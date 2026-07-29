@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { series, seriesPitch, seriesTitle } from "@/lib/tutorial";
+import { series, seriesPitch } from "@/lib/tutorial";
 
 export const metadata: Metadata = {
   title: "Building Relay — the tutorial series",
