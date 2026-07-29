@@ -1,36 +1,46 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# relay-tutorial
 
-## Getting Started
+The application for the **Building Relay** tutorial series — a guided journey from an
+empty directory to a deployed, monitored, multi-tenant chat infrastructure platform.
 
-First, run the development server:
+This repository is a **git submodule** of the main [`relay`](https://github.com/anhba817/relay)
+repository, which holds the series' specification documents (product vision, SRS,
+architecture document, ADRs, and the tutorial plan). The parent repo pins this repo at
+an exact revision so prose and code never drift.
+
+## Stack
+
+- [Next.js](https://nextjs.org) 16 (App Router, TypeScript, Tailwind CSS v4), generated
+  with `create-next-app`
+- [shadcn/ui](https://ui.shadcn.com) with the
+  [Violet Bloom](https://tweakcn.com/themes) theme from tweakcn — light and dark modes
+  via `next-themes` (follows your system preference by default)
+
+## Getting started
+
+Requires Node.js 22+ and [pnpm](https://pnpm.io) 10+.
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+pnpm install   # install dependencies
+pnpm dev       # start the dev server at http://localhost:3000
+pnpm build     # production build
+pnpm lint      # lint
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## Arriving via the parent repo?
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+If you cloned [`relay`](https://github.com/anhba817/relay), this directory is empty
+until you initialize the submodule:
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+```bash
+git submodule update --init
+cd relay-tutorial
+pnpm install
+pnpm dev
+```
 
-## Learn More
+Or clone with submodules in one step:
 
-To learn more about Next.js, take a look at the following resources:
-
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+```bash
+git clone --recurse-submodules git@github.com:anhba817/relay.git
+```
