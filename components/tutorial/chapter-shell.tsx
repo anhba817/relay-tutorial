@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { docsForSourceDoc } from "@/lib/docs";
 import { localePath, t, type Locale } from "@/lib/i18n";
 import {
   chapterReaderProduces,
@@ -51,6 +52,26 @@ export function ChapterHeader({
       <p className="mt-4 text-sm text-muted-foreground">
         {d.shell.youWillProduce}: {chapterReaderProduces(chapter, locale)} ·{" "}
         {d.shell.minutesNote(chapter.readerMinutes)}
+      </p>
+      <p className="mt-2 text-sm text-muted-foreground">
+        {d.shell.sourceDocs}:{" "}
+        {docsForSourceDoc(chapter.sourceDoc).map(({ doc, label }, i) => (
+          <span key={label}>
+            {i > 0 && " · "}
+            {doc ? (
+              <Link
+                href={localePath(locale, `/docs/${doc.slug}`)}
+                className="text-primary hover:underline"
+              >
+                {locale === "vi" ? doc.titleVi : doc.title}
+              </Link>
+            ) : (
+              // Unresolvable sourceDoc: plain text, never a dead link.
+              <span>{label}</span>
+            )}
+          </span>
+        ))}
+        {locale === "vi" && <span> ({d.badges.englishDoc})</span>}
       </p>
     </header>
   );

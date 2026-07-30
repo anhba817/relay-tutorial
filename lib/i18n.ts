@@ -23,10 +23,14 @@ export interface Dictionary {
     previous: string;
     next: string;
     backToContents: string;
+    sourceDocs: string;
+    contents: string;
+    referencedBy: string;
   };
   badges: {
     forthcoming: string;
     englishOnly: string;
+    englishDoc: string;
   };
   boxes: {
     why: string;
@@ -65,10 +69,14 @@ export const dictionaries: Record<Locale, Dictionary> = {
       previous: "Previous",
       next: "Next",
       backToContents: "← Back to the table of contents",
+      sourceDocs: "Source",
+      contents: "Contents",
+      referencedBy: "Referenced in",
     },
     badges: {
       forthcoming: "forthcoming",
       englishOnly: "available in English only",
+      englishDoc: "English",
     },
     boxes: {
       why: "Why",
@@ -103,10 +111,14 @@ export const dictionaries: Record<Locale, Dictionary> = {
       previous: "Trước",
       next: "Tiếp theo",
       backToContents: "← Về mục lục",
+      sourceDocs: "Tài liệu gốc",
+      contents: "Mục lục",
+      referencedBy: "Được tham chiếu trong",
     },
     badges: {
       forthcoming: "sắp ra mắt",
       englishOnly: "hiện chỉ có bản tiếng Anh",
+      englishDoc: "tiếng Anh",
     },
     boxes: {
       why: "Tại sao",

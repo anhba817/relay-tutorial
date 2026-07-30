@@ -44,3 +44,17 @@ Or clone with submodules in one step:
 ```bash
 git clone --recurse-submodules git@github.com:anhba817/relay.git
 ```
+
+## Updating the mirrored docs
+
+The reference pages under `/docs` render the six engineering documents from
+`content/docs/` — verbatim mirrors of the parent repo's canonical `docs/`
+directory. The mirrors are machine-written only:
+
+- `pnpm sync:docs` — copy the current parent `docs/0[1-6]-*.md` into
+  `content/docs/` (requires the parent repo; fails without it).
+- `pnpm check:docs` — fail loudly if any mirror differs from its source
+  (skips with a warning in a standalone clone).
+
+Never hand-edit `content/docs/` — fix the canonical document in the parent
+repo, run `pnpm sync:docs`, and commit the refreshed mirror.
