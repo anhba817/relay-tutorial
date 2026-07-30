@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { t, type Locale } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 
 // The Building Relay recurring box conventions (docs/07 §2 in the relay repo).
@@ -7,6 +8,8 @@ import { cn } from "@/lib/utils";
 
 interface BoxProps {
   children: ReactNode;
+  /** Chapter language — localizes the box label only (feature 004). */
+  locale?: Locale;
 }
 
 function Box({
@@ -42,10 +45,11 @@ function Box({
 }
 
 /** Links a claim in the chapter to its source document or requirement. */
-export function Why({ source, children }: BoxProps & { source?: string }) {
+export function Why({ source, locale = "en", children }: BoxProps & { source?: string }) {
+  const label = t(locale).boxes.why;
   return (
     <Box
-      label={source ? `Why — ${source}` : "Why"}
+      label={source ? `${label} — ${source}` : label}
       className="border-accent-foreground/30 bg-accent text-accent-foreground"
       labelClassName="text-accent-foreground"
     >
@@ -55,10 +59,10 @@ export function Why({ source, children }: BoxProps & { source?: string }) {
 }
 
 /** The bug or mistake you would write naively. */
-export function Trap({ children }: BoxProps) {
+export function Trap({ locale = "en", children }: BoxProps) {
   return (
     <Box
-      label="Trap"
+      label={t(locale).boxes.trap}
       className="border-destructive/40 bg-destructive/10 text-foreground"
       labelClassName="text-destructive"
     >
@@ -68,10 +72,10 @@ export function Trap({ children }: BoxProps) {
 }
 
 /** Verify before continuing — what must be true or in hand. */
-export function Checkpoint({ children }: BoxProps) {
+export function Checkpoint({ locale = "en", children }: BoxProps) {
   return (
     <Box
-      label="Checkpoint"
+      label={t(locale).boxes.checkpoint}
       className="border-primary/40 bg-primary/10 text-foreground"
       labelClassName="text-primary"
     >
@@ -81,10 +85,10 @@ export function Checkpoint({ children }: BoxProps) {
 }
 
 /** What may be skipped, and what the skipper must still take with them. */
-export function SkipAhead({ children }: BoxProps) {
+export function SkipAhead({ locale = "en", children }: BoxProps) {
   return (
     <Box
-      label="Skip ahead"
+      label={t(locale).boxes.skipAhead}
       className="border-border bg-muted text-muted-foreground"
       labelClassName="text-muted-foreground"
     >
@@ -94,10 +98,11 @@ export function SkipAhead({ children }: BoxProps) {
 }
 
 /** A later part revised this content; prose and code never disagree silently. */
-export function Revised({ note, children }: BoxProps & { note?: string }) {
+export function Revised({ note, locale = "en", children }: BoxProps & { note?: string }) {
+  const label = t(locale).boxes.revised;
   return (
     <Box
-      label={note ? `Revised — ${note}` : "Revised"}
+      label={note ? `${label} — ${note}` : label}
       className="border-border bg-secondary text-secondary-foreground"
       labelClassName="text-secondary-foreground"
     >
@@ -107,10 +112,10 @@ export function Revised({ note, children }: BoxProps & { note?: string }) {
 }
 
 /** Ties a Part 0 claim to the concrete artifact it becomes later. */
-export function ForwardRef({ part, children }: BoxProps & { part: string }) {
+export function ForwardRef({ part, locale = "en", children }: BoxProps & { part: string }) {
   return (
     <Box
-      label={`Forward reference — ${part}`}
+      label={`${t(locale).boxes.forwardRef} — ${part}`}
       className="border-accent-foreground/30 border-dashed bg-accent/50 text-foreground"
       labelClassName="text-accent-foreground"
     >
