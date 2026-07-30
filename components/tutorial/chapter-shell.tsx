@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { docsForSourceDoc } from "@/lib/docs";
 import { localePath, t, type Locale } from "@/lib/i18n";
+import { chapterArticleJsonLd, chapterUrl, ogLocale } from "@/lib/seo";
 import {
   chapterReaderProduces,
   chapterTitle,
@@ -28,9 +29,24 @@ export function ChapterHeader({
   const chapter = getChapter(id);
   const part = partOf(id);
   const d = t(locale);
-
+  // Social-preview tags for the battery-frozen chapter files, hoisted into
+  // <head> by React (feature 010, research R3). Titles and descriptions are NOT
+  // emitted here — the metadata API fills og:/twitter: title and description
+  // from each page's own metadata (verified fallback once a layout-level
+  // openGraph exists). The shell adds only what the API cannot know for these
+  // files: url, type, locale. og:image is owned by the opengraph-image files.
   return (
-    <header className="not-prose mb-10 border-b border-border pb-8">
+    <>
+      <meta property="og:url" content={chapterUrl(chapter, locale)} />
+      <meta property="og:type" content="article" />
+      <meta property="og:locale" content={ogLocale(locale)} />
+      <script
+        type="application/ld+json"
+        dangerouslySetInnerHTML={{
+          __html: JSON.stringify(chapterArticleJsonLd(chapter, locale)),
+        }}
+      />
+      <header className="not-prose mb-10 border-b border-border pb-8">
       <nav className="mb-6 text-sm">
         <Link
           href={localePath(locale, "/")}
@@ -74,6 +90,7 @@ export function ChapterHeader({
         {locale === "vi" && <span> ({d.badges.englishDoc})</span>}
       </p>
     </header>
+    </>
   );
 }
 

@@ -2,6 +2,7 @@ import { notFound } from "next/navigation";
 
 import { DocReferencePage } from "@/components/docs/doc-page";
 import { docs, getDoc } from "@/lib/docs";
+import { baseOpenGraph } from "@/lib/seo";
 
 export function generateStaticParams() {
   return docs.map((doc) => ({ slug: doc.slug }));
@@ -17,15 +18,24 @@ export async function generateMetadata({
   const { slug } = await params;
   const doc = getDoc(slug);
   if (!doc) return {};
+  const title = `${doc.titleVi} — Building Relay`;
+  const description = `${doc.titleVi} — tài liệu kỹ thuật gốc của Relay mà loạt bài giảng dạy từ đó, hiển thị trọn vẹn (giữ nguyên tiếng Anh).`;
   return {
-    title: `${doc.titleVi} — Building Relay`,
-    description: `${doc.titleVi} — tài liệu kỹ thuật gốc của Relay mà loạt bài giảng dạy từ đó, hiển thị trọn vẹn (giữ nguyên tiếng Anh).`,
+    title,
+    description,
     alternates: {
       canonical: `/vi/docs/${doc.slug}`,
       languages: {
         en: `/docs/${doc.slug}`,
         vi: `/vi/docs/${doc.slug}`,
       },
+    },
+    openGraph: {
+      ...baseOpenGraph("vi"),
+      title,
+      description,
+      url: `/vi/docs/${doc.slug}`,
+      type: "website",
     },
   };
 }

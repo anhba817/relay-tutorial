@@ -1,8 +1,14 @@
-import type { Metadata } from "next";
 import { IBM_Plex_Mono, Lora, Plus_Jakarta_Sans } from "next/font/google";
+
 import { SiteHeader } from "@/components/site-header";
 import { ThemeProvider } from "@/components/theme-provider";
-import "./globals.css";
+import type { Locale } from "@/lib/i18n";
+import "@/app/globals.css";
+
+// The one <html>/<body> shell both root layouts render. Each locale's route
+// group owns a root layout solely to set the correct page-level language
+// (feature 010, research R1); everything else — fonts, theme, header — is
+// shared here so the two layouts cannot drift.
 
 const plusJakartaSans = Plus_Jakarta_Sans({
   variable: "--font-plus-jakarta-sans",
@@ -20,22 +26,16 @@ const ibmPlexMono = IBM_Plex_Mono({
   weight: ["400", "500", "600"],
 });
 
-export const metadata: Metadata = {
-  metadataBase: new URL(
-    process.env.NEXT_PUBLIC_SITE_URL ?? "http://localhost:3000",
-  ),
-  title: "Relay Tutorial",
-  description: "Application for the Building Relay tutorial series",
-};
-
-export default function RootLayout({
+export function RootShell({
+  lang,
   children,
-}: Readonly<{
+}: {
+  lang: Locale;
   children: React.ReactNode;
-}>) {
+}) {
   return (
     <html
-      lang="en"
+      lang={lang}
       className={`${plusJakartaSans.variable} ${lora.variable} ${ibmPlexMono.variable} h-full antialiased`}
       suppressHydrationWarning
     >

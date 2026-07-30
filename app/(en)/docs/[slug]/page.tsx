@@ -2,6 +2,7 @@ import { notFound } from "next/navigation";
 
 import { DocReferencePage } from "@/components/docs/doc-page";
 import { docs, getDoc } from "@/lib/docs";
+import { baseOpenGraph } from "@/lib/seo";
 
 export function generateStaticParams() {
   return docs.map((doc) => ({ slug: doc.slug }));
@@ -17,15 +18,24 @@ export async function generateMetadata({
   const { slug } = await params;
   const doc = getDoc(slug);
   if (!doc) return {};
+  const title = `${doc.title} — Building Relay`;
+  const description = `${doc.title} — one of the canonical Relay engineering documents the tutorial teaches from, rendered in full.`;
   return {
-    title: `${doc.title} — Building Relay`,
-    description: `${doc.title} — one of the canonical Relay engineering documents the tutorial teaches from, rendered in full.`,
+    title,
+    description,
     alternates: {
       canonical: `/docs/${doc.slug}`,
       languages: {
         en: `/docs/${doc.slug}`,
         vi: `/vi/docs/${doc.slug}`,
       },
+    },
+    openGraph: {
+      ...baseOpenGraph("en"),
+      title,
+      description,
+      url: `/docs/${doc.slug}`,
+      type: "website",
     },
   };
 }
