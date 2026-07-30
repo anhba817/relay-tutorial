@@ -1,0 +1,368 @@
+import { Why, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+
+export const metadata = {
+  title: "Deciding out loud — Building Relay",
+  description:
+    "From 224 requirements to eight architectural drivers to fourteen immutable ADRs: how Relay decides its architecture in writing — with rejected alternatives, reversal conditions, and a review rule that attacks the driver, not the choice.",
+  alternates: {
+    canonical: "/part-0/chapter-05/deciding-out-loud",
+    languages: {
+      en: "/part-0/chapter-05/deciding-out-loud",
+      vi: "/vi/part-0/chapter-05/deciding-out-loud",
+    },
+  },
+};
+
+<ChapterHeader id="0.5" />
+
+Chapter 0.4 ended with a ledger: 224 requirements, each a promise with an address, a
+priority, and a way to be proven wrong. Which leaves the question the ledger cannot
+answer for itself: *how do we intend to keep all that?* An architecture is the answer
+— but not in the form most tutorials suggest. It is not a diagram of boxes and
+arrows, however handsome. Relay's architecture document, the SAD, is at its heart **a
+set of decisions you can argue with**: each one written down, each one naming the
+requirements that forced it, the alternatives it rejected, and the conditions under
+which it should be reversed. This chapter is about that habit — deciding out loud —
+and it is the last thing Part 0 has to teach before the building begins.
+
+The first problem is arithmetic. Two hundred and twenty-four requirements cannot each
+get a vote on the system's shape; a design that tries to answer everything at once
+answers nothing. So the SAD opens with an act of compression we have not seen before
+in the paperwork chain — and that compression is this chapter's first skill.
+
+<SkipAhead>
+
+If you must skip: the SAD distills Relay's 224 requirements into **eight
+architectural drivers** (D1–D8) — the handful that actually shape the system;
+everything else is implementation. Every decision is recorded as an **ADR**: status,
+drivers served, the decision with its accepted trade-offs, at least a couple of
+rejected alternatives *with reasons*, and a reversal condition. ADRs are immutable
+once accepted — superseding takes a new ADR — and the recent media reversal (ADR-13,
+whose status line literally reads "reverses the v1.0 file-storage exclusion") closes
+the 0.1→0.3→0.4→0.5 paperwork chain in the product's own history. Review discipline
+in one line: attack the driver, not the choice. Your exercise — a drivers table and
+two ADRs of your own — completes your Part 0 portfolio.
+
+</SkipAhead>
+
+## From 224 promises to eight drivers
+
+The SAD's second section is a table of eight rows, introduced with a sentence that
+says the quiet part aloud: *"The handful of requirements that actually shape the
+architecture. Everything else is implementation."* That sentence is doing enormous
+work. It claims that of 224 promises, only about eight exert structural force — the
+rest will be honored by code, not by shape. An **architectural driver** is a
+requirement that passes exactly that test: satisfying it changes where things live,
+what owns what, or what is allowed to fail.
+
+Watch one derivation end to end. Chapter 0.4 gave us FR-MSG-05 (a send is
+acknowledged only after the message is durably persisted) and FR-MSG-06 ("an
+acknowledged message shall not be lost" — the one verified by analysis, because no
+single test proves a negative over all futures). Squeeze those together with the
+reliability target NFR-REL-02 and you get driver D1 — and, crucially, a stated
+*consequence*:
+
+```
+D1 · No acknowledged message may be lost
+Source: FR-MSG-05/06, NFR-REL-02
+Consequence: Ack only after durable commit; ordering and persistence
+in one transactional store
+
+D8 · One engineer must be able to run and reason about it
+Source: Portfolio reality; NFR-MNT-03
+Consequence: Few services with sharp boundaries, not many with fuzzy
+ones; boring technology
+```
+
+Read D1's consequence column again, because that is where requirements become
+architecture: *one transactional store*. Three requirements walked in; a structural
+sentence walked out — there will be a single place where durability lives, and
+nothing may claim a message is safe until that place has committed it. Every box in
+the eventual diagram either respects that sentence or is wrong.
+
+Now read D8, the second specimen in the fence and the strangest row in the table. Its
+source column does not cite a shall-statement; it says **"Portfolio reality"** — this
+system is built by one engineer, to be run and defended by one engineer. D8 is a
+driver that is not a requirement at all, and its honesty is the lesson. The SAD gives
+it a paragraph of emphasis: the correct number of services is the smallest number
+that still demonstrates real distributed-systems boundaries, and resume-driven
+microservice sprawl — "fifteen services where five suffice" — is itself an
+architectural smell, and reviewers know it. Team size, deadlines, the skills you
+actually have: these forces shape every real system, and a drivers table that omits
+them is lying by omission. Naming D8 out loud is what lets the SAD say "six services,
+not fifteen" and defend it as a decision rather than confess it as a limitation.
+
+## The anatomy of a decision
+
+Drivers are forces; a decision is what you do about them. The SAD records every
+decision as an **Architecture Decision Record**, and rather than describe the form in
+the abstract, we will walk one — ADR-03, chosen for a particular reason: chapter
+0.4's SRS left its Open Question 1 genuinely open (where do strict per-channel
+sequence numbers come from in a multi-instance system?), and ADR-03 is the decision
+that closes it. A requirement document may end with questions; an architecture may
+not. Here is its terse record, very lightly reflowed:
+
+```
+ADR-03 · Ordering: per-channel sequence via last_sequence row lock
+Status: accepted · resolves SRS Open Question 1 · Drivers: D1, D3
+
+Per-channel sequences, assigned by incrementing channels.last_sequence
+under SELECT … FOR UPDATE in the message-insert transaction. Contention
+is scoped to a single channel — and serialising a channel's writes is
+the requirement (FR-MSG-03), so the lock is not a cost, it is the
+mechanism. Rejected: per-tenant sequence (single hot row per tenant — a
+real bottleneck for zero benefit at v1 scale); Postgres sequences per
+channel (unbounded object count, non-transactional gaps break dedup
+reasoning); Snowflake-style IDs (globally unique but not gap-free per
+channel, which complicates the client's "did I miss something?" logic).
+```
+
+Take the anatomy apart. The **status line** does three jobs in one breath: the
+decision is *accepted*; it exists to resolve a named open question; and it serves
+drivers D1 and D3 — so anyone who disputes it knows immediately which forces they are
+really disputing. The **decision** itself comes with the argument that makes it
+defensible, and this one is worth memorizing as a pattern: a row lock on every send
+looks like an obvious cost, until you notice that FR-MSG-03 *requires* one channel's
+messages to form a strict order — some mechanism must serialize them — so **the lock
+is not a cost, it is the mechanism**. The best decisions often have this shape: what
+looks like the design's weakness is the requirement, physically embodied.
+
+Then the part most teams skip and this discipline refuses to: **rejected
+alternatives, each with its reason**. Per-tenant sequences would trade a non-problem
+for a real one — every send in an environment serializing on a single hot row.
+Postgres sequences are non-transactional: a rolled-back send burns a value, and gaps
+that don't correspond to commits poison the client's "gap means refetch" logic.
+Snowflake-style IDs are only approximately ordered and never dense, so a gap stops
+meaning anything at all. Notice what these three sentences buy: the next person to
+"discover" per-tenant sequences finds their idea already considered, with the reason
+it lost. A rejected alternative recorded with its reason is a meeting that never has
+to happen.
+
+And finally the element that makes the record honest rather than merely confident: a
+**reversal condition**. ADR-03's deep dive states its trigger — revisit when a
+legitimate use case needs more than 500 messages per second in one channel — and then
+adds the sting: at that point the answer is *"that is not a chat channel"*, a product
+boundary, not an architectural fix. Even the reversal condition is a decision.
+
+## One decision, two documents
+
+You may have noticed the terse record above says nothing about lock-cycle
+measurements or why gaps are harmless. That detail lives elsewhere, deliberately.
+Relay splits every decision across two documents: the SAD holds the terse record —
+a decision, its drivers, and its rejected alternatives in a paragraph — while the ADR
+deep-dives document holds the long form, one fixed shape for all fourteen: **Problem
+→ Options → Analysis → Decision → Consequences → Revisit when**. The deep-dives
+document states its own purpose better than we can: the SAD remains the source of
+truth for *what* was decided; the long form exists so the *why* "survives contact
+with a skeptical reviewer."
+
+One more rule completes the discipline, and it should sound familiar. The SAD's
+conventions section: decisions are numbered ADR-nn and are **immutable once
+accepted; superseding requires a new ADR**. This is chapter 0.4's ledger rule wearing
+architect's clothes — the SRS absorbed the media reversal with new IDs and no edits,
+and the decision record works identically. If ADR-03 someday falls to that 500-msg/s
+trigger, ADR-03 will not be rewritten; a new ADR will supersede it, and the record
+will show both the decision and its undoing, in order, forever. An architecture with
+edited decisions has no history, only a present tense — and you cannot learn from a
+document that always agreed with you.
+
+<Why source="SAD §2 & §9 — the review rule">
+
+Why drivers *and* records, and not just records? Because together they change what a
+design review is. The SAD closes its ADR section with the rule: every ADR states its
+reversal condition or rejected alternatives, so if a review disagrees with a
+decision, "the productive move is to attack the driver, not the choice — the choices
+follow from D1–D8 fairly mechanically." Disagreement stops being taste ("I'd have
+used Kafka") and becomes falsifiable ("D5 is wrong, and here is why"). If the driver
+survives, the choice stands; if the driver falls, the choice falls with it — no
+feelings involved. That is what "deciding out loud" buys: arguments you can lose on
+the merits, which is the only kind worth winning.
+
+</Why>
+
+## The chain closes: a reversal arrives as architecture
+
+Part 0 has been quietly following one storyline across four chapters, and it ends
+here. Chapter 0.1 recorded "no hosted file storage" as a v1.0 non-goal, with stated
+reasons — bandwidth, CDN, and storage-operations cost. Chapter 0.3 mapped the
+journeys that made attachments matter anyway. Chapter 0.4 watched the reversal reach
+the SRS as fourteen new FR-MED requirements, new IDs, zero edits. Now watch it arrive
+in the SAD — not as a revision to any existing decision, but as two brand-new ADRs,
+and the first one confesses its ancestry in its status line:
+
+```
+ADR-13 · Media bytes never transit Relay compute:
+presigned direct-to-storage
+Status: accepted · reverses the v1.0 file-storage exclusion
+Drivers: D5, D8, NFR-PRF-08
+
+Uploads: the API service validates declaration and quota, records a
+pending row, and returns a presigned PUT URL; the client uploads
+straight to S3-compatible storage. Downloads: signed GET URLs minted at
+read time, authorised by channel membership (FR-MED-08), never
+persisted (DR-16). Relay's services handle metadata only — the original
+exclusion's cost argument (bandwidth, CDN, storage ops) is answered by
+not building any of it: object storage's durability, bandwidth, and
+lifecycle rules are bought, not rebuilt.
+```
+
+Read the decision against the original objection and notice that it does not
+*overrule* the exclusion — it *answers* it. Every cost 0.1 feared — bandwidth
+through Relay's network, CDN operations, storage management — is met "by not
+building any of it": bytes go straight between the client and object storage, whose
+durability and lifecycle rules are bought, not rebuilt. Relay's services touch
+metadata only. The non-goal's reasons were good; the decision that reversed it is
+the one that made those reasons obsolete. That is what a healthy reversal looks like
+in paperwork: the old argument acknowledged, engaged, and defeated on its own terms
+— in a *new* record, while 0.1's original page still reads exactly as it did.
+
+Its companion ADR-14 handles the uncomfortable half of hosting user uploads —
+scanning — and earns its place in this chapter with two teachable moves. First, the
+gate is placed with surgical precision: the scan pipeline **gates bytes, never
+messages**. A message may reference still-`pending` media and ship immediately;
+recipients render a placeholder; no signed URL exists until the file goes `ready`.
+The rejected alternative — scan before send — would put a 2–10-second CPU-bound
+pipeline inside the send path and couple message availability to scanner
+availability, exactly the coupling driver D5 exists to forbid. Second, the media
+state machine (`pending/ready/rejected`) deliberately mirrors the message state
+machine the SDK already implements (`sending/sent/failed`) — in the ADR's own words,
+**one mental model, twice applied**. New capability, zero new concepts: that is D8
+voting in a decision that is nominally about virus scanning.
+
+<Why source="docs/06 — Reading the fourteen together">
+
+Why does every ADR carry a reversal condition? The deep-dives document names it as
+one of the three themes running through all fourteen decisions: "every decision
+names its own undoing." Reversal triggers are not decoration — they are "the
+discipline that keeps a solo-built system honest: the day a trigger fires, the
+argument for change is already written." A one-engineer project has no colleague to
+say "remember, we chose this because…" — the record has to be that colleague. You
+just watched the mechanism run live: 0.1's exclusion stated its reasons, which is
+precisely what let ADR-13 reverse it cleanly a version later. Decisions with named
+undoings age into history; decisions without them age into folklore.
+
+</Why>
+
+## Reading the fourteen together
+
+Walk the full set of fourteen ADRs — we walked two closely, and the rest wait in the
+same two documents — and the deep-dives document observes that three themes recur,
+and that naming them "is the best summary of the architecture's character."
+**Durability has one home; everything else is allowed to be cheap**: Postgres holds
+truth, and that one strict choice is what purchases every surprisingly relaxed one —
+a fan-out fabric permitted to be lossy, presence allowed to evaporate, an analytical
+store allowed to go down. **The write path is sacred; features live on the read
+side**: sequences commit with rows, sends converge on one code path, and when a new
+feature threatens message semantics, the reflex is to reformulate it as a read-time
+concern. And **every decision names its own undoing** — the theme you just saw
+paying rent. None of these themes was ever written as a requirement. They *emerged*,
+decision by decision, from eight drivers pressing on fourteen choices — which is the
+final sense in which an architecture is not a diagram. The diagram shows what the
+system looks like. The decisions show what the system believes.
+
+<ForwardRef part="Parts 1–7">
+
+The ADRs are the series' remaining table of contents, the same way 0.4's requirement
+IDs were. ADR-01 (one language everywhere) is chapter 1.1, where the repository gets
+its shape. ADR-03 *is* chapter 2.2 — you will hold its row lock in your hands and
+watch the "did I miss something?" logic work. ADR-06's transactional outbox is
+chapter 3.3. ADR-13 and ADR-14 become Part 4's media chapters, presigned URLs, scan
+pipeline, and all. From here on, when a `WHY` box cites an ADR, you have already read
+the argument.
+
+</ForwardRef>
+
+## Your turn
+
+Part 0's final artifacts. You arrive holding an SRS slice of 8–15 requirements from
+chapter 0.4 (vet-clinic scheduler still going strong?); you leave holding a drivers
+table and two ADRs — the same chain Relay just walked, at your scale.
+
+**Exercise 1 — the drivers table.** Distill your slice into **3 to 6 drivers**. The
+number matters: if you produce one driver per requirement you have renamed your
+slice, not distilled it — the compression *is* the skill. Apply ADR thinking's
+entrance exam to every candidate: does satisfying this requirement change where
+things live, what owns what, or what is allowed to fail? A reminder that must
+survive a crashed server shapes structure; a reminder that must be worded politely
+does not. Each row gets three fields, exactly like Relay's:
+
+> **Driver:** No confirmed appointment may silently vanish.
+> **Source:** VET-REM-01, VET-PRT-02 *(your IDs, from your slice)*
+> **Consequence:** Appointments and their reminders live in one durable store;
+> the confirmation screen renders only after commit.
+
+You are allowed — encouraged — to include **one D8-style driver** that is not a
+requirement at all but honest context: "built by one person, evenings only" or
+"must run on the clinic's existing €10/month hosting." Label its source *context*,
+the way Relay's D8 says "portfolio reality." A constraint you admit is a driver; a
+constraint you hide is a future excuse.
+
+**Exercise 2 — two ADRs from scratch.** Pick two structural decisions your drivers
+force — ideally each defending one of your ★-derived requirements. For each, write
+the full anatomy from this chapter, terse-record style:
+
+- **Status** — accepted (you are the review board), plus what it resolves if an
+  open question from your 0.4 slice dies here.
+- **Drivers** — named rows from your Exercise 1 table.
+- **Decision** — what you chose, in two or three sentences, including the
+  trade-off you are knowingly accepting (ADR-03 accepted serialized writes per
+  channel; what pain are you signing up for?).
+- **Rejected alternatives — at least two, each with its reason.** This is the
+  field that separates a record from an announcement. "Rejected: cron-job polling
+  (a crashed poller loses the reminder silently — violates my driver 1)" beats
+  "considered other options" by exactly the amount a future teammate needs.
+- **Reversal condition — one observable trigger.** "Revisit when a clinic exceeds
+  200 appointments/day" is a tripwire; "revisit if performance becomes a problem"
+  is a horoscope. Make it a number someone could put on a dashboard.
+
+**Self-checks.** Each answers yes or no:
+
+1. Does every driver cite requirement IDs from your own slice — or declare itself
+   as context, D8-style? (No orphan drivers, no smuggled constraints.)
+2. Does each ADR name at least one driver from your table — could a reader trace
+   choice → driver → requirement → journey → persona without asking you anything?
+3. Could a new teammate reconstruct *why you didn't choose the obvious
+   alternative* from the rejection reasons alone?
+4. Is every reversal condition observable — a threshold that fires on its own,
+   not a mood?
+
+File both artifacts with the rest of your Part 0 portfolio. They are its keystone:
+every earlier document exists so that these two could be written honestly.
+
+## Takeaways
+
+If you read nothing else in this chapter, keep these:
+
+- **An architecture is a set of decisions you can argue with**, not a diagram. The
+  diagram shows what the system looks like; the decisions show what it believes.
+- **Drivers are the distillation.** Of 224 requirements, eight shape the structure —
+  and an honest table admits forces that aren't requirements at all (D8: one
+  engineer, portfolio reality).
+- **An ADR has a full anatomy**: status, drivers, decision with accepted trade-offs,
+  rejected alternatives *with reasons*, reversal condition. A rejected alternative
+  recorded with its reason is a meeting that never has to happen.
+- **Records are immutable; history never lies.** Accepted ADRs are never edited —
+  superseding takes a new ADR, exactly as the SRS grows by new IDs. ADR-13's status
+  line ("reverses the v1.0 file-storage exclusion") is the proof, closing the
+  0.1→0.3→0.4→0.5 chain in the product's own history.
+- **Attack the driver, not the choice.** The choices follow from D1–D8 fairly
+  mechanically — so productive disagreement disputes the force, not the taste.
+
+<Checkpoint>
+
+This is the end of Part 0, so this checkpoint closes more than a chapter. In your
+project repository you should now hold the complete paperwork portfolio: a
+positioning statement and a list of non-goals (0.1), personas (0.2), two journey
+maps with their ★ moments (0.3), an SRS slice of 8–15 testable requirements (0.4),
+and now a drivers table of 3–6 rows plus two ADRs with full anatomy — every layer
+citing the one above it, from a person to a moment to a promise to a decision. That
+chain is what the next seven parts will keep pulling on: from Part 1's first commit
+onward, we stop writing about the system and start building it, and every piece of
+code will be defending a sentence you can now point to. If any artifact is missing,
+this is the cheapest moment there will ever be to go back for it. Otherwise: the
+paperwork is done, the arguments have survived — the building begins.
+
+</Checkpoint>
+
+<ChapterFooter id="0.5" />
