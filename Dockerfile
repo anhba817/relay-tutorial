@@ -6,7 +6,9 @@
 FROM node:22-alpine AS deps
 WORKDIR /app
 RUN corepack enable
-COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml prisma.config.ts ./
+# postinstall runs `prisma generate`, which needs the schema (and the config).
+COPY prisma ./prisma
 RUN pnpm install --frozen-lockfile
 
 # ---- build ----
@@ -19,6 +21,10 @@ COPY . .
 ARG NEXT_PUBLIC_SITE_URL=http://localhost:3000
 ENV NEXT_PUBLIC_SITE_URL=$NEXT_PUBLIC_SITE_URL
 ENV NEXT_TELEMETRY_DISABLED=1
+# Regenerate the Prisma client in this stage (lib/generated is dockerignored,
+# so the build never depends on a developer machine's artifacts). DATABASE_URL
+# is NOT needed here — and must never be: it is a runtime-only secret.
+RUN pnpm prisma generate
 RUN pnpm build
 
 # ---- run ----

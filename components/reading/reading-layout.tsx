@@ -3,6 +3,7 @@ import type { ReactNode } from "react";
 import { OnThisPage } from "@/components/reading/on-this-page";
 import { SeriesSidebar } from "@/components/reading/series-sidebar";
 import { MobileSeriesNav } from "@/components/reading/mobile-series-nav";
+import { SuggestionCapture } from "@/components/reading/suggestion-capture";
 import type { Locale } from "@/lib/i18n";
 
 // The shared reading shell (feature 012): left series outline (≥ lg), the
@@ -28,6 +29,7 @@ export function ReadingLayout({
         </aside>
         <div id="reading-article" className="min-w-0">
           {children}
+          <SuggestionCapture locale={locale} />
         </div>
         <aside className="hidden xl:block">
           <div className="sticky top-12 max-h-[calc(100vh-3rem)] overflow-y-auto py-8">

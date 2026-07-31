@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 
 import { RootShell } from "@/components/root-shell";
+import { TranslationNotice } from "@/components/translation-notice";
 import { sharedMetadata } from "@/lib/seo";
 
 export const metadata: Metadata = {
@@ -14,5 +15,10 @@ export default function VietnameseRootLayout({
 }: Readonly<{
   children: React.ReactNode;
 }>) {
-  return <RootShell lang="vi">{children}</RootShell>;
+  return (
+    <RootShell lang="vi">
+      <TranslationNotice />
+      {children}
+    </RootShell>
+  );
 }

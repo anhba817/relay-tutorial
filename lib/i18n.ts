@@ -54,6 +54,22 @@ export interface Dictionary {
     switchToThisLanguage: string;
     label: string;
   };
+  suggest: {
+    // The select-and-suggest capture flow (feature 015).
+    action: string;
+    dialogTitle: string;
+    selectedLabel: string;
+    placeholder: string;
+    counter: string; // {n} = characters remaining
+    submit: string;
+    cancel: string;
+    submitting: string;
+    thanks: string;
+    errorInvalid: string;
+    errorTooLong: string;
+    errorRate: string;
+    errorOffline: string;
+  };
 }
 
 export const dictionaries: Record<Locale, Dictionary> = {
@@ -102,6 +118,21 @@ export const dictionaries: Record<Locale, Dictionary> = {
       switchToThisLanguage: "Switch to English",
       label: "EN",
     },
+    suggest: {
+      action: "Suggest an improvement",
+      dialogTitle: "Suggest an improvement",
+      selectedLabel: "Selected text",
+      placeholder: "What would make this passage better?",
+      counter: "{n} characters left",
+      submit: "Send suggestion",
+      cancel: "Cancel",
+      submitting: "Sending…",
+      thanks: "Thank you — suggestion received!",
+      errorInvalid: "That didn't go through — check the suggestion and try again.",
+      errorTooLong: "The selection or suggestion is too long — try a shorter passage.",
+      errorRate: "That's a lot of suggestions at once — please wait a minute and try again.",
+      errorOffline: "We couldn't save your suggestion right now. Please try again later.",
+    },
   },
   vi: {
     landing: {
@@ -147,6 +178,21 @@ export const dictionaries: Record<Locale, Dictionary> = {
     switcher: {
       switchToThisLanguage: "Chuyển sang tiếng Việt",
       label: "VI",
+    },
+    suggest: {
+      action: "Góp ý cải thiện",
+      dialogTitle: "Góp ý cải thiện",
+      selectedLabel: "Đoạn bạn đã chọn",
+      placeholder: "Theo bạn, đoạn này nên viết lại thế nào?",
+      counter: "còn {n} ký tự",
+      submit: "Gửi góp ý",
+      cancel: "Hủy",
+      submitting: "Đang gửi…",
+      thanks: "Cảm ơn bạn — góp ý đã được ghi nhận!",
+      errorInvalid: "Gửi chưa thành công — bạn kiểm tra lại nội dung rồi thử lần nữa nhé.",
+      errorTooLong: "Đoạn chọn hoặc phần góp ý dài quá — bạn thử chọn một đoạn ngắn hơn.",
+      errorRate: "Bạn gửi hơi dồn dập — chờ một phút rồi gửi tiếp nhé.",
+      errorOffline: "Hiện chưa lưu được góp ý của bạn. Bạn quay lại thử sau nhé.",
     },
   },
 };
