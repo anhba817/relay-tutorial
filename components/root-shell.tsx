@@ -1,4 +1,4 @@
-import { IBM_Plex_Mono, Lora, Plus_Jakarta_Sans } from "next/font/google";
+import { IBM_Plex_Mono, Lora, Open_Sans } from "next/font/google";
 
 import { SiteHeader } from "@/components/site-header";
 import { ThemeProvider } from "@/components/theme-provider";
@@ -10,9 +10,9 @@ import "@/app/globals.css";
 // (feature 010, research R1); everything else — fonts, theme, header — is
 // shared here so the two layouts cannot drift.
 
-const plusJakartaSans = Plus_Jakarta_Sans({
-  variable: "--font-plus-jakarta-sans",
-  subsets: ["latin"],
+const openSans = Open_Sans({
+  variable: "--font-open-sans",
+  subsets: ["latin", "vietnamese"],
 });
 
 const lora = Lora({
@@ -36,7 +36,7 @@ export function RootShell({
   return (
     <html
       lang={lang}
-      className={`${plusJakartaSans.variable} ${lora.variable} ${ibmPlexMono.variable} h-full antialiased`}
+      className={`${openSans.variable} ${lora.variable} ${ibmPlexMono.variable} h-full antialiased`}
       suppressHydrationWarning
     >
       <body className="min-h-full flex flex-col">
