@@ -106,7 +106,7 @@ export const series: Part[] = [
         readerProduces: "A drivers table; two ADRs written from scratch",
         sourceDoc: "docs/05-sad.md, docs/06-adr-deep-dives.md",
         readerMinutes: 110,
-        titleVi: "Quyết định thành tiếng — bản SAD và thói quen viết ADR",
+        titleVi: "Quyết định trên giấy trắng mực đen — bản SAD và thói quen viết ADR",
         readerProducesVi: "Bảng động lực thiết kế (drivers); hai bản ADR viết từ con số không",
       },
     ],
