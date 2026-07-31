@@ -1,0 +1,467 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figStoreMap, figStartedVsReady, figComposeGate } from "./figures";
+
+export const metadata = {
+  title: "Một câu lệnh, cả thế giới — Building Relay",
+  description:
+    "Chương 1.2 trao cho workspace cả thế giới của nó: Postgres, Redis, NATS và ClickHouse trong một file compose, có healthcheck để một câu lệnh duy nhất vừa khởi động VỪA sẵn sàng — NFR-MNT-03 là yêu cầu từ ngày đầu.",
+  alternates: {
+    canonical: "/vi/part-1/chapter-02/one-command-whole-world",
+    languages: {
+      en: "/part-1/chapter-02/one-command-whole-world",
+      vi: "/vi/part-1/chapter-02/one-command-whole-world",
+    },
+  },
+};
+
+<ChapterHeader id="1.2" locale="vi" />
+
+Chương 1.1 để lại cho chúng ta một workspace vượt qua ba câu lệnh mà chưa tính
+toán được gì. Đó chính là chủ đích — cửa ải phải dựng trước khi hàng hóa đi
+qua. Nhưng mọi chương phía trước đều cần một thế giới bên dưới: tin nhắn cần
+một nơi lưu trữ gốc, sự kiện cần một xương sống bền vững, việc phát tán trực
+tiếp cần một tấm lưới fan-out, còn analytics cần một ngôi nhà riêng. Hôm nay
+chúng ta dựng cả thế giới ấy trên máy của bạn — bốn store, một file, một câu
+lệnh — và làm cho câu lệnh ấy *trung thực*: nó chỉ trả về khi mọi thứ thực sự
+sẵn sàng nhận việc.
+
+<SkipAhead locale="vi">
+
+Nếu bạn buộc phải đọc lướt: chương này thêm `compose.yaml` vào relay-platform —
+Postgres, Redis, NATS (JetStream), ClickHouse, mỗi service một healthcheck,
+volume chỉ cấp cho nơi nào độ bền dữ liệu là nhiệm vụ — cộng thêm `infra.ts`
+và `infra.test.ts` trong `@relay/config` để cửa ải kiểm được bản khai báo mà
+không cần Docker. Trạng thái cuối chương là tag **`part1-ch2`**: checkout nó,
+`docker compose up -d --wait` đưa cả bốn store về `(healthy)`, và
+`pnpm lint && pnpm typecheck && pnpm test` vẫn xanh — kể cả khi bạn tắt hẳn
+Docker daemon.
+
+</SkipAhead>
+
+## Yêu cầu nằm sờ sờ trước mắt
+
+Nằm khuất trong mục maintainability của bản SRS, ở mức ưu tiên P1 — cùng hạng
+với thứ tự tin nhắn — là NFR-MNT-03: "The full stack shall be startable
+locally with a single command" (toàn bộ hệ thống phải khởi động được tại chỗ
+bằng một câu lệnh duy nhất). Rất dễ đọc dòng đó như một tiện nghi cho dev.
+Không phải. Nó là một *yêu cầu của sản phẩm*, kiểm chứng bằng trình diễn, và
+kế hoạch loạt bài gọi thẳng tên góc nhìn của chương này: một yêu cầu từ ngày
+đầu, không phải thứ nghĩ ra sau.
+
+<Why source="NFR-MNT-03 · D8" locale="vi">
+
+Vì sao khả năng tái lập môi trường tại chỗ lại đứng ngang hàng với thứ tự và
+độ bền dữ liệu? Driver D8: "một kỹ sư phải vận hành và hiểu thấu tất cả."
+Relay là sáu service và bốn store; nếu ráp thế giới ấy tốn một trang wiki và
+một buổi chiều, hệ thống đã phụ lòng người vận hành quan trọng nhất của nó —
+người debug lúc 2 giờ sáng. Một câu lệnh duy nhất là cách D8 sống sót khi chạm
+mặt một hệ phân tán: cả topology trở thành thứ bạn *cầm được trong tay* —
+khởi động, reset, và suy luận về nó. Và vì đây là một yêu cầu, chúng ta xây nó
+trước tiên để mọi chương sau thừa hưởng — chờ đến khi năm service đã tồn tại
+mới quay lại lo chuyện tái lập, đó chính là cách nó biến thành thứ nghĩ ra
+sau.
+
+</Why>
+
+## Vì sao là bốn store này
+
+File compose chúng ta sắp viết gọi tên bốn store. Không cái nào ở đó theo thói
+quen — từng chỗ ngồi đều được biện luận, thành văn, trong các bản ghi quyết
+định của SAD. Trước YAML, hãy nghe lập luận.
+
+**Postgres là system of record — nguồn dữ liệu gốc.** Mọi cam kết mà Phần 2 sẽ
+đổ mồ hôi vì nó đều sống ở đây: thứ tự trong kênh là một row lock của Postgres
+(ADR-03 cấp sequence bằng cách tăng `channels.last_sequence` dưới
+`SELECT … FOR UPDATE`), và ADR-04 chỉ cho phép đúng một writer — "only the API
+service touches PostgreSQL" (chỉ API service được chạm vào PostgreSQL) — để
+các bất biến sống trong một codebase thay vì bị nhân đôi và phải test hai lần.
+
+**NATS JetStream là xương sống sự kiện bền vững.** ADR-02 chọn nó thay vì
+Kafka vì nó mang lại durable stream, consumer group và redelivery "at a
+fraction of Kafka's operational mass" (với một phần nhỏ khối lượng vận hành
+của Kafka) — và danh sách phương án bị bác bỏ rất đáng đọc. Kafka: cồng kềnh
+quá mức cần thiết ở quy mô này. Redis Streams: bị bác vì nó "trói xương sống bền vững
+vào kho trạng thái phù du — một sự cố Redis khi đó sẽ có hai vùng nổ." Các
+store tách bạch nhau là có chủ đích, và sự tách bạch ấy bắt đầu ngay trong
+file compose này.
+
+**Redis là tấm lưới fan-out kiêm bảng presence — và nó được phép làm rơi.**
+ADR-07 để việc phát tán trực tiếp chạy kiểu bắn-rồi-quên một cách có chủ đích:
+một frame pub/sub bị rơi không phải là một tin nhắn bị mất, vì độ bền nằm ở
+Postgres và cursor phía client sẽ vớt lại bất cứ thứ gì lỡ nhịp. ADR-10 đặt
+presence vào Redis với TTL cũng vì lẽ đó — nói theo đúng lời nó, lượng độ bền
+đúng mức cho dấu ba chấm đang gõ và chấm xanh online là *không có gì cả*.
+
+**ClickHouse là kho phân tích, đi đường riêng.** CON-01 của bản SRS cấm
+analytics truy vấn vào database vận hành — nói theo lời ADR-08, phương án tái
+dùng Postgres cho analytics bị bác vì "CON-01 exists precisely to forbid this"
+(CON-01 tồn tại chính xác để cấm điều này). Một node ClickHouse là đủ cho v1
+("một node kèm backup đáp ứng 10k insert/giây và ngưỡng truy vấn 2 s trên 90
+ngày, còn dư dả"), và schema sẽ mang dáng cluster ngay từ đầu, để việc mở
+rộng sau này "là một lần migrate dữ liệu, không phải một lần thiết kế lại."
+
+<Figure
+  caption="Bốn store và những quyết định đã xếp chỗ cho chúng — các service của Relay (đến ở 1.4) sẽ thấy thế giới này đã đứng sẵn."
+  code={figStoreMap}
+/>
+
+## File compose
+
+Kiểm tra công cụ trước — nếp quen từ 1.1. Chương này cần Docker Engine với
+Compose v2; chúng ta dựa vào `--wait`, thứ mọi bản phát hành gần đây đều có.
+Nếu `docker compose version` in ra một số phiên bản v2, bạn đã đủ đồ nghề; nếu
+câu lệnh không tồn tại, hãy cài Docker theo tài liệu chính thức
+([docs.docker.com/engine/install](https://docs.docker.com/engine/install/)) —
+chương này sẽ không kể lại chuyện cài đặt.
+
+```bash
+docker compose version
+```
+
+Giờ thì khai báo cả thế giới. Một file duy nhất ở gốc repository:
+
+```yaml title="compose.yaml"
+# The whole local world, one command:  docker compose up -d --wait
+# Four stores, each here by a recorded decision (SAD §9). Host ports are env
+# knobs with the standard defaults; the container side never changes.
+name: relay
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      # Dev-only credentials — this file never ships anywhere.
+      POSTGRES_USER: relay
+      POSTGRES_PASSWORD: relay
+      POSTGRES_DB: relay
+    ports:
+      - "${RELAY_POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "relay", "-d", "relay"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+
+  redis:
+    image: redis:8-alpine
+    # No volume, on purpose: nothing in Redis is a source of truth.
+    # Fan-out is lossy by design (ADR-07); presence self-heals (ADR-10).
+    ports:
+      - "${RELAY_REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  nats:
+    image: nats:2.12-alpine
+    # JetStream on (-js) with file storage (-sd): the durable event spine
+    # (ADR-02) must survive a restart. -m exposes the monitoring endpoint.
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    ports:
+      - "${RELAY_NATS_PORT:-4222}:4222"
+      - "${RELAY_NATS_MONITOR_PORT:-8222}:8222"
+    volumes:
+      - nats-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.3
+    # The analytical store rides its own path (CON-01): single node in v1,
+    # schema already cluster-shaped (ADR-08).
+    ports:
+      - "${RELAY_CLICKHOUSE_HTTP_PORT:-8123}:8123"
+      - "${RELAY_CLICKHOUSE_NATIVE_PORT:-9000}:9000"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+
+volumes:
+  postgres-data:
+  nats-data:
+  clickhouse-data:
+```
+
+Hãy đọc nó thành ba lớp. Các **image** được ghim vào phiên bản tường minh —
+`postgres:18-alpine`, không phải `postgres:latest` — vì một tag thả nổi là một
+thế giới khác nhau mỗi tháng, trong khi toàn bộ ý nghĩa của file này là *cùng
+một* thế giới ở mọi lần chạy. (Các con số phiên bản trong file sẽ già đi theo
+loạt bài; tag của chương, chứ không phải phần chữ, giữ đúng trạng thái — lời
+dặn từ 1.1, vẫn còn nguyên giá trị.) Các **healthcheck** là tín hiệu sẵn sàng
+bằng ngôn ngữ riêng của từng store: Postgres trả lời `pg_isready`, Redis đáp
+`PONG`, NATS và ClickHouse mỗi bên phơi ra một endpoint HTTP bé xíu. Trông
+chúng như đồ trang trí. Cái BẪY bên dưới nói về lý do chúng là kết cấu chịu
+lực.
+
+Còn các **volume** chính là kiến trúc, được phát biểu lại. Postgres lưu bền vì
+nó là system of record. NATS lưu bền (`-sd /data`) vì ADR-02 đã định JetStream
+là xương sống *bền vững* — một hàng đợi quên sạch sau restart thì không phải
+xương sống. ClickHouse lưu bền vì analytics là thứ tích lũy. Còn Redis không
+nhận gì cả — một cách có chủ đích. Sự bất đối xứng ấy là bản SAD thu vào một
+ánh nhìn.
+
+<Why source="ADR-02 · ADR-07" locale="vi">
+
+Vì sao không cấp volume cho Redis khi cấp nó chỉ tốn hai dòng? Vì chính sự
+vắng mặt ấy *ghi lại một lời hứa*. ADR-07 nói rõ: mất trắng Redis không được
+làm mất dữ liệu — độ bền nằm ở Postgres, client tự hồi phục bằng cursor. Nếu
+chúng ta cứ cho Redis lưu bền, file compose sẽ lặng lẽ tuyên bố điều ngược
+lại, và kỹ sư đầu tiên đọc lướt nó sẽ xây trên một hình dung sai. Bản khai báo
+hạ tầng dạy dỗ bất cứ ai đọc nó; chúng ta bắt bản này dạy sự thật. (Bài smoke
+test cuối chương *khẳng định* sự vắng mặt đó — lời hứa giờ đã có máy kiểm.)
+
+</Why>
+
+<Trap locale="vi">
+
+Lỗi mà bạn sẽ viết ra nếu thiếu đoạn này: `docker compose up -d`, rồi kết nối
+ngay lập tức. Câu lệnh ấy trả về ngay khi container *đã start* — mà start xong
+chưa phải là sẵn sàng. Riêng Postgres dành cả lần khởi động đầu tiên để chạy
+`initdb`, những giây mà cổng đã mở nhưng chẳng ai ở nhà; ClickHouse cũng cần
+một nhịp để ấm máy. Ngay bây giờ thì chưa gì đổ vỡ — con bọ này nằm chờ đến
+chương 1.4, khi các service kết nối lúc khởi động và crash-loop trước những
+store đã mở cửa khi còn chưa kịp thay đồ. Tệ hơn, `depends_on` một mình không
+cứu được bạn: nó xếp thứ tự cho *việc start*, không phải cho *sự sẵn sàng*.
+Cách chữa nằm ở cấu trúc, là hai mảnh chúng ta vừa xây: healthcheck (mỗi store
+tự định nghĩa thế nào là sẵn sàng) và `--wait` (câu lệnh từ chối trả về chừng
+nào tất cả chưa vượt qua). Về sau, khi các service vào chung file, cũng chính
+những healthcheck này sẽ nuôi
+`depends_on: { condition: service_healthy }` — một định nghĩa sẵn sàng, mọi
+nơi cùng dùng.
+
+</Trap>
+
+<Figure
+  caption="Hai vạch đích khác nhau: up -d về đích ở 'đã start'; up -d --wait về đích ở 'sẵn sàng'. Khoảng trống giữa chúng là nơi service của 1.4 sẽ crash-loop."
+  code={figStartedVsReady}
+/>
+
+## Một câu lệnh, có kiểm chứng
+
+Câu lệnh mà chương này sinh ra để phục vụ:
+
+```bash
+docker compose up -d --wait
+```
+
+Lần chạy đầu, Docker tải bốn image (tầm một ly cà phê); từ đó trở đi, khởi
+động nguội đến lúc tất-cả-healthy mất chưa đầy một phút. `--wait` chỉ thoát
+với mã `0` khi mọi healthcheck đều báo khỏe — nó đã trả về nghĩa là thế giới
+đã sẵn sàng. Hãy kiểm chứng theo đúng cách bạn sẽ làm trong mọi phiên debug từ
+nay về sau:
+
+```bash
+docker compose ps
+```
+
+Bốn dòng, mỗi dòng kết thúc bằng `(healthy)`. Chữ ấy là healthcheck của bạn
+đang lên tiếng, không phải sự lạc quan.
+
+Một điểm gợn cần nói thật: các cổng host mặc định (5432, 6379, 4222, 8123) là
+cổng tiêu chuẩn, nghĩa là bất cứ thứ gì đang chiếm chúng trên máy bạn sẽ thắng
+cuộc đua. Chuyện này chẳng hề lý thuyết — chính chiếc máy viết ra chương này
+đang chạy Postgres và Redis riêng của nó. File compose biến mọi cổng host
+thành một biến môi trường với giá trị mặc định tiêu chuẩn, nên một vụ va chạm
+chỉ tốn một biến, không tốn một lần sửa file:
+
+```bash
+RELAY_POSTGRES_PORT=15432 RELAY_REDIS_PORT=16379 docker compose up -d --wait
+```
+
+Phía container không bao giờ đổi — khi các service của Relay xuất hiện, chúng
+nói chuyện với các store qua mạng nội bộ của compose và chẳng bận tâm host của
+bạn map cổng nào.
+
+Dọn dẹp là hai câu lệnh mang hai ý nghĩa rất khác nhau:
+
+```bash
+docker compose down      # stop the world; the volumes survive
+docker compose down -v   # stop the world AND erase every store's data
+```
+
+`down` là một quãng nghỉ: Postgres, NATS và ClickHouse giữ nguyên trạng thái
+trong các named volume và nhặt lại nó ở lần `up` sau. `down -v` là nút reset —
+mọi thứ bền vững chết theo nó. Biết mình đang muốn lệnh nào là khác biệt giữa
+"khởi động lại" và "làm lại từ đầu"; cả hai đều chính đáng, và lời hứa
+một-câu-lệnh của NFR-MNT-03 phủ cả hai chiều.
+
+## Cửa ải học biết về thế giới
+
+Luật của chương 1.1 là mỗi chương kết thúc ở một trạng thái chạy được và *có
+test* — vậy mà chúng ta vừa thêm nguyên một bản khai báo hạ tầng không ai canh
+gác. Cửa ải phải giữ được sự trung thực mà không đòi hỏi Docker (CI runner của
+bạn, và đôi khi cả laptop của bạn, sẽ không có daemon) — nên bài test khẳng
+định về *bản khai báo*, không phải về các container đang chạy. Trước tiên, các
+hằng số:
+
+```ts title="packages/config/src/infra.ts"
+// The local infrastructure, named. The compose file at the repository root
+// (compose.yaml) is the source of truth; these constants let the rest of the
+// workspace — and the smoke test beside this file — refer to it without
+// parsing YAML. This is a new file on purpose: files fenced by earlier
+// chapters are read-only from then on (chapter 1.2's additive-only rule).
+
+export const COMPOSE_FILE = "compose.yaml";
+
+export const INFRA_SERVICES = ["postgres", "redis", "nats", "clickhouse"] as const;
+
+export const DURABLE_VOLUMES = [
+  "postgres-data",
+  "nats-data",
+  "clickhouse-data",
+] as const;
+```
+
+Để ý phần comment về *file mới*. Chương 1.1 đã công bố nội dung chính xác của
+mười file, và loạt bài này hứa rằng các khối code ấy khớp với repository ở tag
+của mọi chương. Cách rẻ nhất để giữ lời là một kỷ luật: **một chương không bao
+giờ sửa file mà chương trước đã trưng ra — hành vi mới nằm trong file mới.**
+Đó là lý do các hằng số phía trên sống trong `infra.ts` thay vì được nối thêm
+vào `index.ts` của 1.1. Khi nào một chương tương lai thật sự phải đổi một file
+cũ, thay đổi ấy sẽ được trưng ra thành một bản diff tường minh, không bao giờ
+tuồn lén.
+
+Và bài test — đúng khuôn của bài smoke test 1.1, đọc file thật:
+
+```ts title="packages/config/src/infra.test.ts"
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { describe, expect, it } from "vitest";
+
+import { COMPOSE_FILE, DURABLE_VOLUMES, INFRA_SERVICES } from "./infra.js";
+
+// The gate stays Docker-free: these assertions read the compose declaration as
+// text — no daemon, no containers. They fail if a store is renamed or dropped,
+// if a healthcheck disappears (docker compose up -d --wait would silently stop
+// meaning "ready"), or if Redis quietly gains a volume it must never need.
+
+const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
+
+describe("the compose declaration agrees with @relay/config", () => {
+  const compose = readFileSync(join(repoRoot, COMPOSE_FILE), "utf8");
+
+  it("declares every infra service", () => {
+    for (const service of INFRA_SERVICES) {
+      expect(compose).toMatch(new RegExp(`^  ${service}:$`, "m"));
+    }
+  });
+
+  it("gives every service a healthcheck — up --wait must mean ready", () => {
+    const healthchecks = compose.match(/^ {4}healthcheck:$/gm) ?? [];
+    expect(healthchecks.length).toBeGreaterThanOrEqual(INFRA_SERVICES.length);
+  });
+
+  it("persists exactly the durable stores — and never Redis", () => {
+    for (const volume of DURABLE_VOLUMES) {
+      expect(compose).toContain(`${volume}:`);
+    }
+    expect(compose).not.toContain("redis-data");
+  });
+});
+```
+
+Ba phép khẳng định, không cái nào mang tính trang trí: đổi tên một store, xóa
+một healthcheck, hay cấp cho Redis chỗ lưu bền — `pnpm test` sẽ trượt trước
+khi con người kịp nhận ra. Giờ hãy chạy trọn cửa ải — tắt Docker đi nếu bạn
+muốn có bằng chứng:
+
+```bash
+pnpm lint
+pnpm typecheck
+pnpm test
+```
+
+Sáu bài test, vẫn xanh, vẫn không cần Docker. Cửa ải của 1.1 đi xuyên qua
+chương này nguyên vẹn — nó chỉ hiểu biết thêm về thế giới.
+
+<Figure
+  caption="Trạng thái cuối chương: một câu lệnh đến một thế giới khỏe mạnh, cửa ải không cần Docker, rồi mới đến cái tag."
+  code={figComposeGate}
+/>
+
+<ForwardRef part="Phần 1–2 và xa hơn" locale="vi">
+
+Câu văn compose đầy đủ của bản SAD rộng hơn file hôm nay: nó gồm cả MinIO đóng
+thế cho object storage và một demo tenant được seed sẵn. Cả hai là những thiếu
+vắng trung thực, không phải sơ suất — MinIO đến cùng phần xử lý media, còn
+seed một tenant cần schema và service chưa tồn tại. Gần hơn: chương 1.3 xây
+`@relay/protocol` trên nền móng lặng lẽ này, và bộ khung biết đi của 1.4 sẽ
+cắm hai service đầu tiên vào đúng những container này — đó là lúc
+`depends_on: { condition: service_healthy }` bắt đầu tiêu thụ những
+healthcheck bạn viết hôm nay.
+
+</ForwardRef>
+
+## Đến lượt bạn
+
+Bài tập chính là công trình: thêm `compose.yaml`, `infra.ts` và
+`infra.test.ts` vào workspace của bạn theo chương này, tự tay gõ phần YAML —
+căn lề thụt của compose là một nghi thức trưởng thành. Rồi thử độ hiểu của
+mình trước thế giới bạn vừa dựng:
+
+1. Chạy `docker compose up -d` (không có `--wait`) rồi lập tức
+   `docker compose ps`. Bắt quả tang một store đang ở `(health: starting)` —
+   đó chính là khoảng trống của cái BẪY, sống động trên máy bạn.
+2. Xóa khối `healthcheck:` của `postgres` rồi chạy lại
+   `docker compose up -d --wait`. Nó trả về gần như tức thì — và chẳng chứng
+   minh điều gì. Cảm nhận xem `--wait` chỉ trung thực ngang với những phép
+   kiểm nuôi nó. (Đặt lại nhé; đằng nào `pnpm test` cũng sẽ đòi.)
+3. Chạy `docker compose down`, rồi `up -d --wait`, rồi xem `docker volume ls`
+   — thế giới quay lại cùng ký ức của nó. Giờ làm y vậy với `down -v` và nhìn
+   các volume biến mất. Nói thành lời: store nào mất dữ liệu, và vì sao Redis
+   chẳng bận lòng.
+
+Nếu bạn kẹt, tag của chương đang giữ sẵn đáp án: `part1-ch2`.
+
+## Những điều đọng lại
+
+Nếu không đọc gì khác trong chương này, hãy giữ lấy những điều sau:
+
+- **Khởi động tại chỗ bằng một câu lệnh là yêu cầu, không phải tiện nghi** —
+  NFR-MNT-03 đứng ở P1 vì người kỹ sư duy nhất của D8 cần một thế giới cầm
+  được trong tay: khởi động, reset (yêu cầu này phủ cả chiều reset).
+- **Mỗi store đều giành được chỗ ngồi bằng văn bản**: Postgres là nguồn gốc,
+  JetStream là xương sống bền vững, Redis là tấm lưới chấp nhận mất có chủ
+  đích, ClickHouse là đường phân tích tách riêng — file compose là bản SAD,
+  phát biểu lại.
+- **Start xong chưa phải là sẵn sàng.** Healthcheck định nghĩa sẵn sàng;
+  `--wait` buộc nó phải đúng; `depends_on` một mình chẳng xếp thứ tự được
+  điều gì đáng kể.
+- **Volume cũng là tài liệu**: lưu bền ở nơi độ bền là nhiệm vụ, không cấp gì
+  ở nơi mất dữ liệu là thiết kế — và có một bài test khẳng định sự bất đối
+  xứng ấy.
+- **Cửa ải không bao giờ cần Docker**: nó kiểm bản khai báo, không kiểm
+  daemon — và kỷ luật chỉ-thêm-file-mới là thứ giữ cho khối code của mọi
+  chương trước vẫn đúng ở mọi tag về sau.
+
+<Checkpoint locale="vi">
+
+Trước khi bắt đầu chương 1.3, bạn cần có: `compose.yaml` ở gốc workspace với
+bốn store; `docker compose up -d --wait` trả về thành công và
+`docker compose ps` hiện bốn dòng `(healthy)`; hiểu rõ hai chế độ dọn dẹp
+(`down` và `down -v`); và cả ba phép kiểm của bộ công cụ chạy xanh — giờ là
+sáu bài test — trong khi Docker không hề chạy. Trạng thái ấy chính là tag
+`part1-ch2` trong repository chuẩn; cứ diff với nó nếu có gì lệch. Chương 1.3
+mặc định workspace và hạ tầng này đã tồn tại, và bắt tay xây `@relay/protocol`
+— thứ code rốt cuộc cũng tính toán được điều gì đó.
+
+</Checkpoint>
+
+<ChapterFooter id="1.2" locale="vi" />

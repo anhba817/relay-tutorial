@@ -132,11 +132,15 @@ export const series: Part[] = [
         id: "1.2",
         path: "/part-1/chapter-02/one-command-whole-world",
         title: "One command, whole world",
-        status: "forthcoming",
-        readerProduces: "A one-command local stack: Postgres, Redis, NATS, ClickHouse",
-        sourceDoc: "docs/05-sad.md",
-        readerMinutes: 90,
+        status: "published",
+        translatedIn: ["vi"],
+        readerProduces:
+          "A one-command local infrastructure — four stores, healthchecked and verified",
+        sourceDoc: "docs/04-srs.md, docs/05-sad.md",
+        readerMinutes: 60,
         titleVi: "Một câu lệnh, cả thế giới",
+        readerProducesVi:
+          "Hạ tầng local một câu lệnh — bốn store, có healthcheck và đã kiểm chứng",
       },
       {
         id: "1.3",

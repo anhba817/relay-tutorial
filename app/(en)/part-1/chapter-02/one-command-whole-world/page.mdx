@@ -1,0 +1,457 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figStoreMap, figStartedVsReady, figComposeGate } from "./figures";
+
+export const metadata = {
+  title: "One command, whole world — Building Relay",
+  description:
+    "Chapter 1.2 gives the workspace its world: Postgres, Redis, NATS, and ClickHouse in one compose file, healthchecked so that a single command means started AND ready — NFR-MNT-03 as a day-one requirement.",
+  alternates: {
+    canonical: "/part-1/chapter-02/one-command-whole-world",
+    languages: {
+      en: "/part-1/chapter-02/one-command-whole-world",
+      vi: "/vi/part-1/chapter-02/one-command-whole-world",
+    },
+  },
+};
+
+<ChapterHeader id="1.2" />
+
+Chapter 1.1 left us with a workspace that passes three commands and computes
+nothing. That was the point — the gate before the goods. But every chapter
+ahead of us needs a world underneath it: messages will need a system of
+record, events will need a durable spine, live delivery will need a fan-out
+fabric, and analytics will need a house of its own. Today we stand that whole
+world up on your machine — four stores, one file, one command — and we make
+the command *honest*: it returns only when everything is actually ready to
+accept work.
+
+<SkipAhead>
+
+If you must skip: the chapter adds `compose.yaml` to relay-platform — Postgres,
+Redis, NATS (JetStream), ClickHouse, each with a healthcheck, volumes only
+where durability is the store's job — plus `infra.ts` and `infra.test.ts` in
+`@relay/config` so the toolchain gate asserts the declaration without Docker.
+The chapter-end state is tag **`part1-ch2`**: check it out,
+`docker compose up -d --wait` brings all four stores to `(healthy)`, and
+`pnpm lint && pnpm typecheck && pnpm test` still passes — with the daemon
+stopped, if you like.
+
+</SkipAhead>
+
+## The requirement hiding in plain sight
+
+Buried in the SRS's maintainability section, at priority P1 — the same tier as
+message ordering — sits NFR-MNT-03: "The full stack shall be startable locally
+with a single command." It is easy to read that as developer comfort. It is
+not. It is a *product requirement*, verified by demonstration, and the
+tutorial plan calls it out as this chapter's whole angle: a day-one
+requirement, not an afterthought.
+
+<Why source="NFR-MNT-03 · D8">
+
+Why does local reproducibility rank with ordering and durability? Driver D8:
+"one engineer must be able to run and reason about it." Relay is six services
+and four stores; if assembling that world takes a wiki page and an afternoon,
+the system has already failed its most important operator — the person
+debugging it at 2 a.m. A single command is how D8 survives contact with a
+distributed system: the whole topology becomes something you can *hold*,
+start, reset, and reason about. And because it is a requirement, we build it
+first and let every later chapter inherit it — retrofitting reproducibility
+after five services exist is how it becomes an afterthought.
+
+</Why>
+
+## Why these four
+
+The compose file we are about to write names four stores. None of them is
+there by habit — each seat at the table was argued for, in writing, in the
+SAD's decision records. Before the YAML, the argument.
+
+**Postgres is the system of record.** Every guarantee Part 2 will bleed for
+lives here: per-channel ordering is a Postgres row lock (ADR-03 assigns
+sequences by incrementing `channels.last_sequence` under `SELECT … FOR
+UPDATE`), and ADR-04 permits exactly one writer — "only the API service
+touches PostgreSQL" — so the invariants live in one codebase instead of being
+duplicated and tested twice.
+
+**NATS JetStream is the durable event spine.** ADR-02 chose it over Kafka
+because it provides durable streams, consumer groups, and redelivery "at a
+fraction of Kafka's operational mass" — and the rejected alternative list is
+instructive. Kafka: operational overkill at this scale. Redis Streams:
+rejected because that "couples the durability spine to the ephemeral-state
+store — one Redis incident would then have two blast radii." The stores are
+separate on purpose, and that separation starts in this compose file.
+
+**Redis is the fan-out fabric and the presence board — and it is allowed to
+lose things.** ADR-07 makes live fan-out fire-and-forget by design: a dropped
+pub/sub frame is not a lost message, because durability lives in Postgres and
+the client's cursor recovers anything missed. ADR-10 puts presence in Redis
+with a TTL for the same reason — in its words, the correct amount of
+durability for typing dots and green circles is none.
+
+**ClickHouse is the analytical store, on its own path.** The SRS's CON-01
+forbids analytics queries against the operational database — in ADR-08's
+words, reusing Postgres for analytics was rejected because "CON-01 exists
+precisely to forbid this." One ClickHouse node is enough for v1 ("one node
+with backups meets 10k inserts/s and the 2 s/90-day query bound with margin"),
+and the schema will be cluster-shaped from day one, so scaling out later "is a
+data migration, not a redesign."
+
+<Figure
+  caption="The four stores and the decisions that seated them — Relay's services (arriving in 1.4) will find this world already standing."
+  code={figStoreMap}
+/>
+
+## The compose file
+
+Check your tools first — the 1.1 convention. This chapter needs Docker Engine
+with Compose v2; we lean on `--wait`, which any current release has. If
+`docker compose version` prints a v2 number, you are equipped; if the command
+is missing entirely, install Docker from the official docs
+([docs.docker.com/engine/install](https://docs.docker.com/engine/install/)) —
+this chapter won't retell them.
+
+```bash
+docker compose version
+```
+
+Now the world, declared. One file at the repository root:
+
+```yaml title="compose.yaml"
+# The whole local world, one command:  docker compose up -d --wait
+# Four stores, each here by a recorded decision (SAD §9). Host ports are env
+# knobs with the standard defaults; the container side never changes.
+name: relay
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      # Dev-only credentials — this file never ships anywhere.
+      POSTGRES_USER: relay
+      POSTGRES_PASSWORD: relay
+      POSTGRES_DB: relay
+    ports:
+      - "${RELAY_POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "relay", "-d", "relay"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+
+  redis:
+    image: redis:8-alpine
+    # No volume, on purpose: nothing in Redis is a source of truth.
+    # Fan-out is lossy by design (ADR-07); presence self-heals (ADR-10).
+    ports:
+      - "${RELAY_REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  nats:
+    image: nats:2.12-alpine
+    # JetStream on (-js) with file storage (-sd): the durable event spine
+    # (ADR-02) must survive a restart. -m exposes the monitoring endpoint.
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    ports:
+      - "${RELAY_NATS_PORT:-4222}:4222"
+      - "${RELAY_NATS_MONITOR_PORT:-8222}:8222"
+    volumes:
+      - nats-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.3
+    # The analytical store rides its own path (CON-01): single node in v1,
+    # schema already cluster-shaped (ADR-08).
+    ports:
+      - "${RELAY_CLICKHOUSE_HTTP_PORT:-8123}:8123"
+      - "${RELAY_CLICKHOUSE_NATIVE_PORT:-9000}:9000"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+
+volumes:
+  postgres-data:
+  nats-data:
+  clickhouse-data:
+```
+
+Read it as three layers. The **images** are pinned to explicit versions —
+`postgres:18-alpine`, not `postgres:latest` — because a floating tag is a
+different world every month, and the whole point of this file is the *same*
+world every time. (Versions in this file will age as the series does; the
+chapter tag, not the prose, holds the exact state — the 1.1 caveat, still
+true.) The **healthchecks** are each store's own idiomatic readiness signal:
+Postgres answers `pg_isready`, Redis answers `PONG`, NATS and ClickHouse each
+expose a tiny HTTP endpoint. They look like decoration. The TRAP below is
+about why they are load-bearing.
+
+And the **volumes** are the architecture, restated. Postgres persists because
+it is the system of record. NATS persists (`-sd /data`) because ADR-02 made
+JetStream the *durable* spine — a queue that forgets on restart is not a
+spine. ClickHouse persists because analytics accumulates. And Redis gets
+nothing — deliberately. That asymmetry is the SAD in one glance.
+
+<Why source="ADR-02 · ADR-07">
+
+Why give Redis no volume when giving it one costs two lines? Because the
+absence *documents a promise*. ADR-07 is explicit that total Redis loss must
+cause no data loss — durability lives in Postgres, clients recover by cursor.
+If we persisted Redis anyway, the compose file would quietly claim the
+opposite, and the first engineer to skim it would build on the wrong mental
+model. Infrastructure declarations teach whoever reads them; we make this one
+teach the truth. (The smoke test at the end of this chapter *asserts* the
+absence — the promise is now machine-checked.)
+
+</Why>
+
+<Trap>
+
+The mistake you would write without this paragraph: `docker compose up -d`,
+then immediately connect. It returns as soon as the containers are *started* —
+and started is not ready. Postgres in particular spends its first boot running
+`initdb`, seconds during which the port is open to nobody; ClickHouse takes a
+moment to warm too. Nothing fails *now* — the bug waits for chapter 1.4, when
+services connect on startup and crash-loop against stores that answered the
+door before they were dressed. Worse, `depends_on` alone does not save you: it
+orders *starts*, not *readiness*. The structural fix is the two pieces we just
+built: healthchecks (each store defines what ready means) and `--wait` (the
+command refuses to return until every one of them passes). Later, when
+services join the file, the same healthchecks feed
+`depends_on: { condition: service_healthy }` — one definition of ready,
+consumed everywhere.
+
+</Trap>
+
+<Figure
+  caption="Two different finish lines: up -d returns at started; up -d --wait returns at ready. The gap between them is where 1.4's services would crash-loop."
+  code={figStartedVsReady}
+/>
+
+## One command, verified
+
+The command this chapter exists for:
+
+```bash
+docker compose up -d --wait
+```
+
+First run, Docker pulls the four images (a coffee's worth of download); after
+that, cold start to all-healthy is well under a minute. The `--wait` exits `0`
+only when every healthcheck reports healthy — if it returns, the world is
+ready. Verify it the way you will in every debugging session from now on:
+
+```bash
+docker compose ps
+```
+
+Four rows, each ending in `(healthy)`. That word is your healthchecks
+speaking, not optimism.
+
+One honest wrinkle: the default host ports (5432, 6379, 4222, 8123) are the
+standard ones, which means anything already using them on your machine wins
+the race. This is not hypothetical — the machine this chapter was written on
+runs its own Postgres and Redis. The compose file makes every host port an
+environment knob with the standard default, so a collision costs one variable,
+not an edit:
+
+```bash
+RELAY_POSTGRES_PORT=15432 RELAY_REDIS_PORT=16379 docker compose up -d --wait
+```
+
+The container side never changes — when Relay's services arrive, they will
+talk to the stores over the compose network and never care what your host
+mapped.
+
+Teardown is two commands with very different meanings:
+
+```bash
+docker compose down      # stop the world; the volumes survive
+docker compose down -v   # stop the world AND erase every store's data
+```
+
+`down` is a pause: Postgres, NATS, and ClickHouse keep their state in the
+named volumes and pick it up on the next `up`. `down -v` is the reset button —
+everything durable dies with it. Knowing which one you mean is the difference
+between "restart" and "start over"; both are legitimate, and NFR-MNT-03's
+one-command promise covers both directions.
+
+## The gate learns about the world
+
+Chapter 1.1's rule was that a chapter ends in a runnable, *tested* state — and
+we just added a whole infrastructure declaration with no test watching it. The
+gate must stay honest without requiring Docker (your CI runner, and sometimes
+your laptop, won't have a daemon) — so the test asserts the *declaration*, not
+the running containers. First, the constants:
+
+```ts title="packages/config/src/infra.ts"
+// The local infrastructure, named. The compose file at the repository root
+// (compose.yaml) is the source of truth; these constants let the rest of the
+// workspace — and the smoke test beside this file — refer to it without
+// parsing YAML. This is a new file on purpose: files fenced by earlier
+// chapters are read-only from then on (chapter 1.2's additive-only rule).
+
+export const COMPOSE_FILE = "compose.yaml";
+
+export const INFRA_SERVICES = ["postgres", "redis", "nats", "clickhouse"] as const;
+
+export const DURABLE_VOLUMES = [
+  "postgres-data",
+  "nats-data",
+  "clickhouse-data",
+] as const;
+```
+
+Notice the comment about *new files*. Chapter 1.1 published the exact contents
+of ten files, and this series promised those fences match the repository at
+every chapter's tag. The cheapest way to keep that promise is a discipline:
+**a chapter never edits a file an earlier chapter fenced — new behavior lands
+in new files.** That is why the constants above live in `infra.ts` instead of
+being appended to 1.1's `index.ts`. When a future chapter genuinely must
+change an old file, the change will be shown as an explicit diff, never
+smuggled.
+
+And the test — same pattern as 1.1's smoke test, reading the real file:
+
+```ts title="packages/config/src/infra.test.ts"
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { describe, expect, it } from "vitest";
+
+import { COMPOSE_FILE, DURABLE_VOLUMES, INFRA_SERVICES } from "./infra.js";
+
+// The gate stays Docker-free: these assertions read the compose declaration as
+// text — no daemon, no containers. They fail if a store is renamed or dropped,
+// if a healthcheck disappears (docker compose up -d --wait would silently stop
+// meaning "ready"), or if Redis quietly gains a volume it must never need.
+
+const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
+
+describe("the compose declaration agrees with @relay/config", () => {
+  const compose = readFileSync(join(repoRoot, COMPOSE_FILE), "utf8");
+
+  it("declares every infra service", () => {
+    for (const service of INFRA_SERVICES) {
+      expect(compose).toMatch(new RegExp(`^  ${service}:$`, "m"));
+    }
+  });
+
+  it("gives every service a healthcheck — up --wait must mean ready", () => {
+    const healthchecks = compose.match(/^ {4}healthcheck:$/gm) ?? [];
+    expect(healthchecks.length).toBeGreaterThanOrEqual(INFRA_SERVICES.length);
+  });
+
+  it("persists exactly the durable stores — and never Redis", () => {
+    for (const volume of DURABLE_VOLUMES) {
+      expect(compose).toContain(`${volume}:`);
+    }
+    expect(compose).not.toContain("redis-data");
+  });
+});
+```
+
+Three assertions, and none of them is decorative: rename a store, delete a
+healthcheck, or give Redis persistence, and `pnpm test` fails before any human
+notices. Run the full gate now — with Docker stopped, if you want the proof:
+
+```bash
+pnpm lint
+pnpm typecheck
+pnpm test
+```
+
+Six tests now, still green, still Docker-free. The gate from 1.1 walks through
+this chapter unchanged — it just knows more about the world.
+
+<Figure
+  caption="The chapter-end state: one command to a healthy world, the Docker-free gate, and then the tag."
+  code={figComposeGate}
+/>
+
+<ForwardRef part="Parts 1–2 and beyond">
+
+The SAD's full compose sentence is wider than today's file: it includes MinIO
+standing in for object storage and a seeded demo tenant. Both are honest
+omissions, not oversights — MinIO arrives with media handling, and seeding a
+tenant needs a schema and services that do not exist yet. Nearer term: chapter
+1.3 builds `@relay/protocol` on this quiet foundation, and 1.4's walking
+skeleton plugs the first two services into these very containers — that is
+when `depends_on: { condition: service_healthy }` starts consuming the
+healthchecks you wrote today.
+
+</ForwardRef>
+
+## Your turn
+
+The exercise is the build: add `compose.yaml`, `infra.ts`, and `infra.test.ts`
+to your workspace from this chapter, typing the YAML yourself — compose
+indentation is a rite of passage. Then probe your understanding against the
+world you built:
+
+1. Run `docker compose up -d` (no `--wait`) and immediately
+   `docker compose ps`. Catch a store at `(health: starting)` — that is the
+   TRAP's gap, live on your machine.
+2. Delete the `healthcheck:` block from `postgres` and run
+   `docker compose up -d --wait` again. It returns almost instantly — and
+   proves nothing. Feel how `--wait` is only as honest as the checks feeding
+   it. (Put it back; `pnpm test` will insist anyway.)
+3. Run `docker compose down`, then `up -d --wait`, and check
+   `docker volume ls` — the world came back with its memory. Now do the same
+   with `down -v` and watch the volumes go. Say out loud which stores lost
+   data and why Redis doesn't care.
+
+If you are stuck, the tag holds the answer key: `part1-ch2`.
+
+## Takeaways
+
+If you read nothing else in this chapter, keep these:
+
+- **Single-command local startup is a requirement, not a comfort** —
+  NFR-MNT-03 sits at P1 because D8's one engineer needs a world they can hold,
+  start, and reset (the requirement even includes the reset).
+- **Each store earned its seat in writing**: Postgres the record, JetStream
+  the durable spine, Redis the deliberately lossy fabric, ClickHouse the
+  separate analytical path — the compose file is the SAD, restated.
+- **Started is not ready.** Healthchecks define ready; `--wait` enforces it;
+  `depends_on` alone orders nothing that matters.
+- **Volumes are documentation**: persistence where durability is the store's
+  job, none where losing data is the design — and a test asserts the
+  asymmetry.
+- **The gate never needs Docker**: it asserts the declaration, not the
+  daemon — and the additive-only rule (new behavior, new files) is what keeps
+  every earlier chapter's fences true at every later tag.
+
+<Checkpoint>
+
+Before starting chapter 1.3, you should have: `compose.yaml` at the workspace
+root with the four stores; `docker compose up -d --wait` returning success and
+`docker compose ps` showing four `(healthy)` rows; both teardown modes
+understood (`down` vs `down -v`); and all three toolchain checks passing —
+six tests now — without Docker running. That state is tag `part1-ch2` in the
+canonical repository; diff yourself against it if anything disagrees. Chapter
+1.3 assumes the workspace and this infrastructure exist, and starts building
+`@relay/protocol` — code that finally computes something.
+
+</Checkpoint>
+
+<ChapterFooter id="1.2" />
