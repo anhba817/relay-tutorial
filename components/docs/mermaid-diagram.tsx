@@ -1,12 +1,13 @@
 "use client";
 
 import { useEffect, useId, useRef, useState } from "react";
-import { useTheme } from "next-themes";
 
-// Renders a mermaid fence from a reference document as an SVG diagram, themed
-// to match the site (mermaid "default" in light, "dark" in dark) and re-rendered
-// on theme change. Until the library loads (and whenever rendering fails), the
-// fallback is the diagram source in a plain fence — honest, never blank.
+// Renders a mermaid fence (reference documents) or chapter figure as an SVG
+// diagram in the series' fixed diagram palette (PlantUML-style cream/red —
+// user-specified theme, applied to ALL diagrams in both site themes; the cream
+// nodes with black text stay legible on dark backgrounds). Until the library
+// loads (and whenever rendering fails), the fallback is the diagram source in
+// a plain fence — honest, never blank.
 //
 // Large diagrams shrink to fit the page width, which can make labels tiny, so
 // each diagram carries GitHub-style controls: zoom in / out / reset, plus
@@ -14,13 +15,31 @@ import { useTheme } from "next-themes";
 const MIN_SCALE = 1;
 const MAX_SCALE = 8;
 
+const DIAGRAM_THEME_VARIABLES = {
+  primaryColor: "#FEFECE",
+  primaryTextColor: "#000000",
+  lineColor: "#A80036",
+  actorBorder: "#A80036",
+  actorBkg: "#FEFECE",
+  activationBorderColor: "#A80036",
+  activationBkgColor: "#FEFECE",
+  noteBkgColor: "#FDFDCD",
+  noteBorderColor: "#A80036",
+  signalColor: "#A80036",
+  signalLineColor: "#A80036",
+  // Extends the user-specified set: flowchart node borders read
+  // primaryBorderColor (the sequence-diagram border vars above don't apply to
+  // flowcharts), so without this the most common diagram type would lose the
+  // red border the palette clearly intends.
+  primaryBorderColor: "#A80036",
+};
+
 export function MermaidDiagram({ code }: { code: string }) {
   const [svg, setSvg] = useState<string | null>(null);
   const [scale, setScale] = useState(1);
   const [offset, setOffset] = useState({ x: 0, y: 0 });
   const [dragging, setDragging] = useState(false);
   const dragRef = useRef<{ x: number; y: number; ox: number; oy: number } | null>(null);
-  const { resolvedTheme } = useTheme();
   const reactId = useId();
 
   useEffect(() => {
@@ -34,11 +53,10 @@ export function MermaidDiagram({ code }: { code: string }) {
           // still stripping script content; "strict" would render the tags as
           // literal text and garble the labels.
           securityLevel: "antiscript",
-          theme: resolvedTheme === "dark" ? "dark" : "default",
+          theme: "base",
+          themeVariables: DIAGRAM_THEME_VARIABLES,
         });
-        const renderId = `mmd${reactId.replace(/[^a-zA-Z0-9]/g, "")}${
-          resolvedTheme === "dark" ? "d" : "l"
-        }`;
+        const renderId = `mmd${reactId.replace(/[^a-zA-Z0-9]/g, "")}`;
         const { svg: rendered } = await mermaid.render(renderId, code);
         if (alive) setSvg(rendered);
       } catch {
@@ -48,7 +66,7 @@ export function MermaidDiagram({ code }: { code: string }) {
     return () => {
       alive = false;
     };
-  }, [code, resolvedTheme, reactId]);
+  }, [code, reactId]);
 
   if (!svg) {
     return (
