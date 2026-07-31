@@ -1,0 +1,463 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figWorkspaceMap, figProtocolPayoff, figToolchainGate } from "./figures";
+
+export const metadata = {
+  title: "The monorepo and the toolchain — Building Relay",
+  description:
+    "Part 1 opens and the code begins: one repository, one language, one toolchain — the pnpm workspace that implements ADR-01, ending in the series' first runnable, tested, tagged state.",
+  alternates: {
+    canonical: "/part-1/chapter-01/the-monorepo-and-the-toolchain",
+    languages: {
+      en: "/part-1/chapter-01/the-monorepo-and-the-toolchain",
+      vi: "/vi/part-1/chapter-01/the-monorepo-and-the-toolchain",
+    },
+  },
+};
+
+<ChapterHeader id="1.1" />
+
+Part 0 ended with a sentence we now have to honor: *the building begins.* This
+chapter is the first commit — and it is deliberately humble. We will not write a
+line of chat logic today. We will build the ground that every one of the next
+forty-odd chapters stands on: one repository, one language, one toolchain, with
+rules that enforce themselves. By the end you will have a workspace where three
+commands pass — and you will know exactly why it is *one* of everything.
+
+<SkipAhead>
+
+If you must skip: the workspace implements ADR-01 (TypeScript/Node everywhere) —
+a pnpm workspace with `packages/*` and `services/*`, one strict `tsconfig.base.json`
+everything extends, one ESLint config, Vitest as the one test runner, and a first
+package (`@relay/config`) whose smoke test proves the toolchain bites. The
+chapter-end state is tag **`part1-ch1`** in the relay-platform repository — check
+it out and `pnpm lint && pnpm typecheck && pnpm test` all pass. That
+three-command gate is the definition of "done" for every chapter from here on.
+
+</SkipAhead>
+
+## The decisions, if you skipped the reasoning
+
+Part 0 produced the paperwork this series builds against. If you read it, this
+list is a ten-second refresher; if you skipped it, this is your entry ticket —
+each item is a binding decision with its argument recorded in the chapter named.
+
+- **The product** ([0.1](/part-0/chapter-01/from-app-to-infrastructure)): Relay
+  is chat *infrastructure* — an API and SDK product teams embed, not a chat app.
+  The non-goals list is a contract; media files are in (a reversed non-goal,
+  reasons answered), voice calls and E2E encryption are out.
+- **The people** ([0.2](/part-0/chapter-02/four-people-who-will-judge-us)): Mai
+  adopts, David approves, Priya operates, Tuan experiences. Resolution order
+  when they collide: Tuan's reliability beats everything.
+- **The moments** ([0.3](/part-0/chapter-03/journeys-where-products-die)): three
+  ★s decide the product — Mai's first message, Priya's reconstruction, Tuan's
+  tunnel.
+- **The promises** ([0.4](/part-0/chapter-04/requirements-you-can-test)): 224
+  requirements with IDs, priorities, and verification methods. FR-TEN-05 (tenant
+  isolation) is the most important line in the document.
+- **The decisions** ([0.5](/part-0/chapter-05/deciding-out-loud)): eight drivers
+  distilled from those requirements; fourteen ADRs, immutable once accepted,
+  each naming its rejected alternatives and its undoing.
+
+Today we implement the first of those fourteen: ADR-01.
+
+## ADR-01 — why one language is the decision, not the default
+
+The conventional microservices instinct says "right tool per service": Go for
+the gateway, maybe Rust for hot paths, Node for the dashboard. Relay's SAD
+records six services — the instinct would hand us three toolchains before we
+have shipped a message. ADR-01 rejects it, and the deep dive's argument is worth
+holding in your hands before you type anything.
+
+The decisive observation: **the SDK must be TypeScript regardless** — FR-SDK-01
+targets browsers, Node, and React Native. The WebSocket protocol has two ends,
+and the frame types, cursor semantics, and idempotency-key logic exist on both.
+If the server is also TypeScript, that contract lives in *one shared package*,
+consumed by the gateway, the API service, and the SDK. In the deep dive's words:
+a frame type change is one commit, and drift between server and client
+serialization "becomes a compile error instead of a production incident." If the
+server were Go, that contract would be maintained twice, forever — by hand, or
+by codegen machinery that is itself a maintenance surface.
+
+<Figure
+  caption="ADR-01's payoff, drawn: one protocol package feeding the gateway, the API service, and the SDK — the contract has one home, so it cannot drift."
+  code={figProtocolPayoff}
+/>
+
+Go's real advantages for a gateway — cheaper sockets, no GC pauses of
+consequence — are real but not binding at v1 scale; mostly-idle sockets are
+exactly the workload Node's event loop was designed for. And the polyglot
+showcase gets the deep dive's sharpest rejection: reviewers with production
+experience read "five languages, one author" as five half-maintained toolchains
+and no depth anywhere. Driver D8 — one engineer must run and reason about all of
+it — makes one stack the only sustainable choice. The reversal condition is on
+record too: revisit when gateway profiling shows more than 20% of event-loop
+time in crypto or serialization at target load.
+
+<Why source="ADR-01 · D8">
+
+Why spend a whole chapter on an empty workspace? Because ADR-01's consequences
+line is a *shape*: "one `pnpm` workspace, one test runner, one lint config."
+Every one of those "ones" is a place where drift is structurally impossible
+instead of procedurally discouraged. D8 is the force behind all of it — a solo
+builder cannot afford two of anything that could disagree. Today's chapter is
+that sentence, typed in.
+
+</Why>
+
+## The workspace, from an empty directory
+
+Check your tools, then make the directory. Everything below assumes Node 22+
+and pnpm 10+.
+
+```bash
+mkdir relay-platform && cd relay-platform
+git init -b main
+```
+
+The root `package.json` declares the workspace's identity: the pinned package
+manager (so every machine resolves dependencies identically), the Node floor,
+and — most importantly — the three scripts that will gate every chapter of this
+series:
+
+```json
+{
+  "name": "relay-platform",
+  "private": true,
+  "version": "0.0.0",
+  "packageManager": "pnpm@10.33.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "lint": "eslint .",
+    "typecheck": "pnpm -r --if-present typecheck",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^26.1.2",
+    "eslint": "^10.8.0",
+    "prettier": "^3.9.6",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.65.0",
+    "vitest": "^4.1.10"
+  }
+}
+```
+
+Two details deserve a sentence each. `"private": true` because this workspace
+root is never published — packages inside it will be. And the TypeScript version
+is *pinned to the 5.9 line* on purpose: at the time of writing, the newest
+TypeScript major is ahead of what the lint toolchain supports, and a workspace
+that chases latest-everything spends its mornings on upgrade archaeology.
+Versions in this file will drift as the series ages — the chapter tag, not the
+prose, is always the truth.
+
+The workspace map is one file. Two globs, and they are a promise about the
+future:
+
+```yaml
+packages:
+  - "packages/*"
+  - "services/*"
+```
+
+`packages/` holds code that other code imports — the protocol package arrives in
+chapter 1.3. `services/` holds the six deployable services from the SAD's
+service view — the first skeletons arrive in 1.4. Today `services/` contains
+only a `.gitkeep`, and that is not embarrassing; it is the map matching the
+architecture document before the buildings exist.
+
+<Figure
+  caption="The workspace at the end of this chapter — one config of each kind at the root, one real package, and the services directory holding a promise."
+  code={figWorkspaceMap}
+/>
+
+## One strict compiler, one lint config, one runner
+
+The TypeScript baseline lives once, at the root, and every package extends it.
+Strictness is cheapest on day one — there is no code yet to complain:
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "noEmit": true
+  }
+}
+```
+
+`strict` is the headline, but the two lines after it are the ones future
+chapters will thank us for: `noUncheckedIndexedAccess` makes every array and
+record lookup admit it might miss, and `exactOptionalPropertyTypes` stops
+"absent" and "undefined" from blurring — both matter enormously in a protocol
+package where a missing field and a null field mean different things on the
+wire.
+
+Lint follows the same one-home rule — a single flat config at the root:
+
+```js
+import eslint from "@eslint/js";
+import tseslint from "typescript-eslint";
+
+// One lint config for the whole workspace (ADR-01's consequence made literal).
+export default tseslint.config(
+  { ignores: ["**/node_modules/**", "**/dist/**", "**/coverage/**"] },
+  eslint.configs.recommended,
+  ...tseslint.configs.recommended,
+);
+```
+
+And the test runner — Vitest, one config, workspace-wide include patterns:
+
+```ts
+import { defineConfig } from "vitest/config";
+
+// One test runner for the whole workspace (ADR-01's consequence made literal).
+export default defineConfig({
+  test: {
+    include: ["packages/**/src/**/*.test.ts", "services/**/src/**/*.test.ts"],
+  },
+});
+```
+
+Install the toolchain (this writes the `devDependencies` you saw above):
+
+```bash
+pnpm add -Dw typescript@~5.9.0 eslint @eslint/js typescript-eslint prettier vitest @types/node
+```
+
+<Trap>
+
+The naive move — and the one you will be tempted toward around chapter 1.4, when
+the services multiply — is to give each package its *own copy* of the tsconfig
+and lint rules, "so they stay independent." Nobody notices the bug for months,
+because there is no moment of failure: the copies just *drift*. One package
+turns `strict` down to ship a Friday fix; another pins a different TypeScript;
+six months later the API service happily compiles code the SDK rejects, and the
+shared-protocol payoff — the entire point of ADR-01 — is quietly dead. The fix
+is structural, and you just built it: every rule has exactly one home
+(`tsconfig.base.json`, one ESLint config, one Vitest config), and packages
+*extend* — they never copy. If a package genuinely needs an exception, it writes
+the exception in its own file where the diff can see it, on top of the shared
+base.
+
+</Trap>
+
+## The first package — and a test that means something
+
+An empty toolchain proves nothing; the checks need something to check. Our first
+package is `@relay/config` — the workspace's shared constants, and the
+designated home for lint and test fragments as packages multiply. To be clear
+about ownership, because the trap above is watching: the *compiler* baseline
+stays at the root as the single source; this package exports the workspace's
+*runtime* constants — and its test is the interesting part.
+
+```json
+{
+  "name": "@relay/config",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  }
+}
+```
+
+```json
+{
+  "extends": "../../tsconfig.base.json",
+  "include": ["src"]
+}
+```
+
+Note the `extends` path: relative, to the root, to the one baseline. The
+package's source is three constants:
+
+```ts
+// @relay/config — the workspace's shared constants, and the designated home
+// for lint/test fragments as packages multiply. The compiler baseline itself
+// lives once at the repository root (tsconfig.base.json); packages extend it
+// by relative path — one home per rule, never copies (chapter 1.1's TRAP).
+
+export const NODE_VERSION_RANGE = ">=22";
+
+export const WORKSPACE_GLOBS = ["packages/*", "services/*"] as const;
+
+export const TOOLCHAIN_CHECKS = ["lint", "typecheck", "test"] as const;
+```
+
+And here is the smoke test — not a `expect(true).toBe(true)` placeholder, but a
+real assertion: the constants this package exports must agree with the actual
+manifests in the repository. If the root `package.json` and `@relay/config` ever
+tell different stories, the suite fails:
+
+```ts
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { describe, expect, it } from "vitest";
+
+import { NODE_VERSION_RANGE, TOOLCHAIN_CHECKS, WORKSPACE_GLOBS } from "./index.js";
+
+// The smoke test that makes "tested state" mean something on day one: the
+// shared constants must agree with the workspace's real manifests — if the
+// root package.json and @relay/config ever tell different stories, this fails.
+
+const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
+
+describe("@relay/config agrees with the workspace manifests", () => {
+  const rootPkg = JSON.parse(
+    readFileSync(join(repoRoot, "package.json"), "utf8"),
+  ) as { engines: { node: string }; scripts: Record<string, string> };
+
+  it("pins the same Node version range as the root manifest", () => {
+    expect(rootPkg.engines.node).toBe(NODE_VERSION_RANGE);
+  });
+
+  it("names exactly the toolchain checks the root manifest provides", () => {
+    for (const check of TOOLCHAIN_CHECKS) {
+      expect(rootPkg.scripts).toHaveProperty(check);
+    }
+  });
+
+  it("lists the same workspace globs as pnpm-workspace.yaml", () => {
+    const workspaceYaml = readFileSync(
+      join(repoRoot, "pnpm-workspace.yaml"),
+      "utf8",
+    );
+    for (const glob of WORKSPACE_GLOBS) {
+      expect(workspaceYaml).toContain(`"${glob}"`);
+    }
+  });
+});
+```
+
+Round out the housekeeping — a `.gitignore` so build artifacts never reach the
+history:
+
+```text
+node_modules/
+dist/
+coverage/
+*.log
+.env*
+.DS_Store
+```
+
+— plus a `.nvmrc` saying `22`, a `.prettierrc` with house style, a
+`services/.gitkeep`, and a README that tells a visitor what this repository is
+and how the chapter tags work. All four are in the tag if you want the exact
+text.
+
+## The gate
+
+Three commands. From here to the end of the series, a chapter is not finished
+until they pass:
+
+```bash
+pnpm install
+pnpm lint
+pnpm typecheck
+pnpm test
+```
+
+On this workspace, that last command runs one file, three assertions, and comes
+back green in well under a second. Small — and load-bearing: the gate now
+exists, and every future chapter walks through it.
+
+<Figure
+  caption="The gate every chapter passes from now on: lint, typecheck, test — then and only then, the chapter tag."
+  code={figToolchainGate}
+/>
+
+<Why source="docs/07 §2 — format rules">
+
+Why tag every chapter? Because "works on my machine, at some point in the past"
+is the standard failure mode of programming tutorials. The format rules make
+two promises: every chapter ends in a runnable, tested state, and the code at
+each state is a named tag (`part1-ch1` for this one) whose tag-to-tag diff *is*
+the chapter. The three-command gate is what makes the first promise
+machine-checkable; the tag is what makes the second one a link instead of a
+claim.
+
+</Why>
+
+<ForwardRef part="Parts 1–2">
+
+This workspace is about to grow into everything: chapter 1.2 gives it a
+one-command local infrastructure (`docker compose up` with Postgres, Redis,
+NATS, ClickHouse); chapter 1.3 builds `@relay/protocol` — the shared package
+this chapter's whole argument was about; 1.4 stands up the first two services.
+And the three-command gate you just built runs unchanged through all of it —
+by Part 2 it will be guarding message ordering and idempotency, not three
+constants.
+
+</ForwardRef>
+
+## Your turn
+
+Part 0's exercises built a parallel project. From this chapter on, the
+convention changes: **the exercise is the build** — you construct Relay itself,
+alongside the chapter, and your artifact is the working state at the end.
+
+So: build the workspace above, from the empty directory, typing rather than
+pasting where you can stand it. Then verify yourself against the gate:
+
+1. Do `pnpm lint`, `pnpm typecheck`, and `pnpm test` all pass from a fresh
+   `pnpm install`?
+2. Delete `"lint"` from the root scripts and run the tests. Did the smoke test
+   fail? (Put it back.) If yes, your test is real — it noticed reality change.
+3. Change `strict` to `false` in a *copy* of the base tsconfig inside
+   `packages/config/` and point the package at it. Feel how easy that was —
+   then delete the copy and re-read the TRAP.
+
+If you are stuck, the tag holds the answer key.
+
+## Takeaways
+
+If you read nothing else in this chapter, keep these:
+
+- **One language is a decision with an argument**, not a default: the SDK must
+  be TypeScript regardless, so a TypeScript server makes the protocol a shared
+  package — drift becomes a compile error, not a production incident (ADR-01).
+- **Every rule gets exactly one home**: one base tsconfig, one lint config, one
+  test runner. Packages extend; they never copy — copies drift, and drift kills
+  the shared-types payoff.
+- **The gate is the format**: `pnpm lint && pnpm typecheck && pnpm test`, green
+  at every chapter tag, from `part1-ch1` to the end of the series.
+- **A day-one test should assert something true about reality** — ours fails if
+  the workspace's manifests and its constants ever disagree.
+- **Empty directories can be architecture**: `services/` holds nothing but a
+  promise that matches the SAD's service view — the map before the buildings.
+
+<Checkpoint>
+
+Before starting chapter 1.2, you should have the relay-platform workspace on
+your machine with: the pnpm workspace covering `packages/*` and `services/*`;
+the strict base tsconfig, single ESLint config, and Vitest at the root;
+`@relay/config` with its three-assertion smoke test; and all three toolchain
+checks passing from a clean `pnpm install`. That state is tag `part1-ch1` in
+the canonical repository — diff yourself against it if anything disagrees.
+Chapter 1.2 assumes this workspace exists and starts adding infrastructure
+underneath it.
+
+</Checkpoint>
+
+<ChapterFooter id="1.1" />
