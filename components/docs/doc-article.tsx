@@ -15,30 +15,7 @@ export function slugifyHeading(text: string): string {
     .replace(/^-+|-+$/g, "");
 }
 
-/**
- * Top-level (h2) sections of a raw markdown document, for the Contents
- * outline. Fenced blocks are skipped so `## ` inside code never leaks in.
- * Ids use the same slugify as the rendered h2 components, so anchors align.
- */
-export function extractOutline(
-  markdown: string,
-): Array<{ text: string; id: string }> {
-  const outline: Array<{ text: string; id: string }> = [];
-  let inFence = false;
-  for (const line of markdown.split("\n")) {
-    if (line.startsWith("```")) {
-      inFence = !inFence;
-      continue;
-    }
-    if (!inFence && line.startsWith("## ")) {
-      const text = line.slice(3).trim().replace(/[*`]/g, "");
-      outline.push({ text, id: slugifyHeading(text) });
-    }
-  }
-  return outline;
-}
-
-function textOf(node: ReactNode): string {
+export function textOf(node: ReactNode): string {
   if (typeof node === "string" || typeof node === "number") return String(node);
   if (Array.isArray(node)) return node.map(textOf).join("");
   if (isValidElement(node)) {

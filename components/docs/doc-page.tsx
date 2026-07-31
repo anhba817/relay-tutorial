@@ -2,7 +2,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import Link from "next/link";
 
-import { DocArticle, extractOutline } from "@/components/docs/doc-article";
+import { DocArticle } from "@/components/docs/doc-article";
+import { ReadingLayout } from "@/components/reading/reading-layout";
 import { chaptersCiting, type DocEntry } from "@/lib/docs";
 import { localePath, t, type Locale } from "@/lib/i18n";
 import { chapterTitle, seriesTitle } from "@/lib/tutorial";
@@ -23,10 +24,10 @@ export async function DocReferencePage({
     "utf8",
   );
   const citing = chaptersCiting(doc.slug);
-  const outline = extractOutline(markdown);
 
   return (
-    <div className="px-6 py-12">
+    <ReadingLayout locale={locale}>
+      <div className="py-12">
       <div className="mx-auto max-w-4xl">
         <header className="mb-10 border-b border-border pb-8">
           <nav className="mb-6 text-sm">
@@ -67,28 +68,6 @@ export async function DocReferencePage({
             </p>
           )}
         </header>
-        {outline.length > 0 && (
-          <nav
-            aria-label={d.shell.contents}
-            className="mb-10 rounded-lg border border-border bg-card p-4"
-          >
-            <p className="mb-2 text-xs font-semibold uppercase tracking-widest text-primary">
-              {d.shell.contents}
-            </p>
-            <ul className="flex flex-col gap-1 text-sm">
-              {outline.map((section) => (
-                <li key={section.id}>
-                  <a
-                    href={`#${section.id}`}
-                    className="text-muted-foreground hover:text-primary"
-                  >
-                    {section.text}
-                  </a>
-                </li>
-              ))}
-            </ul>
-          </nav>
-        )}
         <article lang={locale === "vi" ? "en" : undefined} className="prose max-w-none">
           <DocArticle markdown={markdown} />
         </article>
@@ -101,6 +80,7 @@ export async function DocReferencePage({
           </Link>
         </p>
       </div>
-    </div>
+      </div>
+    </ReadingLayout>
   );
 }

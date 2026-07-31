@@ -25,6 +25,10 @@ export interface Dictionary {
     backToContents: string;
     sourceDocs: string;
     contents: string;
+    onThisPage: string;
+    referenceDocs: string;
+    openNav: string;
+    closeNav: string;
     referencedBy: string;
   };
   badges: {
@@ -71,6 +75,10 @@ export const dictionaries: Record<Locale, Dictionary> = {
       backToContents: "← Back to the table of contents",
       sourceDocs: "Source",
       contents: "Contents",
+      onThisPage: "On this page",
+      referenceDocs: "Reference documents",
+      openNav: "Series contents",
+      closeNav: "Close contents",
       referencedBy: "Referenced in",
     },
     badges: {
@@ -113,6 +121,10 @@ export const dictionaries: Record<Locale, Dictionary> = {
       backToContents: "← Về mục lục",
       sourceDocs: "Tài liệu gốc",
       contents: "Mục lục",
+      onThisPage: "Trên trang này",
+      referenceDocs: "Tài liệu tham khảo",
+      openNav: "Mục lục loạt bài",
+      closeNav: "Đóng mục lục",
       referencedBy: "Được tham chiếu trong",
     },
     badges: {

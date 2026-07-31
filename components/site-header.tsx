@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { LanguageSwitcher } from "@/components/language-switcher";
+import { RelayLogo } from "@/components/logo";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { localeFromPath, localePath } from "@/lib/i18n";
 import { seriesTitle } from "@/lib/tutorial";
@@ -19,8 +20,9 @@ export function SiteHeader() {
       <div className="mx-auto flex h-12 max-w-3xl items-center justify-between px-6">
         <Link
           href={localePath(locale, "/")}
-          className="text-sm font-semibold tracking-tight text-foreground hover:text-primary"
+          className="flex items-center gap-2 text-sm font-semibold tracking-tight text-foreground hover:text-primary"
         >
+          <RelayLogo className="h-6 w-6" />
           {seriesTitle}
         </Link>
         <div className="flex items-center gap-3">
