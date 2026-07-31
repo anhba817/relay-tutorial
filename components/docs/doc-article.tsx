@@ -2,6 +2,7 @@ import { isValidElement, type ReactNode } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { MermaidDiagram } from "@/components/docs/mermaid-diagram";
+import { CodeBlock } from "@/components/tutorial/code-block";
 
 // Renders a mirrored source document (raw markdown string) with full GFM
 // fidelity. The documents are MDX-hostile (JSX-like sequences in prose), so
@@ -55,7 +56,8 @@ const components: Components = {
         return <MermaidDiagram code={textOf(code).trim()} />;
       }
     }
-    return <pre {...props}>{children}</pre>;
+    // Non-diagram fences get the copy-button chrome, same as chapters.
+    return <CodeBlock {...props}>{children}</CodeBlock>;
   },
 };
 

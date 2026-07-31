@@ -1,6 +1,7 @@
 import type { MDXComponents } from "mdx/types";
 
 import { slugifyHeading, textOf } from "@/components/docs/doc-article";
+import { CodeBlock } from "@/components/tutorial/code-block";
 
 // Required by @next/mdx with the App Router. Base HTML elements inherit the
 // chapter shell's `prose` styling; tutorial box components are imported
@@ -15,6 +16,9 @@ const components: MDXComponents = {
       {children}
     </h2>
   ),
+  // Code fences get the copy-button chrome (highlighting itself happens at
+  // build time via rehype-pretty-code — see next.config.ts).
+  pre: (props) => <CodeBlock {...props} />,
 };
 
 export function useMDXComponents(): MDXComponents {

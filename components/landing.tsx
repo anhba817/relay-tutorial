@@ -15,8 +15,11 @@ import {
 // badge (forthcoming / English only), never a dead link (FR-009).
 export function Landing({ locale }: { locale: Locale }) {
   const d = t(locale);
-  const partZero = series[0];
-  const laterParts = series.slice(1);
+  // Parts promote themselves from the road-ahead list to a full chapter
+  // section the moment the manifest gives them chapters — the landing stays
+  // manifest-generic like every other navigation surface (feature 013).
+  const partsWithChapters = series.filter((part) => part.chapters.length > 0);
+  const laterParts = series.filter((part) => part.chapters.length === 0);
 
   return (
     <div className="flex flex-1 flex-col items-center bg-background px-6 py-16 font-sans">
@@ -34,15 +37,20 @@ export function Landing({ locale }: { locale: Locale }) {
           </p>
         </header>
 
-        <section aria-labelledby="part-0-heading" className="mb-12">
+        {partsWithChapters.map((part) => (
+        <section
+          key={part.number}
+          aria-labelledby={`part-${part.number}-heading`}
+          className="mb-12"
+        >
           <h2
-            id="part-0-heading"
+            id={`part-${part.number}-heading`}
             className="text-xs font-semibold uppercase tracking-widest text-primary"
           >
-            {d.shell.part} {partZero.number} — {partTitle(partZero, locale)}
+            {d.shell.part} {part.number} — {partTitle(part, locale)}
           </h2>
           <ul className="mt-4 flex flex-col gap-3">
-            {partZero.chapters.map((chapter) => {
+            {part.chapters.map((chapter) => {
               const linkable =
                 chapter.status === "published" && hasBody(chapter, locale);
               const badge =
@@ -87,6 +95,7 @@ export function Landing({ locale }: { locale: Locale }) {
             })}
           </ul>
         </section>
+        ))}
 
         <section aria-labelledby="later-parts-heading">
           <h2

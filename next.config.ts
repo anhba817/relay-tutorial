@@ -7,6 +7,20 @@ const nextConfig: NextConfig = {
   output: "standalone",
 };
 
-const withMDX = createMDX({});
+const withMDX = createMDX({
+  options: {
+    // String form + serializable options: required by Turbopack. Dual shiki
+    // themes ride the site's light/dark switch via CSS in globals.css.
+    rehypePlugins: [
+      [
+        "rehype-pretty-code",
+        {
+          theme: { light: "github-light", dark: "github-dark" },
+          keepBackground: false,
+        },
+      ],
+    ],
+  },
+});
 
 export default withMDX(nextConfig);
