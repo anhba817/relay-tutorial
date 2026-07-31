@@ -32,6 +32,14 @@ const DIAGRAM_THEME_VARIABLES = {
   // flowcharts), so without this the most common diagram type would lose the
   // red border the palette clearly intends.
   primaryBorderColor: "#A80036",
+  // xychart-beta derives its plot lines from primaryColor — cream lines are
+  // invisible on the page background. Give it explicit line colors: dark,
+  // saturated, mutually distinguishable, led by the palette's red. Series
+  // take colors in order; eight covers future multi-line charts.
+  xyChart: {
+    plotColorPalette:
+      "#A80036, #2E5AAC, #1A7F37, #B25000, #6A3FA0, #0E7490, #8A6D00, #555555",
+  },
 };
 
 export function MermaidDiagram({ code }: { code: string }) {
