@@ -146,7 +146,7 @@ export const series: Part[] = [
         readerProduces: "The @relay/protocol package — frame types, error codes, schemas",
         sourceDoc: "docs/05-sad.md, docs/06-adr-deep-dives.md",
         readerMinutes: 90,
-        titleVi: "Gói protocol",
+        titleVi: "Package protocol",
       },
       {
         id: "1.4",

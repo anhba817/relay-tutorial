@@ -1,5 +1,5 @@
 // Hình minh họa chương 1.1 (feature 013) — bản dịch từ figures.ts tiếng Anh.
-// Tên gói, tên lệnh, tên tag giữ nguyên tiếng Anh.
+// Tên package, tên lệnh, tên tag giữ nguyên tiếng Anh.
 
 export const figWorkspaceMap = `flowchart TB
     root["relay-platform/<br/>package.json · pnpm-workspace.yaml<br/>tsconfig.base.json · eslint.config.mjs · vitest.config.ts"]
@@ -29,6 +29,6 @@ export const figToolchainGate = `flowchart LR
     code["code của chương"]
     lint["pnpm lint<br/>một cấu hình ESLint"]
     types["pnpm typecheck<br/>một tsconfig nghiêm ngặt"]
-    test["pnpm test<br/>một trình chạy test (Vitest)"]
+    test["pnpm test<br/>một test runner (Vitest)"]
     tag["tag của chương<br/>part1-ch1 · part1-ch2 · …"]
     code --> lint --> types --> test --> tag`;
