@@ -29,5 +29,5 @@ export const figPartOneComplete = `flowchart LR
     ch2["1.2 hạ tầng<br/>part1-ch2"]
     ch3["1.3 protocol<br/>part1-ch3"]
     ch4["1.4 bộ khung<br/>part1-ch4"]
-    done["Phần 1 ✓<br/>Phần 2 đắp cơ bắp:<br/>session, gửi tin, thứ tự"]
+    done["Phần 1 ✓<br/>Phần 2 thêm chi tiết:<br/>session, gửi tin, thứ tự"]
     ch1 --> ch2 --> ch3 --> ch4 --> done`;
