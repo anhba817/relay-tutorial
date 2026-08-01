@@ -14,7 +14,7 @@ export const figAdrAnatomy = `flowchart TB
 export const figFunnel = `flowchart TB
     srs["224 REQUIREMENTS<br/>the SRS — every promise with an ID"]
     drivers["8 DRIVERS (D1–D8)<br/>the handful that shape structure"]
-    adrs["14 ADRs<br/>decisions with rejected alternatives<br/>and reversal conditions"]
+    adrs["17 ADRs<br/>decisions with rejected alternatives<br/>and reversal conditions"]
     services["6 SERVICES<br/>the smallest number that still<br/>demonstrates real boundaries"]
     srs -- "distillation" --> drivers
     drivers -- "press on every choice" --> adrs

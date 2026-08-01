@@ -13,7 +13,7 @@ export const figAdrAnatomy = `flowchart TB
 export const figFunnel = `flowchart TB
     srs["224 YÊU CẦU<br/>bản SRS — mỗi lời hứa một ID"]
     drivers["8 DRIVER (D1–D8)<br/>nhóm nhỏ nhào nặn cấu trúc"]
-    adrs["14 ADR<br/>quyết định kèm phương án bị bác bỏ<br/>và điều kiện đảo ngược"]
+    adrs["17 ADR<br/>quyết định kèm phương án bị bác bỏ<br/>và điều kiện đảo ngược"]
     services["6 SERVICE<br/>số nhỏ nhất vẫn phô bày được<br/>ranh giới thực thụ"]
     srs -- "chưng cất" --> drivers
     drivers -- "đè lực lên mọi lựa chọn" --> adrs

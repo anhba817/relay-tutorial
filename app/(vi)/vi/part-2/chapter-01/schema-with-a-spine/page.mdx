@@ -1,0 +1,761 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figTenantSpine, figTwoDoors, figTwoLanes } from "./figures";
+
+export const metadata = {
+  title: "Schema có xương sống — Building Relay",
+  description:
+    "Phần 2 mở màn bằng yêu cầu quan trọng nhất của cả hệ thống, biến thành cấu trúc: schema của bản SAD được migrate, và một tầng repository mà constructor đòi hỏi tenant — rò rỉ giữa các tenant bị loại bỏ ngay từ thiết kế, không phải trông chờ test vớt lại.",
+  alternates: {
+    canonical: "/vi/part-2/chapter-01/schema-with-a-spine",
+    languages: {
+      en: "/part-2/chapter-01/schema-with-a-spine",
+      vi: "/vi/part-2/chapter-01/schema-with-a-spine",
+    },
+  },
+};
+
+<ChapterHeader id="2.1" locale="vi" />
+
+Phần 1 đắp nền: một workspace, bốn store, một bản giao kèo đường truyền, hai
+service biết trả lời. Phần 2 là phần mà kế hoạch loạt bài gắn sao — vòng lặp
+cốt lõi, "nơi loạt bài xứng đáng với lời hứa của nó" — và bạn có thể đoán nó
+sẽ mở màn bằng việc gửi một tin nhắn. Không phải. Nó mở màn bằng dòng chữ mà
+chương 0.4 gọi là yêu cầu quan trọng nhất trong toàn bộ tài liệu: FR-TEN-05,
+không thao tác nào được chạm vào — hay thậm chí để lộ sự tồn tại của — dữ
+liệu thuộc về tenant khác. Relay là hạ tầng đa tenant; một lần rò rỉ là đủ
+phá sập niềm tin mà cả sản phẩm dựa vào để bán mình. Vậy nên trước khi tin
+nhắn đầu tiên được ghi, chúng ta khiến thất bại ấy khó đến mức gần như không
+viết ra nổi: schema có xương sống, và tầng truy cập dữ liệu có một hình dạng
+buộc tenant phải đi theo mọi ngả — bằng chính cấu trúc.
+
+<SkipAhead locale="vi">
+
+Nếu bạn buộc phải đọc lướt: chương này thêm migrations (các bảng trong SAD
+§6.1 cùng một trình chạy tí hon — có phiên bản, chỉ tiến không lùi, không có
+đường down) và `services/api/src/db/` — tầng repository mà constructor đòi
+một `environment_id`, kèm luật eslint cấm import `pg` thô ở bất cứ đâu khác.
+Cửa ải mọc thêm một làn thứ hai, có tên hẳn hoi:
+`pnpm --filter @relay/api migrate && pnpm --filter @relay/api
+test:integration` chạy trên Postgres của compose, trong khi
+`pnpm lint && pnpm typecheck && pnpm test` vẫn không cần Docker. Trạng thái
+cuối chương là tag **`part2-ch1`**.
+
+</SkipAhead>
+
+## Loại bỏ từ thiết kế, không trông chờ test vớt
+
+Driver D4 tuyên bố lập trường: "tenant isolation is a correctness property"
+— cách ly tenant thuộc về tính đúng đắn của hệ thống, ngang hàng với thứ tự
+tin nhắn, chứ không phải một tính năng hay một bộ lọc. Constitution biến
+lập trường ấy thành máy móc, và câu chữ của nó đáng đọc nguyên văn: "Data
+access MUST go through a repository layer whose constructors require an
+`environment_id`; raw connection access outside that layer is
+lint-forbidden. Isolation is enforced in data access, not in handlers" —
+truy cập dữ liệu phải đi qua một tầng repository mà constructor đòi hỏi
+`environment_id`; truy cập kết nối thô bên ngoài tầng đó bị lint cấm; cách
+ly được cưỡng chế ở tầng dữ liệu, không phải trong handler.
+
+<Why source="D4 · FR-TEN-05 · constitution I" locale="vi">
+
+Vì sao đặt ở tầng dữ liệu mà không phải trong handler? Vì handler sinh sôi
+còn sự cảnh giác thì không nhân theo được. Một mệnh đề WHERE thêm tay ở từng
+chỗ gọi sẽ đúng chừng nào mọi kỹ sư tương lai còn nhớ mọi chỗ gọi — tỉ lệ
+lỗi chính là tỉ lệ quên, và một lần quên là một sự cố Sev-0. Một constructor
+đòi hỏi tenant đảo ngược bài toán kinh tế ấy: truy vấn có khóa tenant là
+loại truy vấn duy nhất tồn tại được, còn truy vấn không khóa không phải con
+bọ chờ ai đó bắt — nó là chương trình không biên dịch nổi. Đó chính là điều
+dòng kế hoạch docs/07 muốn nói với "designed out, not tested out" — rồi
+chúng ta vẫn cứ test, vì với những thuộc tính sống còn thì cẩn tắc vô áy
+náy.
+
+</Why>
+
+## Schema, từ chính bàn tay của bản kiến trúc
+
+Bản SAD không mô tả schema — nó *chính là* schema; §6.1 là SQL. Migration
+đầu tiên của chúng ta chép lại các bảng của nó nguyên xi, đủ cả ràng buộc
+lẫn chú thích, vì những ràng buộc ấy là các bản yêu cầu khoác cú pháp SQL:
+DR-01 là `UNIQUE (channel_id, sequence)` (một số sequence, một tin nhắn —
+chương 2.2 sống nhờ dòng này), DR-02 là `UNIQUE (environment_id,
+external_id)` (tên là duy nhất *trong từng tenant*, không phải toàn cục —
+cách ly len cả vào tính duy nhất), DR-03 là một partial unique index trên
+idempotency key (cả chương 2.3 nằm gọn trong đó, gieo mầm từ hôm nay).
+
+Hai bảng cần đến những quyết định mà tài liệu không đưa ra, và chúng ta
+quyết công khai. Bảng `environments` của SAD tham chiếu một bảng
+`applications` chưa từng được định nghĩa — chúng ta tạo một bản stub hai cột
+và ghi lại rằng các chương tenancy của Phần 3 sở hữu hình dạng thật của nó.
+Còn dòng kế hoạch docs/07 lẫn hot-path index trong SAD §6.3 đều nhắc đến một
+bảng `members` mà §6.1 không hề định nghĩa — chúng ta dẫn hình dạng của nó
+từ chính các cột của index ấy và ghi quyết định ngay trong SQL. Cũng để ý
+điều `applications` và `environments` *không* có: cột `environment_id`.
+Chúng là mỏ neo tenancy mà toàn bộ điều khoản được định nghĩa bên trên — mọi
+thứ phía dưới mới mang xương sống, trực tiếp hoặc qua đúng một bước foreign
+key.
+
+<Figure
+  caption="Chiếc xương sống: environments chính là tenant; users và channels mang nó trực tiếp; messages và members thừa hưởng qua một bước foreign key — đúng khoản nhân nhượng mà constitution I cho phép."
+  code={figTenantSpine}
+/>
+
+```sql title="services/api/migrations/001_core_tables.sql"
+-- 001: the core operational tables (chapter 2.1).
+-- The four tenant-bearing tables are reproduced from SAD §6.1 verbatim,
+-- including constraints and their DR citations. Two tables fill gaps the
+-- documents leave open, each marked as this chapter's recorded decision.
+-- Deliberately absent, with named arrivals: message_edits (edit chapter),
+-- outbox (ADR-06's chapter), emoji/media tables (their parts), messages
+-- partitioning (SAD growth note -> retention chapter).
+
+-- DECISION (chapter 2.1): the SAD's environments table references
+-- applications(id) but never defines the table. This stub satisfies the
+-- foreign key; the real application lifecycle belongs to Part 3's tenancy
+-- chapters.
+CREATE TABLE applications (
+    id              UUID PRIMARY KEY,
+    name            TEXT NOT NULL
+);
+
+CREATE TABLE environments (
+    id              UUID PRIMARY KEY,
+    application_id  UUID NOT NULL REFERENCES applications(id),
+    kind            TEXT NOT NULL CHECK (kind IN ('development','production')),
+    signing_secret  TEXT NOT NULL,          -- envelope-encrypted (NFR-SEC-02)
+    retention_days  INT,
+    quota_config    JSONB NOT NULL DEFAULT '{}'
+);
+
+CREATE TABLE users (
+    id              UUID PRIMARY KEY,
+    environment_id  UUID NOT NULL REFERENCES environments(id),
+    external_id     TEXT NOT NULL,
+    display_name    TEXT,
+    avatar_url      TEXT,
+    metadata        JSONB NOT NULL DEFAULT '{}',
+    banned_at       TIMESTAMPTZ,
+    UNIQUE (environment_id, external_id)                  -- DR-02
+);
+
+CREATE TABLE channels (
+    id              UUID PRIMARY KEY,
+    environment_id  UUID NOT NULL REFERENCES environments(id),
+    external_id     TEXT NOT NULL,
+    type            TEXT NOT NULL CHECK (type IN ('public','private')),
+    name            TEXT,
+    metadata        JSONB NOT NULL DEFAULT '{}',
+    last_sequence   BIGINT NOT NULL DEFAULT 0,             -- ADR-03
+    archived_at     TIMESTAMPTZ,
+    UNIQUE (environment_id, external_id)                   -- DR-02
+);
+
+CREATE TABLE messages (
+    id              UUID PRIMARY KEY,
+    channel_id      UUID NOT NULL REFERENCES channels(id),
+    sequence        BIGINT NOT NULL,
+    user_id         UUID REFERENCES users(id),
+    text            TEXT,                                   -- NULL ⇒ tombstone
+    metadata        JSONB NOT NULL DEFAULT '{}',
+    attachments     JSONB,
+    idempotency_key TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    edited_at       TIMESTAMPTZ,
+    deleted_at      TIMESTAMPTZ,
+    UNIQUE (channel_id, sequence)                           -- DR-01
+);
+CREATE UNIQUE INDEX messages_idem
+    ON messages (channel_id, idempotency_key)
+    WHERE idempotency_key IS NOT NULL;                      -- DR-03
+
+-- DECISION (chapter 2.1): the docs/07 row and SAD §6.3's hot-path index
+-- both reference a members table that §6.1 never defines. This shape is
+-- anchored to that index; membership roles arrive with the channel
+-- semantics chapters.
+CREATE TABLE members (
+    channel_id      UUID NOT NULL REFERENCES channels(id),
+    user_id         UUID NOT NULL REFERENCES users(id),
+    joined_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (channel_id, user_id)
+);
+
+-- Hot-path indexes (SAD §6.3): history pagination as a pure index-order
+-- scan (FR-MSG-09), and the resume path's "which channels am I in".
+CREATE INDEX messages_channel_seq ON messages (channel_id, sequence DESC);
+CREATE INDEX members_user_channel ON members (user_id, channel_id);
+```
+
+Một khoản vắng mặt có chủ đích so với SQL của SAD: không có
+`DEFAULT gen_random_uuid()` trên các khóa chính, vì SAD không khai báo cái
+nào. Id được sinh phía ứng dụng bằng `crypto.randomUUID()` — đúng quyết định
+1.4 đã đưa ra cho request id, giờ nối dài sang các hàng dữ liệu.
+
+## Migration là kỷ luật
+
+Điều khoản quy trình của constitution rất gọn: "database migrations are
+versioned, forward-only" — migration có phiên bản và chỉ tiến, không lùi.
+Hãy để ý thứ vắng mặt — không hề có *down*. Một kịch bản rollback không bao
+giờ được chạy thật là tấm chăn an ủi sẽ mục dần; chỉ-tiến nghĩa là sai sót
+được sửa bằng migration kế tiếp, đúng cách chúng sẽ được sửa trên
+production. Trình chạy của chúng ta nhỏ đến mức hiểu được trọn vẹn:
+
+```ts title="services/api/src/db/client.ts"
+import pg from "pg";
+
+// The one place a connection pool is born. DATABASE_URL defaults to the
+// compose stack's dev credentials (chapter 1.2) — override it if your host
+// ports are remapped. Everything outside src/db is lint-forbidden from
+// importing pg at all (constitution I: isolation lives in data access).
+
+export const DEFAULT_DATABASE_URL =
+  "postgres://relay:relay@localhost:5432/relay";
+
+export function createPool(): pg.Pool {
+  return new pg.Pool({
+    connectionString: process.env.DATABASE_URL ?? DEFAULT_DATABASE_URL,
+  });
+}
+```
+
+```ts title="services/api/src/db/migrate.ts"
+import { readdir, readFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+import type pg from "pg";
+
+import { createPool } from "./client.js";
+
+// Migrations as discipline (constitution: versioned, forward-only). There is
+// no down path — not missing, absent by design. Files apply in filename
+// order, each inside a transaction, each recorded; a re-run is a no-op.
+
+const MIGRATIONS_DIR = join(
+  dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "..",
+  "migrations",
+);
+
+export async function migrate(pool: pg.Pool): Promise<string[]> {
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS schema_migrations (
+       version    TEXT PRIMARY KEY,
+       applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+     )`,
+  );
+
+  const files = (await readdir(MIGRATIONS_DIR)).filter((f) => f.endsWith(".sql")).sort();
+  const applied: string[] = [];
+
+  for (const file of files) {
+    const done = await pool.query("SELECT 1 FROM schema_migrations WHERE version = $1", [file]);
+    if ((done.rowCount ?? 0) > 0) continue;
+
+    const sql = await readFile(join(MIGRATIONS_DIR, file), "utf8");
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(sql);
+      await client.query("INSERT INTO schema_migrations (version) VALUES ($1)", [file]);
+      await client.query("COMMIT");
+      applied.push(file);
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+  return applied;
+}
+
+if (import.meta.main) {
+  const pool = createPool();
+  const applied = await migrate(pool);
+  console.log(
+    applied.length === 0
+      ? "migrations: nothing to apply"
+      : `migrations: applied ${applied.join(", ")}`,
+  );
+  await pool.end();
+}
+```
+
+Đáng dừng lại ở hai lựa chọn cấu trúc của trình chạy. Mỗi file áp dụng trong
+một transaction riêng, nên migration hỏng giữa chừng không để lại nửa
+schema — database hoặc ở trước file đó, hoặc ở sau, không bao giờ lơ lửng ở
+giữa. Và sổ sách nằm trong chính database chứ không phải một dấu mốc trên
+đĩa: `schema_migrations` đi cùng đúng phần dữ liệu nó mô tả, nên mọi môi
+trường — laptop của bạn, của đồng đội, production — trả lời câu "tôi đang ở
+phiên bản nào?" theo cùng một cách. Khi 2.2 mang migration 002 đến, vẫn câu
+lệnh này áp dụng đúng phần chênh lệch, ở mọi nơi.
+
+## Loạt bài sửa chính code của mình — giữa ban ngày
+
+Muốn chạy được những thứ trên, API service cần driver `pg` và một script
+`migrate`. Mà `package.json` của nó đã được công bố, đúng từng byte, trong
+chương 1.4 — và loạt bài này từng hứa mọi file nó trưng lên đều khớp
+repository ở tag của từng chương. Lặng lẽ viết đè lên code đã công bố là bội
+ước; đóng băng nó vĩnh viễn thì phi lý. Vậy nên đây là luật mà loạt bài tuân
+theo từ nay: **thay đổi trên những file từng được trưng sẽ xuất hiện dưới
+dạng diff**, ngay trong chương tạo ra thay đổi. Dòng bắt đầu bằng `+` là
+thêm vào, `-` là bỏ đi, và toàn bộ file được chiếu đủ để bản của bạn và bản
+của chúng tôi không thể lệch nhau:
+
+```diff title="services/api/package.json"
+ {
+   "name": "@relay/api",
+   "private": true,
+   "version": "0.0.0",
+   "type": "module",
+   "scripts": {
+     "dev": "tsx watch src/main.ts",
++    "migrate": "tsx src/db/migrate.ts",
++    "test:integration": "vitest run --config vitest.integration.config.ts",
+     "typecheck": "tsc --noEmit"
+   },
+   "dependencies": {
+     "@relay/protocol": "workspace:*",
+-    "@relay/service-kit": "workspace:*"
++    "@relay/service-kit": "workspace:*",
++    "pg": "^8.22.0"
+   },
+   "devDependencies": {
++    "@types/pg": "^8.20.3",
+     "tsx": "^4.23.1"
+   }
+ }
+```
+
+<Why source="bản giao kèo fence, có tu chính" locale="vi">
+
+Vì sao là diff mà không phải in lại nguyên file mới? Vì bản in lại che giấu
+thay đổi và bỏ rơi chương cũ — bạn sẽ có hai phiên bản đầy đủ của một file
+và một cuộc truy tìm xem thứ gì đã dịch chuyển. Diff là đơn vị trung thực
+của thay đổi: nó gọi đích danh những gì chương này làm với đoạn code mà một
+chương trước đã dạy bạn gõ, nó áp gọn lên file bạn đang có sẵn, và nó giữ
+cho fence của 1.4 vẫn đúng *tại tag của 1.4* trong khi chương này sở hữu
+phần chênh lệch. Bản thân dependency runtime thì theo đúng các luật đã định:
+ghim trong phạm vi một bản major, nằm trong package, và có lập luận — `pg`
+là lựa chọn chuẩn mực nhàm chán, và không ORM, vì tầng repository bạn sắp
+xây MỚI LÀ lớp trừu tượng, còn giấu SQL của nó đi là giấu luôn cả chương
+này.
+
+</Why>
+
+Áp diff vào (hoặc sửa tay), rồi `pnpm install`, dựng store dậy, và chạy
+migration hai lần — lần thứ hai chính là kỷ luật đang hiện hình:
+
+```bash
+docker compose up -d --wait postgres
+pnpm install
+pnpm --filter @relay/api migrate
+pnpm --filter @relay/api migrate   # → migrations: nothing to apply
+```
+
+## Tầng repository
+
+Giờ thì chiếc xương sống có thêm người gác. Một file sở hữu mọi truy vấn
+trong hệ thống, và hình dạng của file ấy chính là bản lập luận:
+
+```ts title="services/api/src/db/repository.ts"
+import { randomUUID } from "node:crypto";
+
+import type pg from "pg";
+
+// The repository layer — the ONE place data access lives (ADR-04's single
+// writer, constitution I). Two surfaces with a bright line between them:
+//
+//   createEnvironment — the ADMIN surface. It creates tenants, so it is the
+//   only operation here that is not tenant-scoped. It also inserts a stub
+//   application row to satisfy environments' NOT NULL foreign key (recorded
+//   decision: the real application lifecycle belongs to Part 3).
+//
+//   Repository — everything else. The constructor REQUIRES an
+//   environment_id; every query is scoped by it HERE, in one home — never
+//   at call sites. Cross-tenant reads return null/empty: no data, and no
+//   reveal that the foreign id even exists (FR-TEN-05).
+//
+// All primary keys are generated app-side (crypto.randomUUID) — the SAD's
+// SQL declares no defaults, and the migration adds none.
+
+export interface Environment {
+  id: string;
+  kind: "development" | "production";
+}
+
+export async function createEnvironment(
+  pool: pg.Pool,
+  { name, kind = "development" }: { name: string; kind?: Environment["kind"] },
+): Promise<Environment> {
+  const applicationId = randomUUID();
+  const environmentId = randomUUID();
+  await pool.query("INSERT INTO applications (id, name) VALUES ($1, $2)", [
+    applicationId,
+    name,
+  ]);
+  await pool.query(
+    `INSERT INTO environments (id, application_id, kind, signing_secret)
+     VALUES ($1, $2, $3, $4)`,
+    [environmentId, applicationId, kind, randomUUID()],
+  );
+  return { id: environmentId, kind };
+}
+
+export interface UserRow {
+  id: string;
+  external_id: string;
+  display_name: string | null;
+}
+
+export interface ChannelRow {
+  id: string;
+  external_id: string;
+  type: "public" | "private";
+  name: string | null;
+}
+
+export class Repository {
+  // Explicit fields, not constructor parameter properties — that shorthand
+  // is TS-only syntax erasableSyntaxOnly forbids (chapter 1.4's guarantee).
+  private readonly pool: pg.Pool;
+  private readonly environmentId: string;
+
+  constructor(pool: pg.Pool, environmentId: string) {
+    this.pool = pool;
+    this.environmentId = environmentId;
+  }
+
+  async createUser(externalId: string, displayName?: string): Promise<UserRow> {
+    const id = randomUUID();
+    await this.pool.query(
+      `INSERT INTO users (id, environment_id, external_id, display_name)
+       VALUES ($1, $2, $3, $4)`,
+      [id, this.environmentId, externalId, displayName ?? null],
+    );
+    return { id, external_id: externalId, display_name: displayName ?? null };
+  }
+
+  async getUserByExternalId(externalId: string): Promise<UserRow | null> {
+    const result = await this.pool.query<UserRow>(
+      `SELECT id, external_id, display_name FROM users
+       WHERE environment_id = $1 AND external_id = $2`,
+      [this.environmentId, externalId],
+    );
+    return result.rows[0] ?? null;
+  }
+
+  async createChannel(
+    externalId: string,
+    type: ChannelRow["type"],
+    name?: string,
+  ): Promise<ChannelRow> {
+    const id = randomUUID();
+    await this.pool.query(
+      `INSERT INTO channels (id, environment_id, external_id, type, name)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [id, this.environmentId, externalId, type, name ?? null],
+    );
+    return { id, external_id: externalId, type, name: name ?? null };
+  }
+
+  async getChannelByExternalId(externalId: string): Promise<ChannelRow | null> {
+    const result = await this.pool.query<ChannelRow>(
+      `SELECT id, external_id, type, name FROM channels
+       WHERE environment_id = $1 AND external_id = $2`,
+      [this.environmentId, externalId],
+    );
+    return result.rows[0] ?? null;
+  }
+
+  async listChannels(): Promise<ChannelRow[]> {
+    const result = await this.pool.query<ChannelRow>(
+      `SELECT id, external_id, type, name FROM channels
+       WHERE environment_id = $1 ORDER BY external_id`,
+      [this.environmentId],
+    );
+    return result.rows;
+  }
+
+  /** Membership joins live in channel-land, so the tenant scope rides the
+   * channel: the JOIN below is what makes a foreign channel id useless. */
+  async addMember(channelId: string, userId: string): Promise<boolean> {
+    const result = await this.pool.query(
+      `INSERT INTO members (channel_id, user_id)
+       SELECT c.id, u.id FROM channels c, users u
+       WHERE c.id = $1 AND c.environment_id = $3
+         AND u.id = $2 AND u.environment_id = $3`,
+      [channelId, userId, this.environmentId],
+    );
+    return (result.rowCount ?? 0) > 0;
+  }
+
+  async listMembers(channelId: string): Promise<string[]> {
+    const result = await this.pool.query<{ user_id: string }>(
+      `SELECT m.user_id FROM members m
+       JOIN channels c ON c.id = m.channel_id
+       WHERE m.channel_id = $1 AND c.environment_id = $2
+       ORDER BY m.joined_at`,
+      [channelId, this.environmentId],
+    );
+    return result.rows.map((r) => r.user_id);
+  }
+
+  async channelsForUser(userId: string): Promise<string[]> {
+    const result = await this.pool.query<{ channel_id: string }>(
+      `SELECT m.channel_id FROM members m
+       JOIN users u ON u.id = m.user_id
+       WHERE m.user_id = $1 AND u.environment_id = $2`,
+      [userId, this.environmentId],
+    );
+    return result.rows.map((r) => r.channel_id);
+  }
+}
+```
+
+Hãy nhìn những gì đã trở nên không viết ra nổi. Không có cách nào dựng một
+`Repository` mà không xưng danh tenant — `new Repository(pool)` là lỗi kiểu,
+không phải một dòng góp ý trong code review. Không có truy vấn không khóa
+nào để mà gọi — mệnh đề `WHERE environment_id = $n` sống trong file này và
+chỉ file này. Còn `addMember` cho thấy một mẫu hình tinh tế hơn: với những bảng
+mang tenant qua một bước nhảy, phạm vi khóa cưỡi trên cú JOIN, nên đưa nó
+một channel id *thật* của tenant khác cũng chèn đúng không hàng nào.
+
+<Figure
+  caption="Hai cánh cửa vào một database. Mỗi Repository bị khóa vào tenant của nó ngay lúc khởi tạo; một id ngoại lai — kể cả id thật — chỉ mở ra khoảng không."
+  code={figTwoDoors}
+/>
+
+<Trap locale="vi">
+
+Thế giới trông-chờ-test nhìn rất hợp lý, cho đến đúng cái đêm nó dựng bạn
+dậy. Nó bắt đầu bằng `pool.query()` rắc ở nơi nào tiện tay và
+`WHERE environment_id = ?` thêm ở từng chỗ gọi — mười chín lần, chính xác cả
+mười chín. Chỗ gọi thứ hai mươi được viết vào tháng thứ sáu, bởi một người
+đang vá gấp chiều thứ Sáu cho một endpoint "chỉ liệt kê channel thôi mà", và
+không gì đổ vỡ: compiler không, bộ test toàn dùng một tenant không, code
+review lướt qua một truy vấn giống mọi truy vấn khác cũng không. Vết rò lộ
+ra khi một khách hàng nhìn thấy tên channel của khách hàng khác — FR-TEN-05,
+yêu cầu mà 0.4 xếp trên tất cả, sụp đổ vì một chỗ bỏ sót. Đó là lý do
+constitution có mệnh đề thứ hai, và chúng ta biến nó thành máy móc ngay bây
+giờ — truy cập driver thô bên ngoài tầng repository là một lỗi lint, ngay
+trong bản cấu hình mà mọi chương đã dùng chung từ 1.1:
+
+</Trap>
+
+```diff title="eslint.config.mjs"
+ import eslint from "@eslint/js";
+ import tseslint from "typescript-eslint";
+ 
+ // One lint config for the whole workspace (ADR-01's consequence made literal).
+ export default tseslint.config(
+   { ignores: ["**/node_modules/**", "**/dist/**", "**/coverage/**"] },
+   eslint.configs.recommended,
+   ...tseslint.configs.recommended,
++  {
++    // Isolation lives in data access, not in handlers (constitution I):
++    // only the repository layer may touch the driver.
++    files: ["**/*.ts"],
++    ignores: ["services/api/src/db/**"],
++    rules: {
++      "no-restricted-imports": [
++        "error",
++        {
++          paths: [
++            {
++              name: "pg",
++              message:
++                "Raw database access is forbidden outside services/api/src/db (constitution I).",
++            },
++          ],
++        },
++      ],
++    },
++  },
+ );
+```
+
+Thử liền tay: thêm `import pg from "pg"` vào `main.ts` của gateway rồi chạy
+`pnpm lint`. Lời cự tuyệt bạn nhận được — kèm trích dẫn constitution ngay
+trong thông báo lỗi — chính là điều khoản ấy đang vận hành đúng như văn bản.
+
+## Bộ test vẫn cứ tấn công
+
+Thiết kế loại bỏ xong, vẫn test như thường. Những bài test này cần một
+Postgres thật — chứng minh cách ly trên một bản mock thì chẳng chứng minh
+được gì — nhưng cửa ải ba câu lệnh đã không cần Docker suốt bốn chương và sẽ
+tiếp tục như thế. Mẹo nằm ở đúng một ký tự đặt tên: test tích hợp mang đuôi
+`*.itest.ts`, thứ mà mẫu tìm test của workspace (`*.test.ts`, đã đóng khung
+từ 1.1) đơn giản là không bao giờ khớp. Chúng có config riêng và một làn
+riêng, có tên:
+
+```ts title="services/api/vitest.integration.config.ts"
+import { defineConfig } from "vitest/config";
+
+// The integration lane (chapter 2.1). *.itest.ts files are invisible to the
+// workspace's unit-test include on purpose: `pnpm test` stays Docker-free,
+// and this config is what `pnpm --filter @relay/api test:integration` runs
+// against the compose Postgres.
+export default defineConfig({
+  test: {
+    include: ["src/**/*.itest.ts"],
+  },
+});
+```
+
+```ts title="services/api/src/db/repository.itest.ts"
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+
+import { createPool, DEFAULT_DATABASE_URL } from "./client.js";
+import { migrate } from "./migrate.js";
+import { createEnvironment, Repository, type Environment } from "./repository.js";
+
+// The isolation suite: attack the repository with FOREIGN tenant ids and
+// prove the leak inexpressible (FR-TEN-05, NFR-SEC-09, constitution I).
+// Requires the compose Postgres — this file is *.itest.ts precisely so the
+// Docker-free unit lane never collects it.
+
+// Guardrail: integration tests run against the LOCAL compose stack only.
+const url = new URL(process.env.DATABASE_URL ?? DEFAULT_DATABASE_URL);
+if (!["localhost", "127.0.0.1"].includes(url.hostname)) {
+  throw new Error(
+    `integration tests refuse non-local databases (got host "${url.hostname}") — never point this suite at a shared database`,
+  );
+}
+
+const pool = createPool();
+let envA: Environment;
+let envB: Environment;
+let repoA: Repository;
+let repoB: Repository;
+
+beforeAll(async () => {
+  await migrate(pool);
+  // Deterministic ground: this suite owns these tables in the dev database.
+  await pool.query(
+    "TRUNCATE members, messages, channels, users, environments, applications CASCADE",
+  );
+  envA = await createEnvironment(pool, { name: "tenant-a" });
+  envB = await createEnvironment(pool, { name: "tenant-b" });
+  repoA = new Repository(pool, envA.id);
+  repoB = new Repository(pool, envB.id);
+});
+
+afterAll(async () => {
+  await pool.end();
+});
+
+describe("tenant isolation is structural (FR-TEN-05)", () => {
+  it("a foreign external_id resolves to nothing — not even an existence hint", async () => {
+    await repoA.createUser("tuan", "Tuan");
+    expect(await repoA.getUserByExternalId("tuan")).not.toBeNull();
+    expect(await repoB.getUserByExternalId("tuan")).toBeNull();
+  });
+
+  it("channel reads and lists are scoped by construction", async () => {
+    await repoA.createChannel("support", "public", "Support");
+    expect(await repoB.getChannelByExternalId("support")).toBeNull();
+    expect(await repoB.listChannels()).toEqual([]);
+    expect((await repoA.listChannels()).map((c) => c.external_id)).toContain(
+      "support",
+    );
+  });
+
+  it("membership writes with foreign ids affect zero rows", async () => {
+    const user = await repoA.getUserByExternalId("tuan");
+    const channel = await repoA.getChannelByExternalId("support");
+    expect(await repoA.addMember(channel!.id, user!.id)).toBe(true);
+    // B holds A's REAL ids — and still cannot write or read through them.
+    expect(await repoB.addMember(channel!.id, user!.id)).toBe(false);
+    expect(await repoB.listMembers(channel!.id)).toEqual([]);
+    expect(await repoB.channelsForUser(user!.id)).toEqual([]);
+    expect(await repoA.listMembers(channel!.id)).toEqual([user!.id]);
+  });
+
+  it("uniqueness is per-tenant (DR-02): both tenants may own the same external_id", async () => {
+    await expect(repoB.createUser("tuan", "A different Tuan")).resolves.toBeTruthy();
+    await expect(repoA.createUser("tuan", "Duplicate in A")).rejects.toThrow();
+  });
+});
+```
+
+Hành động đầu tiên của bộ test là một chốt an toàn — nó từ chối mọi database
+không phải máy nội bộ, vì một bài test cách ly có TRUNCATE thì không bao giờ
+được phép gặp một database dùng chung. Rồi nó làm điều trung thực duy nhất:
+trao cho tenant B những định danh *thật* của tenant A và chứng kiến mọi phép
+đọc trả về khoảng không, mọi phép ghi chạm đúng không hàng. Chạy cả hai làn:
+
+```bash
+pnpm lint && pnpm typecheck && pnpm test
+pnpm --filter @relay/api test:integration
+```
+
+<Figure
+  caption="Cửa ải, giờ có hai làn mang tên: làn không-Docker mà mọi chương đã bước từ 1.1, và làn integration chạy schema cùng bộ test cách ly trên Postgres của compose."
+  code={figTwoLanes}
+/>
+
+<ForwardRef part="Phần 2 và xa hơn" locale="vi">
+
+Chương 2.2 đặt tầng này dưới sức ép tương tranh — `last_sequence` và
+`SELECT … FOR UPDATE` trong trận thật, đường ghi tin xây trên chiếc xương
+sống đặt hôm nay. Chiếc index DR-03 chờ 2.3; index phân trang chờ 2.4. Khi
+endpoint ra đời, bộ test cross-tenant sẽ lớn thành hình hài đầy đủ trong
+constitution — tấn công mọi endpoint bằng ID ngoại lai — và chương CI sẽ nối
+cả hai làn vào "mỗi lần build". Row-level security của Postgres có thể một
+ngày nào đó gia nhập như chiếc dây đeo thứ hai; nó sẽ không bao giờ thay thế
+tầng repository, vì luận điểm của ADR-04 là bất biến sống trong một codebase
+duy nhất.
+
+</ForwardRef>
+
+## Đến lượt bạn
+
+Bài tập chính là công trình: migrations, tầng repository, bộ test. Rồi tự
+tấn công thành quả của mình:
+
+1. Bình luận hóa một điều kiện `environment_id` trong `repository.ts` — bất
+   kỳ cái nào — rồi chạy làn integration. Xem phép khẳng định nào tóm được
+   nó và nhanh đến đâu. Hồi chuông ấy chính là món lời của việc "vẫn cứ test".
+2. Thêm `import pg from "pg"` vào một file bất kỳ ngoài `src/db` rồi chạy
+   `pnpm lint`. Đọc to thông báo lỗi; nó trích dẫn constitution.
+3. Tạo môi trường thứ ba trong bộ test và chứng minh cách ly đúng theo từng cặp —
+   A/C và B/C, chứ không riêng A/B. (Để ý phép chứng minh rẻ đến mức nào
+   một khi khuôn tấn công đã có sẵn.)
+
+Nếu bạn kẹt, tag của chương đang giữ sẵn đáp án: `part2-ch1`.
+
+## Những điều đọng lại
+
+Nếu không đọc gì khác trong chương này, hãy giữ lấy những điều sau:
+
+- **Vòng lặp cốt lõi mở màn bằng cách ly vì sự cảnh giác không co giãn** —
+  một constructor đòi tenant thắng mười chín mệnh đề WHERE đúng và một mệnh
+  đề bị quên (D4, FR-TEN-05).
+- **SQL của bản SAD là nguồn**: ràng buộc chính là yêu cầu — DR-01, DR-02,
+  DR-03 gieo hôm nay, gặt ở 2.2–2.4; khoảng trống thật của tài liệu nhận
+  quyết định ghi thẳng trong SQL.
+- **Migration có phiên bản và chỉ tiến** — không có đường down, do thiết
+  kế, và chạy lại luôn an toàn.
+- **Code đã công bố chỉ đổi giữa ban ngày**: diff-fence giờ là một phần giao
+  kèo của loạt bài — thứ một chương đã trưng, các chương sau tu chính bằng
+  diff nhìn thấy được, không bao giờ lặng lẽ.
+- **Hai làn, một cửa ải**: `*.itest.ts` giữ cho test đơn vị không cần
+  Docker trong khi cách ly được chứng minh trên database thật — kèm chốt an
+  toàn từ chối tấn công bất cứ thứ gì dùng chung.
+
+<Checkpoint locale="vi">
+
+Trước khi bắt đầu chương 2.2, bạn cần có: migration 001 đã áp lên Postgres
+compose của bạn (và lần chạy `migrate` thứ hai báo không còn gì để áp); tầng
+repository trong `services/api/src/db/` với luật lint đang sống (tự chứng
+minh bằng một cú import phạm luật rồi xóa đi); và cả hai làn đều xanh — cửa ải không-Docker
+nguyên vẹn từ 1.1, và `test:integration` vượt qua bốn đòn tấn công cách ly
+của nó. Trạng thái ấy là tag `part2-ch1` trong repository chuẩn; cứ diff với
+nó nếu có gì lệch. Chương 2.2 mặc định chiếc xương sống đã tồn tại và xây
+đường ghi tin lên trên — row lock, sequence, và tin nhắn đầu tiên.
+
+</Checkpoint>
+
+<ChapterFooter id="2.1" locale="vi" />

@@ -874,7 +874,195 @@ priced accordingly.
 
 ---
 
-## Reading the fourteen together
+## ADR-15 — NestJS for the API service
+
+### Problem
+
+The API service began as a walking skeleton: one health route over `node:http`. By the
+end of Phase 2 it owns the write path; through Phases 3–4 it accumulates tenancy, key
+management, channels, membership, history, moderation, emoji packs, and the dashboard's
+read APIs — dozens of endpoints, every one needing the same things: input validation at
+the boundary, the EIR-API-04 error envelope, auth context, request-scoped tenancy, and a
+documented contract (EIR-API-07 requires a complete OpenAPI 3.1 spec). The question is
+whether those cross-cutting needs are met by conventions we hand-roll and document, or by
+a framework whose conventions arrive pre-documented.
+
+### Options
+
+1. **Keep hand-rolled node:http** — extend the skeleton's `serve()` helper with routing,
+   validation plumbing, and a hand-maintained OpenAPI document.
+2. **Bare Fastify/Express** — a router with middleware, everything else still hand-rolled.
+3. **NestJS** — modules, dependency injection, guards/pipes/interceptors, first-class
+   validation, generated OpenAPI.
+
+### Analysis
+
+Option 1 is honest at skeleton scale and quadratic after it: every endpoint hand-wires
+validation, error shaping, auth, and docs, and every convention lives only in this
+repository's heads and READMEs. D8 cuts against that — one engineer cannot afford to be
+the framework's sole author *and* its sole documentation. Option 2 buys routing but leaves
+the expensive parts (validation discipline, OpenAPI, DI for testability) as bespoke work.
+Option 3 buys exactly the cross-cutting layer this surface needs, at two real costs: a
+decorator-based programming model (which demands a build/transform step and ends any
+run-the-TS-directly purity) and a materially larger dependency tree.
+
+The costs concentrate where request *shape* matters and mechanisms don't. That describes
+the API service's REST surface precisely — and describes the gateway not at all. The
+gateway's entire job is socket mechanics: the connection registry, the resume buffer, the
+subscribe-before-backfill ordering. Abstraction between that code and the socket is
+surface without benefit, so the framework stops at the gateway's door.
+
+Isolation deserves its own sentence, because frameworks tempt exactly the failure D4
+forbids: putting tenancy checks in guards — handler-land. The repository layer sits
+*beneath* the framework and its constructor still requires an `environment_id`; the guard
+authenticates and resolves the tenant, the data layer enforces it. The framework changes
+who calls the repository, never what the repository demands.
+
+### Decision
+
+NestJS for the API service only. The gateway remains frameworkless; workers remain plain
+consumers. Validation, error envelopes, and OpenAPI generation ride the framework;
+isolation stays in the repository layer.
+
+### Consequences
+
+A build step joins the API service's toolchain (decorators are not erasable syntax).
+Endpoint chapters spend their words on semantics instead of plumbing. EIR-API-07 becomes
+generated output instead of a standing documentation debt. The skeleton's shared `serve()`
+plumbing survives on the gateway side.
+
+### Revisit when
+
+Framework overhead appears on a latency-budget path (NFR-PRF-01), or a core-loop
+mechanism has to fight the abstraction the way it would on the gateway — Fastify is the
+named fallback, and the repository layer's independence is what makes that swap survivable.
+
+---
+
+## ADR-16 — Drizzle for the API service's data layer
+
+### Problem
+
+The repository layer is written against `pg` with hand-typed row interfaces. It is
+correct, visible, and increasingly verbose: every query hand-declares its result shape,
+and NFR-MNT-02's coverage expectations want the compiler carrying more of that load. The
+question is which data-layer tool adds type safety **without hiding the SQL the core loop
+is made of** — the row lock (ADR-03), the idempotency conflict (DR-03), the partial
+unique index, the CHECK constraints.
+
+### Options
+
+1. **Stay on raw pg** — maximum visibility, hand-maintained types.
+2. **Prisma** — schema-first ORM, generated client.
+3. **TypeORM** — decorator entities, the historical NestJS pairing.
+4. **kysely** — a typed SQL query builder with zero schema ownership.
+5. **Drizzle** — SQL-shaped typed queries, schema defined in TS, SQL migrations generated.
+
+### Analysis
+
+The test is the five mechanisms. Prisma fails it structurally: DR-03's partial unique
+index cannot be expressed in its schema at all, and `FOR UPDATE` exists only through raw
+escape hatches — the abstraction is weakest exactly where correctness lives, so its costs
+would be paid everywhere and its benefits suspended on every hot path. TypeORM passes the
+mechanism test but fails the confidence test: result typing is loose where NFR-MNT-02
+wants guarantees, and its API's two personalities make conventions harder, not easier.
+
+kysely and Drizzle both pass. kysely owns nothing — the hand-written migrations stay the
+only schema artifact — which is the purest fit for "the SQL is the source." Drizzle owns a
+TS schema definition, and pays that cost back with schema-level constraint definitions
+(the partial index and CHECKs live next to the tables that own them), relational query
+ergonomics for the read-heavy Phase 3–4 surface, and `.for("update")` /
+`.onConflictDoNothing()` reading almost exactly like the SQL they emit.
+
+The drift risk is the TS schema diverging from §6.1's SQL. The mitigation is mechanical:
+drizzle-kit *generates* SQL migration files, those files are reviewed and applied as SQL,
+and generated DDL is diffed against §6.1's definitions. The applied SQL remains what runs.
+
+### Decision
+
+Drizzle inside the repository layer. The layer's constructor discipline (D4) is
+untouched; Drizzle is its query engine, never a client that escapes it. Raw SQL islands
+remain permitted inside the layer where the builder falls short. Migrations remain
+versioned, forward-only SQL files.
+
+### Consequences
+
+Queries gain end-to-end types without losing their SQL shape. The schema exists twice —
+once as §6.1's SQL truth, once as TS definitions — with drift checked, not assumed away.
+The isolation suite and the lint ban on raw driver imports carry over unchanged.
+
+### Revisit when
+
+The TS schema and applied SQL drift in practice, or new queries routinely bypass the
+builder for raw SQL — either signals that kysely's schema-free model (the named fallback)
+should take over.
+
+---
+
+## ADR-17 — Turborepo for build orchestration
+
+### Problem
+
+The workspace's three-command gate (`lint`, `typecheck`, `test`) has run everything,
+everywhere, on every invocation since chapter 1.1 — the right call when every task was
+fast and no task depended on another. ADR-15 breaks both properties at once: NestJS's
+decorators give the API service a real compile step, and a compiled `@relay/protocol`
+must exist before the services that import it can build. Phases 2–4 add four more
+services and several packages. The question is what runs the tasks — not what installs
+the packages; pnpm keeps that job — so that gate time scales with the size of a change
+rather than the size of the workspace.
+
+### Options
+
+1. **Stay on plain `pnpm -r` scripts** — recursive, uncached, orderless.
+2. **Turborepo** — a task graph with content-hash caching over existing package scripts.
+3. **Nx** — the heavyweight: plugins, generators, a daemon, distributed execution.
+4. **Bazel** (and kin) — hermetic, polyglot, industrial.
+
+### Analysis
+
+Plain `pnpm -r` fails the new requirements structurally: it has no task ordering beyond
+package topology per command, and no memory — a one-line docs change re-typechecks six
+services. It was the correct choice until this ADR's drivers existed, which is exactly
+why it lasted this long.
+
+Bazel solves problems Relay does not have (polyglot builds, thousand-engineer repos) at
+a cost D8 cannot pay: its model replaces the npm-script world instead of running it.
+Nx and Turborepo both fit the actual need. Nx is more capable — and the capability
+arrives as surface: a daemon, code generators, plugin versions to track. The deciding
+observation is that every capability the gate needs (task graph, caching, filtering)
+is the part of Nx that Turborepo *is*, without the rest.
+
+Turborepo's real cost is trust: a cache hit is a claim that nothing relevant changed,
+and the claim is only as good as `turbo.json`'s declared inputs and outputs. An
+undeclared input (an env var, a config file outside the package) produces a stale
+green — the most dangerous failure a gate can have. The mitigation is the same
+discipline the fence rules already established: declarations are reviewed like code,
+and tagged chapter checkpoints run against a clean cache, so a lying cache cannot
+survive a tag.
+
+### Decision
+
+Turborepo as the task runner over the unchanged pnpm workspace. Every `turbo run`
+target remains an ordinary package script — `turbo` orders and caches, packages still
+own their commands. Remote caching waits for CI (Part 6).
+
+### Consequences
+
+The gate's cost now tracks the change, not the workspace; the protocol-before-services
+build order is declared once instead of implied. One new artifact (`turbo.json`) joins
+the reviewed set, and the degradation path stays open: delete it and `pnpm -r` still
+runs everything, slowly and correctly.
+
+### Revisit when
+
+A stale-cache incident survives the input-declaration discipline, or the task graph
+starts encoding dependency knowledge that belongs in package.json — either way Nx (the
+named fallback) or plain recursion takes over.
+
+---
+
+## Reading the seventeen together
 
 Three themes recur, and naming them is the best summary of the architecture's character:
 
@@ -886,7 +1074,10 @@ Three themes recur, and naming them is the best summary of the architecture's ch
 **The write path is sacred; features live on the read side.** Sequences commit with rows
 (ADR-03), sends converge on one code path (ADR-05), and emoji never touch stored text
 (ADR-11, -12). When a new feature threatens FR-MSG semantics, the design reflex is to
-reformulate it as a read-time concern.
+reformulate it as a read-time concern. Even the application stack bends to this theme:
+the framework serves the wide read-and-CRUD surface and stops at the gateway's door
+(ADR-15), and the data layer was chosen so the write path's invariants stay written in
+visible SQL rather than behind an abstraction (ADR-16).
 
 **Every decision names its own undoing.** Reversal triggers are part of each record — not
 decoration, but the discipline that keeps a solo-built system honest: the day a trigger

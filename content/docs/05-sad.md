@@ -901,6 +901,73 @@ consumer messengers set exactly this expectation. **Rejected:** synchronous scan
 covers); scan-on-first-download (moves the latency to the recipient's tap and re-scans
 per CDN miss).
 
+### ADR-15 — API service application framework: NestJS
+**Status:** accepted · **Drivers:** D7, D8 · serves EIR-API-04/07, NFR-USE
+
+The API service's REST surface grows to dozens of endpoints across Phases 2–4 (tenancy,
+channels, messages, keys, moderation, emoji packs, dashboard reads). NestJS supplies the
+module/DI/guard/pipe conventions that keep per-endpoint variance low for a solo builder,
+schema validation at the boundary as a framework primitive, uniform error shaping
+(EIR-API-04), and generated OpenAPI 3.1 (EIR-API-07) instead of a hand-maintained spec.
+**Scope:** the API service only. The gateway stays frameworkless — its work is raw socket
+mechanics (resume buffering, backfill ordering), and a framework between that code and the
+socket is surface without benefit. Workers remain plain consumers. Isolation is unaffected:
+the repository layer (D4) sits beneath the framework, constructed per request with the
+authenticated `environment_id` — guards authenticate, the data layer isolates.
+**Trade-off:** decorators require a build/transform step, and the dependency tree grows a
+DI container; accepted against hand-rolling (and hand-documenting) the same conventions
+across the Phase 2–4 surface. **Rejected:** hand-rolled node:http routing (right for a
+walking skeleton, quadratic pain at platform scale); bare Express/Fastify (routing without
+the validation/OpenAPI/DI conventions this surface needs — Fastify is the named fallback).
+**Revisit:** if framework overhead shows up on latency-budget paths (NFR-PRF-01), or if
+the abstraction starts fighting a core-loop mechanism the way it would on the gateway.
+
+### ADR-16 — API service data layer: Drizzle over raw pg
+**Status:** accepted · **Drivers:** D1, D4, D8 · serves NFR-MNT-02
+
+Repository-layer queries are written with Drizzle: SQL-shaped, fully typed, and — the
+deciding test — the core loop's mechanisms are first-class, not escape hatches:
+`SELECT … FOR UPDATE` (ADR-03's row lock), `ON CONFLICT DO NOTHING` (DR-03), partial
+unique indexes and CHECK constraints expressible in the schema definition. Migrations
+remain versioned, forward-only SQL files: drizzle-kit generates them, they are reviewed
+and applied as SQL, and the applied SQL — not the TS schema — is what runs; generated
+migrations are diffed against this document's §6.1 definitions so the two cannot drift
+silently. The repository discipline is unchanged: Drizzle is the query engine *inside*
+the layer, never a client handed to handlers; raw SQL islands remain permitted inside the
+layer where the builder falls short. **Trade-off:** the schema gains a TS definition
+alongside §6.1's SQL — a second artifact to keep honest, checked rather than assumed.
+**Rejected:** Prisma (cannot express DR-03's partial unique index in its schema, and lock
+semantics exist only as raw escape hatches — the abstraction fails exactly where
+correctness lives); TypeORM (weak result typing where NFR-MNT-02 wants confidence;
+legacy trajectory); kysely (the closest call — typed SQL with zero schema ownership;
+declined for Drizzle's schema-level constraint definitions and relational ergonomics, and
+it is the named fallback). **Revisit:** if the TS schema and applied SQL drift in
+practice, or if builder coverage forces raw SQL for a majority of new queries — at that
+point kysely's schema-free model wins.
+
+### ADR-17 — Monorepo build orchestration: Turborepo
+**Status:** accepted · **Drivers:** D8 · serves NFR-MNT-02/03
+
+ADR-15 gives the workspace its first real build step (NestJS's decorators compile), and
+Phases 2–4 grow it to six services plus shared packages. Plain `pnpm -r` re-runs every
+task in every package on every change; with a build step and a task order (protocol
+builds before the services that import it) that cost becomes quadratic exactly where D8
+wants it flat. Turborepo runs the existing package scripts through a declared task graph
+with content-hash caching: the gate's cost scales with the change, not with the
+workspace. **Scope:** a task runner only. pnpm remains the package manager and workspace
+protocol; every `turbo run` target is an ordinary package script, so removing Turborepo
+degrades to `pnpm -r`, not to a rewrite. Remote caching is deferred until CI exists.
+**Trade-off:** a wrong cache is a false green — correctness now depends on `turbo.json`
+declaring task inputs and outputs honestly. Accepted with discipline: input/output
+declarations are reviewed like code, and tagged checkpoints run clean-cache.
+**Rejected:** staying on plain `pnpm -r` scripts (correct until a build step existed;
+the wrong default once one does — and it remains the degradation path); Nx (more capable,
+but its plugin ecosystem, daemon, and generators are surface a solo builder doesn't
+need — the named fallback if Turborepo's caching proves untrustworthy); Bazel (a build
+team's tool, priced in a currency D8 doesn't hold). **Revisit:** if stale-cache incidents
+survive the input-declaration discipline, or if the task graph starts encoding knowledge
+that belongs in package.json dependencies.
+
 ---
 
 ## 10. Risks and technical debt register
