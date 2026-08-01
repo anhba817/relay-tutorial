@@ -1,0 +1,651 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figFrameMap, figOneSource, figPayoffRevisited } from "./figures";
+
+export const metadata = {
+  title: "Package protocol — Building Relay",
+  description:
+    "Chương 1.3 trả món nợ lâu nhất của Phần 1: @relay/protocol — bản giao kèo đường truyền viết bằng schema zod với kiểu suy ra từ chính nó, mã lỗi, close code, và những bài test biết từ chối frame hỏng — định nghĩa xong trước khi bất kỳ service nào tồn tại.",
+  alternates: {
+    canonical: "/vi/part-1/chapter-03/the-protocol-package",
+    languages: {
+      en: "/part-1/chapter-03/the-protocol-package",
+      vi: "/vi/part-1/chapter-03/the-protocol-package",
+    },
+  },
+};
+
+<ChapterHeader id="1.3" locale="vi" />
+
+Chương 1.1 đưa ra một lập luận và vẽ một bức hình: một package dùng chung
+nuôi cả gateway, API service lẫn SDK, để mỗi lần đổi kiểu frame chỉ tốn một
+commit, và sai lệch giữa hai đầu đường truyền "trở thành lỗi biên dịch thay vì
+sự cố ngoài production." Sau hai chương đắp nền, cái ô trong bức hình ấy vẫn để
+trống. Hôm nay chúng ta lấp nó. Chưa có service nào tồn tại — và đó chính
+là chủ đích: bản giao kèo đi trước, mọi thứ xây sau buộc phải nói đúng thứ
+tiếng nó quy định.
+
+<SkipAhead locale="vi">
+
+Nếu bạn buộc phải đọc lướt: chương này thêm `packages/protocol` —
+`@relay/protocol`, package đầu tiên trong workspace thật sự tính toán được
+điều gì đó, kèm dependency runtime đầu tiên (zod, nằm trong package, ghim
+phiên bản). Schema cho các frame với kiểu tĩnh suy ra từ chính schema, close
+code, sổ mã lỗi, và một bộ test chuyên từ chối frame hỏng. Trạng thái cuối
+chương là tag **`part1-ch3`**: checkout nó và
+`pnpm lint && pnpm typecheck && pnpm test` chạy xanh với 32 bài test.
+
+</SkipAhead>
+
+## Bản giao kèo đi trước
+
+Hệ phân tán nào cũng có một bản giao kèo đường truyền. Câu hỏi duy nhất là nó
+được viết ra một lần, hay phải dựng lại bằng cách đọc hai codebase rồi cầu
+mong chúng khớp nhau. Tài liệu của Relay đã chọn con đường thứ nhất từ lâu
+trước chương này: bản SRS tuyên bố "all frames shall be JSON objects carrying
+a `type` discriminator and a `payload`" — mọi frame là một object JSON mang
+trường `type` phân định và một `payload` (EIR-WS-02), gọi tên frame xác nhận
+handshake kèm hạn chót một giây (EIR-WS-03), và đòi hỏi toàn bộ
+protocol — kết nối lại, thứ tự, backfill — phải được ghi thành văn
+(EIR-WS-07). Các sơ đồ tuần tự trong bản SAD thì đã nói chuyện bằng frame từ
+trước: `message.send {idem_key, channel, text}` đi lên, `message.ack {seq}`
+quay về.
+
+<Why source="ADR-01 · docs/07 §3" locale="vi">
+
+Vì sao xây bản giao kèo trước cả những service sẽ dùng nó? Vì thứ tự xây
+quyết định bên nào phải uốn mình. Xây gateway trước thì protocol trở thành
+"bất cứ thứ gì gateway tình cờ phát ra" — bản giao kèo chỉ còn ghi chép lại
+sự tình cờ. Xây bản giao kèo trước thì gateway phải tuân theo, API service
+phải tuân theo, và — đây là quả ngọt của ADR-01 — SDK ở đầu kia đường truyền
+tuân theo *bằng cách import đúng package này*. Một mái nhà cho bản giao kèo
+nghĩa là chẳng còn gì phải đối chiếu, và đó chính là lý do 1.1 bác bỏ trực
+giác đa ngôn ngữ ngay từ đầu: khoảnh khắc server cũng là TypeScript, "giữ hai
+đầu đồng bộ" không còn là một quy trình nữa — nó trở thành một dòng import.
+
+</Why>
+
+## Bộ từ vựng, dẫn từ tài liệu
+
+Gần như chẳng có gì trong package này là do chúng ta bịa ra. Tài liệu đã gọi
+tên các frame; việc của chúng ta là chép lại cho đúng — và nói thẳng ra ở
+những dòng hiếm hoi mà tài liệu bỏ ngỏ.
+
+**Từ cú handshake**: `connection.ack`, mang "the resolved user identity and a
+resume cursor" — danh tính người dùng đã xác thực và một cursor để nối lại
+(EIR-WS-03). Cursor chính là chiếc map theo từng kênh của ADR-03 —
+`{ channel_id: seq cao nhất đã thấy }` — cũng là những số sequence đã khiến
+việc nối lại và khử trùng lặp trở nên nhẹ tênh. Và vì trình tự nối lại
+trong SAD (§5.2) lấy backfill *trước khi* gửi ack, cái ack cũng là nơi báo
+chuyện cắt bớt: kênh nào có backfill vượt 500 tin nhắn sẽ được đánh dấu
+để client tự tải lại lịch sử thay vì nhận cả núi tồn đọng (FR-RTM-04). Lựa
+chọn nơi chứa ấy — cắt bớt nằm trên ack — là thứ tự của tài liệu cộng với
+quyết định của chúng ta, và chúng ta ghi lại đúng như vậy.
+
+**Từ đường gửi tin**: `message.send {idem_key, channel, text}` và
+`message.ack {seq}`, đúng từng chữ như SAD §5.1 vẽ. Idempotency key do client
+tự cấp (FR-SDK-06) và được server khử trùng lặp trong cửa sổ 24 giờ
+(FR-MSG-04). Tài liệu không ấn định định dạng key, nên chúng ta quyết và ghi
+lại: một chuỗi không rỗng, tối đa 255 ký tự.
+
+**Từ dòng sự kiện**: FR-RTM-05 gọi tên sáu loại sự kiện thời gian thực — tạo
+tin nhắn, sửa, xóa, thay đổi thành viên, thay đổi presence, đang gõ. *Loại sự
+kiện* là của bản SRS; cách viết chuỗi `type` là của chúng ta, ghi lại tại
+đây: `message.created`, `message.updated`, `message.deleted`,
+`membership.changed`, `presence.changed`, `typing` — theo đúng khuôn
+`danh_từ.động_từ` mà chính `connection.ack` và `message.send` của tài liệu đã
+dùng. Các sự kiện message mang theo chính tin nhắn, và cấu trúc của nó dẫn
+thẳng từ bảng `messages` trong SAD (§6.1): `id`, `channel`, `seq`, `user`,
+`text`, `created_at` — cách viết trên đường truyền theo dòng frame của §5.1,
+còn những cột còn lại (metadata, attachments, các dấu vết sửa và tombstone)
+được hoãn lại một cách tường minh cho các phần sẽ hiện thực chúng. Trạng thái
+presence là `online` và `offline` (FR-RTM-06); typing tự hết hạn sau năm giây
+và không bao giờ được lưu (FR-RTM-08).
+
+**Từ phía thất bại**: một frame `error` tái dùng khuôn lỗi của
+REST — `code` cho máy đọc, `message` cho người đọc, một `docs_url`, và
+`field` tùy chọn (EIR-API-04). Việc tái dùng ấy là quyết định của chúng ta;
+thứ đang thiếu cũng vậy: khuôn lỗi mà constitution quy định còn có
+`request_id`, và chúng ta chủ động hoãn nó — chưa có gateway nào tồn tại để
+cấp id cho từng yêu cầu. Nó sẽ nhập hội ở Phần 2. Thêm một quyết định nữa,
+nhỏ nhất: bản SRS yêu cầu server ping mỗi 30 giây (EIR-WS-04), và chúng ta
+đáp ứng bằng frame điều khiển ping/pong nguyên bản của WebSocket thay vì
+frame protocol — trình duyệt tự trả lời chúng, nên bộ từ vựng không cần bận
+tâm.
+
+<Figure
+  caption="Bộ từ vựng đường truyền xếp theo chiều — một frame đi lên, mọi thứ còn lại đi xuống, và các close code đứng ở mép cuộc hội thoại."
+  code={figFrameMap}
+/>
+
+## Dependency runtime đầu tiên
+
+Mọi thứ workspace từng cài đến giờ — TypeScript, ESLint, Vitest — đều là
+devDependency: có mặt lúc xây, vắng mặt lúc code chạy. Chương này nhận
+dependency *runtime* đầu tiên của workspace, và nó nằm trong package cần nó,
+không phải ở gốc:
+
+```json title="packages/protocol/package.json"
+{
+  "name": "@relay/protocol",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "zod": "^4.4.3"
+  }
+}
+```
+
+```json title="packages/protocol/tsconfig.json"
+{
+  "extends": "../../tsconfig.base.json",
+  "include": ["src"]
+}
+```
+
+Hai nước đi quen thuộc và một nước mới. Tsconfig kế thừa từ một bản nền duy
+nhất — luật của 1.1, vẫn đứng vững. Dependency được *ghim trong phạm vi một
+bản major* — cùng kỷ luật với các tag image của 1.2, và cùng lời dặn: các con
+số phiên bản trong trang này sẽ già đi; tag của chương giữ đúng trạng thái.
+Và dependency nằm trong package: `package.json` ở gốc không đổi, vì zod là
+chuyện riêng của `@relay/protocol`. Dependency sống ở nơi dùng nó — những ai
+tiêu thụ package này sẽ nhận được khả năng kiểm tra dữ liệu *thông qua* nó,
+và đó chính là toàn bộ ý tưởng.
+
+<Why source="docs/07 §3 · EIR-WS-02" locale="vi">
+
+Vì sao cần một thư viện kiểm tra lúc chạy khi TypeScript đã gán kiểu cho mọi
+frame? Vì kiểu tĩnh bốc hơi. Lúc chạy, `message.send` là những byte đến từ
+một mạng lưới bạn không kiểm soát, và một interface TypeScript soi được đúng
+không byte nào trong số đó — `as Frame` là một lời hứa không có gì chống
+lưng. Schema là kiểu dữ liệu sống sót qua runtime: cùng một lời khai báo vừa
+cho ta kiểu tĩnh, vừa cho ta hàm tra khảo dữ liệu thật. Constitution đòi dữ
+liệu vào phải được "validated against a schema before processing" — kiểm tra
+bằng schema trước khi xử lý; package này là nơi câu văn ấy thật sự có hiệu lực
+trên đường truyền.
+
+</Why>
+
+## Các schema
+
+Tạo package và phần mã nguồn. Một file cho các frame:
+
+```bash
+mkdir -p packages/protocol/src
+```
+
+```ts title="packages/protocol/src/frames.ts"
+import { z } from "zod";
+
+// The wire contract, one home (ADR-01). Every frame is a JSON object with a
+// `type` discriminator and a `payload` (EIR-WS-02). Schemas are the single
+// source of truth: every exported static type is inferred from its schema,
+// so the types and the validation cannot drift — there is no second
+// definition. Payloads are strict: unknown fields are rejected.
+
+/** Per-channel resume cursor: { channel_id: highest seq seen } (ADR-03). */
+export const cursorSchema = z.record(z.string(), z.number().int().positive());
+
+/** The message on the wire — derived from the SAD §6.1 `messages` columns.
+ * Wire spellings follow SAD §5.1's own frame line (`channel`, `seq`).
+ * metadata/attachments/edit/tombstone fields arrive with Part 2/4. */
+export const messageSchema = z.strictObject({
+  id: z.string().min(1),
+  channel: z.string().min(1),
+  seq: z.number().int().positive(),
+  user: z.string().min(1),
+  text: z.string(),
+  created_at: z.iso.datetime(), // UTC, RFC 3339 (constitution: timestamps)
+});
+
+/** Server → client on successful handshake (EIR-WS-03, SAD §5.2). Sent after
+ * backfill is fetched, so it can also carry the per-channel truncation list
+ * (FR-RTM-04) — channels where backfill exceeded 500 and the client must
+ * refetch history instead. */
+export const connectionAckSchema = z.strictObject({
+  type: z.literal("connection.ack"),
+  payload: z.strictObject({
+    user: z.string().min(1),
+    cursor: cursorSchema,
+    resume_ok: z.boolean(),
+    truncated: z.array(z.string().min(1)),
+  }),
+});
+
+/** Client → server send (SAD §5.1: `message.send {idem_key, channel, text}`).
+ * The idempotency key is client-supplied (FR-SDK-06), deduplicated
+ * server-side within 24 h (FR-MSG-04). */
+export const messageSendSchema = z.strictObject({
+  type: z.literal("message.send"),
+  payload: z.strictObject({
+    idem_key: z.string().min(1).max(255),
+    channel: z.string().min(1),
+    text: z.string(),
+  }),
+});
+
+/** Server → sender after commit — never before (SAD §5.1, FR-MSG-05). */
+export const messageAckSchema = z.strictObject({
+  type: z.literal("message.ack"),
+  payload: z.strictObject({
+    seq: z.number().int().positive(),
+  }),
+});
+
+// The six real-time event kinds (FR-RTM-05). The kinds are the SRS's; the
+// `noun.verb` spellings are this chapter's recorded decision, following the
+// documents' own connection.ack / message.send naming.
+
+export const messageCreatedSchema = z.strictObject({
+  type: z.literal("message.created"),
+  payload: messageSchema,
+});
+
+export const messageUpdatedSchema = z.strictObject({
+  type: z.literal("message.updated"),
+  payload: messageSchema,
+});
+
+export const messageDeletedSchema = z.strictObject({
+  type: z.literal("message.deleted"),
+  payload: messageSchema,
+});
+
+export const membershipChangedSchema = z.strictObject({
+  type: z.literal("membership.changed"),
+  payload: z.strictObject({
+    channel: z.string().min(1),
+    user: z.string().min(1),
+    change: z.enum(["added", "removed"]),
+  }),
+});
+
+/** Presence states per FR-RTM-06; delivery scope is FR-RTM-07's concern. */
+export const presenceChangedSchema = z.strictObject({
+  type: z.literal("presence.changed"),
+  payload: z.strictObject({
+    user: z.string().min(1),
+    state: z.enum(["online", "offline"]),
+  }),
+});
+
+/** Expires after 5 s without renewal and is never persisted (FR-RTM-08). */
+export const typingSchema = z.strictObject({
+  type: z.literal("typing"),
+  payload: z.strictObject({
+    channel: z.string().min(1),
+    user: z.string().min(1),
+  }),
+});
+
+/** Protocol-level error — EIR-API-04's error shape, reused on the socket
+ * (this chapter's recorded decision). `request_id` joins in Part 2, when a
+ * gateway exists to mint one. */
+export const errorFrameSchema = z.strictObject({
+  type: z.literal("error"),
+  payload: z.strictObject({
+    code: z.string().min(1),
+    message: z.string().min(1),
+    docs_url: z.string().min(1),
+    field: z.string().min(1).optional(),
+  }),
+});
+
+/** Every frame either end may legally utter. */
+export const frameSchema = z.discriminatedUnion("type", [
+  connectionAckSchema,
+  messageSendSchema,
+  messageAckSchema,
+  messageCreatedSchema,
+  messageUpdatedSchema,
+  messageDeletedSchema,
+  membershipChangedSchema,
+  presenceChangedSchema,
+  typingSchema,
+  errorFrameSchema,
+]);
+
+// The static types ARE the schemas — z.infer, never a hand-written twin.
+export type Cursor = z.infer<typeof cursorSchema>;
+export type Message = z.infer<typeof messageSchema>;
+export type ConnectionAck = z.infer<typeof connectionAckSchema>;
+export type MessageSend = z.infer<typeof messageSendSchema>;
+export type MessageAck = z.infer<typeof messageAckSchema>;
+export type Frame = z.infer<typeof frameSchema>;
+
+/** Parse anything the wire delivers. Hostile input is an expected value, not
+ * an exception: this returns zod's safeParse result and never throws. */
+export function parseFrame(raw: unknown) {
+  return frameSchema.safeParse(raw);
+}
+```
+
+Hãy đọc nó từ dưới lên và bản thiết kế tự lộ diện. `parseFrame` trả về kết
+quả `safeParse` của zod — thành công kèm dữ liệu đã gán kiểu, hoặc thất bại
+kèm lỗi có cấu trúc, và *không bao giờ* ném exception, vì ở ranh giới mạng,
+dữ liệu hỏng không phải chuyện bất thường — nó là chuyện thường ngày. Các
+kiểu được export đều là `z.infer`: schema là định nghĩa duy nhất, kiểu tĩnh
+được suy ra từ nó, nên hai bên không tài nào bất đồng. Và mọi payload đều là
+object *strict* — frame nào lén mang thêm trường lạ sẽ bị từ chối, đúng kỷ
+luật mà constitution đòi hỏi ở các endpoint ghi ("unknown fields are
+rejected" — trường không quen biết bị từ chối).
+
+<Figure
+  caption="Một schema, hai sản phẩm: người gác cổng lúc chạy và kiểu tĩnh, cùng suy ra từ một định nghĩa — chẳng còn gì để lệch."
+  code={figOneSource}
+/>
+
+<Trap locale="vi">
+
+Tương lai ngây thơ — và bạn sẽ cảm thấy lực hút của nó quanh chương 1.4 — là
+mỗi service coi việc kiểm tra dữ liệu là chuyện riêng của mình: gateway vớ
+lấy một bản thư viện kiểm tra riêng, API service lại thích một thư viện khác,
+rồi ai đó đang vội viết `JSON.parse(raw) as Frame` và đi tiếp. Chẳng có gì đổ
+vỡ ngay; `as` thì không bao giờ. Con bọ sẽ đến sau vài tháng, dưới dạng một
+kiểu frame mà service này chấp nhận còn service kia từ chối — sai lệch
+protocol, đúng căn bệnh mà ADR-01 được chọn để chữa, giờ tái nhập qua cửa sau
+mang tên tiện tay. Cách chữa nằm ở cấu trúc và đã sẵn trong tay bạn: kiểu và
+phần kiểm tra sống trong *cùng một package*, nên ai import kiểu là có luôn
+trình kiểm tra cách đó một dòng, đã thống nhất từ trước và giống hệt nhau ở
+mọi nơi. Một thư viện kiểm tra, một mái nhà, không bản sao — luật của 1.1,
+giờ áp cho hành vi thay vì cấu hình.
+
+</Trap>
+
+## Từ vựng cho thất bại
+
+Giao kèo đâu chỉ có đường vui. Bản SRS đòi các close code phân biệt được
+"authentication failure, quota exhaustion, server shutdown, and protocol
+violation" — lỗi xác thực, cạn quota, server tắt máy, vi phạm protocol
+(EIR-WS-06) — hai mã đã được tài liệu đánh số sẵn, hai mã do chương này đánh
+số, và nói rõ như thế:
+
+```ts title="packages/protocol/src/codes.ts"
+// Close codes and protocol error codes — the contract's failure vocabulary.
+// EIR-WS-06 requires close codes to distinguish authentication failure,
+// quota exhaustion, server shutdown, and protocol violation. Two numbers are
+// document-fixed (4001: EIR-WS-05; 4009: SAD §7); the other two classes are
+// numbered here — chapter 1.3's recorded decision.
+
+export const CLOSE_CODES = {
+  4001: "invalid or expired token",
+  4002: "protocol violation",
+  4008: "quota exhausted",
+  4009: "server shutdown (drain)",
+} as const;
+
+export type CloseCode = keyof typeof CLOSE_CODES;
+
+// Protocol-level error codes carried by the `error` frame (EIR-API-04's
+// shape). A starter registry — endpoints and services add their own codes in
+// their chapters; uniqueness is test-enforced from day one.
+export const ERROR_CODES = {
+  invalid_frame: "the frame failed schema validation",
+  unknown_frame_type: "the type discriminator names no known frame",
+  unauthorized: "the connection is not authorized for this action",
+  rate_limited: "too many frames; slow down and retry",
+} as const;
+
+export type ErrorCode = keyof typeof ERROR_CODES;
+```
+
+Và cánh cửa chính của package — một dòng import cho tất cả:
+
+```ts title="packages/protocol/src/index.ts"
+// @relay/protocol — the shared wire contract (ADR-01's payoff, chapter 1.3).
+// One home for frame schemas, their inferred types, and the failure
+// vocabulary. Consumed by the gateway and API service from 1.4, and by the
+// SDK in a later part.
+
+export * from "./frames.js";
+export * from "./codes.js";
+```
+
+## Những bài test biết cắn
+
+Một schema chấp nhận rác còn tệ hơn không có schema — nó *đóng dấu chứng
+nhận* cho rác. Nên việc chính của bộ test là nói không: với mỗi frame, một
+mẫu hợp lệ phải parse được và đi trọn vòng, cùng một bảng những cú suýt đúng
+mà từng cái một phải bị từ chối.
+
+```ts title="packages/protocol/src/frames.test.ts"
+import { describe, expect, it } from "vitest";
+
+import { parseFrame } from "./frames.js";
+
+// The contract must bite: for every frame, one specimen that parses and a
+// table of malformed near-misses that MUST reject. A schema that accepts
+// garbage is worse than no schema — it certifies garbage.
+
+const message = {
+  id: "m1",
+  channel: "c1",
+  seq: 42,
+  user: "u1",
+  text: "hello",
+  created_at: "2026-08-01T09:00:00.000Z",
+};
+
+const valid: Record<string, unknown> = {
+  "connection.ack": {
+    type: "connection.ack",
+    payload: { user: "u1", cursor: { c1: 42 }, resume_ok: true, truncated: [] },
+  },
+  "message.send": {
+    type: "message.send",
+    payload: { idem_key: "k-1", channel: "c1", text: "hi" },
+  },
+  "message.ack": { type: "message.ack", payload: { seq: 43 } },
+  "message.created": { type: "message.created", payload: message },
+  "message.updated": { type: "message.updated", payload: message },
+  "message.deleted": { type: "message.deleted", payload: message },
+  "membership.changed": {
+    type: "membership.changed",
+    payload: { channel: "c1", user: "u2", change: "added" },
+  },
+  "presence.changed": {
+    type: "presence.changed",
+    payload: { user: "u1", state: "online" },
+  },
+  typing: { type: "typing", payload: { channel: "c1", user: "u1" } },
+  error: {
+    type: "error",
+    payload: {
+      code: "invalid_frame",
+      message: "no",
+      docs_url: "https://docs.example/errors/invalid_frame",
+    },
+  },
+};
+
+describe("every frame parses its valid specimen and round-trips", () => {
+  for (const [name, frame] of Object.entries(valid)) {
+    it(name, () => {
+      const result = parseFrame(frame);
+      expect(result.success).toBe(true);
+      if (result.success) expect(result.data).toEqual(frame);
+    });
+  }
+});
+
+describe("malformed frames reject", () => {
+  const rejects: Array<[string, unknown]> = [
+    ["not an object", "message.send"],
+    ["unknown type discriminator", { type: "message.destroy", payload: {} }],
+    ["missing payload", { type: "message.ack" }],
+    [
+      "missing payload field",
+      { type: "message.send", payload: { channel: "c1", text: "hi" } },
+    ],
+    [
+      "wrong primitive (seq as string)",
+      { type: "message.ack", payload: { seq: "43" } },
+    ],
+    ["zero seq", { type: "message.ack", payload: { seq: 0 } }],
+    ["negative seq", { type: "message.ack", payload: { seq: -1 } }],
+    [
+      "empty idem_key",
+      { type: "message.send", payload: { idem_key: "", channel: "c1", text: "hi" } },
+    ],
+    [
+      "oversized idem_key",
+      {
+        type: "message.send",
+        payload: { idem_key: "k".repeat(256), channel: "c1", text: "hi" },
+      },
+    ],
+    [
+      "unknown extra payload field",
+      {
+        type: "message.send",
+        payload: { idem_key: "k-1", channel: "c1", text: "hi", admin: true },
+      },
+    ],
+    [
+      "invalid presence state",
+      { type: "presence.changed", payload: { user: "u1", state: "away" } },
+    ],
+    [
+      "non-RFC3339 timestamp",
+      { type: "message.created", payload: { ...message, created_at: "yesterday" } },
+    ],
+  ];
+
+  for (const [name, frame] of rejects) {
+    it(name, () => {
+      expect(parseFrame(frame).success).toBe(false);
+    });
+  }
+});
+```
+
+```ts title="packages/protocol/src/codes.test.ts"
+import { describe, expect, it } from "vitest";
+
+import { CLOSE_CODES, ERROR_CODES } from "./codes.js";
+
+// The failure vocabulary stays coherent: EIR-WS-06's four classes are all
+// present, exactly once, with distinct meanings — and error codes never
+// collide or go blank as chapters add to the registry.
+
+describe("close codes cover EIR-WS-06's four classes", () => {
+  it("contains exactly 4001, 4002, 4008, 4009", () => {
+    expect(Object.keys(CLOSE_CODES).map(Number).sort()).toEqual([
+      4001, 4002, 4008, 4009,
+    ]);
+  });
+
+  it("gives every code a distinct, non-empty meaning", () => {
+    const meanings = Object.values(CLOSE_CODES);
+    expect(new Set(meanings).size).toBe(meanings.length);
+    for (const meaning of meanings) expect(meaning.length).toBeGreaterThan(0);
+  });
+});
+
+describe("error codes stay unique and described", () => {
+  it("has no duplicate or empty descriptions", () => {
+    const descriptions = Object.values(ERROR_CODES);
+    expect(new Set(descriptions).size).toBe(descriptions.length);
+    for (const d of descriptions) expect(d.length).toBeGreaterThan(0);
+  });
+
+  it("uses snake_case machine-readable keys (EIR-API-04)", () => {
+    for (const code of Object.keys(ERROR_CODES)) {
+      expect(code).toMatch(/^[a-z][a-z_]*$/);
+    }
+  });
+});
+```
+
+Cài dependency rồi vượt cửa ải:
+
+```bash
+pnpm install
+pnpm lint
+pnpm typecheck
+pnpm test
+```
+
+Giờ là ba mươi hai bài test — sáu bài từ các chương trước, và hai mươi sáu
+bài tra khảo bản giao kèo này từ cả hai phía. Để ý xem bảng từ chối thật sự
+đang kiểm cái gì: không phải zod, mà là *những tuyên bố của chúng ta*.
+"Trường không quen biết bị từ chối" chỉ là một câu văn, cho đến khi có bài
+test chứng minh một `admin: true` lén lút bị bật ra.
+
+<Figure
+  caption="Bức hình của 1.1, hai chương sau: package đã thành hình, và những mũi tên sắp sửa biến thành các dòng import."
+  code={figPayoffRevisited}
+/>
+
+<ForwardRef part="Phần 1–2 và xa hơn" locale="vi">
+
+Chương 1.4 biến những mũi tên đứt nét thành thật: gateway và API service của
+bộ khung biết đi import `@relay/protocol` và không nói thứ tiếng nào khác.
+Phần 2 mở rộng bộ từ vựng theo nhu cầu của vòng lặp lõi — `request_id` trên
+frame lỗi đến cùng gateway đủ khả năng cấp nó, còn các trường sửa tin và
+tombstone đến cùng FR-MSG-07/08. SDK — đầu kia của đường truyền — import đúng
+package này trong phần của riêng nó. Từ vựng cho media, kiểm duyệt và emoji
+nhập hội khi tính năng của chúng đến.
+
+</ForwardRef>
+
+## Đến lượt bạn
+
+Bài tập chính là công trình: tự tạo `packages/protocol` theo chương này, tự
+tay gõ các schema. Rồi tra khảo thứ bạn vừa xây:
+
+1. Thêm mẫu frame hỏng của riêng bạn vào bảng từ chối — chẳng hạn một
+   `message.send` có payload là mảng — và xem bộ test tóm nó. Nếu bạn bịa ra
+   được một cú suýt đúng mà schema *chấp nhận*, bạn vừa tìm thấy một con bọ
+   thật: siết schema lại và giữ mẫu ấy làm test.
+2. Tự viết tay kiểu `MessageSend` bằng một interface TypeScript, rồi so với
+   thứ `z.infer` sinh ra (rê chuột lên nó trong editor). Giờ xóa interface
+   của bạn đi và ngẫm: mỗi trường bạn gõ là một cơ hội để bất đồng với
+   schema. Chính cú xóa ấy là bản thiết kế.
+3. Sửa `seq` cho nhận số bất kỳ rồi chạy test. Hai bộ test lên tiếng — bảng
+   từ chối ở đây, và *tạm thời* chưa gì khác. Đến Phần 2, các bất biến về thứ
+   tự sẽ biến cú đổi một ký tự ấy thành cả tá test trượt xuyên các service.
+   Vùng nổ cứ lớn dần ấy chính là bản giao kèo đang làm đúng việc của nó.
+
+Nếu bạn kẹt, tag của chương đang giữ sẵn đáp án: `part1-ch3`.
+
+## Những điều đọng lại
+
+Nếu không đọc gì khác trong chương này, hãy giữ lấy những điều sau:
+
+- **Bản giao kèo đi trước** — service phải tuân theo package protocol, không
+  bao giờ ngược lại; đó là thứ biến sai lệch thành lỗi biên dịch thay vì sự
+  cố ngoài production (ADR-01, trả nợ đủ).
+- **Bộ từ vựng được dẫn ra, không phải bịa ra**: frame, cursor, cắt bớt
+  backfill và close code đến từ SRS và SAD; nhúm khoảng trống tài liệu bỏ ngỏ
+  được quyết công khai, giấy trắng mực đen.
+- **Schema là kiểu dữ liệu sống sót qua runtime** — mọi kiểu tĩnh đều là
+  `z.infer` từ chính schema kiểm tra nó; một định nghĩa, chẳng còn gì để
+  lệch.
+- **Phần kiểm tra sống cùng nhà với kiểu**: một thư viện, một mái nhà, không
+  bản sao cho từng service — căn bệnh sai lệch không còn cửa sau để quay
+  lại.
+- **Test phải biết cắn**: bộ test chỉ parse frame hợp lệ thì chẳng chứng nhận
+  điều gì; bảng từ chối mới là nơi bản giao kèo kiếm cơm.
+
+<Checkpoint locale="vi">
+
+Trước khi bắt đầu chương 1.4, bạn cần có: `packages/protocol` trong workspace
+với các schema frame, kiểu suy ra, close code và sổ mã lỗi; zod ghim trong
+`package.json` của riêng package đó (manifest ở gốc không suy suyển); và trọn
+cửa ải chạy xanh với 32 bài test — bảng từ chối gánh phần lớn câu chuyện.
+Trạng thái ấy chính là tag `part1-ch3` trong repository chuẩn; cứ diff với nó
+nếu có gì lệch. Chương 1.4 mặc định package này đã tồn tại và dựng bộ khung
+biết đi nói đúng thứ tiếng của nó.
+
+</Checkpoint>
+
+<ChapterFooter id="1.3" locale="vi" />

@@ -146,11 +146,15 @@ export const series: Part[] = [
         id: "1.3",
         path: "/part-1/chapter-03/the-protocol-package",
         title: "The protocol package",
-        status: "forthcoming",
-        readerProduces: "The @relay/protocol package — frame types, error codes, schemas",
-        sourceDoc: "docs/05-sad.md, docs/06-adr-deep-dives.md",
-        readerMinutes: 90,
+        status: "published",
+        translatedIn: ["vi"],
+        readerProduces:
+          "The shared wire contract — frame types, error codes, and schemas that reject bad input",
+        sourceDoc: "docs/04-srs.md, docs/05-sad.md",
+        readerMinutes: 75,
         titleVi: "Package protocol",
+        readerProducesVi:
+          "Bản giao kèo đường truyền dùng chung — kiểu frame, mã lỗi, và schema biết từ chối dữ liệu hỏng",
       },
       {
         id: "1.4",
