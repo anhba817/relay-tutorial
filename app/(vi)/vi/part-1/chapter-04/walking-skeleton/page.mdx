@@ -1,0 +1,711 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figSkeletonMap, figRequestThread, figPartOneComplete } from "./figures";
+
+export const metadata = {
+  title: "Bộ khung biết đi — Building Relay",
+  description:
+    "Màn khép lại Phần 1: API service và gateway đứng dậy — trống rỗng có chủ đích, nhưng quan sát được toàn phần. Health check, request ID và log JSON có cấu trúc ngay từ dòng đầu tiên, kèm câu chuyện thật về cách các service này chạy.",
+  alternates: {
+    canonical: "/vi/part-1/chapter-04/walking-skeleton",
+    languages: {
+      en: "/part-1/chapter-04/walking-skeleton",
+      vi: "/vi/part-1/chapter-04/walking-skeleton",
+    },
+  },
+};
+
+<ChapterHeader id="1.4" locale="vi" />
+
+Ba chương đầu của Phần 1 xây toàn những thứ người dùng không bao giờ nhìn
+thấy: một workspace, bốn store, một bản giao kèo. Hôm nay có thứ biết trả
+lời. Chúng ta dựng dậy hai trong sáu service của Relay — API service và
+gateway — dưới dạng một *bộ khung biết đi*: không logic nghiệp vụ, không kết
+nối store, không có gì để đem đi demo. Thứ chúng có là tất cả những gì đội
+vận hành sẽ cần vào ngày tồi tệ nhất: một health check, một request ID trên
+mọi phản hồi, và những dòng log có cấu trúc để một lệnh grep kể trọn câu
+chuyện của một request. Dựng bộ khung trước khi đắp cơ bắp — vì cấy hệ thần
+kinh vào một cơ thể đã trưởng thành là một ca đại phẫu.
+
+<SkipAhead locale="vi">
+
+Nếu bạn buộc phải đọc lướt: chương này thêm ba thành viên workspace —
+`packages/service-kit` (logger dùng chung, request ID, một lớp bọc HTTP nhỏ
+xíu) và hai service trống-có-chủ-đích `services/api` + `services/gateway`.
+Khởi động bằng `pnpm --filter @relay/api dev` và
+`pnpm --filter @relay/gateway dev` (cổng 4000/4001), còn cửa ải — giờ là 40
+bài test — vẫn không cần Docker. Trạng thái cuối chương là tag
+**`part1-ch4`**, và cùng với nó, Phần 1 hoàn tất.
+
+</SkipAhead>
+
+## Vì sao là hai service này trước
+
+Góc nhìn service của bản SAD gọi tên sáu service triển khai được, và đánh dấu
+đúng hai trong số đó là Phase 1. Cặp đôi ấy không hề ngẫu nhiên — nó là phép
+phân công lao động trung tâm của cả kiến trúc, được quyết từ những bản ADR ta
+đã đọc ở 0.5 và trích nguyên văn từ chính bảng trách nhiệm §4.1. API service
+"owns all REST semantics" — nắm trọn ngữ nghĩa REST — và là "the *only*
+service that writes to PostgreSQL — a deliberate single-writer discipline"
+(service *duy nhất* ghi vào PostgreSQL — một kỷ luật một-người-ghi có chủ
+đích, ADR-04). Gateway "terminates WebSockets" — tiếp nhận WebSocket — và
+chuyển các lệnh ghi qua HTTP nội bộ: "the gateway never writes to the
+database" (gateway không bao giờ ghi vào database, ADR-05).
+
+<Why source="SAD §4.1 · ADR-04/05" locale="vi">
+
+Vì sao khởi đầu bằng hai service rỗng thay vì một service hữu ích? Vì bộ
+khung tồn tại để biến các *ranh giới* thành thật trước khi code kịp chất
+đống lên hai bên bờ. Đường chia API/gateway — một bên nắm bất biến, một bên
+nắm kết nối — là dòng kẻ chịu lực nhất trong bản SAD, và mọi chương của Phần
+2 đều tựa vào nó: tin nhắn gửi đi theo đường gateway → API (ADR-05), đọc
+backfill cũng đi đúng con đường nội bộ ấy (ADR-04). Nếu ta xây một service
+rồi tách sau, đường nối sẽ nằm ở bất cứ đâu cuộc refactor tiện tay bỏ lại.
+Xây theo cách này, đường nối nằm đúng chỗ kiến trúc đã vạch, và nó được test
+— dù đơn sơ đến đâu — từ ngày đầu tiên nó tồn tại.
+
+</Why>
+
+## Observability từ dòng đầu tiên
+
+Dòng kế hoạch của loạt bài trao cho chương này nửa còn lại: health check,
+request ID, log có cấu trúc. Mỗi thứ là một yêu cầu, không phải một thói
+quen.
+
+**Request ID** là EIR-API-05, trích đủ vì mệnh đề nào cũng có việc của nó:
+"Every response shall include a unique `X-Request-Id` header, referenced in
+all error responses and in the request log" — mọi phản hồi phải mang một
+header `X-Request-Id` duy nhất, được nhắc lại trong mọi phản hồi lỗi và trong
+log của request. Tài liệu ấn định tính duy nhất nhưng không ấn định định
+dạng — chúng ta quyết `crypto.randomUUID()` và ghi lại.
+
+**Log có cấu trúc** là NFR-OBS-01: "All services shall emit structured JSON
+logs including request ID, tenant ID, and correlation ID." Đọc câu ấy một
+cách trung thực thì hai trong ba trường chưa thể tồn tại — chưa có tenant nào
+cho đến các đường dữ liệu của Phần 2, và chưa có gì để correlate khi chưa có
+hơn một chặng nhảy (OpenTelemetry đến cùng NFR-OBS-02, về sau). Hôm nay chúng
+ta log `request_id` thật, và ghi nhận hai trường kia là những khoản hoãn có
+địa chỉ đến rõ ràng. Làm giả chúng còn tệ hơn là thiếu chúng.
+
+**Vì sao cần tất cả những thứ này trước cả khi có logic để quan sát?**
+NFR-OBS-06: "Any customer-reported issue shall be traceable from a request ID
+to complete logs and traces within 5 minutes" — mọi sự cố khách hàng báo phải
+truy vết được từ một request ID đến trọn bộ log và trace trong vòng 5 phút.
+Lời hứa ấy đắt khủng khiếp nếu trang bị lại về sau và gần như miễn phí nếu bắt
+đầu từ ngày đầu — *miễn là* nó bắt đầu từ ngày đầu, tức là hôm nay.
+
+Bản thân endpoint health là quyết định của chúng ta, có ghi lại:
+`GET /healthz`, đúng cách viết mà các healthcheck compose của 1.2 đã dùng,
+trả về `{ status: "ok", service, uptime_s }`. Cổng cũng vậy: 4000 cho API
+service, 4001 cho gateway, mỗi bên ghi đè được bằng `PORT` (3000 không thuộc
+về thứ gì trong repo này — đó là nơi trang hướng dẫn bạn đang đọc đang sống).
+
+<Figure
+  caption="Sáu service của bản SAD, hai chiếc giờ đã đứng — rỗng phần sản phẩm, đầy đủ những thuộc tính mà đội vận hành cần vào ngày tồi tệ nhất."
+  code={figSkeletonMap}
+/>
+
+## Một mái nhà cho đồ nghề chung
+
+Cả hai service cần đúng ba món: logger, con dấu request ID, và phần dây điện
+health/404.
+
+<Trap locale="vi">
+
+Nước đi ngây thơ là viết ~80 dòng ấy trong `services/api`, rồi chép sang
+`services/gateway` — chúng bé mà, chép nhanh hơn tách. Đây chính là cái bẫy
+cấu hình của 1.1 khoác áo runtime, và nó kết thúc y hệt: bây giờ chẳng có gì
+hỏng, và sáu tháng sau một bản log `requestId` trong khi bản kia log
+`request_id`, một bên đóng dấu header lên cả phản hồi lỗi còn bên kia quên
+mất, và cú grep mà NFR-OBS-06 đã hứa quay về thiếu một nửa — *ngay giữa sự
+cố khiến bạn phải grep*. Đồ nghề vận hành trôi dạt nguy hiểm hơn logic
+nghiệp vụ, vì chẳng có gì động đến nó cho tới khi mọi chuyện đã hỏng sẵn.
+Cách chữa y như 1.1: một mái nhà. Phần đồ nghề trở thành package dùng chung
+thứ ba của workspace, còn các service mỏng đến mức gần như không tồn tại.
+
+</Trap>
+
+```json title="packages/service-kit/package.json"
+{
+  "name": "@relay/service-kit",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  }
+}
+```
+
+```json title="packages/service-kit/tsconfig.json"
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "erasableSyntaxOnly": true
+  },
+  "include": ["src"]
+}
+```
+
+Một dòng mới trong bản tsconfig quen thuộc: `erasableSyntaxOnly` bắt compiler
+từ chối mọi cú pháp TypeScript không thể chỉ-xóa-đi mà để lại JavaScript hợp
+lệ (enum, namespace). Giữ ý nghĩ đó lại — nó thuộc về một câu chuyện ta sẽ kể
+nốt bên dưới. Tsconfig của hai service chính là file này, giống hệt từng
+byte; chúng ta sẽ không in nó thêm hai lần.
+
+```ts title="packages/service-kit/src/index.ts"
+import { randomUUID } from "node:crypto";
+import { createServer, type Server } from "node:http";
+
+// The operational plumbing every Relay service shares — ONE home, because
+// the second copy is where drift starts (chapter 1.4's TRAP; 1.1's lesson
+// applied to behavior instead of configuration).
+//
+// Logs are structured JSON, one object per line (NFR-OBS-01): request_id is
+// real from day one; tenant_id and trace/correlation ids are recorded
+// deferrals — they join when Part 2's data paths and NFR-OBS-02's tracing
+// make them mean something.
+
+export type LogSink = (line: string) => void;
+
+const stdoutSink: LogSink = (line) => {
+  process.stdout.write(line + "\n");
+};
+
+export interface Logger {
+  log(level: "info" | "error", msg: string, fields?: Record<string, unknown>): void;
+}
+
+/** One JSON object per line; the sink is injectable so tests can assert log
+ * structure instead of scraping stdout — observability you can't test rots. */
+export function createLogger(service: string, sink: LogSink = stdoutSink): Logger {
+  return {
+    log(level, msg, fields = {}) {
+      sink(
+        JSON.stringify({
+          time: new Date().toISOString(),
+          level,
+          service,
+          msg,
+          ...fields,
+        }),
+      );
+    },
+  };
+}
+
+/** EIR-API-05 fixes uniqueness; the UUID format is chapter 1.4's decision. */
+export function newRequestId(): string {
+  return randomUUID();
+}
+
+export interface ServeOptions {
+  service: string;
+  /** Extra fields merged into the /healthz payload. */
+  health: () => Record<string, unknown>;
+  logger?: Logger;
+}
+
+/** Build (but do not start) a service's HTTP server: every response carries
+ * X-Request-Id (EIR-API-05), every request logs exactly one structured line
+ * carrying the same id (NFR-OBS-06's grep-ability starts here), GET /healthz
+ * answers with the service's health payload, and unknown routes get the
+ * EIR-API-04 error shape. The docs_url host is a placeholder until the docs
+ * site exists — constitution V's reachable-page promise lands with it. */
+export function serve(options: ServeOptions): Server {
+  const { service, health } = options;
+  const logger = options.logger ?? createLogger(service);
+  return createServer((req, res) => {
+    const requestId = newRequestId();
+    const path = req.url ?? "/";
+    res.setHeader("X-Request-Id", requestId);
+    res.setHeader("content-type", "application/json");
+
+    let status: number;
+    let body: unknown;
+    if (req.method === "GET" && path === "/healthz") {
+      status = 200;
+      body = { status: "ok", service, ...health() };
+    } else {
+      status = 404;
+      body = {
+        code: "not_found",
+        message: `no route for ${req.method ?? "?"} ${path}`,
+        docs_url: "https://relay.example/docs/errors/not_found",
+      };
+    }
+    res.statusCode = status;
+    res.end(JSON.stringify(body));
+    logger.log("info", "request", {
+      request_id: requestId,
+      method: req.method,
+      path,
+      status,
+    });
+  });
+}
+```
+
+Ba chi tiết xứng đáng với số dòng của chúng. Cái sink tiêm được từ ngoài vào,
+vì phần log không test được sẽ mục ruỗng trong im lặng — các bài test của
+chúng ta sẽ parse từng dòng log, không nheo mắt nhìn stdout. Thân của 404 là
+khuôn lỗi EIR-API-04 — `code`, `message`, `docs_url` — kèm hai quyết định có
+ghi lại: mã `not_found` sống cùng các service cho đến khi một chương API sở
+hữu sổ mã REST riêng, và host của `docs_url` là chỗ giữ tạm cho đến khi trang
+tài liệu ra đời để biến lời hứa trang-tra-cứu-được của constitution V thành
+thật. Và `serve` dựng server nhưng không khởi động nó — chính khoảng tách ấy
+cho phép các bài test khởi động trên một cổng vu vơ.
+
+## Hai service
+
+Có bộ đồ nghề rồi, mỗi service chỉ còn vỏn vẹn một trang:
+
+```json title="services/api/package.json"
+{
+  "name": "@relay/api",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/main.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@relay/protocol": "workspace:*",
+    "@relay/service-kit": "workspace:*"
+  },
+  "devDependencies": {
+    "tsx": "^4.23.1"
+  }
+}
+```
+
+```ts title="services/api/src/main.ts"
+import { createLogger, serve, type Logger } from "@relay/service-kit";
+
+// The API service — SAD §4.1: owns all REST semantics and is the ONLY
+// service that writes to PostgreSQL (ADR-04). At walking-skeleton stage it
+// is deliberately empty: health, request ids, structured logs. The muscles —
+// tenancy, channels, the message write path — grow onto this in Part 2, and
+// its REST error envelope is already asserted (in the test beside this file)
+// to match @relay/protocol's error payload shape: one error shape, one home.
+
+export function createServer(logger?: Logger) {
+  return serve({
+    service: "api",
+    health: () => ({ uptime_s: Math.round(process.uptime()) }),
+    ...(logger ? { logger } : {}),
+  });
+}
+
+if (import.meta.main) {
+  const port = Number(process.env.PORT ?? 4000);
+  const logger = createLogger("api");
+  createServer().listen(port, () => {
+    logger.log("info", "listening", { port });
+  });
+}
+```
+
+```json title="services/gateway/package.json"
+{
+  "name": "@relay/gateway",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/main.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@relay/protocol": "workspace:*",
+    "@relay/service-kit": "workspace:*"
+  },
+  "devDependencies": {
+    "tsx": "^4.23.1"
+  }
+}
+```
+
+```ts title="services/gateway/src/main.ts"
+import { CLOSE_CODES, frameSchema } from "@relay/protocol";
+import { createLogger, serve, type Logger } from "@relay/service-kit";
+
+// The gateway — SAD §4.1: terminates WebSockets and never writes to the
+// database (ADR-05). At walking-skeleton stage no sockets exist yet; instead
+// the gateway DECLARES the wire vocabulary it will speak, computed from
+// @relay/protocol — never hardcoded, so the advertisement cannot drift from
+// the contract. Sessions, JWT verification, and real frames arrive in Part 2.
+
+const frames = frameSchema.options.map((option) => option.shape.type.value);
+const closeCodes = Object.keys(CLOSE_CODES).map(Number);
+
+export function createServer(logger?: Logger) {
+  return serve({
+    service: "gateway",
+    health: () => ({
+      uptime_s: Math.round(process.uptime()),
+      protocol: { frames, close_codes: closeCodes },
+    }),
+    ...(logger ? { logger } : {}),
+  });
+}
+
+if (import.meta.main) {
+  const port = Number(process.env.PORT ?? 4001);
+  const logger = createLogger("gateway");
+  createServer().listen(port, () => {
+    logger.log("info", "listening", { port });
+  });
+}
+```
+
+Gateway làm đúng một việc vượt ra ngoài health: payload health của nó *công
+bố bộ từ vựng protocol mà nó sẽ nói* — từng tên frame, từng close code, tính
+ra lúc khởi động từ chính các export của `@relay/protocol`. Không một chuỗi
+nào được gõ tay, nên bảng công bố không thể lệch khỏi bản giao kèo. 1.3 đã
+hứa bộ khung sẽ không nói thứ tiếng nào ngoài package protocol; một bộ khung
+rỗng chưa thể trò chuyện, nhưng nó có thể bày bộ từ vựng của mình ra tủ kính.
+
+<Why source="các script dev — một quyết định có sẹo" locale="vi">
+
+Nhìn vào script `dev`: `tsx watch src/main.ts`. Đó là một dependency, và nó
+xứng đáng được kể chuyện một cách trung thực, vì phiên bản đầu tiên của chúng
+ta không cần đến nó. Node từ 22.18 biết tự lột kiểu tĩnh và chạy thẳng một
+file TypeScript — chúng ta đã kiểm chứng, và với một file đơn lẻ thì tuyệt
+đẹp. Rồi gateway import `@relay/protocol`, và nền tảng đâm vào tường: quy ước
+ESM của TypeScript viết các import nội bộ là `./frames.js` (được compiler và
+test runner phân giải về `frames.ts`), còn **Node thì không viết lại
+specifier** — nó đi tìm một file `frames.js` chưa từng tồn tại, và đổ sập.
+Các file của package protocol đã xuất bản ở 1.3 và giờ là bất khả xâm phạm;
+sửa import của chúng không nằm trên bàn cân. Vậy nên chúng ta cầm lấy công cụ
+nhỏ nhất phân giải được quy ước ấy: `tsx`, chỉ ở devDependencies, ghim phiên
+bản, trong đúng hai package chạy tiến trình dài hơi. Cờ `erasableSyntaxOnly`
+vẫn ở nguyên trong tsconfig — ngày nào resolver của Node học được quy ước
+này, việc duy nhất cần làm là xóa một devDependency.
+
+</Why>
+
+## Dựng nó dậy
+
+Hai cửa sổ terminal — công cụ trung thực ở quy mô này; một trình quản lý tiến
+trình là cỗ máy ta chưa cần:
+
+```bash
+pnpm --filter @relay/api dev
+```
+
+```bash
+pnpm --filter @relay/gateway dev
+```
+
+Giờ tra khảo bộ khung:
+
+```bash
+curl -i localhost:4000/healthz
+curl -s localhost:4001/healthz
+curl -i localhost:4000/no-such-route
+```
+
+Ba thứ đáng nhìn tận mắt. Header `X-Request-Id` trên mọi phản hồi — gọi hai
+lần, nhận hai UUID khác nhau. Khối `protocol` của gateway điểm danh đủ mười
+frame và bốn close code. Và trong terminal của mỗi service, đúng một dòng log
+JSON cho mỗi request, với `request_id` khớp với header bạn vừa nhận — cặp đôi
+ấy là NFR-OBS-06 thu nhỏ: cầm một id từ bất cứ đâu, grep tìm ra trọn câu
+chuyện của request đó.
+
+<Figure
+  caption="Một request, một id, hai nơi: header phản hồi người gọi giữ lấy và dòng log người vận hành grep ra — cùng một UUID xâu chuỗi cả hai."
+  code={figRequestThread}
+/>
+
+## Những bài test canh chừng người gác
+
+Các bộ test khởi động mỗi service trên cổng 0 — cổng vu vơ do hệ điều hành
+cấp — nên test không bao giờ va chạm với service đang chạy hay với nhau:
+
+```ts title="packages/service-kit/src/index.test.ts"
+import { describe, expect, it } from "vitest";
+
+import { createLogger, newRequestId } from "./index.js";
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+describe("structured logger (NFR-OBS-01)", () => {
+  it("emits one valid JSON object per line with the required fields", () => {
+    const lines: string[] = [];
+    const logger = createLogger("test-svc", (line) => lines.push(line));
+    logger.log("info", "hello", { request_id: "r-1" });
+
+    expect(lines).toHaveLength(1);
+    const parsed = JSON.parse(lines[0]!) as Record<string, unknown>;
+    expect(parsed).toMatchObject({
+      level: "info",
+      service: "test-svc",
+      msg: "hello",
+      request_id: "r-1",
+    });
+    expect(Number.isNaN(Date.parse(parsed.time as string))).toBe(false);
+  });
+
+  it("keeps levels and extra fields intact through the sink", () => {
+    const lines: string[] = [];
+    const logger = createLogger("test-svc", (line) => lines.push(line));
+    logger.log("error", "boom", { status: 500 });
+    const parsed = JSON.parse(lines[0]!) as Record<string, unknown>;
+    expect(parsed.level).toBe("error");
+    expect(parsed.status).toBe(500);
+  });
+});
+
+describe("request ids (EIR-API-05)", () => {
+  it("are UUID-shaped and unique", () => {
+    const a = newRequestId();
+    const b = newRequestId();
+    expect(a).toMatch(UUID_RE);
+    expect(b).toMatch(UUID_RE);
+    expect(a).not.toBe(b);
+  });
+});
+```
+
+```ts title="services/api/src/main.test.ts"
+import type { AddressInfo } from "node:net";
+import type { Server } from "node:http";
+
+import { errorFrameSchema } from "@relay/protocol";
+import { describe, expect, it } from "vitest";
+
+import { createLogger } from "@relay/service-kit";
+
+import { createServer } from "./main.js";
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const silent = createLogger("api", () => {});
+
+function listen(server: Server): Promise<number> {
+  return new Promise((resolve) =>
+    server.listen(0, () => resolve((server.address() as AddressInfo).port)),
+  );
+}
+
+describe("api skeleton", () => {
+  it("answers /healthz with its shape and a fresh request id per response", async () => {
+    const server = createServer(silent);
+    const port = await listen(server);
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/healthz`);
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as Record<string, unknown>;
+      expect(body).toMatchObject({ status: "ok", service: "api" });
+      expect(typeof body.uptime_s).toBe("number");
+
+      const id1 = res.headers.get("x-request-id");
+      const id2 = (await fetch(`http://127.0.0.1:${port}/healthz`)).headers.get(
+        "x-request-id",
+      );
+      expect(id1).toMatch(UUID_RE);
+      expect(id2).toMatch(UUID_RE);
+      expect(id1).not.toBe(id2);
+    } finally {
+      server.close();
+    }
+  });
+
+  it("shapes its 404 exactly like the protocol's error payload (EIR-API-04)", async () => {
+    const server = createServer(silent);
+    const port = await listen(server);
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/no-such-route`);
+      expect(res.status).toBe(404);
+      const body: unknown = await res.json();
+      // One error shape, one home: the REST envelope must parse against the
+      // wire contract's error payload schema — alignment by construction.
+      const parsed = errorFrameSchema.shape.payload.safeParse(body);
+      expect(parsed.success).toBe(true);
+      if (parsed.success) expect(parsed.data.code).toBe("not_found");
+    } finally {
+      server.close();
+    }
+  });
+
+  it("logs exactly one structured line per request, carrying the response's id", async () => {
+    const lines: string[] = [];
+    const server = createServer(createLogger("api", (line) => lines.push(line)));
+    const port = await listen(server);
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/healthz`);
+      expect(lines).toHaveLength(1);
+      const entry = JSON.parse(lines[0]!) as Record<string, unknown>;
+      expect(entry).toMatchObject({
+        service: "api",
+        msg: "request",
+        path: "/healthz",
+        status: 200,
+      });
+      expect(entry.request_id).toBe(res.headers.get("x-request-id"));
+    } finally {
+      server.close();
+    }
+  });
+});
+```
+
+```ts title="services/gateway/src/main.test.ts"
+import type { AddressInfo } from "node:net";
+import type { Server } from "node:http";
+
+import { CLOSE_CODES, frameSchema } from "@relay/protocol";
+import { describe, expect, it } from "vitest";
+
+import { createLogger } from "@relay/service-kit";
+
+import { createServer } from "./main.js";
+
+const silent = createLogger("gateway", () => {});
+
+function listen(server: Server): Promise<number> {
+  return new Promise((resolve) =>
+    server.listen(0, () => resolve((server.address() as AddressInfo).port)),
+  );
+}
+
+describe("gateway skeleton", () => {
+  it("advertises exactly the vocabulary @relay/protocol exports", async () => {
+    const server = createServer(silent);
+    const port = await listen(server);
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/healthz`);
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        status: string;
+        service: string;
+        protocol: { frames: string[]; close_codes: number[] };
+      };
+      expect(body.status).toBe("ok");
+      expect(body.service).toBe("gateway");
+      // Computed from the package on both sides of this assertion — but one
+      // side travelled over HTTP: the advertisement matches the contract.
+      const expectedFrames = frameSchema.options.map((o) => o.shape.type.value);
+      expect(body.protocol.frames).toEqual(expectedFrames);
+      expect(body.protocol.frames).toContain("connection.ack");
+      expect(body.protocol.frames).toHaveLength(10);
+      expect(body.protocol.close_codes).toEqual(
+        Object.keys(CLOSE_CODES).map(Number),
+      );
+    } finally {
+      server.close();
+    }
+  });
+
+  it("carries a request id and answers unknown routes with the shared 404 shape", async () => {
+    const server = createServer(silent);
+    const port = await listen(server);
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/socket-someday`);
+      expect(res.status).toBe(404);
+      expect(res.headers.get("x-request-id")).toBeTruthy();
+      const body = (await res.json()) as Record<string, unknown>;
+      expect(body.code).toBe("not_found");
+      expect(typeof body.docs_url).toBe("string");
+    } finally {
+      server.close();
+    }
+  });
+});
+```
+
+Để ý bài test thứ hai của API service: cái 404 REST của nó phải *parse được
+bằng schema payload lỗi của package protocol*. Một phép khẳng định ấy chính
+là toàn bộ chính sách một-khuôn-lỗi, chạy được bằng máy — phong thư lỗi REST
+và frame lỗi WebSocket không bao giờ có thể lặng lẽ tách đôi, vì có một bài
+test import bên này và đút cho nó bên kia. Cả hai service đều tiêu thụ
+`@relay/protocol` ngay hôm nay, đúng như 1.3 đã nói.
+
+Bước qua cửa ải:
+
+```bash
+pnpm install
+pnpm lint
+pnpm typecheck
+pnpm test
+```
+
+Bốn mươi bài test. Không Docker, không cổng cố định, và là chương thứ tư
+liên tiếp cửa ải không cần gì ngoài Node.
+
+<Figure
+  caption="Bốn chương, bốn tag, một cửa ải — Phần 1 đứng trọn vẹn, và Phần 2 đã có chỗ để đắp cơ bắp."
+  code={figPartOneComplete}
+/>
+
+<ForwardRef part="Phần 2 — vòng lặp lõi" locale="vi">
+
+Mọi khoản hoãn trong chương này đều có địa chỉ đến. Phần 2 đắp cơ bắp: xác
+thực JWT và session WebSocket trên gateway, đường ghi tin nhắn trên API
+service, frame thật trên socket thật — và cùng chúng là `tenant_id` trong
+từng dòng log, `request_id` trên các frame lỗi, và những kết nối store đầu
+tiên chạm vào dàn compose của 1.2. Container và Dockerfile cho các service
+thuộc về Phần 6. Bộ khung log bạn dựng hôm nay sẽ mọc thêm trường; nó không
+bao giờ phải xây lại.
+
+</ForwardRef>
+
+## Đến lượt bạn
+
+Bài tập chính là công trình: tự tạo cả ba thành viên theo chương này, tự tay
+gõ phần kit. Rồi chọc vào bộ khung ở những chỗ nó biết dạy:
+
+1. Khởi động cả hai service, giết gateway, rồi curl API service — nó vẫn trả
+   lời, bình thản. Hai tiến trình hỏng độc lập với nhau chính là toàn bộ lý
+   do "sáu service" là một kiến trúc khả dĩ; bạn vừa quan sát phiên bản nhỏ
+   nhất của điều đó.
+2. Bắn một tá request lẫn lộn vào cả hai service, nhặt một `X-Request-Id` từ
+   một phản hồi, và grep cả hai terminal. Một dòng, một service, trọn câu
+   chuyện — đó là NFR-OBS-06 tập dượt trên một hệ thống to bốn file.
+3. Thêm tạm một route `/version` vào API service và để ý: bài test 404 vẫn
+   xanh nhưng cái *route* thì không ai test. Cảm nhận khoảng hở ấy: mỗi route
+   bạn thêm từ nay về sau đều nợ bộ test một bài. Xóa nó đi (hoặc test nó)
+   trước khi đi tiếp.
+
+Nếu bạn kẹt, tag của chương đang giữ sẵn đáp án: `part1-ch4`.
+
+## Những điều đọng lại
+
+Nếu không đọc gì khác trong chương này, hãy giữ lấy những điều sau:
+
+- **Bộ khung phải dựng trước khi đắp cơ bắp** — đường nối API/gateway là dòng
+  kẻ chịu lực nhất của kiến trúc, và nó tồn tại (kèm test) trước khi bất kỳ
+  logic nào kịp làm nhòe nó.
+- **Observability bắt đầu từ dòng đầu tiên**: request ID trên mọi phản hồi
+  (EIR-API-05), một dòng log JSON có cấu trúc cho mỗi request (NFR-OBS-01),
+  và những khoản hoãn trung thực cho các trường chưa thể tồn tại — vì lời hứa
+  5 phút của NFR-OBS-06 rẻ bây giờ và là đại phẫu về sau.
+- **Đồ nghề vận hành có đúng một mái nhà** — bản sao thứ hai là nơi trôi dạt
+  bắt đầu, và đồ nghề trôi dạt trong im lặng cho tới đúng cái sự cố cần đến
+  nó.
+- **Dependency là quyết định có câu chuyện**: trò lột kiểu của nền tảng đâm
+  vào tường resolver ở cú import liên-package đầu tiên; tsx là công cụ nhỏ
+  nhất chữa được, cầm lên một cách chủ đích và ghim chặt.
+- **Một khuôn lỗi, một mái nhà, máy kiểm chứng** — cái 404 REST parse được
+  bằng schema payload lỗi của protocol, nên hai bộ từ vựng thất bại không thể
+  tách đôi.
+
+<Checkpoint locale="vi">
+
+Trước khi bước vào Phần 2, bạn cần có: cả ba thành viên workspace mới; hai
+service khởi động bằng `pnpm --filter … dev` và trả lời `/healthz` với những
+request ID xuất hiện lại trong log có cấu trúc của chúng; gateway công bố đủ
+mười frame và bốn close code; và cửa ải xanh ở 40 bài test mà không có Docker
+nào đang chạy. Trạng thái ấy là tag `part1-ch4` trong repository chuẩn — và
+nó nhiều hơn một ranh giới chương: **Phần 1 đã hoàn tất.** Workspace, thế
+giới, bản giao kèo, và bộ khung — nền đất đã xong. Phần 2 xây Relay lên trên
+nó.
+
+</Checkpoint>
+
+<ChapterFooter id="1.4" locale="vi" />
