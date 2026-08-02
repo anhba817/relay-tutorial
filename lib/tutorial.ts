@@ -70,7 +70,8 @@ export const series: Part[] = [
         sourceDoc: "docs/02-personas.md",
         readerMinutes: 75,
         titleVi: "Bốn người sẽ phán xét chúng ta",
-        readerProducesVi: "Một bộ chân dung người dùng, bao gồm cả người dùng cuối vô hình",
+        readerProducesVi:
+          "Một bộ chân dung người dùng, bao gồm cả người dùng cuối vô hình",
         translatedIn: ["vi"],
       },
       {
@@ -90,11 +91,13 @@ export const series: Part[] = [
         path: "/part-0/chapter-04/requirements-you-can-test",
         title: "Requirements you can test",
         status: "published",
-        readerProduces: "An SRS slice with IDs, priorities, verification methods",
+        readerProduces:
+          "An SRS slice with IDs, priorities, verification methods",
         sourceDoc: "docs/04-srs.md",
         readerMinutes: 100,
         titleVi: "Những yêu cầu bạn có thể kiểm chứng",
-        readerProducesVi: "Một lát cắt SRS với đầy đủ ID, độ ưu tiên và phương pháp kiểm chứng",
+        readerProducesVi:
+          "Một lát cắt SRS với đầy đủ ID, độ ưu tiên và phương pháp kiểm chứng",
         translatedIn: ["vi"],
       },
       {
@@ -106,8 +109,10 @@ export const series: Part[] = [
         readerProduces: "A drivers table; two ADRs written from scratch",
         sourceDoc: "docs/05-sad.md, docs/06-adr-deep-dives.md",
         readerMinutes: 110,
-        titleVi: "Quyết định trên giấy trắng mực đen — bản SAD và thói quen viết ADR",
-        readerProducesVi: "Bảng động lực thiết kế (drivers); hai bản ADR viết từ con số không",
+        titleVi:
+          "Quyết định trên giấy trắng mực đen — bản SAD và thói quen viết ADR",
+        readerProducesVi:
+          "Bảng động lực thiết kế (drivers); hai bản ADR viết từ con số không",
       },
     ],
   },
@@ -122,11 +127,13 @@ export const series: Part[] = [
         title: "The monorepo and the toolchain",
         status: "published",
         translatedIn: ["vi"],
-        readerProduces: "A running pnpm workspace — TypeScript, lint, and a passing test suite",
+        readerProduces:
+          "A running pnpm workspace — TypeScript, lint, and a passing test suite",
         sourceDoc: "docs/05-sad.md, docs/06-adr-deep-dives.md",
         readerMinutes: 90,
         titleVi: "Monorepo và bộ công cụ",
-        readerProducesVi: "Một pnpm workspace chạy được — TypeScript, lint, và bộ test xanh",
+        readerProducesVi:
+          "Một pnpm workspace chạy được — TypeScript, lint, và bộ test xanh",
       },
       {
         id: "1.2",
@@ -195,11 +202,15 @@ export const series: Part[] = [
         id: "2.2",
         path: "/part-2/chapter-02/the-write-path",
         title: "The write path",
-        status: "forthcoming",
-        readerProduces: "POST message: channel row lock, sequence assignment (ADR-03)",
+        status: "published",
+        translatedIn: ["vi"],
+        readerProduces:
+          "POST message: channel row lock, sequence assignment (ADR-03)",
         sourceDoc: "docs/05-sad.md",
         readerMinutes: 90,
-        titleVi: "Đường ghi tin",
+        titleVi: "Quá trình gửi tin nhắn",
+        readerProducesVi:
+          "Gửi tin nhắn: channel row lock và sequence assignment (ADR-03)",
       },
       {
         id: "2.3",
@@ -226,7 +237,8 @@ export const series: Part[] = [
         path: "/part-2/chapter-05/the-socket",
         title: "The socket",
         status: "forthcoming",
-        readerProduces: "Gateway: WS termination, JWT verify, connection registry",
+        readerProduces:
+          "Gateway: WS termination, JWT verify, connection registry",
         sourceDoc: "docs/04-srs.md, docs/05-sad.md",
         readerMinutes: 90,
         titleVi: "Đường socket",
@@ -265,12 +277,32 @@ export const series: Part[] = [
       },
     ],
   },
-  { number: 3, title: "Becoming a platform", titleVi: "Vươn mình thành nền tảng", chapters: [] },
-  { number: 4, title: "The second data path", titleVi: "Con đường dữ liệu thứ hai", chapters: [] },
-  { number: 5, title: "Developer experience", titleVi: "Trải nghiệm lập trình viên", chapters: [] },
+  {
+    number: 3,
+    title: "Becoming a platform",
+    titleVi: "Vươn mình thành nền tảng",
+    chapters: [],
+  },
+  {
+    number: 4,
+    title: "The second data path",
+    titleVi: "Con đường dữ liệu thứ hai",
+    chapters: [],
+  },
+  {
+    number: 5,
+    title: "Developer experience",
+    titleVi: "Trải nghiệm lập trình viên",
+    chapters: [],
+  },
   { number: 6, title: "Shipping it", titleVi: "Ship sản phẩm", chapters: [] },
   { number: 7, title: "Running it", titleVi: "Vận hành", chapters: [] },
-  { number: 8, title: "The retrospective", titleVi: "Nhìn lại chặng đường", chapters: [] },
+  {
+    number: 8,
+    title: "The retrospective",
+    titleVi: "Nhìn lại chặng đường",
+    chapters: [],
+  },
 ];
 
 const allChapters: Chapter[] = series.flatMap((part) => part.chapters);
@@ -311,7 +343,10 @@ export function chapterTitle(chapter: Chapter, locale: Locale): string {
   return locale === "vi" && chapter.titleVi ? chapter.titleVi : chapter.title;
 }
 
-export function chapterReaderProduces(chapter: Chapter, locale: Locale): string {
+export function chapterReaderProduces(
+  chapter: Chapter,
+  locale: Locale,
+): string {
   return locale === "vi" && chapter.readerProducesVi
     ? chapter.readerProducesVi
     : chapter.readerProduces;
