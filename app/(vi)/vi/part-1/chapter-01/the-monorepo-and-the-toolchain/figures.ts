@@ -2,7 +2,7 @@
 // Tên package, tên lệnh, tên tag giữ nguyên tiếng Anh.
 
 export const figWorkspaceMap = `flowchart TB
-    root["relay-platform/<br/>package.json · pnpm-workspace.yaml<br/>tsconfig.base.json · eslint.config.mjs · vitest.config.ts"]
+    root["relay-platform/<br/>package.json · pnpm-workspace.yaml · turbo.json<br/>tsconfig.base.json · eslint.config.mjs"]
     pkgs["packages/"]
     svcs["services/<br/>(trống cho đến chương 1.4)"]
     config["@relay/config<br/>hằng số dùng chung + bài smoke test<br/>(hôm nay)"]
@@ -31,4 +31,8 @@ export const figToolchainGate = `flowchart LR
     types["pnpm typecheck<br/>một tsconfig nghiêm ngặt"]
     test["pnpm test<br/>một test runner (Vitest)"]
     tag["tag của chương<br/>part1-ch1 · part1-ch2 · …"]
-    code --> lint --> types --> test --> tag`;
+    turbo["turbo run — sắp thứ tự task graph,<br/>cache những gì chứng minh được là đã chạy (ADR-17)"]
+    code --> lint --> types --> test --> tag
+    turbo -.-> lint
+    turbo -.-> types
+    turbo -.-> test`;

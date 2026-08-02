@@ -1,12 +1,12 @@
 import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
 import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
 import { Figure } from "@/components/tutorial/figure";
-import { figSkeletonMap, figRequestThread, figPartOneComplete } from "./figures";
+import { figSkeletonMap, figFrameworkBoundary, figRequestThread, figPartOneComplete } from "./figures";
 
 export const metadata = {
   title: "Walking skeleton — Building Relay",
   description:
-    "Part 1's finale: the API service and gateway stand up — deliberately empty, fully observable. Health checks, request IDs, and structured JSON logs from line one, plus the honest story of how the services actually run.",
+    "Part 1's finale: the API service stands up as a NestJS application and the gateway stands up with no framework at all — one decided boundary (ADR-15), plus health checks, request IDs, and structured JSON logs from line one.",
   alternates: {
     canonical: "/part-1/chapter-04/walking-skeleton",
     languages: {
@@ -24,17 +24,22 @@ Relay's six services — the API service and the gateway — as a *walking
 skeleton*: no business logic, no store connections, nothing a product manager
 could demo. What they have instead is everything operations will need on the
 worst day: a health check, a request ID on every response, and structured logs
-that let one grep tell a request's whole story. Deploy the skeleton before the
-muscles — because retrofitting a nervous system into a grown body is surgery.
+that let one grep tell a request's whole story. And the two services are built
+*differently*, on purpose: one carries an application framework, one refuses
+it, and the line between them is a decision with its own record. Deploy the
+skeleton before the muscles — because retrofitting a nervous system into a
+grown body is surgery.
 
 <SkipAhead>
 
 If you must skip: the chapter adds three workspace members —
-`packages/service-kit` (shared logger, request IDs, a tiny HTTP wrapper) and
-the empty-by-design `services/api` + `services/gateway`. Start them with
-`pnpm --filter @relay/api dev` and `pnpm --filter @relay/gateway dev` (ports
-4000/4001), and the gate — now 40 tests — still needs no Docker. The
-chapter-end state is tag **`part1-ch4`**, and with it Part 1 is complete.
+`packages/service-kit` (shared logger, request IDs, a tiny HTTP wrapper) plus
+`services/api` (a NestJS application — ADR-15) and `services/gateway`
+(frameworkless, same ADR). The protocol package learns to build, shown as this
+series' first *amendment diff* to already-published code. Start everything
+with `pnpm dev` (ports 4000/4001), and the gate — now 40 tests — still needs
+no Docker. The chapter-end state is tag **`part1-ch4`**, and with it Part 1 is
+complete.
 
 </SkipAhead>
 
@@ -60,6 +65,48 @@ travel the same internal road (ADR-04). If we built one service and split it
 later, the seam would land wherever the refactor happened to leave it. Built
 this way, the seam is exactly where the architecture drew it, and it has been
 tested — however trivially — since the day it existed.
+
+</Why>
+
+## One framework, one boundary
+
+There is a second decision standing behind this chapter, and it shapes every
+file in it. The API service's surface is about to grow enormously: Phases 2–4
+give it dozens of REST endpoints — tenancy, channels, messages, keys,
+moderation, emoji packs, dashboard reads. A surface that wide lives or dies on
+*per-endpoint consistency*: the same validation posture, the same error
+envelope, the same wiring conventions, endpoint after endpoint, year after
+year. ADR-15's answer is NestJS — modules, dependency injection, guards and
+pipes as framework primitives, generated OpenAPI when the docs chapters need
+it — so that consistency is something the framework supplies rather than
+something a solo builder re-disciplines forty times.
+
+And the same record draws a hard line: **the gateway gets no framework.** Its
+work is raw socket mechanics — resume buffering, backfill ordering, frames on
+the wire. A framework between that code and the socket is surface without
+benefit; when Part 2's hard chapters arrive, we want nothing standing between
+the gateway and `node:http`. Workers, when they come, stay plain consumers
+for the same reason.
+
+<Figure
+  caption="The boundary this chapter builds: the framework serves the API service's wide surface and stops at the gateway's door — with the service-kit feeding both sides, one home for the plumbing either way."
+  code={figFrameworkBoundary}
+/>
+
+<Why source="ADR-15 · D7/D8">
+
+Why a framework at all, in a series that hand-rolls its migrations? Because
+boring-by-design cuts both ways: hand-rolling is boring where the mechanism
+*is the lesson* (the write path, the resume protocol), and a liability where
+the mechanism is convention at scale. Forty endpoints of hand-rolled routing,
+validation, and error shaping is not a lesson — it is quadratic pain with a
+solo maintainer (D8). The trade-off is real and recorded: decorators need a
+build step, and a DI container joins the dependency tree. This chapter is
+where both costs are paid in daylight. The reversal trigger is on record too:
+if the framework's overhead ever shows up on a latency-budget path, or the
+abstraction starts fighting a core-loop mechanism the way it would on the
+gateway, ADR-15 names its own exits (Fastify as fallback; frameworkless as
+the floor).
 
 </Why>
 
@@ -93,14 +140,16 @@ same spelling our compose healthchecks used in 1.2, returning
 this repo — it is where the tutorial you are reading lives).
 
 <Figure
-  caption="The six services of the SAD, two now standing — empty of product, full of the properties operations needs on the worst day."
+  caption="The six services of the SAD, two now standing — empty of product, full of the properties operations needs on the worst day, and each built the way its ADR says."
   code={figSkeletonMap}
 />
 
 ## One home for the plumbing
 
 Both services need the same three pieces: the logger, the request-id stamp,
-the health/404 wiring.
+the health/404 wiring — and the framework boundary makes the sharing MORE
+important, not less: two services built differently must still log
+identically.
 
 <Trap>
 
@@ -125,13 +174,41 @@ exist.
   "version": "0.0.0",
   "type": "module",
   "exports": {
-    ".": "./src/index.ts"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
   },
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
   }
 }
 ```
+
+Two things are new here compared to the packages you have built so far, and
+both exist because of what is coming three sections down: the package has a
+`build` script, and its `exports` point at `dist/` — compiled JavaScript plus
+type declarations — instead of at TypeScript source. The build config is four
+lines on top of the base — emit on, declarations on, `dist` out, tests
+excluded — and small enough to type in whole:
+
+```json title="packages/service-kit/tsconfig.build.json"
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "declaration": true,
+    "outDir": "dist",
+    "rootDir": "src"
+  },
+  "include": ["src"],
+  "exclude": ["src/**/*.test.ts"]
+}
+```
+
+It sits alongside this package's regular tsconfig:
 
 ```json title="packages/service-kit/tsconfig.json"
 {
@@ -143,11 +220,11 @@ exist.
 }
 ```
 
-One new line in an otherwise familiar tsconfig: `erasableSyntaxOnly` makes the
+One line in an otherwise familiar tsconfig: `erasableSyntaxOnly` makes the
 compiler reject any TypeScript syntax that can't simply be deleted to leave
-valid JavaScript (enums, namespaces). Hold that thought — it belongs to a
-story we'll finish below. The services' own tsconfigs are this identical file;
-we won't print it twice more.
+valid JavaScript (enums, namespaces, parameter properties). Hold that
+thought — this chapter *finishes* that story, and the ending has a twist. The
+kit's source is unchanged in spirit from what you'd write by hand:
 
 ```ts title="packages/service-kit/src/index.ts"
 import { randomUUID } from "node:crypto";
@@ -169,12 +246,19 @@ const stdoutSink: LogSink = (line) => {
 };
 
 export interface Logger {
-  log(level: "info" | "error", msg: string, fields?: Record<string, unknown>): void;
+  log(
+    level: "info" | "error",
+    msg: string,
+    fields?: Record<string, unknown>,
+  ): void;
 }
 
 /** One JSON object per line; the sink is injectable so tests can assert log
  * structure instead of scraping stdout — observability you can't test rots. */
-export function createLogger(service: string, sink: LogSink = stdoutSink): Logger {
+export function createLogger(
+  service: string,
+  sink: LogSink = stdoutSink,
+): Logger {
   return {
     log(level, msg, fields = {}) {
       sink(
@@ -251,56 +335,377 @@ with the services until an API chapter owns a REST registry, and the
 V's reachable-page promise true. And `serve` builds but does not start the
 server — that separation is what lets tests boot it on an ephemeral port.
 
-## The two services
+## The protocol package learns to build — and the series learns to amend
 
-With the kit in place, a service is barely a page:
+The framework's build step (coming next section) changes something for the
+package 1.3 published: a *compiled* service cannot import raw TypeScript
+source from a neighboring package. `@relay/protocol` needs a build of its own,
+and dist-pointing exports. But its `package.json` is already published — it
+appeared in 1.3, byte-for-byte, under this series' fence rule: what a chapter
+prints IS what the repository holds.
+
+So this is the moment the fence discipline grows its long-promised second
+verb. **Published code is edited only in daylight**: a change to a file an
+earlier chapter fenced appears as an explicit diff — the whole file, with
+`+` and `-` carrying the change — and the earlier chapter's own checks keep
+verifying against its own tag, unchanged. Here is the first such amendment
+the series has ever made:
+
+```diff title="packages/protocol/package.json"
+ {
+   "name": "@relay/protocol",
+   "private": true,
+   "version": "0.0.0",
+   "type": "module",
+   "exports": {
+-    ".": "./src/index.ts"
++    ".": {
++      "types": "./dist/index.d.ts",
++      "default": "./dist/index.js"
++    }
+   },
+   "scripts": {
++    "build": "tsc -p tsconfig.build.json",
+     "typecheck": "tsc --noEmit",
+     "test": "vitest run"
+   },
+   "dependencies": {
+     "zod": "^4.4.3"
+   }
+ }
+```
+
+Read it like a reviewer: the exports map now routes consumers to `dist/`
+(with types beside it), and a `build` script appears. Nothing else moves.
+The new build config it references is the service-kit's file, copied
+verbatim — create it as `packages/protocol/tsconfig.build.json`:
+
+```json title="packages/protocol/tsconfig.build.json"
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "declaration": true,
+    "outDir": "dist",
+    "rootDir": "src"
+  },
+  "include": ["src"],
+  "exclude": ["src/**/*.test.ts"]
+}
+```
+
+And now the `dependsOn: ["^build"]` line you declared in 1.1's `turbo.json`
+stops being latent shape and starts doing work: run `pnpm build` and turbo
+compiles the protocol package and the service-kit *before* anything that
+imports them — the build order is declared once, in the graph, not encoded in
+a README's "run these in this order" paragraph.
+
+<Why source="docs/07 §2 — the amendment rule">
+
+Why a diff instead of just printing the new file? Because the fence rule's
+whole value is that it cannot lie by omission. Reprint the file and a reader
+who studied 1.3 has to diff it in their head to notice anything changed;
+print a diff and the change is the artifact — reviewable, minimal, and
+checkable from both ends (the old lines must match what 1.3 published; the
+new lines must match the repository at this chapter's tag). Every future
+amendment in this series uses this exact form, and chapter 2.1 uses it twice
+within the hour, so to speak.
+
+</Why>
+
+## The API service — a NestJS application
+
+With the kit and the builds in place, here is the API service ADR-15
+describes. Its manifest first, because half the decisions live there:
 
 ```json title="services/api/package.json"
 {
   "name": "@relay/api",
   "private": true,
   "version": "0.0.0",
-  "type": "module",
+  "type": "commonjs",
   "scripts": {
-    "dev": "tsx watch src/main.ts",
-    "typecheck": "tsc --noEmit"
+    "build": "nest build",
+    "dev": "nest start --watch",
+    "start": "node dist/main.js",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
   },
   "dependencies": {
+    "@nestjs/common": "^11.1.28",
+    "@nestjs/core": "^11.1.28",
+    "@nestjs/platform-express": "^11.1.28",
     "@relay/protocol": "workspace:*",
-    "@relay/service-kit": "workspace:*"
+    "@relay/service-kit": "workspace:*",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.2"
   },
   "devDependencies": {
-    "tsx": "^4.23.1"
+    "@nestjs/cli": "^11.0.24",
+    "@nestjs/testing": "^11.1.28",
+    "@swc/core": "^1.15.47",
+    "unplugin-swc": "^1.5.9"
   }
 }
 ```
 
-```ts title="services/api/src/main.ts"
-import { createLogger, serve, type Logger } from "@relay/service-kit";
+Read the notable lines slowly. `"type": "commonjs"` — in a workspace that has
+been ESM since 1.1. NestJS's ecosystem compiles to CommonJS, and fighting a
+framework's native dialect is how you volunteer for other people's edge
+cases; so this one package speaks CJS, and Node bridges the two worlds —
+`require()` of an ES module has been stable since Node 22.12, which is
+*exactly* the floor 1.1's `engines` line pinned. (That is the debt paid: 1.1
+promised the reason would appear "when the need appears." This is the need.)
+The dev runner is `nest start --watch` — the framework's own compiler
+watch — and `tsx` is gone from this package: the api no longer runs
+TypeScript source directly, it runs what `nest build` emits into `dist/`.
 
-// The API service — SAD §4.1: owns all REST semantics and is the ONLY
-// service that writes to PostgreSQL (ADR-04). At walking-skeleton stage it
-// is deliberately empty: health, request ids, structured logs. The muscles —
-// tenancy, channels, the message write path — grow onto this in Part 2, and
-// its REST error envelope is already asserted (in the test beside this file)
-// to match @relay/protocol's error payload shape: one error shape, one home.
-
-export function createServer(logger?: Logger) {
-  return serve({
-    service: "api",
-    health: () => ({ uptime_s: Math.round(process.uptime()) }),
-    ...(logger ? { logger } : {}),
-  });
-}
-
-if (import.meta.main) {
-  const port = Number(process.env.PORT ?? 4000);
-  const logger = createLogger("api");
-  createServer().listen(port, () => {
-    logger.log("info", "listening", { port });
-  });
+```json title="services/api/tsconfig.json"
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    // ADR-15's stated trade-off, spent here and only here: NestJS's DI reads
+    // constructor parameter types from decorator metadata, which is emitted
+    // code — so this service gives up erasableSyntaxOnly (still ON in the
+    // gateway and every package) and turns the two decorator flags on.
+    // verbatimModuleSyntax must also yield: this package compiles to
+    // CommonJS (the framework's native dialect), so `import` statements are
+    // rewritten to `require` calls at build time.
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true,
+    "verbatimModuleSyntax": false
+  },
+  "include": ["src"]
 }
 ```
+
+Here is the twist the kit's tsconfig told you to hold: **this service gives
+`erasableSyntaxOnly` up.** Nest's dependency injection works by reading
+constructor parameter *types* at runtime, and those types survive compilation
+only if the compiler emits decorator metadata — which is generated code, the
+exact thing erasable syntax forbids. This is ADR-15's stated trade-off, paid
+where the record says to pay it and nowhere else: the gateway and every
+package keep the flag; the api spends it, and buys DI. (`verbatimModuleSyntax`
+yields for the same reason — a CJS-compiled file's imports are rewritten to
+`require` calls, the opposite of verbatim.)
+
+That tsconfig is the *typecheck* view. What `nest build` compiles is its
+build twin — the same emit idea the packages use, but extending the file
+above instead of the base, with declarations off (nothing imports the api)
+and every test flavor excluded so the compiled output never carries test
+copies. (The second exclude pattern waits for a kind of test that 2.1
+introduces — declared ahead, like 1.1's compose input.)
+
+```json title="services/api/tsconfig.build.json"
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "declaration": false,
+    "outDir": "dist",
+    "rootDir": "src"
+  },
+  "exclude": ["src/**/*.test.ts", "src/**/*.itest.ts"]
+}
+```
+
+And the file that points the Nest CLI at it:
+
+```json title="services/api/nest-cli.json"
+{
+  "$schema": "https://json.schemastore.org/nest-cli",
+  "collection": "@nestjs/schematics",
+  "sourceRoot": "src",
+  "compilerOptions": {
+    "tsConfigPath": "tsconfig.build.json",
+    "deleteOutDir": true
+  }
+}
+```
+
+Now the application itself. A NestJS app is a *module graph*: the module
+declares what exists, the injector wires it, and the pieces never construct
+each other by hand.
+
+```ts title="services/api/src/app.module.ts"
+import {
+  Module,
+  type MiddlewareConsumer,
+  type NestModule,
+} from "@nestjs/common";
+import { APP_FILTER } from "@nestjs/core";
+
+import { HealthController } from "./health.controller";
+import { LOGGER, apiLogger } from "./logger";
+import { ProtocolErrorFilter } from "./protocol-error.filter";
+import { RequestContextMiddleware } from "./request-context.middleware";
+
+// The application described as a module graph — ADR-15's convention for the
+// wide surface Phases 2-4 will grow. Registering the error filter as a
+// provider (APP_FILTER) instead of wiring it in main.ts means every entry
+// point — including tests — gets the same error envelope for free.
+@Module({
+  controllers: [HealthController],
+  providers: [
+    { provide: LOGGER, useFactory: apiLogger },
+    { provide: APP_FILTER, useClass: ProtocolErrorFilter },
+    RequestContextMiddleware,
+  ],
+})
+export class AppModule implements NestModule {
+  configure(consumer: MiddlewareConsumer): void {
+    consumer.apply(RequestContextMiddleware).forRoutes("{*path}");
+  }
+}
+```
+
+Four registrations, each earning its place. The controller:
+
+```ts title="services/api/src/health.controller.ts"
+import { Controller, Get } from "@nestjs/common";
+
+// The same /healthz contract the frameworkless skeleton answered — the
+// framework changes who routes the request, never what the body promises.
+@Controller()
+export class HealthController {
+  @Get("healthz")
+  healthz(): Record<string, unknown> {
+    return {
+      status: "ok",
+      service: "api",
+      uptime_s: Math.round(process.uptime()),
+    };
+  }
+}
+```
+
+The logger enters as a *provider* under an injection token — this is the DI
+bargain in one file:
+
+```ts title="services/api/src/logger.ts"
+import { createLogger, type Logger } from "@relay/service-kit";
+
+// The logger enters the application as a PROVIDER under an injection token,
+// not as a module-level import scattered through the code — that is the DI
+// bargain ADR-15 buys: tests swap the sink by overriding one provider.
+export const LOGGER = "LOGGER";
+
+export function apiLogger(): Logger {
+  return createLogger("api");
+}
+```
+
+The request-id middleware asks for that logger in its constructor — by type,
+which is exactly what the decorator metadata is for — and implements the same
+promise `serve()` makes in the kit: one header out, one log line per request,
+same UUID in both:
+
+```ts title="services/api/src/request-context.middleware.ts"
+import type { IncomingMessage, ServerResponse } from "node:http";
+
+import { Inject, Injectable, type NestMiddleware } from "@nestjs/common";
+import { newRequestId, type Logger } from "@relay/service-kit";
+
+import { LOGGER } from "./logger";
+
+// EIR-API-05 + NFR-OBS-06, unchanged from the frameworkless skeleton: every
+// response carries X-Request-Id, every request logs exactly one structured
+// line carrying the same id. Logging on `finish` (not on entry) is what
+// keeps it to one line per request no matter which controller or filter
+// ends up answering.
+@Injectable()
+export class RequestContextMiddleware implements NestMiddleware {
+  constructor(@Inject(LOGGER) private readonly logger: Logger) {}
+
+  use(req: IncomingMessage, res: ServerResponse, next: () => void): void {
+    const requestId = newRequestId();
+    res.setHeader("X-Request-Id", requestId);
+    res.on("finish", () => {
+      this.logger.log("info", "request", {
+        request_id: requestId,
+        method: req.method,
+        path: req.url,
+        status: res.statusCode,
+      });
+    });
+    next();
+  }
+}
+```
+
+And the error filter is the one-error-shape policy as a framework primitive:
+whatever throws, anywhere — the router's own 404 today, a guard or a bug in
+Part 2 — the wire sees the envelope `@relay/protocol` defines:
+
+```ts title="services/api/src/protocol-error.filter.ts"
+import type { ServerResponse } from "node:http";
+
+import {
+  Catch,
+  HttpException,
+  type ArgumentsHost,
+  type ExceptionFilter,
+} from "@nestjs/common";
+
+// EIR-API-04: one error shape, one home. Whatever throws — the router's own
+// 404, a future guard, an unhandled bug — the wire sees the same envelope
+// the @relay/protocol error payload defines, so the REST surface and the
+// WebSocket surface cannot drift apart. The docs_url host is a placeholder
+// until the docs site exists (constitution V's reachable-page promise).
+@Catch()
+export class ProtocolErrorFilter implements ExceptionFilter {
+  catch(exception: unknown, host: ArgumentsHost): void {
+    const res = host.switchToHttp().getResponse<ServerResponse>();
+    const status =
+      exception instanceof HttpException ? exception.getStatus() : 500;
+    const code = status === 404 ? "not_found" : "internal_error";
+    const message =
+      exception instanceof HttpException
+        ? exception.message
+        : "unexpected internal error";
+    res.statusCode = status;
+    res.setHeader("content-type", "application/json");
+    res.end(
+      JSON.stringify({
+        code,
+        message,
+        docs_url: `https://relay.example/docs/errors/${code}`,
+      }),
+    );
+  }
+}
+```
+
+The entry point boots the graph and gets out of the way — note the framework's
+own logger is switched off; this workspace decided what a log line looks like
+in the kit, and the framework does not get a second opinion:
+
+```ts title="services/api/src/main.ts"
+import "reflect-metadata";
+
+import { NestFactory } from "@nestjs/core";
+import { createLogger } from "@relay/service-kit";
+
+import { AppModule } from "./app.module";
+
+// Nest's own banner logger stays off: this workspace already decided what a
+// log line looks like (one JSON object, NFR-OBS-01), and the framework does
+// not get a second opinion.
+async function bootstrap(): Promise<void> {
+  const app = await NestFactory.create(AppModule, { logger: false });
+  const port = Number(process.env.PORT ?? 4000);
+  await app.listen(port);
+  createLogger("api").log("info", "listening", { port });
+}
+
+void bootstrap();
+```
+
+## The gateway — frameworkless, by decision
+
+The gateway's manifest gains a `test` script for the task graph and otherwise
+refuses everything the api just adopted — no framework dependency, ESM like
+the rest of the workspace, and `tsx` as its runner:
 
 ```json title="services/gateway/package.json"
 {
@@ -310,7 +715,8 @@ if (import.meta.main) {
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/main.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
   },
   "dependencies": {
     "@relay/protocol": "workspace:*",
@@ -355,6 +761,21 @@ if (import.meta.main) {
 }
 ```
 
+Its tsconfig you have effectively already read — it is the kit's file,
+byte for byte, `erasableSyntaxOnly` still on, the flag living exactly where
+the rescope said it would keep living. Copy it across, or type it once
+more:
+
+```json title="services/gateway/tsconfig.json"
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "erasableSyntaxOnly": true
+  },
+  "include": ["src"]
+}
+```
+
 The gateway does one thing beyond health: its health payload *advertises the
 protocol vocabulary it speaks* — every frame name and close code, computed at
 startup from `@relay/protocol`'s actual exports. Not one string is typed by
@@ -362,36 +783,29 @@ hand, so the advertisement cannot drift from the contract. 1.3 promised the
 skeleton would speak nothing but the protocol package; an empty skeleton
 cannot hold conversations yet, but it can put its vocabulary in the window.
 
-<Why source="the run scripts — a decision with a scar">
+<Why source="the gateway's run script — a decision with a scar">
 
-Look at the `dev` scripts: `tsx watch src/main.ts`. That is a dependency, and
-it deserves its story told honestly, because our first attempt had none.
-Node 22.18+ can strip types and run a TypeScript file directly — we verified
-it, and for a single file it is glorious. Then the gateway imported
-`@relay/protocol`, and the platform hit a wall: TypeScript's ESM convention
-writes internal imports as `./frames.js` (resolved to `frames.ts` by the
-compiler and test runner), and **Node does not rewrite specifiers** — it went
-looking for a `frames.js` that has never existed, and crashed. The protocol
-package's files shipped in 1.3 and are read-only now; rewriting their imports
-was not on the table. So we took the smallest tool that resolves the
-convention: `tsx`, dev-only, pinned, in exactly the two packages that run
-long-lived processes. The `erasableSyntaxOnly` flag stays in our tsconfigs —
-the day Node's resolver learns the convention, deleting one devDependency is
-all it will take.
+Why does the gateway run on `tsx` while the api compiles? Node 22.18+ can
+strip types and run a TypeScript file directly — we verified it, and for a
+single file it is glorious. Then the gateway imported `@relay/protocol` back
+in the pre-build days, and the platform hit a wall: TypeScript's ESM
+convention writes internal imports as `./frames.js`, and **Node does not
+rewrite specifiers** — it went looking for a file that did not exist, and
+crashed. `tsx` was the smallest tool that resolves the convention, and it
+remains the right one for the only service that runs TypeScript source as a
+long-lived process. The api never faced the choice: `nest build` emits plain
+JavaScript, and plain JavaScript needs no favors from the loader. One
+workspace, two run stories, both honest — and both pinned in their manifests.
 
 </Why>
 
 ## Stand it up
 
-Two terminals — honest tooling at this scale; a process manager is machinery
-we don't need yet:
+One command now — 1.1's `dev` task was declared shape, and this chapter gives
+it its two targets; turbo starts both services, building the packages first:
 
 ```bash
-pnpm --filter @relay/api dev
-```
-
-```bash
-pnpm --filter @relay/gateway dev
+pnpm dev
 ```
 
 Now interrogate the skeleton:
@@ -404,10 +818,12 @@ curl -i localhost:4000/no-such-route
 
 Three things to see with your own eyes. The `X-Request-Id` header on every
 response — request it twice, get two different UUIDs. The gateway's `protocol`
-block naming all ten frames and four close codes. And in each service's
-terminal, one JSON log line per request whose `request_id` matches the header
-you just received — that pairing is NFR-OBS-06 in miniature: given an id from
-anywhere, grep finds the request's whole story.
+block naming all ten frames and four close codes. And in the log output, one
+JSON line per request whose `request_id` matches the header you just
+received — from both services, in the *same shape*, because the kit is one
+home. That pairing is NFR-OBS-06 in miniature: given an id from anywhere,
+grep finds the request's whole story. You cannot tell from the outside which
+service carries a framework — and that is the boundary working.
 
 <Figure
   caption="One request, one id, two places: the response header the caller keeps and the log line the operator greps — the same UUID threads both."
@@ -416,15 +832,16 @@ anywhere, grep finds the request's whole story.
 
 ## Tests that watch the watchers
 
-The suites boot each service on port 0 — an ephemeral port the OS assigns —
-so tests never collide with running services or each other:
+The kit's suite is unchanged in spirit — parse log lines, never squint at
+stdout:
 
 ```ts title="packages/service-kit/src/index.test.ts"
 import { describe, expect, it } from "vitest";
 
 import { createLogger, newRequestId } from "./index.js";
 
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 describe("structured logger (NFR-OBS-01)", () => {
   it("emits one valid JSON object per line with the required fields", () => {
@@ -464,84 +881,143 @@ describe("request ids (EIR-API-05)", () => {
 });
 ```
 
+The api's suite is where the framework earns its keep in testing. There is
+one new file first — and it exists because of a trap worth naming.
+
+<Trap>
+
+Vitest's default transformer (esbuild) *strips* decorators' metadata — it
+never emits it. Boot a Nest module under it and DI resolves nothing:
+depending on shape you get an unhelpful `undefined` at the first injected
+constructor, or a module that compiles and then dies at runtime — the
+failure is silent exactly where the framework was supposed to be helping.
+The fix is to give the api's tests the same metadata the build has, via SWC.
+While we are in the file: the config is `.mts`, not `.ts`, because inside a
+`"type": "commonjs"` package a `.ts` config would be loaded as CommonJS —
+and vitest refuses to be `require()`d. Two sharp edges, one small file,
+both commented for the next reader:
+
+</Trap>
+
+```ts title="services/api/vitest.config.mts"
+import { defineConfig } from "vitest/config";
+import swc from "unplugin-swc";
+
+// Vitest's default transform (esbuild) strips decorators but never emits
+// decorator METADATA — Nest's DI would silently resolve nothing. SWC does
+// emit it; `module: { type: "es6" }` keeps test files ESM so vitest can load
+// them (this package compiles to CJS, but tests run in vitest's world, not
+// node's). The config is .mts for the same reason: inside a
+// `"type": "commonjs"` package a .ts config would be loaded as CommonJS,
+// which vitest refuses.
+export default defineConfig({
+  test: {
+    include: ["src/**/*.test.ts"],
+  },
+  plugins: [
+    swc.vite({
+      module: { type: "es6" },
+      jsc: { transform: { legacyDecorator: true, decoratorMetadata: true } },
+    }),
+  ],
+});
+```
+
+And the suite itself — same three promises the frameworkless skeleton made,
+now asserted through the framework's own testing harness. Watch the LOGGER
+override: the test swaps the log sink by overriding *one provider*, touching
+none of the application's code. That is the DI bargain paying out on day one:
+
 ```ts title="services/api/src/main.test.ts"
-import type { AddressInfo } from "node:net";
-import type { Server } from "node:http";
+import "reflect-metadata";
 
 import { errorFrameSchema } from "@relay/protocol";
-import { describe, expect, it } from "vitest";
-
 import { createLogger } from "@relay/service-kit";
+import { Test } from "@nestjs/testing";
+import type { INestApplication } from "@nestjs/common";
+import { afterEach, describe, expect, it } from "vitest";
 
-import { createServer } from "./main.js";
+import { AppModule } from "./app.module";
+import { LOGGER } from "./logger";
 
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-const silent = createLogger("api", () => {});
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
-function listen(server: Server): Promise<number> {
-  return new Promise((resolve) =>
-    server.listen(0, () => resolve((server.address() as AddressInfo).port)),
-  );
+// The same three promises the frameworkless skeleton made — the framework
+// swap must be invisible from the wire. Overriding the LOGGER provider is
+// the DI payoff: the test swaps the sink without touching the app's code.
+async function boot(
+  lines?: string[],
+): Promise<{ app: INestApplication; url: string }> {
+  const builder = Test.createTestingModule({ imports: [AppModule] });
+  if (lines) {
+    builder
+      .overrideProvider(LOGGER)
+      .useValue(createLogger("api", (l) => lines.push(l)));
+  } else {
+    builder.overrideProvider(LOGGER).useValue(createLogger("api", () => {}));
+  }
+  const app = (await builder.compile()).createNestApplication({
+    logger: false,
+  });
+  await app.listen(0);
+  return { app, url: await app.getUrl() };
 }
 
 describe("api skeleton", () => {
-  it("answers /healthz with its shape and a fresh request id per response", async () => {
-    const server = createServer(silent);
-    const port = await listen(server);
-    try {
-      const res = await fetch(`http://127.0.0.1:${port}/healthz`);
-      expect(res.status).toBe(200);
-      const body = (await res.json()) as Record<string, unknown>;
-      expect(body).toMatchObject({ status: "ok", service: "api" });
-      expect(typeof body.uptime_s).toBe("number");
+  let app: INestApplication | undefined;
+  afterEach(async () => {
+    await app?.close();
+    app = undefined;
+  });
 
-      const id1 = res.headers.get("x-request-id");
-      const id2 = (await fetch(`http://127.0.0.1:${port}/healthz`)).headers.get(
-        "x-request-id",
-      );
-      expect(id1).toMatch(UUID_RE);
-      expect(id2).toMatch(UUID_RE);
-      expect(id1).not.toBe(id2);
-    } finally {
-      server.close();
-    }
+  it("answers /healthz with its shape and a fresh request id per response", async () => {
+    const booted = await boot();
+    app = booted.app;
+    const res = await fetch(`${booted.url}/healthz`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body).toMatchObject({ status: "ok", service: "api" });
+    expect(typeof body.uptime_s).toBe("number");
+
+    const id1 = res.headers.get("x-request-id");
+    const id2 = (await fetch(`${booted.url}/healthz`)).headers.get(
+      "x-request-id",
+    );
+    expect(id1).toMatch(UUID_RE);
+    expect(id2).toMatch(UUID_RE);
+    expect(id1).not.toBe(id2);
   });
 
   it("shapes its 404 exactly like the protocol's error payload (EIR-API-04)", async () => {
-    const server = createServer(silent);
-    const port = await listen(server);
-    try {
-      const res = await fetch(`http://127.0.0.1:${port}/no-such-route`);
-      expect(res.status).toBe(404);
-      const body: unknown = await res.json();
-      // One error shape, one home: the REST envelope must parse against the
-      // wire contract's error payload schema — alignment by construction.
-      const parsed = errorFrameSchema.shape.payload.safeParse(body);
-      expect(parsed.success).toBe(true);
-      if (parsed.success) expect(parsed.data.code).toBe("not_found");
-    } finally {
-      server.close();
-    }
+    const booted = await boot();
+    app = booted.app;
+    const res = await fetch(`${booted.url}/no-such-route`);
+    expect(res.status).toBe(404);
+    const body: unknown = await res.json();
+    // One error shape, one home: the REST envelope must parse against the
+    // wire contract's error payload schema — alignment by construction.
+    const parsed = errorFrameSchema.shape.payload.safeParse(body);
+    expect(parsed.success).toBe(true);
+    if (parsed.success) expect(parsed.data.code).toBe("not_found");
   });
 
   it("logs exactly one structured line per request, carrying the response's id", async () => {
     const lines: string[] = [];
-    const server = createServer(createLogger("api", (line) => lines.push(line)));
-    const port = await listen(server);
-    try {
-      const res = await fetch(`http://127.0.0.1:${port}/healthz`);
-      expect(lines).toHaveLength(1);
-      const entry = JSON.parse(lines[0]!) as Record<string, unknown>;
-      expect(entry).toMatchObject({
-        service: "api",
-        msg: "request",
-        path: "/healthz",
-        status: 200,
-      });
-      expect(entry.request_id).toBe(res.headers.get("x-request-id"));
-    } finally {
-      server.close();
-    }
+    const booted = await boot(lines);
+    app = booted.app;
+    const res = await fetch(`${booted.url}/healthz`);
+    // The log line lands on the response's `finish` event — settle it.
+    await new Promise((r) => setTimeout(r, 20));
+    expect(lines).toHaveLength(1);
+    const entry = JSON.parse(lines[0]!) as Record<string, unknown>;
+    expect(entry).toMatchObject({
+      service: "api",
+      msg: "request",
+      path: "/healthz",
+      status: 200,
+    });
+    expect(entry.request_id).toBe(res.headers.get("x-request-id"));
   });
 });
 ```
@@ -615,7 +1091,7 @@ protocol package's error payload schema*. That single assertion is the whole
 one-error-shape policy, executable — the REST envelope and the WebSocket error
 frame can never quietly diverge, because a test imports the one and feeds it
 the other. Both services consume `@relay/protocol` today, exactly as 1.3 said
-they would.
+they would — through its dist now, in build order the graph enforces.
 
 Walk the gate:
 
@@ -627,7 +1103,8 @@ pnpm test
 ```
 
 Forty tests. No Docker, no fixed ports, and a fourth consecutive chapter
-where the gate needs nothing but Node.
+where the gate needs nothing but Node — plus, from this chapter on, watch
+the graph build the packages before it tests the services that import them.
 
 <Figure
   caption="Four chapters, four tags, one gate — Part 1 stands complete, and Part 2 has something to grow muscles onto."
@@ -640,7 +1117,10 @@ Everything deferred in this chapter has a named arrival. Part 2 grows the
 muscles: JWT verification and WebSocket sessions on the gateway, the message
 write path on the API service, real frames over real sockets — and with them
 `tenant_id` in every log line, the `request_id` on error frames, and the
-first store connections touching 1.2's compose stack. Containers and
+first store connections touching 1.2's compose stack. The repository layer
+arrives in 2.1, *beneath* the framework — a plain class the module graph will
+eventually construct per request, once there are requests. Validation pipes
+join when there are request bodies to validate (2.2). Containers and
 Dockerfiles for these services belong to Part 6. The log schema you built
 today grows fields; it never gets rebuilt.
 
@@ -656,12 +1136,15 @@ the kit yourself. Then poke the skeleton where it teaches:
    reason "six services" is a plausible architecture; you just observed the
    smallest version of it.
 2. Make a dozen mixed requests to both services, pick one `X-Request-Id` from
-   a response, and grep both terminals for it. One line, one service, the
-   whole story — that is NFR-OBS-06 rehearsed on a system four files big.
-3. Add a temporary `/version` route to the API service and watch the 404 test
-   stay green but the *route* go untested. Feel the gap: every route you add
-   from now on owes the suite a test. Delete it (or test it) before moving
-   on.
+   a response, and grep the output for it. One line, one service, the
+   whole story — that is NFR-OBS-06 rehearsed on a system a few files big.
+3. Comment out the `swc.vite(...)` plugin in the api's vitest config and run
+   its tests. Watch DI fail without metadata — then put it back and re-read
+   the TRAP. Cheap now; bewildering at 2 a.m. later.
+4. Add a temporary `/version` route to the health controller and watch the
+   404 test stay green but the *route* go untested. Feel the gap: every route
+   you add from now on owes the suite a test. Delete it (or test it) before
+   moving on.
 
 If you are stuck, the tag holds the answer key: `part1-ch4`.
 
@@ -672,29 +1155,30 @@ If you read nothing else in this chapter, keep these:
 - **The skeleton deploys before the muscles** — the API/gateway seam is the
   architecture's most load-bearing line, and it exists (and is tested) before
   any logic can blur it.
+- **The framework serves the wide surface and stops at the gateway's door**
+  (ADR-15): consistency-at-scale is what a framework is for; socket mechanics
+  get no layers between the code and the wire.
 - **Observability starts at line one**: request IDs on every response
-  (EIR-API-05), one structured JSON log line per request (NFR-OBS-01), and
-  honest deferrals for the fields that can't exist yet — because NFR-OBS-06's
-  five-minute promise is cheap now and surgery later.
-- **Operational plumbing gets one home** — the second copy is where drift
-  starts, and plumbing drifts silently until the incident that needed it.
-- **Dependencies are decisions with stories**: the platform's type stripping
-  fell to a resolver wall at the first cross-package import; tsx is the
-  smallest tool that fixes it, taken deliberately and pinned.
-- **One error shape, one home, machine-verified** — the REST 404 parses
-  against the protocol's error payload schema, so the two failure vocabularies
-  cannot diverge.
+  (EIR-API-05), one structured JSON log line per request (NFR-OBS-01), honest
+  deferrals for the rest — in the same shape from both services, framework or
+  not, because the plumbing has one home.
+- **Trade-offs are paid in daylight**: the api spends `erasableSyntaxOnly` on
+  decorator metadata and speaks CJS across Node's `require(esm)` bridge —
+  each cost named by ADR-15, each visible in a config you can point at.
+- **Published code is edited only in daylight, too**: the protocol package's
+  build arrived as this series' first amendment diff — old lines checkable
+  against 1.3, new lines checkable against this chapter's tag.
 
 <Checkpoint>
 
-Before starting Part 2, you should have: all three new workspace members;
-both services starting via `pnpm --filter … dev` and answering `/healthz`
-with request IDs that reappear in their structured logs; the gateway
-advertising all ten frames and four close codes; and the gate green at 40
-tests with no Docker running. That state is tag `part1-ch4` in the canonical
-repository — and it is more than a chapter boundary: **Part 1 is complete.**
-The workspace, the world, the contract, and the skeleton are the ground.
-Part 2 builds Relay on it.
+Before starting Part 2, you should have: all three new workspace members; the
+protocol package building to `dist/` per its amendment diff; both services up
+via `pnpm dev` and answering `/healthz` with request IDs that reappear in
+their structured logs; the gateway advertising all ten frames and four close
+codes; and the gate green at 40 tests with no Docker running. That state is
+tag `part1-ch4` in the canonical repository — and it is more than a chapter
+boundary: **Part 1 is complete.** The workspace, the world, the contract, and
+the skeleton are the ground. Part 2 builds Relay on it.
 
 </Checkpoint>
 

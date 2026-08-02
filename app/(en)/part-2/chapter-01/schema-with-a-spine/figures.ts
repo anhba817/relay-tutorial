@@ -1,4 +1,4 @@
-// Chapter 2.1 figures (feature 018). Mermaid sources live here, never in
+// Chapter 2.1 figures (feature 018; revised in 019 for ADR-16). Mermaid sources live here, never in
 // page.mdx. Table names come from the chapter's schema slice only.
 
 export const figTenantSpine = `flowchart TB
@@ -19,8 +19,8 @@ export const figTenantSpine = `flowchart TB
 
 export const figTwoDoors = `flowchart TB
     dbcyl[("one PostgreSQL<br/>rows from every tenant")]
-    repoA["new Repository(pool, envA)<br/>every query: WHERE environment_id = A"]
-    repoB["new Repository(pool, envB)<br/>every query: WHERE environment_id = B"]
+    repoA["new Repository(db, envA)<br/>every query: WHERE environment_id = A"]
+    repoB["new Repository(db, envB)<br/>every query: WHERE environment_id = B"]
     codeA["tenant A's requests"]
     codeB["tenant B's requests"]
     codeA --> repoA --> dbcyl

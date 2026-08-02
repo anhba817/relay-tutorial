@@ -31,14 +31,16 @@ access gets a shape that carries the tenant everywhere, by construction.
 
 <SkipAhead>
 
-If you must skip: the chapter adds migrations (the SAD §6.1 tables plus a
-tiny runner — versioned, forward-only, no down path), and
-`services/api/src/db/` — a repository layer whose constructor requires an
-`environment_id`, with an eslint rule forbidding raw `pg` imports anywhere
-else. The gate grows a second, named lane: `pnpm --filter @relay/api
-migrate && pnpm --filter @relay/api test:integration` against the compose
-Postgres, while `pnpm lint && pnpm typecheck && pnpm test` stays Docker-free.
-The chapter-end state is tag **`part2-ch1`**.
+If you must skip: the chapter adds the data layer ADR-16 chose —
+`services/api/src/db/` with a Drizzle schema mirroring SAD §6.1, migrations
+*generated* by drizzle-kit then reviewed and applied by a tiny hand-rolled
+runner (versioned, forward-only, no down path), and a repository layer whose
+constructor requires an `environment_id`, with an eslint rule forbidding raw
+`pg` *and* `drizzle-orm` imports anywhere else. The gate grows a second,
+named lane: `pnpm --filter @relay/api migrate && pnpm --filter @relay/api
+test:integration` against the compose Postgres, while
+`pnpm lint && pnpm typecheck && pnpm test` stays Docker-free. The
+chapter-end state is tag **`part2-ch1`**.
 
 </SkipAhead>
 
@@ -67,120 +69,319 @@ is the correct fashion for correctness properties.
 
 ## The schema, from the architecture's own hand
 
-The SAD doesn't describe the schema — it *is* the schema; §6.1 is SQL. Our
-first migration reproduces its tables exactly, constraints, comments and
-all, because those constraints are requirements wearing SQL syntax: DR-01 is
-`UNIQUE (channel_id, sequence)` (one sequence number, one message — 2.2
-lives on this), DR-02 is `UNIQUE (environment_id, external_id)` (names are
-unique *per tenant*, not globally — isolation even in uniqueness), DR-03 is
-a partial unique index on idempotency keys (2.3's whole chapter, planted
-now).
+The SAD doesn't describe the schema — it *is* the schema; §6.1 is SQL. And
+those tables are full of constraints that are requirements wearing SQL
+syntax: DR-01 is `UNIQUE (channel_id, sequence)` (one sequence number, one
+message — 2.2 lives on this), DR-02 is `UNIQUE (environment_id, external_id)`
+(names are unique *per tenant*, not globally — isolation even in uniqueness),
+DR-03 is a partial unique index on idempotency keys (2.3's whole chapter,
+planted now). ADR-16's data layer gives that SQL a typed twin: the schema is
+*defined* in TypeScript, and the constraints live beside the tables that own
+them — including DR-03's partial index, which is a first-class citizen here
+and famously inexpressible in some more popular tools (the deep dive names
+names).
 
 Two tables need decisions the documents don't make, and we make them out
 loud. The SAD's `environments` references an `applications` table it never
 defines — we create a two-column stub and record that Part 3's tenancy
 chapters own its real shape. And the docs/07 row and SAD §6.3's hot-path
 index both name a `members` table that §6.1 never defines — we derive its
-shape from that index's own columns and record the decision in the SQL
-itself. Note also what `applications` and `environments` *don't* have: an
-`environment_id`. They are the tenancy anchors the whole clause is defined
-over — everything below them carries the spine, directly or through a
-single foreign-key hop.
+shape from that index's own columns and record the decision where it lives
+now: in the schema definition. Note also what `applications` and
+`environments` *don't* have: an `environment_id`. They are the tenancy
+anchors the whole clause is defined over — everything below them carries the
+spine, directly or through a single foreign-key hop.
 
 <Figure
   caption="The spine: environments is the tenant; users and channels carry it directly; messages and members inherit it through one foreign-key hop — the exact allowance constitution I grants."
   code={figTenantSpine}
 />
 
-```sql title="services/api/migrations/001_core_tables.sql"
--- 001: the core operational tables (chapter 2.1).
--- The four tenant-bearing tables are reproduced from SAD §6.1 verbatim,
--- including constraints and their DR citations. Two tables fill gaps the
--- documents leave open, each marked as this chapter's recorded decision.
--- Deliberately absent, with named arrivals: message_edits (edit chapter),
--- outbox (ADR-06's chapter), emoji/media tables (their parts), messages
--- partitioning (SAD growth note -> retention chapter).
+```ts title="services/api/src/db/schema.ts"
+import { sql } from "drizzle-orm";
+import {
+  bigint,
+  check,
+  index,
+  integer,
+  jsonb,
+  pgTable,
+  primaryKey,
+  text,
+  timestamp,
+  unique,
+  uniqueIndex,
+  uuid,
+} from "drizzle-orm/pg-core";
 
--- DECISION (chapter 2.1): the SAD's environments table references
--- applications(id) but never defines the table. This stub satisfies the
--- foreign key; the real application lifecycle belongs to Part 3's tenancy
--- chapters.
-CREATE TABLE applications (
-    id              UUID PRIMARY KEY,
-    name            TEXT NOT NULL
+// The TS twin of SAD §6.1 (ADR-16). The schema now exists twice — once as
+// the SAD's SQL truth, once here — and that drift risk is checked, not
+// assumed away: drizzle-kit GENERATES the migration SQL from these
+// definitions, and the generated SQL is reviewed against §6.1 before the
+// runner applies it. The four tenant-bearing tables reproduce §6.1
+// column-for-column, constraints and DR citations included. Deliberately
+// absent, with named arrivals: message_edits (edit chapter), outbox
+// (ADR-06's chapter), emoji/media tables (their parts), messages
+// partitioning (SAD growth note -> retention chapter).
+
+// DECISION (chapter 2.1): the SAD's environments table references
+// applications(id) but never defines the table. This stub satisfies the
+// foreign key; the real application lifecycle belongs to Part 3's tenancy
+// chapters.
+export const applications = pgTable("applications", {
+  id: uuid("id").primaryKey(),
+  name: text("name").notNull(),
+});
+
+export const environments = pgTable(
+  "environments",
+  {
+    id: uuid("id").primaryKey(),
+    applicationId: uuid("application_id")
+      .notNull()
+      .references(() => applications.id),
+    kind: text("kind").notNull(),
+    // envelope-encrypted (NFR-SEC-02)
+    signingSecret: text("signing_secret").notNull(),
+    retentionDays: integer("retention_days"),
+    quotaConfig: jsonb("quota_config").notNull().default({}),
+  },
+  (t) => [check("environments_kind_check", sql`${t.kind} IN ('development','production')`)],
 );
 
-CREATE TABLE environments (
-    id              UUID PRIMARY KEY,
-    application_id  UUID NOT NULL REFERENCES applications(id),
-    kind            TEXT NOT NULL CHECK (kind IN ('development','production')),
-    signing_secret  TEXT NOT NULL,          -- envelope-encrypted (NFR-SEC-02)
-    retention_days  INT,
-    quota_config    JSONB NOT NULL DEFAULT '{}'
+export const users = pgTable(
+  "users",
+  {
+    id: uuid("id").primaryKey(),
+    environmentId: uuid("environment_id")
+      .notNull()
+      .references(() => environments.id),
+    externalId: text("external_id").notNull(),
+    displayName: text("display_name"),
+    avatarUrl: text("avatar_url"),
+    metadata: jsonb("metadata").notNull().default({}),
+    bannedAt: timestamp("banned_at", { withTimezone: true }),
+  },
+  (t) => [unique("users_environment_id_external_id_unique").on(t.environmentId, t.externalId)], // DR-02
 );
 
-CREATE TABLE users (
-    id              UUID PRIMARY KEY,
-    environment_id  UUID NOT NULL REFERENCES environments(id),
-    external_id     TEXT NOT NULL,
-    display_name    TEXT,
-    avatar_url      TEXT,
-    metadata        JSONB NOT NULL DEFAULT '{}',
-    banned_at       TIMESTAMPTZ,
-    UNIQUE (environment_id, external_id)                  -- DR-02
+export const channels = pgTable(
+  "channels",
+  {
+    id: uuid("id").primaryKey(),
+    environmentId: uuid("environment_id")
+      .notNull()
+      .references(() => environments.id),
+    externalId: text("external_id").notNull(),
+    type: text("type").notNull(),
+    name: text("name"),
+    metadata: jsonb("metadata").notNull().default({}),
+    lastSequence: bigint("last_sequence", { mode: "number" }).notNull().default(0), // ADR-03
+    archivedAt: timestamp("archived_at", { withTimezone: true }),
+  },
+  (t) => [
+    unique("channels_environment_id_external_id_unique").on(t.environmentId, t.externalId), // DR-02
+    check("channels_type_check", sql`${t.type} IN ('public','private')`),
+  ],
 );
 
-CREATE TABLE channels (
-    id              UUID PRIMARY KEY,
-    environment_id  UUID NOT NULL REFERENCES environments(id),
-    external_id     TEXT NOT NULL,
-    type            TEXT NOT NULL CHECK (type IN ('public','private')),
-    name            TEXT,
-    metadata        JSONB NOT NULL DEFAULT '{}',
-    last_sequence   BIGINT NOT NULL DEFAULT 0,             -- ADR-03
-    archived_at     TIMESTAMPTZ,
-    UNIQUE (environment_id, external_id)                   -- DR-02
+export const messages = pgTable(
+  "messages",
+  {
+    id: uuid("id").primaryKey(),
+    channelId: uuid("channel_id")
+      .notNull()
+      .references(() => channels.id),
+    sequence: bigint("sequence", { mode: "number" }).notNull(),
+    userId: uuid("user_id").references(() => users.id),
+    // NULL => tombstone
+    text: text("text"),
+    metadata: jsonb("metadata").notNull().default({}),
+    attachments: jsonb("attachments"),
+    idempotencyKey: text("idempotency_key"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    editedAt: timestamp("edited_at", { withTimezone: true }),
+    deletedAt: timestamp("deleted_at", { withTimezone: true }),
+  },
+  (t) => [
+    unique("messages_channel_id_sequence_unique").on(t.channelId, t.sequence), // DR-01
+    // DR-03: idempotency enforced at the storage layer — the partial unique
+    // index Prisma could not express is a first-class schema citizen here.
+    uniqueIndex("messages_idem")
+      .on(t.channelId, t.idempotencyKey)
+      .where(sql`${t.idempotencyKey} IS NOT NULL`),
+    // Hot-path index (SAD §6.3): history pagination as a pure
+    // index-order scan (FR-MSG-09).
+    index("messages_channel_seq").on(t.channelId, t.sequence.desc()),
+  ],
 );
 
-CREATE TABLE messages (
-    id              UUID PRIMARY KEY,
-    channel_id      UUID NOT NULL REFERENCES channels(id),
-    sequence        BIGINT NOT NULL,
-    user_id         UUID REFERENCES users(id),
-    text            TEXT,                                   -- NULL ⇒ tombstone
-    metadata        JSONB NOT NULL DEFAULT '{}',
-    attachments     JSONB,
-    idempotency_key TEXT,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    edited_at       TIMESTAMPTZ,
-    deleted_at      TIMESTAMPTZ,
-    UNIQUE (channel_id, sequence)                           -- DR-01
+// DECISION (chapter 2.1): the docs/07 row and SAD §6.3's hot-path index
+// both reference a members table that §6.1 never defines. This shape is
+// anchored to that index; membership roles arrive with the channel
+// semantics chapters.
+export const members = pgTable(
+  "members",
+  {
+    channelId: uuid("channel_id")
+      .notNull()
+      .references(() => channels.id),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id),
+    joinedAt: timestamp("joined_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.channelId, t.userId] }),
+    // Hot-path index (SAD §6.3): the resume path's "which channels am I in".
+    index("members_user_channel").on(t.userId, t.channelId),
+  ],
 );
-CREATE UNIQUE INDEX messages_idem
-    ON messages (channel_id, idempotency_key)
-    WHERE idempotency_key IS NOT NULL;                      -- DR-03
-
--- DECISION (chapter 2.1): the docs/07 row and SAD §6.3's hot-path index
--- both reference a members table that §6.1 never defines. This shape is
--- anchored to that index; membership roles arrive with the channel
--- semantics chapters.
-CREATE TABLE members (
-    channel_id      UUID NOT NULL REFERENCES channels(id),
-    user_id         UUID NOT NULL REFERENCES users(id),
-    joined_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (channel_id, user_id)
-);
-
--- Hot-path indexes (SAD §6.3): history pagination as a pure index-order
--- scan (FR-MSG-09), and the resume path's "which channels am I in".
-CREATE INDEX messages_channel_seq ON messages (channel_id, sequence DESC);
-CREATE INDEX members_user_channel ON members (user_id, channel_id);
 ```
 
-One deliberate omission from the SAD's SQL: no `DEFAULT gen_random_uuid()`
-on the primary keys, because the SAD declares none. Ids are generated
-app-side with `crypto.randomUUID()` — the same decision 1.4 made for
-request ids, now extended to rows.
+One deliberate omission from the SAD's SQL, preserved here: no
+`gen_random_uuid()` defaults on the primary keys, because the SAD declares
+none. Ids are generated app-side with `crypto.randomUUID()` — the same
+decision 1.4 made for request ids, now extended to rows.
+
+## Generated, then reviewed — the drift check in person
+
+The schema existing twice — once as §6.1's SQL truth, once as TypeScript —
+is ADR-16's stated trade-off, and this section is where its mitigation runs.
+The TS schema does not go near the database directly; drizzle-kit turns it
+into a plain SQL file:
+
+```ts title="services/api/drizzle.config.ts"
+import { defineConfig } from "drizzle-kit";
+
+// drizzle-kit's job here is GENERATION only: it turns src/db/schema.ts into
+// plain SQL files under migrations/, which are reviewed against SAD §6.1
+// and applied by src/db/migrate.ts — our runner, our single ledger. Its
+// migrator and its journal table are deliberately unused (ADR-16).
+export default defineConfig({
+  dialect: "postgresql",
+  schema: "./src/db/schema.ts",
+  out: "./migrations",
+});
+```
+
+```bash
+pnpm --filter @relay/api exec drizzle-kit generate --name core_tables
+```
+
+That writes `migrations/0000_core_tables.sql` — and now comes the part that
+is a *discipline*, not a formality: read the generated SQL against SAD §6.1,
+line by line, and record the verdict. Ours is recorded at the top of the
+file itself:
+
+```sql title="services/api/migrations/0000_core_tables.sql"
+-- 0000_core_tables (chapter 2.1): GENERATED by drizzle-kit from
+-- src/db/schema.ts, then reviewed against SAD §6.1 — the ADR-16 drift
+-- check. Review disposition: column-for-column identical to §6.1 for the
+-- four tenant-bearing tables (CHECKs, DR-01/02 UNIQUEs, DR-03 partial
+-- unique index, §6.3 hot-path indexes all present); differences are
+-- formal only (alphabetical table order with FKs as ALTER TABLE, quoted
+-- identifiers, explicit ON DELETE NO ACTION and DESC NULLS LAST — all
+-- Postgres defaults spelled out). `applications` (stub) and `members`
+-- remain this chapter's recorded decisions; see the DECISION comments in
+-- schema.ts. Applied by src/db/migrate.ts — versioned, forward-only.
+
+CREATE TABLE "applications" (
+	"id" uuid PRIMARY KEY NOT NULL,
+	"name" text NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "channels" (
+	"id" uuid PRIMARY KEY NOT NULL,
+	"environment_id" uuid NOT NULL,
+	"external_id" text NOT NULL,
+	"type" text NOT NULL,
+	"name" text,
+	"metadata" jsonb DEFAULT '{}'::jsonb NOT NULL,
+	"last_sequence" bigint DEFAULT 0 NOT NULL,
+	"archived_at" timestamp with time zone,
+	CONSTRAINT "channels_environment_id_external_id_unique" UNIQUE("environment_id","external_id"),
+	CONSTRAINT "channels_type_check" CHECK ("channels"."type" IN ('public','private'))
+);
+--> statement-breakpoint
+CREATE TABLE "environments" (
+	"id" uuid PRIMARY KEY NOT NULL,
+	"application_id" uuid NOT NULL,
+	"kind" text NOT NULL,
+	"signing_secret" text NOT NULL,
+	"retention_days" integer,
+	"quota_config" jsonb DEFAULT '{}'::jsonb NOT NULL,
+	CONSTRAINT "environments_kind_check" CHECK ("environments"."kind" IN ('development','production'))
+);
+--> statement-breakpoint
+CREATE TABLE "members" (
+	"channel_id" uuid NOT NULL,
+	"user_id" uuid NOT NULL,
+	"joined_at" timestamp with time zone DEFAULT now() NOT NULL,
+	CONSTRAINT "members_channel_id_user_id_pk" PRIMARY KEY("channel_id","user_id")
+);
+--> statement-breakpoint
+CREATE TABLE "messages" (
+	"id" uuid PRIMARY KEY NOT NULL,
+	"channel_id" uuid NOT NULL,
+	"sequence" bigint NOT NULL,
+	"user_id" uuid,
+	"text" text,
+	"metadata" jsonb DEFAULT '{}'::jsonb NOT NULL,
+	"attachments" jsonb,
+	"idempotency_key" text,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"edited_at" timestamp with time zone,
+	"deleted_at" timestamp with time zone,
+	CONSTRAINT "messages_channel_id_sequence_unique" UNIQUE("channel_id","sequence")
+);
+--> statement-breakpoint
+CREATE TABLE "users" (
+	"id" uuid PRIMARY KEY NOT NULL,
+	"environment_id" uuid NOT NULL,
+	"external_id" text NOT NULL,
+	"display_name" text,
+	"avatar_url" text,
+	"metadata" jsonb DEFAULT '{}'::jsonb NOT NULL,
+	"banned_at" timestamp with time zone,
+	CONSTRAINT "users_environment_id_external_id_unique" UNIQUE("environment_id","external_id")
+);
+--> statement-breakpoint
+ALTER TABLE "channels" ADD CONSTRAINT "channels_environment_id_environments_id_fk" FOREIGN KEY ("environment_id") REFERENCES "public"."environments"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "environments" ADD CONSTRAINT "environments_application_id_applications_id_fk" FOREIGN KEY ("application_id") REFERENCES "public"."applications"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "members" ADD CONSTRAINT "members_channel_id_channels_id_fk" FOREIGN KEY ("channel_id") REFERENCES "public"."channels"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "members" ADD CONSTRAINT "members_user_id_users_id_fk" FOREIGN KEY ("user_id") REFERENCES "public"."users"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "messages" ADD CONSTRAINT "messages_channel_id_channels_id_fk" FOREIGN KEY ("channel_id") REFERENCES "public"."channels"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "messages" ADD CONSTRAINT "messages_user_id_users_id_fk" FOREIGN KEY ("user_id") REFERENCES "public"."users"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "users" ADD CONSTRAINT "users_environment_id_environments_id_fk" FOREIGN KEY ("environment_id") REFERENCES "public"."environments"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
+CREATE INDEX "members_user_channel" ON "members" USING btree ("user_id","channel_id");--> statement-breakpoint
+CREATE UNIQUE INDEX "messages_idem" ON "messages" USING btree ("channel_id","idempotency_key") WHERE "messages"."idempotency_key" IS NOT NULL;--> statement-breakpoint
+CREATE INDEX "messages_channel_seq" ON "messages" USING btree ("channel_id","sequence" DESC NULLS LAST);
+```
+
+The verdict, in one sentence: column-for-column identical to §6.1 where §6.1
+speaks — every CHECK, both DR-02 uniques, DR-01, the DR-03 partial index,
+both §6.3 hot-path indexes — and the differences are formal (alphabetical
+table order with foreign keys as `ALTER TABLE`, quoted identifiers, Postgres
+defaults spelled out). The two recorded decisions ride along in `schema.ts`
+where they now live.
+
+<Trap>
+
+The failure mode ADR-16 signed up for is **schema drift**: the TypeScript
+definition and the applied SQL slowly becoming two different databases. It
+never happens in one commit. It happens when someone patches production SQL
+by hand "just this once," or edits the TS schema and hand-writes the
+"obvious" migration instead of generating it — and six chapters later a
+partial index exists in one world and not the other, which for DR-03 means
+idempotency silently off. The discipline that prevents it is exactly the
+flow you just ran, every time, no exceptions: change `schema.ts` →
+`drizzle-kit generate` → *read the diff against §6.1* → let the runner
+apply. The generated file is reviewed like code because it IS code — and if
+you ever catch yourself editing a migration's SQL semantics by hand, stop:
+that is the TS schema lying to the future.
+
+</Trap>
 
 ## Migrations as discipline
 
@@ -188,15 +389,25 @@ The constitution's workflow clause is compact: "database migrations are
 versioned, forward-only." Notice what's absent — there is no *down*. A
 rollback script you never run in anger is a comfort blanket that rots;
 forward-only means mistakes are fixed by the next migration, the way they
-will be in production. Our runner is small enough to understand whole:
+will be in production. drizzle-kit *generates* our migrations; it does not
+get to *apply* them — one workspace, one migration ledger, and it is ours.
+The runner is small enough to understand whole, and it survived the
+re-foundation untouched in all but two lines (this package speaks CommonJS
+now — 1.4's story — so `__dirname` and `require.main` replace their ESM
+counterparts):
 
 ```ts title="services/api/src/db/client.ts"
+import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
 import pg from "pg";
 
-// The one place a connection pool is born. DATABASE_URL defaults to the
-// compose stack's dev credentials (chapter 1.2) — override it if your host
-// ports are remapped. Everything outside src/db is lint-forbidden from
-// importing pg at all (constitution I: isolation lives in data access).
+import * as schema from "./schema";
+
+// The one place a connection is born. DATABASE_URL defaults to the compose
+// stack's dev credentials (chapter 1.2) — override it if your host ports
+// are remapped. Everything outside src/db is lint-forbidden from importing
+// pg OR drizzle-orm at all (constitution I: isolation lives in data
+// access) — Drizzle is the query engine INSIDE the repository layer, never
+// a client handed to handlers (ADR-16).
 
 export const DEFAULT_DATABASE_URL =
   "postgres://relay:relay@localhost:5432/relay";
@@ -206,27 +417,30 @@ export function createPool(): pg.Pool {
     connectionString: process.env.DATABASE_URL ?? DEFAULT_DATABASE_URL,
   });
 }
+
+export type Db = NodePgDatabase<typeof schema>;
+
+export function createDb(pool: pg.Pool): Db {
+  return drizzle({ client: pool, schema });
+}
 ```
 
 ```ts title="services/api/src/db/migrate.ts"
 import { readdir, readFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 
 import type pg from "pg";
 
-import { createPool } from "./client.js";
+import { createPool } from "./client";
 
 // Migrations as discipline (constitution: versioned, forward-only). There is
 // no down path — not missing, absent by design. Files apply in filename
 // order, each inside a transaction, each recorded; a re-run is a no-op.
+// drizzle-kit GENERATES these files from src/db/schema.ts; this runner —
+// not drizzle-kit's migrator — is the only thing that APPLIES them, so the
+// workspace has exactly one migration ledger: schema_migrations.
 
-const MIGRATIONS_DIR = join(
-  dirname(fileURLToPath(import.meta.url)),
-  "..",
-  "..",
-  "migrations",
-);
+const MIGRATIONS_DIR = join(__dirname, "..", "..", "migrations");
 
 export async function migrate(pool: pg.Pool): Promise<string[]> {
   await pool.query(
@@ -261,66 +475,91 @@ export async function migrate(pool: pg.Pool): Promise<string[]> {
   return applied;
 }
 
-if (import.meta.main) {
-  const pool = createPool();
-  const applied = await migrate(pool);
-  console.log(
-    applied.length === 0
-      ? "migrations: nothing to apply"
-      : `migrations: applied ${applied.join(", ")}`,
-  );
-  await pool.end();
+// This package compiles to CommonJS (ADR-15's dialect), so the "am I the
+// entry file?" check is require.main — import.meta does not exist here.
+if (require.main === module) {
+  void (async () => {
+    const pool = createPool();
+    const applied = await migrate(pool);
+    console.log(
+      applied.length === 0
+        ? "migrations: nothing to apply"
+        : `migrations: applied ${applied.join(", ")}`,
+    );
+    await pool.end();
+  })();
 }
 ```
 
-## The series amends its own code — in daylight
+## The series amends its own code — the 1.4 form, twice
 
-To run any of this, the API service needs the `pg` driver, and a `migrate`
-script. Its `package.json` was published, byte-for-byte, in chapter 1.4 —
-and this series promised that every file it fences matches the repository at
-every chapter's tag. Silently rewriting published code would break that
-promise; freezing it forever would be absurd. So here is the rule the series
-follows from now on: **changes to previously fenced files appear as diffs**,
-in the chapter that makes them. Lines starting with `+` are added, `-`
-removed, and everything is shown in full so your copy and ours can't drift:
+To run any of this, the API service needs its data-layer dependencies and a
+`migrate` script. Its `package.json` was published, byte-for-byte, in
+chapter 1.4 — which is also the chapter that taught the rule for this exact
+moment: **changes to previously fenced files appear as diffs**, whole file,
+`+` and `-` carrying the change, checkable against both chapters' tags.
 
 ```diff title="services/api/package.json"
  {
    "name": "@relay/api",
    "private": true,
    "version": "0.0.0",
-   "type": "module",
+   "type": "commonjs",
    "scripts": {
-     "dev": "tsx watch src/main.ts",
-+    "migrate": "tsx src/db/migrate.ts",
-+    "test:integration": "vitest run --config vitest.integration.config.ts",
-     "typecheck": "tsc --noEmit"
+     "build": "nest build",
+     "dev": "nest start --watch",
+     "start": "node dist/main.js",
+     "typecheck": "tsc --noEmit",
+-    "test": "vitest run"
++    "test": "vitest run",
++    "migrate": "nest build && node dist/db/migrate.js",
++    "test:integration": "vitest run --config vitest.integration.config.mts"
    },
    "dependencies": {
+     "@nestjs/common": "^11.1.28",
+     "@nestjs/core": "^11.1.28",
+     "@nestjs/platform-express": "^11.1.28",
      "@relay/protocol": "workspace:*",
--    "@relay/service-kit": "workspace:*"
-+    "@relay/service-kit": "workspace:*",
-+    "pg": "^8.22.0"
+     "@relay/service-kit": "workspace:*",
++    "drizzle-orm": "^0.45.2",
++    "pg": "^8.22.0",
+     "reflect-metadata": "^0.2.2",
+     "rxjs": "^7.8.2"
    },
    "devDependencies": {
+     "@nestjs/cli": "^11.0.24",
+     "@nestjs/testing": "^11.1.28",
+     "@swc/core": "^1.15.47",
 +    "@types/pg": "^8.20.3",
-     "tsx": "^4.23.1"
++    "drizzle-kit": "^0.31.10",
+     "unplugin-swc": "^1.5.9"
    }
  }
 ```
 
-<Why source="the fence contract, amended">
+Read it like a reviewer. Two runtime dependencies enter, pinned within their
+majors and package-local: `pg` (the boring driver underneath everything) and
+`drizzle-orm` (the query engine that stays *inside* the repository layer —
+that confinement is the next section). Two dev tools ride along: the types,
+and drizzle-kit, which you just used. The `migrate` script compiles first —
+this package runs built JavaScript, so the runner runs from `dist/` like
+everything else. And `test:integration` points at a config whose extension
+carries 1.4's lesson (`.mts`, because this package is CommonJS and vitest
+refuses to be `require()`d).
 
-Why diffs instead of just printing the new file? Because a reprint hides the
-change and orphans the old chapter — you'd have two full versions of one
-file and a scavenger hunt to find what moved. A diff is the honest unit of
-change: it names exactly what this chapter did to code an earlier chapter
-taught you to type, it applies cleanly to the file you already have, and it
-keeps 1.4's fence true *at 1.4's tag* while this chapter owns the delta.
-The runtime dependency itself follows the settled rules: pinned within a
-major, package-local, and reasoned — `pg` is the boring standard, and no
-ORM, because the repository layer you're about to build IS the abstraction,
-and hiding its SQL would hide the chapter.
+<Why source="ADR-16 · the fence contract">
+
+Why Drizzle, and why show the dependency arriving as a diff? The second
+question is 1.4's answer: the diff is the honest unit of change — old lines
+checkable against the published 1.4, new lines checkable against this
+chapter's tag. The first is ADR-16's: the test for a data layer on THIS
+system is whether the core loop's mechanisms are first-class — `FOR UPDATE`
+for 2.2's row lock, `ON CONFLICT` for 2.3, the DR-03 partial index and the
+CHECKs in the schema definition itself. Drizzle passes; the record names
+what failed and why (Prisma cannot express the partial index; TypeORM types
+too loosely; kysely came second and stays the fallback). And the queries
+you're about to read keep their SQL shape — because in Part 2, hiding the
+SQL would hide the chapter.
 
 </Why>
 
@@ -334,14 +573,15 @@ pnpm --filter @relay/api migrate
 pnpm --filter @relay/api migrate   # → migrations: nothing to apply
 ```
 
-Worth pausing on the runner's two structural choices. Each file applies
-inside its own transaction, so a migration that fails halfway leaves no
-half-schema behind — the database is either before the file or after it,
-never in between. And the bookkeeping is a table in the database itself,
-not a marker on disk: `schema_migrations` travels with the data it
-describes, so every environment — your laptop, a teammate's, production —
-answers "what version am I?" the same way. When 2.2 ships migration 002,
-this same command applies exactly the delta, everywhere.
+Worth pausing on the runner's two structural choices, unchanged from the
+day it was written. Each file applies inside its own transaction, so a
+migration that fails halfway leaves no half-schema behind — the database is
+either before the file or after it, never in between. And the bookkeeping
+is a table in the database itself, not a marker on disk:
+`schema_migrations` travels with the data it describes, so every
+environment — your laptop, a teammate's, production — answers "what version
+am I?" the same way. When 2.2 ships the next migration, this same command
+applies exactly the delta, everywhere.
 
 ## The repository layer
 
@@ -351,7 +591,10 @@ system, and its shape is the argument:
 ```ts title="services/api/src/db/repository.ts"
 import { randomUUID } from "node:crypto";
 
-import type pg from "pg";
+import { and, asc, eq, sql } from "drizzle-orm";
+
+import type { Db } from "./client";
+import { channels, members, users } from "./schema";
 
 // The repository layer — the ONE place data access lives (ADR-04's single
 // writer, constitution I). Two surfaces with a bright line between them:
@@ -366,8 +609,12 @@ import type pg from "pg";
 //   at call sites. Cross-tenant reads return null/empty: no data, and no
 //   reveal that the foreign id even exists (FR-TEN-05).
 //
+// Drizzle is the query engine inside this layer (ADR-16): queries keep
+// their SQL shape and gain end-to-end types. Where the builder falls short,
+// a raw SQL island is permitted — inside the layer, never outside it.
+//
 // All primary keys are generated app-side (crypto.randomUUID) — the SAD's
-// SQL declares no defaults, and the migration adds none.
+// SQL declares no id defaults, and the migration adds none.
 
 export interface Environment {
   id: string;
@@ -375,19 +622,17 @@ export interface Environment {
 }
 
 export async function createEnvironment(
-  pool: pg.Pool,
+  db: Db,
   { name, kind = "development" }: { name: string; kind?: Environment["kind"] },
 ): Promise<Environment> {
   const applicationId = randomUUID();
   const environmentId = randomUUID();
-  await pool.query("INSERT INTO applications (id, name) VALUES ($1, $2)", [
-    applicationId,
-    name,
-  ]);
-  await pool.query(
-    `INSERT INTO environments (id, application_id, kind, signing_secret)
-     VALUES ($1, $2, $3, $4)`,
-    [environmentId, applicationId, kind, randomUUID()],
+  // The admin surface writes through the same Db handle but carries no
+  // tenant scope — it is the operation that MINTS the scope.
+  await db.execute(sql`INSERT INTO applications (id, name) VALUES (${applicationId}, ${name})`);
+  await db.execute(
+    sql`INSERT INTO environments (id, application_id, kind, signing_secret)
+        VALUES (${environmentId}, ${applicationId}, ${kind}, ${randomUUID()})`,
   );
   return { id: environmentId, kind };
 }
@@ -406,33 +651,31 @@ export interface ChannelRow {
 }
 
 export class Repository {
-  // Explicit fields, not constructor parameter properties — that shorthand
-  // is TS-only syntax erasableSyntaxOnly forbids (chapter 1.4's guarantee).
-  private readonly pool: pg.Pool;
-  private readonly environmentId: string;
-
-  constructor(pool: pg.Pool, environmentId: string) {
-    this.pool = pool;
-    this.environmentId = environmentId;
-  }
+  // Constructor parameter properties — the shorthand chapter 1.4 released
+  // for this service when ADR-15 spent erasableSyntaxOnly on decorator
+  // metadata. The guarantee still holds in the gateway and every package.
+  constructor(
+    private readonly db: Db,
+    private readonly environmentId: string,
+  ) {}
 
   async createUser(externalId: string, displayName?: string): Promise<UserRow> {
     const id = randomUUID();
-    await this.pool.query(
-      `INSERT INTO users (id, environment_id, external_id, display_name)
-       VALUES ($1, $2, $3, $4)`,
-      [id, this.environmentId, externalId, displayName ?? null],
-    );
+    await this.db.insert(users).values({
+      id,
+      environmentId: this.environmentId,
+      externalId,
+      displayName: displayName ?? null,
+    });
     return { id, external_id: externalId, display_name: displayName ?? null };
   }
 
   async getUserByExternalId(externalId: string): Promise<UserRow | null> {
-    const result = await this.pool.query<UserRow>(
-      `SELECT id, external_id, display_name FROM users
-       WHERE environment_id = $1 AND external_id = $2`,
-      [this.environmentId, externalId],
-    );
-    return result.rows[0] ?? null;
+    const rows = await this.db
+      .select({ id: users.id, external_id: users.externalId, display_name: users.displayName })
+      .from(users)
+      .where(and(eq(users.environmentId, this.environmentId), eq(users.externalId, externalId)));
+    return rows[0] ?? null;
   }
 
   async createChannel(
@@ -441,75 +684,92 @@ export class Repository {
     name?: string,
   ): Promise<ChannelRow> {
     const id = randomUUID();
-    await this.pool.query(
-      `INSERT INTO channels (id, environment_id, external_id, type, name)
-       VALUES ($1, $2, $3, $4, $5)`,
-      [id, this.environmentId, externalId, type, name ?? null],
-    );
+    await this.db.insert(channels).values({
+      id,
+      environmentId: this.environmentId,
+      externalId,
+      type,
+      name: name ?? null,
+    });
     return { id, external_id: externalId, type, name: name ?? null };
   }
 
   async getChannelByExternalId(externalId: string): Promise<ChannelRow | null> {
-    const result = await this.pool.query<ChannelRow>(
-      `SELECT id, external_id, type, name FROM channels
-       WHERE environment_id = $1 AND external_id = $2`,
-      [this.environmentId, externalId],
-    );
-    return result.rows[0] ?? null;
+    const rows = await this.db
+      .select({
+        id: channels.id,
+        external_id: channels.externalId,
+        type: sql<ChannelRow["type"]>`${channels.type}`,
+        name: channels.name,
+      })
+      .from(channels)
+      .where(
+        and(eq(channels.environmentId, this.environmentId), eq(channels.externalId, externalId)),
+      );
+    return rows[0] ?? null;
   }
 
   async listChannels(): Promise<ChannelRow[]> {
-    const result = await this.pool.query<ChannelRow>(
-      `SELECT id, external_id, type, name FROM channels
-       WHERE environment_id = $1 ORDER BY external_id`,
-      [this.environmentId],
-    );
-    return result.rows;
+    return this.db
+      .select({
+        id: channels.id,
+        external_id: channels.externalId,
+        type: sql<ChannelRow["type"]>`${channels.type}`,
+        name: channels.name,
+      })
+      .from(channels)
+      .where(eq(channels.environmentId, this.environmentId))
+      .orderBy(asc(channels.externalId));
   }
 
   /** Membership joins live in channel-land, so the tenant scope rides the
-   * channel: the JOIN below is what makes a foreign channel id useless. */
+   * channel: the double-scoped SELECT below is what makes a foreign channel
+   * id useless. INSERT ... SELECT is where the builder falls short — this
+   * is the layer's one raw SQL island, permitted by ADR-16 and kept inside
+   * the wall like everything else. */
   async addMember(channelId: string, userId: string): Promise<boolean> {
-    const result = await this.pool.query(
-      `INSERT INTO members (channel_id, user_id)
-       SELECT c.id, u.id FROM channels c, users u
-       WHERE c.id = $1 AND c.environment_id = $3
-         AND u.id = $2 AND u.environment_id = $3`,
-      [channelId, userId, this.environmentId],
+    const result = await this.db.execute(
+      sql`INSERT INTO members (channel_id, user_id)
+          SELECT c.id, u.id FROM channels c, users u
+          WHERE c.id = ${channelId} AND c.environment_id = ${this.environmentId}
+            AND u.id = ${userId} AND u.environment_id = ${this.environmentId}`,
     );
     return (result.rowCount ?? 0) > 0;
   }
 
   async listMembers(channelId: string): Promise<string[]> {
-    const result = await this.pool.query<{ user_id: string }>(
-      `SELECT m.user_id FROM members m
-       JOIN channels c ON c.id = m.channel_id
-       WHERE m.channel_id = $1 AND c.environment_id = $2
-       ORDER BY m.joined_at`,
-      [channelId, this.environmentId],
-    );
-    return result.rows.map((r) => r.user_id);
+    const rows = await this.db
+      .select({ user_id: members.userId })
+      .from(members)
+      .innerJoin(channels, eq(channels.id, members.channelId))
+      .where(and(eq(members.channelId, channelId), eq(channels.environmentId, this.environmentId)))
+      .orderBy(asc(members.joinedAt));
+    return rows.map((r) => r.user_id);
   }
 
   async channelsForUser(userId: string): Promise<string[]> {
-    const result = await this.pool.query<{ channel_id: string }>(
-      `SELECT m.channel_id FROM members m
-       JOIN users u ON u.id = m.user_id
-       WHERE m.user_id = $1 AND u.environment_id = $2`,
-      [userId, this.environmentId],
-    );
-    return result.rows.map((r) => r.channel_id);
+    const rows = await this.db
+      .select({ channel_id: members.channelId })
+      .from(members)
+      .innerJoin(users, eq(users.id, members.userId))
+      .where(and(eq(members.userId, userId), eq(users.environmentId, this.environmentId)));
+    return rows.map((r) => r.channel_id);
   }
 }
 ```
 
 Look at what became inexpressible. There is no way to construct a
-`Repository` without naming a tenant — `new Repository(pool)` is a type
+`Repository` without naming a tenant — `new Repository(db)` is a type
 error, not a code review comment. There is no unscoped query to call — the
-`WHERE environment_id = $n` lives in this file and only this file. And
-`addMember` shows the subtler pattern: for tables that carry their tenant
-through a hop, the scope rides the JOIN, so handing it a *real* channel id
-from another tenant inserts exactly zero rows.
+tenant condition lives in this file and only this file, and every query
+that leaves it is typed end to end. `addMember` shows two subtler patterns
+at once: for tables that carry their tenant through a hop, the scope rides
+the JOIN, so handing it a *real* channel id from another tenant touches
+exactly zero rows — and it is written as raw SQL, because `INSERT … SELECT`
+is where the builder falls short, and ADR-16's rule for that moment is an
+island *inside* the layer, never a leak outside it. (The constructor, note,
+uses the parameter-property shorthand — this service traded
+`erasableSyntaxOnly` away in 1.4, and this is the small dividend.)
 
 <Figure
   caption="Two doors into one database. Each Repository instance is keyed to its tenant at construction; a foreign id — even a real one — opens onto nothing."
@@ -519,7 +779,7 @@ from another tenant inserts exactly zero rows.
 <Trap>
 
 The tested-out world looks reasonable right up until it pages you. It
-starts with `pool.query()` sprinkled where it's convenient and
+starts with query calls sprinkled where they're convenient and
 `WHERE environment_id = ?` added at each call site — nineteen times,
 correctly. The twentieth site is written in month six by someone shipping a
 Friday fix to an endpoint that "just lists channels," and nothing fails:
@@ -528,8 +788,9 @@ skimming a query that looks like every other query. The leak surfaces when
 one customer sees another customer's channel names — FR-TEN-05, the
 requirement 0.4 ranked above everything, violated by an ellipsis. That's
 why the constitution adds its second clause, and we make it mechanical
-right now — raw driver access outside the layer is a lint error, in the
-same config every chapter has shared since 1.1:
+right now — raw data access outside the layer is a lint error, and with
+ADR-16 the ban has two names on it: the driver AND the query engine. The
+1.4 amendment form again, this time on a file 1.1 published:
 
 </Trap>
 
@@ -557,6 +818,18 @@ same config every chapter has shared since 1.1:
 +              message:
 +                "Raw database access is forbidden outside services/api/src/db (constitution I).",
 +            },
++            {
++              name: "drizzle-orm",
++              message:
++                "The query engine lives inside the repository layer only (constitution I, ADR-16).",
++            },
++          ],
++          patterns: [
++            {
++              group: ["drizzle-orm/*"],
++              message:
++                "The query engine lives inside the repository layer only (constitution I, ADR-16).",
++            },
 +          ],
 +        },
 +      ],
@@ -565,26 +838,30 @@ same config every chapter has shared since 1.1:
  );
 ```
 
-Try it: add `import pg from "pg"` to the gateway's `main.ts` and run
-`pnpm lint`. The refusal you get — with the constitution cited in the error
-message — is the clause working as written.
+Try it: add `import pg from "pg"` — or `import { eq } from "drizzle-orm"` —
+to the gateway's `main.ts` and run `pnpm lint`. The refusal you get — with
+the constitution cited in the error message — is the clause working as
+written. Drizzle being banned outside the layer is not lint trivia; it is
+ADR-16's confinement clause: the query engine is the repository's
+implementation detail, never a client handed to handlers.
 
 ## The suite that attacks anyway
 
 Designed out, then tested anyway. These tests need a real Postgres —
 isolation proven against a mock proves nothing — but the three-command gate
-has been Docker-free for four chapters and stays that way. The trick is one
-character of naming: integration tests are `*.itest.ts`, which the
-workspace's test pattern (`*.test.ts`, fenced since 1.1) simply never
-matches. They get their own config and their own named lane:
+has been Docker-free since 1.1 and stays that way. The trick is one
+character of naming: integration tests are `*.itest.ts`, which the unit
+lane's include (`*.test.ts`) simply never matches. They get their own
+config and their own named lane:
 
-```ts title="services/api/vitest.integration.config.ts"
+```ts title="services/api/vitest.integration.config.mts"
 import { defineConfig } from "vitest/config";
 
 // The integration lane (chapter 2.1). *.itest.ts files are invisible to the
-// workspace's unit-test include on purpose: `pnpm test` stays Docker-free,
-// and this config is what `pnpm --filter @relay/api test:integration` runs
-// against the compose Postgres.
+// unit lane's include on purpose: `pnpm test` stays Docker-free, and this
+// config is what `pnpm --filter @relay/api test:integration` runs against
+// the compose Postgres. (.mts because this package compiles to CommonJS —
+// a .ts config would be loaded as CJS, which vitest refuses.)
 export default defineConfig({
   test: {
     include: ["src/**/*.itest.ts"],
@@ -595,9 +872,9 @@ export default defineConfig({
 ```ts title="services/api/src/db/repository.itest.ts"
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { createPool, DEFAULT_DATABASE_URL } from "./client.js";
-import { migrate } from "./migrate.js";
-import { createEnvironment, Repository, type Environment } from "./repository.js";
+import { createDb, createPool, DEFAULT_DATABASE_URL, type Db } from "./client";
+import { migrate } from "./migrate";
+import { createEnvironment, Repository, type Environment } from "./repository";
 
 // The isolation suite: attack the repository with FOREIGN tenant ids and
 // prove the leak inexpressible (FR-TEN-05, NFR-SEC-09, constitution I).
@@ -613,6 +890,7 @@ if (!["localhost", "127.0.0.1"].includes(url.hostname)) {
 }
 
 const pool = createPool();
+const db: Db = createDb(pool);
 let envA: Environment;
 let envB: Environment;
 let repoA: Repository;
@@ -624,10 +902,10 @@ beforeAll(async () => {
   await pool.query(
     "TRUNCATE members, messages, channels, users, environments, applications CASCADE",
   );
-  envA = await createEnvironment(pool, { name: "tenant-a" });
-  envB = await createEnvironment(pool, { name: "tenant-b" });
-  repoA = new Repository(pool, envA.id);
-  repoB = new Repository(pool, envB.id);
+  envA = await createEnvironment(db, { name: "tenant-a" });
+  envB = await createEnvironment(db, { name: "tenant-b" });
+  repoA = new Repository(db, envA.id);
+  repoB = new Repository(db, envB.id);
 });
 
 afterAll(async () => {
@@ -687,10 +965,13 @@ pnpm --filter @relay/api test:integration
 <ForwardRef part="Part 2 and beyond">
 
 Chapter 2.2 puts this layer under concurrency — `last_sequence` and
-`SELECT … FOR UPDATE` in anger, the write path built on the spine laid
-today. The DR-03 index waits for 2.3; the pagination index for 2.4. When
-endpoints exist, the cross-tenant suite grows its full constitution form —
-attacking every endpoint with foreign IDs — and the CI chapter wires both
+`SELECT … FOR UPDATE` in anger (first-class in this data layer, which is
+much of why ADR-16 chose it), the write path built on the spine laid today.
+The DR-03 index waits for 2.3; the pagination index for 2.4. When endpoints
+exist, the module graph starts constructing this Repository per request —
+the request-scoped provider is 2.2's wiring, arriving with the requests it
+scopes — and the cross-tenant suite grows its full constitution form,
+attacking every endpoint with foreign IDs, with the CI chapter wiring both
 lanes into "every build." Postgres row-level security may join someday as a
 second belt; it will never replace the layer, because ADR-04's point is
 that invariants live in one codebase.
@@ -699,15 +980,20 @@ that invariants live in one codebase.
 
 ## Your turn
 
-The exercise is the build: migrations, layer, suite. Then attack your own
-work:
+The exercise is the build: schema, generation, review, layer, suite. Then
+attack your own work:
 
-1. Comment out one `environment_id` condition in `repository.ts` — any one —
+1. Comment out one `environmentId` condition in `repository.ts` — any one —
    and run the integration lane. Watch which assertions catch it and how
    fast. That alarm is what "tested anyway" buys.
-2. Add `import pg from "pg"` to any file outside `src/db` and run
-   `pnpm lint`. Read the error message aloud; it cites the constitution.
-3. Create a third environment in the suite and prove isolation is pairwise —
+2. Add `import { eq } from "drizzle-orm"` to any file outside `src/db` and
+   run `pnpm lint`. Read the error message aloud; it cites the constitution
+   and the ADR.
+3. Change one column in `schema.ts` (rename `display_name`, say), run
+   `drizzle-kit generate`, and read what it wrote — then delete the
+   generated file and revert. You have just rehearsed the drift check on a
+   change that didn't deserve to survive it.
+4. Create a third environment in the suite and prove isolation is pairwise —
    A/C and B/C, not just A/B. (Notice how cheap the proof is once the
    attack pattern exists.)
 
@@ -720,29 +1006,31 @@ If you read nothing else in this chapter, keep these:
 - **The core loop opens with isolation because vigilance doesn't scale** —
   a constructor that demands a tenant beats nineteen correct WHERE clauses
   and one forgotten one (D4, FR-TEN-05).
-- **The SAD's SQL is the source**: constraints are requirements — DR-01,
-  DR-02, DR-03 planted now, harvested in 2.2–2.4; genuine document gaps get
-  decisions recorded in the SQL itself.
-- **Migrations are versioned and forward-only** — there is no down path,
-  by design, and re-running is always safe.
-- **Published code changes only in daylight**: the diff-fence is now part of
-  the series' contract — what a chapter fenced, later chapters amend as
-  visible diffs, never silently.
+- **The SAD's SQL is the source, and now it has a typed twin** (ADR-16):
+  constraints are requirements — DR-01, DR-02, DR-03 planted now, harvested
+  in 2.2–2.4 — and the generate→review flow is what keeps the two schemas
+  from becoming two databases.
+- **Migrations are versioned and forward-only** — generated by drizzle-kit,
+  applied by our runner, one ledger; there is no down path, by design, and
+  re-running is always safe.
+- **The query engine lives inside the layer** — typed queries that keep
+  their SQL shape, raw islands where the builder falls short, and a lint
+  ban with two names on it so nothing leaks past the wall.
 - **Two lanes, one gate**: `*.itest.ts` keeps unit tests Docker-free while
   isolation is proven against a real database — with a guardrail that
   refuses to attack anything shared.
 
 <Checkpoint>
 
-Before starting chapter 2.2, you should have: migration 001 applied to your
-compose Postgres (and a second `migrate` run reporting nothing to apply);
-the repository layer in `services/api/src/db/` with the lint rule active
-(prove it with a scratch violation); and both lanes green — the Docker-free
-gate unchanged since 1.1, and `test:integration` passing its four isolation
-attacks. That state is tag `part2-ch1` in the canonical repository; diff
-yourself against it if anything disagrees. Chapter 2.2 assumes the spine
-exists and builds the write path on it — the row lock, the sequence, and
-the first message.
+Before starting chapter 2.2, you should have: `0000_core_tables.sql`
+generated, reviewed, and applied to your compose Postgres (and a second
+`migrate` run reporting nothing to apply); the repository layer in
+`services/api/src/db/` with the two-name lint rule active (prove it with a
+scratch violation); and both lanes green — the Docker-free gate unchanged
+since 1.1, and `test:integration` passing its four isolation attacks. That
+state is tag `part2-ch1` in the canonical repository; diff yourself against
+it if anything disagrees. Chapter 2.2 assumes the spine exists and builds
+the write path on it — the row lock, the sequence, and the first message.
 
 </Checkpoint>
 

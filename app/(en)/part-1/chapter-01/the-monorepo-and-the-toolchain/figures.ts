@@ -2,7 +2,7 @@
 // page.mdx.
 
 export const figWorkspaceMap = `flowchart TB
-    root["relay-platform/<br/>package.json · pnpm-workspace.yaml<br/>tsconfig.base.json · eslint.config.mjs · vitest.config.ts"]
+    root["relay-platform/<br/>package.json · pnpm-workspace.yaml · turbo.json<br/>tsconfig.base.json · eslint.config.mjs"]
     pkgs["packages/"]
     svcs["services/<br/>(empty until 1.4)"]
     config["@relay/config<br/>shared constants + the smoke test<br/>(today)"]
@@ -31,4 +31,8 @@ export const figToolchainGate = `flowchart LR
     types["pnpm typecheck<br/>one strict tsconfig"]
     test["pnpm test<br/>one runner (Vitest)"]
     tag["the chapter tag<br/>part1-ch1 · part1-ch2 · …"]
-    code --> lint --> types --> test --> tag`;
+    turbo["turbo run — orders the graph,<br/>caches what provably ran (ADR-17)"]
+    code --> lint --> types --> test --> tag
+    turbo -.-> lint
+    turbo -.-> types
+    turbo -.-> test`;

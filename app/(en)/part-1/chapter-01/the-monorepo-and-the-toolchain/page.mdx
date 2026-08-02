@@ -30,10 +30,12 @@ commands pass — and you will know exactly why it is *one* of everything.
 If you must skip: the workspace implements ADR-01 (TypeScript/Node everywhere) —
 a pnpm workspace with `packages/*` and `services/*`, one strict `tsconfig.base.json`
 everything extends, one ESLint config, Vitest as the one test runner, and a first
-package (`@relay/config`) whose smoke test proves the toolchain bites. The
-chapter-end state is tag **`part1-ch1`** in the relay-platform repository — check
-it out and `pnpm lint && pnpm typecheck && pnpm test` all pass. That
-three-command gate is the definition of "done" for every chapter from here on.
+package (`@relay/config`) whose smoke test proves the toolchain bites. Over the
+workspace sits Turborepo (ADR-17): every gate command is an ordinary package
+script that `turbo run` orders and caches. The chapter-end state is tag
+**`part1-ch1`** in the relay-platform repository — check it out and
+`pnpm lint && pnpm typecheck && pnpm test` all pass. That three-command gate is
+the definition of "done" for every chapter from here on.
 
 </SkipAhead>
 
@@ -128,18 +130,22 @@ series:
   "version": "0.0.0",
   "packageManager": "pnpm@10.33.0",
   "engines": {
-    "node": ">=22"
+    "node": ">=22.12"
   },
   "scripts": {
-    "lint": "eslint .",
-    "typecheck": "pnpm -r --if-present typecheck",
-    "test": "vitest run"
+    "dev": "turbo run dev",
+    "lint": "turbo run //#lint:root",
+    "lint:root": "eslint .",
+    "typecheck": "turbo run typecheck",
+    "test": "turbo run test",
+    "build": "turbo run build"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@types/node": "^26.1.2",
     "eslint": "^10.8.0",
     "prettier": "^3.9.6",
+    "turbo": "^2.10.8",
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.65.0",
     "vitest": "^4.1.10"
@@ -147,13 +153,21 @@ series:
 }
 ```
 
-Two details deserve a sentence each. `"private": true` because this workspace
-root is never published — packages inside it will be. And the TypeScript version
+Three details deserve a sentence each. `"private": true` because this workspace
+root is never published — packages inside it will be. The TypeScript version
 is *pinned to the 5.9 line* on purpose: at the time of writing, the newest
 TypeScript major is ahead of what the lint toolchain supports, and a workspace
 that chases latest-everything spends its mornings on upgrade archaeology.
-Versions in this file will drift as the series ages — the chapter tag, not the
-prose, is always the truth.
+And the Node floor is `>=22.12`, not a round `>=22`: a runtime capability this
+workspace will lean on arrives at exactly that version — chapter 1.4 names it
+when the need appears. Versions in this file will drift as the series ages —
+the chapter tag, not the prose, is always the truth.
+
+Notice what the gate scripts *are* now: every one of them says `turbo run`.
+The commands you will type never change — `pnpm lint`, `pnpm typecheck`,
+`pnpm test` — but what runs underneath them is a **task graph**, and that is a
+decision with its own record (ADR-17), argued properly a few sections down.
+First, the pieces the graph will run.
 
 The workspace map is one file. Two globs, and they are a promise about the
 future:
@@ -219,23 +233,16 @@ export default tseslint.config(
 );
 ```
 
-And the test runner — Vitest, one config, workspace-wide include patterns:
-
-```ts title="vitest.config.ts"
-import { defineConfig } from "vitest/config";
-
-// One test runner for the whole workspace (ADR-01's consequence made literal).
-export default defineConfig({
-  test: {
-    include: ["packages/**/src/**/*.test.ts", "services/**/src/**/*.test.ts"],
-  },
-});
-```
+The test runner is Vitest everywhere — but note what is *absent*: there is no
+root Vitest config. Each package owns a two-word `"test": "vitest run"` script
+and Vitest's defaults find that package's `src` tests. "One test runner" was
+never about one config file; it is about one *tool* — and the thing that runs
+every package's script, in the right order, is the task graph.
 
 Install the toolchain (this writes the `devDependencies` you saw above):
 
 ```bash
-pnpm add -Dw typescript@~5.9.0 eslint @eslint/js typescript-eslint prettier vitest @types/node
+pnpm add -Dw typescript@~5.9.0 eslint @eslint/js typescript-eslint prettier vitest @types/node turbo
 ```
 
 <Trap>
@@ -252,6 +259,88 @@ is structural, and you just built it: every rule has exactly one home
 *extend* — they never copy. If a package genuinely needs an exception, it writes
 the exception in its own file where the diff can see it, on top of the shared
 base.
+
+</Trap>
+
+## The task graph — ADR-17, and a cache you are allowed to trust
+
+Why does a one-package workspace need a task runner? It doesn't — yet. It needs
+one *before* the moment it starts hurting, because that moment lands inside a
+published chapter: 1.4 gives this workspace its first real build step, and a
+build step brings a build *order* (the protocol package must compile before
+the services that import it). Plain recursive scripts have no memory and no
+ordering — a one-line docs change re-checks the world. ADR-17's answer is
+Turborepo: every task stays an ordinary package script, `turbo run` decides
+what runs and remembers what already ran. Delete `turbo.json` tomorrow and
+`pnpm -r` still runs the same scripts — slowly, and correctly. That
+degradation path is most of why the decision is safe to make this early.
+
+The whole graph is one file:
+
+```json title="turbo.json"
+{
+  "$schema": "https://turborepo.com/schema.json",
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "outputs": ["dist/**"]
+    },
+    "dev": {
+      "dependsOn": ["^build"],
+      "cache": false,
+      "persistent": true
+    },
+    "typecheck": {
+      "dependsOn": ["^build"]
+    },
+    "test": {
+      "dependsOn": ["^build"],
+      "inputs": ["$TURBO_DEFAULT$", "$TURBO_ROOT$/compose.yaml"]
+    },
+    "//#lint:root": {
+      "inputs": ["**/*.{ts,mts,cts,mjs,js}", "eslint.config.mjs", "package.json"]
+    }
+  }
+}
+```
+
+Read it top to bottom and you have the workspace's future: `build` and `dev`
+have no targets yet — they are declared shape, like `services/` is a declared
+directory, and chapter 1.4 fills both. `dependsOn: ["^build"]` is the ordering
+rule ("my dependencies' builds before me"). Lint stays what it always was —
+ONE ESLint invocation over the whole repository, registered as a root task so
+it caches like everything else. And `test` declares an extra input naming a
+file that does not exist yet: chapter 1.2 creates `compose.yaml`, and a test
+will read it. Declaring the input before the file exists is not pedantry — it
+is the entire discipline the next box is about.
+
+<Why source="ADR-17 · D8">
+
+The trade Turborepo offers is blunt: it will skip work it can prove it already
+did, and in exchange you must tell it the truth about what each task reads. A
+cache hit is a *claim* — "nothing this task depends on has changed" — and the
+claim is only as good as the declared inputs. For a solo builder (D8), the
+payoff compounds: the gate's cost tracks the size of the change, not the size
+of the workspace, for the price of one honest JSON file. ADR-17 records the
+alternatives (staying on plain recursion; Nx, the named fallback) and the
+reversal trigger: a stale-cache incident that survives the input discipline.
+
+</Why>
+
+<Trap>
+
+The failure mode to respect is the **false green**. Suppose a test reads a
+file outside its own package — say, a compose file at the repository root —
+and that file is *not* declared as an input. Edit the file, run the gate:
+`cache hit, replaying logs`, green in milliseconds. The test never ran. It is
+telling you the *old* file was fine — and there is no red anywhere to disagree
+with it. A cache that lies is worse than no cache, because it lies in the
+color of safety. The `$TURBO_ROOT$/compose.yaml` line in `turbo.json` exists
+precisely to make this story impossible for the one cross-package read this
+workspace is about to acquire — and the rule it generalizes to is: every time
+a task learns to read outside its package, the input is declared in the same
+commit. Inputs are reviewed like code, because they are load-bearing exactly
+like code.
 
 </Trap>
 
@@ -274,10 +363,15 @@ stays at the root as the single source; this package exports the workspace's
     ".": "./src/index.ts"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
   }
 }
 ```
+
+Those two scripts are the package's whole citizenship in the task graph: turbo
+discovers tasks by script name, so *having* a `test` script is what makes this
+package testable, cacheable, and orderable — no registration file anywhere.
 
 ```json title="packages/config/tsconfig.json"
 {
@@ -295,7 +389,7 @@ package's source is three constants:
 // lives once at the repository root (tsconfig.base.json); packages extend it
 // by relative path — one home per rule, never copies (chapter 1.1's TRAP).
 
-export const NODE_VERSION_RANGE = ">=22";
+export const NODE_VERSION_RANGE = ">=22.12";
 
 export const WORKSPACE_GLOBS = ["packages/*", "services/*"] as const;
 
@@ -356,6 +450,7 @@ history:
 node_modules/
 dist/
 coverage/
+.turbo/
 *.log
 .env*
 .DS_Store
@@ -379,8 +474,21 @@ pnpm test
 ```
 
 On this workspace, that last command runs one file, three assertions, and comes
-back green in well under a second. Small — and load-bearing: the gate now
-exists, and every future chapter walks through it.
+back green in well under a second. Run it *again* and watch the graph earn its
+keep:
+
+```text
+@relay/config:test: cache hit, replaying logs 11d54803264fc27c
+ Tasks:    1 successful, 1 total
+Cached:    1 cached, 1 total
+  Time:    7ms >>> FULL TURBO
+```
+
+Seven milliseconds, because nothing changed and turbo can prove it. When you
+want the proof re-earned instead of replayed — before a tag, say — force it:
+`pnpm turbo run test --force` re-runs everything cold, and it had better be
+just as green. Small — and load-bearing: the gate now exists, and every future
+chapter walks through it.
 
 <Figure
   caption="The gate every chapter passes from now on: lint, typecheck, test — then and only then, the chapter tag."
@@ -426,7 +534,13 @@ pasting where you can stand it. Then verify yourself against the gate:
    fail? (Put it back.) If yes, your test is real — it noticed reality change.
 3. Change `strict` to `false` in a *copy* of the base tsconfig inside
    `packages/config/` and point the package at it. Feel how easy that was —
-   then delete the copy and re-read the TRAP.
+   then delete the copy and re-read the first TRAP.
+4. Run `pnpm test` twice and read the second output: `FULL TURBO`. Now bookmark
+   this one for the end of chapter 1.2: delete the `$TURBO_ROOT$/compose.yaml`
+   line from `turbo.json`, edit one character of `compose.yaml`, and run
+   `pnpm test`. Watch the cache lie to you in green. Put the line back, run
+   again, and watch it confess (`cache miss, executing`). That is the second
+   TRAP, performed live.
 
 If you are stuck, the tag holds the answer key.
 
@@ -442,6 +556,9 @@ If you read nothing else in this chapter, keep these:
   the shared-types payoff.
 - **The gate is the format**: `pnpm lint && pnpm typecheck && pnpm test`, green
   at every chapter tag, from `part1-ch1` to the end of the series.
+- **A cache is a claim, and claims need honest inputs** (ADR-17): turbo skips
+  what it can prove already ran; every file a task reads gets declared, or the
+  cache will one day be green about something it never checked.
 - **A day-one test should assert something true about reality** — ours fails if
   the workspace's manifests and its constants ever disagree.
 - **Empty directories can be architecture**: `services/` holds nothing but a
@@ -451,9 +568,10 @@ If you read nothing else in this chapter, keep these:
 
 Before starting chapter 1.2, you should have the relay-platform workspace on
 your machine with: the pnpm workspace covering `packages/*` and `services/*`;
-the strict base tsconfig, single ESLint config, and Vitest at the root;
-`@relay/config` with its three-assertion smoke test; and all three toolchain
-checks passing from a clean `pnpm install`. That state is tag `part1-ch1` in
+the strict base tsconfig and single ESLint config at the root; `turbo.json`
+declaring the five tasks; `@relay/config` with its three-assertion smoke test
+and its own `test` script; and all three toolchain checks passing from a clean
+`pnpm install` — then passing again as cache hits. That state is tag `part1-ch1` in
 the canonical repository — diff yourself against it if anything disagrees.
 Chapter 1.2 assumes this workspace exists and starts adding infrastructure
 underneath it.

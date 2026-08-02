@@ -1,4 +1,4 @@
-// Hình minh họa chương 2.1 (feature 018). Mã mermaid sống ở đây, không bao
+// Hình minh họa chương 2.1 (feature 018; sửa đổi trong 019 theo ADR-16). Mã mermaid sống ở đây, không bao
 // giờ nằm trong page.mdx. Tên bảng, tên cột, tên lệnh giữ nguyên tiếng Anh.
 
 export const figTenantSpine = `flowchart TB
@@ -19,8 +19,8 @@ export const figTenantSpine = `flowchart TB
 
 export const figTwoDoors = `flowchart TB
     dbcyl[("một PostgreSQL<br/>chứa hàng của mọi tenant")]
-    repoA["new Repository(pool, envA)<br/>mọi truy vấn: WHERE environment_id = A"]
-    repoB["new Repository(pool, envB)<br/>mọi truy vấn: WHERE environment_id = B"]
+    repoA["new Repository(db, envA)<br/>mọi truy vấn: WHERE environment_id = A"]
+    repoB["new Repository(db, envB)<br/>mọi truy vấn: WHERE environment_id = B"]
     codeA["request của tenant A"]
     codeB["request của tenant B"]
     codeA --> repoA --> dbcyl

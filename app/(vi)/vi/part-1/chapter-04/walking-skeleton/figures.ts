@@ -1,9 +1,28 @@
 // Hình minh họa chương 1.4 (feature 017). Mã mermaid sống ở đây, không bao
 // giờ nằm trong page.mdx. Tên service, tên frame, tên lệnh giữ nguyên tiếng Anh.
 
+export const figFrameworkBoundary = `flowchart LR
+    subgraph apiSide["services/api — NestJS (ADR-15)"]
+      mod["AppModule<br/>đồ thị module · DI"]
+      ctl["HealthController"]
+      mw["middleware request-id"]
+      flt["filter lỗi theo protocol"]
+      mod --> ctl
+      mod --> mw
+      mod --> flt
+    end
+    subgraph gwSide["services/gateway — không framework, do quyết định"]
+      serve["serve() của service-kit<br/>node:http trần"]
+    end
+    kit["@relay/service-kit<br/>logger · request id<br/>(một mái nhà, cho cả hai bên)"]
+    kit --> apiSide
+    kit --> gwSide
+    note["Framework phục vụ mặt tiền CRUD rộng<br/>và dừng bước trước cửa gateway:<br/>phần cơ khí socket không nhận thêm lớp nào<br/>chen giữa code và đường truyền (ADR-15)"]
+    gwSide ~~~ note`;
+
 export const figSkeletonMap = `flowchart TB
-    api["API service ✓ ĐANG ĐỨNG<br/>/healthz · X-Request-Id · log JSON<br/>(nắm REST; writer duy nhất của Postgres — ADR-04)"]
-    gw["Gateway service ✓ ĐANG ĐỨNG<br/>/healthz + bảng công bố protocol<br/>(tiếp nhận WebSocket; không bao giờ ghi DB — ADR-05)"]
+    api["API service ✓ ĐANG ĐỨNG — một ứng dụng NestJS (ADR-15)<br/>/healthz · X-Request-Id · log JSON<br/>(nắm REST; writer duy nhất của Postgres — ADR-04)"]
+    gw["Gateway service ✓ ĐANG ĐỨNG — không framework, do quyết định (ADR-15)<br/>/healthz + bảng công bố protocol<br/>(tiếp nhận WebSocket; không bao giờ ghi DB — ADR-05)"]
     whk["Webhook dispatcher<br/>(Phần 3 →)"]
     ing["Analytics ingester<br/>(Phần 5 →)"]
     mws["Media worker<br/>(Phần 4 →)"]
