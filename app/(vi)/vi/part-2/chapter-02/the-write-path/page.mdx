@@ -1,0 +1,1171 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figRaceTimeline, figSendWalk, figLockScope } from "./figures";
+
+export const metadata = {
+  title: "Write path — Building Relay",
+  description:
+    "Message đầu tiên được ghi — và naive version được viết trước, để bạn thấy hai concurrent senders phá hỏng ordering trước khi channel row lock khiến chuyện đó không còn xảy ra được (ADR-03).",
+  alternates: {
+    canonical: "/vi/part-2/chapter-02/the-write-path",
+    languages: {
+      en: "/part-2/chapter-02/the-write-path",
+      vi: "/vi/part-2/chapter-02/the-write-path",
+    },
+  },
+};
+
+<ChapterHeader id="2.2" locale="vi" />
+
+Chương 2.1 dựng spine và thách bất cứ ai leak qua nó. Hôm nay spine ấy có
+mảnh product thật đầu tiên: một message được ghi vào database, được ack, và
+được gán sequence — mà chuyện gán sequence chính là toàn bộ chương này.
+Ordering promise của Relay là FR-MSG-03, đáng trích đủ vì từng chữ đều là
+design constraint: "Message ordering within a channel shall be determined
+solely by server-assigned sequence number, never by client timestamp."
+*Solely. Server-assigned. Never by client timestamp.* Chương này xây cỗ máy
+assign những sequence number ấy — và theo luật của phần này, trước hết ta xây
+cỗ máy assign chúng *sai*, chạy dưới concurrency, rồi nhìn nó fail. Sau đó ta
+lắp fix của ADR-03 và nhìn failure ấy trở thành thứ không còn viết ra được.
+
+<SkipAhead locale="vi">
+
+Nếu bạn buộc phải đọc lướt: chương này thêm real endpoint đầu tiên của api —
+`POST /v1/channels/:channelId/messages` — dưới dạng NestJS module tiếp nối
+idiom của 1.4, còn repository có thêm `sendMessage` (một Drizzle transaction:
+`SELECT … FOR UPDATE` trên channel row, `seq = last_sequence + 1`, insert,
+commit, rồi *sau đó* mới trả 201). Một dev-mode environment header tạm thay
+real credential của Phần 3, như một recorded decision. Naive lockless version
+được build trước và chứng minh được rằng nó corrupt ordering dưới hai
+concurrent writers. Trạng thái cuối chương là tag **`part2-ch2`**;
+integration lane có thêm hai file — ordering test đặt cạnh isolation suite
+của 2.1, và một endpoint suite riêng.
+
+</SkipAhead>
+
+## Một message send thật sự hứa gì
+
+SAD mô tả send path ở §5.1, và ba margin note của nó chính là requirement của
+chương này. Thứ nhất: **ack after commit, never before** (FR-MSG-05:
+"The system shall acknowledge a send only after the message is durably
+persisted") — 201 của sender nghĩa là *durable*, không phải *received*. Thứ
+hai: FR-MSG-02 — mỗi message nhận "a monotonically increasing, gap-tolerant
+sequence number, unique and strictly ordered within a channel." Thứ ba:
+sequence được assign **under a row lock on the channel** — decision của
+ADR-03, deep dive ta đã đọc ở 0.5 và giờ cuối cùng cũng được gõ thành code.
+
+Hãy để ý điều requirement *không* promise: global ordering. Sequence number
+sắp xếp message *within a channel* (chính lời FR-MSG-02), và contention scope
+của ADR-03 khớp với nó: one channel, one lock. Hai busy channel không bao giờ
+chờ nhau; một busy channel serialize các send của chính nó — và việc serialize
+ấy không phải một cost đáng tiếc, nó *chính là* ordering guarantee, được mua
+đúng ở granularity mà requirement đòi.
+
+<Figure
+  caption="Lock scope là promise scope: mỗi channel serialize send của chính nó và không gì khác (ADR-03) — đúng shape của within-a-channel guarantee mà FR-MSG-03 đòi."
+  code={figLockScope}
+/>
+
+## Hai definition trước
+
+Trước cả hai version của write path, layer này cần hai bổ sung nhỏ — cả hai
+nằm cạnh các row type mà 2.1 đã export (`UserRow`, `ChannelRow`), trong cùng
+một file và cùng style:
+
+```diff title="services/api/src/db/repository.ts"
+ import { randomUUID } from "node:crypto";
+ 
+ import { and, asc, eq, sql } from "drizzle-orm";
+ 
+ import type { Db } from "./client";
+-import { channels, members, users } from "./schema";
++import { channels, members, messages, users } from "./schema";
+ 
+ // The repository layer — the ONE place data access lives (ADR-04's single
+ // writer, constitution I). Two surfaces with a bright line between them:
+ //
+ //   createEnvironment — the ADMIN surface. It creates tenants, so it is the
+ //   only operation here that is not tenant-scoped. It also inserts a stub
+ //   application row to satisfy environments' NOT NULL foreign key (recorded
+ //   decision: the real application lifecycle belongs to Part 3).
+ //
+ //   Repository — everything else. The constructor REQUIRES an
+ //   environment_id; every query is scoped by it HERE, in one home — never
+ //   at call sites. Cross-tenant reads return null/empty: no data, and no
+ //   reveal that the foreign id even exists (FR-TEN-05).
+ //
+ // Drizzle is the query engine inside this layer (ADR-16): queries keep
+ // their SQL shape and gain end-to-end types. Where the builder falls short,
+ // a raw SQL island is permitted — inside the layer, never outside it.
+ //
+ // All primary keys are generated app-side (crypto.randomUUID) — the SAD's
+ // SQL declares no id defaults, and the migration adds none.
+ 
+ export interface Environment {
+   id: string;
+   kind: "development" | "production";
+ }
+ 
+ export async function createEnvironment(
+   db: Db,
+   { name, kind = "development" }: { name: string; kind?: Environment["kind"] },
+ ): Promise<Environment> {
+   const applicationId = randomUUID();
+   const environmentId = randomUUID();
+   // The admin surface writes through the same Db handle but carries no
+   // tenant scope — it is the operation that MINTS the scope.
+   await db.execute(
+     sql`INSERT INTO applications (id, name) VALUES (${applicationId}, ${name})`,
+   );
+   await db.execute(
+     sql`INSERT INTO environments (id, application_id, kind, signing_secret)
+         VALUES (${environmentId}, ${applicationId}, ${kind}, ${randomUUID()})`,
+   );
+   return { id: environmentId, kind };
+ }
+ 
+ export interface UserRow {
+   id: string;
+   external_id: string;
+   display_name: string | null;
+ }
+ 
+ export interface ChannelRow {
+   id: string;
+   external_id: string;
+   type: "public" | "private";
+   name: string | null;
+ }
+ 
++export interface MessageRow {
++  id: string;
++  channel_id: string;
++  seq: number;
++  text: string | null;
++  created_at: string;
++}
++
++/** Thrown when a channel id resolves to nothing IN THIS TENANT — which,
++ * from the caller's side, is indistinguishable from "does not exist"
++ * (FR-TEN-05: no data, and no reveal that the foreign id exists). The
++ * layer stays framework-free; the service turns this into the wire's
++ * 404 (constitution I's isolation, EIR-API-04's envelope). */
++export class ChannelNotFoundError extends Error {
++  constructor(public readonly channelId: string) {
++    super(`channel not found: ${channelId}`);
++    this.name = "ChannelNotFoundError";
++  }
++}
++
+ export class Repository {
+   // Constructor parameter properties — the shorthand chapter 1.4 released
+   // for this service when ADR-15 spent erasableSyntaxOnly on decorator
+   // metadata. The guarantee still holds in the gateway and every package.
+   constructor(
+     private readonly db: Db,
+     private readonly environmentId: string,
+   ) {}
+ 
+   async createUser(externalId: string, displayName?: string): Promise<UserRow> {
+     const id = randomUUID();
+     await this.db.insert(users).values({
+       id,
+       environmentId: this.environmentId,
+       externalId,
+       displayName: displayName ?? null,
+     });
+     return { id, external_id: externalId, display_name: displayName ?? null };
+   }
+ 
+   async getUserByExternalId(externalId: string): Promise<UserRow | null> {
+     const rows = await this.db
+       .select({
+         id: users.id,
+         external_id: users.externalId,
+         display_name: users.displayName,
+       })
+       .from(users)
+       .where(
+         and(
+           eq(users.environmentId, this.environmentId),
+           eq(users.externalId, externalId),
+         ),
+       );
+     return rows[0] ?? null;
+   }
+ 
+   async createChannel(
+     externalId: string,
+     type: ChannelRow["type"],
+     name?: string,
+   ): Promise<ChannelRow> {
+     const id = randomUUID();
+     await this.db.insert(channels).values({
+       id,
+       environmentId: this.environmentId,
+       externalId,
+       type,
+       name: name ?? null,
+     });
+     return { id, external_id: externalId, type, name: name ?? null };
+   }
+ 
+   async getChannelByExternalId(externalId: string): Promise<ChannelRow | null> {
+     const rows = await this.db
+       .select({
+         id: channels.id,
+         external_id: channels.externalId,
+         type: sql<ChannelRow["type"]>`${channels.type}`,
+         name: channels.name,
+       })
+       .from(channels)
+       .where(
+         and(
+           eq(channels.environmentId, this.environmentId),
+           eq(channels.externalId, externalId),
+         ),
+       );
+     return rows[0] ?? null;
+   }
+ 
+   async listChannels(): Promise<ChannelRow[]> {
+     return this.db
+       .select({
+         id: channels.id,
+         external_id: channels.externalId,
+         type: sql<ChannelRow["type"]>`${channels.type}`,
+         name: channels.name,
+       })
+       .from(channels)
+       .where(eq(channels.environmentId, this.environmentId))
+       .orderBy(asc(channels.externalId));
+   }
+ 
+   /** Membership joins live in channel-land, so the tenant scope rides the
+    * channel: the double-scoped SELECT below is what makes a foreign channel
+    * id useless. INSERT ... SELECT is where the builder falls short — this
+    * is the layer's one raw SQL island, permitted by ADR-16 and kept inside
+    * the wall like everything else. */
+   async addMember(channelId: string, userId: string): Promise<boolean> {
+     const result = await this.db.execute(
+       sql`INSERT INTO members (channel_id, user_id)
+           SELECT c.id, u.id FROM channels c, users u
+           WHERE c.id = ${channelId} AND c.environment_id = ${this.environmentId}
+             AND u.id = ${userId} AND u.environment_id = ${this.environmentId}`,
+     );
+     return (result.rowCount ?? 0) > 0;
+   }
+ 
+   async listMembers(channelId: string): Promise<string[]> {
+     const rows = await this.db
+       .select({ user_id: members.userId })
+       .from(members)
+       .innerJoin(channels, eq(channels.id, members.channelId))
+       .where(
+         and(
+           eq(members.channelId, channelId),
+           eq(channels.environmentId, this.environmentId),
+         ),
+       )
+       .orderBy(asc(members.joinedAt));
+     return rows.map((r) => r.user_id);
+   }
+ 
+   async channelsForUser(userId: string): Promise<string[]> {
+     const rows = await this.db
+       .select({ channel_id: members.channelId })
+       .from(members)
+       .innerJoin(users, eq(users.id, members.userId))
+       .where(
+         and(
+           eq(members.userId, userId),
+           eq(users.environmentId, this.environmentId),
+         ),
+       );
+     return rows.map((r) => r.channel_id);
+   }
++
++  /** The write path (chapter 2.2): sequence assignment under the channel
++   * row lock (ADR-03). The transaction IS the ordering guarantee: the
++   * lock serialises assignment per channel, and the ack that matters
++   * happens only after commit (FR-MSG-05).
++   */
++  async sendMessage(
++    channelId: string,
++    {
++      userId,
++      text,
++      metadata,
++    }: { userId?: string; text: string; metadata?: unknown },
++  ): Promise<MessageRow> {
++    return this.db.transaction(async (tx) => {
++      const [channel] = await tx
++        .select({ id: channels.id, lastSequence: channels.lastSequence })
++        .from(channels)
++        .where(
++          and(
++            eq(channels.id, channelId),
++            eq(channels.environmentId, this.environmentId),
++          ),
++        )
++        .for("update");
++      if (!channel) throw new ChannelNotFoundError(channelId);
++      const seq = channel.lastSequence + 1;
++      const id = randomUUID();
++      await tx
++        .update(channels)
++        .set({ lastSequence: seq })
++        .where(eq(channels.id, channel.id));
++      await tx.insert(messages).values({
++        id,
++        channelId: channel.id,
++        sequence: seq,
++        userId: userId ?? null,
++        text,
++        metadata: metadata ?? {},
++      });
++      return {
++        id,
++        channel_id: channel.id,
++        seq,
++        text,
++        created_at: new Date().toISOString(),
++      };
++    });
++  }
+ }
+```
+
+Hai note về shape. `MessageRow` dùng snake_case key vì đây là row
+*wire-facing* — cùng convention mà `UserRow` và `ChannelRow` đã đặt ở 2.1,
+nơi camelCase TS column của schema được map sang name mà API return. Còn
+`ChannelNotFoundError` không import gì: repository ở 2.1 không biết HTTP và
+giờ vẫn vậy. Việc một domain error trở thành status code là việc của service,
+ba mục nữa — chính vì thế isolation story vẫn test được mà không cần boot
+server.
+
+## Build bản sai trước
+
+Đây là version ai cũng viết đầu tiên, và cũng là version sống sót qua mọi
+code review không chủ đích soi nó. Đọc `last_sequence` của channel, cộng một,
+rồi insert.
+
+```ts title="services/api/src/db/repository.naive.ts"
+// THE NAIVE WRITE — this file exists for one section of chapter 2.2 and is
+// deleted before the tag. Read the sequence, add one, insert. It passes
+// every single-user test you will ever write.
+//
+// The `pause` parameter is the test's handle on the gap: production code
+// would never take it, but a race you cannot reproduce is a race you
+// cannot demonstrate (the same injection idiom 2.7 uses on the resume
+// window).
+async sendMessageNaive(channelId: string, text: string, pause?: Promise<void>) {
+  const [channel] = await this.db
+    .select({ id: channels.id, lastSequence: channels.lastSequence })
+    .from(channels)
+    .where(and(eq(channels.id, channelId), eq(channels.environmentId, this.environmentId)));
+  if (!channel) throw new ChannelNotFoundError(channelId);
+  const seq = channel.lastSequence + 1;          // ← read…
+  if (pause) await pause;                        //   …the gap, held open…
+  const id = randomUUID();
+  await this.db.insert(messages).values({ id, channelId, sequence: seq, text });
+  await this.db                                  // …then write.
+    .update(channels)
+    .set({ lastSequence: seq })
+    .where(eq(channels.id, channel.id));
+  return { id, channel_id: channelId, seq, text };
+}
+```
+
+Nó chạy. Nó return number tăng dần. Nó sẽ qua một buổi demo. Giờ đặt nó vào
+điều kiện duy nhất mà production luôn chạy trong đó — concurrency.
+
+Và ở đây chương này phải nói thật một điều, vì naive version *lắt léo hơn vẻ
+ngoài của nó*. Fire hai send vào cùng một channel bằng `Promise.all` trơn, rất
+có thể bạn sẽ nhận được `seq 1, seq 2` sạch sẽ. Chúng ta đã chạy đúng như vậy
+với implementation này và nó pass. Event loop của Node tình cờ schedule hai
+read ở hai phía của write, và bug ngủ yên. Một race trốn được obvious test
+không phải bug nhẹ hơn — nó tệ hơn, vì nghĩa là mọi casual check bạn chạy đều
+sẽ xác nhận broken code là đúng.
+
+Vậy nên test *force* interleaving thay vì cầu may. Một promise được giữ mở
+giữa read và write ghim cả hai writer vào cùng gap:
+
+```diff title="services/api/src/db/repository.itest.ts"
+ import { afterAll, beforeAll, describe, expect, it } from "vitest";
+ 
+ import { createDb, createPool, DEFAULT_DATABASE_URL, type Db } from "./client";
+ import { migrate } from "./migrate";
+ import { createEnvironment, Repository, type Environment } from "./repository";
+ 
+ // The isolation suite: attack the repository with FOREIGN tenant ids and
+ // prove the leak inexpressible (FR-TEN-05, NFR-SEC-09, constitution I).
+ // Requires the compose Postgres — this file is *.itest.ts precisely so the
+ // Docker-free unit lane never collects it.
+ 
+ // Guardrail: integration tests run against the LOCAL compose stack only.
+ const url = new URL(process.env.DATABASE_URL ?? DEFAULT_DATABASE_URL);
+ if (!["localhost", "127.0.0.1"].includes(url.hostname)) {
+   throw new Error(
+     `integration tests refuse non-local databases (got host "${url.hostname}") — never point this suite at a shared database`,
+   );
+ }
+ 
+ const pool = createPool();
+ const db: Db = createDb(pool);
+ let envA: Environment;
+ let envB: Environment;
+ let repoA: Repository;
+ let repoB: Repository;
+ 
+ beforeAll(async () => {
+   await migrate(pool);
+-  // Deterministic ground: this suite owns these tables in the dev database.
+-  await pool.query(
+-    "TRUNCATE members, messages, channels, users, environments, applications CASCADE",
+-  );
++  // Deterministic ground WITHOUT a truncate: this suite mints its own
++  // environments, and 2.1 proved no other environment's rows are visible
++  // through them. Isolation buys parallel-safe test files for free — see
++  // the note below.
+   envA = await createEnvironment(db, { name: "tenant-a" });
+   envB = await createEnvironment(db, { name: "tenant-b" });
+   repoA = new Repository(db, envA.id);
+   repoB = new Repository(db, envB.id);
+ });
+ 
+ afterAll(async () => {
+   await pool.end();
+ });
+ 
+ describe("tenant isolation is structural (FR-TEN-05)", () => {
+   it("a foreign external_id resolves to nothing — not even an existence hint", async () => {
+     await repoA.createUser("tuan", "Tuan");
+     expect(await repoA.getUserByExternalId("tuan")).not.toBeNull();
+     expect(await repoB.getUserByExternalId("tuan")).toBeNull();
+   });
+ 
+   it("channel reads and lists are scoped by construction", async () => {
+     await repoA.createChannel("support", "public", "Support");
+     expect(await repoB.getChannelByExternalId("support")).toBeNull();
+     expect(await repoB.listChannels()).toEqual([]);
+     expect((await repoA.listChannels()).map((c) => c.external_id)).toContain(
+       "support",
+     );
+   });
+ 
+   it("membership writes with foreign ids affect zero rows", async () => {
+     const user = await repoA.getUserByExternalId("tuan");
+     const channel = await repoA.getChannelByExternalId("support");
+     expect(await repoA.addMember(channel!.id, user!.id)).toBe(true);
+     // B holds A's REAL ids — and still cannot write or read through them.
+     expect(await repoB.addMember(channel!.id, user!.id)).toBe(false);
+     expect(await repoB.listMembers(channel!.id)).toEqual([]);
+     expect(await repoB.channelsForUser(user!.id)).toEqual([]);
+     expect(await repoA.listMembers(channel!.id)).toEqual([user!.id]);
+   });
+ 
+   it("uniqueness is per-tenant (DR-02): both tenants may own the same external_id", async () => {
+     await expect(
+       repoB.createUser("tuan", "A different Tuan"),
+     ).resolves.toBeTruthy();
+     await expect(repoA.createUser("tuan", "Duplicate in A")).rejects.toThrow();
+   });
+ });
++
++describe("sequence assignment is serialised per channel (ADR-03)", () => {
++  it("two concurrent sends never interleave", async () => {
++    const channel = await repoA.createChannel("ordering", "public");
++    const [a, b] = await Promise.all([
++      repoA.sendMessage(channel.id, { text: "first writer" }),
++      repoA.sendMessage(channel.id, { text: "second writer" }),
++    ]);
++    // Two sends, two DISTINCT consecutive sequence numbers — always.
++    expect(new Set([a.seq, b.seq]).size).toBe(2);
++    expect(Math.abs(a.seq - b.seq)).toBe(1);
++  });
++});
+```
+
+Chạy nó với naive implementation và nó fail, lần nào cũng vậy, đúng như thiết
+kế:
+
+```text
+[ { ok: 1 },
+  { err: 'Error: Failed query: insert into "messages" …' } ]
+```
+
+Hai writer đều read `last_sequence = 0` khi gate đang đóng, cả hai đều tính
+`seq 1`, và insert thứ hai chết trên `UNIQUE (channel_id, sequence)` của
+DR-01 — constraint mà 2.1 đã trồng, bắt được corruption mà application layer
+không hề thấy sắp tới. Không có constraint ấy, bạn sẽ có hai message cùng
+claim một position và không có error nào cả: một ordering chưa từng order
+được gì.
+
+Test này nằm trong suite của 2.1 thay vì một file mới vì subject của nó là
+*repository* — không HTTP, không framework, chỉ hai call race trên một
+channel. Integration file ở đây được đặt tên theo thing under test, không
+theo chương thêm nó.
+
+Với naive version, test này fail — không phải always, và đó mới là phần độc
+hại thật sự, nhưng đủ reliable để thấy trong vài lần chạy.
+<Figure
+  caption="Read-then-write gap dưới hai writer: cả hai read 41, cả hai claim 42. Unique constraint của DR-01 biến silent corruption thành loud error — nhưng fix thuộc về layer sâu hơn."
+  code={figRaceTimeline}
+/>
+
+<Trap locale="vi">
+
+Bản patch rất dễ nghĩ tới sau khi bạn thấy race là một *retry loop* — catch
+unique violation, re-read, try again. Nó thậm chí chạy được, mostly, và đó là
+lý do nó là trap: bạn đã biến correctness property thành liveness lottery.
+Dưới real contention, loop retry nhiều hơn, đốt round-trip đúng lúc channel
+bận nhất, và mỗi retry re-run bất cứ thứ gì handler đã làm. Tệ hơn, loop sống
+trong *handler* — đúng nơi constitution nói rõ invariant không được sống. Row
+lock tốn một dòng, giữ trong vài microsecond, và chuyển toàn bộ problem vào
+transaction machinery của database, thứ đã giải nó đúng từ trước khi Node tồn
+tại. Khi một design dùng application code để đánh nhau với physics, đó là dấu
+hiệu design đang đứng sai layer.
+
+</Trap>
+
+## Write path, làm cho đúng
+
+Mechanism của ADR-03 là một clause: lock channel row trong suốt thời gian
+assignment. Repository — một home duy nhất của data access từ 2.1 — nhận
+write method đầu tiên, được trình bày theo đúng cách loạt bài này trình bày
+mọi edit vào published code: dưới dạng diff.
+
+Diff phía trên đã chứa nó — đây là riêng method ấy, vì nó là centerpiece của
+chương này:
+
+```ts title="services/api/src/db/repository.ts (excerpt)"
+  /** The write path (chapter 2.2): sequence assignment under the channel
+   * row lock (ADR-03). The transaction IS the ordering guarantee: the
+   * lock serialises assignment per channel, and the ack that matters
+   * happens only after commit (FR-MSG-05).
+   */
+  async sendMessage(
+    channelId: string,
+    {
+      userId,
+      text,
+      metadata,
+    }: { userId?: string; text: string; metadata?: unknown },
+  ): Promise<MessageRow> {
+    return this.db.transaction(async (tx) => {
+      const [channel] = await tx
+        .select({ id: channels.id, lastSequence: channels.lastSequence })
+        .from(channels)
+        .where(
+          and(
+            eq(channels.id, channelId),
+            eq(channels.environmentId, this.environmentId),
+          ),
+        )
+        .for("update");
+      if (!channel) throw new ChannelNotFoundError(channelId);
+      const seq = channel.lastSequence + 1;
+      const id = randomUUID();
+      await tx
+        .update(channels)
+        .set({ lastSequence: seq })
+        .where(eq(channels.id, channel.id));
+      await tx.insert(messages).values({
+        id,
+        channelId: channel.id,
+        sequence: seq,
+        userId: userId ?? null,
+        text,
+        metadata: metadata ?? {},
+      });
+      return {
+        id,
+        channel_id: channel.id,
+        seq,
+        text,
+        created_at: new Date().toISOString(),
+      };
+    });
+  }
+```
+
+Hãy đọc shape của nó, vì shape chính là argument. `SELECT … FOR UPDATE` —
+first-class trong data layer này, và đó là phần lớn lý do ADR-16 chọn nó —
+lấy row lock của channel *inside the tenant scope* (condition `environmentId`
+đi cùng, như mọi query trong layer này từ 2.1: foreign channel id không lock
+được gì và không reveal gì). Bất cứ concurrent sender nào cũng hit cùng
+`FOR UPDATE` và *wait* — không fail, wait, vài microsecond — cho đến khi
+transaction của chúng ta commit. Đến lúc nó read `last_sequence`, increment
+của chúng ta đã durable. Race không được handle; nó không thể xảy ra.
+
+Một tính từ trong FR-MSG-02 đáng dừng lại trước khi đi tiếp:
+*gap-tolerant*. Requirement promise các number strictly increasing, không
+promise contiguous number — và design này có thể tạo gap, hoàn toàn hợp lệ.
+Nếu một transaction lấy lock, increment `last_sequence`, rồi rollback ở insert, number
+nó claim đơn giản là không bao giờ được dùng. Vì thế client phải treat
+sequence number as ordering, never as count — và requirement đã được worded
+từ nhiều năm trước chương này chính để implementation này legal. Khi resume
+logic của 2.7 deduplicate theo `seq`, gap không tốn gì; chỉ *tie* mới tốn, và
+tie là thứ lock khiến impossible.
+
+Và hãy để ý ack sống ở đâu: `sendMessage` chỉ return khi `db.transaction`
+commit. Controller phía trên nó không thể send 201 cho message chưa durable,
+vì nó không bao giờ *see* message cho đến khi message đã durable. FR-MSG-05
+không được enforce bằng discipline; nó được enforce bằng control flow.
+
+<Why source="ADR-03 · FR-MSG-02/03 · constitution II" locale="vi">
+
+Vì sao dùng pessimistic lock, trong một thời đại phản xạ với optimistic retry
+hoặc UUIDv7 timestamp? Câu trả lời của deep dive là chính *requirement* đã
+pessimistic: FR-MSG-03 nói ordering do server quyết, solely, at write time —
+không có version "eventually agree on an order" nào thỏa nó. Constitution
+siết chặt hơn: "Message ordering within a channel MUST be determined solely
+by server-assigned, strictly increasing sequence numbers — never by client
+timestamps." Timestamp skew, UUID va vào ordering semantics ngay cả khi
+unique, và mọi scheme assign order mà không có coordination đều tái phát hiện
+cùng một sự thật từ phía bên kia: *someone* must serialise, và row lock của
+Postgres là serialiser rẻ nhất, boring nhất, đã tồn tại sẵn trong stack. One
+lock, one channel, microseconds — và 2.7 sẽ đặt toàn bộ resume protocol lên
+fact rằng những number này không có gap nào client cần lo và không bao giờ có
+tie.
+
+</Why>
+
+## Real endpoint đầu tiên
+
+Skeleton từ 1.4 cuối cùng mọc một chi. Module này tiếp tục mọi idiom chương
+đó đã dạy — controller trong module graph, validation ở boundary, error đi
+qua protocol filter:
+
+```ts title="services/api/src/messages/messages.controller.ts"
+import { Body, Controller, Param, Post, UseGuards } from "@nestjs/common";
+
+import { EnvironmentContextGuard } from "./environment-context.guard";
+import { MessagesService } from "./messages.service";
+import { sendMessageBodySchema } from "./messages.schema";
+// `import type` is required, not stylistic: with isolatedModules and
+// emitDecoratorMetadata on (ADR-15's trade-off, chapter 1.4), a type used
+// in a decorated signature must be imported as a type or TS1272 refuses
+// to compile it.
+import type { SendMessageBody } from "./messages.schema";
+import { ZodValidationPipe } from "./zod-validation.pipe";
+
+// The api's first product endpoint (chapter 2.2). Validation is zod at the
+// boundary — the same schema family as @relay/protocol, so the REST body
+// and the WebSocket frame payload cannot drift (1.3's payoff, again).
+@Controller("v1/channels/:channelId/messages")
+@UseGuards(EnvironmentContextGuard)
+export class MessagesController {
+  constructor(private readonly messages: MessagesService) {}
+
+  @Post()
+  async send(
+    @Param("channelId") channelId: string,
+    @Body(new ZodValidationPipe(sendMessageBodySchema)) body: SendMessageBody,
+  ) {
+    return this.messages.send(channelId, body);
+  }
+}
+```
+
+Body shape là zod schema, đặt cạnh controller — cùng library mà
+`@relay/protocol` dùng, để REST body và frame payload sẽ mang cùng field ở 2.5
+được mô tả bằng một vocabulary duy nhất:
+
+```ts title="services/api/src/messages/messages.schema.ts"
+import { z } from "zod";
+
+// The send body (chapter 2.2). FR-MSG-01 fixes the limits: text up to
+// 8,000 characters, metadata up to 4 KB of JSON — the length check lands
+// with FR-EMJ-02's code-point counting in the emoji chapter; today the
+// character bound is the honest approximation, recorded as such.
+export const sendMessageBodySchema = z.strictObject({
+  text: z.string().min(1).max(8000),
+  metadata: z.record(z.string(), z.unknown()).optional(),
+});
+
+export type SendMessageBody = z.infer<typeof sendMessageBodySchema>;
+```
+
+Import ấy là dependency mới duy nhất của chương này — zod đã có trong
+workspace (1.3 build protocol package trên nó), nhưng api service chưa từng
+declare nó, nên amendment là một dòng trên fence của 1.4:
+
+```diff title="services/api/package.json"
+ {
+   "name": "@relay/api",
+   "private": true,
+   "version": "0.0.0",
+   "type": "commonjs",
+   "scripts": {
+     "build": "nest build",
+     "dev": "nest start --watch",
+     "start": "node dist/main.js",
+     "typecheck": "tsc --noEmit",
+     "test": "vitest run",
+     "migrate": "nest build && node dist/db/migrate.js",
+     "test:integration": "vitest run --config vitest.integration.config.mts"
+   },
+   "dependencies": {
+     "@nestjs/common": "^11.1.28",
+     "@nestjs/core": "^11.1.28",
+     "@nestjs/platform-express": "^11.1.28",
+     "@relay/protocol": "workspace:*",
+     "@relay/service-kit": "workspace:*",
+     "drizzle-orm": "^0.45.2",
+     "pg": "^8.22.0",
+     "reflect-metadata": "^0.2.2",
+-    "rxjs": "^7.8.2"
++    "rxjs": "^7.8.2",
++    "zod": "^4.4.3"
+   },
+   "devDependencies": {
+     "@nestjs/cli": "^11.0.24",
+     "@nestjs/testing": "^11.1.28",
+     "@swc/core": "^1.15.47",
+     "@types/pg": "^8.20.3",
+     "drizzle-kit": "^0.31.10",
+     "unplugin-swc": "^1.5.9"
+   }
+ }
+```
+
+Pipe apply nó dài mười lăm dòng, và khiến deferred promise của 1.4
+("validation pipes join when there are request bodies to validate") thành sự
+thật ngay trên body đầu tiên api từng accept:
+
+```ts title="services/api/src/messages/zod-validation.pipe.ts"
+import { BadRequestException, type PipeTransform } from "@nestjs/common";
+import type { ZodType } from "zod";
+
+// Boundary validation (chapter 2.2). safeParse, never parse: a throw
+// from deep inside a library is not an error shape anyone can rely on.
+// The BadRequestException carries the message; 1.4's ProtocolErrorFilter
+// turns it into the EIR-API-04 envelope on the way out — one error shape,
+// one home, unchanged since the skeleton.
+export class ZodValidationPipe<T> implements PipeTransform<unknown, T> {
+  constructor(private readonly schema: ZodType<T>) {}
+
+  transform(value: unknown): T {
+    const result = this.schema.safeParse(value);
+    if (!result.success) {
+      throw new BadRequestException(
+        result.error.issues[0]?.message ?? "invalid body",
+      );
+    }
+    return result.data;
+  }
+}
+```
+
+Guard là scaffold được dán nhãn trung thực của phần này:
+
+```ts title="services/api/src/messages/environment-context.guard.ts"
+import {
+  type CanActivate,
+  type ExecutionContext,
+  Injectable,
+  UnauthorizedException,
+} from "@nestjs/common";
+
+// DECISION (chapter 2.2): real credentials arrive with Part 3 (API keys
+// in 3.2, tenancy in 3.1). Until then, public routes name their tenant
+// via the X-Relay-Environment header — a dev-mode seam, load-bearing for
+// exactly as long as it takes Part 3 to replace it. The guard resolves
+// the header; the request-scoped Repository below it is what makes the
+// scoping real (constitution I).
+@Injectable()
+export class EnvironmentContextGuard implements CanActivate {
+  canActivate(context: ExecutionContext): boolean {
+    const req = context.switchToHttp().getRequest<{
+      headers: Record<string, string | undefined>;
+      environmentId?: string;
+    }>();
+    const environmentId = req.headers["x-relay-environment"];
+    if (!environmentId) {
+      throw new UnauthorizedException("missing X-Relay-Environment");
+    }
+    req.environmentId = environmentId;
+    return true;
+  }
+}
+```
+
+Còn service là nơi domain error trở thành status code — đúng thứ mà việc viết
+`ChannelNotFoundError` framework-free đã mở đường:
+
+```ts title="services/api/src/messages/messages.service.ts"
+import { Injectable, NotFoundException } from "@nestjs/common";
+
+import {
+  ChannelNotFoundError,
+  Repository,
+  type MessageRow,
+} from "../db/repository";
+import type { SendMessageBody } from "./messages.schema";
+
+// The thin layer between HTTP and the repository (chapter 2.2). It owns
+// exactly one thing today: turning the layer's domain error into the
+// wire's 404 — same non-answer a foreign tenant's id has received since
+// 2.1, now wearing an HTTP status. The filter from 1.4 shapes the body.
+@Injectable()
+export class MessagesService {
+  constructor(private readonly repo: Repository) {}
+
+  async send(channelId: string, body: SendMessageBody): Promise<MessageRow> {
+    try {
+      return await this.repo.sendMessage(channelId, body);
+    } catch (error) {
+      if (error instanceof ChannelNotFoundError) {
+        // A CONSTANT message: echoing the id back would make the foreign-id
+        // answer differ from the missing-id answer, and "different" is
+        // itself a disclosure (FR-TEN-05).
+        throw new NotFoundException("channel not found");
+      }
+      throw error;
+    }
+  }
+}
+```
+
+Ba file ấy feed vào một mảnh NestJS wiring thật sự mới mà chương này giới
+thiệu: **request-scoped repository**. 1.4 đã hứa "a plain class the module
+graph will eventually construct per request, once there are requests." Bây
+giờ đã có request.
+
+```ts title="services/api/src/messages/messages.module.ts"
+import { Module, Scope } from "@nestjs/common";
+import { REQUEST } from "@nestjs/core";
+
+import { createDb, createPool, type Db } from "../db/client";
+import type { RequestWithTenant } from "./request-with-tenant";
+import { Repository } from "../db/repository";
+import { EnvironmentContextGuard } from "./environment-context.guard";
+import { MessagesController } from "./messages.controller";
+import { MessagesService } from "./messages.service";
+
+// The repository stays the plain 2.1 class — the framework's job is only
+// to construct it per request with the authenticated tenant (ADR-15's
+// scope note: guards authenticate, the data layer isolates).
+@Module({
+  controllers: [MessagesController],
+  providers: [
+    {
+      provide: "DB",
+      useFactory: (): Db => createDb(createPool()),
+      scope: Scope.DEFAULT,
+    },
+    {
+      provide: Repository,
+      scope: Scope.REQUEST,
+      inject: ["DB", REQUEST],
+      useFactory: (db: Db, req: RequestWithTenant) =>
+        // The FACTORY reads the header, not the guard's leftovers: Nest
+        // resolves request-scoped providers BEFORE the enhancer chain
+        // runs, so anything a guard stashes on the request is invisible
+        // here. The guard still rejects tenant-less requests (401); the
+        // factory is what scopes the layer.
+        new Repository(db, req.headers["x-relay-environment"] ?? ""),
+    },
+    MessagesService,
+    EnvironmentContextGuard,
+  ],
+})
+export class MessagesModule {}
+```
+
+Class mà 2.1 build không hề bị đụng vào — `new Repository(db, environmentId)`,
+tenant được require ngay lúc construction. Thứ thay đổi là *ai gọi new*:
+injector, một lần mỗi request, với tenant mà guard resolve được. Handler không
+thể giữ unscoped repository vì cùng lý do nó chưa bao giờ có thể —
+constructor không cho phép — và giờ nó cũng không thể giữ một repository
+*wrongly scoped*, vì nó không construct thứ ấy nữa.
+
+<Why source="SAD §5.1 · EIR-API-01/04" locale="vi">
+
+Vì sao là `POST /v1/channels/:channelId/messages` mà không phải một
+`/v1/messages` phẳng với channel nằm trong body? Vì REST surface của SAD treo
+resource dưới owner của chúng, và vì câu hỏi 404-vs-403 tan đi khi channel
+nằm trong path: foreign channel id là *not found* — cùng non-answer mà
+repository đã đưa ra từ 2.1, giờ visible ở HTTP layer với cùng envelope mà
+filter của 1.4 đã stamp lên mọi error từ khi skeleton đứng dậy. One error
+shape, one home, chương thứ ba liên tiếp.
+
+</Why>
+
+## Endpoint có suite riêng
+
+Repository test chứng minh *lock*. Nó không nói gì về việc một request có đi
+qua guard, pipe, error translation của service, và filter hay không — bốn
+layer đứng giữa client và lock ấy. Vậy nên module này có một integration file
+đặt tên theo chính subject của nó:
+
+```ts title="services/api/src/messages/messages.itest.ts"
+import "reflect-metadata";
+
+import { Test } from "@nestjs/testing";
+import type { INestApplication } from "@nestjs/common";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+
+import { AppModule } from "../app.module";
+import { createDb, createPool } from "../db/client";
+import { createEnvironment, Repository } from "../db/repository";
+
+// The endpoint path (chapter 2.2): guard → pipe → service → repository →
+// filter, over real HTTP against the compose Postgres. Its own environment,
+// minted here — no truncate, because tenant isolation means this suite and
+// the repository suite cannot see each other's rows (2.1's property, paying
+// for itself in the test lane).
+describe("POST /v1/channels/:channelId/messages", () => {
+  let app: INestApplication;
+  let url: string;
+  let env: { id: string };
+  let channelId: string;
+  let foreignChannelId: string;
+
+  beforeAll(async () => {
+    const db = createDb(createPool());
+    env = await createEnvironment(db, { name: "messages-itest" });
+    channelId = (
+      await new Repository(db, env.id).createChannel("general", "public")
+    ).id;
+    const other = await createEnvironment(db, { name: "messages-itest-other" });
+    foreignChannelId = (
+      await new Repository(db, other.id).createChannel("theirs", "public")
+    ).id;
+    app = (
+      await Test.createTestingModule({ imports: [AppModule] }).compile()
+    ).createNestApplication({ logger: false });
+    await app.listen(0);
+    url = await app.getUrl();
+  });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  const send = (body: unknown, channel = channelId, environment = env.id) =>
+    fetch(`${url}/v1/channels/${channel}/messages`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-relay-environment": environment,
+      },
+      body: JSON.stringify(body),
+    });
+
+  it("returns 201 with an ascending sequence", async () => {
+    const first = await send({ text: "hello" });
+    expect(first.status).toBe(201);
+    const a = (await first.json()) as { seq: number };
+    const b = (await (await send({ text: "again" })).json()) as { seq: number };
+    expect(b.seq).toBe(a.seq + 1);
+  });
+
+  it("rejects a malformed body through the protocol envelope", async () => {
+    const res = await send({ text: "" });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body).toMatchObject({ code: "invalid_request" });
+    expect(typeof body.docs_url).toBe("string");
+  });
+
+  it("answers a FOREIGN channel id with the same 404 as a missing one", async () => {
+    const foreign = await send({ text: "not for you" }, foreignChannelId);
+    const missing = await send({ text: "nobody home" }, crypto.randomUUID());
+    expect(foreign.status).toBe(404);
+    expect(missing.status).toBe(404);
+    // Indistinguishable — no data, and no reveal that the id exists.
+    expect(await foreign.json()).toEqual(await missing.json());
+  });
+});
+```
+
+Assertion cuối cùng ấy là isolation moment của chương trên HTTP surface. 2.1
+chứng minh foreign id return nothing *at the layer*; ở đây nó chứng minh hai
+answer byte-identical *on the wire* — vì 403 ở nơi đáng phải là 404 tự nó đã
+là disclosure, và toàn bộ điểm của FR-TEN-05 là tenant thậm chí không được
+biết nơi khác có gì. Để assertion ấy pass đã expose một gap trong filter của
+1.4, được fix hai section dưới.
+
+<Why source="2.1's isolation suite · constitution I" locale="vi">
+
+Vì sao file thứ hai không cần `TRUNCATE`, trong khi suite của 2.1 mở đầu bằng
+nó? Vì 2.1 đã build property khiến truncation không còn cần thiết. Mỗi suite
+tự mint environment của mình; mọi repository operation đều scoped vào đó; nên
+row của suite này *structurally invisible* với suite kia, giống như row của
+customer này invisible với customer khác. Ngược lại, shared truncate là một
+suite với tay ra ngoài tenant của chính nó để cleanup — đúng thứ layer này
+tồn tại để ngăn — và nó trở thành active hazard ngay khi hai integration file
+chạy cùng lúc, mỗi file wipe fixture của file kia mid-test. Vậy nên amendment
+phía trên retire nó: determinism giờ đến từ isolation thay vì destruction, và
+lane này có thể thêm bao nhiêu file tùy phần này cần.
+
+</Why>
+
+## Hai điều code dạy lại chúng ta
+
+Viết endpoint làm lộ hai correction mà không bản design nào tự sinh ra
+được — đúng kiểu điều loạt bài này tồn tại để show, không phải để hide.
+
+**Guard không thể hand tenant cho repository.** Wiring hiển nhiên là: guard
+read header, stash nó lên request, factory read lại. Nó không work, và fail
+silently — mọi request nhận repository scoped to `undefined`, nên mọi channel
+đều là "not found" và endpoint return một 404 perfectly-shaped cho data đang
+tồn tại. Lý do là ordering: **Nest resolves request-scoped providers before
+the enhancer chain runs**, nên tại factory time guard chưa execute. Fix là để
+factory tự read header (xem module phía trên) và để guard làm job mà nó thật
+sự đủ sớm để làm — reject tenant-less requests. Guards authenticate; factory
+scopes.
+
+**Một 400 tự gọi mình là `internal_error` là nói dối.** Filter của 1.4 map
+404 sang `not_found` và mọi thứ khác sang `internal_error` — ổn khi error duy
+nhất skeleton có thể produce *là* 404. Ngay khi validation pipe tồn tại,
+client nhận 400 mà body lại claim server broke. Vậy nên registry của filter
+được widen, như một amendment cho fence của 1.4:
+
+```diff title="services/api/src/protocol-error.filter.ts"
+ import type { ServerResponse } from "node:http";
+ 
+ import {
+   Catch,
+   HttpException,
+   type ArgumentsHost,
+   type ExceptionFilter,
+ } from "@nestjs/common";
+ 
+ // EIR-API-04: one error shape, one home. Whatever throws — the router's own
+ // 404, a future guard, an unhandled bug — the wire sees the same envelope
+ // the @relay/protocol error payload defines, so the REST surface and the
+ // WebSocket surface cannot drift apart. The docs_url host is a placeholder
+ // until the docs site exists (constitution V's reachable-page promise).
+ @Catch()
+ export class ProtocolErrorFilter implements ExceptionFilter {
+   catch(exception: unknown, host: ArgumentsHost): void {
+     const res = host.switchToHttp().getResponse<ServerResponse>();
+     const status =
+       exception instanceof HttpException ? exception.getStatus() : 500;
+-    const code = status === 404 ? "not_found" : "internal_error";
++    // REST error codes by status (chapter 2.2 widened this: a 400 that
++    // calls itself "internal_error" is a lie the client cannot act on).
++    // The registry stays here until an API chapter owns a REST one.
++    const code =
++      status === 400
++        ? "invalid_request"
++        : status === 401
++          ? "unauthorized"
++          : status === 404
++            ? "not_found"
++            : "internal_error";
+     const message =
+       exception instanceof HttpException
+         ? exception.message
+         : "unexpected internal error";
+     res.statusCode = status;
+     res.setHeader("content-type", "application/json");
+     res.end(
+       JSON.stringify({
+         code,
+         message,
+         docs_url: `https://relay.example/docs/errors/${code}`,
+       }),
+     );
+   }
+ }
+```
+
+Hai code mới được thêm vào, matched với những status mà api giờ thật sự có thể produce.
+REST code registry vẫn sống cùng service — một API chapter về sau sẽ own bản
+thật — nhưng "the code must describe what happened" không phải thứ nên defer.
+
+## Chạy thử, rồi qua gate
+
+Dựng store lên, chạy cả hai lane, rồi làm điều loạt bài này luôn làm — nhìn
+machinery bằng chính mắt bạn:
+
+```bash
+docker compose up -d --wait postgres
+pnpm --filter @relay/api migrate
+pnpm dev
+curl -s -X POST localhost:4000/v1/channels/$CHANNEL/messages \
+  -H "X-Relay-Environment: $ENV" -H "content-type: application/json" \
+  -d '{"text":"first message ever"}'
+```
+
+201 mang `seq: 1`. Send again: `seq: 2`. Integration lane giờ chạy cả hai
+file against locked implementation — hai writer với distinct consecutive
+number trong repository suite, và ba case của endpoint suite over real HTTP —
+tám assertion trên hai file. Docker-free gate vẫn Docker-free ở mốc bốn mươi.
+
+<Figure
+  caption="Write path ở cuối chương này — spine của §5.1 được implement đến trước outbox line, dòng vẫn cố ý absent cho đến chapter riêng của nó."
+  code={figSendWalk}
+/>
+
+<ForwardRef part="Phần 2 và Phần 3" locale="vi">
+
+Những gì §5.1 cho thấy mà chương này cố ý chưa build: idempotency leg
+(`ON CONFLICT … DO NOTHING` và retry return original) là 2.3, chỉ cách một
+chương — insert của chúng ta sẽ thêm đúng một clause. Dòng
+`INSERT outbox event` inside cùng transaction là chương 3.3, và skip nó lúc
+này là safe chính vì chưa có gì consume event. Real credentials replace
+environment header ở 3.1/3.2. Và sequence number được mint hôm nay là currency
+mọi chương sau sẽ spend: 2.4 page bằng chúng, 2.7 resume bằng chúng, 2.8
+assert bằng chúng.
+
+</ForwardRef>
+
+## Đến lượt bạn
+
+Bài tập chính là build: module, guard, pipe, repository method, cả hai test.
+Rồi cố ý break nó:
+
+1. Swap service về lại `sendMessageNaive` và chạy ordering test vài lần. Nhìn
+   nó fail *intermittently* — rồi đọc lại TRAP và để ý intermittent tệ hơn
+   always-fail nhiều thế nào.
+2. Chỉ delete clause `.for("update")`, giữ transaction, rồi chạy lại. Một
+   transaction không có lock vẫn race — isolation level không phải
+   serialisation. (Put it back.)
+3. Put `TRUNCATE` back vào suite của 2.1 và chạy integration lane vài lần.
+   Nếu hai file từng chạy cùng lúc, hãy nhìn fixture vanish mid-test — một
+   intermittent failure đọc như platform bug nhưng thật ra là test-lane bug.
+   Take it back out.
+
+Nếu bạn kẹt, tag đang giữ sẵn đáp án: `part2-ch2`.
+
+## Những điều đọng lại
+
+Nếu không đọc gì khác trong chương này, hãy giữ lấy những điều sau:
+
+- **Ordering is assigned, not observed** (FR-MSG-03): server mint sequence
+  number dưới per-channel row lock (ADR-03); client timestamp chỉ là trivia.
+- **Naive version pass mọi non-concurrent test** — đó là lý do các chương của
+  phần này stage failure trước khi fix.
+- **Ack after commit, never before** (FR-MSG-05, constitution II): 201 nghĩa
+  là durable, và control flow khiến early ack unwritable.
+- **Lock scope is promise scope**: một channel serialize send của chính nó và
+  không gì khác — contention được priced đúng ở granularity mà requirement
+  mua.
+- **Framework constructs; layer isolates**: request-scoped provider trao cho
+  mỗi request một repository đã locked to its tenant — constructor discipline
+  của 2.1, giờ wired to real traffic.
+- **Tests are filed by subject, và isolation làm chúng parallel-safe**: lock
+  được proven ở repository, envelope ở endpoint, và không suite nào wipe
+  database vì không suite nào thấy tenant của suite kia.
+
+<Checkpoint locale="vi">
+
+Trước khi bắt đầu chương 2.3, bạn cần có: messages module live với guard và
+pipe của nó; `sendMessage` trong repository thực hiện locked assignment;
+failure của naive version đã được chứng kiến ít nhất một lần và file đã bị
+deleted; cả hai integration file green — ordering test trong suite của 2.1 và
+endpoint suite over HTTP với foreign-id 404 — còn Docker-free gate untouched.
+State ấy là tag `part2-ch2` trong canonical repository. Chương 2.3 assume
+sends work và làm retry safe — Tuan sắp đi vào tunnel với đúng endpoint này
+mid-flight.
+
+</Checkpoint>
+
+<ChapterFooter id="2.2" locale="vi" />

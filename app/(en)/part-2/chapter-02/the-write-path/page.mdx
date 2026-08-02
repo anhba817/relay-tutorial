@@ -1,0 +1,1190 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figRaceTimeline, figSendWalk, figLockScope } from "./figures";
+
+export const metadata = {
+  title: "The write path — Building Relay",
+  description:
+    "The first message is written — and the naive version is written first, so you can watch two concurrent senders corrupt the ordering before the channel row lock makes it impossible (ADR-03).",
+  alternates: {
+    canonical: "/part-2/chapter-02/the-write-path",
+    languages: {
+      en: "/part-2/chapter-02/the-write-path",
+      vi: "/vi/part-2/chapter-02/the-write-path",
+    },
+  },
+};
+
+<ChapterHeader id="2.2" />
+
+Chapter 2.1 built a spine and dared anyone to leak across it. Today the
+spine gets its first vertebra of actual product: a message is written to the
+database, acknowledged, and numbered — and the numbering is the whole
+chapter. Relay's ordering promise is FR-MSG-03, quoted in full because every
+word is a design constraint: "Message ordering within a channel shall be
+determined solely by server-assigned sequence number, never by client
+timestamp." *Solely. Server-assigned. Never by client timestamp.* This
+chapter builds the machine that assigns those numbers — and per this part's
+standing rule, we first build the machine that assigns them *wrong*, run it
+under concurrency, and watch it fail. Then we install ADR-03's fix and watch
+the failure become inexpressible.
+
+<SkipAhead>
+
+If you must skip: the chapter adds the api's first real endpoint —
+`POST /v1/channels/:channelId/messages` — as a NestJS module continuing
+1.4's idioms, with the repository gaining `sendMessage` (a Drizzle
+transaction: `SELECT … FOR UPDATE` on the channel row, `seq =
+last_sequence + 1`, insert, commit, and only then the 201). A dev-mode
+environment header stands in for Part 3's real credentials, as a recorded
+decision. The naive lockless version is built first and demonstrably
+corrupts ordering under two concurrent writers. The chapter-end state is
+tag **`part2-ch2`**; the integration lane gains two files — the ordering
+test beside 2.1's isolation suite, and an endpoint suite of its own.
+
+</SkipAhead>
+
+## What a message send actually promises
+
+The SAD walks the send in §5.1, and three of its margin notes are this
+chapter's requirements. First: **ack after commit, never before**
+(FR-MSG-05: "The system shall acknowledge a send only after the message is
+durably persisted") — the sender's 201 means *durable*, not *received*.
+Second: FR-MSG-02 — every message gets "a monotonically increasing,
+gap-tolerant sequence number, unique and strictly ordered within a
+channel." Third: the sequence is assigned **under a row lock on the
+channel** — ADR-03's decision, whose deep dive we read back in 0.5 and now
+finally get to type in.
+
+Notice what the requirements do *not* promise: global ordering. Sequence
+numbers order messages *within a channel* (FR-MSG-02's own words), and
+ADR-03's contention scope matches: one channel, one lock. Two busy channels
+never wait on each other; one busy channel serialises its own sends — and
+that serialisation is not an unfortunate cost, it *is* the ordering
+guarantee, purchased at exactly the granularity the requirement asks for.
+
+<Figure
+  caption="The lock's scope is the promise's scope: each channel serialises its own sends and nothing else (ADR-03) — which is precisely the shape of FR-MSG-03's within-a-channel guarantee."
+  code={figLockScope}
+/>
+
+## Two definitions first
+
+Before either version of the write, the layer needs two small additions —
+both alongside the row types 2.1 already exports (`UserRow`, `ChannelRow`),
+in the same file and the same style:
+
+```diff title="services/api/src/db/repository.ts"
+ import { randomUUID } from "node:crypto";
+ 
+ import { and, asc, eq, sql } from "drizzle-orm";
+ 
+ import type { Db } from "./client";
+-import { channels, members, users } from "./schema";
++import { channels, members, messages, users } from "./schema";
+ 
+ // The repository layer — the ONE place data access lives (ADR-04's single
+ // writer, constitution I). Two surfaces with a bright line between them:
+ //
+ //   createEnvironment — the ADMIN surface. It creates tenants, so it is the
+ //   only operation here that is not tenant-scoped. It also inserts a stub
+ //   application row to satisfy environments' NOT NULL foreign key (recorded
+ //   decision: the real application lifecycle belongs to Part 3).
+ //
+ //   Repository — everything else. The constructor REQUIRES an
+ //   environment_id; every query is scoped by it HERE, in one home — never
+ //   at call sites. Cross-tenant reads return null/empty: no data, and no
+ //   reveal that the foreign id even exists (FR-TEN-05).
+ //
+ // Drizzle is the query engine inside this layer (ADR-16): queries keep
+ // their SQL shape and gain end-to-end types. Where the builder falls short,
+ // a raw SQL island is permitted — inside the layer, never outside it.
+ //
+ // All primary keys are generated app-side (crypto.randomUUID) — the SAD's
+ // SQL declares no id defaults, and the migration adds none.
+ 
+ export interface Environment {
+   id: string;
+   kind: "development" | "production";
+ }
+ 
+ export async function createEnvironment(
+   db: Db,
+   { name, kind = "development" }: { name: string; kind?: Environment["kind"] },
+ ): Promise<Environment> {
+   const applicationId = randomUUID();
+   const environmentId = randomUUID();
+   // The admin surface writes through the same Db handle but carries no
+   // tenant scope — it is the operation that MINTS the scope.
+   await db.execute(
+     sql`INSERT INTO applications (id, name) VALUES (${applicationId}, ${name})`,
+   );
+   await db.execute(
+     sql`INSERT INTO environments (id, application_id, kind, signing_secret)
+         VALUES (${environmentId}, ${applicationId}, ${kind}, ${randomUUID()})`,
+   );
+   return { id: environmentId, kind };
+ }
+ 
+ export interface UserRow {
+   id: string;
+   external_id: string;
+   display_name: string | null;
+ }
+ 
+ export interface ChannelRow {
+   id: string;
+   external_id: string;
+   type: "public" | "private";
+   name: string | null;
+ }
+ 
++export interface MessageRow {
++  id: string;
++  channel_id: string;
++  seq: number;
++  text: string | null;
++  created_at: string;
++}
++
++/** Thrown when a channel id resolves to nothing IN THIS TENANT — which,
++ * from the caller's side, is indistinguishable from "does not exist"
++ * (FR-TEN-05: no data, and no reveal that the foreign id exists). The
++ * layer stays framework-free; the service turns this into the wire's
++ * 404 (constitution I's isolation, EIR-API-04's envelope). */
++export class ChannelNotFoundError extends Error {
++  constructor(public readonly channelId: string) {
++    super(`channel not found: ${channelId}`);
++    this.name = "ChannelNotFoundError";
++  }
++}
++
+ export class Repository {
+   // Constructor parameter properties — the shorthand chapter 1.4 released
+   // for this service when ADR-15 spent erasableSyntaxOnly on decorator
+   // metadata. The guarantee still holds in the gateway and every package.
+   constructor(
+     private readonly db: Db,
+     private readonly environmentId: string,
+   ) {}
+ 
+   async createUser(externalId: string, displayName?: string): Promise<UserRow> {
+     const id = randomUUID();
+     await this.db.insert(users).values({
+       id,
+       environmentId: this.environmentId,
+       externalId,
+       displayName: displayName ?? null,
+     });
+     return { id, external_id: externalId, display_name: displayName ?? null };
+   }
+ 
+   async getUserByExternalId(externalId: string): Promise<UserRow | null> {
+     const rows = await this.db
+       .select({
+         id: users.id,
+         external_id: users.externalId,
+         display_name: users.displayName,
+       })
+       .from(users)
+       .where(
+         and(
+           eq(users.environmentId, this.environmentId),
+           eq(users.externalId, externalId),
+         ),
+       );
+     return rows[0] ?? null;
+   }
+ 
+   async createChannel(
+     externalId: string,
+     type: ChannelRow["type"],
+     name?: string,
+   ): Promise<ChannelRow> {
+     const id = randomUUID();
+     await this.db.insert(channels).values({
+       id,
+       environmentId: this.environmentId,
+       externalId,
+       type,
+       name: name ?? null,
+     });
+     return { id, external_id: externalId, type, name: name ?? null };
+   }
+ 
+   async getChannelByExternalId(externalId: string): Promise<ChannelRow | null> {
+     const rows = await this.db
+       .select({
+         id: channels.id,
+         external_id: channels.externalId,
+         type: sql<ChannelRow["type"]>`${channels.type}`,
+         name: channels.name,
+       })
+       .from(channels)
+       .where(
+         and(
+           eq(channels.environmentId, this.environmentId),
+           eq(channels.externalId, externalId),
+         ),
+       );
+     return rows[0] ?? null;
+   }
+ 
+   async listChannels(): Promise<ChannelRow[]> {
+     return this.db
+       .select({
+         id: channels.id,
+         external_id: channels.externalId,
+         type: sql<ChannelRow["type"]>`${channels.type}`,
+         name: channels.name,
+       })
+       .from(channels)
+       .where(eq(channels.environmentId, this.environmentId))
+       .orderBy(asc(channels.externalId));
+   }
+ 
+   /** Membership joins live in channel-land, so the tenant scope rides the
+    * channel: the double-scoped SELECT below is what makes a foreign channel
+    * id useless. INSERT ... SELECT is where the builder falls short — this
+    * is the layer's one raw SQL island, permitted by ADR-16 and kept inside
+    * the wall like everything else. */
+   async addMember(channelId: string, userId: string): Promise<boolean> {
+     const result = await this.db.execute(
+       sql`INSERT INTO members (channel_id, user_id)
+           SELECT c.id, u.id FROM channels c, users u
+           WHERE c.id = ${channelId} AND c.environment_id = ${this.environmentId}
+             AND u.id = ${userId} AND u.environment_id = ${this.environmentId}`,
+     );
+     return (result.rowCount ?? 0) > 0;
+   }
+ 
+   async listMembers(channelId: string): Promise<string[]> {
+     const rows = await this.db
+       .select({ user_id: members.userId })
+       .from(members)
+       .innerJoin(channels, eq(channels.id, members.channelId))
+       .where(
+         and(
+           eq(members.channelId, channelId),
+           eq(channels.environmentId, this.environmentId),
+         ),
+       )
+       .orderBy(asc(members.joinedAt));
+     return rows.map((r) => r.user_id);
+   }
+ 
+   async channelsForUser(userId: string): Promise<string[]> {
+     const rows = await this.db
+       .select({ channel_id: members.channelId })
+       .from(members)
+       .innerJoin(users, eq(users.id, members.userId))
+       .where(
+         and(
+           eq(members.userId, userId),
+           eq(users.environmentId, this.environmentId),
+         ),
+       );
+     return rows.map((r) => r.channel_id);
+   }
++
++  /** The write path (chapter 2.2): sequence assignment under the channel
++   * row lock (ADR-03). The transaction IS the ordering guarantee: the
++   * lock serialises assignment per channel, and the ack that matters
++   * happens only after commit (FR-MSG-05).
++   */
++  async sendMessage(
++    channelId: string,
++    {
++      userId,
++      text,
++      metadata,
++    }: { userId?: string; text: string; metadata?: unknown },
++  ): Promise<MessageRow> {
++    return this.db.transaction(async (tx) => {
++      const [channel] = await tx
++        .select({ id: channels.id, lastSequence: channels.lastSequence })
++        .from(channels)
++        .where(
++          and(
++            eq(channels.id, channelId),
++            eq(channels.environmentId, this.environmentId),
++          ),
++        )
++        .for("update");
++      if (!channel) throw new ChannelNotFoundError(channelId);
++      const seq = channel.lastSequence + 1;
++      const id = randomUUID();
++      await tx
++        .update(channels)
++        .set({ lastSequence: seq })
++        .where(eq(channels.id, channel.id));
++      await tx.insert(messages).values({
++        id,
++        channelId: channel.id,
++        sequence: seq,
++        userId: userId ?? null,
++        text,
++        metadata: metadata ?? {},
++      });
++      return {
++        id,
++        channel_id: channel.id,
++        seq,
++        text,
++        created_at: new Date().toISOString(),
++      };
++    });
++  }
+ }
+```
+
+Two notes on shapes. `MessageRow` uses snake_case keys because it is a
+*wire-facing* row — the same convention `UserRow` and `ChannelRow` set in
+2.1, where the schema's camelCase TS columns are mapped to the names the
+API returns. And `ChannelNotFoundError` imports nothing: the repository
+knew nothing about HTTP in 2.1 and still doesn't. A domain error crossing
+into a status code is the service's job, three sections down — which is
+exactly why the isolation story stays testable without booting a server.
+
+## Build the wrong one first
+
+Here is the version everyone writes first, and the version that survives
+every code review that isn't looking for it. Read the channel's
+`last_sequence`, add one, insert:
+
+```ts title="services/api/src/db/repository.naive.ts"
+// THE NAIVE WRITE — this file exists for one section of chapter 2.2 and is
+// deleted before the tag. Read the sequence, add one, insert. It passes
+// every single-user test you will ever write.
+//
+// The `pause` parameter is the test's handle on the gap: production code
+// would never take it, but a race you cannot reproduce is a race you
+// cannot demonstrate (the same injection idiom 2.7 uses on the resume
+// window).
+async sendMessageNaive(channelId: string, text: string, pause?: Promise<void>) {
+  const [channel] = await this.db
+    .select({ id: channels.id, lastSequence: channels.lastSequence })
+    .from(channels)
+    .where(and(eq(channels.id, channelId), eq(channels.environmentId, this.environmentId)));
+  if (!channel) throw new ChannelNotFoundError(channelId);
+  const seq = channel.lastSequence + 1;          // ← read…
+  if (pause) await pause;                        //   …the gap, held open…
+  const id = randomUUID();
+  await this.db.insert(messages).values({ id, channelId, sequence: seq, text });
+  await this.db                                  // …then write.
+    .update(channels)
+    .set({ lastSequence: seq })
+    .where(eq(channels.id, channel.id));
+  return { id, channel_id: channelId, seq, text };
+}
+```
+
+It works. It returns ascending numbers. It will pass a demo. Now put it
+under the only condition production ever runs in — concurrency.
+
+And here the chapter has to be honest about something, because the naive
+version is *sneakier than it looks*. Fire two sends at one channel with a
+plain `Promise.all` and you will very likely get a clean `seq 1, seq 2`.
+We ran exactly that against this implementation and it passed. Node's
+event loop happened to schedule the two reads either side of the write,
+and the bug slept. A race that hides from the obvious test is not a
+milder bug — it is a worse one, because it means every casual check you
+run will bless the broken code.
+
+So the test *forces* the interleaving instead of hoping for it. A promise
+held open between the read and the write pins both writers inside the gap
+at once:
+
+```diff title="services/api/src/db/repository.itest.ts"
+ import { afterAll, beforeAll, describe, expect, it } from "vitest";
+ 
+ import { createDb, createPool, DEFAULT_DATABASE_URL, type Db } from "./client";
+ import { migrate } from "./migrate";
+ import { createEnvironment, Repository, type Environment } from "./repository";
+ 
+ // The isolation suite: attack the repository with FOREIGN tenant ids and
+ // prove the leak inexpressible (FR-TEN-05, NFR-SEC-09, constitution I).
+ // Requires the compose Postgres — this file is *.itest.ts precisely so the
+ // Docker-free unit lane never collects it.
+ 
+ // Guardrail: integration tests run against the LOCAL compose stack only.
+ const url = new URL(process.env.DATABASE_URL ?? DEFAULT_DATABASE_URL);
+ if (!["localhost", "127.0.0.1"].includes(url.hostname)) {
+   throw new Error(
+     `integration tests refuse non-local databases (got host "${url.hostname}") — never point this suite at a shared database`,
+   );
+ }
+ 
+ const pool = createPool();
+ const db: Db = createDb(pool);
+ let envA: Environment;
+ let envB: Environment;
+ let repoA: Repository;
+ let repoB: Repository;
+ 
+ beforeAll(async () => {
+   await migrate(pool);
+-  // Deterministic ground: this suite owns these tables in the dev database.
+-  await pool.query(
+-    "TRUNCATE members, messages, channels, users, environments, applications CASCADE",
+-  );
++  // Deterministic ground WITHOUT a truncate: this suite mints its own
++  // environments, and 2.1 proved no other environment's rows are visible
++  // through them. Isolation buys parallel-safe test files for free — see
++  // the note below.
+   envA = await createEnvironment(db, { name: "tenant-a" });
+   envB = await createEnvironment(db, { name: "tenant-b" });
+   repoA = new Repository(db, envA.id);
+   repoB = new Repository(db, envB.id);
+ });
+ 
+ afterAll(async () => {
+   await pool.end();
+ });
+ 
+ describe("tenant isolation is structural (FR-TEN-05)", () => {
+   it("a foreign external_id resolves to nothing — not even an existence hint", async () => {
+     await repoA.createUser("tuan", "Tuan");
+     expect(await repoA.getUserByExternalId("tuan")).not.toBeNull();
+     expect(await repoB.getUserByExternalId("tuan")).toBeNull();
+   });
+ 
+   it("channel reads and lists are scoped by construction", async () => {
+     await repoA.createChannel("support", "public", "Support");
+     expect(await repoB.getChannelByExternalId("support")).toBeNull();
+     expect(await repoB.listChannels()).toEqual([]);
+     expect((await repoA.listChannels()).map((c) => c.external_id)).toContain(
+       "support",
+     );
+   });
+ 
+   it("membership writes with foreign ids affect zero rows", async () => {
+     const user = await repoA.getUserByExternalId("tuan");
+     const channel = await repoA.getChannelByExternalId("support");
+     expect(await repoA.addMember(channel!.id, user!.id)).toBe(true);
+     // B holds A's REAL ids — and still cannot write or read through them.
+     expect(await repoB.addMember(channel!.id, user!.id)).toBe(false);
+     expect(await repoB.listMembers(channel!.id)).toEqual([]);
+     expect(await repoB.channelsForUser(user!.id)).toEqual([]);
+     expect(await repoA.listMembers(channel!.id)).toEqual([user!.id]);
+   });
+ 
+   it("uniqueness is per-tenant (DR-02): both tenants may own the same external_id", async () => {
+     await expect(
+       repoB.createUser("tuan", "A different Tuan"),
+     ).resolves.toBeTruthy();
+     await expect(repoA.createUser("tuan", "Duplicate in A")).rejects.toThrow();
+   });
+ });
++
++describe("sequence assignment is serialised per channel (ADR-03)", () => {
++  it("two concurrent sends never interleave", async () => {
++    const channel = await repoA.createChannel("ordering", "public");
++    const [a, b] = await Promise.all([
++      repoA.sendMessage(channel.id, { text: "first writer" }),
++      repoA.sendMessage(channel.id, { text: "second writer" }),
++    ]);
++    // Two sends, two DISTINCT consecutive sequence numbers — always.
++    expect(new Set([a.seq, b.seq]).size).toBe(2);
++    expect(Math.abs(a.seq - b.seq)).toBe(1);
++  });
++});
+```
+
+Run that against the naive implementation and it fails, every time,
+exactly as designed:
+
+```text
+[ { ok: 1 },
+  { err: 'Error: Failed query: insert into "messages" …' } ]
+```
+
+Both writers read `last_sequence = 0` while the gate was closed, both
+computed `seq 1`, and the second insert died on DR-01's
+`UNIQUE (channel_id, sequence)` — the constraint 2.1 planted, catching a
+corruption the application layer never saw coming. Without that
+constraint you would have two messages claiming one position and no error
+at all: an ordering that never ordered anything.
+
+The test lives in 2.1's suite rather than a new file because its subject
+is the *repository* — no HTTP, no framework, just two calls racing at one
+channel. Integration files here are named for the thing under test, not
+for the chapter that adds them.
+
+Against the naive version, this test fails — not always, which is the
+truly poisonous part, but reliably enough to see within a few runs
+<Figure
+  caption="The read-then-write gap under two writers: both read 41, both claim 42. DR-01's unique constraint turns silent corruption into a loud error — but the fix belongs one level deeper."
+  code={figRaceTimeline}
+/>
+
+<Trap>
+
+The tempting patch, once you've seen the race, is a *retry loop* — catch
+the unique violation, re-read, try again. It even works, mostly, which is
+what makes it a trap: you have converted a correctness property into a
+liveness lottery. Under real contention the loop retries more often,
+burning round-trips exactly when the channel is busiest, and every retry
+re-runs whatever else your handler did. Worse, the loop lives in the
+*handler* — the place the constitution explicitly says invariants must not
+live. The row lock costs one line, holds for microseconds, and moves the
+entire problem into the database's transaction machinery, which has been
+solving it correctly since before Node existed. When a design fights
+physics with application code, take it as a sign the design is standing in
+the wrong layer.
+
+</Trap>
+
+## The write path, done right
+
+ADR-03's mechanism is one clause: lock the channel row for the duration of
+the assignment. The repository — the one home data access has had since
+2.1 — gains its first write method, shown as this series shows all edits
+to published code, as a diff:
+
+The diff above already carried it — here is the method on its own, since
+it is the chapter's centrepiece:
+
+```ts title="services/api/src/db/repository.ts (excerpt)"
+  /** The write path (chapter 2.2): sequence assignment under the channel
+   * row lock (ADR-03). The transaction IS the ordering guarantee: the
+   * lock serialises assignment per channel, and the ack that matters
+   * happens only after commit (FR-MSG-05).
+   */
+  async sendMessage(
+    channelId: string,
+    {
+      userId,
+      text,
+      metadata,
+    }: { userId?: string; text: string; metadata?: unknown },
+  ): Promise<MessageRow> {
+    return this.db.transaction(async (tx) => {
+      const [channel] = await tx
+        .select({ id: channels.id, lastSequence: channels.lastSequence })
+        .from(channels)
+        .where(
+          and(
+            eq(channels.id, channelId),
+            eq(channels.environmentId, this.environmentId),
+          ),
+        )
+        .for("update");
+      if (!channel) throw new ChannelNotFoundError(channelId);
+      const seq = channel.lastSequence + 1;
+      const id = randomUUID();
+      await tx
+        .update(channels)
+        .set({ lastSequence: seq })
+        .where(eq(channels.id, channel.id));
+      await tx.insert(messages).values({
+        id,
+        channelId: channel.id,
+        sequence: seq,
+        userId: userId ?? null,
+        text,
+        metadata: metadata ?? {},
+      });
+      return {
+        id,
+        channel_id: channel.id,
+        seq,
+        text,
+        created_at: new Date().toISOString(),
+      };
+    });
+  }
+```
+
+Read the shape, because the shape is the argument. The `SELECT … FOR
+UPDATE` — first-class in this data layer, which is much of why ADR-16
+chose it — takes the channel's row lock *inside the tenant scope* (the
+`environmentId` condition rides along, as every query in this layer has
+since 2.1: a foreign channel id locks nothing and reveals nothing). Any
+concurrent sender hits the same `FOR UPDATE` and *waits* — not fails,
+waits, microseconds — until our transaction commits. By the time it reads
+`last_sequence`, our increment is durable. The race isn't handled; it
+cannot occur.
+
+One adjective in FR-MSG-02 deserves a beat before we move on:
+*gap-tolerant*. The requirement promises strictly increasing numbers, not
+contiguous ones — and this design can produce gaps, legitimately. If a
+transaction takes the lock, increments `last_sequence`, and then rolls
+back on the insert, the number it claimed is simply never used. Clients
+must therefore treat sequence numbers as an ordering, never as a count —
+and the requirement was worded years before this chapter precisely so
+that this implementation would be legal. When 2.7's resume logic
+deduplicates on `seq`, gaps cost nothing; only *ties* would, and ties are
+what the lock makes impossible.
+
+And note where the ack lives: `sendMessage` returns only when
+`db.transaction` commits. The controller above it cannot send a 201 for a
+message that isn't durable, because it never *sees* the message until it
+is. FR-MSG-05 isn't enforced by discipline; it's enforced by control flow.
+
+<Why source="ADR-03 · FR-MSG-02/03 · constitution II">
+
+Why a pessimistic lock, in an era that reflexively reaches for optimistic
+retries or UUIDv7 timestamps? The deep dive's answer is that the
+*requirement* is pessimistic: FR-MSG-03 says ordering is decided by the
+server, solely, at write time — there is no version of "eventually agree
+on an order" that satisfies it. The constitution hardens it: "Message
+ordering within a channel MUST be determined solely by server-assigned,
+strictly increasing sequence numbers — never by client timestamps."
+Timestamps skew, UUIDs collide in ordering semantics even when unique, and
+every scheme that assigns order without coordination re-discovers the
+same truth from the other side: *someone* must serialise, and Postgres's
+row lock is the cheapest, boringest serialiser that already exists in the
+stack. One lock, one channel, microseconds — and 2.7 will lean its entire
+resume protocol on the fact that these numbers have no gaps a client
+needs to worry about and no ties, ever.
+
+</Why>
+
+## The first real endpoint
+
+The skeleton from 1.4 finally grows a limb. The module continues every
+idiom that chapter taught — a controller in the module graph, validation
+at the boundary, errors through the protocol filter:
+
+```ts title="services/api/src/messages/messages.controller.ts"
+import { Body, Controller, Param, Post, UseGuards } from "@nestjs/common";
+
+import { EnvironmentContextGuard } from "./environment-context.guard";
+import { MessagesService } from "./messages.service";
+import { sendMessageBodySchema } from "./messages.schema";
+// `import type` is required, not stylistic: with isolatedModules and
+// emitDecoratorMetadata on (ADR-15's trade-off, chapter 1.4), a type used
+// in a decorated signature must be imported as a type or TS1272 refuses
+// to compile it.
+import type { SendMessageBody } from "./messages.schema";
+import { ZodValidationPipe } from "./zod-validation.pipe";
+
+// The api's first product endpoint (chapter 2.2). Validation is zod at the
+// boundary — the same schema family as @relay/protocol, so the REST body
+// and the WebSocket frame payload cannot drift (1.3's payoff, again).
+@Controller("v1/channels/:channelId/messages")
+@UseGuards(EnvironmentContextGuard)
+export class MessagesController {
+  constructor(private readonly messages: MessagesService) {}
+
+  @Post()
+  async send(
+    @Param("channelId") channelId: string,
+    @Body(new ZodValidationPipe(sendMessageBodySchema)) body: SendMessageBody,
+  ) {
+    return this.messages.send(channelId, body);
+  }
+}
+```
+
+The body's shape is a zod schema, kept beside the controller — the same
+library `@relay/protocol` uses, so the REST body and the frame payload
+that will carry the same fields in 2.5 are described in one vocabulary:
+
+```ts title="services/api/src/messages/messages.schema.ts"
+import { z } from "zod";
+
+// The send body (chapter 2.2). FR-MSG-01 fixes the limits: text up to
+// 8,000 characters, metadata up to 4 KB of JSON — the length check lands
+// with FR-EMJ-02's code-point counting in the emoji chapter; today the
+// character bound is the honest approximation, recorded as such.
+export const sendMessageBodySchema = z.strictObject({
+  text: z.string().min(1).max(8000),
+  metadata: z.record(z.string(), z.unknown()).optional(),
+});
+
+export type SendMessageBody = z.infer<typeof sendMessageBodySchema>;
+```
+
+That import is the chapter's one new dependency — zod was already in the
+workspace (1.3 built the protocol package on it), but the api service had
+never declared it, so the amendment is one line on a 1.4 fence:
+
+```diff title="services/api/package.json"
+ {
+   "name": "@relay/api",
+   "private": true,
+   "version": "0.0.0",
+   "type": "commonjs",
+   "scripts": {
+     "build": "nest build",
+     "dev": "nest start --watch",
+     "start": "node dist/main.js",
+     "typecheck": "tsc --noEmit",
+     "test": "vitest run",
+     "migrate": "nest build && node dist/db/migrate.js",
+     "test:integration": "vitest run --config vitest.integration.config.mts"
+   },
+   "dependencies": {
+     "@nestjs/common": "^11.1.28",
+     "@nestjs/core": "^11.1.28",
+     "@nestjs/platform-express": "^11.1.28",
+     "@relay/protocol": "workspace:*",
+     "@relay/service-kit": "workspace:*",
+     "drizzle-orm": "^0.45.2",
+     "pg": "^8.22.0",
+     "reflect-metadata": "^0.2.2",
+-    "rxjs": "^7.8.2"
++    "rxjs": "^7.8.2",
++    "zod": "^4.4.3"
+   },
+   "devDependencies": {
+     "@nestjs/cli": "^11.0.24",
+     "@nestjs/testing": "^11.1.28",
+     "@swc/core": "^1.15.47",
+     "@types/pg": "^8.20.3",
+     "drizzle-kit": "^0.31.10",
+     "unplugin-swc": "^1.5.9"
+   }
+ }
+```
+
+The pipe that applies it is fifteen lines, and it makes 1.4's deferred
+promise ("validation pipes join when there are request bodies to
+validate") come true on the first body the api ever accepts:
+
+```ts title="services/api/src/messages/zod-validation.pipe.ts"
+import { BadRequestException, type PipeTransform } from "@nestjs/common";
+import type { ZodType } from "zod";
+
+// Boundary validation (chapter 2.2). safeParse, never parse: a throw
+// from deep inside a library is not an error shape anyone can rely on.
+// The BadRequestException carries the message; 1.4's ProtocolErrorFilter
+// turns it into the EIR-API-04 envelope on the way out — one error shape,
+// one home, unchanged since the skeleton.
+export class ZodValidationPipe<T> implements PipeTransform<unknown, T> {
+  constructor(private readonly schema: ZodType<T>) {}
+
+  transform(value: unknown): T {
+    const result = this.schema.safeParse(value);
+    if (!result.success) {
+      throw new BadRequestException(
+        result.error.issues[0]?.message ?? "invalid body",
+      );
+    }
+    return result.data;
+  }
+}
+```
+
+The guard is this part's honestly-labeled scaffold:
+
+```ts title="services/api/src/messages/environment-context.guard.ts"
+import {
+  type CanActivate,
+  type ExecutionContext,
+  Injectable,
+  UnauthorizedException,
+} from "@nestjs/common";
+
+// DECISION (chapter 2.2): real credentials arrive with Part 3 (API keys
+// in 3.2, tenancy in 3.1). Until then, public routes name their tenant
+// via the X-Relay-Environment header — a dev-mode seam, load-bearing for
+// exactly as long as it takes Part 3 to replace it. The guard resolves
+// the header; the request-scoped Repository below it is what makes the
+// scoping real (constitution I).
+@Injectable()
+export class EnvironmentContextGuard implements CanActivate {
+  canActivate(context: ExecutionContext): boolean {
+    const req = context.switchToHttp().getRequest<{
+      headers: Record<string, string | undefined>;
+      environmentId?: string;
+    }>();
+    const environmentId = req.headers["x-relay-environment"];
+    if (!environmentId) {
+      throw new UnauthorizedException("missing X-Relay-Environment");
+    }
+    req.environmentId = environmentId;
+    return true;
+  }
+}
+```
+
+And the service is where the domain error becomes a status code — the
+translation `ChannelNotFoundError` was written framework-free to allow:
+
+```ts title="services/api/src/messages/messages.service.ts"
+import { Injectable, NotFoundException } from "@nestjs/common";
+
+import {
+  ChannelNotFoundError,
+  Repository,
+  type MessageRow,
+} from "../db/repository";
+import type { SendMessageBody } from "./messages.schema";
+
+// The thin layer between HTTP and the repository (chapter 2.2). It owns
+// exactly one thing today: turning the layer's domain error into the
+// wire's 404 — same non-answer a foreign tenant's id has received since
+// 2.1, now wearing an HTTP status. The filter from 1.4 shapes the body.
+@Injectable()
+export class MessagesService {
+  constructor(private readonly repo: Repository) {}
+
+  async send(channelId: string, body: SendMessageBody): Promise<MessageRow> {
+    try {
+      return await this.repo.sendMessage(channelId, body);
+    } catch (error) {
+      if (error instanceof ChannelNotFoundError) {
+        // A CONSTANT message: echoing the id back would make the foreign-id
+        // answer differ from the missing-id answer, and "different" is
+        // itself a disclosure (FR-TEN-05).
+        throw new NotFoundException("channel not found");
+      }
+      throw error;
+    }
+  }
+}
+```
+
+Those three files feed the one genuinely new piece of NestJS wiring this
+chapter introduces: the **request-scoped repository**.
+1.4 promised "a plain class the module graph will eventually construct per
+request, once there are requests." There are requests now:
+
+```ts title="services/api/src/messages/messages.module.ts"
+import { Module, Scope } from "@nestjs/common";
+import { REQUEST } from "@nestjs/core";
+
+import { createDb, createPool, type Db } from "../db/client";
+import type { RequestWithTenant } from "./request-with-tenant";
+import { Repository } from "../db/repository";
+import { EnvironmentContextGuard } from "./environment-context.guard";
+import { MessagesController } from "./messages.controller";
+import { MessagesService } from "./messages.service";
+
+// The repository stays the plain 2.1 class — the framework's job is only
+// to construct it per request with the authenticated tenant (ADR-15's
+// scope note: guards authenticate, the data layer isolates).
+@Module({
+  controllers: [MessagesController],
+  providers: [
+    {
+      provide: "DB",
+      useFactory: (): Db => createDb(createPool()),
+      scope: Scope.DEFAULT,
+    },
+    {
+      provide: Repository,
+      scope: Scope.REQUEST,
+      inject: ["DB", REQUEST],
+      useFactory: (db: Db, req: RequestWithTenant) =>
+        // The FACTORY reads the header, not the guard's leftovers: Nest
+        // resolves request-scoped providers BEFORE the enhancer chain
+        // runs, so anything a guard stashes on the request is invisible
+        // here. The guard still rejects tenant-less requests (401); the
+        // factory is what scopes the layer.
+        new Repository(db, req.headers["x-relay-environment"] ?? ""),
+    },
+    MessagesService,
+    EnvironmentContextGuard,
+  ],
+})
+export class MessagesModule {}
+```
+
+The class 2.1 built is untouched — `new Repository(db, environmentId)`,
+tenant demanded at construction. What changed is *who calls new*: the
+injector, once per request, with the guard's resolved tenant. A handler
+cannot hold an unscoped repository for the same reason it never could —
+the constructor won't allow it — and now it cannot hold a *wrongly* scoped
+one either, because it never constructs the thing at all.
+
+<Why source="SAD §5.1 · EIR-API-01/04">
+
+Why `POST /v1/channels/:channelId/messages` and not a flat `/v1/messages`
+with the channel in the body? Because the SAD's REST surface hangs
+resources off their owners, and because the 404-vs-403 question dissolves
+when the channel is in the path: a foreign channel id is *not found* — the
+same non-answer the repository has given since 2.1, now visible at the
+HTTP layer with the same envelope 1.4's filter has stamped on every error
+since the skeleton stood up. One error shape, one home, third chapter
+running.
+
+</Why>
+
+## The endpoint gets its own suite
+
+The repository test proves the *lock*. It says nothing about whether a
+request survives the guard, the pipe, the service's error translation, and
+the filter — the four layers that stand between a client and that lock. So
+the module gets an integration file named for its own subject:
+
+```ts title="services/api/src/messages/messages.itest.ts"
+import "reflect-metadata";
+
+import { Test } from "@nestjs/testing";
+import type { INestApplication } from "@nestjs/common";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+
+import { AppModule } from "../app.module";
+import { createDb, createPool } from "../db/client";
+import { createEnvironment, Repository } from "../db/repository";
+
+// The endpoint path (chapter 2.2): guard → pipe → service → repository →
+// filter, over real HTTP against the compose Postgres. Its own environment,
+// minted here — no truncate, because tenant isolation means this suite and
+// the repository suite cannot see each other's rows (2.1's property, paying
+// for itself in the test lane).
+describe("POST /v1/channels/:channelId/messages", () => {
+  let app: INestApplication;
+  let url: string;
+  let env: { id: string };
+  let channelId: string;
+  let foreignChannelId: string;
+
+  beforeAll(async () => {
+    const db = createDb(createPool());
+    env = await createEnvironment(db, { name: "messages-itest" });
+    channelId = (
+      await new Repository(db, env.id).createChannel("general", "public")
+    ).id;
+    const other = await createEnvironment(db, { name: "messages-itest-other" });
+    foreignChannelId = (
+      await new Repository(db, other.id).createChannel("theirs", "public")
+    ).id;
+    app = (
+      await Test.createTestingModule({ imports: [AppModule] }).compile()
+    ).createNestApplication({ logger: false });
+    await app.listen(0);
+    url = await app.getUrl();
+  });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  const send = (body: unknown, channel = channelId, environment = env.id) =>
+    fetch(`${url}/v1/channels/${channel}/messages`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-relay-environment": environment,
+      },
+      body: JSON.stringify(body),
+    });
+
+  it("returns 201 with an ascending sequence", async () => {
+    const first = await send({ text: "hello" });
+    expect(first.status).toBe(201);
+    const a = (await first.json()) as { seq: number };
+    const b = (await (await send({ text: "again" })).json()) as { seq: number };
+    expect(b.seq).toBe(a.seq + 1);
+  });
+
+  it("rejects a malformed body through the protocol envelope", async () => {
+    const res = await send({ text: "" });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body).toMatchObject({ code: "invalid_request" });
+    expect(typeof body.docs_url).toBe("string");
+  });
+
+  it("answers a FOREIGN channel id with the same 404 as a missing one", async () => {
+    const foreign = await send({ text: "not for you" }, foreignChannelId);
+    const missing = await send({ text: "nobody home" }, crypto.randomUUID());
+    expect(foreign.status).toBe(404);
+    expect(missing.status).toBe(404);
+    // Indistinguishable — no data, and no reveal that the id exists.
+    expect(await foreign.json()).toEqual(await missing.json());
+  });
+});
+```
+
+That last assertion is the chapter's isolation moment on the HTTP surface.
+2.1 proved a foreign id returns nothing *at the layer*; here it proves the
+two answers are byte-identical *on the wire* — because a 403 where a 404
+belongs is itself a disclosure, and the whole point of FR-TEN-05 is that a
+tenant cannot even learn what exists elsewhere. Getting that assertion
+to pass exposed a gap in 1.4's filter, fixed two sections down.
+
+<Why source="2.1's isolation suite · constitution I">
+
+Why does the second file need no `TRUNCATE`, when 2.1's suite opened with
+one? Because 2.1 built the property that makes truncation unnecessary.
+Each suite mints its own environment; every repository operation is scoped
+to it; so one suite's rows are *structurally invisible* to the other, the
+same way one customer's rows are invisible to another. A shared truncate,
+by contrast, is a suite reaching outside its own tenant to clean up — the
+one thing the layer exists to prevent — and it becomes an active hazard
+the moment two integration files run at once, each wiping the other's
+fixtures mid-test. So the amendment above retires it: determinism now comes
+from isolation rather than from destruction, and the lane can add as many
+files as the part needs.
+
+</Why>
+
+## Two things the code taught us
+
+Writing the endpoint surfaced two corrections that no amount of design
+could have produced — the kind this series exists to show rather than
+hide.
+
+**The guard cannot hand the tenant to the repository.** The obvious wiring
+is: guard reads the header, stashes it on the request, factory reads it
+back. It does not work, and it fails silently — every request gets a
+repository scoped to `undefined`, so every channel is "not found" and the
+endpoint returns a perfectly-shaped 404 for data that exists. The reason
+is ordering: **Nest resolves request-scoped providers before the enhancer
+chain runs**, so at factory time the guard has not executed yet. The fix
+is to let the factory read the header itself (see the module above) and
+leave the guard doing the job it is actually early enough to do — refusing
+tenant-less requests. Guards authenticate; the factory scopes.
+
+**A 400 that calls itself `internal_error` is a lie.** 1.4's filter mapped
+404 to `not_found` and everything else to `internal_error` — fine when the
+only error the skeleton could produce *was* a 404. The moment a validation
+pipe exists, a client gets a 400 whose body claims the server broke. So
+the filter's registry widens, as an amendment to 1.4's fence:
+
+```diff title="services/api/src/protocol-error.filter.ts"
+ import type { ServerResponse } from "node:http";
+ 
+ import {
+   Catch,
+   HttpException,
+   type ArgumentsHost,
+   type ExceptionFilter,
+ } from "@nestjs/common";
+ 
+ // EIR-API-04: one error shape, one home. Whatever throws — the router's own
+ // 404, a future guard, an unhandled bug — the wire sees the same envelope
+ // the @relay/protocol error payload defines, so the REST surface and the
+ // WebSocket surface cannot drift apart. The docs_url host is a placeholder
+ // until the docs site exists (constitution V's reachable-page promise).
+ @Catch()
+ export class ProtocolErrorFilter implements ExceptionFilter {
+   catch(exception: unknown, host: ArgumentsHost): void {
+     const res = host.switchToHttp().getResponse<ServerResponse>();
+     const status =
+       exception instanceof HttpException ? exception.getStatus() : 500;
+-    const code = status === 404 ? "not_found" : "internal_error";
++    // REST error codes by status (chapter 2.2 widened this: a 400 that
++    // calls itself "internal_error" is a lie the client cannot act on).
++    // The registry stays here until an API chapter owns a REST one.
++    const code =
++      status === 400
++        ? "invalid_request"
++        : status === 401
++          ? "unauthorized"
++          : status === 404
++            ? "not_found"
++            : "internal_error";
+     const message =
+       exception instanceof HttpException
+         ? exception.message
+         : "unexpected internal error";
+     res.statusCode = status;
+     res.setHeader("content-type", "application/json");
+     res.end(
+       JSON.stringify({
+         code,
+         message,
+         docs_url: `https://relay.example/docs/errors/${code}`,
+       }),
+     );
+   }
+ }
+```
+
+Two codes join, matched to statuses the api can now actually produce. The
+REST code registry still lives with the services — an API chapter owns the
+real one later — but "the code must describe what happened" is not a thing
+to defer.
+
+## Walk it, then gate it
+
+Bring the store up, run both lanes, and then do the thing this series
+always does — watch the machinery with your own eyes:
+
+```bash
+docker compose up -d --wait postgres
+pnpm --filter @relay/api migrate
+pnpm dev
+curl -s -X POST localhost:4000/v1/channels/$CHANNEL/messages \
+  -H "X-Relay-Environment: $ENV" -H "content-type: application/json" \
+  -d '{"text":"first message ever"}'
+```
+
+The 201 carries `seq: 1`. Send again: `seq: 2`. The integration lane now
+runs both files against the locked implementation — two writers with
+distinct consecutive numbers in the repository suite, and the endpoint
+suite's three cases over real HTTP — eight assertions across two files.
+The Docker-free gate stays Docker-free at forty.
+
+<Figure
+  caption="The write path at the end of this chapter — §5.1's spine implemented up to the outbox line, which stays deliberately absent until its own chapter."
+  code={figSendWalk}
+/>
+
+<ForwardRef part="Part 2 and Part 3">
+
+What §5.1 shows that this chapter deliberately did not build: the
+idempotency leg (`ON CONFLICT … DO NOTHING` and the retry that returns
+the original) is 2.3, one chapter away — our insert will grow exactly one
+clause. The `INSERT outbox event` line inside the same transaction is
+3.3's chapter, and skipping it now is safe precisely because nothing
+consumes events yet. Real credentials replace the environment header in
+3.1/3.2. And the sequence numbers minted today are the currency every
+later chapter spends: 2.4 pages by them, 2.7 resumes by them, 2.8 asserts
+by them.
+
+</ForwardRef>
+
+## Your turn
+
+The exercise is the build: module, guard, pipe, repository method, both
+tests. Then break it on purpose:
+
+1. Swap the service back to `sendMessageNaive` and run the ordering test
+   a few times. Watch it fail *intermittently* — then read the TRAP
+   again and notice how much worse intermittent is than always.
+2. Delete the `.for("update")` clause only, keep the transaction, and run
+   again. A transaction without the lock still races — isolation levels
+   are not serialisation. (Put it back.)
+3. Put the `TRUNCATE` back into 2.1's suite and run the integration lane a
+   few times. If the two files ever run at once, watch fixtures vanish
+   mid-test — an intermittent failure that reads like a platform bug and
+   is really a test-lane bug. Take it back out.
+
+If you are stuck, the tag holds the answer key: `part2-ch2`.
+
+## Takeaways
+
+If you read nothing else in this chapter, keep these:
+
+- **Ordering is assigned, not observed** (FR-MSG-03): the server mints
+  sequence numbers under a per-channel row lock (ADR-03); clients'
+  timestamps are trivia.
+- **The naive version passes every test that isn't concurrent** — which
+  is why this part's chapters stage the failure before the fix.
+- **Ack after commit, never before** (FR-MSG-05, constitution II): the
+  201 means durable, and the control flow makes early acks unwritable.
+- **The lock's scope is the promise's scope**: one channel serialises its
+  own sends and nothing else — contention priced exactly at the
+  granularity the requirement bought.
+- **The framework constructs; the layer isolates**: the request-scoped
+  provider hands each request a repository already locked to its tenant —
+  2.1's constructor discipline, now wired to real traffic.
+- **Tests are filed by subject, and isolation makes them parallel-safe**:
+  the lock is proven at the repository, the envelope at the endpoint, and
+  neither suite wipes the database because neither can see the other's
+  tenant.
+
+<Checkpoint>
+
+Before starting chapter 2.3, you should have: the messages module live
+with its guard and pipe; `sendMessage` in the repository doing the locked
+assignment; the naive version's failure witnessed at least once and the
+file deleted; both integration files green — the ordering test in 2.1's
+suite and the endpoint suite over HTTP with its foreign-id 404 — and the
+Docker-free gate untouched. That state is tag `part2-ch2` in
+the canonical repository. Chapter 2.3 assumes sends work and makes
+retrying them safe — Tuan is about to drive into a tunnel with this exact
+endpoint mid-flight.
+
+</Checkpoint>
+
+<ChapterFooter id="2.2" />
