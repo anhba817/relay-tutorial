@@ -1,0 +1,1378 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figConnectWalk, figSendOverSocket, figGatewayAnatomy } from "./figures";
+
+export const metadata = {
+  title: "Socket — Building Relay",
+  description:
+    "Gateway cuối cùng làm đúng nhiệm vụ: WebSocket termination, JWT verification ngay ở cửa, connection registry, và các frame của 1.3 chạy trên wire thật — trong khi mọi write vẫn được forward tới đúng service duy nhất được phép thực hiện chúng.",
+  alternates: {
+    canonical: "/vi/part-2/chapter-05/the-socket",
+    languages: {
+      en: "/part-2/chapter-05/the-socket",
+      vi: "/vi/part-2/chapter-05/the-socket",
+    },
+  },
+};
+
+<ChapterHeader id="2.5" locale="vi" />
+
+Trong bốn chương, gateway chỉ là một bộ khung có vocabulary — 1.4 dựng cho
+nó một health endpoint *advertise* mười frame của protocol, nhưng từ đó đến
+giờ nó chưa hề nói một frame nào. Hôm nay nó nói. WebSocket termination là
+lý do tồn tại trọn vẹn của gateway trong service view của SAD, và chương này
+build công việc đó cho đúng: upgrade handshake, token được check ngay ở cửa,
+một session object cho mỗi socket, một registry của những ai đang connected,
+và các frame của 1.3 — được parse bằng cùng zod schemas mà hai đầu đã share
+từ lúc protocol package ra đời — chảy qua một wire thật. Thứ nó chủ ý *không*
+build là bất kỳ path nào từ socket này tới database. Sự từ chối đó là chủ đề
+thứ hai của chương.
+
+<SkipAhead locale="vi">
+
+Nếu bạn buộc phải đọc lướt: gateway (vẫn frameworkless — boundary của
+ADR-15, đã học ở 1.4) có thêm `ws` cho WebSocket termination trên
+`/v1/ws?token=`, `jose` cho JWT verification (failure thì close code 4001,
+EIR-WS-05), một per-socket session, một in-memory connection registry, ping
+mỗi 30s và close sau hai lần miss (EIR-WS-04), cùng `connection.ack` trong
+vòng một giây sau handshake (EIR-WS-03). Frame `message.send` được forward
+tới một internal api route mới — gateway không bao giờ write gì cả
+(ADR-05). Dev-mode tokens tạm đứng chỗ cho credential mint thật của Part 3,
+như một recorded decision. Shapes của internal hop đi vào `@relay/protocol`,
+nên client của gateway và validation của api derive từ cùng một definition.
+Trạng thái cuối chương là tag **`part2-ch5`**.
+
+</SkipAhead>
+
+## Cánh cửa, và ai được đi qua
+
+Wire contract đã định hình chương này từ lâu. EIR-WS-01: một WebSocket
+endpoint nhận user token như connection parameter. EIR-WS-02: mọi frame là
+JSON với `type` discriminator và `payload` — đúng từng chữ với discriminated
+union mà `@relay/protocol` encode, vì 1.3 derive schemas từ chính các dòng
+đó. EIR-WS-03: một `connection.ack` mang resolved identity và resume cursor,
+trong vòng một giây sau handshake. EIR-WS-05: bad token → close code `4001`
+kèm diagnostic reason — một con số protocol package đã mang theo từ khi bảng
+`CLOSE_CODES` được viết.
+
+Authentication đi trước, vì không thứ gì khác được xảy ra trước nó:
+
+```ts title="services/gateway/src/auth.ts"
+import { jwtVerify } from "jose";
+
+// The door (chapter 2.5). Tokens are verified BEFORE the upgrade
+// completes — an unauthenticated socket never reaches session code.
+//
+// DECISION (chapter 2.5): real tokens are minted by Part 3 (the dev-token
+// endpoint is FR-AUT-09; per-environment signing secrets live in the
+// environments table). Until then, dev tokens are HS256 over
+// RELAY_DEV_JWT_SECRET with claims { sub: user external_id,
+// env: environment_id } — a seam Part 3 replaces without touching the
+// session code behind it.
+
+export const DEV_JWT_SECRET = process.env.RELAY_DEV_JWT_SECRET ?? "dev-secret";
+
+export interface Identity {
+  userExternalId: string;
+  environmentId: string;
+}
+
+export async function verifyToken(token: string): Promise<Identity | null> {
+  try {
+    const { payload } = await jwtVerify(
+      token,
+      new TextEncoder().encode(DEV_JWT_SECRET),
+    );
+    // Non-EMPTY strings: `typeof x === "string"` happily accepts "", and an
+    // empty environment claim would open a session scoped to no tenant —
+    // which constitution I says must be unrepresentable, not merely
+    // unlikely. Found by the test below, not by reading the code.
+    if (
+      typeof payload.sub !== "string" ||
+      payload.sub.length === 0 ||
+      typeof payload.env !== "string" ||
+      payload.env.length === 0
+    ) {
+      return null;
+    }
+    return { userExternalId: payload.sub, environmentId: payload.env };
+  } catch {
+    return null;
+  }
+}
+```
+
+Upgrade đi nhờ HTTP server mà service-kit của 1.4 đã build sẵn — một port,
+hai protocols, đúng việc một upgrade handshake sinh ra để làm. Chi tiết wiring
+đáng biết là `noServer: true`:
+
+```ts
+const wss = new WebSocketServer({ noServer: true });
+server.on("upgrade", (req, socket, head) => { /* check, then handleUpgrade */ });
+```
+
+Để `ws` sở hữu upgrade nghĩa là handshake hoàn tất rồi *sau đó* bạn mới reject
+— close một socket đã tồn tại. Với `noServer`, token được verify khi
+connection vẫn còn là một pending upgrade, và `4001` của EIR-WS-05 rơi vào
+một socket thực ra chưa từng mở. `null` từ `verifyToken` close bằng code đó và
+reason string của chính protocol package; token hợp lệ thì construct session.
+
+File riêng của session là trung tâm của chương này — thứ tự operations *chính
+là* lập luận:
+
+```ts title="services/gateway/src/session.ts"
+import { randomUUID } from "node:crypto";
+import type { IncomingMessage, Server } from "node:http";
+
+import { CLOSE_CODES, frameSchema, type Frame } from "@relay/protocol";
+import type { Logger } from "@relay/service-kit";
+import { WebSocketServer, type WebSocket } from "ws";
+
+import type { ApiClient } from "./api-client.js";
+import { verifyToken, type Identity } from "./auth.js";
+import { Registry, type Connection } from "./registry.js";
+
+// One session per socket (chapter 2.5). The order of operations here is the
+// chapter: verify at the door, learn memberships, register, ack inside
+// EIR-WS-03's one-second budget, then start the heartbeat. Frames in are
+// parsed with @relay/protocol's schemas — the SAME objects the api uses, so
+// a frame the gateway accepts is a frame every component understands.
+
+const PING_INTERVAL_MS = 30_000;
+const MAX_MISSED_PINGS = 2;
+
+function send(socket: WebSocket, frame: Frame): void {
+  socket.send(JSON.stringify(frame));
+}
+
+/** EIR-API-04's envelope, wearing its WebSocket clothes. */
+function sendError(socket: WebSocket, code: string, message: string): void {
+  send(socket, {
+    type: "error",
+    payload: {
+      code,
+      message,
+      docs_url: `https://relay.example/docs/errors/${code}`,
+    },
+  });
+}
+
+export interface SessionServerOptions {
+  server: Server;
+  api: ApiClient;
+  logger: Logger;
+  /** Overridable so tests can run the heartbeat in milliseconds instead of
+   * half-minutes — the interval is a contract (EIR-WS-04), not a constant
+   * the tests should have to wait out. */
+  pingIntervalMs?: number;
+}
+
+export function attachSessions({
+  server,
+  api,
+  logger,
+  pingIntervalMs = PING_INTERVAL_MS,
+}: SessionServerOptions): { registry: Registry; close: () => void } {
+  const registry = new Registry();
+  // noServer: the upgrade is handled by hand so the token can be checked
+  // BEFORE the handshake completes. Letting ws own the upgrade would mean
+  // rejecting a socket that already exists (EIR-WS-05 wants the close code
+  // on a connection we never really opened).
+  const wss = new WebSocketServer({ noServer: true });
+
+  server.on("upgrade", (req: IncomingMessage, socket, head) => {
+    const url = new URL(req.url ?? "/", "http://localhost");
+    if (url.pathname !== "/v1/ws") {
+      socket.destroy();
+      return;
+    }
+    const token = url.searchParams.get("token");
+    void (async () => {
+      const identity = token ? await verifyToken(token) : null;
+      wss.handleUpgrade(req, socket, head, (ws) => {
+        if (!identity) {
+          // 4001: "invalid or expired token" (EIR-WS-05). The close code is
+          // the protocol package's, not a number invented here.
+          ws.close(4001, CLOSE_CODES[4001]);
+          logger.log("info", "connection.rejected", { reason: "bad_token" });
+          return;
+        }
+        void open(ws, identity);
+      });
+    })();
+  });
+
+  async function open(socket: WebSocket, identity: Identity): Promise<void> {
+    const connection: Connection = {
+      id: randomUUID(),
+      identity,
+      socket,
+      channelIds: new Set(),
+      missedPings: 0,
+    };
+    try {
+      connection.channelIds = new Set(await api.memberships(identity));
+    } catch (error) {
+      // The api is the only source of membership (ADR-05). If it cannot
+      // answer, we do not guess — we close, and the client retries with
+      // backoff. A session with unknown memberships would deliver nothing
+      // and look healthy doing it.
+      logger.log("error", "connection.memberships_failed", {
+        connection_id: connection.id,
+        error: String(error),
+      });
+      socket.close(1011, "membership lookup failed");
+      return;
+    }
+
+    registry.add(connection);
+    logger.log("info", "connection.opened", {
+      connection_id: connection.id,
+      user: identity.userExternalId,
+      channels: connection.channelIds.size,
+    });
+
+    // EIR-WS-03: identity and a resume cursor within one second. The cursor
+    // is empty here and means it for the first time in 2.7 — the field
+    // exists because the contract says so, not because we have data for it.
+    send(socket, {
+      type: "connection.ack",
+      payload: {
+        user: identity.userExternalId,
+        cursor: {},
+        resume_ok: true,
+        truncated: [],
+      },
+    });
+
+    socket.on("pong", () => {
+      connection.missedPings = 0;
+    });
+    socket.on("message", (raw) => void handle(connection, raw.toString()));
+    socket.on("close", (code) => {
+      registry.remove(connection.id);
+      logger.log("info", "connection.closed", {
+        connection_id: connection.id,
+        code,
+      });
+    });
+  }
+
+  async function handle(connection: Connection, raw: string): Promise<void> {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      sendError(connection.socket, "invalid_frame", "frame is not JSON");
+      return;
+    }
+    const frame = frameSchema.safeParse(parsed);
+    if (!frame.success) {
+      sendError(
+        connection.socket,
+        "invalid_frame",
+        frame.error.issues[0]?.message ?? "frame failed schema validation",
+      );
+      return;
+    }
+    if (frame.data.type !== "message.send") {
+      // Everything else in the union is server → client. A client uttering
+      // one is a protocol violation, not a malformed frame (EIR-WS-06).
+      sendError(
+        connection.socket,
+        "unknown_frame_type",
+        `clients may not send ${frame.data.type}`,
+      );
+      connection.socket.close(4002, CLOSE_CODES[4002]);
+      return;
+    }
+
+    const { channel, text, idem_key } = frame.data.payload;
+    try {
+      const { seq } = await api.sendMessage(connection.identity, {
+        channel_id: channel,
+        text,
+        idempotency_key: idem_key,
+      });
+      // The ack carries the sequence the API committed — after the commit,
+      // never before (FR-MSG-05, unchanged since 2.2; the socket is a new
+      // door onto the same write path).
+      send(connection.socket, { type: "message.ack", payload: { seq } });
+    } catch (error) {
+      logger.log("error", "send.failed", {
+        connection_id: connection.id,
+        error: String(error),
+      });
+      sendError(connection.socket, "internal_error", "send failed");
+    }
+  }
+
+  const heartbeat = setInterval(() => {
+    for (const connection of registry.all()) {
+      if (connection.missedPings >= MAX_MISSED_PINGS) {
+        // A dead socket that looks alive is a resume that never triggers
+        // (EIR-WS-04). 2.7 needs death to be detected promptly.
+        connection.socket.close(1001, "ping timeout");
+        registry.remove(connection.id);
+        continue;
+      }
+      connection.missedPings += 1;
+      connection.socket.ping();
+    }
+  }, pingIntervalMs);
+
+  return {
+    registry,
+    close: () => {
+      clearInterval(heartbeat);
+      wss.close();
+    },
+  };
+}
+```
+
+```diff title="services/gateway/package.json"
+ {
+   "name": "@relay/gateway",
+   "private": true,
+   "version": "0.0.0",
+   "type": "module",
+   "scripts": {
+     "dev": "tsx watch src/main.ts",
+     "typecheck": "tsc --noEmit",
+     "test": "vitest run"
+   },
+   "dependencies": {
+     "@relay/protocol": "workspace:*",
+-    "@relay/service-kit": "workspace:*"
++    "@relay/service-kit": "workspace:*",
++    "jose": "^6.2.7",
++    "ws": "^8.21.1"
+   },
+   "devDependencies": {
++    "@types/ws": "^8.18.1",
+     "tsx": "^4.23.1"
+   }
+ }
+```
+
+```diff title="services/gateway/src/main.ts"
+ import { CLOSE_CODES, frameSchema } from "@relay/protocol";
+ import { createLogger, serve, type Logger } from "@relay/service-kit";
+ 
++import { createApiClient } from "./api-client.js";
++import { attachSessions } from "./session.js";
++
+ // The gateway — SAD §4.1: terminates WebSockets and never writes to the
+-// database (ADR-05). At walking-skeleton stage no sockets exist yet; instead
+-// the gateway DECLARES the wire vocabulary it will speak, computed from
++// database (ADR-05). Chapter 1.4 stood up the HTTP half (health, request
++// ids, structured logs); chapter 2.5 gives it the job it exists for. The
++// health payload still advertises the wire vocabulary, computed from
+-// @relay/protocol — never hardcoded, so the advertisement cannot drift from
++// @relay/protocol so the advertisement cannot drift from the contract.
+-// the contract. Sessions, JWT verification, and real frames arrive in Part 2.
+ 
+ const frames = frameSchema.options.map((option) => option.shape.type.value);
+ const closeCodes = Object.keys(CLOSE_CODES).map(Number);
+ 
++export const DEFAULT_API_URL = "http://localhost:4000";
++
+ export function createServer(logger?: Logger) {
+-  return serve({
++  const log = logger ?? createLogger("gateway");
++  const server = serve({
+     service: "gateway",
+     health: () => ({
+       uptime_s: Math.round(process.uptime()),
+       protocol: { frames, close_codes: closeCodes },
+     }),
+-    ...(logger ? { logger } : {}),
++    logger: log,
+   });
++  // The socket server rides the SAME listener as health — one port, two
++  // protocols, which is what an upgrade handshake is for.
++  const sessions = attachSessions({
++    server,
++    api: createApiClient(process.env.RELAY_API_URL ?? DEFAULT_API_URL),
++    logger: log,
++  });
++  server.on("close", sessions.close);
++  return server;
+ }
+ 
+ if (import.meta.main) {
+   const port = Number(process.env.PORT ?? 4001);
+   const logger = createLogger("gateway");
+-  createServer().listen(port, () => {
++  createServer(logger).listen(port, () => {
+     logger.log("info", "listening", { port });
+   });
+ }
+```
+
+Membership là câu hỏi duy nhất gateway không thể tự trả lời — channels sống
+sau repository, và repository sống ở nơi writes sống. Vì vậy session hỏi api
+qua internal surface (`GET /internal/memberships`), cache câu trả lời trên
+session, còn 2.6/3.x chịu trách nhiệm giữ nó fresh (membership *changes*
+fan out thành frame `membership.changed` — event đó tồn tại trong protocol
+chính xác để cache này có thể được invalidated). Sau đó ack được gửi ra, trong
+one-second budget của EIR-WS-03 (live walk bên dưới đo được 40 ms trong một
+nghìn ms cho phép), rồi pings bắt đầu: một ping mỗi 30 giây, miss hai lần liên
+tiếp thì gateway close socket (EIR-WS-04) — vì một dead socket trông *như*
+còn sống là một resume không bao giờ trigger, và 2.7 cần cái chết được phát
+hiện nhanh và trung thực.
+
+<Figure
+  caption="Connect walk: verify ngay ở cửa (fail thì 4001), lấy memberships từ api, register, ack trong vòng một giây — và chỉ sau đó frames mới được phép chảy."
+  code={figConnectWalk}
+/>
+
+## Frames trên wire — và write không thuộc về gateway
+
+Frame thật đầu tiên của một connected client là `message.send`, và đây là lúc
+chương này gặp quyết định đã định hình toàn bộ service map. Gateway *có thể*
+write message — nó có payload, và import repository chỉ là một dòng. Dòng đó
+bị cấm, không phải vì gu thiết kế:
+
+```ts title="services/gateway/src/registry.ts"
+import type { WebSocket } from "ws";
+
+import type { Identity } from "./auth.js";
+
+// The in-memory connection registry (chapter 2.5): who is connected to
+// THIS instance, and which channels they can hear. Its cross-instance
+// story is deliberately absent — chapter 2.6 exists because of what this
+// file cannot see.
+//
+// Note what else is absent: no pg, no drizzle-orm, no repository import.
+// The gateway never touches the database (ADR-05) — and the lint ban from
+// 2.1 makes the mistake a build failure, not a review comment.
+
+export interface Connection {
+  readonly id: string;
+  readonly identity: Identity;
+  readonly socket: WebSocket;
+  channelIds: Set<string>;
+  missedPings: number;
+}
+
+export class Registry {
+  private readonly byId = new Map<string, Connection>();
+
+  add(connection: Connection): void {
+    this.byId.set(connection.id, connection);
+  }
+
+  remove(connectionId: string): void {
+    this.byId.delete(connectionId);
+  }
+
+  /** Every local connection that should hear about this channel. 2.6 turns
+   * the same question into a cross-instance one; the answer's shape does
+   * not change, only where the question travels. */
+  subscribersOf(channelId: string): Connection[] {
+    return [...this.byId.values()].filter((c) => c.channelIds.has(channelId));
+  }
+
+  all(): Connection[] {
+    return [...this.byId.values()];
+  }
+
+  get size(): number {
+    return this.byId.size;
+  }
+}
+```
+
+`message.send` được parse bằng `frameSchema.safeParse` — garbage nhận một
+`error` frame và, nếu lặp lại, close code `4002` (protocol violation,
+vocabulary của EIR-WS-06) — rồi được forward: một HTTP `POST
+/internal/messages` tới api, mang theo environment và user của session trong
+headers. Api chạy write path của 2.2/2.3 — lock, sequence, idempotency, commit
+— và response 201 quay về để trở thành frame `message.ack {seq}` trên socket.
+Sơ đồ §5.1 giờ đọc được từng dòng trong code bạn đã viết; phần mới duy nhất
+là wire mà nó đi qua.
+
+Trước khi đến client, hãy nhìn thứ client dựa vào. Gateway và api đều cần
+đồng ý một internal request và response trông như thế nào — và đó là đúng bài
+toán 1.3 đã giải cho wire, nên nó nhận cùng một đáp án: một definition, trong
+shared package, được import bởi cả hai bên.
+
+```ts title="packages/protocol/src/internal.ts"
+import { z } from "zod";
+
+// The INTERNAL service contract (chapter 2.5) — distinct from the wire
+// contract above it. `frames.ts` is what a customer's client speaks;
+// this is what the gateway and the API service speak to each other over
+// the internal HTTP hop (ADR-05).
+//
+// It lives in the same package for the same reason the frames do: two
+// components on either side of a boundary, one definition between them.
+// The gateway derives its client types from these schemas AND parses
+// responses with them — an internal caller has no more right to assume a
+// payload's shape than an external one does.
+
+/** Gateway → api: forward the payload a `message.send` frame carried. */
+export const internalSendRequestSchema = z.strictObject({
+  channel_id: z.string().uuid(),
+  text: z.string().min(1).max(8000), // FR-MSG-01
+  idempotency_key: z.string().min(1).max(255).optional(), // FR-MSG-04
+});
+
+/** api → gateway: the committed message. `seq` is what the ack carries
+ * (FR-MSG-05 — after the commit, never before). */
+export const internalSendResponseSchema = z.strictObject({
+  id: z.string().min(1),
+  channel_id: z.string().min(1),
+  seq: z.number().int().positive(),
+  text: z.string().nullable(),
+  created_at: z.iso.datetime(),
+});
+
+/** api → gateway: the channels this user may hear (FR-RTM-01). */
+export const internalMembershipsResponseSchema = z.strictObject({
+  channel_ids: z.array(z.string().min(1)),
+});
+
+export type InternalSendRequest = z.infer<typeof internalSendRequestSchema>;
+export type InternalSendResponse = z.infer<typeof internalSendResponseSchema>;
+export type InternalMembershipsResponse = z.infer<
+  typeof internalMembershipsResponseSchema
+>;
+```
+
+```diff title="packages/protocol/src/index.ts"
+ // @relay/protocol — the shared wire contract (ADR-01's payoff, chapter 1.3).
+-// One home for frame schemas, their inferred types, and the failure
++// One home for frame schemas, their inferred types, the failure
+-// vocabulary. Consumed by the gateway and API service from 1.4, and by the
+-// SDK in a later part.
++// vocabulary, and — from chapter 2.5 — the internal service contract the
++// gateway and API service share. Consumed by the gateway and API service
++// from 1.4, and by the SDK in a later part.
+ 
+ export * from "./frames.js";
+ export * from "./codes.js";
++export * from "./internal.js";
++export * from "./internal.js";
+```
+
+Bây giờ client không tự viết shape nào cả. Types của nó là `z.infer` từ các
+schemas đó, và — phần quan trọng hơn — nó *parse* thứ quay về:
+
+```ts title="services/gateway/src/api-client.ts"
+import {
+  internalMembershipsResponseSchema,
+  internalSendResponseSchema,
+  type InternalSendRequest,
+  type InternalSendResponse,
+} from "@relay/protocol";
+
+// The gateway's only road to state (chapter 2.5, ADR-05): internal HTTP to
+// the api service. Not a database client — a client of the service that
+// owns the database.
+//
+// Request and response shapes are NOT written here. They come from
+// @relay/protocol's internal contract, the same schemas the api validates
+// with, so the two sides cannot drift (ADR-01's payoff, applied to the
+// internal hop). And responses are PARSED, not assumed: an internal caller
+// has no more right to trust a payload's shape than an external one does —
+// the day the api changes a field name, this fails loudly here instead of
+// producing an `undefined` seq in an ack three layers away.
+
+export interface Identity {
+  environmentId: string;
+  userExternalId: string;
+}
+
+export interface ApiClient {
+  memberships(identity: Identity): Promise<string[]>;
+  sendMessage(
+    identity: Identity,
+    body: InternalSendRequest,
+  ): Promise<InternalSendResponse>;
+}
+
+export function createApiClient(baseUrl: string): ApiClient {
+  const headers = (identity: Identity) => ({
+    "content-type": "application/json",
+    "x-relay-environment": identity.environmentId,
+    "x-relay-user": identity.userExternalId,
+  });
+
+  async function parse<T>(
+    res: Response,
+    schema: { safeParse: (value: unknown) => { success: boolean; data?: T } },
+    what: string,
+  ): Promise<T> {
+    if (!res.ok) throw new Error(`${what} failed: ${res.status}`);
+    const parsed = schema.safeParse(await res.json());
+    if (!parsed.success || parsed.data === undefined) {
+      throw new Error(`${what} returned a payload the contract does not allow`);
+    }
+    return parsed.data;
+  }
+
+  return {
+    async memberships(identity) {
+      const res = await fetch(`${baseUrl}/internal/memberships`, {
+        headers: headers(identity),
+      });
+      const body = await parse(
+        res,
+        internalMembershipsResponseSchema,
+        "memberships",
+      );
+      return body.channel_ids;
+    },
+    async sendMessage(identity, body) {
+      const res = await fetch(`${baseUrl}/internal/messages`, {
+        method: "POST",
+        headers: headers(identity),
+        body: JSON.stringify(body satisfies InternalSendRequest),
+      });
+      return parse(res, internalSendResponseSchema, "send");
+    },
+  };
+}
+```
+
+<Why source="ADR-01 · ADR-05 · constitution VI" locale="vi">
+
+Vì sao một call *internal* lại đáng được validation? Câu trả lời quen thuộc là
+không cần — đó là service của ta, trên network của ta, và types đã khớp rồi.
+Nhưng "types đã khớp" là một claim compile-time về một runtime boundary: ngay
+khoảnh khắc api được deploy ở version khác gateway — trạng thái bình thường
+trong mọi rolling deploy — hai bên thật sự không còn đồng ý, và một field
+đến dưới dạng `undefined` trở thành `seq` bằng `undefined` trong ack, rồi
+thành một client lưu một cursor mà nó không bao giờ resume được. Parsing biến
+việc đó thành failure ồn ào ngay tại hop nơi nó xảy ra.
+
+Nhưng shape của fix mới là phần thú vị. Ta không viết một client-side type và
+một api-side validator tình cờ match nhau: có **một schema**, trong package
+sinh ra để được share, và cả hai bên derive từ nó. Đó là payoff của ADR-01
+được dùng lần thứ hai — lần đầu là frames, lần này là internal hop — và là lý
+do platform này có thể từ chối gRPC mà không từ bỏ phần lớn thứ gRPC được
+dùng để mang lại. Một file `.proto` cũng enforce cùng contract bằng cách
+generate hai bản sao của nó; shared TypeScript schema enforce bằng cách không
+bao giờ tạo bản sao thứ hai.
+
+</Why>
+
+Và ở phía api, các route mà gateway gọi — validate bằng cùng schema mà client
+gửi, vì chỉ có một schema:
+
+```ts title="services/api/src/internal/internal.controller.ts"
+import {
+  BadRequestException,
+  Body,
+  Controller,
+  Get,
+  Headers,
+  Post,
+  UseGuards,
+} from "@nestjs/common";
+
+import { EnvironmentContextGuard } from "../messages/environment-context.guard";
+import { MessagesService } from "../messages/messages.service";
+import { Repository } from "../db/repository";
+import {
+  internalSendRequestSchema,
+  type InternalSendRequest,
+} from "@relay/protocol";
+
+import { ZodValidationPipe } from "../messages/zod-validation.pipe";
+
+// The internal surface (chapter 2.5): the routes the gateway calls on a
+// connected user's behalf. They reuse the SAME service methods as the
+// public routes — the write path has one implementation (ADR-04), and the
+// socket is a new door onto it, not a second path.
+//
+// DECISION (chapter 2.5): these routes are network-internal and
+// unauthenticated between services at this stage; the gateway's forwarded
+// identity headers are trusted. Service-to-service credentials are Part 3
+// hardening, and this controller is the whole seam.
+@Controller("internal")
+@UseGuards(EnvironmentContextGuard)
+export class InternalController {
+  constructor(
+    private readonly repo: Repository,
+    private readonly messages: MessagesService,
+  ) {}
+
+  /** Which channels may this user hear? The gateway caches the answer on
+   * the session; membership.changed frames invalidate it (FR-RTM-05). */
+  @Get("memberships")
+  async memberships(@Headers("x-relay-user") userExternalId?: string) {
+    if (!userExternalId) throw new BadRequestException("missing x-relay-user");
+    const user = await this.repo.getUserByExternalId(userExternalId);
+    // An unknown user is not an error — it is a user with no channels. The
+    // gateway's job is delivery, not identity forensics.
+    if (!user) return { channel_ids: [] };
+    return { channel_ids: await this.repo.channelsForUser(user.id) };
+  }
+
+  @Post("messages")
+  async send(
+    @Body(new ZodValidationPipe(internalSendRequestSchema))
+    body: InternalSendRequest,
+    @Headers("x-relay-user") userExternalId?: string,
+  ) {
+    if (!userExternalId) throw new BadRequestException("missing x-relay-user");
+    const user = await this.repo.getUserByExternalId(userExternalId);
+    if (!user) throw new BadRequestException("unknown user");
+    return this.messages.send(body.channel_id, {
+      text: body.text,
+      ...(body.idempotency_key !== undefined && {
+        idempotency_key: body.idempotency_key,
+      }),
+    });
+  }
+}
+```
+
+Internal module reuse nguyên các providers của `MessagesModule` — repository
+request-scoped, guard, service — để socket path và REST path là cùng một code
+với hai cánh cửa:
+
+```diff title="services/api/src/app.module.ts"
+ import {
+   Module,
+   type MiddlewareConsumer,
+   type NestModule,
+ } from "@nestjs/common";
+ import { APP_FILTER } from "@nestjs/core";
+ 
+ import { HealthController } from "./health.controller";
++import { InternalModule } from "./internal/internal.module";
++import { MessagesModule } from "./messages/messages.module";
+ import { LOGGER, apiLogger } from "./logger";
+ import { ProtocolErrorFilter } from "./protocol-error.filter";
+ import { RequestContextMiddleware } from "./request-context.middleware";
+ 
+ // The application described as a module graph — ADR-15's convention for the
+ // wide surface Phases 2-4 will grow. Registering the error filter as a
+ // provider (APP_FILTER) instead of wiring it in main.ts means every entry
+ // point — including tests — gets the same error envelope for free.
+ @Module({
++  imports: [MessagesModule, InternalModule],
+   controllers: [HealthController],
+   providers: [
+     { provide: LOGGER, useFactory: apiLogger },
+     { provide: APP_FILTER, useClass: ProtocolErrorFilter },
+     RequestContextMiddleware,
+   ],
+ })
+ export class AppModule implements NestModule {
+   configure(consumer: MiddlewareConsumer): void {
+     consumer.apply(RequestContextMiddleware).forRoutes("{*path}");
+   }
+ }
+```
+
+```diff title="services/api/src/messages/messages.module.ts"
+ import { Module, Scope } from "@nestjs/common";
+ import { REQUEST } from "@nestjs/core";
+ 
+ import { createDb, createPool, type Db } from "../db/client";
+ import type { RequestWithTenant } from "./request-with-tenant";
+ import { Repository } from "../db/repository";
+ import { EnvironmentContextGuard } from "./environment-context.guard";
+ import { MessagesController } from "./messages.controller";
+ import { MessagesService } from "./messages.service";
+ 
+ // The repository stays the plain 2.1 class — the framework's job is only
+ // to construct it per request with the authenticated tenant (ADR-15's
+ // scope note: guards authenticate, the data layer isolates).
+ @Module({
+   controllers: [MessagesController],
+   providers: [
+     {
+       provide: "DB",
+       useFactory: (): Db => createDb(createPool()),
+       scope: Scope.DEFAULT,
+     },
+     {
+       provide: Repository,
+       scope: Scope.REQUEST,
+       inject: ["DB", REQUEST],
+       useFactory: (db: Db, req: RequestWithTenant) =>
+         // The FACTORY reads the header, not the guard's leftovers: Nest
+         // resolves request-scoped providers BEFORE the enhancer chain
+         // runs, so anything a guard stashes on the request is invisible
+         // here. The guard still rejects tenant-less requests (401); the
+         // factory is what scopes the layer.
+         new Repository(db, req.headers["x-relay-environment"] ?? ""),
+     },
+     MessagesService,
+     EnvironmentContextGuard,
+   ],
++  exports: [Repository, MessagesService, EnvironmentContextGuard],
+ })
+ export class MessagesModule {}
+```
+
+<Why source="ADR-05 · ADR-04 · constitution IV" locale="vi">
+
+Vì sao một send phải đi *hai* hop — socket tới gateway, HTTP tới api — trong
+khi một service có thể làm cả hai? Vì "gateway never writes to the database"
+là thứ khiến mọi chương khó sau chương này còn xử lý được. Sequence
+assignment, idempotency, và tenant scoping sống sau một repository trong một
+service (single writer của ADR-04; constitution IV: "invariants live in one
+codebase, not in convention") — nên 2.2 và 2.3 được viết một lần, và socket
+path *reuse* chúng thay vì re-implement theo một cách hơi khác. Lập luận sắc
+nhất của deep dive là failure mode của symmetry: hai write paths nghĩa là mọi
+invariant trở thành một cuộc đua giữa hai implementations đang drift. Và hop
+đó cũng mua lợi ích theo chiều ngược lại — gateways vẫn đủ stateless để scale
+bằng số lượng (CON-02 cấm sticky sessions), chính là tiền đề mà 2.6 build lên.
+Một hop internal HTTP là cái giá khiêm tốn để không bao giờ có hai ý kiến về
+ý nghĩa của một send.
+
+</Why>
+
+<Figure
+  caption="§5.1 trên wire thật: gateway parse, forward, và ack; api quyết định. Hai services, một write path — boundary 1.4 đã vẽ, giờ đang mang traffic."
+  code={figSendOverSocket}
+/>
+
+<Trap locale="vi">
+
+Cái bẫy là shortcut mà WHY của chương này vừa cấm, và nó sẽ cám dỗ bạn *đặc
+biệt ở reads*. "Gateway never writes" — được, nhưng chắc nó `SELECT` được chứ?
+Một membership check ở đây, một last-message preview ở kia; import repository
+read-only nghe vô hại và tiết kiệm một hop. Nó không vô hại: ngay khoảnh khắc
+gateway đọc Postgres, nó cần pool, credentials, migrations-awareness, và kỷ
+luật tenant-scoping — bản sao thứ hai của đúng bộ máy mà 2.1 đã build một nhà
+duy nhất cho nó, và một nơi thứ hai để isolation bugs có thể sống
+(cross-tenant suite tấn công repository; query path phía gateway sẽ nằm ngoài
+mọi thứ mà suite đó chứng minh). Lint ban từ 2.1 đã làm import fail ồn ào.
+Khi latency của hop một ngày nào đó thành vấn đề, đáp án mà SAD chỉ tới là
+cache được feed bởi events (đó là lý do `membership.changed` tồn tại), không
+bao giờ là side-door vào store. Nếu bạn thấy mình muốn gateway thông minh hơn,
+thường bạn chỉ còn cách một frame type để không cần nó thông minh như vậy nữa.
+
+</Trap>
+
+## Heartbeats, và vì sao cái chết phải được phát hiện nhanh
+
+Ping loop trông như housekeeping nhưng thực ra đủ load-bearing để có
+requirement riêng. EIR-WS-04: ping mỗi 30 giây, close sau hai lần miss liên
+tiếp. Chỉ TCP sẽ không nói cho bạn biết một chiếc điện thoại đã vào hầm — một
+dead mobile socket có thể trông hoàn toàn khỏe mạnh từ phía server trong
+nhiều phút, vì không có gì đang cố write vào nó. Trong những phút đó registry
+đếm một connection không thể nghe, fan-out (chương sau) sẽ vui vẻ deliver
+frames vào khoảng không, và — phần quan trọng nhất — reconnect logic của
+*client* có thể không biết nó cần chạy. Heartbeat biến "im lặng" thành
+"evidence": sáu mươi đến chín mươi giây sau khi đường hầm nuốt socket của
+Tuan, gateway biết, registry drop entry, và câu chuyện của connection kết
+thúc ở một sequence number có thể biết được. 2.7 build resume chính trên sự
+có-thể-biết đó.
+
+<Why source="EIR-WS-04 · NFR-PRF · journey 4, stage 3" locale="vi">
+
+Vì sao là 30 giây và hai lần, thay vì 5 giây và một lần? Vì heartbeats được
+trả bằng pin của người mà chiếc điện thoại là kế sinh nhai — design note của
+journey 4 nói backoff và heartbeat tuning, với Tuan, là "ergonomic
+requirements about heat and battery, not just network etiquette." Loop chặt
+hơn phát hiện death nhanh hơn và rút pin hàng nghìn điện thoại khỏe mạnh chỉ
+để bắt dead socket hiếm gặp sớm hơn một phút; loop thưa hơn tiết kiệm radio
+wake-ups và để ghosts nấn ná trong mọi registry và presence list. Ba mươi
+nhân hai là điểm mà documents chọn trên đường cong đó, và requirement ghim nó
+cụ thể để mỗi service không tự tune riêng — con số là một *contract* mà cả
+reconnect logic của SDK (5.1) lẫn grace period của presence (30 giây của
+FR-RTM-06 — không phải trùng hợp) đều build dựa vào.
+
+</Why>
+
+## Chạy thử
+
+`pnpm dev` bật cả hai services (task graph build packages trước — wiring của
+1.1 vẫn tiếp tục trả lợi ích). Mint một dev token và connect; `wscat` dùng
+được, hoặc one-liner node của chương:
+
+```bash
+pnpm dev                       # api on 4000, gateway on 4001
+node scripts/ws-walk.mjs       # seed, connect, send, retry
+```
+
+Script đủ ngắn để đọc, và nó sống ở workspace root thay vì trong bất kỳ
+service nào — nó seed qua repository của api và connect bằng WebSocket client,
+nên nó không thuộc hẳn về bên nào:
+
+```js title="scripts/ws-walk.mjs"
+// The chapter 2.5 walk, as a script (so the transcript in the chapter is
+// reproducible rather than decorative). Seeds a user, channel and
+// membership, mints a dev token, connects, sends, and retries with the
+// SAME idempotency key so 2.3's recovery leg shows through the socket.
+import { SignJWT } from "jose";
+import WebSocket from "ws";
+
+import { createDb, createPool } from "../services/api/dist/db/client.js";
+import {
+  createEnvironment,
+  Repository,
+} from "../services/api/dist/db/repository.js";
+
+const GATEWAY = process.env.RELAY_GATEWAY_URL ?? "ws://127.0.0.1:4001";
+const SECRET = process.env.RELAY_DEV_JWT_SECRET ?? "dev-secret";
+
+const db = createDb(createPool());
+const env = await createEnvironment(db, { name: `ws-walk-${Date.now()}` });
+const repo = new Repository(db, env.id);
+const user = await repo.createUser("tuan", "Tuan");
+const channel = await repo.createChannel("fleet", "public");
+await repo.addMember(channel.id, user.id);
+
+const token = await new SignJWT({ env: env.id })
+  .setProtectedHeader({ alg: "HS256" })
+  .setSubject("tuan")
+  .sign(new TextEncoder().encode(SECRET));
+
+const started = Date.now();
+const socket = new WebSocket(`${GATEWAY}/v1/ws?token=${token}`);
+const frame = {
+  type: "message.send",
+  payload: {
+    idem_key: "walk-key-1",
+    channel: channel.id,
+    text: "B2, north ramp",
+  },
+};
+
+socket.on("message", (raw) => {
+  const received = JSON.parse(raw.toString());
+  console.log(`← ${Date.now() - started}ms  ${JSON.stringify(received)}`);
+  if (received.type === "connection.ack") {
+    console.log(`→       ${JSON.stringify(frame)}`);
+    socket.send(JSON.stringify(frame));
+    setTimeout(() => {
+      console.log("→       retry, SAME key");
+      socket.send(JSON.stringify(frame));
+    }, 250);
+  }
+});
+setTimeout(() => process.exit(0), 1500);
+```
+
+Hai chỉnh sửa nhỏ ở workspace đi kèm với nó: root manifest có thêm hai dev
+dependencies mà script cần, và lint config học rằng các file `.mjs` dưới
+`scripts/` chạy trực tiếp trên Node, bên ngoài tsconfig của bất kỳ package
+nào, nên globals của chúng phải được khai báo thay vì suy luận:
+
+```diff title="package.json"
+ {
+   "name": "relay-platform",
+   "private": true,
+   "version": "0.0.0",
+   "packageManager": "pnpm@10.33.0",
+   "engines": {
+     "node": ">=22.12"
+   },
+   "scripts": {
+     "dev": "turbo run dev",
+     "lint": "turbo run //#lint:root",
+     "lint:root": "eslint .",
+     "typecheck": "turbo run typecheck",
+     "test": "turbo run test",
+     "build": "turbo run build"
+   },
+   "devDependencies": {
+     "@eslint/js": "^10.0.1",
+     "@types/node": "^26.1.2",
+     "eslint": "^10.8.0",
++    "globals": "^17.9.0",
++    "jose": "^6.2.7",
+     "prettier": "^3.9.6",
+     "turbo": "^2.10.8",
+     "typescript": "^5.9.3",
+     "typescript-eslint": "^8.65.0",
+-    "vitest": "^4.1.10"
++    "vitest": "^4.1.10",
++    "ws": "^8.21.1"
+   }
+ }
+```
+
+```diff title="eslint.config.mjs"
+ import eslint from "@eslint/js";
++import globals from "globals";
+ import tseslint from "typescript-eslint";
+ 
+ // One lint config for the whole workspace (ADR-01's consequence made literal).
+ export default tseslint.config(
+   { ignores: ["**/node_modules/**", "**/dist/**", "**/coverage/**"] },
+   eslint.configs.recommended,
+   ...tseslint.configs.recommended,
++  {
++    // Dev scripts run on Node directly, outside any package's tsconfig —
++    // so the globals have to be declared rather than inferred (chapter 2.5).
++    files: ["scripts/**/*.mjs"],
++    languageOptions: { globals: globals.nodeBuiltin },
++  },
+   {
+     // Isolation lives in data access, not in handlers (constitution I):
+     // only the repository layer may touch the driver.
+     files: ["**/*.ts"],
+     ignores: ["services/api/src/db/**"],
+     rules: {
+       "no-restricted-imports": [
+         "error",
+         {
+           paths: [
+             {
+               name: "pg",
+               message:
+                 "Raw database access is forbidden outside services/api/src/db (constitution I).",
+             },
+             {
+               name: "drizzle-orm",
+               message:
+                 "The query engine lives inside the repository layer only (constitution I, ADR-16).",
+             },
+           ],
+           patterns: [
+             {
+               group: ["drizzle-orm/*"],
+               message:
+                 "The query engine lives inside the repository layer only (constitution I, ADR-16).",
+             },
+           ],
+         },
+       ],
+     },
+   },
+ );
+```
+
+Thứ quay về, nguyên văn từ lần chạy:
+
+```text
+← 40ms  {"type":"connection.ack","payload":{"user":"tuan","cursor":{},"resume_ok":true,"truncated":[]}}
+→       {"type":"message.send","payload":{"idem_key":"walk-key-1","channel":"193dc1fd…","text":"B2, north ramp"}}
+← 59ms  {"type":"message.ack","payload":{"seq":1}}
+→       retry, SAME key
+← 307ms {"type":"message.ack","payload":{"seq":1}}
+```
+
+Đọc hai dòng cuối hai lần. Retry quay về với **seq 1 lần nữa** — không phải
+seq 2, không phải error. Idempotency index của chương 2.3 đang làm việc qua
+một cánh cửa chưa tồn tại khi ta build nó, vì socket path không phải write
+path thứ hai; nó là cùng một path với WebSocket đặt phía trước (ADR-05).
+Không có gì trong 2.3 phải đổi để điều đó đúng.
+
+Và các failures, cũng nguyên văn:
+
+```text
+$ token=garbage      → closed 4001 — invalid or expired token
+$ send "not json"    → {"type":"error","payload":{"code":"invalid_frame",
+                        "message":"frame is not JSON","docs_url":"…"}}
+```
+
+Ba thứ cần tận mắt verify: garbage token close với `4001` trước bất kỳ frame
+nào; garbage *frame* tạo ra một `error` frame đúng shape của protocol (cùng
+envelope đó, mặc bộ đồ WebSocket); và ack của send mang sequence number do api
+mint — check database và tìm row mà socket chưa bao giờ chạm trực tiếp.
+
+Và hãy nhìn logs trong lúc làm. Observability contract của 1.4 mở rộng tới
+sockets mà không đổi shape: session log một structured line khi connect
+(identity, một connection id được mint như request id) và một line khi close
+(close code, reason, ping strike count), còn mọi forwarded send log ở cả hai
+phía của internal hop với cùng các fields thân thiện với correlation. Khi
+suite của 2.8 kill một socket giữa lúc send, những dòng này là cách test —
+và sau này là operator — reconstruct bên nào đã thấy gì. Lời hứa năm phút của
+NFR-OBS-06 được viết cho HTTP requests; connections giữ nó theo cùng cách,
+bằng cách không bao giờ anonymous.
+
+Suite tăng lên tám cases trên ephemeral ports, kiểu 1.4 — và để ý thứ nó
+*không* cần: database. Api là stub, vì gateway không có store access để
+exercise (ADR-05). Nếu các tests này cần Postgres, gateway hẳn đang làm một
+thứ nó không được phép làm:
+
+```ts title="services/gateway/src/session.test.ts"
+import { SignJWT } from "jose";
+import { WebSocket } from "ws";
+import { afterEach, describe, expect, it } from "vitest";
+import type { Server } from "node:http";
+import type { AddressInfo } from "node:net";
+
+import { createLogger, type Logger } from "@relay/service-kit";
+import { serve } from "@relay/service-kit";
+import type { Frame } from "@relay/protocol";
+
+import type { InternalSendResponse } from "@relay/protocol";
+
+import type { ApiClient } from "./api-client.js";
+import { DEV_JWT_SECRET } from "./auth.js";
+import { attachSessions } from "./session.js";
+
+// The door, the frames, and the liveness clock — all provable without a
+// database, because the gateway has no database (ADR-05). The api is a
+// stub here for exactly that reason: if these tests needed Postgres, the
+// gateway would be doing something it is not allowed to do.
+
+const silent: Logger = createLogger("gateway", () => {});
+
+// The stub cannot lie about the shape: ApiClient's types come from
+// @relay/protocol's internal contract, so a partial response is a compile
+// error here — the same guarantee the real client gets at runtime.
+function committed(seq: number): InternalSendResponse {
+  return {
+    id: "00000000-0000-0000-0000-000000000001",
+    channel_id: "11111111-1111-1111-1111-111111111111",
+    seq,
+    text: "hello",
+    created_at: new Date().toISOString(),
+  };
+}
+
+function stubApi(overrides: Partial<ApiClient> = {}): ApiClient {
+  return {
+    memberships: async () => ["11111111-1111-1111-1111-111111111111"],
+    sendMessage: async () => committed(42),
+    ...overrides,
+  };
+}
+
+async function token(claims: Record<string, string> = {}): Promise<string> {
+  return new SignJWT({ env: "env-1", ...claims })
+    .setProtectedHeader({ alg: "HS256" })
+    .setSubject("tuan")
+    .sign(new TextEncoder().encode(DEV_JWT_SECRET));
+}
+
+interface Harness {
+  url: string;
+  close: () => Promise<void>;
+}
+
+async function boot(
+  api: ApiClient = stubApi(),
+  pingIntervalMs?: number,
+): Promise<Harness> {
+  const server: Server = serve({
+    service: "gateway",
+    health: () => ({}),
+    logger: silent,
+  });
+  const sessions = attachSessions({
+    server,
+    api,
+    logger: silent,
+    ...(pingIntervalMs !== undefined && { pingIntervalMs }),
+  });
+  await new Promise<void>((resolve) => server.listen(0, resolve));
+  const { port } = server.address() as AddressInfo;
+  return {
+    url: `ws://127.0.0.1:${port}/v1/ws`,
+    close: async () => {
+      sessions.close();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    },
+  };
+}
+
+/** Collect frames until a predicate matches, or reject on close/timeout. */
+function nextFrame(socket: WebSocket, type: Frame["type"]): Promise<Frame> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`no ${type} frame`)), 2000);
+    socket.on("message", (raw) => {
+      const frame = JSON.parse(raw.toString()) as Frame;
+      if (frame.type === type) {
+        clearTimeout(timer);
+        resolve(frame);
+      }
+    });
+    socket.on("close", (code) => {
+      clearTimeout(timer);
+      reject(new Error(`closed ${code}`));
+    });
+  });
+}
+
+function closeCode(socket: WebSocket): Promise<number> {
+  return new Promise((resolve) => socket.on("close", (code) => resolve(code)));
+}
+
+describe("the socket (chapter 2.5)", () => {
+  let harness: Harness | undefined;
+  afterEach(async () => {
+    await harness?.close();
+    harness = undefined;
+  });
+
+  it("acks a valid connection with identity and a resume cursor (EIR-WS-03)", async () => {
+    harness = await boot();
+    const started = Date.now();
+    const socket = new WebSocket(`${harness.url}?token=${await token()}`);
+    const ack = await nextFrame(socket, "connection.ack");
+    // Inside EIR-WS-03's one-second budget, measured rather than asserted.
+    expect(Date.now() - started).toBeLessThan(1000);
+    expect(ack).toMatchObject({
+      type: "connection.ack",
+      payload: { user: "tuan", resume_ok: true, truncated: [] },
+    });
+    socket.close();
+  });
+
+  it("rejects a bad token with 4001 before any frame (EIR-WS-05)", async () => {
+    harness = await boot();
+    for (const bad of ["", "not-a-jwt", await token({ env: "" })]) {
+      const socket = new WebSocket(`${harness.url}?token=${bad}`);
+      expect(await closeCode(socket)).toBe(4001);
+    }
+  });
+
+  it("forwards message.send to the api and acks the committed sequence", async () => {
+    const sent: unknown[] = [];
+    harness = await boot(
+      stubApi({
+        sendMessage: async (identity, body) => {
+          sent.push({ identity, body });
+          return committed(7);
+        },
+      }),
+    );
+    const socket = new WebSocket(`${harness.url}?token=${await token()}`);
+    await nextFrame(socket, "connection.ack");
+    socket.send(
+      JSON.stringify({
+        type: "message.send",
+        payload: { idem_key: "k1", channel: "c1", text: "hello" },
+      }),
+    );
+    const ack = await nextFrame(socket, "message.ack");
+    expect(ack).toMatchObject({ type: "message.ack", payload: { seq: 7 } });
+    // The gateway carried; the api decided. The identity travelled with it.
+    expect(sent).toEqual([
+      {
+        identity: { userExternalId: "tuan", environmentId: "env-1" },
+        body: { channel_id: "c1", text: "hello", idempotency_key: "k1" },
+      },
+    ]);
+    socket.close();
+  });
+
+  it("answers garbage with the protocol's error envelope", async () => {
+    harness = await boot();
+    const socket = new WebSocket(`${harness.url}?token=${await token()}`);
+    await nextFrame(socket, "connection.ack");
+    socket.send("this is not json");
+    const error = await nextFrame(socket, "error");
+    expect(error).toMatchObject({
+      type: "error",
+      payload: { code: "invalid_frame" },
+    });
+    socket.close();
+  });
+
+  it("closes with 4002 when a client utters a server-only frame (EIR-WS-06)", async () => {
+    harness = await boot();
+    const socket = new WebSocket(`${harness.url}?token=${await token()}`);
+    await nextFrame(socket, "connection.ack");
+    // message.ack is the SERVER's word. A client sending it is not
+    // malformed input — it is a protocol violation.
+    socket.send(JSON.stringify({ type: "message.ack", payload: { seq: 1 } }));
+    expect(await closeCode(socket)).toBe(4002);
+  });
+
+  it("closes a socket that stops answering pings (EIR-WS-04)", async () => {
+    // The interval is injectable so the contract can be tested in
+    // milliseconds instead of a minute and a half.
+    harness = await boot(stubApi(), 20);
+    const socket = new WebSocket(`${harness.url}?token=${await token()}`);
+    await nextFrame(socket, "connection.ack");
+    socket.pong = () => {}; // stop answering
+    expect(await closeCode(socket)).toBe(1001);
+  });
+});
+```
+
+Unit lane đứng ở bốn mươi chín, bao gồm sáu case mới của gateway; integration
+lane vẫn giữ nguyên ở hai mươi mốt. Sockets gặp compose stack ở 2.6, khi có
+thứ gì đó bên kia wire để chạm tới.
+
+<Trap locale="vi">
+
+Một case trong suite đó tồn tại vì việc viết nó đã tìm ra một lỗ hổng. Cánh
+cửa ban đầu check `typeof payload.sub === "string" && typeof payload.env ===
+"string"` — điều này đúng với `""`. Vì vậy một token mang empty `env` claim
+đi qua cửa và mở một session scoped tới *không tenant nào*, rồi failure lộ ra
+hai layer sau dưới dạng membership lookup bị api reject. Constitution I nói
+một tenant-less query phải unrepresentable, không chỉ unlikely, nên claims giờ
+được check non-empty. Bài học vượt ra ngoài bug này: `typeof` là type check,
+không phải validation, và mọi boundary nhận một string nên nói rõ một string
+*valid* trông như thế nào. Frames có điều đó miễn phí — zod schemas từ 1.3 —
+và chính check hand-rolled duy nhất trong chương là chỗ có lỗ hổng.
+
+</Trap>
+
+<Figure
+  caption="Anatomy của gateway ở cuối chương này: door, session, registry — và không có path nào tới store ở bất kỳ đâu trong hộp. Thứ registry không thể thấy xuyên instances chính là opening problem của 2.6."
+  code={figGatewayAnatomy}
+/>
+
+<ForwardRef part="Phần 2 và 3" locale="vi">
+
+Registry của chương này trung thực về giới hạn của nó: nó biết sockets của
+*instance này* và không biết của ai khác — chạy hai gateways và hai users bị
+chia qua chúng sẽ không nghe được nhau, đó là opening demonstration của 2.6
+và là việc của Redis pub/sub (ADR-07). `connection.ack` đã mang resume cursor
+vì EIR-WS-03 yêu cầu; 2.7 làm cho nó có ý nghĩa. Presence (FR-RTM-06) và
+typing (FR-RTM-08) đi nhờ cùng session machinery này trong chương riêng của
+chúng, dựa trên Redis TTLs theo ADR-10. Và dev-token seam cố ý nông: real
+credentials của 3.2 thay secret lookup trong `auth.ts` bằng `signing_secret`
+của bảng environments mà không chạm một dòng nào sau cánh cửa.
+
+</ForwardRef>
+
+## Đến lượt bạn
+
+Bài tập chính là build: auth, session, registry, internal route, wiring diff,
+tests. Sau đó chất vấn cánh cửa:
+
+1. Connect bằng expired token, wrong-secret token, và không token. Confirm cả
+   ba đều chết với `4001` và reason — và không có gì được log *như thể*
+   session đã từng tồn tại (cánh cửa nằm trước ngôi nhà).
+2. Send một frame có `type` mà protocol không biết. Đọc `error` frame nhận
+   lại, rồi send garbage thêm hai lần và nhìn `4002` close socket. Escalation
+   đó là vocabulary của EIR-WS-06 đang được dùng.
+3. Dừng trả lời pings (hầu hết ws clients cho phép bạn disable pong). Canh
+   thời gian close: hai missed pings ≈ 60-90 giây (EIR-WS-04). Sau đó
+   reconnect và để ý registry đã quên bạn sạch sẽ — session lifetime chính là
+   socket lifetime, không hơn.
+
+Nếu bạn bị kẹt, tag giữ answer key: `part2-ch5`.
+
+## Điều cần giữ lại
+
+Nếu không đọc gì khác trong chương này, hãy giữ lại những điểm này:
+
+- **Verify ngay ở cửa** (EIR-WS-05): authentication đi trước session; bad
+  token nhận `4001` và không bao giờ chạm session code.
+- **Frames đã được thống nhất sẵn**: cả hai đầu parse bằng schemas của
+  `@relay/protocol` — contract của 1.3, cuối cùng cũng mang traffic mà nó
+  không thể drift khỏi.
+- **Gateway carries; api decides** (ADR-05): `message.send` là một write của
+  2.2/2.3 được forward, ack sau cùng commit — một write path, giờ có socket
+  đặt phía trước.
+- **Không store access, kể cả reads**: shortcut đó là một isolation surface
+  thứ hai cải trang; events, không phải side-doors, là cách gateway học thêm
+  thông tin (toàn bộ lập luận của TRAP).
+- **Liveness được enforce, không assume** (EIR-WS-04): ping, hai lần miss,
+  close — vì resume story của 2.7 cần death được detect.
+
+<Checkpoint locale="vi">
+
+Trước khi bắt đầu chương 2.6, bạn nên có: một socket authenticate được, ack
+trong vòng một giây, và mang `message.send` → `message.ack` end to end qua
+write path của api; registry map users và channels tới live sockets trên một
+instance; pings close dead connections; và gate xanh ở cả hai lanes. Trạng
+thái đó là tag `part2-ch5` trong canonical repository. Giờ hãy bật một
+gateway instance *thứ hai* và nhìn hai users không nghe được nhau — chương 2.6
+mở ra đúng tại đó.
+
+</Checkpoint>
+
+<ChapterFooter id="2.5" />

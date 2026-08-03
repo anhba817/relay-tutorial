@@ -240,12 +240,15 @@ export const series: Part[] = [
         id: "2.5",
         path: "/part-2/chapter-05/the-socket",
         title: "The socket",
-        status: "forthcoming",
+        status: "published",
+        translatedIn: ["vi"],
         readerProduces:
           "Gateway: WS termination, JWT verify, connection registry",
         sourceDoc: "docs/04-srs.md, docs/05-sad.md",
         readerMinutes: 90,
-        titleVi: "Đường socket",
+        titleVi: "Socket",
+        readerProducesVi:
+          "Gateway: WS termination, JWT verify, connection registry",
       },
       {
         id: "2.6",
