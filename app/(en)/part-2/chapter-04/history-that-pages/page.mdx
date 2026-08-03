@@ -1,0 +1,826 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figOffsetDrift, figCursorStability, figIndexRide } from "./figures";
+
+export const metadata = {
+  title: "History that pages — Building Relay",
+  description:
+    "Offset pagination is demonstrated drifting under live inserts — pages that repeat and pages with holes — before cursors on (channel_id, seq) make the read path as stable as the write path made the order.",
+  alternates: {
+    canonical: "/part-2/chapter-04/history-that-pages",
+    languages: {
+      en: "/part-2/chapter-04/history-that-pages",
+      vi: "/vi/part-2/chapter-04/history-that-pages",
+    },
+  },
+};
+
+<ChapterHeader id="2.4" />
+
+Two chapters of writing deserve one chapter of reading. A chat client's
+first question on opening a channel is "what did I miss?", and its second —
+as the user scrolls up — is "what came before that?" Both are the same
+query: *give me a page of history, anchored somewhere*. The anchoring is
+the entire chapter. Message feeds have a property that breaks the
+pagination scheme every web framework hands you by default: they *move
+while you read them*. New messages arrive between page one and page two,
+and a scheme that counts rows from the top will happily count the same row
+twice — or skip one forever. Per this part's rule, we build the broken
+version first and watch it lie.
+
+<SkipAhead>
+
+If you must skip: the chapter adds
+`GET /v1/channels/:channelId/messages` with cursor pagination in both
+directions and a page cap of 200 (FR-MSG-09), riding the
+`messages_channel_seq` index from 2.1 as a pure index-order scan. Cursors
+are opaque tokens encoding a sequence position (constitution V: "List
+endpoints use opaque cursor pagination; offset pagination is not
+offered"). Offset pagination's drift under live inserts is demonstrated,
+not asserted. The chapter also corrects chapter 2.1: the dedicated `DESC` index it
+created turns out to be redundant, so the SAD is amended and a
+forward-only migration drops it. The chapter-end state is tag
+**`part2-ch4`**.
+
+</SkipAhead>
+
+## The feed that moves under you
+
+Offset pagination is arithmetic: `ORDER BY something, OFFSET 50 LIMIT 50`
+— "skip what I've seen, give me the next batch." It is the default in
+every tutorial, every admin panel, every framework scaffold, and it is
+*correct* for data that holds still. Chat does not hold still. Between
+your first page and your second, the fleet channel got three new
+messages — and every row in the table just moved three positions relative
+to the top.
+
+Stage it. The suite writes sixty messages, reads page one, writes three
+more mid-scroll — two hundred drivers don't stop typing because someone
+opened the app — then reads page two.
+
+Note where the broken read lives: **inside the test file**, not in the
+repository. The constitution says offset pagination "is not offered", and
+a method that exists is a method someone will eventually call — so the
+version this chapter argues against never enters the production layer at
+all. It stays here, where it can be demonstrated and can never be
+imported. (The file sits under `src/db/` because that is where the lint
+rule from 2.1 permits the query engine — the same reason 2.3's DR-01
+guard lives beside the isolation suite.)
+
+```ts title="services/api/src/db/history-drift.itest.ts"
+import { beforeAll, describe, expect, it } from "vitest";
+import { desc, eq, sql } from "drizzle-orm";
+
+import { createDb, createPool, DEFAULT_DATABASE_URL, type Db } from "./client";
+import { migrate } from "./migrate";
+import { createEnvironment, Repository } from "./repository";
+import { messages } from "./schema";
+
+// The staged failure for chapter 2.4 — offset pagination drifting under a
+// moving feed.
+//
+// The offset read lives HERE, in the test, and not in the repository: the
+// constitution says offset pagination "is not offered", and a method that
+// exists is a method someone will call. Keeping the broken version in the
+// suite means the demonstration stays runnable at the tag without the
+// production layer ever shipping the thing the chapter argues against.
+// (This file sits under src/db/ because that is where the lint rule
+// permits the query engine — the same reason 2.3's DR-01 guard lives in
+// repository.itest.ts.)
+
+const url = new URL(process.env.DATABASE_URL ?? DEFAULT_DATABASE_URL);
+if (!["localhost", "127.0.0.1"].includes(url.hostname)) {
+  throw new Error(
+    `integration tests refuse non-local databases (got host "${url.hostname}") — never point this suite at a shared database`,
+  );
+}
+
+const pool = createPool();
+const db: Db = createDb(pool);
+let repo: Repository;
+
+/** The pagination every framework hands you — correct for data that holds
+ * still, which a chat feed never does. */
+async function readByOffset(
+  channelId: string,
+  { offset, limit }: { offset: number; limit: number },
+) {
+  return db
+    .select({ id: messages.id, seq: messages.sequence })
+    .from(messages)
+    .where(eq(messages.channelId, channelId))
+    .orderBy(desc(messages.sequence))
+    .limit(limit)
+    .offset(offset);
+}
+
+beforeAll(async () => {
+  await migrate(pool);
+  const env = await createEnvironment(db, { name: "history-drift-itest" });
+  repo = new Repository(db, env.id);
+});
+
+describe("offset pagination drifts under live inserts (chapter 2.4)", () => {
+  it("serves rows the reader has already seen", async () => {
+    const channel = await repo.createChannel("drift-repeat", "public");
+    for (let i = 1; i <= 60; i += 1) {
+      await repo.sendMessage(channel.id, { text: `m-${i}` });
+    }
+    const page1 = await readByOffset(channel.id, { offset: 0, limit: 50 });
+    // The feed moves mid-scroll: three drivers type while page two loads.
+    for (let i = 1; i <= 3; i += 1) {
+      await repo.sendMessage(channel.id, { text: `live-${i}` });
+    }
+    const page2 = await readByOffset(channel.id, { offset: 50, limit: 50 });
+
+    const seen = new Set(page1.map((m) => m.id));
+    const repeats = page2.filter((m) => seen.has(m.id));
+    // Three inserts, three repeats — the drift is exactly the shift.
+    expect(repeats).toHaveLength(3);
+  });
+
+  it("hides rows the reader will never see, when the feed shrinks", async () => {
+    const channel = await repo.createChannel("drift-gap", "public");
+    for (let i = 1; i <= 60; i += 1) {
+      await repo.sendMessage(channel.id, { text: `m-${i}` });
+    }
+    const page1 = await readByOffset(channel.id, { offset: 0, limit: 50 });
+    // A moderator deletes a message the reader has ALREADY passed — one
+    // from page one's range. Every row below it shifts up one position,
+    // so page two's offset now starts one row too late.
+    const victim = page1[25]!;
+    await db.execute(sql`DELETE FROM messages WHERE id = ${victim.id}`);
+
+    const page2 = await readByOffset(channel.id, { offset: 50, limit: 50 });
+    const delivered = new Set([...page1, ...page2].map((m) => m.seq));
+    const survivors = await db
+      .select({ seq: messages.sequence })
+      .from(messages)
+      .where(eq(messages.channelId, channel.id));
+    const missed = survivors.filter((m) => !delivered.has(m.seq));
+    // A row that still exists was served on neither page. From the
+    // reader's chair that is not "a little overlap" — it is data loss.
+    expect(missed.length).toBeGreaterThan(0);
+  });
+});
+```
+
+Run it and the count is exactly what the arithmetic predicts: **three
+inserts, three repeated rows** — sequences 73, 72 and 71, the tail of page
+one arriving again at the head of page two. Three inserts pushed every
+existing row three positions deeper, so `OFFSET 50` starts three rows
+*earlier* in content terms than page one ended. The user sees the same
+messages twice — annoying.
+
+The second case is the one nobody demos, and it is worse. Delete a
+message the reader has already passed — a moderator removing something
+from page one's range — and every row below it shifts *up*. Now
+`OFFSET 50` starts one row too **late**, and a message that still exists
+is served on neither page. The test asserts exactly that: a surviving row
+delivered nowhere. Not annoying; invisible data loss, from the reader's
+chair. Nothing errored in either case. Both pages were correct answers to
+questions the client never meant to ask.
+
+<Figure
+  caption="Offset arithmetic under a moving feed: three inserts between pages shift every row, and page two overlaps page one. With deletes it's worse — rows silently vanish into the seam."
+  code={figOffsetDrift}
+/>
+
+## Anchor to a position, not a count
+
+The fix is to stop asking "skip fifty" and start asking "continue from
+*here*" — where *here* is a position in the one ordering this system
+already guarantees. Chapter 2.2 minted it: the sequence number, strictly
+ordered within a channel, assigned under a lock, no ties possible. A
+cursor that says "everything older than seq 363" cannot be moved by
+inserts, because new messages get *higher* numbers — they land above every
+cursor, never inside one.
+
+FR-MSG-09 asked for exactly this shape all along: "The system shall
+support retrieving channel history in both directions from a cursor, with
+a maximum page size of 200." Both directions — older (scroll-up) and newer
+(catch-up) — from one anchor. And the constitution closes the exit:
+offset pagination "is not offered." Not deprecated, not discouraged — not
+offered, so no client ever builds on the version that lies.
+
+The repository grows its read method, amended in daylight as always:
+
+```diff title="services/api/src/db/repository.ts"
+-import { and, asc, eq, sql } from "drizzle-orm";
++import { and, asc, desc, eq, gt, lt, sql, type SQL } from "drizzle-orm";
+
+ import type { Db } from "./client";
+ import { channels, members, messages, users } from "./schema";
+@@ -351,6 +351,60 @@ export class Repository {
+     return { ...row, created_at: toIso(row.created_at) };
+   }
+
++  /** History reads (chapter 2.4): one page of messages anchored to a
++   * sequence position, in either direction (FR-MSG-09), riding the
++   * messages_channel_seq index in its natural order. The channel join
++   * carries the tenant scope, so a foreign channel id pages nothing.
++   *
++   * Anchors are strictly EXCLUSIVE: the cursor names the last row the
++   * client already has. Inclusive comparisons would serve that row twice,
++   * once per page — offset drift rebuilt at a single row's scale.
++   */
++  async listMessages(
++    channelId: string,
++    {
++      beforeSeq,
++      afterSeq,
++      limit,
++    }: { beforeSeq?: number; afterSeq?: number; limit: number },
++  ): Promise<MessageRow[]> {
++    const columns = {
++      id: messages.id,
++      channel_id: messages.channelId,
++      seq: messages.sequence,
++      text: messages.text,
++      created_at: messages.createdAt,
++    };
++    const scoped = (extra?: SQL) =>
++      and(
++        eq(messages.channelId, channelId),
++        eq(channels.environmentId, this.environmentId),
++        ...(extra ? [extra] : []),
++      );
++    const rows = await (afterSeq === undefined
++      ? this.db
++          .select(columns)
++          .from(messages)
++          .innerJoin(channels, eq(channels.id, messages.channelId))
++          .where(
++            scoped(
++              beforeSeq === undefined
++                ? undefined
++                : lt(messages.sequence, beforeSeq),
++            ),
++          )
++          .orderBy(desc(messages.sequence))
++          .limit(limit)
++      : this.db
++          .select(columns)
++          .from(messages)
++          .innerJoin(channels, eq(channels.id, messages.channelId))
++          .where(scoped(gt(messages.sequence, afterSeq)))
++          .orderBy(asc(messages.sequence))
++          .limit(limit));
++    return rows.map((row) => ({ ...row, created_at: toIso(row.created_at) }));
++  }
++
+   /** Every message in the channel, ordered by sequence — tenant-scoped
+    * like everything else here. DECISION (chapter 2.3): this exists for
+    * the idempotency suite's row counts; 2.4 replaces it with the real
+```
+
+Look at the `WHERE`/`ORDER BY` pair: seek once to `(channel, cursor)`,
+read fifty adjacent index entries, stop. No sort node, no counting from
+the top, no work proportional to how deep the reader has scrolled. Ask
+Postgres to confirm it rather than taking the claim on faith:
+
+```text
+Limit  (cost=0.27..8.29 rows=1 width=24)
+  ->  Index Scan Backward using messages_channel_id_sequence_unique on messages
+        Index Cond: ((channel_id = '…'::uuid) AND (sequence < 100))
+```
+
+A `Limit` over an `Index Scan` with both predicates in the `Index Cond`
+and no `Sort` above it — the page is a walk, exactly as designed. But
+read the index *name*, because it is not the one this chapter expected.
+
+<Why source="SAD §6.3 · the plan, actually run">
+
+Chapter 2.1 created `messages_channel_seq` on `(channel_id, sequence DESC)`
+and labelled it, in the SAD's own words, "history pagination as a pure
+index-order scan (FR-MSG-09)". This is that pagination — and the planner
+did not use that index. It walked **DR-01's unique index** —
+`UNIQUE (channel_id, sequence)`, created for an entirely different
+reason — *backward*.
+
+That is not a planner mistake; it is how btrees work. An index is an
+ordered structure, and ordered structures can be read from either end. A
+dedicated `DESC` index buys nothing over an `ASC` index on the same
+columns, because a backward scan costs what a forward scan costs. The one
+case that genuinely needs a `DESC` index is mixed-direction ordering
+across *several* columns — `ORDER BY a ASC, b DESC`, where reversal would
+flip both. This query orders by one column after an equality predicate,
+so that case cannot arise.
+
+So the index is redundant. Don't take the word for it — measure. At fifty
+thousand rows, with the index present and then dropped:
+
+```text
+both indexes present   → Index Scan Backward using messages_..._sequence_unique
+                         cost=0.41..5.04
+messages_channel_seq   → Index Scan Backward using messages_..._sequence_unique
+   dropped               cost=0.41..5.04     ← identical plan, identical cost
+```
+
+Not "close enough": the same plan and the same numbers. The index cost
+about 2 MB per fifty thousand messages, was maintained on every insert —
+on the write path 2.2 deliberately serialised under a row lock — and was
+used by nothing.
+
+</Why>
+
+## Fixing chapter 2.1, from chapter 2.4
+
+Here is where a series that runs its own code parts company with one that
+doesn't. The index came from the SAD; the SAD was wrong; and the way to
+handle that is not a footnote but the project's own machinery, in three
+moves.
+
+**The document is amended first.** §6.3's hot-path paragraph now says the
+ordering comes from DR-01's unique index, with a dated note recording the
+measurement and the reasoning. The constitution requires this: where code
+and the SAD disagree, the conflict is "resolved explicitly by amendment
+rather than ignored." Code that quietly diverges from its architecture
+document is how an architecture document becomes fiction.
+
+**The schema definition drops the index** — and says why, so the next
+reader doesn't helpfully add it back:
+
+```diff title="services/api/src/db/schema.ts"
+@@ -127,9 +127,10 @@ export const messages = pgTable(
+     uniqueIndex("messages_idem")
+       .on(t.channelId, t.idempotencyKey)
+       .where(sql`${t.idempotencyKey} IS NOT NULL`),
+-    // Hot-path index (SAD §6.3): history pagination as a pure
+-    // index-order scan (FR-MSG-09).
+-    index("messages_channel_seq").on(t.channelId, t.sequence.desc()),
++    // No dedicated (channel_id, sequence DESC) index: DR-01's unique
++    // constraint above already supplies that ordering, and Postgres walks
++    // it backward for newest-first pages. Chapter 2.4 measured it and
++    // migration 0002 dropped the redundant twin (SAD §6.3, amended).
+   ],
+ );
+```
+
+**And the correction travels forward.** Migration `0000` created the
+index; you cannot edit `0000`, because it has already run everywhere it
+was ever going to run. Forward-only means the fix is a *new* file — and
+this is exactly what forward-only is for. drizzle-kit generated it from
+the changed schema, and we reviewed it the same way we review every
+generated migration:
+
+```sql title="services/api/migrations/0001_drop_redundant_index.sql"
+-- 0001 (chapter 2.4): GENERATED by drizzle-kit, then reviewed.
+--
+-- 0000 created messages_channel_seq on (channel_id, sequence DESC) for
+-- history pagination, per SAD §6.3 as it stood. Measured at 50,000 rows,
+-- the planner never used it: it walks DR-01's UNIQUE (channel_id, sequence)
+-- BACKWARD instead, and dropping this index changed neither the plan nor
+-- the cost estimate (0.41..5.04 either way). A btree is bidirectional, so a
+-- DESC twin of an existing ASC index adds no ordering — only write
+-- amplification on the send path and storage.
+--
+-- Review disposition: one statement, exactly the intended drop, nothing
+-- else. Forward-only as always — 0000 stays true at its own tag, and this
+-- file is how the correction travels (SAD §6.3 amended 2026-08-02, v1.1).
+
+DROP INDEX "messages_channel_seq";```
+
+Apply it, and the plan is unchanged — because the index it removed was
+never doing the work:
+
+```text
+Index Scan Backward using messages_channel_id_sequence_unique
+  cost=0.41..4.93  Index Cond: ((channel_id = '…') AND (sequence < 40000))
+```
+
+Chapter 2.1 is not retroactively wrong: at tag `part2-ch1` that index
+exists, its fence matches, and its checkpoint passes. It was a reasonable
+decision on the evidence available, and the evidence arrived three
+chapters later. That is what a tag lineage is *for* — earlier states stay
+true, and corrections travel forward with their reasons attached.
+
+<Figure
+  caption="The read is the index's walking direction: seek to the cursor position, read one page of adjacent entries, stop. Scroll depth costs nothing — the plan is identical at message 50 and message 50,000."
+  code={figIndexRide}
+/>
+
+<Why source="FR-MSG-09 · constitution V · SAD §6.1's index">
+
+Why is *opacity* part of the requirement — why `cursor=eyJzIjozNjN9`
+instead of an honest `?before_seq=363`? Because a naked sequence number
+in a public API is a contract you didn't mean to sign. Clients will
+construct them, do arithmetic on them, store them, and assume gap-free
+increments — and 2.2 was explicit that gaps are legal. The constitution's
+clause ("opaque cursor pagination") makes the position a *token*: the
+server can change what's inside — add a timestamp for retention-aware
+reads, add a shard hint at 10× scale — without breaking a single client,
+because no client ever saw inside. Opacity is not obfuscation; it is the
+API keeping its options open in the one place clients are most tempted to
+guess.
+
+</Why>
+
+The cursor codec itself is deliberately dull — encode, decode, refuse
+garbage:
+
+```ts title="services/api/src/messages/cursor.ts"
+// Opaque history cursors (chapter 2.4). The token encodes a sequence
+// position; clients treat it as a black box (constitution V: "List
+// endpoints use opaque cursor pagination; offset pagination is not
+// offered"). The structure inside may change at any time — a timestamp
+// for retention-aware reads, a shard hint at 10x scale — and no client
+// breaks, because no client ever saw inside.
+
+const PREFIX = "s:";
+
+export function encodeCursor(seq: number): string {
+  return Buffer.from(`${PREFIX}${seq}`, "utf8").toString("base64url");
+}
+
+/** Decode a cursor, or null if the token is not one of ours. Callers turn
+ * null into a 400 through the usual envelope — never a 500, and never a
+ * silent fallback to "start from the top", which would quietly serve the
+ * wrong page. */
+export function decodeCursor(token: string): number | null {
+  let raw: string;
+  try {
+    raw = Buffer.from(token, "base64url").toString("utf8");
+  } catch {
+    return null;
+  }
+  const match = /^s:(\d+)$/.exec(raw);
+  if (!match) return null;
+  const seq = Number(match[1]);
+  return Number.isSafeInteger(seq) ? seq : null;
+}
+```
+
+Its unit tests are the cheapest in the chapter and the ones you will be
+glad of: round-trip, opacity, and refusal.
+
+```ts title="services/api/src/messages/cursor.test.ts"
+import { describe, expect, it } from "vitest";
+
+import { decodeCursor, encodeCursor } from "./cursor";
+
+// The codec is dull on purpose — but "dull" still has to round-trip and
+// still has to refuse everything else, because a cursor that decodes to
+// the wrong number serves the wrong page in silence.
+describe("history cursors (chapter 2.4)", () => {
+  it("round-trips a sequence position", () => {
+    for (const seq of [0, 1, 42, 1_000_000]) {
+      expect(decodeCursor(encodeCursor(seq))).toBe(seq);
+    }
+  });
+
+  it("is opaque — the token does not read as its contents", () => {
+    expect(encodeCursor(363)).not.toContain("363");
+  });
+
+  it("refuses anything it did not mint", () => {
+    for (const junk of [
+      "",
+      "363",
+      "not-base64!",
+      Buffer.from("s:abc").toString("base64url"),
+    ]) {
+      expect(decodeCursor(junk)).toBeNull();
+    }
+  });
+});
+```
+
+The query schema caps `limit` at FR-MSG-09's 200 — and *clamps* rather
+than rejects, so a client asking for 500 gets 200 and a cursor instead of
+a lecture:
+
+```diff title="services/api/src/messages/messages.schema.ts"
+ import { z } from "zod";
+ 
+ // The send body (chapter 2.2). FR-MSG-01 fixes the limits: text up to
+ // 8,000 characters, metadata up to 4 KB of JSON — the length check lands
+ // with FR-EMJ-02's code-point counting in the emoji chapter; today the
+ // character bound is the honest approximation, recorded as such.
+ export const sendMessageBodySchema = z.strictObject({
+   text: z.string().min(1).max(8000),
+   metadata: z.record(z.string(), z.unknown()).optional(),
+   // Chapter 2.3 (FR-MSG-04): the client's idempotency key — minted at send
+   // time (FR-SDK-06), optional because server-originated messages may not
+   // carry one. The partial unique index (DR-03) ignores NULLs.
+   idempotency_key: z.string().uuid().optional(),
+ });
+ 
+ export type SendMessageBody = z.infer<typeof sendMessageBodySchema>;
++
++// The history query (chapter 2.4, FR-MSG-09): an opaque cursor, a
++// direction, and a page size capped at 200. `limit` CLAMPS rather than
++// rejects — a client asking for 500 gets 200 and a next_cursor, because
++// caps exist to protect the server and a clamp does that just as well
++// while leaving the client's loop logic alone.
++export const historyQuerySchema = z.strictObject({
++  cursor: z.string().min(1).optional(),
++  direction: z.enum(["older", "newer"]).default("older"),
++  limit: z.coerce.number().int().min(1).max(200).default(50),
++});
++
++export type HistoryQuery = z.infer<typeof historyQuerySchema>;
+```
+
+The service owns the only place that knows a cursor encodes a sequence.
+A token we did not mint is a 400, never a silent reset to the top:
+
+```diff title="services/api/src/messages/messages.service.ts"
+-import { Injectable, NotFoundException } from "@nestjs/common";
++import {
++  BadRequestException,
++  Injectable,
++  NotFoundException,
++} from "@nestjs/common";
+ 
+ import {
+   ChannelNotFoundError,
+   Repository,
+   type MessageRow,
+ } from "../db/repository";
++import { decodeCursor, encodeCursor } from "./cursor";
+-import type { SendMessageBody } from "./messages.schema";
++import type { HistoryQuery, SendMessageBody } from "./messages.schema";
+ 
+ // The thin layer between HTTP and the repository (chapters 2.2 + 2.3). It
+ // owns two things: turning the layer's domain error into the wire's 404,
+ // and translating the repository's `duplicate: true` into FR-MSG-04's
+ // "201-equivalent semantics" — the retry returns the original message,
+ // indistinguishable from a fresh send (the `duplicate` flag stays internal).
+ @Injectable()
+ export class MessagesService {
+   constructor(private readonly repo: Repository) {}
+ 
++  async send(channelId: string, body: SendMessageBody): Promise<MessageRow> {
+-  async send(
+-    channelId: string,
+-    body: SendMessageBody,
+-  ): Promise<MessageRow> {
+     try {
+       const result = await this.repo.sendMessage(channelId, {
+         text: body.text,
+         metadata: body.metadata,
+         ...(body.idempotency_key != null && {
+           idempotencyKey: body.idempotency_key,
+         }),
+       });
+       // The internal duplicate flag never reaches the wire: the client
+       // sees the same body whether this was the original send or the
+       // retry that recovered it (FR-MSG-04's 201-equivalent semantics).
+       return {
+         id: result.id,
+         channel_id: result.channel_id,
+         seq: result.seq,
+         text: result.text,
+         created_at: result.created_at,
+       };
+     } catch (error) {
+       if (error instanceof ChannelNotFoundError) {
+         // A CONSTANT message: echoing the id back would make the foreign-id
+         // answer differ from the missing-id answer, and "different" is
+         // itself a disclosure (FR-TEN-05).
+         throw new NotFoundException("channel not found");
+       }
+       throw error;
+     }
+   }
++
++  /** A page of history (chapter 2.4). The cursor is opaque coming in and
++   * going out; the service is the only place that knows it encodes a
++   * sequence. A cursor we did not mint is a 400, never a silent reset to
++   * the top — serving the wrong page quietly is worse than refusing. */
++  async history(
++    channelId: string,
++    { cursor, direction, limit }: HistoryQuery,
++  ): Promise<{
++    messages: MessageRow[];
++    next_cursor: string | null;
++    prev_cursor: string | null;
++  }> {
++    let anchor: number | undefined;
++    if (cursor !== undefined) {
++      const decoded = decodeCursor(cursor);
++      if (decoded === null) throw new BadRequestException("malformed cursor");
++      anchor = decoded;
++    }
++    const messages = await this.repo.listMessages(channelId, {
++      limit,
++      ...(direction === "newer"
++        ? { afterSeq: anchor ?? 0 }
++        : anchor === undefined
++          ? {}
++          : { beforeSeq: anchor }),
++    });
++    // Edge rows become the next anchors. A short page still yields a
++    // next_cursor: "no more yet" and "no more ever" are the same answer
++    // in a feed that keeps growing, and the client simply gets an empty
++    // page next time.
++    const first = messages[0];
++    const last = messages[messages.length - 1];
++    return {
++      messages,
++      next_cursor: last ? encodeCursor(last.seq) : null,
++      prev_cursor: first ? encodeCursor(first.seq) : null,
++    };
++  }
+ }
+```
+
+And the route itself is four lines on the controller 2.2 built:
+
+```diff title="services/api/src/messages/messages.controller.ts"
+-import { Body, Controller, Param, Post, UseGuards } from "@nestjs/common";
++import {
++  Body,
++  Controller,
++  Get,
++  Param,
++  Post,
++  Query,
++  UseGuards,
++} from "@nestjs/common";
+ 
+ import { EnvironmentContextGuard } from "./environment-context.guard";
+ import { MessagesService } from "./messages.service";
+-import { sendMessageBodySchema } from "./messages.schema";
++import { historyQuerySchema, sendMessageBodySchema } from "./messages.schema";
+ // `import type` is required, not stylistic: with isolatedModules and
+ // emitDecoratorMetadata on (ADR-15's trade-off, chapter 1.4), a type used
+ // in a decorated signature must be imported as a type or TS1272 refuses
+ // to compile it.
+-import type { SendMessageBody } from "./messages.schema";
++import type { HistoryQuery, SendMessageBody } from "./messages.schema";
+ import { ZodValidationPipe } from "./zod-validation.pipe";
+ 
+ // The api's first product endpoint (chapter 2.2). Validation is zod at the
+ // boundary — the same schema family as @relay/protocol, so the REST body
+ // and the WebSocket frame payload cannot drift (1.3's payoff, again).
+ @Controller("v1/channels/:channelId/messages")
+ @UseGuards(EnvironmentContextGuard)
+ export class MessagesController {
+   constructor(private readonly messages: MessagesService) {}
+ 
+   @Post()
+   async send(
+     @Param("channelId") channelId: string,
+     @Body(new ZodValidationPipe(sendMessageBodySchema)) body: SendMessageBody,
+   ) {
+     return this.messages.send(channelId, body);
+   }
++
++  @Get()
++  async history(
++    @Param("channelId") channelId: string,
++    @Query(new ZodValidationPipe(historyQuerySchema)) query: HistoryQuery,
++  ) {
++    return this.messages.history(channelId, query);
++  }
+ }
+```
+
+<Trap>
+
+The trap is the **boundary row**, and every hand-rolled cursor
+implementation hits it: is the anchor *inclusive* or *exclusive*? Use
+`>=`/`<=` and the row the cursor points at appears twice — once as the
+last row of page one, once as the first row of page two; you have rebuilt
+offset drift's duplicate at a single row's scale, and it reproduces on
+*every* page boundary, not just under concurrent writes. The rule this
+chapter fixes: **a cursor names the last row the client has; pages are
+strictly exclusive of it** (`<` and `>`, never `<=`/`>=`). The itest pins
+the seam — page one's last seq and page two's first seq must differ by at
+least one — because this is exactly the kind of bug a reviewer's eye
+slides over: both operators look correct alone, and only the seam between
+two requests knows the difference.
+
+</Trap>
+
+## Both directions, one anchor
+
+FR-MSG-09's "both directions" clause is easy to read past and expensive to
+retrofit, so give it its own beat. Scroll-up is the direction everyone
+designs for: *older than my anchor, newest first* — `beforeSeq`,
+descending, the classic history read. But the mirror direction — *newer
+than my anchor, oldest first* — is not a nice-to-have symmetric flourish;
+it is the **catch-up read**, and it is how a client that has been away
+asks "what did I miss since seq 363?" The response arrives in ascending
+order because that is the order the client will render and apply it. If
+that sentence sounds familiar, it should: it is the resume question,
+almost verbatim. Chapter 2.7's backfill — "deliver all messages with a
+sequence number greater than the cursor" (FR-RTM-03) — is this method
+called with `afterSeq`, a cap, and a truncation flag. We are not building
+pagination and resume as cousins; they are the same read, and building it
+once here is why 2.7 gets to spend its pages on the race instead of the
+query.
+
+One more shape decision earns a sentence: the page cap clamps rather than
+errors. A client asking for `limit=500` gets 200 (FR-MSG-09's maximum) and
+a `next_cursor` — not a 400 lecture. Caps exist to protect the server, and
+a clamp protects it exactly as well as a rejection while leaving the
+client's loop logic untouched; the deep-paging client simply iterates.
+Rejections are for requests the server *cannot* honor safely; clamps are
+for requests it can honor at a smaller size. Confusing the two is how APIs
+grow retry loops around their own arbitrary numbers.
+
+<Why source="FR-RTM-04 · NFR-PRF · the 500 cap ahead">
+
+Why cap at all, if the index makes deep reads cheap? Because cheap-per-page
+is not cheap-per-request: an uncapped "everything since my cursor" against
+a fleet channel that saw six hundred messages overnight is a six-hundred-row
+response assembled, serialized, and pushed down a possibly-mobile pipe in
+one breath. The requirements split the concern deliberately: FR-MSG-09
+caps a *page* at 200, and FR-RTM-04 caps a *backfill* at 500-then-truncate
+— "return a truncation indicator instructing the client to refetch history
+rather than streaming the entire backlog." Journey 4 says the same thing
+from Tuan's seat: after a long offline stretch, replaying the flood is
+worse than saying "you're far behind — page it." The numbers are the
+documents'; the posture — bounded responses, always, with an honest signal
+when the bound bit — is this chapter's to establish, because every later
+read surface inherits it.
+
+</Why>
+
+## Walk it
+
+Seed a channel past one page and read it like a client would:
+
+```bash
+curl -s "localhost:4000/v1/channels/$CHANNEL/messages?limit=50" \
+  -H "X-Relay-Environment: $ENV"
+# → 50 newest messages + next_cursor
+curl -s "localhost:4000/v1/channels/$CHANNEL/messages?limit=50&cursor=$NEXT" \
+  -H "X-Relay-Environment: $ENV"
+# → the NEXT 50, no repeats — send three messages between the calls and
+#   verify the second page is identical either way
+```
+
+The history suite is five cases — cursor stability under live inserts,
+the exclusive seam, the catch-up direction, a foreign channel paging
+nothing, and the codec's round trip through the endpoint's own path —
+with the drift suite's two beside it. The integration lane stands at
+twenty-one across five files; the Docker-free gate is forty-three, three
+of them the codec's. Nothing needs deleting before the tag: the broken
+read never left the test file.
+
+<ForwardRef part="Parts 2 and 4">
+
+The catch-up direction (`afterSeq`, ascending) built today is 2.7's
+backfill in miniature: "everything since cursor X" is precisely the
+question a resuming connection asks, capped and truncated per FR-RTM-04 —
+the resume chapter will call this method with the caps turned on. Read
+state (FR-MSG-12, "highest sequence read") is the same anchor pointed the
+other way. And when Part 4's moderation chapter introduces tombstones,
+they will flow through this exact page shape (FR-MSG-10: history includes
+tombstones "so that clients can render deletions without gaps in
+ordering") — the page holds its shape; only what a deleted row *renders
+as* changes.
+
+</ForwardRef>
+
+## Your turn
+
+The exercise is the build: codec, repository read, route, and the three
+tests. Then stress the anchor:
+
+1. Re-run the offset drift demo, but with a *delete* between pages
+   instead of inserts. Watch a row vanish from the seam — the gap variant
+   nobody's demo ever shows, and the reason "it's just a little overlap"
+   is the wrong lesson to take from the duplicate variant.
+2. Flip one comparison to `<=` and run the seam test. One duplicated row,
+   every page boundary, forever. Flip it back and keep the test.
+3. Request `limit=500`. Confirm you get 200 (the FR-MSG-09 cap) and not
+   an error — caps clamp, they don't scold — then find where the clamp
+   lives and convince yourself a client cannot route around it.
+
+If you are stuck, the tag holds the answer key: `part2-ch4`.
+
+## Takeaways
+
+If you read nothing else in this chapter, keep these:
+
+- **Feeds move; counts lie**: offset pagination double-serves and
+  silently skips under live writes — demonstrated, not asserted.
+- **Anchor to the ordering you already paid for**: 2.2's sequence numbers
+  give every message a position inserts cannot shift; cursors name
+  positions, not offsets (FR-MSG-09).
+- **Opacity is the API keeping its options open** (constitution V):
+  clients hold tokens, not numbers, so the token's insides can evolve.
+- **The seam is the test**: exclusive anchors, pinned by an assertion on
+  the boundary row — the one-row bug reviewers don't see.
+- **The index was the plan all along**: 2.1 planted
+  `messages_channel_seq` for this exact query shape; scroll depth now
+  costs a seek plus one page, at any depth.
+
+<Checkpoint>
+
+Before starting chapter 2.5, you should have: the history endpoint paging
+both directions with opaque cursors; the drift demonstration witnessed
+and the offset method deleted; the seam test green; caps clamping at 200.
+That state is tag `part2-ch4` in the canonical repository. The api's
+read/write pair is now complete enough to carry a conversation — chapter
+2.5 finally opens the socket that conversations actually arrive on.
+
+</Checkpoint>
+
+<ChapterFooter id="2.4" />

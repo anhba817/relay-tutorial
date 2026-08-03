@@ -1,0 +1,804 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figOffsetDrift, figCursorStability, figIndexRide } from "./figures";
+
+export const metadata = {
+  title: "Lịch sử biết phân trang — Building Relay",
+  description:
+    "Offset pagination được dựng để drift dưới live inserts — page bị lặp và page có lỗ hổng — trước khi cursor trên (channel_id, seq) khiến read path ổn định như write path đã ổn định thứ tự.",
+  alternates: {
+    canonical: "/vi/part-2/chapter-04/history-that-pages",
+    languages: {
+      en: "/part-2/chapter-04/history-that-pages",
+      vi: "/vi/part-2/chapter-04/history-that-pages",
+    },
+  },
+};
+
+<ChapterHeader id="2.4" locale="vi" />
+
+Hai chương viết xứng đáng có một chương đọc. Câu hỏi đầu tiên của một chat
+client khi mở channel là "tôi đã bỏ lỡ gì?", và câu hỏi thứ hai — khi user
+cuộn lên — là "trước đó có gì?" Cả hai là cùng một query: *cho tôi một page
+history, neo ở đâu đó*. Cái neo ấy là toàn bộ chương này. Message feeds có
+một thuộc tính phá vỡ pagination scheme mà mọi web framework mặc định đưa
+cho bạn: chúng *dịch chuyển trong lúc bạn đọc*. Message mới đến giữa page
+một và page hai, và một scheme đếm rows từ đầu bảng sẽ vui vẻ đếm cùng một
+row hai lần — hoặc bỏ qua một row mãi mãi. Theo luật của phần này, ta build
+phiên bản hỏng trước và nhìn nó nói dối.
+
+<SkipAhead locale="vi">
+
+Nếu bạn buộc phải đọc lướt: chương này thêm
+`GET /v1/channels/:channelId/messages` với cursor pagination theo cả hai
+hướng và page cap 200 (FR-MSG-09), chạy trên index `messages_channel_seq` từ
+2.1 như một pure index-order scan. Cursors là opaque tokens encode một vị trí
+sequence (constitution V: "List endpoints use opaque cursor pagination;
+offset pagination is not offered"). Drift của offset pagination dưới live
+inserts được chứng minh bằng demo, không chỉ khẳng định. Chương này cũng sửa
+chương 2.1: dedicated `DESC` index mà chương đó tạo hóa ra redundant, nên SAD
+được amend và một forward-only migration drop nó. Trạng thái cuối chương là
+tag **`part2-ch4`**.
+
+</SkipAhead>
+
+## Feed dịch chuyển dưới chân bạn
+
+Offset pagination là phép tính số học: `ORDER BY something, OFFSET 50 LIMIT
+50` — "bỏ qua phần tôi đã thấy, đưa tôi batch tiếp theo." Nó là default trong
+mọi tutorial, mọi admin panel, mọi framework scaffold, và nó *đúng* với dữ
+liệu đứng yên. Chat không đứng yên. Giữa page đầu tiên và page thứ hai của
+bạn, fleet channel nhận thêm ba message mới — và mọi row trong table vừa dịch
+ba vị trí so với đầu feed.
+
+Dựng nó lên. Suite ghi sáu mươi messages, đọc page một, ghi thêm ba message
+giữa lúc scroll — hai trăm tài xế không ngừng gõ chỉ vì có người mở app — rồi
+đọc page hai.
+
+Để ý broken read sống ở đâu: **bên trong test file**, không phải trong
+repository. Constitution nói offset pagination "is not offered", và một
+method đã tồn tại thì sớm muộn cũng có người gọi — nên phiên bản mà chương
+này phản biện không bao giờ đi vào production layer. Nó ở lại đây, nơi nó có
+thể được chứng minh và không bao giờ được import. (File nằm dưới `src/db/` vì
+đó là nơi lint rule từ 2.1 cho phép query engine — cùng lý do guard DR-01 của
+2.3 sống cạnh isolation suite.)
+
+```ts title="services/api/src/db/history-drift.itest.ts"
+import { beforeAll, describe, expect, it } from "vitest";
+import { desc, eq, sql } from "drizzle-orm";
+
+import { createDb, createPool, DEFAULT_DATABASE_URL, type Db } from "./client";
+import { migrate } from "./migrate";
+import { createEnvironment, Repository } from "./repository";
+import { messages } from "./schema";
+
+// The staged failure for chapter 2.4 — offset pagination drifting under a
+// moving feed.
+//
+// The offset read lives HERE, in the test, and not in the repository: the
+// constitution says offset pagination "is not offered", and a method that
+// exists is a method someone will call. Keeping the broken version in the
+// suite means the demonstration stays runnable at the tag without the
+// production layer ever shipping the thing the chapter argues against.
+// (This file sits under src/db/ because that is where the lint rule
+// permits the query engine — the same reason 2.3's DR-01 guard lives in
+// repository.itest.ts.)
+
+const url = new URL(process.env.DATABASE_URL ?? DEFAULT_DATABASE_URL);
+if (!["localhost", "127.0.0.1"].includes(url.hostname)) {
+  throw new Error(
+    `integration tests refuse non-local databases (got host "${url.hostname}") — never point this suite at a shared database`,
+  );
+}
+
+const pool = createPool();
+const db: Db = createDb(pool);
+let repo: Repository;
+
+/** The pagination every framework hands you — correct for data that holds
+ * still, which a chat feed never does. */
+async function readByOffset(
+  channelId: string,
+  { offset, limit }: { offset: number; limit: number },
+) {
+  return db
+    .select({ id: messages.id, seq: messages.sequence })
+    .from(messages)
+    .where(eq(messages.channelId, channelId))
+    .orderBy(desc(messages.sequence))
+    .limit(limit)
+    .offset(offset);
+}
+
+beforeAll(async () => {
+  await migrate(pool);
+  const env = await createEnvironment(db, { name: "history-drift-itest" });
+  repo = new Repository(db, env.id);
+});
+
+describe("offset pagination drifts under live inserts (chapter 2.4)", () => {
+  it("serves rows the reader has already seen", async () => {
+    const channel = await repo.createChannel("drift-repeat", "public");
+    for (let i = 1; i <= 60; i += 1) {
+      await repo.sendMessage(channel.id, { text: `m-${i}` });
+    }
+    const page1 = await readByOffset(channel.id, { offset: 0, limit: 50 });
+    // The feed moves mid-scroll: three drivers type while page two loads.
+    for (let i = 1; i <= 3; i += 1) {
+      await repo.sendMessage(channel.id, { text: `live-${i}` });
+    }
+    const page2 = await readByOffset(channel.id, { offset: 50, limit: 50 });
+
+    const seen = new Set(page1.map((m) => m.id));
+    const repeats = page2.filter((m) => seen.has(m.id));
+    // Three inserts, three repeats — the drift is exactly the shift.
+    expect(repeats).toHaveLength(3);
+  });
+
+  it("hides rows the reader will never see, when the feed shrinks", async () => {
+    const channel = await repo.createChannel("drift-gap", "public");
+    for (let i = 1; i <= 60; i += 1) {
+      await repo.sendMessage(channel.id, { text: `m-${i}` });
+    }
+    const page1 = await readByOffset(channel.id, { offset: 0, limit: 50 });
+    // A moderator deletes a message the reader has ALREADY passed — one
+    // from page one's range. Every row below it shifts up one position,
+    // so page two's offset now starts one row too late.
+    const victim = page1[25]!;
+    await db.execute(sql`DELETE FROM messages WHERE id = ${victim.id}`);
+
+    const page2 = await readByOffset(channel.id, { offset: 50, limit: 50 });
+    const delivered = new Set([...page1, ...page2].map((m) => m.seq));
+    const survivors = await db
+      .select({ seq: messages.sequence })
+      .from(messages)
+      .where(eq(messages.channelId, channel.id));
+    const missed = survivors.filter((m) => !delivered.has(m.seq));
+    // A row that still exists was served on neither page. From the
+    // reader's chair that is not "a little overlap" — it is data loss.
+    expect(missed.length).toBeGreaterThan(0);
+  });
+});
+```
+
+Chạy nó và con số đúng hệt như phép tính dự đoán: **ba inserts, ba repeated
+rows** — sequences 73, 72 và 71, phần đuôi của page một quay lại ở đầu page
+hai. Ba inserts đẩy mọi row đang tồn tại sâu thêm ba vị trí, nên `OFFSET 50`
+bắt đầu *sớm hơn* ba row theo nghĩa nội dung so với nơi page một kết thúc.
+User thấy cùng message hai lần — phiền.
+
+Case thứ hai là thứ gần như không ai demo, và nó tệ hơn. Xóa một message mà
+reader đã đi qua — một moderator gỡ thứ gì đó khỏi vùng của page một — và mọi
+row bên dưới dịch *lên*. Giờ `OFFSET 50` bắt đầu **muộn** hơn một row, và một
+message vẫn còn tồn tại không được trả ở page nào cả. Test assert đúng điều
+đó: một row sống sót nhưng không được deliver ở đâu. Không chỉ phiền; đó là
+data loss vô hình, từ ghế của reader. Không case nào error. Cả hai page đều
+là câu trả lời đúng cho những câu hỏi client chưa bao giờ định hỏi.
+
+<Figure
+  caption="Offset arithmetic dưới một feed đang dịch chuyển: ba inserts giữa các page làm mọi row lệch đi, và page hai overlap page một. Với deletes còn tệ hơn — rows âm thầm biến mất ở boundary."
+  code={figOffsetDrift}
+/>
+
+## Neo vào một vị trí, không phải một con số
+
+Fix là ngừng hỏi "bỏ qua năm mươi" và bắt đầu hỏi "tiếp tục từ *đây*" — nơi
+*đây* là một vị trí trong đúng ordering mà hệ thống này đã guarantee. Chương
+2.2 đã mint nó: sequence number, được ordered chặt trong một channel, assign
+dưới lock, không thể hòa. Một cursor nói "mọi thứ older than seq 363" không
+thể bị inserts dịch chuyển, vì messages mới nhận số *cao hơn* — chúng nằm
+phía trên mọi cursor, không bao giờ chen vào bên trong.
+
+FR-MSG-09 đã đòi đúng shape này ngay từ đầu: "The system shall support
+retrieving channel history in both directions from a cursor, with a maximum
+page size of 200." Cả hai hướng — older (scroll-up) và newer (catch-up) — từ
+một anchor. Và constitution đóng lối thoát: offset pagination "is not
+offered." Không phải deprecated, không phải discouraged — không được offered,
+nên không client nào build trên phiên bản biết nói dối.
+
+Repository mọc thêm read method, được amend công khai như mọi lần:
+
+```diff title="services/api/src/db/repository.ts"
+-import { and, asc, eq, sql } from "drizzle-orm";
++import { and, asc, desc, eq, gt, lt, sql, type SQL } from "drizzle-orm";
+
+ import type { Db } from "./client";
+ import { channels, members, messages, users } from "./schema";
+@@ -351,6 +351,60 @@ export class Repository {
+     return { ...row, created_at: toIso(row.created_at) };
+   }
+
++  /** History reads (chapter 2.4): one page of messages anchored to a
++   * sequence position, in either direction (FR-MSG-09), riding the
++   * messages_channel_seq index in its natural order. The channel join
++   * carries the tenant scope, so a foreign channel id pages nothing.
++   *
++   * Anchors are strictly EXCLUSIVE: the cursor names the last row the
++   * client already has. Inclusive comparisons would serve that row twice,
++   * once per page — offset drift rebuilt at a single row's scale.
++   */
++  async listMessages(
++    channelId: string,
++    {
++      beforeSeq,
++      afterSeq,
++      limit,
++    }: { beforeSeq?: number; afterSeq?: number; limit: number },
++  ): Promise<MessageRow[]> {
++    const columns = {
++      id: messages.id,
++      channel_id: messages.channelId,
++      seq: messages.sequence,
++      text: messages.text,
++      created_at: messages.createdAt,
++    };
++    const scoped = (extra?: SQL) =>
++      and(
++        eq(messages.channelId, channelId),
++        eq(channels.environmentId, this.environmentId),
++        ...(extra ? [extra] : []),
++      );
++    const rows = await (afterSeq === undefined
++      ? this.db
++          .select(columns)
++          .from(messages)
++          .innerJoin(channels, eq(channels.id, messages.channelId))
++          .where(
++            scoped(
++              beforeSeq === undefined
++                ? undefined
++                : lt(messages.sequence, beforeSeq),
++            ),
++          )
++          .orderBy(desc(messages.sequence))
++          .limit(limit)
++      : this.db
++          .select(columns)
++          .from(messages)
++          .innerJoin(channels, eq(channels.id, messages.channelId))
++          .where(scoped(gt(messages.sequence, afterSeq)))
++          .orderBy(asc(messages.sequence))
++          .limit(limit));
++    return rows.map((row) => ({ ...row, created_at: toIso(row.created_at) }));
++  }
++
+   /** Every message in the channel, ordered by sequence — tenant-scoped
+    * like everything else here. DECISION (chapter 2.3): this exists for
+    * the idempotency suite's row counts; 2.4 replaces it with the real
+```
+
+Nhìn cặp `WHERE`/`ORDER BY`: seek một lần tới `(channel, cursor)`, đọc năm
+mươi index entries liền kề, dừng. Không sort node, không đếm từ đầu feed,
+không có work tỷ lệ với độ sâu mà reader đã scroll. Hãy bắt Postgres xác nhận
+thay vì tin lời:
+
+```text
+Limit  (cost=0.27..8.29 rows=1 width=24)
+  ->  Index Scan Backward using messages_channel_id_sequence_unique on messages
+        Index Cond: ((channel_id = '…'::uuid) AND (sequence < 100))
+```
+
+Một `Limit` nằm trên `Index Scan`, cả hai predicate đều ở trong `Index Cond`,
+và không có `Sort` phía trên — page là một bước đi, đúng như thiết kế. Nhưng
+hãy đọc *tên* của index, vì nó không phải index chương này tưởng sẽ dùng.
+
+<Why source="SAD §6.3 · the plan, actually run" locale="vi">
+
+Chương 2.1 tạo `messages_channel_seq` trên `(channel_id, sequence DESC)` và
+gắn nhãn cho nó, theo chính lời của SAD, "history pagination as a pure
+index-order scan (FR-MSG-09)". Đây chính là pagination đó — và planner không
+dùng index ấy. Nó scan **unique index của DR-01** —
+`UNIQUE (channel_id, sequence)`, được tạo vì một lý do hoàn toàn khác — theo
+hướng *backward*.
+
+Đó không phải lỗi của planner; đó là cách btrees hoạt động. Một index là một
+cấu trúc có thứ tự, và cấu trúc có thứ tự có thể được đọc từ cả hai đầu. Một
+dedicated `DESC` index không đem lại gì so với một `ASC` index trên cùng các
+columns, vì backward scan tốn như forward scan. Case duy nhất thật sự cần
+`DESC` index là mixed-direction ordering trên *nhiều* columns — `ORDER BY a
+ASC, b DESC`, nơi đảo chiều sẽ lật cả hai. Query này order theo một column
+sau một equality predicate, nên case đó không thể xảy ra.
+
+Vậy index này redundant. Đừng chỉ tin lời — hãy đo. Ở năm mươi nghìn rows,
+khi index còn đó rồi bị drop:
+
+```text
+both indexes present   → Index Scan Backward using messages_..._sequence_unique
+                         cost=0.41..5.04
+messages_channel_seq   → Index Scan Backward using messages_..._sequence_unique
+   dropped               cost=0.41..5.04     ← identical plan, identical cost
+```
+
+Không phải "gần đủ giống": cùng plan và cùng con số. Index này tốn khoảng 2
+MB cho mỗi năm mươi nghìn messages, được maintain trên mỗi insert — trên
+write path mà 2.2 đã cố ý serialize dưới row lock — và chẳng thứ gì dùng nó.
+
+</Why>
+
+## Sửa chương 2.1, từ chương 2.4
+
+Đây là nơi một series tự chạy code của mình tách khỏi một series không làm
+vậy. Index đến từ SAD; SAD sai; và cách xử lý không phải một footnote mà là
+chính machinery của dự án, trong ba bước.
+
+**Tài liệu được amend trước.** Đoạn hot-path của §6.3 giờ nói ordering đến từ
+unique index của DR-01, kèm một dated note ghi lại phép đo và lý do.
+Constitution yêu cầu chuyện này: nơi code và SAD bất đồng, conflict được
+"resolved explicitly by amendment rather than ignored." Code âm thầm rẽ khỏi
+architecture document là cách một architecture document biến thành hư cấu.
+
+**Schema definition bỏ index** — và nói vì sao, để reader kế tiếp không
+nhiệt tình thêm nó lại:
+
+```diff title="services/api/src/db/schema.ts"
+@@ -127,9 +127,10 @@ export const messages = pgTable(
+     uniqueIndex("messages_idem")
+       .on(t.channelId, t.idempotencyKey)
+       .where(sql`${t.idempotencyKey} IS NOT NULL`),
+-    // Hot-path index (SAD §6.3): history pagination as a pure
+-    // index-order scan (FR-MSG-09).
+-    index("messages_channel_seq").on(t.channelId, t.sequence.desc()),
++    // No dedicated (channel_id, sequence DESC) index: DR-01's unique
++    // constraint above already supplies that ordering, and Postgres walks
++    // it backward for newest-first pages. Chapter 2.4 measured it and
++    // migration 0002 dropped the redundant twin (SAD §6.3, amended).
+   ],
+ );
+```
+
+**Và correction đi tiếp về phía trước.** Migration `0000` đã tạo index; bạn
+không thể sửa `0000`, vì nó đã chạy ở mọi nơi nó từng có thể chạy.
+Forward-only nghĩa là fix là một file *mới* — và đây chính là lý do
+forward-only tồn tại. drizzle-kit sinh nó từ schema đã đổi, và ta review nó
+như review mọi generated migration:
+
+```sql title="services/api/migrations/0001_drop_redundant_index.sql"
+-- 0001 (chapter 2.4): GENERATED by drizzle-kit, then reviewed.
+--
+-- 0000 created messages_channel_seq on (channel_id, sequence DESC) for
+-- history pagination, per SAD §6.3 as it stood. Measured at 50,000 rows,
+-- the planner never used it: it walks DR-01's UNIQUE (channel_id, sequence)
+-- BACKWARD instead, and dropping this index changed neither the plan nor
+-- the cost estimate (0.41..5.04 either way). A btree is bidirectional, so a
+-- DESC twin of an existing ASC index adds no ordering — only write
+-- amplification on the send path and storage.
+--
+-- Review disposition: one statement, exactly the intended drop, nothing
+-- else. Forward-only as always — 0000 stays true at its own tag, and this
+-- file is how the correction travels (SAD §6.3 amended 2026-08-02, v1.1).
+
+DROP INDEX "messages_channel_seq";
+```
+
+Apply migration đó, và plan không đổi — vì index nó gỡ chưa từng làm việc đó:
+
+```text
+Index Scan Backward using messages_channel_id_sequence_unique
+  cost=0.41..4.93  Index Cond: ((channel_id = '…') AND (sequence < 40000))
+```
+
+Chương 2.1 không sai hồi tố: ở tag `part2-ch1`, index đó tồn tại, fence của
+nó khớp, và checkpoint của nó pass. Đó là một decision hợp lý dựa trên
+evidence lúc ấy, còn evidence đến muộn hơn ba chương. Một tag lineage sinh ra
+để làm đúng việc đó — earlier states vẫn đúng, và corrections đi tiếp về phía
+trước cùng lý do của chúng.
+
+<Figure
+  caption="Read là hướng đi của index: seek tới vị trí cursor, đọc một page entries liền kề, dừng. Scroll depth không tốn thêm gì — plan giống hệt ở message 50 và message 50.000."
+  code={figIndexRide}
+/>
+
+<Why source="FR-MSG-09 · constitution V · SAD §6.1's index" locale="vi">
+
+Vì sao *opacity* là một phần của requirement — vì sao `cursor=eyJzIjozNjN9`
+thay vì một `?before_seq=363` thật thà? Vì một sequence number trần trong
+public API là một contract bạn không định ký. Clients sẽ tự dựng chúng, làm
+số học trên chúng, lưu chúng, và giả định increments không có gaps — trong
+khi 2.2 đã nói rõ gaps là hợp lệ. Clause của constitution ("opaque cursor
+pagination") biến vị trí thành một *token*: server có thể đổi phần bên trong
+— thêm timestamp cho retention-aware reads, thêm shard hint ở quy mô 10× —
+mà không làm hỏng một client nào, vì không client nào từng thấy bên trong.
+Opacity không phải obfuscation; đó là API giữ lại quyền lựa chọn ở đúng nơi
+clients dễ đoán mò nhất.
+
+</Why>
+
+Cursor codec tự nó cố ý nhạt — encode, decode, từ chối rác:
+
+```ts title="services/api/src/messages/cursor.ts"
+// Opaque history cursors (chapter 2.4). The token encodes a sequence
+// position; clients treat it as a black box (constitution V: "List
+// endpoints use opaque cursor pagination; offset pagination is not
+// offered"). The structure inside may change at any time — a timestamp
+// for retention-aware reads, a shard hint at 10x scale — and no client
+// breaks, because no client ever saw inside.
+
+const PREFIX = "s:";
+
+export function encodeCursor(seq: number): string {
+  return Buffer.from(`${PREFIX}${seq}`, "utf8").toString("base64url");
+}
+
+/** Decode a cursor, or null if the token is not one of ours. Callers turn
+ * null into a 400 through the usual envelope — never a 500, and never a
+ * silent fallback to "start from the top", which would quietly serve the
+ * wrong page. */
+export function decodeCursor(token: string): number | null {
+  let raw: string;
+  try {
+    raw = Buffer.from(token, "base64url").toString("utf8");
+  } catch {
+    return null;
+  }
+  const match = /^s:(\d+)$/.exec(raw);
+  if (!match) return null;
+  const seq = Number(match[1]);
+  return Number.isSafeInteger(seq) ? seq : null;
+}
+```
+
+Unit tests của nó rẻ nhất chương và cũng là những tests bạn sẽ biết ơn:
+round-trip, opacity, và refusal.
+
+```ts title="services/api/src/messages/cursor.test.ts"
+import { describe, expect, it } from "vitest";
+
+import { decodeCursor, encodeCursor } from "./cursor";
+
+// The codec is dull on purpose — but "dull" still has to round-trip and
+// still has to refuse everything else, because a cursor that decodes to
+// the wrong number serves the wrong page in silence.
+describe("history cursors (chapter 2.4)", () => {
+  it("round-trips a sequence position", () => {
+    for (const seq of [0, 1, 42, 1_000_000]) {
+      expect(decodeCursor(encodeCursor(seq))).toBe(seq);
+    }
+  });
+
+  it("is opaque — the token does not read as its contents", () => {
+    expect(encodeCursor(363)).not.toContain("363");
+  });
+
+  it("refuses anything it did not mint", () => {
+    for (const junk of [
+      "",
+      "363",
+      "not-base64!",
+      Buffer.from("s:abc").toString("base64url"),
+    ]) {
+      expect(decodeCursor(junk)).toBeNull();
+    }
+  });
+});
+```
+
+Query schema cap `limit` ở 200 của FR-MSG-09 — và *clamp* thay vì reject, để
+một client hỏi 500 nhận 200 và một cursor thay vì một bài giảng:
+
+```diff title="services/api/src/messages/messages.schema.ts"
+ import { z } from "zod";
+
+ // The send body (chapter 2.2). FR-MSG-01 fixes the limits: text up to
+ // 8,000 characters, metadata up to 4 KB of JSON — the length check lands
+ // with FR-EMJ-02's code-point counting in the emoji chapter; today the
+ // character bound is the honest approximation, recorded as such.
+ export const sendMessageBodySchema = z.strictObject({
+   text: z.string().min(1).max(8000),
+   metadata: z.record(z.string(), z.unknown()).optional(),
+   // Chapter 2.3 (FR-MSG-04): the client's idempotency key — minted at send
+   // time (FR-SDK-06), optional because server-originated messages may not
+   // carry one. The partial unique index (DR-03) ignores NULLs.
+   idempotency_key: z.string().uuid().optional(),
+ });
+
+ export type SendMessageBody = z.infer<typeof sendMessageBodySchema>;
++
++// The history query (chapter 2.4, FR-MSG-09): an opaque cursor, a
++// direction, and a page size capped at 200. `limit` CLAMPS rather than
++// rejects — a client asking for 500 gets 200 and a next_cursor, because
++// caps exist to protect the server and a clamp does that just as well
++// while leaving the client's loop logic alone.
++export const historyQuerySchema = z.strictObject({
++  cursor: z.string().min(1).optional(),
++  direction: z.enum(["older", "newer"]).default("older"),
++  limit: z.coerce.number().int().min(1).max(200).default(50),
++});
++
++export type HistoryQuery = z.infer<typeof historyQuerySchema>;
+```
+
+Service sở hữu nơi duy nhất biết một cursor encode một sequence. Một token
+không do ta mint là 400, không bao giờ là silent reset về đầu feed:
+
+```diff title="services/api/src/messages/messages.service.ts"
+-import { Injectable, NotFoundException } from "@nestjs/common";
++import {
++  BadRequestException,
++  Injectable,
++  NotFoundException,
++} from "@nestjs/common";
+
+ import {
+   ChannelNotFoundError,
+   Repository,
+   type MessageRow,
+ } from "../db/repository";
++import { decodeCursor, encodeCursor } from "./cursor";
+-import type { SendMessageBody } from "./messages.schema";
++import type { HistoryQuery, SendMessageBody } from "./messages.schema";
+
+ // The thin layer between HTTP and the repository (chapters 2.2 + 2.3). It
+ // owns two things: turning the layer's domain error into the wire's 404,
+ // and translating the repository's `duplicate: true` into FR-MSG-04's
+ // "201-equivalent semantics" — the retry returns the original message,
+ // indistinguishable from a fresh send (the `duplicate` flag stays internal).
+ @Injectable()
+ export class MessagesService {
+   constructor(private readonly repo: Repository) {}
+
++  async send(channelId: string, body: SendMessageBody): Promise<MessageRow> {
+-  async send(
+-    channelId: string,
+-    body: SendMessageBody,
+-  ): Promise<MessageRow> {
+     try {
+       const result = await this.repo.sendMessage(channelId, {
+         text: body.text,
+         metadata: body.metadata,
+         ...(body.idempotency_key != null && {
+           idempotencyKey: body.idempotency_key,
+         }),
+       });
+       // The internal duplicate flag never reaches the wire: the client
+       // sees the same body whether this was the original send or the
+       // retry that recovered it (FR-MSG-04's 201-equivalent semantics).
+       return {
+         id: result.id,
+         channel_id: result.channel_id,
+         seq: result.seq,
+         text: result.text,
+         created_at: result.created_at,
+       };
+     } catch (error) {
+       if (error instanceof ChannelNotFoundError) {
+         // A CONSTANT message: echoing the id back would make the foreign-id
+         // answer differ from the missing-id answer, and "different" is
+         // itself a disclosure (FR-TEN-05).
+         throw new NotFoundException("channel not found");
+       }
+       throw error;
+     }
+   }
++
++  /** A page of history (chapter 2.4). The cursor is opaque coming in and
++   * going out; the service is the only place that knows it encodes a
++   * sequence. A cursor we did not mint is a 400, never a silent reset to
++   * the top — serving the wrong page quietly is worse than refusing. */
++  async history(
++    channelId: string,
++    { cursor, direction, limit }: HistoryQuery,
++  ): Promise<{
++    messages: MessageRow[];
++    next_cursor: string | null;
++    prev_cursor: string | null;
++  }> {
++    let anchor: number | undefined;
++    if (cursor !== undefined) {
++      const decoded = decodeCursor(cursor);
++      if (decoded === null) throw new BadRequestException("malformed cursor");
++      anchor = decoded;
++    }
++    const messages = await this.repo.listMessages(channelId, {
++      limit,
++      ...(direction === "newer"
++        ? { afterSeq: anchor ?? 0 }
++        : anchor === undefined
++          ? {}
++          : { beforeSeq: anchor }),
++    });
++    // Edge rows become the next anchors. A short page still yields a
++    // next_cursor: "no more yet" and "no more ever" are the same answer
++    // in a feed that keeps growing, and the client simply gets an empty
++    // page next time.
++    const first = messages[0];
++    const last = messages[messages.length - 1];
++    return {
++      messages,
++      next_cursor: last ? encodeCursor(last.seq) : null,
++      prev_cursor: first ? encodeCursor(first.seq) : null,
++    };
++  }
+ }
+```
+
+Và route chỉ là bốn dòng trên controller mà 2.2 đã dựng:
+
+```diff title="services/api/src/messages/messages.controller.ts"
+-import { Body, Controller, Param, Post, UseGuards } from "@nestjs/common";
++import {
++  Body,
++  Controller,
++  Get,
++  Param,
++  Post,
++  Query,
++  UseGuards,
++} from "@nestjs/common";
+
+ import { EnvironmentContextGuard } from "./environment-context.guard";
+ import { MessagesService } from "./messages.service";
+-import { sendMessageBodySchema } from "./messages.schema";
++import { historyQuerySchema, sendMessageBodySchema } from "./messages.schema";
+ // `import type` is required, not stylistic: with isolatedModules and
+ // emitDecoratorMetadata on (ADR-15's trade-off, chapter 1.4), a type used
+ // in a decorated signature must be imported as a type or TS1272 refuses
+ // to compile it.
+-import type { SendMessageBody } from "./messages.schema";
++import type { HistoryQuery, SendMessageBody } from "./messages.schema";
+ import { ZodValidationPipe } from "./zod-validation.pipe";
+
+ // The api's first product endpoint (chapter 2.2). Validation is zod at the
+ // boundary — the same schema family as @relay/protocol, so the REST body
+ // and the WebSocket frame payload cannot drift (1.3's payoff, again).
+ @Controller("v1/channels/:channelId/messages")
+ @UseGuards(EnvironmentContextGuard)
+ export class MessagesController {
+   constructor(private readonly messages: MessagesService) {}
+
+   @Post()
+   async send(
+     @Param("channelId") channelId: string,
+     @Body(new ZodValidationPipe(sendMessageBodySchema)) body: SendMessageBody,
+   ) {
+     return this.messages.send(channelId, body);
+   }
++
++  @Get()
++  async history(
++    @Param("channelId") channelId: string,
++    @Query(new ZodValidationPipe(historyQuerySchema)) query: HistoryQuery,
++  ) {
++    return this.messages.history(channelId, query);
++  }
+ }
+```
+
+<Trap locale="vi">
+
+Trap là **boundary row**, và mọi cursor implementation tự cuốn đều vấp nó:
+anchor là *inclusive* hay *exclusive*? Dùng `>=`/`<=` thì row mà cursor trỏ
+tới xuất hiện hai lần — một lần là row cuối của page một, một lần là row đầu
+của page hai; bạn đã rebuild duplicate của offset drift ở quy mô một row, và
+nó lặp lại ở *mọi* page boundary, không chỉ dưới concurrent writes. Luật mà
+chương này chốt: **cursor gọi tên row cuối client đã có; pages strictly
+exclusive khỏi nó** (`<` và `>`, không bao giờ `<=`/`>=`). Itest ghim seam —
+seq cuối của page một và seq đầu của page hai phải khác nhau ít nhất một đơn
+vị — vì đây chính là loại bug mắt reviewer dễ trượt qua: mỗi operator nhìn
+riêng đều có vẻ đúng, và chỉ seam giữa hai request mới biết khác biệt.
+
+</Trap>
+
+## Cả hai hướng, một anchor
+
+Clause "both directions" của FR-MSG-09 rất dễ đọc lướt qua và rất đắt để
+retrofit, nên hãy cho nó một nhịp riêng. Scroll-up là hướng ai cũng design:
+*older than my anchor, newest first* — `beforeSeq`, descending, classic
+history read. Nhưng hướng mirror — *newer than my anchor, oldest first* —
+không phải một nice-to-have symmetric flourish; nó là **catch-up read**, và là
+cách một client đã vắng mặt hỏi "tôi đã bỏ lỡ gì kể từ seq 363?" Response đến
+theo ascending order vì đó là thứ tự client sẽ render và apply nó. Nếu câu ấy
+nghe quen, đúng là nên quen: nó gần như y nguyên câu hỏi resume. Backfill của
+chương 2.7 — "deliver all messages with a sequence number greater than the
+cursor" (FR-RTM-03) — là method này được gọi với `afterSeq`, một cap, và một
+truncation flag. Ta không build pagination và resume như hai họ hàng; chúng
+là cùng một read, và build một lần ở đây là lý do 2.7 được dành trang cho
+race thay vì query.
+
+Thêm một shape decision đáng có một câu: page cap clamp thay vì error. Một
+client hỏi `limit=500` nhận 200 (maximum của FR-MSG-09) và một `next_cursor`
+— không phải một 400 lecture. Caps tồn tại để bảo vệ server, và clamp bảo vệ
+server đúng bằng rejection trong khi để loop logic của client nguyên vẹn;
+deep-paging client chỉ việc iterate. Rejections dành cho requests mà server
+*không thể* honor an toàn; clamps dành cho requests nó có thể honor ở size
+nhỏ hơn. Lẫn lộn hai thứ là cách APIs mọc retry loops quanh chính những con
+số tùy tiện của mình.
+
+<Why source="FR-RTM-04 · NFR-PRF · the 500 cap ahead" locale="vi">
+
+Vì sao cần cap, nếu index làm deep reads rẻ? Vì cheap-per-page không phải
+cheap-per-request: một request không cap kiểu "everything since my cursor"
+trên fleet channel có sáu trăm messages qua đêm là một response sáu trăm row
+được assemble, serialize, rồi đẩy qua một đường truyền có thể là mobile trong
+một hơi. Requirements cố ý tách mối lo: FR-MSG-09 cap một *page* ở 200, còn
+FR-RTM-04 cap một *backfill* ở 500-rồi-truncate — "return a truncation
+indicator instructing the client to refetch history rather than streaming the
+entire backlog." Journey 4 nói cùng điều đó từ ghế của Tuan: sau một đoạn
+offline dài, replay cả lũ còn tệ hơn nói "bạn tụt xa rồi — page it." Các con
+số là của documents; posture — bounded responses, luôn luôn, với một signal
+trung thực khi cap đã chạm — là việc chương này thiết lập, vì mọi read
+surface về sau đều thừa hưởng nó.
+
+</Why>
+
+## Đi thử
+
+Seed một channel vượt qua một page và đọc nó như một client sẽ đọc:
+
+```bash
+curl -s "localhost:4000/v1/channels/$CHANNEL/messages?limit=50" \
+  -H "X-Relay-Environment: $ENV"
+# → 50 newest messages + next_cursor
+curl -s "localhost:4000/v1/channels/$CHANNEL/messages?limit=50&cursor=$NEXT" \
+  -H "X-Relay-Environment: $ENV"
+# → the NEXT 50, no repeats — send three messages between the calls and
+#   verify the second page is identical either way
+```
+
+History suite có năm cases — cursor stability dưới live inserts, exclusive
+seam, catch-up direction, foreign channel trả page rỗng, và codec round trip
+qua chính endpoint path — kèm hai case của drift suite bên cạnh. Integration
+lane đứng ở hai mươi mốt test trên năm file; Docker-free gate là bốn mươi ba,
+ba trong số đó là của codec. Không cần delete gì trước tag: broken read chưa
+từng rời test file.
+
+<ForwardRef part="Phần 2 và 4" locale="vi">
+
+Catch-up direction (`afterSeq`, ascending) build hôm nay là backfill của 2.7
+ở dạng thu nhỏ: "everything since cursor X" chính xác là câu hỏi một
+resuming connection đặt ra, capped và truncated theo FR-RTM-04 — chương
+resume sẽ gọi method này với caps bật lên. Read state (FR-MSG-12, "highest
+sequence read") là cùng anchor quay về hướng kia. Và khi chương moderation
+của Phần 4 giới thiệu tombstones, chúng sẽ đi qua đúng page shape này
+(FR-MSG-10: history includes tombstones "so that clients can render deletions
+without gaps in ordering") — page giữ nguyên shape; chỉ cách một deleted row
+được *render* thay đổi.
+
+</ForwardRef>
+
+## Đến lượt bạn
+
+Bài tập chính là build: codec, repository read, route, và ba tests. Rồi stress
+anchor:
+
+1. Chạy lại offset drift demo, nhưng với một *delete* giữa các page thay vì
+   inserts. Nhìn một row biến mất khỏi seam — gap variant mà gần như không
+   demo nào cho thấy, và là lý do "chỉ là overlap chút thôi" là bài học sai
+   từ duplicate variant.
+2. Đổi một comparison thành `<=` và chạy seam test. Một duplicated row, mọi
+   page boundary, mãi mãi. Đổi lại và giữ test.
+3. Request `limit=500`. Xác nhận bạn nhận 200 (cap của FR-MSG-09) chứ không
+   phải error — caps clamp, chúng không lên lớp — rồi tìm nơi clamp sống và
+   tự thuyết phục rằng client không thể vòng qua nó.
+
+Nếu mắc kẹt, tag giữ answer key: `part2-ch4`.
+
+## Những điều đọng lại
+
+Nếu bạn không đọc gì khác trong chương này, hãy giữ lại những điều sau:
+
+- **Feeds move; counts lie**: offset pagination double-serves và silently
+  skips dưới live writes — demonstrated, not asserted.
+- **Anchor to the ordering you already paid for**: sequence numbers của 2.2
+  cho mỗi message một position mà inserts không thể shift; cursors name
+  positions, not offsets (FR-MSG-09).
+- **Opacity is the API keeping its options open** (constitution V): clients
+  giữ tokens, không phải numbers, để phần bên trong token có thể evolve.
+- **The seam is the test**: exclusive anchors, được ghim bằng assertion trên
+  boundary row — one-row bug mà reviewers không thấy.
+- **The index was the plan all along**: 2.1 trồng `messages_channel_seq` cho
+  đúng query shape này; scroll depth giờ tốn một seek cộng một page, ở bất kỳ
+  depth nào.
+
+<Checkpoint locale="vi">
+
+Trước khi bắt đầu chương 2.5, bạn nên có: history endpoint paging cả hai
+hướng với opaque cursors; drift demonstration đã được chứng kiến và offset
+method đã bị delete; seam test green; caps clamping ở 200. State đó là tag
+`part2-ch4` trong canonical repository. Cặp read/write của api giờ đã đủ hoàn
+chỉnh để chở một conversation — chương 2.5 cuối cùng mở socket nơi các
+conversation thật sự đi qua.
+
+</Checkpoint>
+
+<ChapterFooter id="2.4" locale="vi" />

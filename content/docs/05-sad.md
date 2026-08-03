@@ -1,6 +1,6 @@
 # Relay — Software Architecture Document
 
-**Version:** 1.0 (draft)
+**Version:** 1.1 (draft)
 **Status:** For review
 **Companion documents:** `01-product-vision.md` · `02-personas.md` · `03-journey-map.md` · `04-srs.md`
 **Structure:** views-based (C4-influenced), with Architecture Decision Records
@@ -447,10 +447,22 @@ CREATE INDEX media_unreferenced
     WHERE status = 'pending';                               -- the 24 h reaper's scan (FR-MED-10)
 ```
 
-**Hot-path indexes:** `messages (channel_id, sequence DESC)` serves history pagination
-(FR-MSG-09) as a pure index-order scan — the composite index's leftmost-prefix behaviour is
-exactly what cursor pagination wants. `members (user_id, channel_id)` serves the resume
-path's "which channels am I in".
+**Hot-path indexes:** history pagination (FR-MSG-09) is a pure index-order scan over
+`(channel_id, sequence)` — the composite index's leftmost-prefix behaviour is exactly what
+cursor pagination wants. That ordering is already supplied by DR-01's
+`UNIQUE (channel_id, sequence)`, which the planner walks **backward** for newest-first
+pages; a separate `DESC` index is therefore not created. `members (user_id, channel_id)`
+serves the resume path's "which channels am I in".
+
+> **Amended 2026-08-02 (v1.1).** This section previously specified a dedicated
+> `messages (channel_id, sequence DESC)` index. Measured against 50,000 rows, the planner
+> ignored it in favour of a backward scan of DR-01's unique index, and dropping it changed
+> neither the plan nor the cost estimate (`0.41..5.04` either way). A btree is bidirectional,
+> so a `DESC` twin of an existing `ASC` index adds no ordering — it only adds write
+> amplification on the send path and storage. Mixed-direction *multi-column* ordering would
+> justify one; this query orders by a single column after an equality predicate, so it never
+> can. The index was created by the schema chapter and removed by a forward-only migration in
+> the pagination chapter, where the evidence appeared.
 
 **Isolation enforcement (D4):** every query goes through a repository layer whose
 constructors *require* an `environment_id`; raw connection access is lint-forbidden outside
