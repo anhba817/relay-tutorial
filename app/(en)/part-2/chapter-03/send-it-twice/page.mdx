@@ -1,0 +1,937 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figDuplicateTimeline, figIdempotentRetry, figWhereItLives } from "./figures";
+
+export const metadata = {
+  title: "Send it twice — Building Relay",
+  description:
+    "The retry that duplicates a message is staged exactly as journey 4 predicts it — then DR-03's partial unique index, planted in chapter 2.1, finally does the work it was planted for.",
+  alternates: {
+    canonical: "/part-2/chapter-03/send-it-twice",
+    languages: {
+      en: "/part-2/chapter-03/send-it-twice",
+      vi: "/vi/part-2/chapter-03/send-it-twice",
+    },
+  },
+};
+
+<ChapterHeader id="2.3" />
+
+Chapter 0.3 mapped the journey this part exists to win, and its worst
+moment fits in one sentence: Tuan types "B2, north ramp" and hits send *as
+the signal dies*. The send is in flight; no ack ever comes back. Now his
+client faces the oldest question in distributed systems — did it happen? —
+and both available guesses are wrong. Assume failure and resend: the
+dispatcher may read the message twice. Assume success and don't: the
+dispatcher may never read it at all. The journey map is blunt about the
+stakes: "Duplicate and phantom messages are the #1 user-visible defect in
+homegrown chat." This chapter makes the question *safe to answer wrong* —
+retry as many times as you like, the database will keep exactly one.
+
+<SkipAhead>
+
+If you must skip: `sendMessage` gains an `idempotency_key`, enforced by the
+partial unique index 2.1 planted (DR-03) — the insert becomes
+`ON CONFLICT … DO NOTHING`, and a conflicting retry fetches and returns the
+*original* message with 201-equivalent semantics (FR-MSG-04). The failure
+is staged first: a retry without a key visibly duplicates "B2, north ramp".
+Enforcement lives in the storage layer, never application memory
+(constitution II). The chapter-end state is tag **`part2-ch3`**.
+
+</SkipAhead>
+
+## The ten-second window
+
+Replay 2.2's machinery under journey 4's conditions. The POST reaches the
+api; the transaction commits; seq 42 is durable; the 201 leaves the
+server — and dies in a tunnel entrance. From the platform's side, the send
+succeeded. From Tuan's side, there is only silence and a clock icon
+(FR-SDK-05's honest `sending` state — the SDK chapters own that icon, but
+its honesty starts here, because a state can only be honest if the server
+makes it resolvable).
+
+Ninety seconds later the phone finds wifi and the client does the only
+reasonable thing: it sends again. Watch what 2.2's endpoint — correct in
+every way that chapter measured — does with the retry:
+
+```ts title="services/api/src/messages/idempotency.itest.ts (excerpt)"
+it("a retry WITHOUT a key duplicates the message — journey 4's failure, staged", async () => {
+  const channel = await repo.createChannel("idem-no-key", "public");
+  await repo.sendMessage(channel.id, { text: "B2, north ramp" });
+  // The ack was lost; the client cannot know. It retries:
+  await repo.sendMessage(channel.id, { text: "B2, north ramp" });
+  const rows = await repo.listMessagesRaw(channel.id);
+  // Two rows, seq 1 and 2, identical text. The dispatcher reads it twice.
+  expect(rows.filter((m) => m.text === "B2, north ramp")).toHaveLength(2);
+});
+```
+
+The test *passes* — that's the staging. Nothing in 2.2 was wrong; every
+transaction did exactly what it promised. The defect lives between the
+transactions, in the retry the network forced, and no amount of care inside
+one request can see it. The journey map named the failure before we ever
+wrote the endpoint: "the naive implementation retries without an
+idempotency key and the dispatcher receives 'B2, north ramp' three
+times — or worse, the client assumes failure when the server actually
+persisted it."
+
+<Figure
+  caption="The ten-second window: a committed message, a lost ack, an honest retry — and a dispatcher who reads 'B2, north ramp' twice. Nothing malfunctioned; the design was simply incomplete."
+  code={figDuplicateTimeline}
+/>
+
+## The key travels with the message
+
+The fix is a contract between client and server. At send time — *before*
+anything can fail, which is the part that matters (FR-SDK-06: the key is
+"generated at send time, before the failure") — the client mints an
+idempotency key and attaches it. The key means: *this logical send, however
+many times it physically arrives*. FR-MSG-04 states the server's half:
+"A repeated key within 24 hours shall return the original message with
+`201`-equivalent semantics and shall not create a duplicate."
+
+2.1 planted the enforcement mechanism and told you to wait for this
+chapter. Here it is, from the migration you already applied — the partial
+unique index the schema chapter called "2.3's whole chapter, planted now":
+
+```sql
+CREATE UNIQUE INDEX "messages_idem" ON "messages"
+  USING btree ("channel_id","idempotency_key")
+  WHERE "messages"."idempotency_key" IS NOT NULL;   -- DR-03
+```
+
+Partial, because keys are optional (server-originated messages may not
+carry one — the index ignores NULLs instead of treating them as equal).
+Unique per `(channel_id, key)`, because the key namespace belongs to the
+channel. And *in the database*, which is the entire argument of the next
+box.
+
+Optional deserves one more sentence, because it is a policy, not a
+loophole. Interactive clients — anything a human's thumb can retry —
+should always send a key, and the SDK will make that automatic. But
+FR-MSG-13's backend-originated sends and the system messages later parts
+introduce have callers with their own delivery guarantees, and forcing a
+synthetic key on them would be ceremony without protection. The partial
+index encodes the policy exactly: *if* you claim a key, it binds
+absolutely; if you don't, you have opted out of retry protection, and
+that opt-out is visible in your own code rather than defaulted into it.
+
+<Why source="DR-03 · FR-MSG-04 · constitution II">
+
+Why enforce idempotency in an index instead of an in-memory set of seen
+keys — which is simpler, faster, and the first thing every homegrown
+implementation reaches for? The constitution answers with its own words:
+"Every write endpoint MUST accept an idempotency key, enforced at the
+storage layer (unique index), not in application memory — it must survive
+restarts and work across instances." A memory set dies with the process —
+and restarts cluster around deploys, which cluster with traffic, which is
+when retries happen. It is also *per instance*: Tuan's retry lands on
+whichever api replica the balancer picks, and a set on instance A protects
+nothing on instance B. The index has neither failure mode, and it has a
+property no application check can offer: it holds even for code that
+forgets to check. The 24-hour window in FR-MSG-04, incidentally, is why
+this is an *index* and not an eternal ledger — a retention chapter will
+eventually prune what the requirement lets expire.
+
+</Why>
+
+<Figure
+  caption="Where the guarantee lives decides what survives: memory dies with the process and splits across instances; the index is one truth that outlives both (constitution II)."
+  code={figWhereItLives}
+/>
+
+The key enters through the same boundary schema 2.2 built — one optional
+field, and the pipe validates it like everything else:
+
+```diff title="services/api/src/messages/messages.schema.ts"
+ import { z } from "zod";
+ 
+ // The send body (chapter 2.2). FR-MSG-01 fixes the limits: text up to
+ // 8,000 characters, metadata up to 4 KB of JSON — the length check lands
+ // with FR-EMJ-02's code-point counting in the emoji chapter; today the
+ // character bound is the honest approximation, recorded as such.
+ export const sendMessageBodySchema = z.strictObject({
+   text: z.string().min(1).max(8000),
+   metadata: z.record(z.string(), z.unknown()).optional(),
++  // Chapter 2.3 (FR-MSG-04): the client's idempotency key — minted at send
++  // time (FR-SDK-06), optional because server-originated messages may not
++  // carry one. The partial unique index (DR-03) ignores NULLs.
++  idempotency_key: z.string().uuid().optional(),
+ });
+ 
+ export type SendMessageBody = z.infer<typeof sendMessageBodySchema>;
+```
+
+## What the retry deserves to hear back
+
+Before the mechanism, settle the semantics, because they are less obvious
+than they look. When the retry hits the index and inserts nothing, what
+should the client receive? An error ("409: duplicate") feels rigorous and
+is exactly wrong. The client is not misbehaving — it is doing precisely
+what a client *must* do after a lost ack, and the question it is asking is
+not "may I create a message?" but "**is my message in?**" The truthful
+answer is yes — here it is, seq 42, created at the timestamp the tunnel
+ate. That is why FR-MSG-04 specifies "201-equivalent semantics": the retry
+receives the *original* message, indistinguishable in body from the answer
+it would have gotten the first time, so client code has exactly one
+success path to write. An error response here would force every SDK and
+every customer integration to treat "already sent" as a failure they must
+special-case back into success — hundreds of teams re-deriving, badly, a
+decision the platform should have made once.
+
+<Why source="FR-MSG-04 · journey 4, stage 4">
+
+Why does the journey map measure this in *feelings*? Stage 4 of Tuan's
+journey — glancing at the phone after the tunnel — lists the expected
+emotion as "nothing, which is the product working." That nothing is
+manufactured here, in the response-shape decision: the retry succeeded
+quietly, the clock icon resolved to sent, exactly one "B2, north ramp"
+exists, and the reply sits below it. Every alternative response shape
+leaks the infrastructure's inner drama into Tuan's thumb: an error toast,
+a duplicate bubble, a message that never resolves. The API's blandest
+possible answer is the product's best possible behavior — a sentence
+worth keeping for every retry-adjacent decision this platform will ever
+make.
+
+</Why>
+
+The service is where that decision becomes code — it maps the request
+body's snake_case key onto the repository's argument and drops the
+internal flag before anything reaches the wire:
+
+```diff title="services/api/src/messages/messages.service.ts"
+ import { Injectable, NotFoundException } from "@nestjs/common";
+ 
+ import {
+   ChannelNotFoundError,
+   Repository,
+   type MessageRow,
+ } from "../db/repository";
+ import type { SendMessageBody } from "./messages.schema";
+ 
+-// The thin layer between HTTP and the repository (chapter 2.2). It owns
++// The thin layer between HTTP and the repository (chapters 2.2 + 2.3). It
+-// exactly one thing today: turning the layer's domain error into the
++// owns two things: turning the layer's domain error into the wire's 404,
+-// wire's 404 — same non-answer a foreign tenant's id has received since
+-// 2.1, now wearing an HTTP status. The filter from 1.4 shapes the body.
++// and translating the repository's `duplicate: true` into FR-MSG-04's
++// "201-equivalent semantics" — the retry returns the original message,
++// indistinguishable from a fresh send (the `duplicate` flag stays internal).
+ @Injectable()
+ export class MessagesService {
+   constructor(private readonly repo: Repository) {}
+ 
+-  async send(channelId: string, body: SendMessageBody): Promise<MessageRow> {
++  async send(
++    channelId: string,
++    body: SendMessageBody,
++  ): Promise<MessageRow> {
+     try {
+-      return await this.repo.sendMessage(channelId, body);
++      const result = await this.repo.sendMessage(channelId, {
++        text: body.text,
++        metadata: body.metadata,
++        ...(body.idempotency_key != null && {
++          idempotencyKey: body.idempotency_key,
++        }),
++      });
++      // The internal duplicate flag never reaches the wire: the client
++      // sees the same body whether this was the original send or the
++      // retry that recovered it (FR-MSG-04's 201-equivalent semantics).
++      return {
++        id: result.id,
++        channel_id: result.channel_id,
++        seq: result.seq,
++        text: result.text,
++        created_at: result.created_at,
++      };
+     } catch (error) {
+       if (error instanceof ChannelNotFoundError) {
+         // A CONSTANT message: echoing the id back would make the foreign-id
+         // answer differ from the missing-id answer, and "different" is
+         // itself a disclosure (FR-TEN-05).
+         throw new NotFoundException("channel not found");
+       }
+       throw error;
+     }
+   }
+ }
+```
+
+## One clause on the write path
+
+The write path from 2.2 grows exactly the clause §5.1 shows, and the
+repository amendment is small enough to read whole:
+
+```diff title="services/api/src/db/repository.ts"
+ import { randomUUID } from "node:crypto";
+ 
+ import { and, asc, eq, sql } from "drizzle-orm";
+ 
+ import type { Db } from "./client";
+ import { channels, members, messages, users } from "./schema";
+ 
+ // The repository layer — the ONE place data access lives (ADR-04's single
+ // writer, constitution I). Two surfaces with a bright line between them:
+ //
+ //   createEnvironment — the ADMIN surface. It creates tenants, so it is the
+ //   only operation here that is not tenant-scoped. It also inserts a stub
+ //   application row to satisfy environments' NOT NULL foreign key (recorded
+ //   decision: the real application lifecycle belongs to Part 3).
+ //
+ //   Repository — everything else. The constructor REQUIRES an
+ //   environment_id; every query is scoped by it HERE, in one home — never
+ //   at call sites. Cross-tenant reads return null/empty: no data, and no
+ //   reveal that the foreign id even exists (FR-TEN-05).
+ //
+ // Drizzle is the query engine inside this layer (ADR-16): queries keep
+ // their SQL shape and gain end-to-end types. Where the builder falls short,
+ // a raw SQL island is permitted — inside the layer, never outside it.
+ //
+ // All primary keys are generated app-side (crypto.randomUUID) — the SAD's
+ // SQL declares no id defaults, and the migration adds none.
+ 
+ export interface Environment {
+   id: string;
+   kind: "development" | "production";
+ }
+ 
+ export async function createEnvironment(
+   db: Db,
+   { name, kind = "development" }: { name: string; kind?: Environment["kind"] },
+ ): Promise<Environment> {
+   const applicationId = randomUUID();
+   const environmentId = randomUUID();
+   // The admin surface writes through the same Db handle but carries no
+   // tenant scope — it is the operation that MINTS the scope.
+   await db.execute(
+     sql`INSERT INTO applications (id, name) VALUES (${applicationId}, ${name})`,
+   );
+   await db.execute(
+     sql`INSERT INTO environments (id, application_id, kind, signing_secret)
+         VALUES (${environmentId}, ${applicationId}, ${kind}, ${randomUUID()})`,
+   );
+   return { id: environmentId, kind };
+ }
+ 
+ export interface UserRow {
+   id: string;
+   external_id: string;
+   display_name: string | null;
+ }
+ 
+ export interface ChannelRow {
+   id: string;
+   external_id: string;
+   type: "public" | "private";
+   name: string | null;
+ }
+ 
+ export interface MessageRow {
+   id: string;
+   channel_id: string;
+   seq: number;
+   text: string | null;
+   created_at: string;
++  /** Chapter 2.3 (FR-MSG-04): true when a retry was recognised by the
++   * idempotency index and the ORIGINAL message was returned instead of
++   * a new insert. The service layer uses this to decide response shape. */
++  duplicate?: boolean;
+ }
+ 
+ /** Thrown when a channel id resolves to nothing IN THIS TENANT — which,
+  * from the caller's side, is indistinguishable from "does not exist"
+  * (FR-TEN-05: no data, and no reveal that the foreign id exists). The
+  * layer stays framework-free; the service turns this into the wire's
+  * 404 (constitution I's isolation, EIR-API-04's envelope). */
+ export class ChannelNotFoundError extends Error {
+   constructor(public readonly channelId: string) {
+     super(`channel not found: ${channelId}`);
+     this.name = "ChannelNotFoundError";
+   }
++}
++
++/** Timestamps cross the wire as RFC 3339 strings (constitution: UTC,
++ * millisecond precision) — the driver hands back a Date or a string
++ * depending on the column and the query shape. */
++function toIso(value: Date | string): string {
++  return value instanceof Date ? value.toISOString() : String(value);
+ }
+ 
+ export class Repository {
+   // Constructor parameter properties — the shorthand chapter 1.4 released
+   // for this service when ADR-15 spent erasableSyntaxOnly on decorator
+   // metadata. The guarantee still holds in the gateway and every package.
+   constructor(
+     private readonly db: Db,
+     private readonly environmentId: string,
+   ) {}
+ 
+   async createUser(externalId: string, displayName?: string): Promise<UserRow> {
+     const id = randomUUID();
+     await this.db.insert(users).values({
+       id,
+       environmentId: this.environmentId,
+       externalId,
+       displayName: displayName ?? null,
+     });
+     return { id, external_id: externalId, display_name: displayName ?? null };
+   }
+ 
+   async getUserByExternalId(externalId: string): Promise<UserRow | null> {
+     const rows = await this.db
+       .select({
+         id: users.id,
+         external_id: users.externalId,
+         display_name: users.displayName,
+       })
+       .from(users)
+       .where(
+         and(
+           eq(users.environmentId, this.environmentId),
+           eq(users.externalId, externalId),
+         ),
+       );
+     return rows[0] ?? null;
+   }
+ 
+   async createChannel(
+     externalId: string,
+     type: ChannelRow["type"],
+     name?: string,
+   ): Promise<ChannelRow> {
+     const id = randomUUID();
+     await this.db.insert(channels).values({
+       id,
+       environmentId: this.environmentId,
+       externalId,
+       type,
+       name: name ?? null,
+     });
+     return { id, external_id: externalId, type, name: name ?? null };
+   }
+ 
+   async getChannelByExternalId(externalId: string): Promise<ChannelRow | null> {
+     const rows = await this.db
+       .select({
+         id: channels.id,
+         external_id: channels.externalId,
+         type: sql<ChannelRow["type"]>`${channels.type}`,
+         name: channels.name,
+       })
+       .from(channels)
+       .where(
+         and(
+           eq(channels.environmentId, this.environmentId),
+           eq(channels.externalId, externalId),
+         ),
+       );
+     return rows[0] ?? null;
+   }
+ 
+   async listChannels(): Promise<ChannelRow[]> {
+     return this.db
+       .select({
+         id: channels.id,
+         external_id: channels.externalId,
+         type: sql<ChannelRow["type"]>`${channels.type}`,
+         name: channels.name,
+       })
+       .from(channels)
+       .where(eq(channels.environmentId, this.environmentId))
+       .orderBy(asc(channels.externalId));
+   }
+ 
+   /** Membership joins live in channel-land, so the tenant scope rides the
+    * channel: the double-scoped SELECT below is what makes a foreign channel
+    * id useless. INSERT ... SELECT is where the builder falls short — this
+    * is the layer's one raw SQL island, permitted by ADR-16 and kept inside
+    * the wall like everything else. */
+   async addMember(channelId: string, userId: string): Promise<boolean> {
+     const result = await this.db.execute(
+       sql`INSERT INTO members (channel_id, user_id)
+           SELECT c.id, u.id FROM channels c, users u
+           WHERE c.id = ${channelId} AND c.environment_id = ${this.environmentId}
+             AND u.id = ${userId} AND u.environment_id = ${this.environmentId}`,
+     );
+     return (result.rowCount ?? 0) > 0;
+   }
+ 
+   async listMembers(channelId: string): Promise<string[]> {
+     const rows = await this.db
+       .select({ user_id: members.userId })
+       .from(members)
+       .innerJoin(channels, eq(channels.id, members.channelId))
+       .where(
+         and(
+           eq(members.channelId, channelId),
+           eq(channels.environmentId, this.environmentId),
+         ),
+       )
+       .orderBy(asc(members.joinedAt));
+     return rows.map((r) => r.user_id);
+   }
+ 
+   async channelsForUser(userId: string): Promise<string[]> {
+     const rows = await this.db
+       .select({ channel_id: members.channelId })
+       .from(members)
+       .innerJoin(users, eq(users.id, members.userId))
+       .where(
+         and(
+           eq(members.userId, userId),
+           eq(users.environmentId, this.environmentId),
+         ),
+       );
+     return rows.map((r) => r.channel_id);
+   }
+ 
+-  /** The write path (chapter 2.2): sequence assignment under the channel
++  /** The write path (chapters 2.2 + 2.3): sequence assignment under the
+-   * row lock (ADR-03). The transaction IS the ordering guarantee: the
++   * channel row lock (ADR-03), with idempotency enforcement via the
++   * partial unique index (DR-03). The transaction IS the ordering
+-   * lock serialises assignment per channel, and the ack that matters
++   * guarantee: the lock serialises assignment per channel, and the ack
+-   * happens only after commit (FR-MSG-05).
++   * that matters happens only after commit (FR-MSG-05).
++   *
++   * When an idempotency key is present and conflicts with an existing
++   * message, the insert is skipped (ON CONFLICT DO NOTHING), the channel's
++   * sequence is left untouched, and the ORIGINAL message is returned with
++   * `duplicate: true` — FR-MSG-04's "201-equivalent semantics".
+    */
+   async sendMessage(
+     channelId: string,
+     {
+       userId,
+       text,
+       metadata,
+-    }: { userId?: string; text: string; metadata?: unknown },
++      idempotencyKey,
++    }: {
++      userId?: string;
++      text: string;
++      metadata?: unknown;
++      idempotencyKey?: string;
++    },
+   ): Promise<MessageRow> {
+     return this.db.transaction(async (tx) => {
+       const [channel] = await tx
+         .select({ id: channels.id, lastSequence: channels.lastSequence })
+         .from(channels)
+         .where(
+           and(
+             eq(channels.id, channelId),
+             eq(channels.environmentId, this.environmentId),
+           ),
+         )
+         .for("update");
+       if (!channel) throw new ChannelNotFoundError(channelId);
+       const seq = channel.lastSequence + 1;
+       const id = randomUUID();
++
+-      await tx
+-        .update(channels)
+-        .set({ lastSequence: seq })
+-        .where(eq(channels.id, channel.id));
+-      await tx.insert(messages).values({
++      const insert = tx.insert(messages).values({
+         id,
+         channelId: channel.id,
+         sequence: seq,
+         userId: userId ?? null,
+         text,
+         metadata: metadata ?? {},
++        idempotencyKey: idempotencyKey ?? null,
+       });
++
++      // The conflict clause is attached ONLY when a key is present, and it
++      // names the partial index explicitly. A bare ON CONFLICT DO NOTHING
++      // would absorb every constraint on the table — including DR-01's
++      // UNIQUE (channel_id, sequence), whose loud failure is 2.2's safety
++      // net. A keyless send therefore carries no conflict clause at all.
++      const inserted = await (
++        idempotencyKey
++          ? insert.onConflictDoNothing({
++              target: [messages.channelId, messages.idempotencyKey],
++              where: sql`${messages.idempotencyKey} IS NOT NULL`,
++            })
++          : insert
++      ).returning({ id: messages.id, createdAt: messages.createdAt });
++
++      if (inserted.length === 0) {
++        // The key has been here before. Return the ORIGINAL message — the
++        // retry gets the same answer the lost ack carried (FR-MSG-04) —
++        // and leave last_sequence alone: a recognised duplicate wrote
++        // nothing, so it consumes nothing.
++        return {
++          ...(await this.getMessageByIdempotencyKey(
++            tx,
++            channel.id,
++            idempotencyKey!,
++          )),
++          duplicate: true,
++        };
++      }
++
++      // The sequence is spent only by a message that actually landed.
++      await tx
++        .update(channels)
++        .set({ lastSequence: seq })
++        .where(eq(channels.id, channel.id));
++
+       return {
+         id,
+         channel_id: channel.id,
+         seq,
+         text,
+-        created_at: new Date().toISOString(),
++        created_at: toIso(inserted[0]!.createdAt),
+       };
+     });
+   }
++
++  /** Fetch a message by its idempotency key within a channel — the
++   * recovery leg of 2.3's duplicate-recognised path. The channel join
++   * carries the tenant scope: every query in this layer answers only for
++   * its own environment, private helpers included (constitution I). */
++  private async getMessageByIdempotencyKey(
++    tx: Db,
++    channelId: string,
++    idempotencyKey: string,
++  ): Promise<MessageRow> {
++    const [row] = await tx
++      .select({
++        id: messages.id,
++        channel_id: messages.channelId,
++        seq: messages.sequence,
++        text: messages.text,
++        created_at: messages.createdAt,
++      })
++      .from(messages)
++      .innerJoin(channels, eq(channels.id, messages.channelId))
++      .where(
++        and(
++          eq(messages.channelId, channelId),
++          eq(messages.idempotencyKey, idempotencyKey),
++          eq(channels.environmentId, this.environmentId),
++        ),
++      );
++    // The row MUST exist: this method is only reached when the insert
++    // conflicted on the idempotency index, so the key is already there.
++    if (!row) {
++      throw new Error(
++        `idempotency key ${idempotencyKey} conflicted but its message is missing — index inconsistency`,
++      );
++    }
++    return { ...row, created_at: toIso(row.created_at) };
++  }
++
++  /** Every message in the channel, ordered by sequence — tenant-scoped
++   * like everything else here. DECISION (chapter 2.3): this exists for
++   * the idempotency suite's row counts; 2.4 replaces it with the real
++   * paginated read, and this method retires with that chapter. */
++  async listMessagesRaw(
++    channelId: string,
++  ): Promise<{ id: string; text: string | null; seq: number }[]> {
++    return this.db
++      .select({
++        id: messages.id,
++        text: messages.text,
++        seq: messages.sequence,
++      })
++      .from(messages)
++      .innerJoin(channels, eq(channels.id, messages.channelId))
++      .where(
++        and(
++          eq(messages.channelId, channelId),
++          eq(channels.environmentId, this.environmentId),
++        ),
++      )
++      .orderBy(asc(messages.sequence));
++  }
+ }
+```
+
+Two details in that diff are not decoration, and both were learned the
+hard way — by writing the obvious version first and watching what it did.
+
+**The conflict clause is attached conditionally.** Read the ternary again:
+when there is no key, the insert carries *no* `ON CONFLICT` clause at all.
+The tempting shape is `.onConflictDoNothing(key ? {...} : undefined)` —
+one call site, tidy. But passing `undefined` does not mean "no clause"; it
+emits a **bare `ON CONFLICT DO NOTHING`**, and a bare clause absorbs
+*every* constraint on the table. That includes DR-01's
+`UNIQUE (channel_id, sequence)` — the very constraint that made 2.2's race
+visible. We shipped that version, then forced a sequence collision on a
+keyless send to see what it did:
+
+```text
+Error: idempotency key undefined conflicted but its message is missing …
+```
+
+The message was silently dropped, and the failure surfaced as an internal
+error about a key the caller never supplied. Idempotency had quietly
+disarmed the safety net one chapter after we installed it. Hence the
+guard — and hence its own test, filed in 2.1's suite where sequence
+behavior lives:
+
+```diff title="services/api/src/db/repository.itest.ts"
+ import { afterAll, beforeAll, describe, expect, it } from "vitest";
++import { sql } from "drizzle-orm";
+ 
+ import { createDb, createPool, DEFAULT_DATABASE_URL, type Db } from "./client";
+ import { migrate } from "./migrate";
+ import { createEnvironment, Repository, type Environment } from "./repository";
+ 
+ // The isolation suite: attack the repository with FOREIGN tenant ids and
+ // prove the leak inexpressible (FR-TEN-05, NFR-SEC-09, constitution I).
+ // Requires the compose Postgres — this file is *.itest.ts precisely so the
+ // Docker-free unit lane never collects it.
+ 
+ // Guardrail: integration tests run against the LOCAL compose stack only.
+ const url = new URL(process.env.DATABASE_URL ?? DEFAULT_DATABASE_URL);
+ if (!["localhost", "127.0.0.1"].includes(url.hostname)) {
+   throw new Error(
+     `integration tests refuse non-local databases (got host "${url.hostname}") — never point this suite at a shared database`,
+   );
+ }
+ 
+ const pool = createPool();
+ const db: Db = createDb(pool);
+ let envA: Environment;
+ let envB: Environment;
+ let repoA: Repository;
+ let repoB: Repository;
+ 
+ beforeAll(async () => {
+   await migrate(pool);
+   // Deterministic ground WITHOUT a truncate: this suite mints its own
+   // environments, and 2.1 proved no other environment's rows are visible
+   // through them. Isolation buys parallel-safe test files for free — see
+   // the note below.
+   envA = await createEnvironment(db, { name: "tenant-a" });
+   envB = await createEnvironment(db, { name: "tenant-b" });
+   repoA = new Repository(db, envA.id);
+   repoB = new Repository(db, envB.id);
+ });
+ 
+ afterAll(async () => {
+   await pool.end();
+ });
+ 
+ describe("tenant isolation is structural (FR-TEN-05)", () => {
+   it("a foreign external_id resolves to nothing — not even an existence hint", async () => {
+     await repoA.createUser("tuan", "Tuan");
+     expect(await repoA.getUserByExternalId("tuan")).not.toBeNull();
+     expect(await repoB.getUserByExternalId("tuan")).toBeNull();
+   });
+ 
+   it("channel reads and lists are scoped by construction", async () => {
+     await repoA.createChannel("support", "public", "Support");
+     expect(await repoB.getChannelByExternalId("support")).toBeNull();
+     expect(await repoB.listChannels()).toEqual([]);
+     expect((await repoA.listChannels()).map((c) => c.external_id)).toContain(
+       "support",
+     );
+   });
+ 
+   it("membership writes with foreign ids affect zero rows", async () => {
+     const user = await repoA.getUserByExternalId("tuan");
+     const channel = await repoA.getChannelByExternalId("support");
+     expect(await repoA.addMember(channel!.id, user!.id)).toBe(true);
+     // B holds A's REAL ids — and still cannot write or read through them.
+     expect(await repoB.addMember(channel!.id, user!.id)).toBe(false);
+     expect(await repoB.listMembers(channel!.id)).toEqual([]);
+     expect(await repoB.channelsForUser(user!.id)).toEqual([]);
+     expect(await repoA.listMembers(channel!.id)).toEqual([user!.id]);
+   });
+ 
+   it("uniqueness is per-tenant (DR-02): both tenants may own the same external_id", async () => {
+     await expect(
+       repoB.createUser("tuan", "A different Tuan"),
+     ).resolves.toBeTruthy();
+     await expect(repoA.createUser("tuan", "Duplicate in A")).rejects.toThrow();
+   });
+ });
+ 
+ describe("sequence assignment is serialised per channel (ADR-03)", () => {
+   it("two concurrent sends never interleave", async () => {
+     const channel = await repoA.createChannel("ordering", "public");
+     const [a, b] = await Promise.all([
+       repoA.sendMessage(channel.id, { text: "first writer" }),
+       repoA.sendMessage(channel.id, { text: "second writer" }),
+     ]);
+     // Two sends, two DISTINCT consecutive sequence numbers — always.
+     expect(new Set([a.seq, b.seq]).size).toBe(2);
+     expect(Math.abs(a.seq - b.seq)).toBe(1);
+   });
+ });
++
++describe("idempotency must not disarm DR-01 (chapter 2.3)", () => {
++  it("a keyless send still fails loudly on a sequence collision", async () => {
++    const channel = await repoA.createChannel("dr01-guard", "public");
++    await repoA.sendMessage(channel.id, { text: "first" });
++    // Rewind the counter so the next keyless send reuses seq 1. The
++    // conflict clause must NOT swallow this: DR-01's unique constraint is
++    // 2.2's safety net, and idempotency has no business disarming it.
++    await db.execute(
++      sql`UPDATE channels SET last_sequence = 0 WHERE id = ${channel.id}`,
++    );
++    await expect(
++      repoA.sendMessage(channel.id, { text: "collides" }),
++    ).rejects.toThrow();
++    // And nothing landed: the failed insert wrote no row.
++    const rows = await repoA.listMessagesRaw(channel.id);
++    expect(rows).toHaveLength(1);
++  });
++});
+```
+
+**The sequence is spent only by a message that lands.** The `UPDATE
+channels` moved *below* the insert. In the first draft it ran before, so a
+recognised duplicate still advanced `last_sequence` — three retries of one
+message left the counter at 3 with a single row in the table. FR-MSG-02
+tolerates gaps, so nothing was *broken*; but a retry that wrote nothing
+should consume nothing, and a counter that drifts from reality for no
+reason is a small lie you will eventually have to explain to someone
+debugging at 3 a.m. The suite pins it: after three keyed retries, the next
+message is seq 2, not seq 4.
+
+There is one subtlety worth saying out loud: the conflict leg *still runs
+inside the row-lock transaction from 2.2*. That means a retry that loses
+the race against its own original (two retries in flight at once — it
+happens) serialises like any other pair of sends, and exactly one of them
+inserts. The lock orders; the index deduplicates; neither does the other's
+job. The service layer translates `duplicate: true` into FR-MSG-04's
+"201-equivalent semantics" at the HTTP boundary: the `duplicate` flag is
+stripped, and the original `MessageRow` is returned — NestJS's `@Post()`
+default status is `201`, so the retry receives a `201` with the exact body
+the lost ack carried. No special status code, no conditional header —
+the client's single success path just works.
+
+<Trap>
+
+The trap here is *scope creep of the key*, in both directions. Too narrow:
+generating the key at retry time instead of send time — the retry then
+carries a *different* key, the index sees two logical sends, and you have
+reimplemented the bug with extra steps; the key must be minted before the
+first attempt, which is why FR-SDK-06 pins it to send time. Too wide:
+reusing one key across messages ("the client's request id") — now the
+index eats legitimately distinct sends and users lose messages to a
+guarantee meant to protect them. The key's exact meaning is *one logical
+message send*, and both failure modes come from drifting off that meaning
+rather than from any mechanical bug. When 2.8's suite retries "B2, north
+ramp", the assertion is not just "one row" — it is "one row *and* the
+retry got seq 42 back", proving the recovery leg returned the original
+rather than swallowing the send.
+
+</Trap>
+
+## Walk it
+
+Stage the journey by hand — same channel, same text, same key, twice:
+
+```bash
+KEY=$(uuidgen)
+curl -s -X POST localhost:4000/v1/channels/$CHANNEL/messages \
+  -H "X-Relay-Environment: $ENV" -H "content-type: application/json" \
+  -d "{\"text\":\"B2, north ramp\",\"idempotency_key\":\"$KEY\"}"
+# → seq 42. Now the "retry" — identical request:
+curl -s -X POST localhost:4000/v1/channels/$CHANNEL/messages \
+  -H "X-Relay-Environment: $ENV" -H "content-type: application/json" \
+  -d "{\"text\":\"B2, north ramp\",\"idempotency_key\":\"$KEY\"}"
+# → seq 42 again — the SAME message, recognised, not re-created
+```
+
+If you want to see exactly what the database was told, ask the query
+builder rather than guessing — the inference clause is the whole trick:
+
+```text
+on conflict ("channel_id","idempotency_key")
+  where "messages"."idempotency_key" IS NOT NULL
+  do nothing
+```
+
+That `WHERE` sits in the *inference* position, before `DO NOTHING`. It is
+how Postgres knows which index you mean, and it is why the clause matches
+`messages_idem` — the partial index — instead of matching nothing at all.
+
+The idempotency suite is five cases: the staged duplicate, the recognised
+retry, five concurrent sends under one key, the no-burn sequence check,
+and the per-channel key namespace. With the DR-01 guard added to 2.1's
+suite, the integration lane stands at fourteen across three files; the
+Docker-free gate is untouched at forty.
+
+<Figure
+  caption="The same ten seconds with a key: the retry hits DR-03's index, inserts nothing, and receives the original seq 42 — the answer the tunnel ate."
+  code={figIdempotentRetry}
+/>
+
+<ForwardRef part="Parts 2, 3 and 5">
+
+The key's client half — minted at send time, stored in the offline queue,
+flushed with the original key on reconnect — is the SDK's chapter (5.1
+implements FR-SDK-06/07; today's curl commands played the SDK by hand).
+2.7 leans on this chapter twice: the resume flush retries un-acked sends
+through exactly this path, and 2.8's mid-send kill is only survivable
+because the key predates the kill. And when 3.6 adds rate limits, the
+duplicate-recognised response deliberately won't count against them —
+retrying safely is behavior the platform wants to *reward*.
+
+</ForwardRef>
+
+## Your turn
+
+The exercise is the build: the key through schema, service, repository,
+and both tests. Then attack the guarantee:
+
+1. Re-run the staged duplicate with keys attached and watch the second
+   response return the original seq. Then run the no-key version once
+   more and feel how quiet the failure is — no error, ever, anywhere.
+2. Change the conditional back to `.onConflictDoNothing(key ? {…} :
+   undefined)`, then run the DR-01 guard in 2.1's suite. Watch a sequence
+   collision get swallowed and re-emerge as an internal error about a key
+   nobody sent. Put the ternary back outside the call.
+3. Move the `UPDATE channels` above the insert again and run the no-burn
+   test. Three retries, counter at 3, one row — a gap you manufactured
+   for nothing.
+4. Send the same key to two *different* channels. Two rows — correct: the
+   key's namespace is the channel (DR-03's index says so). Write down why
+   a global key namespace would be wrong for a multi-tenant system before
+   reading the answer in the deep dive.
+
+If you are stuck, the tag holds the answer key: `part2-ch3`.
+
+## Takeaways
+
+If you read nothing else in this chapter, keep these:
+
+- **A lost ack makes both client guesses wrong** — idempotency keys make
+  the retry safe instead of making the client clever (FR-MSG-04).
+- **The key is minted before the failure** (FR-SDK-06): a key generated
+  at retry time is just the bug wearing a disguise.
+- **Enforcement lives in the storage layer** (DR-03, constitution II):
+  memory dies with the process and splits across instances; the index
+  survives both and binds even forgetful code.
+- **The retry returns the original** — 201-equivalent semantics mean the
+  lost answer is re-delivered, not re-earned.
+- **Lock and index do different jobs**: the lock orders sends; the index
+  collapses repeats of one send. 2.2 + 2.3 together are constitution II's
+  first two clauses, executable.
+
+<Checkpoint>
+
+Before starting chapter 2.4, you should have: the key flowing from
+request body to index; the staged duplicate witnessed without keys and
+impossible with them; the concurrent-retry test green in the integration
+lane; the Docker-free gate untouched. That state is tag `part2-ch3` in
+the canonical repository. Chapter 2.4 turns to reading what we've
+written — under a feed that never stops moving.
+
+</Checkpoint>
+
+<ChapterFooter id="2.3" />
