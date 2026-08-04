@@ -809,8 +809,20 @@ recovers anything missed (the SDK refetches on gap). This is the architectural p
 ADR-03 — once ordering and resume are correct, the fan-out fabric is allowed to be lossy,
 and therefore simple and fast. **Rejected:** JetStream for live fan-out (durable, but
 per-channel consumer management for ephemeral delivery is heavy machinery to avoid a
-problem the cursor already solves); gateway-to-gateway mesh (O(n²) connections, discovery
-complexity).
+problem the cursor already solves); core NATS pub/sub (technically apt — at-most-once,
+subject-based, comparable latency — and refused on dependency shape rather than mechanism:
+Redis is mandatory for the gateway regardless, since ADR-10 puts presence in Redis with
+TTLs, so fan-out on NATS would leave that service holding two broker clients and remove
+none); gateway-to-gateway mesh (O(n²) connections, discovery complexity).
+
+> **Amended 2026-08-04 (v1.1).** Core NATS pub/sub was added to the rejected list. The
+> original record refused *JetStream* for live fan-out but was silent on core NATS — the
+> closest competitor, and the one the "we already run NATS" argument actually reaches for.
+> That refusal is deliberately weaker than the others: it is an argument about how many
+> client libraries the gateway holds, not about whether the mechanism fits. A NATS-only
+> proposal that also moves presence off Redis (NATS KV) would reopen it legitimately, and
+> would be a larger decision than this ADR — it would delete a store from the deployment,
+> not swap a fabric.
 
 ### ADR-08 — ClickHouse single-node in v1, schema designed for cluster
 **Status:** accepted · **Drivers:** D5, D8, NFR-SCL-05

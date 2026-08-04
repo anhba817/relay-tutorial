@@ -409,7 +409,8 @@ This fabric runs at the system's highest frequency. How durable must it be?
 
 1. **Redis pub/sub** — fire-and-forget, at-most-once.
 2. **JetStream** for live fan-out — durable.
-3. **Gateway-to-gateway mesh** — direct peer distribution.
+3. **Core NATS pub/sub** — fire-and-forget on a broker the stack already runs.
+4. **Gateway-to-gateway mesh** — direct peer distribution.
 
 ### Analysis
 
@@ -429,6 +430,18 @@ channel-per-gateway for deliveries that are ephemeral by nature — heavy machin
 avoid a problem the cursor already solves, plus higher per-message latency on the hottest
 path. The mesh option reinvents a message broker with O(n²) connections and a discovery
 protocol; it is what you build when you don't have Redis, and we have Redis.
+
+Core NATS is the honest competitor, and it deserves a better answer than the other two get.
+It is at-most-once, subject-based with wildcards, comparably fast, and *already deployed* —
+ADR-02 put JetStream in the stack for the durable spine, and core subjects come along with
+it. The case against is not mechanical. It is that Redis does not leave: ADR-10 keeps
+presence as Redis keys with TTLs, and rate-limit buckets follow. So fan-out on NATS gives
+the gateway two broker clients where it had one, deletes nothing from the deployment, and
+splits the ephemeral concerns of a single service across two systems. Choosing Redis keeps
+a clean mapping — gateway to Redis, api and workers to NATS — where each broker's guarantee
+matches its cargo. The genuinely interesting alternative is the one nobody proposed: move
+presence to NATS KV and remove Redis entirely. That is a coherent architecture and a much
+larger decision; it belongs to a deployment review, not to the fan-out fabric's ADR.
 
 The Redis-down case (failure matrix): fan-out pauses, gateways detect and cycle clients,
 clients resume by cursor against Postgres. Degraded latency, zero loss — the design's

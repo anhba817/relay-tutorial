@@ -1,0 +1,2009 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figSplitBrain, figHandshake, figFanout, figLossyIsFine } from "./figures";
+
+export const metadata = {
+  title: "Two servers, one conversation — Building Relay",
+  description:
+    "Run two gateway instances and watch a conversation split in half — then wire Redis pub/sub between them (ADR-07) and hear the lossy-fabric argument that makes at-most-once the correct choice.",
+  alternates: {
+    canonical: "/part-2/chapter-06/two-servers-one-conversation",
+    languages: {
+      en: "/part-2/chapter-06/two-servers-one-conversation",
+      vi: "/vi/part-2/chapter-06/two-servers-one-conversation",
+    },
+  },
+};
+
+<ChapterHeader id="2.6" />
+
+Chapter 2.5 ended with an instruction that was really an ambush: start a
+*second* gateway instance. Do it now — same build, different port — and
+connect the dispatcher to instance one, Tuan to instance two. The
+dispatcher sends; the api commits; the ack comes back; and Tuan's socket
+hears nothing at all. Nothing is broken. Every component is doing exactly
+what 2.5 built it to do — and that is the problem. The registry knows *its
+own* sockets, delivery walks the registry, and a conversation whose
+members landed on different instances is now two half-conversations that
+happen to share a database. This chapter connects the instances — and
+spends most of its pages on *how little* the connection is allowed to
+promise.
+
+<SkipAhead>
+
+If you must skip: the gateway gains Redis pub/sub fan-out (ADR-07,
+`ioredis`): the instance that handled a send publishes the committed
+message to `chan:{channel_id}` *after* the ack; every instance subscribes
+for channels its connected users belong to and delivers `message.created`
+to local members. The fabric is deliberately **at-most-once** — a dropped
+frame costs nothing durable, because recovery lives in Postgres sequences
+and 2.7's cursors. No sticky sessions, per CON-02. Two older gaps close on
+the way: the write path finally records *who sent* each message (2.5
+resolved the sender and dropped it), and a recognised retry is no longer
+republished to every member. The chapter-end state is tag **`part2-ch6`**.
+
+</SkipAhead>
+
+## Stage the split brain
+
+The demonstration is worth automating, because you will re-stage it twice
+more before the chapter ends. It seeds an environment, puts two users in
+one channel, connects them to *different* instances, sends one message,
+and then reports what the far side heard — it does not assert an outcome,
+because the same script has to tell the truth before and after the fix:
+
+```js title="scripts/split-brain.mjs"
+// The chapter 2.6 demonstration: two gateway instances, two users, one
+// channel. Run it BEFORE fanout.ts exists (or with Redis stopped) to see
+// the conversation split in half, and again after to see it whole. The
+// script does not assert which outcome is correct — it REPORTS what the
+// far side heard, so the same command tells you the truth in both states.
+import { SignJWT } from "jose";
+import WebSocket from "ws";
+
+import { createDb, createPool } from "../services/api/dist/db/client.js";
+import {
+  createEnvironment,
+  Repository,
+} from "../services/api/dist/db/repository.js";
+
+const G1 = process.env.RELAY_GW1 ?? "ws://127.0.0.1:4001";
+const G2 = process.env.RELAY_GW2 ?? "ws://127.0.0.1:4002";
+const SECRET = process.env.RELAY_DEV_JWT_SECRET ?? "dev-secret";
+
+const db = createDb(createPool());
+const env = await createEnvironment(db, { name: `split-${Date.now()}` });
+const repo = new Repository(db, env.id);
+const dispatcher = await repo.createUser("dispatcher", "Dispatcher");
+const driver = await repo.createUser("tuan", "Tuan");
+const channel = await repo.createChannel("fleet", "public");
+await repo.addMember(channel.id, dispatcher.id);
+await repo.addMember(channel.id, driver.id);
+
+const token = (sub) =>
+  new SignJWT({ env: env.id })
+    .setProtectedHeader({ alg: "HS256" })
+    .setSubject(sub)
+    .sign(new TextEncoder().encode(SECRET));
+
+const heard = [];
+
+function connect(url, who, sub) {
+  return new Promise((resolve) => {
+    const socket = new WebSocket(`${url}/v1/ws?token=${sub}`);
+    socket.on("message", (raw) => {
+      const frame = JSON.parse(raw.toString());
+      if (frame.type === "connection.ack") resolve(socket);
+      else {
+        heard.push({ who: who.trim(), type: frame.type });
+        console.log(`  ${who} ← ${JSON.stringify(frame)}`);
+      }
+    });
+  });
+}
+
+const a = await connect(G1, "dispatcher(G1)", await token("dispatcher"));
+await connect(G2, "tuan(G2)      ", await token("tuan"));
+console.log("both connected — dispatcher on G1, Tuan on G2\n");
+
+console.log("dispatcher sends on G1:");
+a.send(
+  JSON.stringify({
+    type: "message.send",
+    payload: {
+      idem_key: `k-${Date.now()}`,
+      channel: channel.id,
+      text: "which entrance?",
+    },
+  }),
+);
+
+setTimeout(() => {
+  const tuanHeard = heard.filter(
+    (f) => f.who === "tuan(G2)" && f.type === "message.created",
+  );
+  console.log(
+    tuanHeard.length === 0
+      ? "\nTuan heard nothing. Two servers, two conversations."
+      : `\nTuan heard it (${tuanHeard.length} message.created). Two servers, one conversation.`,
+  );
+  process.exit(0);
+}, 1200);
+```
+
+Run the api, two gateways, and the script:
+
+```bash
+node services/api/dist/main.js &                     # after pnpm build
+(cd services/gateway && PORT=4001 pnpm exec tsx src/main.ts &)
+(cd services/gateway && PORT=4002 pnpm exec tsx src/main.ts &)
+node scripts/split-brain.mjs
+```
+
+```text
+both connected — dispatcher on G1, Tuan on G2
+
+dispatcher sends on G1:
+  dispatcher(G1) ← {"type":"message.ack","payload":{"seq":1}}
+
+Tuan heard nothing. Two servers, two conversations.
+```
+
+The write path is *fine*: the message is in Postgres with a sequence
+number, and history (2.4) will show it to anyone who asks. What is missing
+is the live push — FR-RTM-01 promises "a connected client shall receive
+messages for every channel of which it is a member," and FR-RTM-02
+sharpens it into this chapter's requirement: delivery "shall function
+correctly when sender and recipient are connected to **different gateway
+instances**." One ack, one silence, and a requirement that a single
+process could never have failed.
+
+<Figure
+  caption="The split brain, staged: instance one delivered to every socket it can see, and Tuan isn't in that set. Two correct registries, one broken conversation."
+  code={figSplitBrain}
+/>
+
+<Trap>
+
+There is a fix that makes this chapter unnecessary, and half the internet
+will recommend it: **sticky sessions**. Pin each *channel's* members to
+the same instance — route by channel id at the load balancer — and the 2.5
+registry works unchanged, no Redis, no new moving part. It is the trap
+this part has been driving toward since the SAD was written, and the
+documents ban it by name: CON-02 — "WebSocket connections shall not
+require sticky routing for correctness." Why so absolute? Count what
+stickiness actually costs. A user is in *many* channels — which one picks
+their instance? (There is no good answer; channel-stickiness and
+user-stickiness contradict each other the moment two users share two
+channels.) An instance dying takes *its channels* down rather than
+shedding anonymous load. Deploys must drain by channel. Scale-out
+re-shards conversations mid-flight. And the constitution's scalability
+clause — "horizontal scalability with no single-instance state" — becomes
+a lie with a routing table. Stickiness converts a delivery problem into a
+placement problem, and placement problems metastasize. The SAD's answer
+keeps every gateway identical and anonymous: *any* instance can serve
+*any* socket, and the fabric — not the router — carries messages across.
+
+</Trap>
+
+## The fabric, and the promise it refuses to make
+
+ADR-07 names the mechanism: Redis pub/sub, one subject per channel,
+`chan:{channel_id}`. The instance that handled the send publishes the
+committed message; every instance that hosts a member of that channel is
+subscribed and delivers to its local sockets. §5.1 already drew it — the
+`publish to Redis chan:{channel_id}` line under the ack, with the note
+"all gateway instances fan out to members." Here is the whole fabric:
+
+```ts title="services/gateway/src/fanout.ts"
+import { messageCreatedSchema, type Message } from "@relay/protocol";
+import type { Logger } from "@relay/service-kit";
+// A NAMED import, not a default: ioredis is CommonJS, the gateway is ESM,
+// and without esModuleInterop a default import of a CJS module hands you
+// the module.exports namespace — which is not constructable. TypeScript
+// says so plainly ("This expression is not constructable"); the fix is to
+// take the named export the package actually provides.
+import { Redis } from "ioredis";
+
+// The fan-out fabric (chapter 2.6, ADR-07): Redis pub/sub, one subject per
+// channel — `chan:{channel_id}`. The instance that handled a send publishes
+// the committed message AFTER the api's response; every instance hosting a
+// member of that channel is subscribed and delivers to its local sockets.
+//
+// This fabric is AT-MOST-ONCE by design. No acks, no replay, no consumer
+// groups. A frame that misses a subscriber is simply gone — and that is
+// acceptable because it is RECOVERABLE: sequences live in Postgres, cursors
+// live with the client, and 2.7's resume path turns any gap into a
+// backfill. Durability was never this layer's job (constitution IV:
+// nothing in Redis is a source of truth).
+//
+// ioredis over node-redis for subscriber-mode ergonomics: a subscribed
+// connection cannot issue ordinary commands, so publisher and subscriber
+// must be two connections — ioredis models that as two client objects whose
+// lifecycles match the session registry's.
+
+export const DEFAULT_REDIS_URL = "redis://localhost:6379";
+
+/** One subject per channel: an instance receives only frames it can
+ * actually deliver, and a pathological channel saturates its own subject
+ * rather than every gateway's inbox. */
+export function subjectFor(channelId: string): string {
+  return `chan:${channelId}`;
+}
+
+export interface Fanout {
+  /** Register the delivery callback. Set by the session layer at wiring
+   * time — the fabric knows how to receive, the sessions know who to
+   * hand it to. */
+  onDelivery(handler: (channelId: string, message: Message) => void): void;
+  /** Publish a committed message to its channel's subject. A failure here
+   * costs delivery latency, never durability. */
+  publish(message: Message): Promise<void>;
+  subscribe(channelId: string): Promise<void>;
+  unsubscribe(channelId: string): Promise<void>;
+  close(): Promise<void>;
+}
+
+export interface FanoutOptions {
+  url?: string;
+  logger: Logger;
+}
+
+export function createFanout({
+  url = process.env.RELAY_REDIS_URL ?? DEFAULT_REDIS_URL,
+  logger,
+}: FanoutOptions): Fanout {
+  let deliver: (channelId: string, message: Message) => void = () => {};
+  const publisher = new Redis(url);
+  const subscriber = new Redis(url);
+  // Reference-counted, because two users of the same channel on one
+  // instance must not unsubscribe each other.
+  const counts = new Map<string, number>();
+
+  subscriber.on("message", (subject: string, raw: string) => {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      logger.log("error", "fanout.unparsable", { subject });
+      return;
+    }
+    // The fabric is inside the trust boundary, and frames are STILL
+    // validated: "inside" is one compromised dependency away from
+    // "outside", and a malformed payload must not reach a client.
+    const message = messageCreatedSchema.shape.payload.safeParse(parsed);
+    if (!message.success) {
+      logger.log("error", "fanout.invalid_payload", { subject });
+      return;
+    }
+    deliver(message.data.channel, message.data);
+  });
+
+  return {
+    onDelivery(handler) {
+      deliver = handler;
+    },
+    async publish(message) {
+      try {
+        await publisher.publish(
+          subjectFor(message.channel),
+          JSON.stringify(message),
+        );
+      } catch (error) {
+        // Delivery is allowed to fail; the message is already durable and
+        // 2.7's resume will find it. Log and move on.
+        logger.log("error", "fanout.publish_failed", {
+          channel: message.channel,
+          error: String(error),
+        });
+      }
+    },
+    async subscribe(channelId) {
+      const next = (counts.get(channelId) ?? 0) + 1;
+      counts.set(channelId, next);
+      if (next === 1) await subscriber.subscribe(subjectFor(channelId));
+    },
+    async unsubscribe(channelId) {
+      const next = (counts.get(channelId) ?? 1) - 1;
+      if (next <= 0) {
+        counts.delete(channelId);
+        await subscriber.unsubscribe(subjectFor(channelId));
+      } else {
+        counts.set(channelId, next);
+      }
+    },
+    async close() {
+      subscriber.disconnect();
+      publisher.disconnect();
+    },
+  };
+}
+```
+
+Three details in that file are worth stopping on.
+
+The **named import** is not a style preference. `ioredis` ships CommonJS,
+the gateway is ESM, and without `esModuleInterop` a default import of a
+CJS module hands you the module namespace rather than the class — which
+TypeScript reports as `error TS2351: This expression is not
+constructable`. The named export is what the package actually provides.
+This is the same ESM/CJS seam 1.4 crossed when the api chose
+`"type": "commonjs"`; it does not stop mattering just because the
+frameworks hide it.
+
+**Two connections, not one**, because a Redis client in subscriber mode
+cannot issue ordinary commands. The library models that constraint as two
+client objects, and the fabric's shape follows the protocol's rather than
+pretending the constraint away.
+
+And the **reference count**. Two users of the same channel on one instance
+must not unsubscribe each other — the first arrival opens the
+subscription, the last departure closes it. Delete that `Map` and you get
+a bug that appears only when two members of one channel share an
+instance *and* one of them disconnects: the survivor goes quietly deaf.
+
+<Figure
+  caption="What a connect actually costs: one local token check, one membership call, then the subscriptions the ack refuses to wait for — the ordering that keeps a broker outage out of the handshake."
+  code={figHandshake}
+/>
+
+<Figure
+  caption="§5.1 completed across two machines: commit, ack, publish, deliver — with Redis carrying frames between instances that never learn each other's names."
+  code={figFanout}
+/>
+
+<Why source="ADR-07 · constitution IV">
+
+Why is at-most-once the *right* promise rather than a compromise? Because
+strengthening it is expensive exactly where this system already paid.
+At-least-once fan-out means broker acks, redelivery, and consumer
+bookkeeping on the hot path of every message — to defend against a loss
+whose cost is… a client falling back to the resume path it must implement
+*anyway* (sockets die; 2.7 exists regardless of how good the fabric is).
+The deep dive's framing is the one to keep: the platform's delivery
+guarantee is **exactly-once *appearance*, not exactly-once *delivery***
+— sequences and idempotency make duplicates and gaps *detectable and
+repairable*, so no individual hop needs to be perfect. The constitution
+generalizes it: "The live fan-out fabric is permitted to be lossy
+(at-most-once) precisely because durability and resume live in PostgreSQL
+sequences and cursors." One strict layer purchases every relaxed one —
+and Redis, doing the simplest possible thing at memory speed, is the
+relaxed one.
+
+</Why>
+
+<Figure
+  caption="The lossy-fabric argument in one picture: a delivered frame is milliseconds of latency; a dropped frame is a resume — both paths end at the same truth in Postgres."
+  code={figLossyIsFine}
+/>
+
+<Why source="ADR-07 · ADR-02 · ADR-10">
+
+Why a *second* broker, when NATS JetStream has been sitting in the compose
+stack since 1.2? Because the brokers are split by **durability class**, not
+by convenience. JetStream is the durable event spine (ADR-02) — the
+outbox's events, webhooks, metering: cargo whose loss costs money. Redis
+carries the cargo whose loss costs latency. Running fan-out on JetStream
+would mean consumer state per channel per instance for deliveries that are
+ephemeral by nature, and the subscription set churns on every connect and
+disconnect — cheap for a `SUBSCRIBE`, expensive for a server-side consumer
+object. It would also deliver durability you actively do not want: a
+gateway that reconnects would replay frames the client is about to refetch
+by cursor in 2.7, and two recovery paths for the same data is how
+duplicates are born. You would spend configuration effort switching off the
+feature you chose the broker for. (ADR-02 makes the same call in reverse:
+Redis Streams was rejected for the spine, because coupling durability to
+the ephemeral store gives one Redis incident two blast radii.)
+
+The sharper version of the question is **core** NATS pub/sub —
+fire-and-forget, subject-based, comparably fast, close to a drop-in. The
+SAD refuses it too, but on weaker grounds, and it is worth being honest
+about which kind of argument you are being handed: Redis does not leave the
+deployment either way, because ADR-10 keeps presence in Redis with TTLs. So
+fan-out on NATS would give this one service two broker clients and remove
+nothing. That is an argument about dependency shape, not about mechanism.
+The road not taken — presence in NATS KV, Redis deleted outright — is a
+coherent architecture and a legitimately larger decision than the one this
+chapter is making.
+
+</Why>
+
+<Why source="ADR-07 · SAD §5.2 · FR-RTM-01">
+
+Why one subject *per channel*, rather than one global firehose every
+instance filters? Because the subscription set then IS the membership
+set, and three good things fall out of that alignment. Traffic: an
+instance receives only frames it can actually deliver — a thousand quiet
+channels cost its network nothing. Blast radius: a pathological channel
+(someone scripted a bot into the fleet channel) saturates its own
+subject, not every gateway's inbox. And correctness reads off the
+structure: FR-RTM-01 promises delivery "for every channel of which the
+user is a member, without per-channel subscription" — *client-side*
+subscription, that is; the gateway's per-channel subjects are exactly how
+the platform keeps that promise invisible. The publishing side stays
+instance-agnostic (§5.2's words: "no registry lookup on the hot path, no
+sticky routing") — the publisher throws the frame at the subject and
+never learns who was listening. Decoupling that complete is what lets
+2.7 treat "who hears what" as purely a subscriber-side question during
+resume.
+
+</Why>
+
+There is also a small but load-bearing shape decision in what gets
+published: the *whole committed message*, not a "something changed" poke.
+A poke would force every subscriber back to the api to fetch — turning
+one write into N reads on the hottest path in the system, and
+reintroducing the store-adjacent gateway the TRAP in 2.5 banned. The
+frame that fans out is the frame the api returned at commit: already
+validated, already numbered, ready to deliver byte-for-byte.
+
+## The sender the write path forgot
+
+Publishing "the whole committed message" runs into something immediately.
+Here is the wire shape a `message.created` frame must carry, from 1.3's
+protocol package: `id`, `channel`, `seq`, **`user`**, `text`,
+`created_at`. And here is what the database had to say about the messages
+2.5 wrote through the socket:
+
+```text
+ sequence |   sender   |      text
+----------+------------+-----------------
+        1 |            | which entrance?
+        2 |            | B2, north ramp
+```
+
+Every one of them anonymous. 2.5's internal route *resolved* the sender —
+it had to, to reject unknown users — and then dropped it on the floor
+before calling the service; `user_id` has been nullable since 2.1 and
+nothing complained. Reads did not need it (2.4's history never selected
+it), so the gap sat there. Fan-out is the first feature that cannot
+proceed without it: you cannot name the sender of a frame you are about
+to put on someone else's screen.
+
+This is the same shape as 2.4's redundant index — a chapter discovering
+what an earlier chapter got wrong, and fixing it forward. The internal
+contract grows one required field, and one optional one we will come back
+to:
+
+```diff title="packages/protocol/src/internal.ts"
+ import { z } from "zod";
+ 
+ // The INTERNAL service contract (chapter 2.5) — distinct from the wire
+ // contract above it. `frames.ts` is what a customer's client speaks;
+ // this is what the gateway and the API service speak to each other over
+ // the internal HTTP hop (ADR-05).
+ //
+ // It lives in the same package for the same reason the frames do: two
+ // components on either side of a boundary, one definition between them.
+ // The gateway derives its client types from these schemas AND parses
+ // responses with them — an internal caller has no more right to assume a
+ // payload's shape than an external one does.
+ 
+ /** Gateway → api: forward the payload a `message.send` frame carried. */
+ export const internalSendRequestSchema = z.strictObject({
+   channel_id: z.string().uuid(),
+   text: z.string().min(1).max(8000), // FR-MSG-01
+   idempotency_key: z.string().min(1).max(255).optional(), // FR-MSG-04
+ });
+ 
+ /** api → gateway: the committed message. `seq` is what the ack carries
+  * (FR-MSG-05 — after the commit, never before). */
+ export const internalSendResponseSchema = z.strictObject({
+   id: z.string().min(1),
+   channel_id: z.string().min(1),
+   seq: z.number().int().positive(),
++  /** The sender, as the api RECORDED it — not as the caller asserted it.
++   * Added in chapter 2.6: fan-out is the first feature that must name a
++   * sender, and a frame the live path invents would not match the frame
++   * 2.7's resume path reads back out of Postgres. */
++  user: z.string().min(1),
+   text: z.string().nullable(),
+   created_at: z.iso.datetime(),
++  /** True when 2.3's idempotency index recognised a retry. The PUBLIC api
++   * still hides this (a client cannot tell a retry from a first send);
++   * an internal caller needs it, because storage being idempotent does
++   * not make delivery idempotent — chapter 2.6's trap. */
++  duplicate: z.boolean().optional(),
+ });
+ 
+ /** api → gateway: the channels this user may hear (FR-RTM-01). */
+ export const internalMembershipsResponseSchema = z.strictObject({
+   channel_ids: z.array(z.string().min(1)),
+ });
+ 
+ export type InternalSendRequest = z.infer<typeof internalSendRequestSchema>;
+ export type InternalSendResponse = z.infer<typeof internalSendResponseSchema>;
+ export type InternalMembershipsResponse = z.infer<
+   typeof internalMembershipsResponseSchema
+ >;
+```
+
+The service stops being the place FR-MSG-04's promise is kept, and starts
+being what it should have been: a pass-through that carries the write's
+inputs down and its result up.
+
+```diff title="services/api/src/messages/messages.service.ts"
+ import {
+   BadRequestException,
+   Injectable,
+   NotFoundException,
+ } from "@nestjs/common";
+ 
+ import {
+   ChannelNotFoundError,
+   Repository,
+   type MessageRow,
+ } from "../db/repository";
+ import { decodeCursor, encodeCursor } from "./cursor";
+ import type { HistoryQuery, SendMessageBody } from "./messages.schema";
+ 
+ // The thin layer between HTTP and the repository (chapters 2.2 + 2.3). It
+ // owns two things: turning the layer's domain error into the wire's 404,
+-// and translating the repository's `duplicate: true` into FR-MSG-04's
+-// "201-equivalent semantics" — the retry returns the original message,
+-// indistinguishable from a fresh send (the `duplicate` flag stays internal).
++// and carrying the write path's inputs down to the repository.
++//
++// AMENDED in chapter 2.6: `duplicate` used to be erased here, which made
++// FR-MSG-04's "indistinguishable retry" a property of the SERVICE. It is
++// really a property of the PUBLIC WIRE — the internal caller needs the
++// flag to avoid publishing a retry to every member. So the flag now
++// travels to the controllers, and the public one erases it.
+ @Injectable()
+ export class MessagesService {
+   constructor(private readonly repo: Repository) {}
+ 
+-  async send(channelId: string, body: SendMessageBody): Promise<MessageRow> {
++  async send(
++    channelId: string,
++    body: SendMessageBody,
++    /** Chapter 2.6: who wrote it. Optional because the public REST route
++     * has no authenticated user yet (its own chapter, Part 3); the
++     * internal route always knows. */
++    userId?: string,
++  ): Promise<MessageRow> {
+     try {
+-      const result = await this.repo.sendMessage(channelId, {
++      return await this.repo.sendMessage(channelId, {
+         text: body.text,
+         metadata: body.metadata,
++        ...(userId !== undefined && { userId }),
+         ...(body.idempotency_key != null && {
+           idempotencyKey: body.idempotency_key,
+         }),
+       });
+-      // The internal duplicate flag never reaches the wire: the client
+-      // sees the same body whether this was the original send or the
+-      // retry that recovered it (FR-MSG-04's 201-equivalent semantics).
+-      return {
+-        id: result.id,
+-        channel_id: result.channel_id,
+-        seq: result.seq,
+-        text: result.text,
+-        created_at: result.created_at,
+-      };
+     } catch (error) {
+       if (error instanceof ChannelNotFoundError) {
+         // A CONSTANT message: echoing the id back would make the foreign-id
+         // answer differ from the missing-id answer, and "different" is
+         // itself a disclosure (FR-TEN-05).
+         throw new NotFoundException("channel not found");
+       }
+       throw error;
+     }
+   }
+ 
+   /** A page of history (chapter 2.4). The cursor is opaque coming in and
+    * going out; the service is the only place that knows it encodes a
+    * sequence. A cursor we did not mint is a 400, never a silent reset to
+    * the top — serving the wrong page quietly is worse than refusing. */
+   async history(
+     channelId: string,
+     { cursor, direction, limit }: HistoryQuery,
+   ): Promise<{
+     messages: MessageRow[];
+     next_cursor: string | null;
+     prev_cursor: string | null;
+   }> {
+     let anchor: number | undefined;
+     if (cursor !== undefined) {
+       const decoded = decodeCursor(cursor);
+       if (decoded === null) throw new BadRequestException("malformed cursor");
+       anchor = decoded;
+     }
+     const messages = await this.repo.listMessages(channelId, {
+       limit,
+       ...(direction === "newer"
+         ? { afterSeq: anchor ?? 0 }
+         : anchor === undefined
+           ? {}
+           : { beforeSeq: anchor }),
+     });
+     // Edge rows become the next anchors. A short page still yields a
+     // next_cursor: "no more yet" and "no more ever" are the same answer
+     // in a feed that keeps growing, and the client simply gets an empty
+     // page next time.
+     const first = messages[0];
+     const last = messages[messages.length - 1];
+     return {
+       messages,
+       next_cursor: last ? encodeCursor(last.seq) : null,
+       prev_cursor: first ? encodeCursor(first.seq) : null,
+     };
+   }
+ }
+```
+
+```diff title="services/api/src/internal/internal.controller.ts"
+ import {
+   BadRequestException,
+   Body,
+   Controller,
+   Get,
+   Headers,
+   Post,
+   UseGuards,
+ } from "@nestjs/common";
+ 
+ import { EnvironmentContextGuard } from "../messages/environment-context.guard";
+ import { MessagesService } from "../messages/messages.service";
+ import { Repository } from "../db/repository";
+ import {
+   internalSendRequestSchema,
+   type InternalSendRequest,
+ } from "@relay/protocol";
+ 
+ import { ZodValidationPipe } from "../messages/zod-validation.pipe";
+ 
+ // The internal surface (chapter 2.5): the routes the gateway calls on a
+ // connected user's behalf. They reuse the SAME service methods as the
+ // public routes — the write path has one implementation (ADR-04), and the
+ // socket is a new door onto it, not a second path.
+ //
+ // DECISION (chapter 2.5): these routes are network-internal and
+ // unauthenticated between services at this stage; the gateway's forwarded
+ // identity headers are trusted. Service-to-service credentials are Part 3
+ // hardening, and this controller is the whole seam.
+ @Controller("internal")
+ @UseGuards(EnvironmentContextGuard)
+ export class InternalController {
+   constructor(
+     private readonly repo: Repository,
+     private readonly messages: MessagesService,
+   ) {}
+ 
+   /** Which channels may this user hear? The gateway caches the answer on
+    * the session; membership.changed frames invalidate it (FR-RTM-05). */
+   @Get("memberships")
+   async memberships(@Headers("x-relay-user") userExternalId?: string) {
+     if (!userExternalId) throw new BadRequestException("missing x-relay-user");
+     const user = await this.repo.getUserByExternalId(userExternalId);
+     // An unknown user is not an error — it is a user with no channels. The
+     // gateway's job is delivery, not identity forensics.
+     if (!user) return { channel_ids: [] };
+     return { channel_ids: await this.repo.channelsForUser(user.id) };
+   }
+ 
+   @Post("messages")
+   async send(
+     @Body(new ZodValidationPipe(internalSendRequestSchema))
+     body: InternalSendRequest,
+     @Headers("x-relay-user") userExternalId?: string,
+   ) {
+     if (!userExternalId) throw new BadRequestException("missing x-relay-user");
+     const user = await this.repo.getUserByExternalId(userExternalId);
+     if (!user) throw new BadRequestException("unknown user");
+-    return this.messages.send(body.channel_id, {
+-      text: body.text,
+-      ...(body.idempotency_key !== undefined && {
+-        idempotency_key: body.idempotency_key,
+-      }),
+-    });
++    const message = await this.messages.send(
++      body.channel_id,
++      {
++        text: body.text,
++        ...(body.idempotency_key !== undefined && {
++          idempotency_key: body.idempotency_key,
++        }),
++      },
++      // Chapter 2.6: the sender is RESOLVED here and, until now, dropped
++      // here — every socket-written row had user_id NULL. Fan-out cannot
++      // build a message.created frame without a sender, so the write path
++      // finally records the one it already had in its hand.
++      user.id,
++    );
++    // `user` is echoed as the EXTERNAL id: internal uuids are ours, and
++    // the frame this becomes is client-facing.
++    return { ...message, user: userExternalId };
+   }
+ }
+```
+
+<Why source="FR-MSG-04 · constitution V">
+
+Why move the `duplicate` erasure *down* into the controller instead of
+leaving it in the service? Because "a retry is indistinguishable from a
+first send" is a promise about the **public wire**, not about an internal
+function's return type. The service had been enforcing a wire rule, which
+looks tidy right up to the moment a second caller appears with a
+legitimate need for the truth. The gateway *is* that caller: it must know
+whether a write was new in order to decide whether anyone else should hear
+about it. So the flag now travels to both controllers, and the public one
+— the one facing a customer's API key — is where it dies. Same guarantee,
+enforced at the boundary the guarantee is about.
+
+</Why>
+
+And with attribution recorded, `user` is echoed back to the gateway as the
+**external** id: internal uuids belong to the platform, and the frame this
+value becomes is client-facing (constitution V — the external id is the
+identifier customers know).
+
+One more thing this section owes: 2.5 shipped the internal routes with
+their only tests on the *other* side of the wire, where the api was a stub.
+Nothing checked that the real api emits what the shared schema demands —
+and the gateway parses these bodies at runtime and refuses what does not
+fit, so drift here shows up as a failed send rather than a failed test. A
+contract with two implementations needs a test at the boundary:
+
+```ts title="services/api/src/internal/internal.itest.ts"
+import "reflect-metadata";
+
+import { Test } from "@nestjs/testing";
+import type { INestApplication } from "@nestjs/common";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+
+import {
+  internalMembershipsResponseSchema,
+  internalSendResponseSchema,
+} from "@relay/protocol";
+
+import { AppModule } from "../app.module";
+import { createDb, createPool } from "../db/client";
+import { createEnvironment, Repository } from "../db/repository";
+
+// The internal boundary, tested as a CONTRACT (chapter 2.6). 2.5 built these
+// routes and verified them only through the gateway's tests, where the api
+// was a stub — which means nothing checked that the real api emits what the
+// shared schema demands. The gateway parses these bodies at runtime and
+// refuses what does not fit, so an unnoticed drift here becomes a failed
+// send in production; asserting the schema HERE turns that into a red test.
+//
+// Both response schemas are z.strictObject: an extra field fails exactly as
+// loudly as a missing one. That is deliberate for a contract whose two sides
+// deploy together.
+describe("the internal surface", () => {
+  let app: INestApplication;
+  let url: string;
+  let env: { id: string };
+  let channelId: string;
+
+  beforeAll(async () => {
+    const db = createDb(createPool());
+    env = await createEnvironment(db, { name: "internal-itest" });
+    const repo = new Repository(db, env.id);
+    const user = await repo.createUser("tuan", "Tuan");
+    channelId = (await repo.createChannel("fleet", "public")).id;
+    await repo.addMember(channelId, user.id);
+    app = (
+      await Test.createTestingModule({ imports: [AppModule] }).compile()
+    ).createNestApplication({ logger: false });
+    await app.listen(0);
+    url = await app.getUrl();
+  });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  const headers = (user = "tuan") => ({
+    "content-type": "application/json",
+    "x-relay-environment": env.id,
+    "x-relay-user": user,
+  });
+
+  const send = (body: unknown, user = "tuan") =>
+    fetch(`${url}/internal/messages`, {
+      method: "POST",
+      headers: headers(user),
+      body: JSON.stringify(body),
+    });
+
+  it("emits a send response the shared contract accepts", async () => {
+    const res = await send({ channel_id: channelId, text: "which entrance?" });
+    expect(res.status).toBe(201);
+    const parsed = internalSendResponseSchema.safeParse(await res.json());
+    // The error is printed on failure because "shape drift" is useless as a
+    // diagnosis; the field name is the whole story.
+    expect(parsed.error?.issues ?? []).toEqual([]);
+    expect(parsed.success).toBe(true);
+    // The field this chapter had to add: a frame cannot name its sender if
+    // the write path does not record one.
+    expect(parsed.data?.user).toBe("tuan");
+  });
+
+  it("reports a recognised retry as a duplicate, once (FR-MSG-04)", async () => {
+    const body = { channel_id: channelId, text: "B2", idempotency_key: "k-1" };
+    const first = internalSendResponseSchema.parse(
+      await (await send(body)).json(),
+    );
+    const retry = internalSendResponseSchema.parse(
+      await (await send(body)).json(),
+    );
+    // Same message, both times — and the internal caller is TOLD, because
+    // it has to decide whether anyone else hears about it (the fan-out
+    // republish trap). The public route keeps this invisible.
+    expect(retry.id).toBe(first.id);
+    expect(retry.seq).toBe(first.seq);
+    expect(first.duplicate).toBeUndefined();
+    expect(retry.duplicate).toBe(true);
+  });
+
+  it("persists the sender on the row, not just in the response", async () => {
+    const res = internalSendResponseSchema.parse(
+      await (await send({ channel_id: channelId, text: "north ramp" })).json(),
+    );
+    const history = await fetch(
+      `${url}/v1/channels/${channelId}/messages?limit=50`,
+      { headers: headers() },
+    );
+    const page = (await history.json()) as { messages: { id: string }[] };
+    // History does not expose `user` yet — 2.7's resume path is where the
+    // read side catches up. What this asserts is that the message exists
+    // and the write did not fail silently while claiming a sender.
+    expect(page.messages.some((m) => m.id === res.id)).toBe(true);
+  });
+
+  it("emits a memberships response the shared contract accepts", async () => {
+    const res = await fetch(`${url}/internal/memberships`, {
+      headers: headers(),
+    });
+    const parsed = internalMembershipsResponseSchema.safeParse(
+      await res.json(),
+    );
+    expect(parsed.error?.issues ?? []).toEqual([]);
+    expect(parsed.data?.channel_ids).toContain(channelId);
+  });
+
+  it("answers for an unknown user with no channels rather than an error", async () => {
+    const res = await fetch(`${url}/internal/memberships`, {
+      headers: headers("nobody-here"),
+    });
+    expect(res.status).toBe(200);
+    expect(
+      internalMembershipsResponseSchema.parse(await res.json()).channel_ids,
+    ).toEqual([]);
+  });
+});
+```
+
+Writing that test taught something the plan did not anticipate. While the
+new api was running, an *old* gateway process from the previous chapter was
+still listening on a port — and every send through it failed with "send
+returned a payload the contract does not allow." The new required `user`
+field broke the old client instantly, because `z.strictObject` rejects
+unknown keys in both directions. For this contract that is correct:
+gateway and api ship as one unit, and a mismatch should be loud and
+immediate rather than a field silently read as `undefined` three layers
+away. It is also a preview of why the *public* API cannot behave this way
+— customers do not redeploy when we do, which is what makes Part 3's
+versioning chapter a different problem with different rules.
+
+```diff title="services/api/src/messages/messages.controller.ts"
+ import {
+   Body,
+   Controller,
+   Get,
+   Param,
+   Post,
+   Query,
+   UseGuards,
+ } from "@nestjs/common";
+ 
+ import { EnvironmentContextGuard } from "./environment-context.guard";
+ import { MessagesService } from "./messages.service";
+ import { historyQuerySchema, sendMessageBodySchema } from "./messages.schema";
+ // `import type` is required, not stylistic: with isolatedModules and
+ // emitDecoratorMetadata on (ADR-15's trade-off, chapter 1.4), a type used
+ // in a decorated signature must be imported as a type or TS1272 refuses
+ // to compile it.
+ import type { HistoryQuery, SendMessageBody } from "./messages.schema";
+ import { ZodValidationPipe } from "./zod-validation.pipe";
+ 
+ // The api's first product endpoint (chapter 2.2). Validation is zod at the
+ // boundary — the same schema family as @relay/protocol, so the REST body
+ // and the WebSocket frame payload cannot drift (1.3's payoff, again).
+ @Controller("v1/channels/:channelId/messages")
+ @UseGuards(EnvironmentContextGuard)
+ export class MessagesController {
+   constructor(private readonly messages: MessagesService) {}
+ 
+   @Post()
+   async send(
+     @Param("channelId") channelId: string,
+     @Body(new ZodValidationPipe(sendMessageBodySchema)) body: SendMessageBody,
+   ) {
+-    return this.messages.send(channelId, body);
++    const message = await this.messages.send(channelId, body);
++    // FR-MSG-04's "201-equivalent semantics" lives HERE, on the public
++    // wire: the client sees the same body whether this was the original
++    // send or the retry that recovered it. Moved down from the service in
++    // chapter 2.6, where an internal caller turned out to need the flag.
++    // The field list is spelled out rather than spread-minus-`duplicate`,
++    // so a new column joins the public response only when someone decides
++    // it should.
++    return {
++      id: message.id,
++      channel_id: message.channel_id,
++      seq: message.seq,
++      text: message.text,
++      created_at: message.created_at,
++    };
+   }
+ 
+   @Get()
+   async history(
+     @Param("channelId") channelId: string,
+     @Query(new ZodValidationPipe(historyQuerySchema)) query: HistoryQuery,
+   ) {
+     return this.messages.history(channelId, query);
+   }
+ }
+```
+
+## Wire it
+
+Sessions gain three responsibilities and no new knowledge of Redis. They
+subscribe for the channels a connecting socket can hear, they turn
+inbound fabric frames into `message.created` for local members, and they
+publish after the ack:
+
+```diff title="services/gateway/src/session.ts"
+ import { randomUUID } from "node:crypto";
+ import type { IncomingMessage, Server } from "node:http";
+ 
+-import { CLOSE_CODES, frameSchema, type Frame } from "@relay/protocol";
++import {
++  CLOSE_CODES,
++  frameSchema,
++  type Frame,
++  type Message,
++} from "@relay/protocol";
+ import type { Logger } from "@relay/service-kit";
+ import { WebSocketServer, type WebSocket } from "ws";
+ 
+ import type { ApiClient } from "./api-client.js";
+ import { verifyToken, type Identity } from "./auth.js";
++import type { Fanout } from "./fanout.js";
+ import { Registry, type Connection } from "./registry.js";
+ 
+ // One session per socket (chapter 2.5). The order of operations here is the
+ // chapter: verify at the door, learn memberships, register, ack inside
+ // EIR-WS-03's one-second budget, then start the heartbeat. Frames in are
+ // parsed with @relay/protocol's schemas — the SAME objects the api uses, so
+ // a frame the gateway accepts is a frame every component understands.
+ 
+ const PING_INTERVAL_MS = 30_000;
+ const MAX_MISSED_PINGS = 2;
+ 
+ function send(socket: WebSocket, frame: Frame): void {
+   socket.send(JSON.stringify(frame));
+ }
+ 
+ /** EIR-API-04's envelope, wearing its WebSocket clothes. */
+ function sendError(socket: WebSocket, code: string, message: string): void {
+   send(socket, {
+     type: "error",
+     payload: {
+       code,
+       message,
+       docs_url: `https://relay.example/docs/errors/${code}`,
+     },
+   });
+ }
+ 
+ export interface SessionServerOptions {
+   server: Server;
+   api: ApiClient;
+   logger: Logger;
++  /** The cross-instance fabric (chapter 2.6). Optional so 2.5's tests —
++   * and a single-instance dev run — still work without Redis; when it is
++   * absent, delivery is local-only, which is exactly the split brain this
++   * chapter opened with. */
++  fanout?: Fanout;
+   /** Overridable so tests can run the heartbeat in milliseconds instead of
+    * half-minutes — the interval is a contract (EIR-WS-04), not a constant
+    * the tests should have to wait out. */
+   pingIntervalMs?: number;
+ }
+ 
+ export function attachSessions({
+   server,
+   api,
+   logger,
++  fanout,
+   pingIntervalMs = PING_INTERVAL_MS,
+ }: SessionServerOptions): { registry: Registry; close: () => void } {
+   const registry = new Registry();
++
++  /** A frame arriving from the fabric — born on this instance or another,
++   * indistinguishable by design — becomes message.created for every local
++   * member of its channel. */
++  function deliver(channelId: string, message: Message): void {
++    for (const connection of registry.subscribersOf(channelId)) {
++      send(connection.socket, { type: "message.created", payload: message });
++    }
++  }
++  fanout?.onDelivery(deliver);
+   // noServer: the upgrade is handled by hand so the token can be checked
+   // BEFORE the handshake completes. Letting ws own the upgrade would mean
+   // rejecting a socket that already exists (EIR-WS-05 wants the close code
+   // on a connection we never really opened).
+   const wss = new WebSocketServer({ noServer: true });
+ 
+   server.on("upgrade", (req: IncomingMessage, socket, head) => {
+     const url = new URL(req.url ?? "/", "http://localhost");
+     if (url.pathname !== "/v1/ws") {
+       socket.destroy();
+       return;
+     }
+     const token = url.searchParams.get("token");
+     void (async () => {
+       const identity = token ? await verifyToken(token) : null;
+       wss.handleUpgrade(req, socket, head, (ws) => {
+         if (!identity) {
+           // 4001: "invalid or expired token" (EIR-WS-05). The close code is
+           // the protocol package's, not a number invented here.
+           ws.close(4001, CLOSE_CODES[4001]);
+           logger.log("info", "connection.rejected", { reason: "bad_token" });
+           return;
+         }
+         void open(ws, identity);
+       });
+     })();
+   });
+ 
+   async function open(socket: WebSocket, identity: Identity): Promise<void> {
+     const connection: Connection = {
+       id: randomUUID(),
+       identity,
+       socket,
+       channelIds: new Set(),
+       missedPings: 0,
+     };
+     try {
+       connection.channelIds = new Set(await api.memberships(identity));
+     } catch (error) {
+       // The api is the only source of membership (ADR-05). If it cannot
+       // answer, we do not guess — we close, and the client retries with
+       // backoff. A session with unknown memberships would deliver nothing
+       // and look healthy doing it.
+       logger.log("error", "connection.memberships_failed", {
+         connection_id: connection.id,
+         error: String(error),
+       });
+       socket.close(1011, "membership lookup failed");
+       return;
+     }
+ 
+     registry.add(connection);
++    // Subscriptions follow membership: the first local member of a channel
++    // makes this instance a subscriber, and the last one to leave releases
++    // it (reference-counted in the fabric).
++    //
++    // NOT AWAITED, and that is the whole point. EIR-WS-03 gives the
++    // handshake one second, and the fabric is the one dependency in this
++    // path that is ALLOWED to be down (ADR-07). Awaiting it here made the
++    // ack wait on Redis — a stopped broker stopped connections dead, which
++    // is a far worse failure than the dropped frames the fabric is
++    // permitted. Subscriptions land when they land; ioredis replays them on
++    // reconnect, and until then this instance is simply deaf, which is the
++    // documented cost.
++    void Promise.all(
++      [...connection.channelIds].map((channelId) =>
++        fanout?.subscribe(channelId).catch((error: unknown) => {
++          logger.log("error", "fanout.subscribe_failed", {
++            channel: channelId,
++            error: String(error),
++          });
++        }),
++      ),
++    );
+     logger.log("info", "connection.opened", {
+       connection_id: connection.id,
+       user: identity.userExternalId,
+       channels: connection.channelIds.size,
+     });
+ 
+     // EIR-WS-03: identity and a resume cursor within one second. The cursor
+     // is empty here and means it for the first time in 2.7 — the field
+     // exists because the contract says so, not because we have data for it.
+     send(socket, {
+       type: "connection.ack",
+       payload: {
+         user: identity.userExternalId,
+         cursor: {},
+         resume_ok: true,
+         truncated: [],
+       },
+     });
+ 
+     socket.on("pong", () => {
+       connection.missedPings = 0;
+     });
+     socket.on("message", (raw) => void handle(connection, raw.toString()));
+     socket.on("close", (code) => {
+       registry.remove(connection.id);
++      void Promise.all(
++        [...connection.channelIds].map((channelId) =>
++          fanout?.unsubscribe(channelId),
++        ),
++      );
+       logger.log("info", "connection.closed", {
+         connection_id: connection.id,
+         code,
+       });
+     });
+   }
+ 
+   async function handle(connection: Connection, raw: string): Promise<void> {
+     let parsed: unknown;
+     try {
+       parsed = JSON.parse(raw);
+     } catch {
+       sendError(connection.socket, "invalid_frame", "frame is not JSON");
+       return;
+     }
+     const frame = frameSchema.safeParse(parsed);
+     if (!frame.success) {
+       sendError(
+         connection.socket,
+         "invalid_frame",
+         frame.error.issues[0]?.message ?? "frame failed schema validation",
+       );
+       return;
+     }
+     if (frame.data.type !== "message.send") {
+       // Everything else in the union is server → client. A client uttering
+       // one is a protocol violation, not a malformed frame (EIR-WS-06).
+       sendError(
+         connection.socket,
+         "unknown_frame_type",
+         `clients may not send ${frame.data.type}`,
+       );
+       connection.socket.close(4002, CLOSE_CODES[4002]);
+       return;
+     }
+ 
+     const { channel, text, idem_key } = frame.data.payload;
+     try {
+-      const { seq } = await api.sendMessage(connection.identity, {
++      const committed = await api.sendMessage(connection.identity, {
+         channel_id: channel,
+         text,
+         idempotency_key: idem_key,
+       });
++      const { seq } = committed;
+       // The ack carries the sequence the API committed — after the commit,
+       // never before (FR-MSG-05, unchanged since 2.2; the socket is a new
+       // door onto the same write path).
+       send(connection.socket, { type: "message.ack", payload: { seq } });
++      // …and only THEN does anyone else hear about it. Durability, then the
++      // sender's confirmation, then everybody's copy: no step overtakes the
++      // one before it (§5.1's ordering, now spanning machines).
++      //
++      // A RECOGNISED RETRY IS NOT REPUBLISHED. 2.3 made the retry safe for
++      // storage; that did not make it safe for delivery, and a client that
++      // retries on a flaky link would otherwise put the same message on
++      // every member's screen twice. `text === null` is the same argument:
++      // a tombstone recovered by an old key is not a creation.
++      if (!committed.duplicate && committed.text !== null) {
++        await fanout?.publish({
++          id: committed.id,
++          channel: committed.channel_id,
++          seq: committed.seq,
++          user: committed.user,
++          text: committed.text,
++          created_at: committed.created_at,
++        });
++      }
+     } catch (error) {
+       logger.log("error", "send.failed", {
+         connection_id: connection.id,
+         error: String(error),
+       });
+       sendError(connection.socket, "internal_error", "send failed");
+     }
+   }
+ 
+   const heartbeat = setInterval(() => {
+     for (const connection of registry.all()) {
+       if (connection.missedPings >= MAX_MISSED_PINGS) {
+         // A dead socket that looks alive is a resume that never triggers
+         // (EIR-WS-04). 2.7 needs death to be detected promptly.
+         connection.socket.close(1001, "ping timeout");
+         registry.remove(connection.id);
+         continue;
+       }
+       connection.missedPings += 1;
+       connection.socket.ping();
+     }
+   }, pingIntervalMs);
+ 
+   return {
+     registry,
+     close: () => {
+       clearInterval(heartbeat);
+       wss.close();
+     },
+   };
+ }
+```
+
+Two decisions inside that diff earned their comments the hard way.
+
+**The handshake never waits on the fabric.** The first version of this
+code awaited the subscribes before sending `connection.ack` — which reads
+as careful (don't ack a session that isn't listening yet) and is in fact
+the worst bug in the chapter. Run it with Redis stopped and the client
+gets *nothing*: `ioredis` queues commands while disconnected, so the
+subscribe promise never settles, so the ack never goes out, so a broker
+that is *allowed to be down* takes connection establishment with it.
+EIR-WS-03 gives the handshake one second; the fabric has no place in that
+budget. Subscriptions are fired and forgotten, they land when the broker
+comes back, and until then the instance is deaf — which is precisely the
+cost ADR-07 already agreed to pay.
+
+**The sender hears its own message twice**, and that is intended: once as
+`message.ack` (which carries only `seq`), then once as `message.created`
+with the id and timestamp. The publishing instance is a subscriber like
+any other, so the echo costs nothing extra and every client — sender or
+not — renders messages through one code path.
+
+```diff title="services/gateway/src/main.ts"
+ import { CLOSE_CODES, frameSchema } from "@relay/protocol";
+ import { createLogger, serve, type Logger } from "@relay/service-kit";
+ 
+ import { createApiClient } from "./api-client.js";
++import { createFanout } from "./fanout.js";
+ import { attachSessions } from "./session.js";
+ 
+ // The gateway — SAD §4.1: terminates WebSockets and never writes to the
+ // database (ADR-05). Chapter 1.4 stood up the HTTP half (health, request
+-// ids, structured logs); chapter 2.5 gives it the job it exists for. The
++// ids, structured logs); chapter 2.5 gives it the job it exists for, and
++// 2.6 makes that job survive a second instance. The
+ // health payload still advertises the wire vocabulary, computed from
+ // @relay/protocol so the advertisement cannot drift from the contract.
+ 
+ const frames = frameSchema.options.map((option) => option.shape.type.value);
+ const closeCodes = Object.keys(CLOSE_CODES).map(Number);
+ 
+ export const DEFAULT_API_URL = "http://localhost:4000";
+ 
+ export function createServer(logger?: Logger) {
+   const log = logger ?? createLogger("gateway");
+   const server = serve({
+     service: "gateway",
+     health: () => ({
+       uptime_s: Math.round(process.uptime()),
+       protocol: { frames, close_codes: closeCodes },
+     }),
+     logger: log,
+   });
+   // The socket server rides the SAME listener as health — one port, two
+   // protocols, which is what an upgrade handshake is for.
++  // Every instance is both publisher and subscriber: there is no leader
++  // here, and no instance knows how many others exist (ADR-07). Scaling
++  // out is adding a process.
++  const fanout = createFanout({ logger: log });
+   const sessions = attachSessions({
+     server,
+     api: createApiClient(process.env.RELAY_API_URL ?? DEFAULT_API_URL),
+     logger: log,
++    fanout,
+   });
+-  server.on("close", sessions.close);
++  server.on("close", () => {
++    sessions.close();
++    void fanout.close();
++  });
+   return server;
+ }
+ 
+ if (import.meta.main) {
+   const port = Number(process.env.PORT ?? 4001);
+   const logger = createLogger("gateway");
+   createServer(logger).listen(port, () => {
+     logger.log("info", "listening", { port });
+   });
+ }
+```
+
+<Trap>
+
+2.3 made a retry safe for *storage*. It did not make a retry safe for
+*delivery*, and the wire contract guarantees you will meet the difference:
+`idem_key` is **required** on every `message.send` frame, so every socket
+send is retryable by construction. A client on a flaky link sends, times
+out, retries; the api recognises the key and returns the original message,
+correctly, with the same id and sequence; and a naive `publish` then puts
+that message on every member's screen a *second* time. The database is
+pristine and the conversation looks broken — the failure mode 2.3's
+chapter was written to prevent, reappearing one layer up. Hence the guard:
+publish only what was actually created. `text === null` is the same
+argument in a different costume — a tombstone recovered by an old
+idempotency key is not a creation, and `message.created` is the wrong
+frame for it.
+
+</Trap>
+
+## What Redis is — and is pointedly not
+
+SAD §6.3 titles itself "Redis — ephemeral state only," and this chapter is
+its first consumer, so the discipline gets set now. Everything this
+chapter puts in Redis is *reconstructible*: subscriptions re-establish on
+reconnect, in-flight frames are recoverable from Postgres by sequence. The
+test for any future Redis use is one question — *if Redis vanished right
+now, what would be lost?* — and the only acceptable answer is "latency."
+No message bodies as truth, no counters that bill, no state whose loss a
+customer could name. (Presence and rate-limit buckets pass the same test
+when their chapters arrive: a lost presence bit rebuilds from connection
+state; a lost bucket refills conservatively.)
+
+That discipline is also why the compose stack's Redis needs no volume, and
+why 7.4's chaos drill can kill Redis mid-conversation and expect the
+system to shrug.
+
+The gateway grows its own integration lane for the first time — the
+`*.itest.ts` convention from 2.1, now with a second member, because a
+fabric test needs a real broker:
+
+```ts title="services/gateway/vitest.integration.config.mts"
+import { defineConfig } from "vitest/config";
+
+// The gateway's integration lane (chapter 2.6). Same convention 2.1
+// established for the api: *.itest.ts is invisible to the Docker-free unit
+// include, and this config is what `pnpm --filter @relay/gateway
+// test:integration` runs against the compose Redis.
+export default defineConfig({
+  test: {
+    include: ["src/**/*.itest.ts"],
+  },
+});
+```
+
+```diff title="services/gateway/package.json"
+ {
+   "name": "@relay/gateway",
+   "private": true,
+   "version": "0.0.0",
+   "type": "module",
+   "scripts": {
+     "dev": "tsx watch src/main.ts",
+     "typecheck": "tsc --noEmit",
+-    "test": "vitest run"
++    "test": "vitest run",
++    "test:integration": "vitest run --config vitest.integration.config.mts"
+   },
+   "dependencies": {
+     "@relay/protocol": "workspace:*",
+     "@relay/service-kit": "workspace:*",
++    "ioredis": "^6.0.0",
+     "jose": "^6.2.7",
+     "ws": "^8.21.1"
+   },
+   "devDependencies": {
+     "@types/ws": "^8.18.1",
+     "tsx": "^4.23.1"
+   }
+ }
+```
+
+The test that matters is the one a single process cannot fake. Two fabric
+clients stand in for two instances: same code, same broker, no knowledge
+of each other.
+
+```ts title="services/gateway/src/fanout.itest.ts"
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+
+import { createLogger } from "@relay/service-kit";
+import type { Message } from "@relay/protocol";
+
+import { createFanout, subjectFor, type Fanout } from "./fanout.js";
+
+// Chapter 2.6's real test: the one behaviour a single-process test CANNOT
+// show. Two fabric clients stand in for two gateway instances — same code,
+// same Redis, no knowledge of each other. If a message published by one
+// arrives at the other, the split brain is closed.
+//
+// This file is a `.itest.ts`, so the Docker-free lane never sees it (the
+// two-lane gate, chapter 2.1). It needs the compose Redis:
+//   docker compose up -d redis
+//   RELAY_REDIS_PORT=16379 pnpm --filter @relay/gateway test:integration
+
+const url = `redis://localhost:${process.env.RELAY_REDIS_PORT ?? "6379"}`;
+const logger = createLogger("fanout-itest");
+
+const CHANNEL = "11111111-1111-1111-1111-111111111111";
+const OTHER = "22222222-2222-2222-2222-222222222222";
+
+function messageOn(channel: string, seq: number): Message {
+  return {
+    id: `00000000-0000-0000-0000-${String(seq).padStart(12, "0")}`,
+    channel,
+    seq,
+    user: "linh",
+    text: `message ${seq}`,
+    created_at: new Date().toISOString(),
+  };
+}
+
+/** Redis pub/sub is fire-and-forget, so a test cannot poll a queue — it
+ * waits for the callback, with a deadline. A failure here is a real
+ * failure: the frame did not cross. */
+function nextDelivery(
+  instance: { deliveries: Array<[string, Message]> },
+  timeoutMs = 2000,
+): Promise<[string, Message]> {
+  const started = Date.now();
+  return new Promise((resolve, reject) => {
+    const tick = setInterval(() => {
+      const delivery = instance.deliveries.shift();
+      if (delivery) {
+        clearInterval(tick);
+        resolve(delivery);
+      } else if (Date.now() - started > timeoutMs) {
+        clearInterval(tick);
+        reject(new Error("no delivery within the deadline"));
+      }
+    }, 10);
+  });
+}
+
+/** One gateway instance's worth of fabric, with its deliveries recorded. */
+function instance(): { fanout: Fanout; deliveries: Array<[string, Message]> } {
+  const deliveries: Array<[string, Message]> = [];
+  const fanout = createFanout({ url, logger });
+  fanout.onDelivery((channelId, message) =>
+    deliveries.push([channelId, message]),
+  );
+  return { fanout, deliveries };
+}
+
+describe("fan-out across instances", () => {
+  let g1: ReturnType<typeof instance>;
+  let g2: ReturnType<typeof instance>;
+
+  beforeAll(() => {
+    g1 = instance();
+    g2 = instance();
+  });
+
+  afterAll(async () => {
+    await g1.fanout.close();
+    await g2.fanout.close();
+  });
+
+  it("delivers a message published on one instance to a subscriber on another", async () => {
+    await g2.fanout.subscribe(CHANNEL);
+    await g1.fanout.publish(messageOn(CHANNEL, 1));
+
+    const [channelId, message] = await nextDelivery(g2);
+    expect(channelId).toBe(CHANNEL);
+    expect(message.seq).toBe(1);
+    expect(message.text).toBe("message 1");
+    // Attribution survives the hop — the field chapter 2.6 had to add
+    // before this frame could exist at all.
+    expect(message.user).toBe("linh");
+  });
+
+  it("does not deliver channels an instance has no member of", async () => {
+    await g1.fanout.publish(messageOn(OTHER, 2));
+    await expect(nextDelivery(g2, 300)).rejects.toThrow("deadline");
+    // …and the subscribed channel still works, so the silence above was
+    // scoping, not a broken connection.
+    await g1.fanout.publish(messageOn(CHANNEL, 3));
+    const [, message] = await nextDelivery(g2);
+    expect(message.seq).toBe(3);
+  });
+
+  it("keeps the subscription while a second local member holds it", async () => {
+    // Two sockets on one instance, same channel: the first subscribe
+    // opened it, the second must not be able to close it.
+    await g2.fanout.subscribe(CHANNEL);
+    await g2.fanout.unsubscribe(CHANNEL);
+
+    await g1.fanout.publish(messageOn(CHANNEL, 4));
+    const [, message] = await nextDelivery(g2);
+    expect(message.seq).toBe(4);
+
+    // The last holder leaving DOES close it.
+    await g2.fanout.unsubscribe(CHANNEL);
+    await g1.fanout.publish(messageOn(CHANNEL, 5));
+    await expect(nextDelivery(g2, 300)).rejects.toThrow("deadline");
+  });
+
+  it("drops a payload the contract does not allow instead of forwarding it", async () => {
+    await g2.fanout.subscribe(CHANNEL);
+    // Something else — an older instance, a stray script, a compromised
+    // dependency — puts junk on the subject. It must not reach a client.
+    const raw = instance();
+    await raw.fanout.publish(messageOn(CHANNEL, 6));
+    const [, good] = await nextDelivery(g2);
+    expect(good.seq).toBe(6);
+
+    await new Promise<void>((resolve) => {
+      const redis = raw.fanout;
+      void redis.publish({
+        ...messageOn(CHANNEL, 7),
+        seq: -1, // schema demands a positive integer
+      });
+      setTimeout(resolve, 100);
+    });
+    await expect(nextDelivery(g2, 300)).rejects.toThrow("deadline");
+    await raw.fanout.close();
+  });
+
+  it("names subjects per channel, so an instance hears only what it can deliver", () => {
+    expect(subjectFor(CHANNEL)).toBe(`chan:${CHANNEL}`);
+  });
+});
+```
+
+Everything *else* about fan-out is a decision the gateway makes, not the
+broker, so it belongs in the Docker-free lane with a recording stub — what
+gets published, in what order relative to the ack, and what does not get
+published at all:
+
+```diff title="services/gateway/src/session.test.ts"
+ import { SignJWT } from "jose";
+ import { WebSocket } from "ws";
+ import { afterEach, describe, expect, it } from "vitest";
+ import type { Server } from "node:http";
+ import type { AddressInfo } from "node:net";
+ 
+ import { createLogger, type Logger } from "@relay/service-kit";
+ import { serve } from "@relay/service-kit";
+ import type { Frame } from "@relay/protocol";
+ 
+ import type { InternalSendResponse } from "@relay/protocol";
+ 
+ import type { ApiClient } from "./api-client.js";
+ import { DEV_JWT_SECRET } from "./auth.js";
++import type { Fanout } from "./fanout.js";
+ import { attachSessions } from "./session.js";
+ 
+ // The door, the frames, and the liveness clock — all provable without a
+ // database, because the gateway has no database (ADR-05). The api is a
+ // stub here for exactly that reason: if these tests needed Postgres, the
+ // gateway would be doing something it is not allowed to do.
+ 
+ const silent: Logger = createLogger("gateway", () => {});
+ 
+ // The stub cannot lie about the shape: ApiClient's types come from
+ // @relay/protocol's internal contract, so a partial response is a compile
+ // error here — the same guarantee the real client gets at runtime.
+ function committed(seq: number): InternalSendResponse {
+   return {
+     id: "00000000-0000-0000-0000-000000000001",
+     channel_id: "11111111-1111-1111-1111-111111111111",
+     seq,
++    user: "tuan",
+     text: "hello",
+     created_at: new Date().toISOString(),
+   };
+ }
+ 
+ function stubApi(overrides: Partial<ApiClient> = {}): ApiClient {
+   return {
+     memberships: async () => ["11111111-1111-1111-1111-111111111111"],
+     sendMessage: async () => committed(42),
+     ...overrides,
+   };
+ }
+ 
+ async function token(claims: Record<string, string> = {}): Promise<string> {
+   return new SignJWT({ env: "env-1", ...claims })
+     .setProtectedHeader({ alg: "HS256" })
+     .setSubject("tuan")
+     .sign(new TextEncoder().encode(DEV_JWT_SECRET));
+ }
+ 
+ interface Harness {
+   url: string;
+   close: () => Promise<void>;
+ }
+ 
++/** A fabric that records instead of connecting. What gets published, and
++ * in what order relative to the ack, is the gateway's decision — provable
++ * without Redis. Chapter 2.6's itest covers the part that needs a broker. */
++function stubFanout(): Fanout & { published: unknown[]; subjects: string[] } {
++  const published: unknown[] = [];
++  const subjects: string[] = [];
++  return {
++    published,
++    subjects,
++    onDelivery: () => {},
++    publish: async (message) => {
++      published.push(message);
++    },
++    subscribe: async (channelId) => {
++      subjects.push(channelId);
++    },
++    unsubscribe: async () => {},
++    close: async () => {},
++  };
++}
++
+ async function boot(
+   api: ApiClient = stubApi(),
+   pingIntervalMs?: number,
++  fanout?: Fanout,
+ ): Promise<Harness> {
+   const server: Server = serve({
+     service: "gateway",
+     health: () => ({}),
+     logger: silent,
+   });
+   const sessions = attachSessions({
+     server,
+     api,
+     logger: silent,
++    ...(fanout !== undefined && { fanout }),
+     ...(pingIntervalMs !== undefined && { pingIntervalMs }),
+   });
+   await new Promise<void>((resolve) => server.listen(0, resolve));
+   const { port } = server.address() as AddressInfo;
+   return {
+     url: `ws://127.0.0.1:${port}/v1/ws`,
+     close: async () => {
+       sessions.close();
+       await new Promise<void>((resolve) => server.close(() => resolve()));
+     },
+   };
+ }
+ 
+ /** Collect frames until a predicate matches, or reject on close/timeout. */
+ function nextFrame(socket: WebSocket, type: Frame["type"]): Promise<Frame> {
+   return new Promise((resolve, reject) => {
+     const timer = setTimeout(() => reject(new Error(`no ${type} frame`)), 2000);
+     socket.on("message", (raw) => {
+       const frame = JSON.parse(raw.toString()) as Frame;
+       if (frame.type === type) {
+         clearTimeout(timer);
+         resolve(frame);
+       }
+     });
+     socket.on("close", (code) => {
+       clearTimeout(timer);
+       reject(new Error(`closed ${code}`));
+     });
+   });
+ }
+ 
+ function closeCode(socket: WebSocket): Promise<number> {
+   return new Promise((resolve) => socket.on("close", (code) => resolve(code)));
+ }
+ 
+ describe("the socket (chapter 2.5)", () => {
+   let harness: Harness | undefined;
+   afterEach(async () => {
+     await harness?.close();
+     harness = undefined;
+   });
+ 
+   it("acks a valid connection with identity and a resume cursor (EIR-WS-03)", async () => {
+     harness = await boot();
+     const started = Date.now();
+     const socket = new WebSocket(`${harness.url}?token=${await token()}`);
+     const ack = await nextFrame(socket, "connection.ack");
+     // Inside EIR-WS-03's one-second budget, measured rather than asserted.
+     expect(Date.now() - started).toBeLessThan(1000);
+     expect(ack).toMatchObject({
+       type: "connection.ack",
+       payload: { user: "tuan", resume_ok: true, truncated: [] },
+     });
+     socket.close();
+   });
+ 
+   it("rejects a bad token with 4001 before any frame (EIR-WS-05)", async () => {
+     harness = await boot();
+     for (const bad of ["", "not-a-jwt", await token({ env: "" })]) {
+       const socket = new WebSocket(`${harness.url}?token=${bad}`);
+       expect(await closeCode(socket)).toBe(4001);
+     }
+   });
+ 
+   it("forwards message.send to the api and acks the committed sequence", async () => {
+     const sent: unknown[] = [];
+     harness = await boot(
+       stubApi({
+         sendMessage: async (identity, body) => {
+           sent.push({ identity, body });
+           return committed(7);
+         },
+       }),
+     );
+     const socket = new WebSocket(`${harness.url}?token=${await token()}`);
+     await nextFrame(socket, "connection.ack");
+     socket.send(
+       JSON.stringify({
+         type: "message.send",
+         payload: { idem_key: "k1", channel: "c1", text: "hello" },
+       }),
+     );
+     const ack = await nextFrame(socket, "message.ack");
+     expect(ack).toMatchObject({ type: "message.ack", payload: { seq: 7 } });
+     // The gateway carried; the api decided. The identity travelled with it.
+     expect(sent).toEqual([
+       {
+         identity: { userExternalId: "tuan", environmentId: "env-1" },
+         body: { channel_id: "c1", text: "hello", idempotency_key: "k1" },
+       },
+     ]);
+     socket.close();
+   });
+ 
+   it("answers garbage with the protocol's error envelope", async () => {
+     harness = await boot();
+     const socket = new WebSocket(`${harness.url}?token=${await token()}`);
+     await nextFrame(socket, "connection.ack");
+     socket.send("this is not json");
+     const error = await nextFrame(socket, "error");
+     expect(error).toMatchObject({
+       type: "error",
+       payload: { code: "invalid_frame" },
+     });
+     socket.close();
+   });
+ 
+   it("closes with 4002 when a client utters a server-only frame (EIR-WS-06)", async () => {
+     harness = await boot();
+     const socket = new WebSocket(`${harness.url}?token=${await token()}`);
+     await nextFrame(socket, "connection.ack");
+     // message.ack is the SERVER's word. A client sending it is not
+     // malformed input — it is a protocol violation.
+     socket.send(JSON.stringify({ type: "message.ack", payload: { seq: 1 } }));
+     expect(await closeCode(socket)).toBe(4002);
+   });
+ 
+   it("closes a socket that stops answering pings (EIR-WS-04)", async () => {
+     // The interval is injectable so the contract can be tested in
+     // milliseconds instead of a minute and a half.
+     harness = await boot(stubApi(), 20);
+     const socket = new WebSocket(`${harness.url}?token=${await token()}`);
+     await nextFrame(socket, "connection.ack");
+     socket.pong = () => {}; // stop answering
+     expect(await closeCode(socket)).toBe(1001);
+   });
++  it("subscribes to every channel the session can hear (chapter 2.6)", async () => {
++    const fanout = stubFanout();
++    harness = await boot(stubApi(), undefined, fanout);
++    const socket = new WebSocket(`${harness.url}?token=${await token()}`);
++    await nextFrame(socket, "connection.ack");
++    // Membership decides subscriptions: an instance hears exactly the
++    // channels its local sockets belong to, nothing more.
++    expect(fanout.subjects).toEqual(["11111111-1111-1111-1111-111111111111"]);
++    socket.close();
++  });
++
++  it("acks the handshake even when the fabric never answers (chapter 2.6)", async () => {
++    const fanout = stubFanout();
++    // A broker that is down, modelled honestly: subscribe never settles.
++    // ioredis queues the command and replays it on reconnect, so the
++    // promise can stay pending indefinitely.
++    fanout.subscribe = () => new Promise<void>(() => {});
++    harness = await boot(stubApi(), undefined, fanout);
++    const socket = new WebSocket(`${harness.url}?token=${await token()}`);
++    // EIR-WS-03's budget is not negotiable, and the fabric is the one
++    // dependency here that is ALLOWED to be down (ADR-07). Awaiting the
++    // subscribe made a stopped Redis stop connections — worse than the
++    // dropped frames at-most-once already permits.
++    const ack = await nextFrame(socket, "connection.ack");
++    expect(ack).toMatchObject({ type: "connection.ack" });
++    socket.close();
++  });
++
++  it("publishes the committed message only after the ack (chapter 2.6)", async () => {
++    const fanout = stubFanout();
++    harness = await boot(stubApi(), undefined, fanout);
++    const socket = new WebSocket(`${harness.url}?token=${await token()}`);
++    await nextFrame(socket, "connection.ack");
++    socket.send(
++      JSON.stringify({
++        type: "message.send",
++        payload: {
++          // idem_key is REQUIRED by the wire contract (2.3): every socket
++          // send is retryable by construction, which is exactly why the
++          // republish rule below matters.
++          idem_key: "k-0",
++          channel: "11111111-1111-1111-1111-111111111111",
++          text: "hello",
++        },
++      }),
++    );
++    await nextFrame(socket, "message.ack");
++    // The published frame is the WIRE shape, not the internal response:
++    // `channel`, not `channel_id`, and a sender that came back from the
++    // api rather than being asserted by the gateway.
++    expect(fanout.published).toEqual([
++      {
++        id: "00000000-0000-0000-0000-000000000001",
++        channel: "11111111-1111-1111-1111-111111111111",
++        seq: 42,
++        user: "tuan",
++        text: "hello",
++        created_at: expect.any(String),
++      },
++    ]);
++    socket.close();
++  });
++
++  it("does not republish a recognised retry (chapter 2.6's trap)", async () => {
++    const fanout = stubFanout();
++    harness = await boot(
++      // The api recognised 2.3's idempotency key and returned the
++      // ORIGINAL message. Storage stayed correct; delivery must not now
++      // put the same message on every screen a second time.
++      stubApi({
++        sendMessage: async () => ({ ...committed(42), duplicate: true }),
++      }),
++      undefined,
++      fanout,
++    );
++    const socket = new WebSocket(`${harness.url}?token=${await token()}`);
++    await nextFrame(socket, "connection.ack");
++    socket.send(
++      JSON.stringify({
++        type: "message.send",
++        payload: {
++          channel: "11111111-1111-1111-1111-111111111111",
++          text: "hello",
++          idem_key: "k-1",
++        },
++      }),
++    );
++    // The sender is still acked — the retry SUCCEEDED, and FR-MSG-04 says
++    // it looks like a first send.
++    expect(await nextFrame(socket, "message.ack")).toMatchObject({
++      payload: { seq: 42 },
++    });
++    expect(fanout.published).toEqual([]);
++    socket.close();
++  });
+ });
+```
+
+At the tag, the two lanes read: **52 unit tests** (config 6, service-kit
+3, protocol 26, api 6, gateway 12) with no Docker, and **31 integration
+tests across 7 files** — the api's 26 against Postgres, the gateway's 5
+against Redis.
+
+## Walk it
+
+Re-run the split-brain script with the fabric wired:
+
+```bash
+docker compose up -d --wait redis
+node scripts/split-brain.mjs
+```
+
+```text
+both connected — dispatcher on G1, Tuan on G2
+
+dispatcher sends on G1:
+  dispatcher(G1) ← {"type":"message.ack","payload":{"seq":1}}
+  dispatcher(G1) ← {"type":"message.created","payload":{"id":"aea33d4d-d3c9-4bbe-9cf2-5d42151bb041","channel":"35227465-a4b1-419e-bec9-69da666096cf","seq":1,"user":"dispatcher","text":"which entrance?","created_at":"2026-08-03T13:20:51.663Z"}}
+  tuan(G2)       ← {"type":"message.created","payload":{"id":"aea33d4d-d3c9-4bbe-9cf2-5d42151bb041","channel":"35227465-a4b1-419e-bec9-69da666096cf","seq":1,"user":"dispatcher","text":"which entrance?","created_at":"2026-08-03T13:20:51.663Z"}}
+
+Tuan heard it (1 message.created). Two servers, one conversation.
+```
+
+Identical ids, identical sequence, a named sender, and one frame arriving
+on a machine that has never heard of the machine that produced it.
+
+Then do the thing that proves the argument rather than the happy path:
+stop Redis mid-conversation, keep sending, and bring it back. Measured on
+three sends — one before the outage, one during, one after:
+
+```text
+redis up:                  dispatcher acks=1 errors=0 | tuan message.created=1
+redis stopped:             dispatcher acks=2 errors=0 | tuan message.created=1
+redis restarted:           dispatcher acks=3 errors=0 | tuan message.created=2
+
+in postgres: 3 messages — 3:redis back, 2:during outage, 1:redis up
+```
+
+Read that middle line carefully, because it is the whole chapter in one
+row. With the broker down the send still **acked** — no error, no failed
+write; the write path never touched Redis. What was lost is exactly one
+live frame. And the last line is why that is acceptable: the message
+nobody heard is in Postgres, numbered `2`, sitting between the two that
+*were* delivered. History shows it now; 2.7's resume will hand it to a
+live socket without asking Redis to remember anything. Delivery resumed
+on its own, too — `ioredis` replays its subscriptions on reconnect, so no
+operator action put the conversation back together.
+
+The fabric's amnesia is not a failure mode. It is the design, and this
+transcript is the receipt.
+
+<ForwardRef part="Part 2 and beyond">
+
+Three IOUs leave this chapter. The `duplicate` flag now crosses the
+internal boundary, but `user` still does not reach the *history* response
+— 2.4's reads predate attribution, and 2.7 is where a resumed session
+needs frames identical to the live ones, so that is where the read path
+catches up. A REST-originated send (2.2's public endpoint, no gateway
+involved) commits but reaches no socket: the WS path publishes because a
+gateway handled it, and nothing publishes for the api's own writes. That
+asymmetry is 3.3's opening argument — the transactional outbox gives
+*every* committed write an event that fans out, regardless of which door
+it entered. And presence (FR-RTM-06) and typing (FR-RTM-08) will reuse
+this exact pub/sub plumbing with TTLs per ADR-10.
+
+</ForwardRef>
+
+## Your turn
+
+The exercise is the build: `fanout.ts`, the subscription lifecycle, the
+second integration lane, the two-instance script. Then break the fabric
+with intent:
+
+1. Re-stage the split brain (stop Redis, or comment out the subscribe
+   call) and watch FR-RTM-02 fail *silently* — no error anywhere, just a
+   half-deaf conversation. This is why the 2.8 suite runs two instances:
+   single-instance tests cannot see this entire class of bug.
+2. Put the `await` back in front of the handshake's subscribe, stop Redis,
+   and connect. Nothing arrives — not even a close code. Then decide which
+   of the two failures you would rather explain to a customer.
+3. Publish a hand-crafted garbage payload to `chan:...` with `redis-cli`
+   and watch it get dropped and logged rather than forwarded. The fabric
+   is inside the trust boundary, and frames still get validated, because
+   "inside" is one compromised dependency away from "outside."
+4. Connect the same user to *both* instances (FR-RTM-09 allows five
+   concurrent connections). Send once; confirm both sockets receive
+   exactly one copy each — per-connection delivery, deduplicated by
+   nothing, because each socket legitimately wants its own copy.
+
+If you are stuck, the tag holds the answer key: `part2-ch6`.
+
+## Takeaways
+
+If you read nothing else in this chapter, keep these:
+
+- **Correct components can still lose the conversation** — per-instance
+  registries are right and insufficient; FR-RTM-02 is a property of the
+  *fleet*, not of any instance.
+- **Stickiness is the trap with the best reviews** (CON-02 bans it):
+  routing-as-delivery converts one problem you can solve into placement
+  problems you can only manage.
+- **A dependency allowed to fail must not be awaited on a path that
+  cannot** — the ack budget belongs to the client, not to the broker.
+- **Publish after ack, and publish only what was created**: durability,
+  sender, everyone else — and a recognised retry is not a creation.
+- **At-most-once is a purchase, not a compromise** (ADR-07): Postgres
+  sequences bought the right to a fabric with no memory, and 2.7 is where
+  the receipt gets cashed.
+- **Redis holds nothing that can be lost** (§6.3): the test is "what dies
+  with it?", and the only acceptable casualty is latency.
+
+<Checkpoint>
+
+Before starting chapter 2.7, you should have: two gateway instances
+delivering one conversation through `chan:{channel_id}`; subscriptions
+following the registry's membership and never blocking a handshake;
+messages that name their sender in the database; a retry that is stored
+once and delivered once; the stop-Redis drill witnessed — sends acked,
+one frame lost, nothing durable moved, delivery resuming by itself; the
+gateway's integration lane green against compose Redis and the unit lane
+still Docker-free. That state is tag `part2-ch6` in the canonical
+repository. Chapter 2.7 drives into the tunnel: everything this chapter
+allowed itself to drop, the resume protocol now has to repair — exactly
+once, in order.
+
+</Checkpoint>
+
+<ChapterFooter id="2.6" />
