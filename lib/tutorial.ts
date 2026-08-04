@@ -266,12 +266,15 @@ export const series: Part[] = [
         id: "2.7",
         path: "/part-2/chapter-07/the-tunnel",
         title: "The tunnel",
-        status: "forthcoming",
+        status: "published",
+        translatedIn: [],
         readerProduces:
           "Resume protocol: cursors, backfill, subscribe-before-backfill buffer",
         sourceDoc: "docs/04-srs.md, docs/05-sad.md",
         readerMinutes: 100,
         titleVi: "Đường hầm",
+        readerProducesVi:
+          "Resume protocol: cursor, backfill, buffer subscribe-trước-backfill",
       },
       {
         id: "2.8",

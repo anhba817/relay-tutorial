@@ -1,0 +1,2305 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figRaceTimeline, figBufferMachine, figTunnelWalk } from "./figures";
+
+export const metadata = {
+  title: "The tunnel — Building Relay",
+  description:
+    "The series' flagship bug: the duplicate/gap race between backfill and live delivery, staged in both of its wrong orders — then closed with the subscribe-before-backfill buffer from SAD §5.2.",
+  alternates: {
+    canonical: "/part-2/chapter-07/the-tunnel",
+    languages: {
+      en: "/part-2/chapter-07/the-tunnel",
+      vi: "/vi/part-2/chapter-07/the-tunnel",
+    },
+  },
+};
+
+<ChapterHeader id="2.7" />
+
+Every chapter of this part has been quietly aimed at ninety seconds of
+silence in an underground car park. Tuan sent "B2, north ramp" as the
+signal died (2.3 made the retry safe); the dispatcher replied while he was
+gone (2.2 numbered it; 2.6 delivered it to everyone who could hear); and
+now his phone finds wifi and asks the question the whole platform exists
+to answer: *what did I miss?* The answer must be complete — no gaps — and
+it must not repeat itself — no duplicates — and the window in which both
+failures live is measured in milliseconds, between two operations that
+each look correct alone. This is the tutorial's flagship bug. The SAD
+staged it in §5.2 years before this code existed; today we reproduce it,
+both ways, and then close it.
+
+<SkipAhead>
+
+If you must skip: the gateway's connect path gains resume — cursors in the
+upgrade URL, then a strict five-step sequence: **subscribe first, buffer
+live frames, backfill from the api (seq > cursor, cap 500 with
+`truncated: true` per FR-RTM-04), flush the buffer discarding
+`seq ≤` the backfill's high-water mark, then go live**. Either naive
+ordering fails, and this chapter shows both failures as test output.
+Sequence numbers make the dedup one comparison (FR-RTM-03, SAD §5.2).
+Anything that cannot promise completeness — a broker that will not confirm
+a subscription, a corrupted cursor, an api that will not answer — acks
+`resume_ok: false` and names the channels to page instead. The chapter-end
+state is tag **`part2-ch7`**.
+
+</SkipAhead>
+
+## The question with two wrong answers
+
+FR-RTM-03 states the contract: "On reconnection with a resume cursor, the
+system shall deliver all messages with a sequence number greater than the
+cursor for every channel of which the user is a member." *All* — no gaps.
+And the whole part's spirit, soon to be 2.8's assertion, adds: no
+duplicates. The client's half is small: remember the highest seq it has
+applied per channel (the `connection.ack` has carried a cursor field since
+1.3, waiting for this chapter), present it on connect.
+
+The server's half decomposes into two operations we already own. Catch-up
+is a read: 2.4's `afterSeq` direction, capped. Live delivery is 2.6's
+subscription. Resume is "do both" — and "do both" has an ordering problem
+that no amount of care inside either operation can fix, because the
+failure lives *between* them, in time.
+
+## Stage the race — both ways
+
+Here is the timeline, concretely, with the numbers the test uses. Tuan's
+cursor says 41. The dispatcher's reply — seq 42 — is already in Postgres.
+And the dispatcher is *still typing*: seq 43 will be committed and
+published on the fabric during the milliseconds Tuan's resume takes.
+
+**Naive order one: backfill, then subscribe.** The gateway fetches
+`seq > 41`, gets `[42]`, delivers it, then subscribes. Seq 43 was
+published *while the backfill was in flight* — before the subscription
+existed. Redis is at-most-once with no memory (2.6 made that a feature);
+the frame is simply gone. Tuan's client believes it is live and current,
+and it is missing a message it will never learn about. **A gap — the worst
+failure this platform can have, because it is silent.**
+
+**Naive order two: subscribe, then deliver, no buffer.** Now the
+subscription is live during the backfill window, so seq 43 arrives —
+good — but it arrives *while* the backfill is still being assembled, and
+if it is also in the backfill it goes out **twice**. **A duplicate** —
+journey 4's original sin, resurrected on the read side after 2.3 killed
+it on the write side.
+
+The race is milliseconds wide, so the test does not hope to hit it. It
+*injects* it: the api stub publishes the live frame from inside the
+backfill call, which makes "a message published during the backfill
+window" a line of code rather than a stress loop.
+
+```text
+  it("stages the race: a frame published DURING backfill is neither lost nor doubled", async () => {
+    const fanout = stubFanout();
+    harness = await boot(
+      stubApi({
+        backfill: async () => {
+          fanout.emit(frame(43));
+          return {
+            [CHANNEL]: { messages: [frame(42), frame(43)], truncated: false },
+          };
+        },
+      }),
+      undefined,
+      fanout,
+    );
+    …
+    expect(seqs).toEqual([42, 43]);                 // complete…
+    expect(new Set(seqs).size).toBe(seqs.length);   // …and exactly once
+  });
+```
+
+Now the triptych. Run that test against each implementation and read what
+it says. **Naive order two** — the buffer removed, everything delivered on
+arrival:
+
+```text
+ FAIL  src/session.test.ts > stages the race: a frame published DURING backfill…
+AssertionError: expected [ 43, 42, 43 ] to deeply equal [ 42, 43 ]
+
+  [
++   43,
+    42,
+    43,
+  ]
+```
+
+Twice, *and* out of order — the live copy of 43 overtook the backfill that
+contained 42. **Naive order one** — the subscribe moved after the fetch:
+
+```text
+ FAIL  src/session.test.ts > stages the other interleaving: published during backfill…
+AssertionError: expected [ 42 ] to deeply equal [ 42, 43 ]
+
+  [
+    42,
+-   43,
+  ]
+```
+
+One line, one missing message, no error anywhere. And the same test
+against the implementation this chapter builds:
+
+```text
+ ✓ src/session.test.ts (21 tests)
+```
+
+Keep those three outputs side by side. That is the chapter.
+
+<Figure
+  caption="The §5.2 race, staged: seq 43 is published inside the backfill window. Subscribe too late and it falls in the gap; subscribe early without a buffer and it arrives twice. Both orders are wrong — the fix is neither order."
+  code={figRaceTimeline}
+/>
+
+## The fix is a buffer, not an ordering
+
+The SAD closes the race in one paragraph, quoted whole because it is the
+chapter: "subscribe-then-backfill can deliver a live frame that is also in
+the backfill (duplicate); backfill-then-subscribe can drop a message that
+lands in the gap. The gateway subscribes first, buffers live frames,
+serves backfill, then flushes the buffer discarding anything with `seq ≤`
+the backfill's high-water mark."
+
+Five steps. The file that holds them is deliberately pure — parsing,
+marks, partitioning — so the theorem can be tested without a socket, a
+broker, or a database:
+
+```ts title="services/gateway/src/resume.ts"
+import type { Message } from "@relay/protocol";
+
+// The resume sequence (chapter 2.7, SAD §5.2). The order is LOAD-BEARING:
+//
+//   1 subscribe   — from this instant, no frame can be missed
+//   2 buffer      — but none may be delivered yet: it might duplicate
+//                   something the backfill is about to send
+//   3 backfill    — seq > cursor per channel from the api, capped; emit in
+//                   sequence order; note the high-water mark H per channel
+//   4 flush       — emit buffered frames with seq > H; DISCARD seq <= H
+//   5 live        — normal 2.6 delivery from here on
+//
+// Either naive ordering loses. Backfill-then-subscribe drops whatever was
+// published during the backfill window — the fabric is at-most-once with no
+// memory (2.6 made that a feature), so the frame is simply gone, and the
+// client believes it is current. Subscribe-then-deliver double-sends the
+// overlap. The fix is not a better order: it is overlap plus dedup. We buy
+// completeness with redundancy and repay the redundancy with one integer
+// comparison, which is most of why sequences exist (ADR-03).
+//
+// This file is deliberately pure — parsing, marks, partitioning. The
+// orchestration lives in session.ts, where the socket is; the theorem lives
+// here, where a unit test can hold it still.
+
+/** A connection is either holding frames back or handing them over. The
+ * middle of a resume is the only time the first state exists. */
+export type ResumePhase = "buffering" | "live";
+
+/** How many live frames one resuming connection may hold. A resume is
+ * milliseconds; a channel that produces 500 frames inside it is a channel
+ * the client should be paging history for, not streaming. */
+export const MAX_BUFFERED_FRAMES = 500;
+
+/** How long the fabric gets to confirm subscriptions before resume gives
+ * up on being safe. 2.6 forbade AWAITING the subscribe on the handshake —
+ * a stopped broker must not block a connect — and resume needs it awaited
+ * to close the gap. Both rules survive with a deadline: wait briefly, and
+ * if the fabric will not confirm, say so honestly (`resume_ok: false`)
+ * instead of pretending the gap is closed. */
+export const SUBSCRIBE_DEADLINE_MS = 500;
+
+/** Cursors ride the upgrade URL: `?cursor=<channel_id>:<seq>`, repeated.
+ * They arrive with the handshake because EIR-WS-03's ack must already carry
+ * the truncation list — the server cannot report what it has not fetched.
+ *
+ * Returns null for a malformed set, which the caller turns into a degraded
+ * resume rather than a rejected connection: a client whose stored cursor
+ * got corrupted can recover by refetching history, but a client closed at
+ * the door can only reconnect and be closed again.
+ */
+export function parseCursors(
+  url: string,
+): Record<string, number> | null | undefined {
+  const query = url.includes("?") ? url.slice(url.indexOf("?") + 1) : "";
+  const raw = new URLSearchParams(query).getAll("cursor");
+  if (raw.length === 0) return undefined; // a fresh connect, not a resume
+  const cursors: Record<string, number> = {};
+  for (const entry of raw) {
+    // rsplit: channel ids are opaque to the gateway and a colon inside one
+    // must not silently truncate it.
+    const split = entry.lastIndexOf(":");
+    if (split <= 0) return null;
+    const channelId = entry.slice(0, split);
+    const seq = Number(entry.slice(split + 1));
+    if (!Number.isInteger(seq) || seq < 0) return null;
+    cursors[channelId] = seq;
+  }
+  return cursors;
+}
+
+/** Cursors the caller has no business resuming are dropped before the api
+ * is asked. Membership is the api's truth (ADR-05) and it re-checks; this
+ * is about not turning one connect into a thousand index scans, and about
+ * a foreign channel id being a no-op rather than a question. */
+export function scopeCursors(
+  cursors: Record<string, number>,
+  channelIds: Set<string>,
+): Record<string, number> {
+  return Object.fromEntries(
+    Object.entries(cursors).filter(([channelId]) => channelIds.has(channelId)),
+  );
+}
+
+/** The backfill's high-water mark per channel: the last sequence the
+ * client is about to have. Channels absent from the backfill keep their
+ * presented cursor as the mark — nothing new arrived, so anything buffered
+ * is genuinely new. */
+export function highWaterMarks(
+  cursors: Record<string, number>,
+  backfilled: Record<string, { messages: Message[] }>,
+): Record<string, number> {
+  const marks: Record<string, number> = { ...cursors };
+  for (const [channelId, page] of Object.entries(backfilled)) {
+    const last = page.messages[page.messages.length - 1];
+    if (last) marks[channelId] = last.seq;
+  }
+  return marks;
+}
+
+/** Step 4. `<=` and not `<`: H itself was just delivered by the backfill,
+ * so a buffered copy of H is a duplicate. Off-by-one here is user-visible —
+ * the same seam lesson 2.4's exclusive anchors taught, third appearance. */
+export function flushable(
+  buffer: Message[],
+  marks: Record<string, number>,
+): Message[] {
+  return buffer.filter((frame) => frame.seq > (marks[frame.channel] ?? 0));
+}
+
+/** A promise that resolves false instead of hanging forever. */
+export async function withDeadline(
+  work: Promise<unknown>,
+  ms: number,
+): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<boolean>((resolve) => {
+    timer = setTimeout(() => resolve(false), ms);
+  });
+  try {
+    // A REJECTION is a false, not a throw: the caller's decision is the same
+    // either way — resume cannot promise completeness — and a rejected
+    // subscribe must not take the connection down with it.
+    return await Promise.race([
+      work.then(
+        () => true,
+        () => false,
+      ),
+      deadline,
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+```
+
+Walk the five steps against the staged timeline and watch both failure
+modes dissolve. Seq 43 published during backfill? The subscription already
+exists (step 1), so it lands in the buffer (step 2) — no gap. Also present
+in the backfill because it committed before the query ran? Then the
+backfill delivers it, the high-water mark H is 43, the buffered copy has
+`seq ≤ H`, and the flush discards it — no duplicate. In the other
+interleaving — committed after the query — it is *only* in the buffer,
+`seq > H`, and the flush delivers it exactly once. Every case ends the
+same way: complete, once, in order.
+
+<Figure
+  caption="The five-phase resume: subscribe → buffer → backfill → flush (discarding ≤ H) → live. Redundancy in, one comparison out."
+  code={figBufferMachine}
+/>
+
+<Why source="SAD §5.2 · ADR-03 · FR-RTM-03">
+
+Why does one integer comparison solve what looks like a distributed-
+systems coordination problem? Because the coordination already happened —
+at write time, in 2.2, under the channel row lock. Every message carries
+a server-assigned position in a total per-channel order, so "have I seen
+this?" and "what am I missing?" stop being questions about *time* (which
+is unknowable across machines) and become questions about *integers*
+(which are free). This is the payoff the SAD promised when it made
+sequences the system's one strict layer: the fabric got to be lossy
+(2.6), the client's cursor got to be one number, and the resume race —
+genuinely hard in systems that order by arrival — collapses into
+`seq ≤ H`. The lesson generalizes beyond chat: when recovery logic is
+getting clever, the ordering primitive underneath is usually too weak.
+
+</Why>
+
+<Trap>
+
+The buffer's danger is believing it can be skipped in the "common case."
+The race window is milliseconds; reconnects after a quiet night hit it
+approximately never; and every manual test you run will pass without the
+buffer. So the naive orderings *survive in production for months* — until
+a busy channel meets a reconnection storm (7.5 simulates the car park's
+forty drivers), and suddenly the gap variant is eating messages at the
+worst possible moment: right when users are reconnecting and *checking
+whether they missed something*. A correctness property that fails only
+under load is not a smaller bug; it is a bug with better camouflage and a
+pager attached. This is why the test injects the race instead of hoping:
+the window must be *provably* closed, not observed-empty. And the flush
+rule's `≤` versus `<` is 2.4's seam lesson again — H itself was delivered
+by the backfill, so a buffered copy of H is a duplicate. One character,
+user-visible.
+
+</Trap>
+
+## Two rules that disagree
+
+Step 1 says the subscription must *exist* before the backfill query runs —
+not be requested, exist — or the window reopens. Chapter 2.6 says the
+opposite in as many words: never await the subscribe on the connect path,
+because a stopped broker must cost delivery, not connections. Both rules
+are right, and they are about to collide inside the same function.
+
+The way out is not to pick one. It is to notice that resume makes a
+*promise* — completeness — that a fresh connect does not, and a promise
+you cannot keep should be withdrawn rather than faked. So: a resuming
+connection awaits the subscribe **with a deadline**, and if the fabric
+will not confirm in time, the ack goes out with `resume_ok: false` and
+every channel listed in `truncated`. The client stops trusting the stream
+and pages history instead — the same recovery FR-RTM-04 already specifies
+for a backlog too large to stream. Nothing hangs, nothing lies.
+
+That branch turns out to be the honest home for every other way resume can
+fail to be safe: a cursor the gateway cannot parse, an api that will not
+answer, a buffer that hit its ceiling. Each one degrades to the same
+answer, and the client needs exactly one recovery path for all of them.
+
+<Why source="FR-RTM-03 · EIR-WS-03 · constitution V">
+
+Why does a malformed cursor degrade instead of closing the connection?
+Chapter 2.4 answers a cursor it did not mint with `400 Bad Request`, and
+consistency would suggest a close code here. But look at what each client
+can *do* with the answer. A REST caller reads the 400, drops the cursor,
+and issues a different request a millisecond later — it is mid-flight and
+can change its mind. A socket client closed at the door has one move:
+reconnect. If its stored cursor is corrupt — the exact case this is — the
+reconnect presents the same corrupt cursor and earns the same close, and
+the client is in a loop that no amount of backoff fixes. `resume_ok: false`
+plus the channel list is not a softer error; it is the only error the
+receiving code can act on. Same principle as the 400, opposite mechanics,
+because the transport changes what "you can retry differently" means.
+
+</Why>
+
+## The ack says where you *were*, not where you're going
+
+`connection.ack` carries a `cursor` field, and there is a tempting wrong
+thing to put in it: the post-backfill high-water mark — "you are now at
+43." It is wrong because of when the ack goes out. The SAD's sequence is
+explicit: fetch the backfill, **ack**, then deliver the backfilled frames.
+A client that stored `43` from the ack and then died before rendering the
+frames would resume from 43 next time, and messages 42 and 43 would be
+gone forever — a gap manufactured by the very field meant to prevent one.
+
+So the ack echoes the cursors the server *accepted*. The client advances
+its own cursor as it applies frames, which is the only place that
+knowledge honestly lives.
+
+<Why source="FR-RTM-03 · FR-SDK-05">
+
+Why does the cursor live with the *client* instead of the server keeping
+"last delivered" per connection? Because only the client knows what it
+actually *applied*. A server-side delivery ledger records what was written
+to a socket — and a socket is precisely the thing that dies mid-write;
+frames can be sent-but-never-received (the tunnel ate them) or
+received-but-never-rendered (the app was killed mid-paint). Every one of
+those cases makes a server-side ledger optimistic, and an optimistic
+resume point means gaps. The client's cursor — highest seq it has fully
+applied, per channel — is pessimistic by construction: worst case it is
+slightly behind, the backfill overlaps a little, and the seq dedup this
+chapter just built absorbs the overlap for free. The design leans on the
+same asymmetry as 2.3's idempotency keys: the party that knows the truth
+carries the token, and the server makes acting on that token safe rather
+than trying to know the truth remotely.
+
+</Why>
+
+## The api's half: backfill with a ceiling
+
+The contract grows a request and a response, and the response is the
+interesting one — it carries **frames**, not rows:
+
+```diff title="packages/protocol/src/internal.ts"
+@@ -1,4 +1,6 @@
+ import { z } from "zod";
++
++import { messageSchema } from "./frames.js";
+
+ // The INTERNAL service contract (chapter 2.5) — distinct from the wire
+ // contract above it. `frames.ts` is what a customer's client speaks;
+@@ -38,6 +40,48 @@
+   duplicate: z.boolean().optional(),
+ });
+
++/** The per-connect channel ceiling (chapter 2.7). */
++export const MAX_RESUME_CHANNELS = 200;
++
++/** FR-RTM-04's ceiling: past this, the client is told to page history
++ * instead of having the backlog streamed at it. */
++export const BACKFILL_LIMIT = 500;
++
++/** Gateway → api: resume cursors, `{channel_id: highest seq the client
++ * applied}` (chapter 2.7, FR-RTM-03). A read with a body, so POST — the
++ * cursor map does not belong in a URL.
++ *
++ * The map is SIZE-CAPPED. The gateway already drops cursors for channels
++ * the caller is not a member of, so a well-behaved request is bounded by
++ * membership; the cap is what stops a malformed or hostile one from
++ * turning one connect into ten thousand index scans. */
++export const internalBackfillRequestSchema = z.strictObject({
++  cursors: z
++    .record(z.string().min(1), z.number().int().nonnegative())
++    .refine((map) => Object.keys(map).length <= MAX_RESUME_CHANNELS, {
++      message: `at most ${MAX_RESUME_CHANNELS} channels per resume`,
++    }),
++});
++
++/** api → gateway: per channel, everything after the cursor — as WIRE
++ * frames, not as rows. The resume path must emit what the live path
++ * emits, so the api hands back `messageSchema` payloads and the gateway
++ * forwards them untouched; a frame that differs by one field between
++ * "delivered live" and "delivered on resume" is a client bug waiting for
++ * a reconnect to happen.
++ *
++ * `truncated` is per channel, because the ceiling is per channel: one
++ * flooded channel must not force the others onto the history endpoint. */
++export const internalBackfillResponseSchema = z.strictObject({
++  channels: z.record(
++    z.string().min(1),
++    z.strictObject({
++      messages: z.array(messageSchema),
++      truncated: z.boolean(),
++    }),
++  ),
++});
++
+ /** api → gateway: the channels this user may hear (FR-RTM-01). */
+ export const internalMembershipsResponseSchema = z.strictObject({
+   channel_ids: z.array(z.string().min(1)),
+@@ -48,3 +92,9 @@
+ export type InternalMembershipsResponse = z.infer<
+   typeof internalMembershipsResponseSchema
+ >;
++export type InternalBackfillRequest = z.infer<
++  typeof internalBackfillRequestSchema
++>;
++export type InternalBackfillResponse = z.infer<
++  typeof internalBackfillResponseSchema
++>;
+```
+
+Returning wire frames from an internal read looks like a layering
+violation and is the opposite. The live path publishes `messageSchema`
+payloads; if resume returned rows for the gateway to reshape, the two
+paths would each own a mapping, and the day they disagree by one field is
+the day a client renders resumed messages differently from live ones. One
+shape, one producer.
+
+Which forces a question the read path has been able to duck until now: who
+sent it? 2.6 fixed the *write* so `user_id` is recorded, and left the read
+side alone with an explicit IOU. Resume is where it comes due — a frame
+must name its sender — so the repository's reads join the sender in, and
+history (2.4's endpoint) gains the field along the way:
+
+```diff title="services/api/src/db/repository.ts"
+@@ -71,6 +71,16 @@
+    * idempotency index and the ORIGINAL message was returned instead of
+    * a new insert. The service layer uses this to decide response shape. */
+   duplicate?: boolean;
++}
++
++/** A message as the READ paths return it (chapter 2.7). The sender is the
++ * external id — the identifier a client knows — and it is nullable for two
++ * honest reasons: the column has been nullable since 2.1 (system messages
++ * have no author), and every row written through the socket before 2.6's
++ * fix has no author recorded. A caller that needs to build a wire frame
++ * has to decide what to do with those; the layer does not decide for it. */
++export interface MessageWithSender extends MessageRow {
++  user: string | null;
+ }
+
+ /** Thrown when a channel id resolves to nothing IN THIS TENANT — which,
+@@ -367,11 +377,16 @@
+       afterSeq,
+       limit,
+     }: { beforeSeq?: number; afterSeq?: number; limit: number },
+-  ): Promise<MessageRow[]> {
++  ): Promise<MessageWithSender[]> {
+     const columns = {
+       id: messages.id,
+       channel_id: messages.channelId,
+       seq: messages.sequence,
++      // The sender joins the read path in 2.7 (the IOU 2.6 wrote): resume
++      // must emit frames identical to live ones, and a reader that gets a
++      // different shape depending on which door it came through is a client
++      // bug waiting for a reconnect.
++      user: users.externalId,
+       text: messages.text,
+       created_at: messages.createdAt,
+     };
+@@ -386,6 +401,10 @@
+           .select(columns)
+           .from(messages)
+           .innerJoin(channels, eq(channels.id, messages.channelId))
++          // LEFT, not INNER: an unattributed row must still be READ. An
++          // inner join here would make those rows vanish from history —
++          // silent data loss dressed up as a query.
++          .leftJoin(users, eq(users.id, messages.userId))
+           .where(
+             scoped(
+               beforeSeq === undefined
+@@ -399,10 +418,69 @@
+           .select(columns)
+           .from(messages)
+           .innerJoin(channels, eq(channels.id, messages.channelId))
++          // LEFT, not INNER: an unattributed row must still be READ. An
++          // inner join here would make those rows vanish from history —
++          // silent data loss dressed up as a query.
++          .leftJoin(users, eq(users.id, messages.userId))
+           .where(scoped(gt(messages.sequence, afterSeq)))
+           .orderBy(asc(messages.sequence))
+           .limit(limit));
+     return rows.map((row) => ({ ...row, created_at: toIso(row.created_at) }));
++  }
++
++  /** Resume backfill (chapter 2.7, FR-RTM-03): for each cursor, everything
++   * the client has not applied yet — capped, with an honest truncation
++   * signal per channel (FR-RTM-04).
++   *
++   * Membership is evaluated NOW, not when the cursor was minted: a channel
++   * the user was removed from while offline backfills nothing, and a cursor
++   * naming a channel in another tenant is a no-op rather than a leak
++   * (constitution I, and the members join is what enforces it).
++   *
++   * One query per channel, deliberately. A single statement would need a
++   * window function to apply a per-channel cap, and the loop is bounded by
++   * the caller's membership — each iteration is an index scan on
++   * (channel_id, sequence) starting exactly where the client stopped.
++   */
++  async backfill(
++    userId: string,
++    cursors: Record<string, number>,
++    /** Required, not defaulted: FR-RTM-04's ceiling is a contract number,
++     * and the contract lives one layer up. The repository enforces a cap;
++     * it does not get to choose it. */
++    limit: number,
++  ): Promise<
++    Record<string, { messages: MessageWithSender[]; truncated: boolean }>
++  > {
++    const out: Record<
++      string,
++      { messages: MessageWithSender[]; truncated: boolean }
++    > = {};
++    for (const [channelId, since] of Object.entries(cursors)) {
++      const [member] = await this.db
++        .select({ channel_id: members.channelId })
++        .from(members)
++        .innerJoin(channels, eq(channels.id, members.channelId))
++        .where(
++          and(
++            eq(members.channelId, channelId),
++            eq(members.userId, userId),
++            eq(channels.environmentId, this.environmentId),
++          ),
++        );
++      if (!member) continue;
++      // limit + 1 is how the cap answers two questions with one scan: the
++      // page, and whether there was more.
++      const rows = await this.listMessages(channelId, {
++        afterSeq: since,
++        limit: limit + 1,
++      });
++      out[channelId] = {
++        messages: rows.slice(0, limit),
++        truncated: rows.length > limit,
++      };
++    }
++    return out;
+   }
+
+   /** Every message in the channel, ordered by sequence — tenant-scoped
+```
+
+Two details in that diff earn their comments. The join is a **left** join:
+an unattributed row must still be readable, and an inner join would make
+those rows silently vanish from history — data loss disguised as a query.
+And `backfill` runs one query per channel, on purpose: a per-channel cap
+needs a window function to express in a single statement, and the loop is
+bounded by membership, each iteration an index scan starting exactly where
+the client stopped.
+
+The route is where rows become frames, and where two kinds of row turn out
+to have no frame at all:
+
+```ts title="services/api/src/internal/backfill.controller.ts"
+import {
+  BadRequestException,
+  Body,
+  Controller,
+  Headers,
+  Post,
+  UseGuards,
+} from "@nestjs/common";
+
+import {
+  BACKFILL_LIMIT,
+  internalBackfillRequestSchema,
+  type InternalBackfillRequest,
+  type InternalBackfillResponse,
+  type Message,
+} from "@relay/protocol";
+
+import { EnvironmentContextGuard } from "../messages/environment-context.guard";
+import { Repository, type MessageWithSender } from "../db/repository";
+import { ZodValidationPipe } from "../messages/zod-validation.pipe";
+
+// The api's half of resume (chapter 2.7): everything the client has not
+// applied yet, per channel, capped. It is a READ behind a POST, because the
+// request carries a map — cursors in a query string would be a length limit
+// waiting to be hit, and this route is internal, uncacheable, and called
+// once per connect.
+//
+// The controller's real job is SHAPE: the repository returns rows, the
+// gateway needs frames, and this is the boundary where one becomes the
+// other (the same division of labour 2.6 settled for the public send).
+@Controller("internal")
+@UseGuards(EnvironmentContextGuard)
+export class BackfillController {
+  constructor(private readonly repo: Repository) {}
+
+  @Post("backfill")
+  async backfill(
+    @Body(new ZodValidationPipe(internalBackfillRequestSchema))
+    body: InternalBackfillRequest,
+    @Headers("x-relay-user") userExternalId?: string,
+  ): Promise<InternalBackfillResponse> {
+    if (!userExternalId) throw new BadRequestException("missing x-relay-user");
+    const user = await this.repo.getUserByExternalId(userExternalId);
+    // An unknown user resumes nothing — the same answer memberships gives,
+    // for the same reason: delivery is not identity forensics.
+    if (!user) return { channels: {} };
+
+    const pages = await this.repo.backfill(
+      user.id,
+      body.cursors,
+      BACKFILL_LIMIT,
+    );
+    const channels: InternalBackfillResponse["channels"] = {};
+    for (const [channelId, page] of Object.entries(pages)) {
+      const messages = page.messages.flatMap((row) => toFrame(row, channelId));
+      channels[channelId] = {
+        messages,
+        // Truncation is reported as the READ found it, not as the mapping
+        // left it: dropping an unrenderable row does not mean the client
+        // should go page history, and hiding a real cap would.
+        truncated: page.truncated,
+      };
+    }
+    return { channels };
+  }
+}
+
+/** A row becomes a frame, or it becomes nothing.
+ *
+ * Two kinds of row cannot be a `message.created` payload, and both are
+ * honest gaps rather than bugs to paper over:
+ *
+ *   - **No sender.** Every row written through the socket before 2.6's fix
+ *     has `user_id` NULL. There is no truthful value to invent, and the
+ *     wire contract requires one.
+ *   - **No text.** A tombstone (FR-MSG-08) is not a creation. When deletes
+ *     arrive in Part 4 they get `message.deleted`, and resume will carry
+ *     that frame instead.
+ *
+ * The client is not left guessing: sequence numbers are contiguous per
+ * channel, so a skipped row shows up as a gap the SDK detects and repairs
+ * through 2.4's history endpoint (FR-RTM-03's safety net, one layer down).
+ */
+function toFrame(row: MessageWithSender, channelId: string): Message[] {
+  if (row.user === null || row.text === null) return [];
+  return [
+    {
+      id: row.id,
+      channel: channelId,
+      seq: row.seq,
+      user: row.user,
+      text: row.text,
+      created_at: row.created_at,
+    },
+  ];
+}
+```
+
+A tombstone is not a creation — deletes get `message.deleted` when Part 4
+builds them — and a row with no sender cannot name one truthfully. Every
+message written through the socket before 2.6's fix is in that second
+category. Rather than invent a value, the mapping drops the row, which
+shows up at the client as a missing sequence number: the gap-detection
+signal the SDK already has to implement, repaired through 2.4's history
+endpoint. The residue of an unfixed nullable column is a real cost, and
+this is where you pay it.
+
+```diff title="services/api/src/messages/messages.service.ts"
+@@ -8,6 +8,7 @@
+   ChannelNotFoundError,
+   Repository,
+   type MessageRow,
++  type MessageWithSender,
+ } from "../db/repository";
+ import { decodeCursor, encodeCursor } from "./cursor";
+ import type { HistoryQuery, SendMessageBody } from "./messages.schema";
+@@ -61,7 +62,7 @@
+     channelId: string,
+     { cursor, direction, limit }: HistoryQuery,
+   ): Promise<{
+-    messages: MessageRow[];
++    messages: MessageWithSender[];
+     next_cursor: string | null;
+     prev_cursor: string | null;
+   }> {
+```
+
+```diff title="services/api/src/internal/internal.module.ts"
+@@ -1,6 +1,7 @@
+ import { Module } from "@nestjs/common";
+
+ import { MessagesModule } from "../messages/messages.module";
++import { BackfillController } from "./backfill.controller";
+ import { InternalController } from "./internal.controller";
+
+ // The internal routes reuse MessagesModule's providers wholesale — the
+@@ -8,6 +9,6 @@
+ // doors (ADR-04/05).
+ @Module({
+   imports: [MessagesModule],
+-  controllers: [InternalController],
++  controllers: [InternalController, BackfillController],
+ })
+ export class InternalModule {}
+```
+
+## The gateway's half: phases on the connection
+
+Delivery does not learn about resume. It learns about a *phase*, which is
+one field on the connection the registry already tracks:
+
+```diff title="services/gateway/src/registry.ts"
+@@ -1,6 +1,9 @@
+ import type { WebSocket } from "ws";
+
++import type { Message } from "@relay/protocol";
++
+ import type { Identity } from "./auth.js";
++import type { ResumePhase } from "./resume.js";
+
+ // The in-memory connection registry (chapter 2.5): who is connected to
+ // THIS instance, and which channels they can hear. Its cross-instance
+@@ -17,6 +20,15 @@
+   readonly socket: WebSocket;
+   channelIds: Set<string>;
+   missedPings: number;
++  /** Chapter 2.7. A connection resuming through the tunnel spends its first
++   * milliseconds holding live frames back so the backfill can go first; a
++   * fresh connect is born "live" and never buffers. Delivery reads this
++   * field and nothing else — the resume machinery is invisible to it. */
++  phase: ResumePhase;
++  buffer: Message[];
++  /** Set when the buffer hit its ceiling. The frames are gone, so the
++   * client must be told to page history instead of trusting the stream. */
++  overflowed: boolean;
+ }
+
+ export class Registry {
+```
+
+```diff title="services/gateway/src/api-client.ts"
+@@ -1,6 +1,9 @@
+ import {
++  internalBackfillResponseSchema,
+   internalMembershipsResponseSchema,
+   internalSendResponseSchema,
++  type InternalBackfillRequest,
++  type InternalBackfillResponse,
+   type InternalSendRequest,
+   type InternalSendResponse,
+ } from "@relay/protocol";
+@@ -24,6 +27,12 @@
+
+ export interface ApiClient {
+   memberships(identity: Identity): Promise<string[]>;
++  /** Resume backfill (chapter 2.7): everything past the cursors, per
++   * channel, already shaped as wire frames. */
++  backfill(
++    identity: Identity,
++    cursors: Record<string, number>,
++  ): Promise<InternalBackfillResponse["channels"]>;
+   sendMessage(
+     identity: Identity,
+     body: InternalSendRequest,
+@@ -62,6 +71,15 @@
+       );
+       return body.channel_ids;
+     },
++    async backfill(identity, cursors) {
++      const res = await fetch(`${baseUrl}/internal/backfill`, {
++        method: "POST",
++        headers: headers(identity),
++        body: JSON.stringify({ cursors } satisfies InternalBackfillRequest),
++      });
++      const body = await parse(res, internalBackfillResponseSchema, "backfill");
++      return body.channels;
++    },
+     async sendMessage(identity, body) {
+       const res = await fetch(`${baseUrl}/internal/messages`, {
+         method: "POST",
+```
+
+And the orchestration — the five steps in the order the SAD wrote them,
+plus every degrade path:
+
+```diff title="services/gateway/src/session.ts"
+@@ -14,6 +14,15 @@
+ import { verifyToken, type Identity } from "./auth.js";
+ import type { Fanout } from "./fanout.js";
+ import { Registry, type Connection } from "./registry.js";
++import {
++  MAX_BUFFERED_FRAMES,
++  SUBSCRIBE_DEADLINE_MS,
++  flushable,
++  highWaterMarks,
++  parseCursors,
++  scopeCursors,
++  withDeadline,
++} from "./resume.js";
+
+ // One session per socket (chapter 2.5). The order of operations here is the
+ // chapter: verify at the door, learn memberships, register, ack inside
+@@ -53,6 +62,10 @@
+    * half-minutes — the interval is a contract (EIR-WS-04), not a constant
+    * the tests should have to wait out. */
+   pingIntervalMs?: number;
++  /** Same reasoning for the resume path's patience with the fabric
++   * (chapter 2.7): the degrade branch is a contract, and a test should not
++   * have to sit through half a second to see it. */
++  resumeDeadlineMs?: number;
+ }
+
+ export function attachSessions({
+@@ -61,6 +74,7 @@
+   logger,
+   fanout,
+   pingIntervalMs = PING_INTERVAL_MS,
++  resumeDeadlineMs = SUBSCRIBE_DEADLINE_MS,
+ }: SessionServerOptions): { registry: Registry; close: () => void } {
+   const registry = new Registry();
+
+@@ -69,6 +83,17 @@
+    * member of its channel. */
+   function deliver(channelId: string, message: Message): void {
+     for (const connection of registry.subscribersOf(channelId)) {
++      if (connection.phase === "buffering") {
++        // Step 2 (chapter 2.7). The frame is NOT dropped and NOT sent: it
++        // waits until the backfill has had its turn, because sending it now
++        // risks a duplicate and dropping it risks a gap.
++        if (connection.buffer.length >= MAX_BUFFERED_FRAMES) {
++          connection.overflowed = true;
++          continue;
++        }
++        connection.buffer.push(message);
++        continue;
++      }
+       send(connection.socket, { type: "message.created", payload: message });
+     }
+   }
+@@ -96,18 +121,28 @@
+           logger.log("info", "connection.rejected", { reason: "bad_token" });
+           return;
+         }
+-        void open(ws, identity);
++        void open(ws, identity, req.url ?? "/");
+       });
+     })();
+   });
+
+-  async function open(socket: WebSocket, identity: Identity): Promise<void> {
++  async function open(
++    socket: WebSocket,
++    identity: Identity,
++    url: string,
++  ): Promise<void> {
++    // Cursors are read BEFORE anything else, because their presence decides
++    // whether this connection is born buffering or born live.
++    const presented = parseCursors(url);
+     const connection: Connection = {
+       id: randomUUID(),
+       identity,
+       socket,
+       channelIds: new Set(),
+       missedPings: 0,
++      phase: presented === undefined ? "live" : "buffering",
++      buffer: [],
++      overflowed: false,
+     };
+     try {
+       connection.channelIds = new Set(await api.memberships(identity));
+@@ -128,44 +163,23 @@
+     // Subscriptions follow membership: the first local member of a channel
+     // makes this instance a subscriber, and the last one to leave releases
+     // it (reference-counted in the fabric).
+-    //
+-    // NOT AWAITED, and that is the whole point. EIR-WS-03 gives the
+-    // handshake one second, and the fabric is the one dependency in this
+-    // path that is ALLOWED to be down (ADR-07). Awaiting it here made the
+-    // ack wait on Redis — a stopped broker stopped connections dead, which
+-    // is a far worse failure than the dropped frames the fabric is
+-    // permitted. Subscriptions land when they land; ioredis replays them on
+-    // reconnect, and until then this instance is simply deaf, which is the
+-    // documented cost.
+-    void Promise.all(
++    const subscribing = Promise.all(
+       [...connection.channelIds].map((channelId) =>
+-        fanout?.subscribe(channelId).catch((error: unknown) => {
+-          logger.log("error", "fanout.subscribe_failed", {
+-            channel: channelId,
+-            error: String(error),
+-          });
+-        }),
++        fanout?.subscribe(channelId),
+       ),
+     );
+     logger.log("info", "connection.opened", {
+       connection_id: connection.id,
+       user: identity.userExternalId,
+       channels: connection.channelIds.size,
++      resuming: presented !== undefined,
+     });
+
+-    // EIR-WS-03: identity and a resume cursor within one second. The cursor
+-    // is empty here and means it for the first time in 2.7 — the field
+-    // exists because the contract says so, not because we have data for it.
+-    send(socket, {
+-      type: "connection.ack",
+-      payload: {
+-        user: identity.userExternalId,
+-        cursor: {},
+-        resume_ok: true,
+-        truncated: [],
+-      },
+-    });
+-
++    // Listeners go on BEFORE the resume, not after the ack. A resume takes
++    // a round trip to the api, and a socket that dies inside that window
++    // must still be removed from the registry and release its subscriptions
++    // — otherwise a client that reconnects impatiently leaks an instance's
++    // worth of state per attempt.
+     socket.on("pong", () => {
+       connection.missedPings = 0;
+     });
+@@ -181,6 +195,142 @@
+         connection_id: connection.id,
+         code,
+       });
++    });
++
++    if (presented === undefined) {
++      // A FRESH connect, and 2.6's rule stands unchanged: never wait on the
++      // fabric here. EIR-WS-03 gives the handshake one second, and a stopped
++      // broker must cost delivery, not connections.
++      void subscribing.catch((error: unknown) => {
++        logger.log("error", "fanout.subscribe_failed", {
++          connection_id: connection.id,
++          error: String(error),
++        });
++      });
++      ack(connection, { cursor: {}, resume_ok: true, truncated: [] });
++      return;
++    }
++    await resume(connection, presented, subscribing);
++  }
++
++  /** EIR-WS-03's ack. `cursor` echoes what the server ACCEPTED, never the
++   * post-backfill high-water mark: this frame goes out BEFORE the backfilled
++   * frames, so advertising a position the client has not received yet is how
++   * you manufacture the gap this chapter exists to close. */
++  function ack(
++    connection: Connection,
++    payload: {
++      cursor: Record<string, number>;
++      resume_ok: boolean;
++      truncated: string[];
++    },
++  ): void {
++    send(connection.socket, {
++      type: "connection.ack",
++      payload: { user: connection.identity.userExternalId, ...payload },
++    });
++  }
++
++  /** The five steps (chapter 2.7, SAD §5.2). Steps 1 and 2 already happened
++   * — the connection was born `buffering` and the subscribes are in flight
++   * — so what is left is: confirm, backfill, ack, emit, flush, live. */
++  async function resume(
++    connection: Connection,
++    presented: Record<string, number> | null,
++    subscribing: Promise<unknown>,
++  ): Promise<void> {
++    const cursors =
++      presented === null ? {} : scopeCursors(presented, connection.channelIds);
++
++    /** Everything that cannot promise completeness ends up here: the client
++     * is told resume did not happen and which channels to page instead. The
++     * frames held so far are dropped on purpose — they would be an arbitrary
++     * fragment of a stream the client is about to refetch in full. */
++    const degrade = (reason: string): void => {
++      connection.buffer = [];
++      connection.phase = "live";
++      ack(connection, {
++        cursor: cursors,
++        resume_ok: false,
++        truncated: [...connection.channelIds],
++      });
++      logger.log("info", "resume.degraded", {
++        connection_id: connection.id,
++        reason,
++      });
++    };
++
++    // A malformed cursor is not a closed connection. A client whose stored
++    // cursor got corrupted can recover from `resume_ok: false` by paging
++    // history; a client closed at the door can only reconnect and be closed
++    // again. (2.4 answers a bad cursor with 400 because a REST caller can
++    // read the error and change its mind mid-flight; a socket cannot.)
++    if (presented === null) return degrade("malformed_cursor");
++
++    // Step 1 must be TRUE, not merely started: a subscription that lands
++    // after the backfill query leaves the window open. 2.6's rule survives
++    // via the deadline — resume waits briefly and then degrades honestly
++    // rather than hanging a handshake on a broker.
++    if (!(await withDeadline(subscribing, resumeDeadlineMs))) {
++      return degrade("fabric_unconfirmed");
++    }
++
++    let backfilled: Awaited<ReturnType<ApiClient["backfill"]>>;
++    try {
++      // Step 3. Nothing is emitted yet — the ack has to carry the
++      // truncation list, so the fetch comes first (EIR-WS-03's comment in
++      // the protocol package has said so since 1.3).
++      backfilled = await api.backfill(connection.identity, cursors);
++    } catch (error) {
++      logger.log("error", "resume.backfill_failed", {
++        connection_id: connection.id,
++        error: String(error),
++      });
++      return degrade("backfill_failed");
++    }
++
++    const marks = highWaterMarks(cursors, backfilled);
++    const truncated = Object.entries(backfilled)
++      .filter(([, page]) => page.truncated)
++      .map(([channelId]) => channelId);
++    // An overflowed buffer means live frames were dropped and we cannot say
++    // which; the honest answer is the same one FR-RTM-04 gives for too much
++    // backfill — page history instead of trusting the stream.
++    if (connection.overflowed) return degrade("buffer_overflow");
++
++    ack(connection, { cursor: cursors, resume_ok: true, truncated });
++
++    for (const [, page] of Object.entries(backfilled)) {
++      for (const message of page.messages) {
++        send(connection.socket, {
++          type: "message.created",
++          payload: message,
++        });
++      }
++    }
++
++    // Step 4. Overflow between the ack and here cannot be reported in an
++    // ack that already left, so the socket closes and the client resumes
++    // again from the cursor it never advanced. (A channel busy enough to
++    // overflow every attempt would loop; 7.5's load work is where that gets
++    // measured rather than guessed.)
++    if (connection.overflowed) {
++      connection.socket.close(1011, "resume buffer overflow");
++      return;
++    }
++    for (const message of flushable(connection.buffer, marks)) {
++      send(connection.socket, { type: "message.created", payload: message });
++    }
++    connection.buffer = [];
++    // Step 5.
++    connection.phase = "live";
++    logger.log("info", "resume.completed", {
++      connection_id: connection.id,
++      backfilled: Object.values(backfilled).reduce(
++        (n, page) => n + page.messages.length,
++        0,
++      ),
++      truncated: truncated.length,
+     });
+   }
+
+```
+
+One change in that diff is not about resume at all, and it is the kind of
+bug a chapter finds by writing the code: the socket's `close` listener used
+to be registered *after* the ack. That was harmless when the ack was
+immediate. A resume takes a round trip to the api, and a socket that dies
+inside that window would never run its cleanup — the registry keeps the
+connection, the fabric keeps the subscription, and an impatient client
+leaks an instance's worth of state per attempt. Listeners now go on before
+the resume runs. Adding a slow path to a fast one changes which
+assumptions were load-bearing.
+
+## What the tests had to learn
+
+The theorem gets unit tests, because pure functions deserve them:
+
+```ts title="services/gateway/src/resume.test.ts"
+import { describe, expect, it } from "vitest";
+
+import type { Message } from "@relay/protocol";
+
+import {
+  flushable,
+  highWaterMarks,
+  parseCursors,
+  scopeCursors,
+  withDeadline,
+} from "./resume.js";
+
+// The resume theorem, held still (chapter 2.7). Everything here is a pure
+// function precisely so the ordering argument can be tested without a
+// socket, a broker, or a database — session.test.ts then proves the
+// orchestration, and resume.itest.ts proves it against a real Redis.
+
+const CH = "11111111-1111-1111-1111-111111111111";
+const OTHER = "22222222-2222-2222-2222-222222222222";
+
+function frame(channel: string, seq: number): Message {
+  return {
+    id: `id-${seq}`,
+    channel,
+    seq,
+    user: "tuan",
+    text: `m${seq}`,
+    created_at: "2026-08-04T00:00:00.000Z",
+  };
+}
+
+describe("parseCursors", () => {
+  it("distinguishes a fresh connect from a resume with nothing new", () => {
+    // undefined means "no cursor presented" — a first connect. An empty
+    // object would mean "resume from the beginning", which is a different
+    // instruction, and conflating the two costs a client its whole history.
+    expect(parseCursors("/v1/ws?token=abc")).toBeUndefined();
+    expect(parseCursors("/v1/ws")).toBeUndefined();
+    expect(parseCursors(`/v1/ws?token=abc&cursor=${CH}:0`)).toEqual({ [CH]: 0 });
+  });
+
+  it("reads one cursor per channel", () => {
+    expect(
+      parseCursors(`/v1/ws?token=t&cursor=${CH}:41&cursor=${OTHER}:87`),
+    ).toEqual({ [CH]: 41, [OTHER]: 87 });
+  });
+
+  it("splits on the LAST colon, so an id containing one survives", () => {
+    expect(parseCursors("/v1/ws?cursor=weird:id:41")).toEqual({
+      "weird:id": 41,
+    });
+  });
+
+  it("returns null for anything it cannot trust", () => {
+    for (const bad of [
+      "/v1/ws?cursor=nocolon",
+      "/v1/ws?cursor=:41",
+      `/v1/ws?cursor=${CH}:notanumber`,
+      `/v1/ws?cursor=${CH}:-1`,
+      `/v1/ws?cursor=${CH}:1.5`,
+      `/v1/ws?cursor=${CH}:41&cursor=broken`,
+    ]) {
+      expect(parseCursors(bad), bad).toBeNull();
+    }
+  });
+});
+
+describe("scopeCursors", () => {
+  it("drops cursors for channels the caller is not in", () => {
+    // A foreign channel id is a no-op, not a question the api gets asked
+    // (constitution I) — and the bound on work per connect is membership.
+    expect(scopeCursors({ [CH]: 41, [OTHER]: 9 }, new Set([CH]))).toEqual({
+      [CH]: 41,
+    });
+  });
+});
+
+describe("highWaterMarks", () => {
+  it("takes the last backfilled sequence per channel", () => {
+    expect(
+      highWaterMarks(
+        { [CH]: 41, [OTHER]: 87 },
+        { [CH]: { messages: [frame(CH, 42), frame(CH, 43)] } },
+      ),
+    ).toEqual({ [CH]: 43, [OTHER]: 87 });
+  });
+
+  it("keeps the presented cursor when a channel backfilled nothing", () => {
+    // Nothing arrived while the client was away, so anything in the buffer
+    // is genuinely new and must survive the flush.
+    expect(highWaterMarks({ [CH]: 41 }, { [CH]: { messages: [] } })).toEqual({
+      [CH]: 41,
+    });
+  });
+});
+
+describe("flushable", () => {
+  it("keeps frames after the mark and discards the overlap", () => {
+    const buffer = [frame(CH, 42), frame(CH, 43), frame(CH, 44)];
+    expect(flushable(buffer, { [CH]: 43 }).map((f) => f.seq)).toEqual([44]);
+  });
+
+  it("discards the mark itself — `<=`, not `<`", () => {
+    // H was delivered by the backfill. A buffered copy of H is the duplicate
+    // this chapter exists to prevent, and it is exactly one character away.
+    expect(flushable([frame(CH, 43)], { [CH]: 43 })).toEqual([]);
+    expect(flushable([frame(CH, 44)], { [CH]: 43 }).map((f) => f.seq)).toEqual([
+      44,
+    ]);
+  });
+
+  it("marks are per channel, so a quiet channel's frames are not swallowed", () => {
+    const buffer = [frame(CH, 10), frame(OTHER, 5)];
+    expect(
+      flushable(buffer, { [CH]: 43, [OTHER]: 4 }).map((f) => f.channel),
+    ).toEqual([OTHER]);
+  });
+
+  it("treats an unknown channel's mark as 0 rather than dropping the frame", () => {
+    // A channel joined DURING the resume has no cursor and no backfill. Its
+    // frames are new by definition; the safe default is to deliver.
+    expect(flushable([frame(OTHER, 1)], {}).map((f) => f.seq)).toEqual([1]);
+  });
+});
+
+describe("withDeadline", () => {
+  it("reports success, timeout, and rejection as a plain boolean", async () => {
+    expect(await withDeadline(Promise.resolve(), 50)).toBe(true);
+    expect(await withDeadline(new Promise(() => {}), 20)).toBe(false);
+    // A rejected subscribe degrades the resume; it does not throw the
+    // connection away.
+    expect(await withDeadline(Promise.reject(new Error("redis down")), 50)).toBe(
+      false,
+    );
+  });
+});
+```
+
+The orchestration gets the injected race and every degrade branch:
+
+```diff title="services/gateway/src/session.test.ts"
+@@ -8,7 +8,7 @@
+ import { serve } from "@relay/service-kit";
+ import type { Frame } from "@relay/protocol";
+
+-import type { InternalSendResponse } from "@relay/protocol";
++import type { InternalSendResponse, Message } from "@relay/protocol";
+
+ import type { ApiClient } from "./api-client.js";
+ import { DEV_JWT_SECRET } from "./auth.js";
+@@ -38,9 +38,24 @@
+
+ function stubApi(overrides: Partial<ApiClient> = {}): ApiClient {
+   return {
+-    memberships: async () => ["11111111-1111-1111-1111-111111111111"],
++    memberships: async () => [CHANNEL],
++    backfill: async () => ({}),
+     sendMessage: async () => committed(42),
+     ...overrides,
++  };
++}
++
++const CHANNEL = "11111111-1111-1111-1111-111111111111";
++
++/** A backfilled or live frame, in the wire shape the api now returns. */
++function frame(seq: number, channel = CHANNEL): Message {
++  return {
++    id: `id-${seq}`,
++    channel,
++    seq,
++    user: "dispatcher",
++    text: `m${seq}`,
++    created_at: "2026-08-04T00:00:00.000Z",
+   };
+ }
+
+@@ -59,13 +74,30 @@
+ /** A fabric that records instead of connecting. What gets published, and
+  * in what order relative to the ack, is the gateway's decision — provable
+  * without Redis. Chapter 2.6's itest covers the part that needs a broker. */
+-function stubFanout(): Fanout & { published: unknown[]; subjects: string[] } {
++function stubFanout(): Fanout & {
++  published: unknown[];
++  subjects: string[];
++  /** Inject a live frame at a moment the test chooses. This is how the
++   * flagship race gets reproduced deterministically instead of hopefully:
++   * the api stub calls it from inside the backfill, so "a message published
++   * during the backfill window" is a line of code, not a stress loop. */
++  emit: (message: Message) => void;
++} {
+   const published: unknown[] = [];
+   const subjects: string[] = [];
++  let deliver: (channelId: string, message: Message) => void = () => {};
+   return {
+     published,
+     subjects,
+-    onDelivery: () => {},
++    // Honest about the fabric's one rule: a frame published to a subject
++    // this instance has not subscribed to does NOT arrive. Without that,
++    // the stub would silently paper over the gap variant of the race.
++    emit: (message) => {
++      if (subjects.includes(message.channel)) deliver(message.channel, message);
++    },
++    onDelivery: (handler) => {
++      deliver = handler;
++    },
+     publish: async (message) => {
+       published.push(message);
+     },
+@@ -81,6 +113,7 @@
+   api: ApiClient = stubApi(),
+   pingIntervalMs?: number,
+   fanout?: Fanout,
++  resumeDeadlineMs?: number,
+ ): Promise<Harness> {
+   const server: Server = serve({
+     service: "gateway",
+@@ -93,6 +126,7 @@
+     logger: silent,
+     ...(fanout !== undefined && { fanout }),
+     ...(pingIntervalMs !== undefined && { pingIntervalMs }),
++    ...(resumeDeadlineMs !== undefined && { resumeDeadlineMs }),
+   });
+   await new Promise<void>((resolve) => server.listen(0, resolve));
+   const { port } = server.address() as AddressInfo;
+@@ -313,4 +347,226 @@
+     expect(fanout.published).toEqual([]);
+     socket.close();
+   });
++  // ── chapter 2.7: the tunnel ────────────────────────────────────────────
++  //
++  // Every test below turns the resume window into something a test can hold
++  // still. `record` collects frames in arrival ORDER, because order is the
++  // property under test: an ack, then the backfill, then the flush.
++
++  function record(socket: WebSocket): Frame[] {
++    const frames: Frame[] = [];
++    socket.on("message", (raw) =>
++      frames.push(JSON.parse(raw.toString()) as Frame),
++    );
++    return frames;
++  }
++
++  const created = (frames: Frame[]): number[] =>
++    frames
++      .filter((f) => f.type === "message.created")
++      .map((f) => (f as { payload: Message }).payload.seq);
++
++  async function settle(ms = 60): Promise<void> {
++    await new Promise((resolve) => setTimeout(resolve, ms));
++  }
++
++  it("delivers the backfill after the ack, in sequence order (FR-RTM-03)", async () => {
++    const fanout = stubFanout();
++    harness = await boot(
++      stubApi({
++        backfill: async (_identity, cursors) => {
++          // The cursor the client presented arrives verbatim.
++          expect(cursors).toEqual({ [CHANNEL]: 41 });
++          return {
++            [CHANNEL]: { messages: [frame(42), frame(43)], truncated: false },
++          };
++        },
++      }),
++      undefined,
++      fanout,
++    );
++    const socket = new WebSocket(
++      `${harness.url}?token=${await token()}&cursor=${CHANNEL}:41`,
++    );
++    const frames = record(socket);
++    await nextFrame(socket, "connection.ack");
++    await settle();
++    expect(frames[0]).toMatchObject({
++      type: "connection.ack",
++      payload: { resume_ok: true, truncated: [], cursor: { [CHANNEL]: 41 } },
++    });
++    expect(created(frames)).toEqual([42, 43]);
++    socket.close();
++  });
++
++  it("stages the race: a frame published DURING backfill is neither lost nor doubled", async () => {
++    // The flagship bug (SAD §5.2). seq 43 is published while the backfill
++    // is in flight, and the backfill ALSO contains it — the interleaving
++    // where a naive subscribe-then-deliver sends it twice.
++    const fanout = stubFanout();
++    harness = await boot(
++      stubApi({
++        backfill: async () => {
++          fanout.emit(frame(43));
++          return {
++            [CHANNEL]: { messages: [frame(42), frame(43)], truncated: false },
++          };
++        },
++      }),
++      undefined,
++      fanout,
++    );
++    const socket = new WebSocket(
++      `${harness.url}?token=${await token()}&cursor=${CHANNEL}:41`,
++    );
++    const frames = record(socket);
++    await nextFrame(socket, "connection.ack");
++    await settle();
++    const seqs = created(frames);
++    expect(seqs).toEqual([42, 43]); // complete…
++    expect(new Set(seqs).size).toBe(seqs.length); // …and exactly once
++    socket.close();
++  });
++
++  it("stages the other interleaving: published during backfill, absent from it", async () => {
++    // Same window, the other order: seq 43 committed AFTER the backfill
++    // query's snapshot, so it exists ONLY in the buffer. This is the
++    // interleaving where backfill-then-subscribe loses the message.
++    const fanout = stubFanout();
++    harness = await boot(
++      stubApi({
++        backfill: async () => {
++          fanout.emit(frame(43));
++          return { [CHANNEL]: { messages: [frame(42)], truncated: false } };
++        },
++      }),
++      undefined,
++      fanout,
++    );
++    const socket = new WebSocket(
++      `${harness.url}?token=${await token()}&cursor=${CHANNEL}:41`,
++    );
++    const frames = record(socket);
++    await nextFrame(socket, "connection.ack");
++    await settle();
++    expect(created(frames)).toEqual([42, 43]);
++    socket.close();
++  });
++
++  it("forwards per-channel truncation so the client pages history instead (FR-RTM-04)", async () => {
++    const fanout = stubFanout();
++    harness = await boot(
++      stubApi({
++        backfill: async () => ({
++          [CHANNEL]: { messages: [frame(42)], truncated: true },
++        }),
++      }),
++      undefined,
++      fanout,
++    );
++    const socket = new WebSocket(
++      `${harness.url}?token=${await token()}&cursor=${CHANNEL}:41`,
++    );
++    const ack = await nextFrame(socket, "connection.ack");
++    expect(ack).toMatchObject({
++      payload: { resume_ok: true, truncated: [CHANNEL] },
++    });
++    socket.close();
++  });
++
++  it("degrades honestly when the fabric will not confirm the subscription", async () => {
++    const fanout = stubFanout();
++    fanout.subscribe = () => new Promise<void>(() => {}); // broker down
++    let asked = false;
++    harness = await boot(
++      stubApi({
++        backfill: async () => {
++          asked = true;
++          return {};
++        },
++      }),
++      undefined,
++      fanout,
++      20, // deadline in ms, injected like the ping interval
++    );
++    const socket = new WebSocket(
++      `${harness.url}?token=${await token()}&cursor=${CHANNEL}:41`,
++    );
++    const ack = await nextFrame(socket, "connection.ack");
++    // resume_ok: false and the channel listed — the client refetches rather
++    // than believing a stream that has a hole in it. And the backfill is
++    // never requested: a resume that cannot be safe should not be expensive.
++    expect(ack).toMatchObject({
++      payload: { resume_ok: false, truncated: [CHANNEL] },
++    });
++    expect(asked).toBe(false);
++    socket.close();
++  });
++
++  it("degrades on a malformed cursor rather than closing the door", async () => {
++    harness = await boot(stubApi(), undefined, stubFanout());
++    const socket = new WebSocket(
++      `${harness.url}?token=${await token()}&cursor=garbage`,
++    );
++    const ack = await nextFrame(socket, "connection.ack");
++    expect(ack).toMatchObject({ payload: { resume_ok: false } });
++    socket.close();
++  });
++
++  it("degrades when the api cannot serve the backfill", async () => {
++    harness = await boot(
++      stubApi({
++        backfill: async () => {
++          throw new Error("api down");
++        },
++      }),
++      undefined,
++      stubFanout(),
++    );
++    const socket = new WebSocket(
++      `${harness.url}?token=${await token()}&cursor=${CHANNEL}:41`,
++    );
++    expect(await nextFrame(socket, "connection.ack")).toMatchObject({
++      payload: { resume_ok: false, truncated: [CHANNEL] },
++    });
++    socket.close();
++  });
++
++  it("never buffers a fresh connect — 2.6's rule survives 2.7", async () => {
++    // No cursor means no resume: the connection is born live and a live
++    // frame goes straight out, no buffer, no flush. (That the ack does not
++    // WAIT on the fabric is 2.6's test above; this one is about phase.)
++    const fanout = stubFanout();
++    harness = await boot(stubApi(), undefined, fanout);
++    const socket = new WebSocket(`${harness.url}?token=${await token()}`);
++    const frames = record(socket);
++    await nextFrame(socket, "connection.ack");
++    fanout.emit(frame(1));
++    await settle();
++    expect(created(frames)).toEqual([1]);
++    socket.close();
++  });
++
++  it("ignores a cursor for a channel the user is not a member of", async () => {
++    let seen: Record<string, number> | undefined;
++    harness = await boot(
++      stubApi({
++        backfill: async (_identity, cursors) => {
++          seen = cursors;
++          return {};
++        },
++      }),
++      undefined,
++      stubFanout(),
++    );
++    const socket = new WebSocket(
++      `${harness.url}?token=${await token()}` +
++        `&cursor=${CHANNEL}:41&cursor=99999999-9999-9999-9999-999999999999:7`,
++    );
++    await nextFrame(socket, "connection.ack");
++    // The foreign cursor never reaches the api: membership is the bound on
++    // resume work, and a channel the caller is not in is not a question.
++    expect(seen).toEqual({ [CHANNEL]: 41 });
++    socket.close();
++  });
+ });
+```
+
+Then the same race against a **real** broker — a second fanout client
+publishing on the subject, Redis in the middle, nobody faking the
+interleaving:
+
+```ts title="services/gateway/src/resume.itest.ts"
+import { randomUUID } from "node:crypto";
+
+import { SignJWT } from "jose";
+import { WebSocket } from "ws";
+import { afterEach, describe, expect, it } from "vitest";
+import type { Server } from "node:http";
+import type { AddressInfo } from "node:net";
+
+import { createLogger, serve, type Logger } from "@relay/service-kit";
+import type { Frame, Message } from "@relay/protocol";
+
+import type { ApiClient } from "./api-client.js";
+import { DEV_JWT_SECRET } from "./auth.js";
+import { createFanout } from "./fanout.js";
+import { attachSessions } from "./session.js";
+
+// Chapter 2.7's race, run against a REAL broker. The unit suite proves the
+// ordering with a stub whose timing the test controls; this file proves it
+// with Redis in the middle, where the publish is a network round trip on
+// another connection and nobody is faking the interleaving.
+//
+// The api is still a stub — the gateway has no database (ADR-05), and the
+// api's own half of resume is tested in its own lane against Postgres. What
+// is real here is the thing that was fake before: the fabric.
+//
+//   docker compose up -d redis
+//   RELAY_REDIS_PORT=16379 pnpm --filter @relay/gateway test:integration
+
+const url = `redis://localhost:${process.env.RELAY_REDIS_PORT ?? "6379"}`;
+const silent: Logger = createLogger("gateway", () => {});
+// Unique per run, so this suite and 2.6's cannot hear each other on a
+// shared broker (see the note in fanout.itest.ts).
+const CHANNEL = randomUUID();
+
+function frame(seq: number): Message {
+  return {
+    id: `id-${seq}`,
+    channel: CHANNEL,
+    seq,
+    user: "dispatcher",
+    text: `m${seq}`,
+    created_at: "2026-08-04T00:00:00.000Z",
+  };
+}
+
+function token(): Promise<string> {
+  return new SignJWT({ env: "env-1" })
+    .setProtectedHeader({ alg: "HS256" })
+    .setSubject("tuan")
+    .sign(new TextEncoder().encode(DEV_JWT_SECRET));
+}
+
+interface Harness {
+  url: string;
+  close: () => Promise<void>;
+}
+
+async function boot(api: ApiClient): Promise<Harness> {
+  const fanout = createFanout({ url, logger: silent });
+  const server: Server = serve({
+    service: "gateway",
+    health: () => ({}),
+    logger: silent,
+  });
+  const sessions = attachSessions({ server, api, logger: silent, fanout });
+  await new Promise<void>((resolve) => server.listen(0, resolve));
+  const { port } = server.address() as AddressInfo;
+  return {
+    url: `ws://127.0.0.1:${port}/v1/ws`,
+    close: async () => {
+      sessions.close();
+      await fanout.close();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    },
+  };
+}
+
+/** Another gateway instance, as far as Redis is concerned. */
+async function publishFromElsewhere(message: Message): Promise<void> {
+  const other = createFanout({ url, logger: silent });
+  await other.publish(message);
+  await other.close();
+}
+
+function record(socket: WebSocket): Frame[] {
+  const frames: Frame[] = [];
+  socket.on("message", (raw) =>
+    frames.push(JSON.parse(raw.toString()) as Frame),
+  );
+  return frames;
+}
+
+const created = (frames: Frame[]): number[] =>
+  frames
+    .filter((f) => f.type === "message.created")
+    .map((f) => (f as { payload: Message }).payload.seq);
+
+const settle = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+describe("resume across a real fabric", () => {
+  let harness: Harness | undefined;
+
+  afterEach(async () => {
+    await harness?.close();
+    harness = undefined;
+  });
+
+  it("loses nothing and repeats nothing when a frame is published mid-backfill", async () => {
+    // The backfill leg is deliberately slow, and a DIFFERENT process — a
+    // different fanout client on the same subject — publishes into the
+    // window. Neither side coordinates; only the buffer saves this.
+    harness = await boot({
+      memberships: async () => [CHANNEL],
+      backfill: async () => {
+        await publishFromElsewhere(frame(43));
+        await settle(150); // give Redis time to actually deliver it
+        return {
+          [CHANNEL]: { messages: [frame(42), frame(43)], truncated: false },
+        };
+      },
+      sendMessage: async () => {
+        throw new Error("not used");
+      },
+    });
+    const socket = new WebSocket(
+      `${harness.url}?token=${await token()}&cursor=${CHANNEL}:41`,
+    );
+    const frames = record(socket);
+    await settle(700);
+    const seqs = created(frames);
+    expect(seqs).toEqual([42, 43]);
+    expect(new Set(seqs).size).toBe(seqs.length);
+    socket.close();
+  });
+
+  it("delivers a mid-backfill frame that the backfill did not contain", async () => {
+    // Committed after the backfill's snapshot: it exists ONLY in the buffer,
+    // and the flush is the only reason the client ever sees it.
+    harness = await boot({
+      memberships: async () => [CHANNEL],
+      backfill: async () => {
+        await publishFromElsewhere(frame(43));
+        await settle(150);
+        return { [CHANNEL]: { messages: [frame(42)], truncated: false } };
+      },
+      sendMessage: async () => {
+        throw new Error("not used");
+      },
+    });
+    const socket = new WebSocket(
+      `${harness.url}?token=${await token()}&cursor=${CHANNEL}:41`,
+    );
+    const frames = record(socket);
+    await settle(700);
+    expect(created(frames)).toEqual([42, 43]);
+    socket.close();
+  });
+
+  it("goes live after the flush, with no buffering left behind", async () => {
+    harness = await boot({
+      memberships: async () => [CHANNEL],
+      backfill: async () => ({
+        [CHANNEL]: { messages: [frame(42)], truncated: false },
+      }),
+      sendMessage: async () => {
+        throw new Error("not used");
+      },
+    });
+    const socket = new WebSocket(
+      `${harness.url}?token=${await token()}&cursor=${CHANNEL}:41`,
+    );
+    const frames = record(socket);
+    await settle(400);
+    // A frame published AFTER the resume finished must arrive immediately —
+    // the phase went back to normal 2.6 delivery.
+    await publishFromElsewhere(frame(44));
+    await settle(300);
+    expect(created(frames)).toEqual([42, 44]);
+    socket.close();
+  });
+});
+```
+
+Writing that file broke chapter 2.6's integration suite, which is worth
+more than the fix. Both suites published to the same hard-coded channel
+id on the same Redis, so they heard each other's frames: one test saw
+`[42, 43, 6]` — a seq 6 that belonged to the other file entirely. Redis
+pub/sub has no namespaces; the only namespace available is the channel id.
+Chapter 2.1 solved exactly this shape for Postgres by giving every suite
+its own environment, and the fix here is the same idea in a different
+store:
+
+```diff title="services/gateway/src/fanout.itest.ts"
+@@ -1,3 +1,5 @@
++import { randomUUID } from "node:crypto";
++
+ import { afterAll, beforeAll, describe, expect, it } from "vitest";
+
+ import { createLogger } from "@relay/service-kit";
+@@ -18,8 +20,14 @@
+ const url = `redis://localhost:${process.env.RELAY_REDIS_PORT ?? "6379"}`;
+ const logger = createLogger("fanout-itest");
+
+-const CHANNEL = "11111111-1111-1111-1111-111111111111";
+-const OTHER = "22222222-2222-2222-2222-222222222222";
++// Fresh subjects per run (chapter 2.7's fix). Redis pub/sub has no
++// namespaces, so two suites publishing to a hard-coded subject on one broker
++// read each other's frames — which is exactly what happened the first time
++// resume.itest.ts ran beside this file. 2.1 solved the same problem for
++// Postgres with a per-suite environment; the fix here is the same idea in
++// the only namespace pub/sub has: the channel id.
++const CHANNEL = randomUUID();
++const OTHER = randomUUID();
+
+ function messageOn(channel: string, seq: number): Message {
+   return {
+```
+
+The api's half is tested against Postgres, where the cap and the
+membership rules live:
+
+```ts title="services/api/src/internal/backfill.itest.ts"
+import "reflect-metadata";
+
+import { Test } from "@nestjs/testing";
+import type { INestApplication } from "@nestjs/common";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+
+import {
+  BACKFILL_LIMIT,
+  internalBackfillResponseSchema,
+  MAX_RESUME_CHANNELS,
+} from "@relay/protocol";
+
+import { AppModule } from "../app.module";
+import { createDb, createPool } from "../db/client";
+import { createEnvironment, Repository } from "../db/repository";
+
+// The api's half of resume (chapter 2.7), against the compose Postgres. The
+// gateway's suites prove the ORDERING; this one proves the read: everything
+// past the cursor, capped honestly, scoped to membership as it stands now.
+
+describe("POST /internal/backfill", () => {
+  let app: INestApplication;
+  let url: string;
+  let env: { id: string };
+  let repo: Repository;
+  let channelId: string;
+  let quietChannelId: string;
+  let leftChannelId: string;
+  let tuan: { id: string };
+
+  beforeAll(async () => {
+    const db = createDb(createPool());
+    env = await createEnvironment(db, { name: "backfill-itest" });
+    repo = new Repository(db, env.id);
+    tuan = await repo.createUser("tuan", "Tuan");
+    const dispatcher = await repo.createUser("dispatcher", "Dispatcher");
+    channelId = (await repo.createChannel("fleet", "public")).id;
+    quietChannelId = (await repo.createChannel("quiet", "public")).id;
+    leftChannelId = (await repo.createChannel("left", "public")).id;
+    for (const id of [channelId, quietChannelId]) {
+      await repo.addMember(id, tuan.id);
+      await repo.addMember(id, dispatcher.id);
+    }
+    // Tuan is NOT a member of leftChannelId — the "removed while offline"
+    // case, which is indistinguishable from "never joined" by design.
+    await repo.addMember(leftChannelId, dispatcher.id);
+    app = (
+      await Test.createTestingModule({ imports: [AppModule] }).compile()
+    ).createNestApplication({ logger: false });
+    await app.listen(0);
+    url = await app.getUrl();
+  }, 60_000);
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  const ask = (cursors: Record<string, number>, user = "tuan") =>
+    fetch(`${url}/internal/backfill`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-relay-environment": env.id,
+        "x-relay-user": user,
+      },
+      body: JSON.stringify({ cursors }),
+    });
+
+  const parsed = async (res: Response) =>
+    internalBackfillResponseSchema.parse(await res.json());
+
+  /** Messages arrive through the repository with an author, because a frame
+   * without one cannot exist (2.6's fix, 2.7's dependency). */
+  const say = (channel: string, text: string) =>
+    repo.sendMessage(channel, { text, userId: tuan.id });
+
+  it("returns everything after the cursor as wire frames, in sequence order", async () => {
+    const a = await say(channelId, "B2, north ramp");
+    const b = await say(channelId, "which entrance?");
+    const body = await parsed(await ask({ [channelId]: a.seq - 1 }));
+    const page = body.channels[channelId]!;
+    expect(page.messages.map((m) => m.seq)).toEqual([a.seq, b.seq]);
+    expect(page.truncated).toBe(false);
+    // The frame is complete enough to deliver as-is: this is the same shape
+    // the live path publishes, which is the entire point of returning frames
+    // instead of rows.
+    expect(page.messages[0]).toMatchObject({
+      id: a.id,
+      channel: channelId,
+      seq: a.seq,
+      user: "tuan",
+      text: "B2, north ramp",
+    });
+  });
+
+  it("excludes the cursor's own message — the anchor is exclusive", async () => {
+    const a = await say(channelId, "already applied");
+    const body = await parsed(await ask({ [channelId]: a.seq }));
+    expect(body.channels[channelId]!.messages.map((m) => m.seq)).not.toContain(
+      a.seq,
+    );
+  });
+
+  it("answers a caught-up cursor with an empty page, not an absent channel", async () => {
+    // "Nothing new" and "no such channel" must not look the same: the client
+    // uses the difference to decide whether its cursor is still valid.
+    const body = await parsed(await ask({ [quietChannelId]: 0 }));
+    expect(body.channels[quietChannelId]).toEqual({
+      messages: [],
+      truncated: false,
+    });
+  });
+
+  it("caps the page and says so (FR-RTM-04)", async () => {
+    const flood = (await repo.createChannel("flood", "public")).id;
+    await repo.addMember(flood, tuan.id);
+    // One past the ceiling, so the cap and the flag are both exercised.
+    for (let i = 0; i < BACKFILL_LIMIT + 1; i++) {
+      await say(flood, `m${i}`);
+    }
+    const page = (await parsed(await ask({ [flood]: 0 }))).channels[flood]!;
+    expect(page.messages.length).toBe(BACKFILL_LIMIT);
+    expect(page.truncated).toBe(true);
+    // Capped from the OLDEST end: resume is a catch-up, so the client keeps
+    // reading forward from where the page stops rather than guessing at a
+    // hole in the middle.
+    expect(page.messages[0]!.seq).toBe(1);
+    expect(page.messages.at(-1)!.seq).toBe(BACKFILL_LIMIT);
+  }, 120_000);
+
+  it("evaluates membership NOW, not when the cursor was minted", async () => {
+    await repo.sendMessage(leftChannelId, {
+      text: "not for tuan",
+      userId: tuan.id,
+    });
+    const body = await parsed(await ask({ [leftChannelId]: 0 }));
+    // Absent entirely — a channel the user is not in backfills nothing, and
+    // says nothing about whether it exists (constitution I, FR-TEN-05).
+    expect(body.channels[leftChannelId]).toBeUndefined();
+  });
+
+  it("treats a foreign tenant's channel id as a channel that is not there", async () => {
+    const db = createDb(createPool());
+    const other = await createEnvironment(db, { name: "backfill-itest-other" });
+    const theirs = (
+      await new Repository(db, other.id).createChannel("theirs", "public")
+    ).id;
+    const body = await parsed(await ask({ [theirs]: 0 }));
+    expect(body.channels[theirs]).toBeUndefined();
+  });
+
+  it("skips a message no frame can be built from, rather than inventing one", async () => {
+    const orphans = (await repo.createChannel("orphans", "public")).id;
+    await repo.addMember(orphans, tuan.id);
+    // No userId: the shape of every row written through the socket before
+    // 2.6's fix. There is no truthful sender to put on the wire.
+    const anonymous = await repo.sendMessage(orphans, { text: "who said it?" });
+    const withAuthor = await say(orphans, "this one is attributable");
+    const page = (await parsed(await ask({ [orphans]: 0 }))).channels[orphans]!;
+    expect(page.messages.map((m) => m.seq)).toEqual([withAuthor.seq]);
+    // The gap is visible to the client as a missing sequence number — which
+    // is precisely the signal the SDK repairs through 2.4's history endpoint.
+    expect(page.messages.map((m) => m.seq)).not.toContain(anonymous.seq);
+  });
+
+  it("refuses a cursor map big enough to turn one connect into a scan storm", async () => {
+    const cursors: Record<string, number> = {};
+    for (let i = 0; i <= MAX_RESUME_CHANNELS; i++) {
+      cursors[`channel-${i}`] = 1;
+    }
+    expect((await ask(cursors)).status).toBe(400);
+  });
+
+  it("resumes nothing for a user the environment has never seen", async () => {
+    const body = await parsed(await ask({ [channelId]: 0 }, "nobody-here"));
+    expect(body.channels).toEqual({});
+  });
+});
+```
+
+At the tag the lanes read: **74 unit tests** (config 6, service-kit 3,
+protocol 26, api 6, gateway 33) with no Docker, and **43 integration tests
+across 9 files** — the api's 35 against Postgres, the gateway's 8 against
+Redis.
+
+## Walk it — through the tunnel by hand
+
+The walk drives the journey: hear a message live, lose the socket without
+a goodbye, miss two more, come back with a cursor.
+
+```js title="scripts/tunnel-walk.mjs"
+// Chapter 2.7's walk: Tuan drives into the tunnel and comes back out.
+//
+// Phase 1 is the resume itself — connect, hear a message, lose the socket
+// mid-conversation, miss two more, reconnect with the cursor, and see exactly
+// what was missed and nothing else.
+//
+// Phase 2 is FR-RTM-04's ceiling: a channel that ran away while the client
+// was gone, where the honest answer is "page history instead."
+//
+//   node services/api/dist/main.js &
+//   (cd services/gateway && PORT=4001 pnpm exec tsx src/main.ts &)
+//   node scripts/tunnel-walk.mjs
+import { SignJWT } from "jose";
+import WebSocket from "ws";
+
+import { createDb, createPool } from "../services/api/dist/db/client.js";
+import {
+  createEnvironment,
+  Repository,
+} from "../services/api/dist/db/repository.js";
+
+const GW = process.env.RELAY_GW ?? "ws://127.0.0.1:4001";
+const SECRET = process.env.RELAY_DEV_JWT_SECRET ?? "dev-secret";
+const BACKFILL_LIMIT = 500;
+
+const db = createDb(createPool());
+const env = await createEnvironment(db, { name: `tunnel-${Date.now()}` });
+const repo = new Repository(db, env.id);
+const tuan = await repo.createUser("tuan", "Tuan");
+const dispatcher = await repo.createUser("dispatcher", "Dispatcher");
+const channel = await repo.createChannel("fleet", "public");
+const flood = await repo.createChannel("flood", "public");
+for (const c of [channel, flood]) {
+  await repo.addMember(c.id, tuan.id);
+  await repo.addMember(c.id, dispatcher.id);
+}
+
+const token = (sub) =>
+  new SignJWT({ env: env.id })
+    .setProtectedHeader({ alg: "HS256" })
+    .setSubject(sub)
+    .sign(new TextEncoder().encode(SECRET));
+
+/** Connect and report every frame, keeping a cursor the way a client would:
+ * the highest sequence it has actually applied, per channel. */
+async function connect(label, sub, cursors = {}, quiet = false) {
+  const query = Object.entries(cursors)
+    .map(([id, seq]) => `&cursor=${id}:${seq}`)
+    .join("");
+  const socket = new WebSocket(`${GW}/v1/ws?token=${await token(sub)}${query}`);
+  const applied = { ...cursors };
+  socket.on("message", (raw) => {
+    const frame = JSON.parse(raw.toString());
+    if (frame.type === "connection.ack") {
+      console.log(
+        `  ${label} ← connection.ack resume_ok=${frame.payload.resume_ok} truncated=${JSON.stringify(frame.payload.truncated)}`,
+      );
+      return;
+    }
+    if (frame.type === "message.created") {
+      const { channel: id, seq, text } = frame.payload;
+      applied[id] = Math.max(applied[id] ?? 0, seq);
+      const where = id === channel.id ? "fleet" : "flood";
+      if (!quiet) {
+        console.log(
+          `  ${label} ← message.created ${where} seq=${seq} "${text}"`,
+        );
+      }
+      return;
+    }
+    console.log(`  ${label} ← ${JSON.stringify(frame)}`);
+  });
+  await new Promise((resolve) => socket.on("open", resolve));
+  return { socket, applied };
+}
+
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+console.log("phase 1 — into the tunnel\n");
+// The dispatcher sends through a SOCKET, not straight into the database.
+// Writing through the repository would commit the row and publish nothing —
+// the REST-send asymmetry 2.6 left open — and Tuan would never hear anything
+// live, which would quietly turn this walk into a lie.
+const dispatch = await connect("dispatcher", "dispatcher", {}, true);
+const say = (text) =>
+  dispatch.socket.send(
+    JSON.stringify({
+      type: "message.send",
+      payload: { idem_key: `k-${text}`, channel: channel.id, text },
+    }),
+  );
+
+const first = await connect("tuan", "tuan");
+await wait(300);
+say("convoy leaving in five");
+await wait(400);
+
+// The tunnel: no close frame, no goodbye — the radio simply stops.
+first.socket.terminate();
+console.log(
+  `\n  …signal lost (cursor at fleet:${first.applied[channel.id] ?? 0})`,
+);
+say("which entrance?");
+say("B2, north ramp");
+await wait(500);
+console.log("  two messages sent while Tuan is underground\n");
+
+console.log("phase 1 — out the other side, resuming from the cursor");
+const back = await connect("tuan", "tuan", {
+  [channel.id]: first.applied[channel.id] ?? 0,
+});
+await wait(600);
+console.log(
+  `\n  applied through fleet:${back.applied[channel.id]} — and seq 1, heard live before the tunnel, was NOT resent\n`,
+);
+back.socket.terminate();
+dispatch.socket.terminate();
+
+console.log(
+  `phase 2 — a channel that ran away (${BACKFILL_LIMIT + 1} messages)`,
+);
+for (let i = 1; i <= BACKFILL_LIMIT + 1; i++) {
+  await repo.sendMessage(flood.id, { text: `m${i}`, userId: dispatcher.id });
+}
+let delivered = 0;
+const listener = await connect("tuan", "tuan", { [flood.id]: 0 }, true);
+listener.socket.on("message", (raw) => {
+  if (JSON.parse(raw.toString()).type === "message.created") delivered++;
+});
+await wait(1500);
+console.log(
+  `\n  frames delivered on resume: ${delivered} of ${BACKFILL_LIMIT + 1} — the rest is history's job (FR-RTM-04)`,
+);
+listener.socket.terminate();
+process.exit(0);
+```
+
+```text
+phase 1 — into the tunnel
+
+  dispatcher ← connection.ack resume_ok=true truncated=[]
+  tuan ← connection.ack resume_ok=true truncated=[]
+  dispatcher ← {"type":"message.ack","payload":{"seq":1}}
+  tuan ← message.created fleet seq=1 "convoy leaving in five"
+
+  …signal lost (cursor at fleet:1)
+  dispatcher ← {"type":"message.ack","payload":{"seq":2}}
+  dispatcher ← {"type":"message.ack","payload":{"seq":3}}
+  two messages sent while Tuan is underground
+
+phase 1 — out the other side, resuming from the cursor
+  tuan ← connection.ack resume_ok=true truncated=[]
+  tuan ← message.created fleet seq=2 "which entrance?"
+  tuan ← message.created fleet seq=3 "B2, north ramp"
+
+  applied through fleet:3 — and seq 1, heard live before the tunnel, was NOT resent
+
+phase 2 — a channel that ran away (501 messages)
+  tuan ← connection.ack resume_ok=true truncated=["378b1ce4-4a07-4ff2-92c2-92bc192d312f"]
+
+  frames delivered on resume: 500 of 501 — the rest is history's job (FR-RTM-04)
+```
+
+Read the middle of phase 1 carefully. The dispatcher's two sends were
+**acked** while Tuan was gone — durable, numbered, and published to a
+fabric where nobody was listening for him. Those frames are gone; 2.6
+promised they would be, and this is the promise being kept. What arrives
+after the reconnect is exactly seq 2 and seq 3: the one he already had is
+not resent, and neither of the two he missed is missing.
+
+Phase 2 is the ceiling. Five hundred frames delivered, one channel named
+in `truncated`, and the five hundred and first is not a bug — it is the
+hand-off. A resume that floods a phone which just found one bar of signal
+fails the user as surely as a gap does, so past the cap the honest answer
+is "page history at your own speed," and the resume path and the history
+path stay two doors onto the same read.
+
+The first version of this script lied, which is worth mentioning because
+the lie was invisible. It had the dispatcher write through the repository
+directly — and a repository write commits a row and publishes *nothing*
+(2.6's open asymmetry, 3.3's outbox). Tuan therefore heard nothing live,
+his cursor stayed at 0, and the resume delivered all three messages while
+the script cheerfully printed that the first had not been resent. A
+transcript is only evidence if you read it.
+
+<Figure
+  caption="§5.2's resume walk, end to end: connect with cursors, subscribe-first, backfill capped at 500, flush, live — and the queued 'B2, north ramp' retries through 2.3's door with its original key."
+  code={figTunnelWalk}
+/>
+
+<ForwardRef part="Part 2's finale, then Part 5">
+
+One chapter remains in this part, and it writes almost no new machinery:
+2.8 scripts journey 4 end to end — two instances, a mid-send kill, this
+chapter's resume — and asserts the part's whole promise in one suite. The
+client-side half of today (the cursor store, the offline queue, the
+jittered backoff that keeps forty reconnecting drivers from becoming a
+thundering herd) is 5.1's SDK chapter; today's walk played it by hand. The
+buffer's overflow branch closes a socket rather than lying, and whether
+that can loop on a genuinely violent channel is a load question, which is
+7.5's. And presence — "Tuan appears online again" — rides this same
+reconnect moment when ADR-10's chapter arrives.
+
+</ForwardRef>
+
+## Your turn
+
+The exercise is the build: `resume.ts`, the backfill route and repository
+method, the injected race test. Then attack the window, and note that both
+attacks are two-line patches — which is the point:
+
+1. In `session.ts`, change the connection's starting phase to `"live"` so
+   nothing buffers, and run the race test. Read `[43, 42, 43]`. Then put
+   the buffer back and move the subscribe to *after* the backfill instead,
+   and read `[42]`. Keep all three outputs; that triptych is the chapter.
+2. Change the flush comparison from `seq > mark` to `seq >= mark` and find
+   which test catches the boundary duplicate. (2.4's seam lesson, third
+   appearance — it will not be the last.)
+3. Reconnect with a cursor from a channel you were removed from while
+   offline. Confirm the backfill excludes it entirely — membership is
+   evaluated at resume time, not cursor time, and a foreign-channel cursor
+   is a no-op rather than a leak.
+4. Stop Redis and reconnect *with* a cursor. You should get
+   `resume_ok: false` and every channel in `truncated` — the degrade, not
+   a hang and not a lie. Then reconnect *without* a cursor and confirm the
+   ack still arrives immediately: 2.6's rule, still standing.
+
+If you are stuck, the tag holds the answer key: `part2-ch7`.
+
+## Takeaways
+
+If you read nothing else in this chapter, keep these:
+
+- **The race lives between two correct operations**: backfill and
+  subscribe are each fine; every ordering of the pair is wrong; the fix is
+  overlap plus dedup, not a better ordering (SAD §5.2).
+- **Subscribe → buffer → backfill → flush(≤ H) → live** — five steps, and
+  the order is the entire theorem.
+- **Sequences turn time into integers**: the coordination happened at
+  write time under 2.2's lock, so resume dedup costs one comparison — the
+  strict layer paying out exactly where the SAD said it would.
+- **A promise you cannot keep should be withdrawn, not faked**:
+  `resume_ok: false` with the channels to page is the one answer that
+  covers a dead broker, a corrupt cursor, and an unavailable api.
+- **Deterministic reproduction or it isn't fixed**: a milliseconds-wide
+  window demands an injected race, because the naive versions pass every
+  casual check for months.
+- **Caps are part of correctness** (FR-RTM-04): a resume that floods a
+  weak connection fails the user as surely as a gap; truncate honestly and
+  hand off to history.
+
+<Checkpoint>
+
+Before starting chapter 2.8, you should have: resume running its five
+steps on every connect-with-cursor; the race test passing with injection
+and failing against both naive orders (witness all three); the degrade
+branch answering `resume_ok: false` when completeness cannot be promised;
+truncation at 500 handing off to 2.4's history; sender attribution
+reaching the read path at last; and both lanes green. That state is tag
+`part2-ch7` in the canonical repository. Everything journey 4 needs now
+exists — chapter 2.8 straps it together and runs the drive.
+
+</Checkpoint>
+
+<ChapterFooter id="2.7" />
