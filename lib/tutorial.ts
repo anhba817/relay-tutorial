@@ -280,12 +280,15 @@ export const series: Part[] = [
         id: "2.8",
         path: "/part-2/chapter-08/milestone-the-tuan-test",
         title: "Milestone: the Tuan test",
-        status: "forthcoming",
+        status: "published",
+        translatedIn: ["vi"],
         readerProduces:
           "An integration suite scripting journey 4 end-to-end — the SRS Phase 1 exit criterion",
         sourceDoc: "docs/03-journey-map.md, docs/04-srs.md",
         readerMinutes: 100,
         titleVi: "Cột mốc: bài kiểm tra Tuan",
+        readerProducesVi:
+          "Suite e2e cho journey 4 — tiêu chí thoát Phase 1",
       },
     ],
   },

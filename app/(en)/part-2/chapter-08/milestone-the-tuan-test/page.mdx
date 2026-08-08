@@ -1,0 +1,1287 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figJourneySwimlane, figCapabilityMap, figPhaseOneExit } from "./figures";
+
+export const metadata = {
+  title: "Milestone: the Tuan test — Building Relay",
+  description:
+    "Journey 4 becomes an executable integration suite: two gateway instances, a socket killed mid-send, a tunnel, a resume — and the assertions that make Part 2's promise a passing test instead of a claim.",
+  alternates: {
+    canonical: "/part-2/chapter-08/milestone-the-tuan-test",
+    languages: {
+      en: "/part-2/chapter-08/milestone-the-tuan-test",
+      vi: "/vi/part-2/chapter-08/milestone-the-tuan-test",
+    },
+  },
+};
+
+<ChapterHeader id="2.8" />
+
+The tutorial plan made a rule back in Part 0 and this chapter is where it
+stops being a rule and starts being a file: "the journeys are the
+milestones. These aren't metaphors — they are the integration suites, and
+they are the SRS phase exit criteria. A reader who passes the Tuan test
+has built Phase 1, definitionally." Six chapters built machinery; this one
+builds almost none. It writes the drive into the car park as a test —
+every stage of journey 4, in order, against two real gateway processes, a
+real api, real stores — and lets the assertions say what seven chapters of
+prose have been promising. When this suite is green, Part 2 is not "done"
+in the sense of finished chapters. It is done in the sense the SRS defined
+before any code existed.
+
+<SkipAhead>
+
+If you must skip — though this is the one chapter where skipping misses
+the point: a new dev-only workspace member, `packages/e2e`, holds
+`tuan.itest.ts` — a harness that boots the api and TWO gateways as child
+processes against the compose stores, then scripts journey 4: converse
+across instances, kill Tuan's socket mid-send, keep talking while he is
+gone *and while he is reconnecting*, resume on the other instance, retry
+with the original key. Assertions: exactly-once, one strict order, no
+gaps, no cross-tenant leak, and a read path that agrees with the live one.
+Green suite = SRS §7.3's Phase 1 exit criterion, met. Along the way the
+suite finds four defects in chapters 2.4–2.7, which is what milestone
+suites are for. The chapter-end state is tag **`part2-ch8`** — and with
+it, **Part 2 is complete**.
+
+</SkipAhead>
+
+## The journey, restated as a test plan
+
+Journey 4's stages map one-to-one onto suite phases, and it is worth
+seeing the correspondence before reading any code — the journey map was
+the test plan all along, written in persona language:
+
+**Stage 1 — type and send** → seed a conversation: dispatcher and Tuan in
+one channel, connected to *different* gateway instances (the suite runs
+two on purpose; 2.6 taught us single-instance tests are blind to a whole
+class of bug). Each hears the other cross-instance.
+
+**Stage 2 — lose signal ★** → the forced disconnect. Tuan's client mints
+an idempotency key *before* the send (FR-SDK-06's discipline, played by the
+harness), writes "B2, north ramp", and the harness destroys the TCP socket
+before any ack can return. Not a graceful close — a kill. The star on this
+stage is the journey map's: "the moment the platform was actually built
+for."
+
+**Stage 3 — reconnect** → the tunnel window first: the dispatcher keeps
+talking while Tuan is gone. Then Tuan reconnects to the *other* instance,
+because CON-02 says any gateway must do, presents his cursor, and the
+resume runs 2.7's five steps — while the dispatcher, who has no idea any
+of this is happening, sends one more. The queued send flushes with the
+original key.
+
+**Stage 4 — confirm** → the assertions. One "B2, north ramp" in existence,
+everywhere. Every client's view strictly ordered by seq, and identical. No
+frame lost, none doubled, nothing from another tenant.
+
+**Stage 5 — move on** → the suite ends. Nothing to assert; the absence of
+drama *was* the requirement — the journey map scores this stage's feeling
+as "nothing, which is the product working."
+
+<Figure
+  caption="Journey 4 as a swimlane, with the kill on stage 2's star: the suite scripts exactly this, one assertion per promise the part has made."
+  code={figJourneySwimlane}
+/>
+
+## A home for a test that belongs to no service
+
+Where does a test live when it exercises two services and two stores at
+once? Not in `services/api` — it would drag gateway lifecycle into the
+api's lane. Not in `services/gateway` — mirrored problem. The suite's
+subject is the *system*, so it gets a system-level home:
+
+```json title="packages/e2e/package.json"
+{
+  "name": "@relay/e2e",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test:integration": "vitest run --config vitest.integration.config.mts"
+  },
+  "dependencies": {
+    "@relay/protocol": "workspace:*"
+  },
+  "devDependencies": {
+    "@relay/api": "workspace:*",
+    "@relay/gateway": "workspace:*",
+    "@types/ws": "^8.18.1",
+    "jose": "^6.2.7",
+    "ws": "^8.21.1"
+  }
+}
+```
+
+```json title="packages/e2e/tsconfig.json"
+{
+  "extends": "../../tsconfig.base.json",
+  "include": ["src"]
+}
+```
+
+DECISION (chapter 2.8): a dev-only workspace member under `packages/` —
+the existing globs cover it, it is never published, and it deliberately has
+**no `test` script**. The unit lane has nothing to collect here, so the
+Docker-free gate stays exactly as fast as 1.1 built it. Its only verb is
+`test:integration`, the lane 2.1 named.
+
+Two details in that manifest are not decoration. It depends on
+`@relay/api` and `@relay/gateway` even though it imports neither by name:
+the suite *boots* them, so it needs them built, and in a task graph the
+way you say that is a dependency. Add `test:integration` to `turbo.json`
+with `dependsOn: ["^build"]` and the stale-build failure mode disappears —
+`^build` builds a package's dependencies, so declaring them is what makes
+the guarantee real.
+
+```diff title="turbo.json"
+@@ -17,6 +17,18 @@
+       "dependsOn": ["^build"],
+       "inputs": ["$TURBO_DEFAULT$", "$TURBO_ROOT$/compose.yaml"]
+     },
++    "test:integration": {
++      "dependsOn": ["^build"],
++      "cache": false,
++      "env": [
++        "DATABASE_URL",
++        "RELAY_POSTGRES_PORT",
++        "RELAY_REDIS_URL",
++        "RELAY_REDIS_PORT",
++        "RELAY_DEV_JWT_SECRET",
++        "RELAY_E2E_API_PORT"
++      ]
++    },
+     "//#lint:root": {
+       "inputs": [
+         "**/*.{ts,mts,cts,mjs,js}",
+```
+
+```diff title="package.json"
+@@ -12,6 +12,7 @@
+     "lint:root": "eslint .",
+     "typecheck": "turbo run typecheck",
+     "test": "turbo run test",
++    "test:integration": "turbo run test:integration",
+     "build": "turbo run build"
+   },
+   "devDependencies": {
+```
+
+`cache: false` is the other one, and it is a correctness setting rather
+than a performance one. Turborepo caches a task's result keyed on its
+inputs; an integration suite's real inputs include a Postgres and a Redis
+it does not own. A cached green from an hour ago is not evidence that the
+system works now, and a milestone that can be satisfied by a cache hit is
+ceremony.
+
+```ts title="packages/e2e/vitest.integration.config.mts"
+import { defineConfig } from "vitest/config";
+
+// The system lane (chapter 2.8). Same `*.itest.ts` convention 2.1
+// established, with one difference that matters: this package has no `test`
+// script at all, so the Docker-free gate never looks here. A journey suite
+// that boots two gateways and an api has no business slowing down the loop
+// a reader runs on every save.
+//
+// The whole suite is one journey, and it boots real processes — so it gets
+// a real timeout, and it does not run its files in parallel.
+export default defineConfig({
+  test: {
+    include: ["src/**/*.itest.ts"],
+    testTimeout: 60_000,
+    hookTimeout: 60_000,
+    fileParallelism: false,
+  },
+});
+```
+
+## The harness
+
+The suite boots services as child processes, because the star of this
+journey is a *transport* failure and in-process fakes cannot die the way
+transports die:
+
+```ts title="packages/e2e/src/harness.ts"
+import { spawn, type ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { SignJWT } from "jose";
+import { WebSocket } from "ws";
+
+import type { Frame, Message } from "@relay/protocol";
+
+// The system harness (chapter 2.8): boots the api and N gateway instances as
+// CHILD PROCESSES against the compose stores, wires a minimal client per
+// persona, and — the part that matters — can kill a socket at a precise
+// moment mid-conversation.
+//
+// Child processes, not in-process servers, for one reason: journey 4's star
+// stage is a TRANSPORT death, and the whole point of the milestone is that
+// nothing in the path is a fake. Two gateways here are two operating-system
+// processes with their own ports, their own Redis connections and their own
+// registries — the configuration 2.6 proved a single-instance test cannot
+// see past.
+//
+// The client is deliberately primitive: connect, send, collect frames,
+// remember the highest seq applied per channel, hold unacked sends with
+// their keys. That is the SDK's job description (Part 5) played by a few
+// dozen lines of test code — and when the real SDK exists, its own e2e
+// reuses this exact scenario.
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const REPO = join(HERE, "..", "..", "..");
+const require_ = createRequire(import.meta.url);
+
+const DEV_SECRET = process.env.RELAY_DEV_JWT_SECRET ?? "dev-secret";
+
+/** Store coordinates are FORWARDED, never invented. Each service already has
+ * a default (2.1's `DEFAULT_DATABASE_URL`, 2.6's `DEFAULT_REDIS_URL`), and a
+ * harness that composes its own URL from a port variable becomes a second
+ * source of truth — one that can hand a child process an address the parent
+ * would never have used itself. That is precisely how this suite first
+ * failed: turbo runs tasks in strict env mode, the port variable was
+ * filtered out, and the harness confidently passed `localhost:5432` to an
+ * api that would have found the right store on its own. */
+const forwarded = (...names: string[]): Record<string, string> =>
+  Object.fromEntries(
+    names.flatMap((name) => {
+      const value = process.env[name];
+      return value === undefined ? [] : [[name, value]];
+    }),
+  );
+
+/** DECISION (chapter 2.8): the suite seeds through the api's own repository
+ * layer, imported from its build output. There is no admin API to create an
+ * environment, a user or a channel yet — that is Part 3's tenancy work — and
+ * inventing one for a test would be inventing product. The import is a
+ * test-only seam with a named retirement, like 2.3's `listMessagesRaw`. */
+interface Seeder {
+  createEnvironment: (
+    db: unknown,
+    input: { name: string },
+  ) => Promise<{ id: string }>;
+  Repository: new (
+    db: unknown,
+    environmentId: string,
+  ) => {
+    createUser: (
+      externalId: string,
+      displayName?: string,
+    ) => Promise<{ id: string }>;
+    createChannel: (
+      externalId: string,
+      type: "public" | "private",
+      name?: string,
+    ) => Promise<{ id: string }>;
+    addMember: (channelId: string, userId: string) => Promise<boolean>;
+    sendMessage: (
+      channelId: string,
+      body: { text: string; userId?: string },
+    ) => Promise<{ id: string; seq: number }>;
+  };
+}
+
+function loadApiInternals(): {
+  db: unknown;
+  seeder: Seeder;
+} {
+  const dist = join(REPO, "services", "api", "dist", "db");
+  if (!existsSync(join(dist, "repository.js"))) {
+    throw new Error(
+      "the api is not built — run `pnpm build` before the e2e lane " +
+        "(the suite boots the real service, not a stub)",
+    );
+  }
+  const client = require_(join(dist, "client.js")) as {
+    createDb: (pool: unknown) => unknown;
+    createPool: () => unknown;
+  };
+  const seeder = require_(join(dist, "repository.js")) as Seeder;
+  return { db: client.createDb(client.createPool()), seeder };
+}
+
+async function waitForHealth(url: string, what: string): Promise<void> {
+  const deadline = Date.now() + 30_000;
+  for (;;) {
+    try {
+      const res = await fetch(url);
+      if (res.ok) return;
+    } catch {
+      // not listening yet
+    }
+    if (Date.now() > deadline) throw new Error(`${what} never became healthy`);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
+/** One persona's client: a socket, a frame log, and a cursor. */
+export class Client {
+  private socket: WebSocket | undefined;
+  readonly frames: Frame[] = [];
+  /** Highest sequence APPLIED per channel — the client's half of resume
+   * (2.7), and the reason a resumed session gets no duplicates. */
+  readonly cursors = new Map<string, number>();
+  /** Sends that were written but never acked. The queue survives a socket
+   * death, which is what makes 2.3's key worth minting before the send. */
+  readonly unacked: { text: string; channel: string; key: string }[] = [];
+
+  constructor(
+    readonly name: string,
+    private readonly token: string,
+    private readonly log: (line: string) => void,
+  ) {}
+
+  async connect(gatewayUrl: string, resume = false): Promise<void> {
+    // Frames from the previous connection stay in the log — this client is
+    // the same client, the way an SDK is the same object across a reconnect
+    // — so waits must look only at what arrives from here on.
+    const from = this.frames.length;
+    const cursor = resume
+      ? [...this.cursors]
+          .map(([channel, seq]) => `&cursor=${channel}:${seq}`)
+          .join("")
+      : "";
+    const url = `${gatewayUrl}/v1/ws?token=${this.token}${cursor}`;
+    const socket = new WebSocket(url);
+    this.socket = socket;
+    socket.on("message", (raw) => {
+      const frame = JSON.parse(raw.toString()) as Frame;
+      this.frames.push(frame);
+      if (frame.type === "message.created") {
+        const { channel, seq } = frame.payload;
+        this.cursors.set(
+          channel,
+          Math.max(this.cursors.get(channel) ?? 0, seq),
+        );
+      }
+      if (frame.type === "message.ack") {
+        // An ack clears the oldest unacked send: this client has one in
+        // flight at a time, which is all the journey needs.
+        this.unacked.shift();
+      }
+    });
+    await new Promise<void>((resolve, reject) => {
+      socket.once("open", resolve);
+      socket.once("error", reject);
+    });
+    await this.waitFor(
+      (f) => f.type === "connection.ack",
+      "connection.ack",
+      5_000,
+      from,
+    );
+    this.log(
+      `${this.name} connected to ${gatewayUrl}${resume ? " (resuming)" : ""}`,
+    );
+  }
+
+  private live(): WebSocket {
+    if (!this.socket) throw new Error(`${this.name} is not connected`);
+    return this.socket;
+  }
+
+  /** Mint the key BEFORE the send, per FR-SDK-06 — a key generated on the
+   * retry path is a key that cannot deduplicate anything (2.3's trap). */
+  mintKey(): string {
+    return `k-${randomUUID()}`;
+  }
+
+  send(channel: string, text: string, key = this.mintKey()): string {
+    this.unacked.push({ text, channel, key });
+    this.live().send(
+      JSON.stringify({
+        type: "message.send",
+        payload: { idem_key: key, channel, text },
+      }),
+    );
+    return key;
+  }
+
+  /** Stage 2's star: write the frame, then destroy the transport before any
+   * ack can come back. `terminate()` and no await — an ack cannot arrive in
+   * the same tick, so the kill is protocol-timed, not sleep-timed. */
+  sendAndKillBeforeAck(channel: string, text: string, key: string): void {
+    this.send(channel, text, key);
+    this.live().terminate();
+    this.log(`${this.name} sent "${text}" and lost the socket before any ack`);
+  }
+
+  /** Re-send everything the socket died owing, with the ORIGINAL keys. */
+  flushQueue(): void {
+    const queued = [...this.unacked];
+    this.unacked.length = 0;
+    for (const item of queued) {
+      this.log(`${this.name} retries "${item.text}" with its original key`);
+      this.send(item.channel, item.text, item.key);
+    }
+  }
+
+  close(): void {
+    this.socket?.close();
+  }
+
+  async waitFor(
+    predicate: (frame: Frame) => boolean,
+    what: string,
+    timeoutMs = 5_000,
+    from = 0,
+  ): Promise<Frame> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const found = this.frames.slice(from).find(predicate);
+      if (found) return found;
+      if (Date.now() > deadline) {
+        throw new Error(`${this.name}: no ${what} within ${timeoutMs}ms`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  }
+
+  /** Wait for a specific message text to arrive — a delivery assertion that
+   * polls with a deadline instead of sleeping and hoping (2.8's trap). */
+  expectCreated(text: string, timeoutMs = 5_000, from = 0): Promise<Frame> {
+    return this.waitFor(
+      (f) => f.type === "message.created" && f.payload.text === text,
+      `message.created "${text}"`,
+      timeoutMs,
+      from,
+    );
+  }
+
+  /** Come back — possibly on a different instance (CON-02), always with the
+   * cursor this client applied. Everything it knew survives: the frames it
+   * rendered, the sends it still owes. */
+  async reconnect(gatewayUrl: string): Promise<number> {
+    const from = this.frames.length;
+    await this.connect(gatewayUrl, true);
+    return from;
+  }
+
+  /** Everything this client believes about a channel, in arrival order. */
+  timeline(channel: string): Message[] {
+    return this.frames
+      .filter(
+        (f): f is Extract<Frame, { type: "message.created" }> =>
+          f.type === "message.created" && f.payload.channel === channel,
+      )
+      .map((f) => f.payload);
+  }
+}
+
+export interface System {
+  gateways: string[];
+  apiUrl: string;
+  log: string[];
+  /** The services' own logs, for when an assertion is not the whole story. */
+  serviceOutput: () => string;
+  seedConversation: () => Promise<{
+    environmentId: string;
+    channel: string;
+    dispatcher: Client;
+    tuan: Client;
+  }>;
+  seedForeignTenant: () => Promise<{ channel: string; text: string }>;
+  client: (name: string, environmentId: string) => Promise<Client>;
+  stop: () => Promise<void>;
+}
+
+export async function boot({ gateways = 2 } = {}): Promise<System> {
+  const { db, seeder } = loadApiInternals();
+  const log: string[] = [];
+  const say = (line: string) => {
+    log.push(line);
+    console.log(`  ${line}`);
+  };
+
+  const children: ChildProcess[] = [];
+  /** Child stdio is CAPTURED, not discarded. A suite that boots processes
+   * and then hides their logs cannot explain its own failures, and the one
+   * thing a milestone must do when it goes red is say where to look. */
+  const output = new Map<string, string[]>();
+  const capture = (name: string, child: ChildProcess) => {
+    const lines: string[] = [];
+    output.set(name, lines);
+    child.stdout?.on("data", (d: Buffer) => lines.push(d.toString().trim()));
+    child.stderr?.on("data", (d: Buffer) => lines.push(d.toString().trim()));
+    child.on("exit", (code, signal) => {
+      if (code !== 0 && signal === null) lines.push(`exited with code ${code}`);
+    });
+    return child;
+  };
+  const dump = (what: string) => {
+    const lines = [`${what}; child output follows:`];
+    for (const [name, log] of output) {
+      lines.push(`--- ${name} ---`, ...log.slice(-12));
+    }
+    return lines.join("\n");
+  };
+  const env = {
+    ...process.env,
+    ...forwarded(
+      "DATABASE_URL",
+      "RELAY_POSTGRES_PORT",
+      "RELAY_REDIS_URL",
+      "RELAY_REDIS_PORT",
+    ),
+    RELAY_DEV_JWT_SECRET: DEV_SECRET,
+  };
+
+  const apiPort = Number(process.env.RELAY_E2E_API_PORT ?? 4100);
+  children.push(
+    capture(
+      "api",
+      spawn("node", [join(REPO, "services", "api", "dist", "main.js")], {
+        env: { ...env, PORT: String(apiPort) },
+        stdio: ["ignore", "pipe", "pipe"],
+      }),
+    ),
+  );
+  const apiUrl = `http://127.0.0.1:${apiPort}`;
+  await waitForHealth(`${apiUrl}/healthz`, "api");
+  say(`api up on ${apiPort}`);
+
+  const urls: string[] = [];
+  for (let i = 0; i < gateways; i++) {
+    const port = apiPort + 1 + i;
+    children.push(
+      capture(
+        `gateway ${i + 1}`,
+        spawn("pnpm", ["exec", "tsx", "src/main.ts"], {
+          cwd: join(REPO, "services", "gateway"),
+          env: { ...env, PORT: String(port), RELAY_API_URL: apiUrl },
+          stdio: ["ignore", "pipe", "pipe"],
+        }),
+      ),
+    );
+    await waitForHealth(`http://127.0.0.1:${port}/healthz`, `gateway ${i + 1}`);
+    urls.push(`ws://127.0.0.1:${port}`);
+    say(`gateway ${i + 1} up on ${port}`);
+  }
+
+  const environments: string[] = [];
+  const newEnvironment = async (label: string) => {
+    const created = await seeder.createEnvironment(db, {
+      name: `e2e-${label}-${randomUUID().slice(0, 8)}`,
+    });
+    environments.push(created.id);
+    return new seeder.Repository(db, created.id);
+  };
+
+  const token = (environmentId: string, subject: string) =>
+    new SignJWT({ env: environmentId })
+      .setProtectedHeader({ alg: "HS256" })
+      .setSubject(subject)
+      .sign(new TextEncoder().encode(DEV_SECRET));
+
+  let primaryEnvironment = "";
+
+  return {
+    gateways: urls,
+    apiUrl,
+    log,
+    serviceOutput: () => dump("service output"),
+    async seedConversation() {
+      const repo = await newEnvironment("fleet");
+      primaryEnvironment = environments.at(-1)!;
+      const dispatcherUser = await repo.createUser("dispatcher", "Dispatcher");
+      const tuanUser = await repo.createUser("tuan", "Tuan");
+      const channel = await repo.createChannel("fleet", "public");
+      await repo.addMember(channel.id, dispatcherUser.id);
+      await repo.addMember(channel.id, tuanUser.id);
+      say(`seeded one channel with two members in ${primaryEnvironment}`);
+      return {
+        environmentId: primaryEnvironment,
+        channel: channel.id,
+        dispatcher: new Client(
+          "dispatcher",
+          await token(primaryEnvironment, "dispatcher"),
+          say,
+        ),
+        tuan: new Client("tuan", await token(primaryEnvironment, "tuan"), say),
+      };
+    },
+    /** A second tenant with traffic of its own. Nothing in journey 4 asks
+     * for it; constitution I asks for it everywhere correctness is being
+     * asserted, so it rides along. */
+    async seedForeignTenant() {
+      const repo = await newEnvironment("other");
+      const other = environments.at(-1)!;
+      const user = await repo.createUser("stranger", "Stranger");
+      const channel = await repo.createChannel("theirs", "public");
+      await repo.addMember(channel.id, user.id);
+      const text = "this belongs to another tenant";
+      await repo.sendMessage(channel.id, { text, userId: user.id });
+      say(`seeded a foreign tenant (${other}) with one message`);
+      return { channel: channel.id, text };
+    },
+    async client(name, environmentId) {
+      return new Client(name, await token(environmentId, name), say);
+    },
+    async stop() {
+      for (const child of children) child.kill("SIGTERM");
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    },
+  };
+}
+```
+
+Three things in there were learned the hard way, all in the first hour of
+running it.
+
+**Child stdio is captured, not discarded.** The first version passed
+`stdio: "ignore"`, and the first failure was `dispatcher: no
+connection.ack within 5000ms` — a true statement that explains nothing.
+With the logs attached to the error, the same failure read
+`GET /internal/memberships … status 500`, and the cause was one line away.
+A suite that boots processes and hides their output cannot explain its own
+failures, and explaining failures is most of what a milestone is for.
+
+**Store coordinates are forwarded, never invented.** That 500 happened
+because the harness composed its own `DATABASE_URL` from a port variable —
+and Turborepo 2 runs tasks in **strict env mode**, where a variable not
+declared in `turbo.json` simply is not there. The port vanished, the
+harness confidently built `localhost:5432`, and handed it to an api that
+would have found the right store on its own using 2.1's default. Two fixes,
+both of which are the real lesson: declare what the lane needs (that is
+the `env` array in the diff above), and let each service own its own
+default instead of guessing on its behalf.
+
+**The client survives its socket.** A reconnect returns the *same* client
+object, carrying the frames it already rendered and the sends it still
+owes. The first draft created a fresh client for the resumed session, and
+the assertions immediately went strange: Tuan's timeline was `[2, 3]`
+where the dispatcher's was `[1, 2, 3]`, because the pre-tunnel message had
+been rendered by an object the test had thrown away. That is not how an SDK
+behaves, and modelling it that way would have asserted a promise nobody
+makes.
+
+## The suite itself
+
+```ts title="packages/e2e/src/tuan.itest.ts"
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+
+import type { Frame, Message } from "@relay/protocol";
+
+import { boot, type Client, type System } from "./harness.js";
+
+// THE TUAN TEST (chapter 2.8) — journey 4, executable.
+//
+// docs/07's Rule 2: "the journeys are the milestones. These aren't
+// metaphors — they are the integration suites, and they are the SRS phase
+// exit criteria." SRS §7.3 states Phase 1's criterion in one sentence: "Two
+// clients exchange messages through the public API, surviving a forced
+// disconnect with correct ordering and no duplicates." Every clause of that
+// sentence is an assertion below.
+//
+//   docker compose up -d --wait postgres redis
+//   pnpm build
+//   RELAY_POSTGRES_PORT=… RELAY_REDIS_PORT=… pnpm --filter @relay/e2e test:integration
+//
+// Read the right margin: each step names the chapter that made it possible.
+// Remove that chapter's work and a named assertion here fails.
+
+const countOf = (timeline: Message[], text: string): number =>
+  timeline.filter((m) => m.text === text).length;
+
+const seqsOf = (timeline: Message[]): number[] => timeline.map((m) => m.seq);
+
+const isStrictlyAscending = (seqs: number[]): boolean =>
+  seqs.every((seq, i) => i === 0 || seq > seqs[i - 1]!);
+
+const sorted = (seqs: number[]): number[] => [...seqs].sort((a, b) => a - b);
+
+describe("journey 4 — the message that survives the tunnel", () => {
+  let system: System;
+  let channel: string;
+  let environmentId: string;
+  let dispatcher: Client;
+  let tuan: Client;
+  let foreign: { channel: string; text: string };
+  /** Where Tuan's frame log stood when he came back — everything after this
+   * index arrived through the resume. */
+  let afterResume = 0;
+
+  beforeAll(async () => {
+    system = await boot({ gateways: 2 });
+    const seeded = await system.seedConversation(); // 2.1
+    ({ channel, environmentId, dispatcher, tuan } = seeded);
+    foreign = await system.seedForeignTenant();
+
+    // ── stage 1: type and send ───────────────────────────────────────────
+    // Two personas, two INSTANCES. 2.6 exists because a single-instance
+    // arrangement is blind to a whole class of bug (CON-02: any gateway
+    // must serve any socket).
+    try {
+      await dispatcher.connect(system.gateways[0]!); // 1.4 / 2.5
+      await tuan.connect(system.gateways[1]!);
+    } catch (error) {
+      // A handshake that never completes is usually a service saying why in
+      // a log nobody read. Attach it to the failure.
+      throw new Error(`${String(error)}\n${system.serviceOutput()}`, {
+        cause: error,
+      });
+    }
+
+    dispatcher.send(channel, "which entrance?"); // 2.2
+    await tuan.expectCreated("which entrance?"); // 2.6, cross-instance
+
+    // ── stage 2: lose signal ★ ───────────────────────────────────────────
+    // The key is minted BEFORE the send (FR-SDK-06), and the transport dies
+    // before any ack can return. This is the moment the platform was built
+    // for.
+    const ramp = tuan.mintKey(); // 2.3
+    tuan.sendAndKillBeforeAck(channel, "B2, north ramp", ramp);
+
+    // ── stage 3: the tunnel, then reconnect ──────────────────────────────
+    // The dispatcher keeps talking while Tuan is gone. Those frames are
+    // published to a fabric nobody is listening on for him — at-most-once,
+    // by design (2.6) — so only Postgres remembers them.
+    dispatcher.send(channel, "ok, coming down");
+    await dispatcher.expectCreated("ok, coming down");
+
+    // Tuan comes back on the OTHER instance (CON-02), presenting the cursor
+    // he had applied before the tunnel. Same client object: an SDK does not
+    // forget what it rendered just because a socket died.
+    //
+    // And the dispatcher does not politely stop typing while that happens.
+    // This send goes out WHILE the resume is in flight, which is the race
+    // 2.7 closed: the frame may be in the backfill, in the buffer, or both,
+    // and the outcome must be identical either way. The window here is real
+    // timing across processes, not injected — 2.7's own test is where the
+    // interleaving is forced deterministically; this one runs it for real.
+    const coming = tuan.reconnect(system.gateways[0]!); // 2.7
+    dispatcher.send(channel, "still coming down");
+    afterResume = await coming;
+
+    // The queued send flushes with its ORIGINAL key.
+    tuan.flushQueue(); // 2.3
+    await tuan.waitFor(
+      (f) => f.type === "message.ack",
+      "message.ack",
+      5_000,
+      afterResume,
+    );
+    await tuan.expectCreated("B2, north ramp", 5_000, afterResume);
+    await tuan.expectCreated("still coming down", 5_000, afterResume);
+    // Let anything still in flight land before the assertions read views.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+  });
+
+  afterAll(async () => {
+    dispatcher?.close();
+    tuan?.close();
+    await system?.stop();
+  });
+
+  // ── stage 4: confirm ───────────────────────────────────────────────────
+
+  it("delivers the tunnelled message exactly once, to everyone (FR-MSG-04)", () => {
+    // The send that was never acked was written once, retried once with the
+    // same key, and exists once — in the sender's own view and in the
+    // recipient's. Break 2.3 and this is 2.
+    expect(countOf(tuan.timeline(channel), "B2, north ramp")).toBe(1);
+    expect(countOf(dispatcher.timeline(channel), "B2, north ramp")).toBe(1);
+  });
+
+  it("shows both clients the same messages in the same order (FR-MSG-03)", () => {
+    // One order, server-assigned under 2.2's row lock — not "an order per
+    // client, close enough".
+    const mine = sorted(seqsOf(tuan.timeline(channel)));
+    const theirs = sorted(seqsOf(dispatcher.timeline(channel)));
+    expect(mine).toEqual(theirs);
+    expect(mine.length).toBe(4);
+  });
+
+  it("resumes with no gap and no double (FR-RTM-03, SAD §5.2)", () => {
+    const seqs = seqsOf(tuan.timeline(channel));
+    // Arrival order is ascending: the backfill came in sequence order and
+    // the flush added nothing out of place.
+    expect(isStrictlyAscending(seqs)).toBe(true);
+    // Contiguous from 1: nothing the tunnel ate is missing, and nothing
+    // that arrived during the resume window went astray.
+    expect(seqs).toEqual([1, 2, 3, 4]);
+    expect(new Set(seqs).size).toBe(seqs.length);
+  });
+
+  it("recovers what the tunnel ate, and re-sends nothing else (FR-RTM-03)", () => {
+    const timeline = tuan.timeline(channel);
+    // Everything Tuan received after coming back — the backfill plus the
+    // flush, which is exactly what a resume is allowed to deliver.
+    const afterTheTunnel = tuan.frames
+      .slice(afterResume)
+      .filter(
+        (f): f is Extract<Frame, { type: "message.created" }> =>
+          f.type === "message.created",
+      )
+      .map((f) => f.payload);
+
+    // Heard live before the disconnect: present once in the whole story…
+    expect(countOf(timeline, "which entrance?")).toBe(1);
+    // …and NOT among the frames the resume delivered. This is the `seq <= H`
+    // discard earning its keep: the backfill contained it, and the cursor
+    // said Tuan already had it.
+    expect(countOf(afterTheTunnel, "which entrance?")).toBe(0);
+
+    // Sent while he was underground: recovered by the backfill, exactly once.
+    expect(countOf(afterTheTunnel, "ok, coming down")).toBe(1);
+    expect(countOf(timeline, "ok, coming down")).toBe(1);
+
+    // Sent DURING the resume: exactly once, whichever side of the seam it
+    // came down. Zero would be 2.7's gap; two would be 2.7's duplicate.
+    expect(countOf(timeline, "still coming down")).toBe(1);
+  });
+
+  it("acks the retry with the original message's sequence (FR-MSG-05)", async () => {
+    const acks = tuan.frames.filter((f) => f.type === "message.ack");
+    const ramped = tuan
+      .timeline(channel)
+      .find((m) => m.text === "B2, north ramp")!;
+    // The retry is answered with the sequence the FIRST attempt committed —
+    // 201-equivalent semantics, indistinguishable from a first send.
+    expect(acks.at(-1)).toMatchObject({ payload: { seq: ramped.seq } });
+  });
+
+  it("names the sender on every frame (chapter 2.6's fix)", () => {
+    const timeline = tuan.timeline(channel);
+    expect(timeline.find((m) => m.text === "B2, north ramp")!.user).toBe(
+      "tuan",
+    );
+    expect(timeline.find((m) => m.text === "ok, coming down")!.user).toBe(
+      "dispatcher",
+    );
+  });
+
+  it("never mentions another tenant, on any surface (constitution I)", async () => {
+    // Not a journey stage — a property. Isolation gets asserted wherever
+    // correctness is asserted, so the suite seeds a second tenant with
+    // traffic and confirms it stayed invisible.
+    const everything = JSON.stringify(tuan.frames);
+    expect(everything).not.toContain(foreign.text);
+    expect(everything).not.toContain(foreign.channel);
+
+    // And through the REST door, with this tenant's header: a foreign
+    // channel is a 404, indistinguishable from one that does not exist
+    // (FR-TEN-05).
+    const res = await fetch(
+      `${system.apiUrl}/v1/channels/${foreign.channel}/messages?limit=10`,
+      { headers: { "x-relay-environment": environmentId } },
+    );
+    expect(res.status).toBe(404);
+  });
+
+  it("agrees with history — the read path tells the same story (FR-MSG-09)", async () => {
+    // The live path and the read path are two doors onto one truth (2.4).
+    // If they disagree, one of them is lying, and the suite would rather
+    // know now.
+    const res = await fetch(
+      `${system.apiUrl}/v1/channels/${channel}/messages?limit=50&direction=newer`,
+      { headers: { "x-relay-environment": environmentId } },
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { messages: Message[] };
+    expect(body.messages.map((m) => m.seq)).toEqual(
+      sorted(seqsOf(tuan.timeline(channel))),
+    );
+    expect(
+      body.messages.filter((m) => m.text === "B2, north ramp").length,
+    ).toBe(1);
+  });
+});
+```
+
+Read the annotations down the right margin: every step names the chapter
+that made it possible. That is the design, and the next section tests it.
+
+## Run it, and read what it says
+
+```bash
+docker compose up -d --wait postgres redis
+RELAY_POSTGRES_PORT=… RELAY_REDIS_PORT=… pnpm test:integration
+```
+
+```text
+  api up on 4100
+  gateway 1 up on 4101
+  gateway 2 up on 4102
+  seeded one channel with two members in bf842ba8-aed9-46a6-84a9-1e8dea676595
+  seeded a foreign tenant (67f61181-41ac-487d-a15f-4630b0cca82d) with one message
+  dispatcher connected to ws://127.0.0.1:4101
+  tuan connected to ws://127.0.0.1:4102
+  tuan sent "B2, north ramp" and lost the socket before any ack
+  tuan connected to ws://127.0.0.1:4101 (resuming)
+  tuan retries "B2, north ramp" with its original key
+ ✓ delivers the tunnelled message exactly once, to everyone (FR-MSG-04) 1ms
+ ✓ shows both clients the same messages in the same order (FR-MSG-03) 1ms
+ ✓ resumes with no gap and no double (FR-RTM-03, SAD §5.2) 0ms
+ ✓ recovers what the tunnel ate, and re-sends nothing else (FR-RTM-03) 0ms
+ ✓ acks the retry with the original message's sequence (FR-MSG-05) 0ms
+ ✓ names the sender on every frame (chapter 2.6's fix) 0ms
+ ✓ never mentions another tenant, on any surface (constitution I) 4ms
+ ✓ agrees with history — the read path tells the same story (FR-MSG-09) 4ms
+
+ Test Files  1 passed (1)
+      Tests  8 passed (8)
+   Duration  2.32s
+```
+
+Ten lines of narration and eight assertions, in two and a third seconds,
+including booting three processes. That number matters: a milestone you
+can run between edits gets run.
+
+Across all lanes at the tag: **74 unit tests** with no Docker (config 6,
+service-kit 3, protocol 26, api 6, gateway 33) and **52 integration tests
+across 10 files** — the api's 36 against Postgres, the gateway's 8 against
+Redis, and the journey's 8 against everything at once.
+
+## The sabotage tour
+
+The claim this chapter makes is strong: remove any one chapter's work and a
+*named* assertion here fails. Claims like that deserve testing, so here is
+the tour — each sabotage is a one-line patch.
+
+**Break 2.3** — have the harness retry with a fresh key instead of the
+original:
+
+```text
+ × delivers the tunnelled message exactly once, to everyone (FR-MSG-04)
+ × shows both clients the same messages in the same order (FR-MSG-03)
+ × resumes with no gap and no double (FR-RTM-03, SAD §5.2)
+ × acks the retry with the original message's sequence (FR-MSG-05)
+ × agrees with history — the read path tells the same story (FR-MSG-09)
+
+AssertionError: expected 2 to be 1
+```
+
+Two ramps in the channel, and five assertions object. Note which ones: the
+count, the order, the seq set, the ack, and the read path. A single
+missing key is visible from five directions, which is what it means for a
+requirement to be load-bearing.
+
+**Break 2.7** — start the connection `live` instead of `buffering`, so
+nothing is held back during the resume:
+
+```text
+ × shows both clients the same messages in the same order (FR-MSG-03)
+ × resumes with no gap and no double (FR-RTM-03, SAD §5.2)
+ × recovers what the tunnel ate, and re-sends nothing else (FR-RTM-03)
+ × agrees with history — the read path tells the same story (FR-MSG-09)
+
+AssertionError: expected [ 1, 2, 3, 4, 4 ] to deeply equal [ 1, 2, 3, 4 ]
+```
+
+`4, 4` — the message the dispatcher sent during the resume arrived twice,
+once live and once in the backfill. Exactly the duplicate 2.7's buffer
+exists to prevent, caught in a suite that knows nothing about buffers.
+
+<Trap>
+
+**That second sabotage passed the first time I ran it**, with all eight
+assertions green and no buffer anywhere. The journey as originally scripted
+had the dispatcher stop talking while Tuan reconnected — so nothing was
+ever published during the resume window, so the race never happened, so
+the assertion that "proves" 2.7 proved nothing. The suite was green and
+the claim was false.
+
+This is the failure mode of journey suites, and it is worse than
+flakiness because it is silent: **a milestone proves only what its script
+actually exercises.** The fix was to make the script honest — a dispatcher
+does not politely pause because someone else's phone is reconnecting — and
+with one more send inside the window the sabotage fails every run, five out
+of five. Before trusting any milestone suite, break the thing it claims to
+protect and watch it go red. If it stays green, you have a ceremony, not a
+gate.
+
+The related trap is **flakiness treated as weather**: a kill-timing test
+that fails one run in thirty, gets retried in CI, and quietly stops being
+evidence. Every source of nondeterminism here is something the platform
+claims to handle, so a flake is a finding. The kill is protocol-timed
+(write, then destroy, no sleep); delivery waits poll with a deadline
+instead of sleeping a guessed interval; the suite ran five consecutive
+clean passes at 2.3s before this chapter was written. If it flakes, either
+the harness has a race — fix it — or the platform does — *definitely* fix
+it. There is no third bucket.
+
+</Trap>
+
+## What the suite found
+
+A milestone suite earns its keep on the day it runs, not the day it is
+written. This one found four defects, none of which any per-chapter lane
+had noticed.
+
+**Two doors disagreed about the same resource.** POST to a channel this
+tenant cannot see answers 404 (2.2 decided that deliberately, and asserts
+the body matches a missing channel's). GET on that channel's history
+answered `200` with an empty page — because a tenant-scoped query simply
+found no rows, and nobody had ever asked what the endpoint should say. It
+leaks nothing, but it leaves a client unable to tell "no such conversation"
+from "nothing said yet", and it makes one resource answer two ways
+depending on the verb. The read path now asks the same question the write
+path always did:
+
+```diff title="services/api/src/db/repository.ts"
+@@ -359,6 +359,26 @@
+       );
+     }
+     return { ...row, created_at: toIso(row.created_at) };
++  }
++
++  /** Does this channel resolve IN THIS TENANT? (chapter 2.8.)
++   *
++   * The write path has asked since 2.2 — it needs the channel row to lock —
++   * so it answers a foreign id with a 404. The read path never asked: a
++   * tenant-scoped query over a foreign channel simply returns no rows, and
++   * the endpoint dressed that as an empty page. The milestone suite caught
++   * the two doors disagreeing about the same resource. */
++  async channelExists(channelId: string): Promise<boolean> {
++    const rows = await this.db
++      .select({ id: channels.id })
++      .from(channels)
++      .where(
++        and(
++          eq(channels.id, channelId),
++          eq(channels.environmentId, this.environmentId),
++        ),
++      );
++    return rows.length > 0;
+   }
+
+   /** History reads (chapter 2.4): one page of messages anchored to a
+```
+
+```diff title="services/api/src/messages/messages.service.ts"
+@@ -66,6 +66,16 @@
+     next_cursor: string | null;
+     prev_cursor: string | null;
+   }> {
++    // A channel that does not resolve in this tenant is a 404 here, exactly
++    // as it is on the send path (chapter 2.8's finding). An empty page would
++    // not leak anything — a foreign channel and an empty one would look the
++    // same — but it leaves a client unable to tell "no such conversation"
++    // from "no messages yet", and it made one resource answer two ways
++    // depending on the verb.
++    if (!(await this.repo.channelExists(channelId))) {
++      throw new NotFoundException("channel not found");
++    }
++
+     let anchor: number | undefined;
+     if (cursor !== undefined) {
+       const decoded = decodeCursor(cursor);
+```
+
+```diff title="services/api/src/messages/messages.itest.ts"
+@@ -67,6 +67,25 @@
+     expect(typeof body.docs_url).toBe("string");
+   });
+
++  it("answers a foreign channel's HISTORY with that same 404 (chapter 2.8)", async () => {
++    // The milestone suite found the two doors disagreeing: POST said 404 for
++    // a channel this tenant cannot see, GET said 200 with an empty page. An
++    // empty page leaks nothing, but it leaves a client unable to tell "no
++    // such conversation" from "nothing said yet" — and one resource should
++    // not answer two ways depending on the verb.
++    const foreign = await fetch(
++      `${url}/v1/channels/${foreignChannelId}/messages?limit=10`,
++      { headers: { "x-relay-environment": env.id } },
++    );
++    const missing = await fetch(
++      `${url}/v1/channels/${crypto.randomUUID()}/messages?limit=10`,
++      { headers: { "x-relay-environment": env.id } },
++    );
++    expect(foreign.status).toBe(404);
++    expect(missing.status).toBe(404);
++    expect(await foreign.json()).toEqual(await missing.json());
++  });
++
+   it("answers a FOREIGN channel id with the same 404 as a missing one", async () => {
+     const foreign = await send({ text: "not for you" }, foreignChannelId);
+     const missing = await send({ text: "nobody home" }, crypto.randomUUID());
+```
+
+**A close handler could throw.** Chapter 2.7 added a `.catch` to the
+subscribe path and forgot the release path, so a socket closing after its
+fabric had gone away produced an unhandled rejection during teardown —
+three of them, which turned a passing gateway lane red without failing a
+single test. The suite that surfaced it was this one; the bug was 2.7's:
+
+```diff title="services/gateway/src/session.ts"
+@@ -186,9 +186,20 @@
+     socket.on("message", (raw) => void handle(connection, raw.toString()));
+     socket.on("close", (code) => {
+       registry.remove(connection.id);
++      // Releasing a subscription can fail — a broker that went away, or a
++      // fabric already closed while sockets were still draining — and a
++      // close handler is the last place that should throw. The subscribe
++      // path has said this since 2.7; the release path had not, and an
++      // unhandled rejection during teardown is how chapter 2.8's lane found
++      // out. Nothing to recover: the connection is gone either way.
+       void Promise.all(
+         [...connection.channelIds].map((channelId) =>
+-          fanout?.unsubscribe(channelId),
++          fanout?.unsubscribe(channelId).catch((error: unknown) => {
++            logger.log("error", "fanout.unsubscribe_failed", {
++              channel: channelId,
++              error: String(error),
++            });
++          }),
+         ),
+       );
+       logger.log("info", "connection.closed", {
+```
+
+**A stale build could pass for a fresh one.** The e2e lane boots
+`services/api/dist`, so a source change with no rebuild tests yesterday's
+code — and it fails in a way that looks like a product bug. The task graph
+fixes that structurally (`dependsOn: ["^build"]` plus the dependency
+declaration above), which is better than a sentence in a README asking
+people to remember.
+
+**Strict env mode silently removed the store coordinates**, described
+above with the harness. Worth naming again here because of the shape:
+nothing errored, nothing warned, a variable was just absent, and the
+symptom appeared three layers away as a 500. Configuration that fails
+loudly is a feature; this failed quietly, and only a suite that captured
+its children's logs could say why.
+
+<Why source="docs/07 §4 Rule 2 · SRS §7.3">
+
+Why does a chapter that writes one test file deserve milestone billing?
+Because of what "done" means without it. Six chapters each proved their own
+machinery in isolation — and 2.6 already showed how components can be
+individually correct while the *system* fails. The phase exit criterion was
+written at requirements time precisely so that "Phase 1 complete" would
+never be a judgment call: "Two clients exchange messages through the public
+API, surviving a forced disconnect with correct ordering and no
+duplicates." That sentence names two clients (the suite runs two), a forced
+disconnect (the harness kills, not closes), ordering (the seq assertions)
+and no duplicates (the count assertions). The suite is that sentence,
+transliterated. Rule 2's deeper point is about *authority*: a reader who
+modifies this platform six months from now does not re-argue Part 2's
+correctness in review — they run the Tuan test.
+
+</Why>
+
+<Why source="NFR-MNT-02 · constitution VI">
+
+Why a journey suite on top of the per-chapter tests, when the constitution
+already demands "100% branch coverage" for ordering, idempotency and tenant
+isolation? Because coverage and confidence measure different failure
+classes. The branch-coverage clause is discharged down in the unit and
+per-service lanes, where every `if` in the lock path and the flush rule can
+be exercised cheaply and exactly — this suite adds nearly nothing to that
+number. What it adds is the thing coverage cannot express: that the
+branches *compose* — that 2.3's recovery leg still returns the original
+when the retry arrives through 2.7's flush on a different instance than the
+send. Six chapters of green unit lanes and this suite red would mean the
+parts are right and the product is wrong; that state is exactly what 2.6's
+split brain looked like, and exactly what phase exit criteria exist to rule
+out. The constitution's verification stack has three floors —
+requirement-cited unit tests, per-service integration lanes, journey
+milestones — and each floor catches what the one below structurally cannot.
+
+</Why>
+
+<Figure
+  caption="Every chapter of the part, load-bearing in one suite: remove any one and a named assertion fails. This is what 'the milestone is the part' means, mechanically."
+  code={figCapabilityMap}
+/>
+
+## Part 2, closed
+
+The SRS phase table can now be read as a checklist rather than a plan.
+Phase 1's requirement groups — FR-USR, FR-CHN, FR-MSG, FR-RTM at P1 — have
+their machinery: users and channels since 2.1, the message contract's write
+and read sides in 2.2–2.4, real-time delivery and resume in 2.5–2.7. And
+the exit criterion has a green checkmark with a command attached. Some
+Phase 1 P1 rows deliberately wait where the plan put them — FR-EMJ-01/02's
+shortcode handling belongs to the emoji chapters, presence and typing
+frames to their ADR-10 chapter — recorded, not forgotten; the exit
+criterion names the loop, and the loop stands.
+
+<Figure
+  caption="The sentence from §7.3, the suite that transliterates it, and the part boundary it closes — Phase 1 exits on a passing test, not a paragraph."
+  code={figPhaseOneExit}
+/>
+
+<ForwardRef part="Part 3 — becoming a platform">
+
+Part 3 turns "a chat backend" into "infrastructure someone else can build
+on": real tenancy and signup (3.1), the API keys and user tokens that
+retire this part's dev-mode seams (3.2 — the environment header and
+dev-secret JWTs both have their replacement chapters on record), the
+transactional outbox that closes 2.6's REST-fan-out gap (3.3), JetStream
+and the first consumers (3.4), webhooks (3.5), rate limits (3.6) — and its
+own milestone gauntlet: the cross-tenant attack suite run against every
+endpoint (3.7), which grows the isolation assertion this chapter planted
+into a part-closing suite of its own. Two seams here retire by name: the
+harness seeds through the repository because no admin API exists yet, and
+`packages/e2e` will gain a second journey the moment Part 3 has one. The
+Tuan test keeps running through all of it — from here to production, it is
+the sentinel that Part 2's promises stay kept while the platform grows
+around them.
+
+</ForwardRef>
+
+## Your turn
+
+The exercise is the run, then the sabotage tour — break each chapter and
+watch this suite name it:
+
+1. Do both sabotages above and read the failure messages before reading the
+   diffs. Do they tell you where to look? If not, improve them; milestone
+   suites earn their keep through their failure output.
+2. Remove the dispatcher's send during the resume window — the one line
+   that makes the 2.7 sabotage fail — and confirm the buffer regression
+   goes undetected again. Sit with that for a minute: the suite was green,
+   and the platform was broken.
+3. Point both personas at ONE gateway instance and re-run. Everything
+   passes, which is exactly the problem; write down which failures this
+   configuration can no longer detect and you have written 2.6's lesson in
+   your own hand.
+4. Kill Redis mid-suite. The resume degrades to `resume_ok: false`
+   (2.7's honest answer), so which assertions fail, and are they failing
+   for the right reason? A milestone should be as clear about degradation
+   as it is about success.
+
+If you are stuck, the tag holds the answer key: `part2-ch8`.
+
+## Takeaways
+
+If you read nothing else in this chapter — read the suite; it is the
+chapter. But for the record:
+
+- **The journey is the milestone** (docs/07 Rule 2): journey 4 runs as a
+  suite, and Phase 1's exit criterion is a passing test, not a paragraph.
+- **A milestone proves only what its script exercises**: the first version
+  of this suite passed with 2.7's buffer deleted. Break what it protects
+  and watch it go red, or it is ceremony.
+- **Two instances or it doesn't count**: the system's hardest bugs live
+  between components; the harness boots the fleet, not a fake.
+- **The kill is the point**: a transport death mid-send, before the ack —
+  staged at a protocol-defined moment, not after a sleep.
+- **Suites that boot processes must keep their logs**: the difference
+  between "no ack in 5000ms" and "memberships returned 500" is the
+  difference between a mystery and a fix.
+- **A cached milestone is not a milestone** (`cache: false`): the inputs
+  include stores the task does not own.
+
+<Checkpoint>
+
+Part 2 is complete. You should have: the Tuan test green in
+`packages/e2e`, booting an api and two gateways against the compose
+stores; both sabotages witnessed, failing by name; the four defects this
+chapter found fixed in 2.4–2.7's code; 74 unit tests Docker-free and 52
+integration tests across three lanes. That state is tag `part2-ch8` in the
+canonical repository, and SRS §7.3's Phase 1 exit criterion is met — by a
+command, not a claim. Part 3 begins by taking the dev-mode seams out from
+under all of it.
+
+</Checkpoint>
+
+<ChapterFooter id="2.8" />
