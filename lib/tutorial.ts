@@ -296,7 +296,87 @@ export const series: Part[] = [
     number: 3,
     title: "Becoming a platform",
     titleVi: "Vươn mình thành nền tảng",
-    chapters: [],
+    chapters: [
+      {
+        id: "3.1",
+        path: "/part-3/chapter-01/tenants-all-the-way-down",
+        title: "Tenants all the way down",
+        status: "published",
+        translatedIn: ["vi"],
+        readerProduces:
+          "Orgs, apps, environments; OAuth signup; the auto-created dev environment",
+        sourceDoc: "docs/04-srs.md, docs/05-sad.md",
+        readerMinutes: 95,
+        titleVi: "Tenant từ trên xuống dưới",
+        readerProducesVi:
+          "Org, app, environment; signup bằng OAuth; environment dev tạo tự động",
+      },
+      {
+        id: "3.2",
+        path: "/part-3/chapter-02/keys-and-tokens",
+        title: "Keys and tokens — two credentials, one mistake",
+        status: "forthcoming",
+        readerProduces:
+          "API keys (prefix, hash, rotation); user JWTs; the dev-token endpoint",
+        sourceDoc: "docs/04-srs.md",
+        readerMinutes: 100,
+        titleVi: "Key và token — hai loại credential, một lỗi thường gặp",
+      },
+      {
+        id: "3.3",
+        path: "/part-3/chapter-03/the-outbox",
+        title: "The outbox",
+        status: "forthcoming",
+        readerProduces:
+          "Transactional outbox + relay (ADR-06); the crash-in-the-gap test",
+        sourceDoc: "docs/05-sad.md",
+        readerMinutes: 90,
+        titleVi: "Outbox",
+      },
+      {
+        id: "3.4",
+        path: "/part-3/chapter-04/jetstream-and-the-first-consumer",
+        title: "JetStream and the first consumer",
+        status: "forthcoming",
+        readerProduces: "NATS setup; subjects; durable pull consumers",
+        sourceDoc: "docs/05-sad.md",
+        readerMinutes: 90,
+        titleVi: "JetStream và consumer đầu tiên",
+      },
+      {
+        id: "3.5",
+        path: "/part-3/chapter-05/webhooks-that-survive-the-customer",
+        title: "Webhooks that survive the customer",
+        status: "forthcoming",
+        readerProduces:
+          "Dispatcher: HMAC signing, retry tiers, DLQ, auto-disable",
+        sourceDoc: "docs/04-srs.md",
+        readerMinutes: 100,
+        titleVi: "Webhook sống sót qua phía khách hàng",
+      },
+      {
+        id: "3.6",
+        path: "/part-3/chapter-06/limits-and-quotas",
+        title: "Limits and quotas",
+        status: "forthcoming",
+        readerProduces:
+          "Redis token buckets; standard headers; spending caps",
+        sourceDoc: "docs/04-srs.md",
+        readerMinutes: 90,
+        titleVi: "Giới hạn và quota",
+      },
+      {
+        id: "3.7",
+        path: "/part-3/chapter-07/milestone-the-isolation-gauntlet",
+        title: "Milestone: the isolation gauntlet",
+        status: "forthcoming",
+        readerProduces:
+          "The cross-tenant attack suite run against every endpoint",
+        sourceDoc: "docs/04-srs.md",
+        readerMinutes: 100,
+        titleVi: "Cột mốc: cửa ải cô lập tenant",
+      },
+    ],
   },
   {
     number: 4,

@@ -1075,7 +1075,70 @@ named fallback) or plain recursion takes over.
 
 ---
 
-## Reading the seventeen together
+## ADR-18 — Two user populations: platform humans and tenant end users, never merged
+
+### Problem
+
+Two kinds of person interact with Relay. A customer's end users — Tuan, the dispatcher —
+exist inside an environment and never sign in to Relay at all; their identity is whatever
+`external_id` the customer already had for them. The people who *run* a Relay account sign
+in with GitHub or Google, may own several organisations, and belong to no environment.
+Should one table hold both?
+
+### Options
+
+1. **Two tables**, one above the tenant boundary and one below.
+2. **One `users` table** with a nullable `environment_id`, null meaning "platform human".
+3. **One table with a view** per population, hiding the nullable column behind names.
+
+### Analysis
+
+Option 2 is the one that sounds economical and is disqualified by a single column. A
+platform human belongs to no tenant, so the tenant column has to be nullable — and a
+nullable tenant column is precisely the shape Principle I exists to prevent, the one
+FR-TEN-06 rules out in words ("every persisted operational and analytical record shall
+carry a non-null tenant identifier"). The consequence is not aesthetic. Chapter 2.1 built
+the repository so that a query without an `environment_id` cannot be *expressed*; with a
+nullable tenant, isolation stops being enforced by construction and becomes a thing
+reviewers must notice. The most important requirement in the system (FR-TEN-05) would then
+rest on vigilance, which is exactly the trade the constitution refuses.
+
+Option 3 changes nothing that matters. The column is still nullable; the view only makes it
+harder to see.
+
+Option 1 costs two tables and an honest admission: "who is this?" is answered differently on
+either side of the boundary. That is not a wart — it is what the boundary *is*. Below it,
+identity is the customer's `external_id`, scoped to an environment. Above it, identity is a
+provider account, scoped to nothing, because a person is not a tenant.
+
+The identity key is worth its own note. It is `(provider, provider_account_id)`, never the
+email: emails change hands, providers may withhold them, and a provider that does release
+one has usually not verified it. That makes account linking — the same person arriving via
+GitHub and then Google — a deliberate later feature rather than an accident of matching
+strings, and chapter 3.1 says so where a reader will meet it.
+
+### Decision
+
+Option 1. `users` stays exactly what Part 2 made it; `humans` and `memberships` join the
+schema above the boundary, and no row ever crosses.
+
+### Consequences
+
+Positive: FR-TEN-06 remains true of every operational row without exception, so the
+repository's scoping stays enforceable by construction; roles (FR-TEN-07) have somewhere to
+live; and the isolation gauntlet (3.7) has an unambiguous answer to "which population does
+this identifier belong to?". Negative: two tables to reason about, and any future feature
+touching both populations — audit trails naming an actor, for instance — must say which one
+it means. That cost is paid in clarity rather than in correctness.
+
+### Revisit when
+
+A product requirement genuinely spans both populations — a customer's end user who is also
+a Relay account holder, wanting one login. Even then the answer is likely a link table
+rather than a merge, because the tenant column's nullability is the thing that must not
+change.
+
+## Reading the eighteen together
 
 Three themes recur, and naming them is the best summary of the architecture's character:
 
@@ -1091,6 +1154,12 @@ reformulate it as a read-time concern. Even the application stack bends to this 
 the framework serves the wide read-and-CRUD surface and stops at the gateway's door
 (ADR-15), and the data layer was chosen so the write path's invariants stay written in
 visible SQL rather than behind an abstraction (ADR-16).
+
+**Isolation is structural, never procedural.** The single writer (ADR-04), the repository
+layer that cannot express an unscoped query (ADR-16), and the refusal to merge the two user
+populations (ADR-18) are one argument in three places: tenant safety is a property of the
+shapes, not of anyone's attention. Each of those decisions rejected a cheaper option whose
+only flaw was needing someone to be careful.
 
 **Every decision names its own undoing.** Reversal triggers are part of each record — not
 decoration, but the discipline that keeps a solo-built system honest: the day a trigger

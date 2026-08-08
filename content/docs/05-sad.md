@@ -994,6 +994,31 @@ that belongs in package.json dependencies.
 
 ---
 
+### ADR-18 — Two user populations: platform humans and tenant end users, never merged
+**Status:** accepted (chapter 3.1) · **Drivers:** D4 · serves FR-TEN-01/06/07, NFR-SEC-09
+
+Relay has two kinds of person and they share nothing but the word "user". A customer's end
+users (`users`, §6.1) belong to an environment, arrive through the API, are identified by
+the customer's own `external_id`, and never sign in to Relay. The humans who run a Relay
+account belong to organisations, arrive by OAuth, are identified by a provider account, and
+may own several organisations at once. **They live in separate tables — `users` below the
+tenant boundary, `humans` above it — and no row ever moves between them.**
+
+The instinct to merge them is strong, and the cost is precise: a single table needs a
+nullable `environment_id`, because a platform human belongs to no tenant. That is the one
+column shape Principle I forbids, and FR-TEN-06 states as a requirement — every
+operational record carries a non-null tenant identifier. Once nullable, the repository's
+mandatory scoping cannot be enforced by construction, and every isolation guarantee in the
+system becomes a code review rather than a type. **Trade-off:** two identity tables, and
+"who is this?" is answered differently on either side of the boundary — accepted, because
+that difference is exactly what the boundary means. **Consequence:** a person's provider
+account is their identity (`UNIQUE (provider, provider_account_id)`); account linking
+across providers needs a verified-email or add-a-login flow and is deferred with its own
+chapter. **Rejected:** one `users` table with a nullable tenant (breaks FR-TEN-06 and
+Principle I); a `platform_users` view over the same table (same nullable column, now
+hidden); storing organisation membership as an array on the organisation (not queryable, no
+room for roles, no foreign key).
+
 ## 10. Risks and technical debt register
 
 | # | Risk / debt | Exposure | Mitigation / trigger |

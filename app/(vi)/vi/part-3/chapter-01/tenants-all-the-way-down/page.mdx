@@ -1,0 +1,1816 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figBoundary, figSignup, figTwoPopulations } from "./figures";
+
+export const metadata = {
+  title: "Tenant từ trên xuống dưới — Building Relay",
+  description:
+    "Phần 3 mở đầu bằng việc biến một chat backend đang chạy thành infrastructure mà người khác có thể sign up: organisations, applications và environments, một OAuth signup provision cả ba từ một lần authentication, và boundary ngăn hai loại user bị merge với nhau.",
+  alternates: {
+    canonical: "/vi/part-3/chapter-01/tenants-all-the-way-down",
+    languages: {
+      en: "/part-3/chapter-01/tenants-all-the-way-down",
+      vi: "/vi/part-3/chapter-01/tenants-all-the-way-down",
+    },
+  },
+};
+
+<ChapterHeader id="3.1" locale="vi" />
+
+Phần 2 kết thúc với một passing suite và một claim có thể bảo vệ: messages
+arrive exactly once, đúng order, xuyên instances, qua một tunnel. Thứ nó chưa
+có là một product mà người khác có thể dùng. Mọi request trong Phần 2 gọi tên
+tenant bằng một header do client tự assert, và mọi tenant trong Phần 2 được tạo
+bởi một test helper. Chưa có cách nào để *trở thành* customer.
+
+Chương này build điều đó: các containers nơi thế giới của một customer sống, và
+một hành động duy nhất tạo ra chúng. Nó cũng trả một món nợ bạn đã thấy tôi
+nhận. Chapter 2.1 cần một row `applications` để thỏa foreign key, chưa có định
+nghĩa cho nó, và để lại đoạn này:
+
+```text
+// DECISION (chapter 2.1): the SAD's environments table references
+// applications(id) but never defines the table. This stub satisfies the
+// foreign key; the real application lifecycle belongs to Part 3's tenancy
+// chapters.
+```
+
+Đây là chương đó, và stub biến mất.
+
+<SkipAhead locale="vi">
+
+Nếu bạn buộc phải đọc lướt: schema có thêm ba tables phía trên tenant boundary
+— `organisations`, `humans`, `memberships` — stub `applications` của 2.1 trở
+thành table thật biết owner của nó, và `environments` có thêm
+`UNIQUE (application_id, kind)`, kết hợp với kind CHECK hiện có thì *chính là*
+rule "exactly two environments" của FR-TEN-04. Signup là OAuth
+authorization-code flow viết tay: `GET /auth/github/start` mint `state` vào
+HttpOnly cookie, `GET /auth/github/callback` verify binding đó trước khi nói
+chuyện với bất kỳ ai, rồi provision organisation, application, `development`
+environment và một membership `owner` trong một transaction (FR-TEN-01,
+FR-TEN-02). Không dependency mới. Không session — đó là việc của 3.2. Trạng
+thái cuối chương là tag **`part3-ch1`**.
+
+</SkipAhead>
+
+## Ba containers, và vì sao không phải hai
+
+SRS yêu cầu một shape cụ thể, trong bốn requirements dễ đọc hơn nếu gom thành
+một câu. Một người tạo một **organisation** bằng cách authenticate với provider
+và không cung cấp gì thêm (FR-TEN-01). Organisation đó có thể chứa nhiều
+**applications**, mỗi application có data, keys và quotas độc lập (FR-TEN-03).
+Mỗi application có đúng hai **environments**, `development` và `production`,
+với credentials, quotas và datastores riêng (FR-TEN-04). Và việc tạo một
+organisation tự động tạo một application và một `development` environment,
+không cần input nào khác (FR-TEN-02).
+
+Ba levels nhiều hơn thứ hầu hết mọi người sẽ vẽ một level, nên đáng hỏi mỗi
+level *để làm gì*. Organisation là nơi billing và human ownership sống — nó là
+thứ một công ty là. Application là nơi một *product* sống: một công ty ship hai
+apps muốn hai sets channels, hai sets keys, và một invoice. Còn environment là
+nơi data sống, vì ship bất kỳ thứ gì cũng cần có một chỗ để phá trước.
+
+Level cuối cùng đó là thứ bạn đã build.
+
+<Figure
+  caption="Boundary chương này vẽ ra. Phía trên nó, rows nói ai sở hữu account và không mang tenant column. Phía dưới nó, mọi row mang environment_id và repository từ chối query nếu thiếu nó."
+  code={figBoundary}
+/>
+
+<Why source="FR-TEN-04 · FR-TEN-06 · constitution I" locale="vi">
+
+Vì sao **environment** là tenant, thay vì application hay organisation? Vì nó
+là level duy nhất nơi câu trả lời cho "request này có được thấy row này không?"
+là một giá trị duy nhất, và Phần 2 đã chứng minh điều đó. Mọi table chapter 2.1
+viết đều mang `environment_id`; mọi repository constructor đều đòi một
+environment; isolation suite attack column đó và không gì khác. Nếu tenant là
+application, `development` và `production` sẽ share một dataset và việc đầu
+tiên customer nào làm với Relay sẽ là test trong production. Nếu tenant là
+organisation, hai products của cùng một công ty sẽ share channels. Requirement
+chốt con số ở hai per application (FR-TEN-04) thật ra là một statement về blast
+radius: bạn có đúng một nơi để bất cẩn, và nó tên là `development`.
+
+</Why>
+
+## Những tables SAD chưa từng viết
+
+SAD §6.1 define `environments` và mọi thứ bên dưới nó bằng SQL, rất chính xác.
+Nó không define `applications`, cũng không define bất kỳ thứ gì phía trên —
+`environments` references `applications(id)` rồi document dừng lại. Vì vậy ba
+tables bên dưới được **derived from the SRS**, không phải quote từ SAD, và nói
+rõ điều đó ngay trong schema nơi reader sẽ gặp chúng. Đây là cùng mechanism 2.1
+đã dùng cho `members`: khi documents hết đường, chapter record một decision
+thay vì trình bày một invention như specification.
+
+```diff title="services/api/src/db/schema.ts"
+@@ -24,13 +24,87 @@
+ // (ADR-06's chapter), emoji/media tables (their parts), messages
+ // partitioning (SAD growth note -> retention chapter).
+
+-// DECISION (chapter 2.1): the SAD's environments table references
+-// applications(id) but never defines the table. This stub satisfies the
+-// foreign key; the real application lifecycle belongs to Part 3's tenancy
+-// chapters.
++// The tenancy hierarchy (chapter 3.1). Everything from here to `members`
++// below sits ABOVE the environment boundary: these rows say who owns a
++// platform account, and they are the only tables in this file without an
++// environment_id. Everything below the boundary carries one and is scoped by
++// the repository (constitution I).
++//
++// DECISION (chapter 3.1): SAD §6.1 defines `environments` and everything under
++// it, but never defines the containers above — the gap 2.1 papered over with a
++// one-column `applications` stub. These three tables are derived from the SRS
++// (FR-TEN-01/02/03/04/07), not quoted from the SAD, and that is why they carry
++// this note.
++export const organisations = pgTable("organisations", {
++  id: uuid("id").primaryKey(),
++  name: text("name").notNull(),
++  createdAt: timestamp("created_at", { withTimezone: true })
++    .notNull()
++    .defaultNow(),
++});
++
++// A person who signs in to Relay. NOT the `users` table below — see ADR-18.
++// Identity is the provider account, never the email: emails change hands, and
++// a provider may not release one at all (hence nullable).
++export const humans = pgTable(
++  "humans",
++  {
++    id: uuid("id").primaryKey(),
++    provider: text("provider").notNull(),
++    providerAccountId: text("provider_account_id").notNull(),
++    displayName: text("display_name"),
++    email: text("email"),
++    createdAt: timestamp("created_at", { withTimezone: true })
++      .notNull()
++      .defaultNow(),
++  },
++  (t) => [
++    // Signup idempotency, decided by the index rather than by a read-then-
++    // write check that loses to a concurrent second click (2.3's lesson).
++    unique("humans_provider_account_unique").on(
++      t.provider,
++      t.providerAccountId,
++    ),
++    check("humans_provider_check", sql`${t.provider} IN ('github','google')`),
++  ],
++);
++
++export const memberships = pgTable(
++  "memberships",
++  {
++    organisationId: uuid("organisation_id")
++      .notNull()
++      .references(() => organisations.id),
++    humanId: uuid("human_id")
++      .notNull()
++      .references(() => humans.id),
++    role: text("role").notNull(),
++    joinedAt: timestamp("joined_at", { withTimezone: true })
++      .notNull()
++      .defaultNow(),
++  },
++  (t) => [
++    primaryKey({ columns: [t.organisationId, t.humanId] }),
++    check(
++      "memberships_role_check",
++      sql`${t.role} IN ('owner','admin','member')`,
++    ), // FR-TEN-07
++  ],
++);
++
++// Replaces chapter 2.1's stub: an application now knows who owns it
++// (FR-TEN-03). Deletion (FR-TEN-08) needs machinery this chapter does not
++// build, so no cascade is declared — a cascade would imply a deletion story
++// that does not exist yet.
+ export const applications = pgTable("applications", {
+   id: uuid("id").primaryKey(),
++  organisationId: uuid("organisation_id")
++    .notNull()
++    .references(() => organisations.id),
+   name: text("name").notNull(),
++  createdAt: timestamp("created_at", { withTimezone: true })
++    .notNull()
++    .defaultNow(),
+ });
+
+ export const environments = pgTable(
+@@ -51,6 +125,10 @@
+       "environments_kind_check",
+       sql`${t.kind} IN ('development','production')`,
+     ),
++    // FR-TEN-04 says exactly two environments per application. With the CHECK
++    // above, this unique index IS that rule: two legal kinds, one row each.
++    // No trigger, no counting query, nothing to lose a race to.
++    unique("environments_application_kind_unique").on(t.applicationId, t.kind),
+   ],
+ );
+
+```
+
+Hai chi tiết trong diff đó làm nhiều việc hơn vẻ ngoài của chúng.
+
+`UNIQUE (application_id, kind)` trên `environments` **chính là** FR-TEN-04.
+Kind CHECK từ 2.1 đã giới hạn column vào hai legal values; unique index trên
+`(application_id, kind)` vì vậy cho phép tối đa một row cho mỗi loại, tức tối
+đa hai environments. Không trigger, không `SELECT count(*)` để concurrent
+request race qua — rule là một shape, và shapes không cần được nhớ.
+
+Và `humans` không có `environment_id`. Sự vắng mặt đó là dòng quan trọng nhất
+của chương, và nó có ADR riêng.
+
+<Trap locale="vi">
+
+Đây là shape gần như ai cũng với tới đầu tiên, và cũng là shape âm thầm tháo
+rời Phần 2: **đặt những người sign up vào table `users`.** Đã có sẵn users
+table. Nó đã có display name và một identifier giống email. Thêm column
+`provider` và cho `environment_id` nullable với nghĩa "platform humans" là thay
+đổi mười phút.
+
+Rồi nhìn xem bạn vừa làm gì với `environment_id`. Bây giờ nó nullable. FR-TEN-06
+nói mọi persisted operational record mang một tenant identifier non-null, và nó
+nói vậy vì chapter 2.1 đã build một repository mà constructors *require* một
+tenant — một query thiếu tenant không thể được express. Khoảnh khắc column có
+thể null, guarantee đó ngừng là structural. Hôm nay không có gì vỡ; isolation
+suite vẫn pass; và requirement quan trọng nhất trong system (FR-TEN-05, "không
+operation nào được return, modify, hoặc reveal data thuộc tenant khác") âm thầm
+trở thành thứ reviewers phải nhận ra, thay vì thứ types từ chối.
+
+Hai populations, hai tables, không row nào từng crossing. Bên dưới boundary,
+user là end user của customer, được identify bằng `external_id` của chính
+customer, scoped vào một environment, và không bao giờ sign in vào Relay. Phía
+trên, human là một người có provider account, có thể own nhiều organisations và
+không thuộc tenant nào cả. Chúng share chữ "user" và không gì khác. **ADR-18**
+record điều này, vì mọi chapter sau đều inherit nó — audit trails, dashboard,
+và isolation gauntlet của 3.7 đều cần biết một identifier thuộc population nào.
+
+</Trap>
+
+<Figure
+  caption="ADR-18 trong một hình: shape rẻ hơn cần nullable tenant column, chính là thứ biến isolation từ enforceable by construction thành review checklist."
+  code={figTwoPopulations}
+/>
+
+## Migration không apply được
+
+Khi schema đã viết xong, drizzle-kit generate SQL và — theo workflow của
+ADR-16 — chúng ta đọc nó trước khi chạy. Điều đầu tiên nó muốn làm là bất khả:
+
+```text
+ALTER TABLE "applications" ADD COLUMN "organisation_id" uuid NOT NULL;
+```
+
+Statement đó không thể succeed trên bất kỳ database nào đã có application
+rows, và database của mọi reader đều có: `createEnvironment` của 2.1 đã mint
+chúng từ khi Phần 2 bắt đầu. Của tôi có 237 rows. Một NOT NULL column không thể
+đi vào một populated table nếu chưa có ai nói existing rows nên chứa gì — và
+generator không có cách nào biết.
+
+Vì vậy statement được rewrite bằng tay, theo shape mà vấn đề này luôn có: add
+nó nullable, backfill, rồi constrain.
+
+```sql title="services/api/migrations/0002_tenancy.sql"
+-- Chapter 3.1 — the tenancy hierarchy (FR-TEN-01/02/03/04/07).
+--
+-- REVIEW DISPOSITION: drizzle-kit generated this file from schema.ts and it
+-- was reviewed before being applied (the ADR-16 workflow). One statement was
+-- rewritten by hand:
+--
+--   generated:  ALTER TABLE "applications" ADD COLUMN "organisation_id" uuid NOT NULL;
+--
+-- That fails on any database that already has application rows — which every
+-- reader's does, because chapter 2.1's createEnvironment has been minting them
+-- since Part 2. A NOT NULL column cannot appear on a populated table without
+-- saying what the existing rows should hold. Replaced by the three-step shape
+-- below: add nullable, backfill, then constrain.
+--
+-- The backfill gives every orphaned application its own organisation and
+-- reuses the application's uuid as the organisation's, so the lineage stays
+-- readable afterwards: an organisation whose id matches an application is one
+-- this migration invented.
+
+CREATE TABLE "humans" (
+	"id" uuid PRIMARY KEY NOT NULL,
+	"provider" text NOT NULL,
+	"provider_account_id" text NOT NULL,
+	"display_name" text,
+	"email" text,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	CONSTRAINT "humans_provider_account_unique" UNIQUE("provider","provider_account_id"),
+	CONSTRAINT "humans_provider_check" CHECK ("humans"."provider" IN ('github','google'))
+);
+--> statement-breakpoint
+CREATE TABLE "memberships" (
+	"organisation_id" uuid NOT NULL,
+	"human_id" uuid NOT NULL,
+	"role" text NOT NULL,
+	"joined_at" timestamp with time zone DEFAULT now() NOT NULL,
+	CONSTRAINT "memberships_organisation_id_human_id_pk" PRIMARY KEY("organisation_id","human_id"),
+	CONSTRAINT "memberships_role_check" CHECK ("memberships"."role" IN ('owner','admin','member'))
+);
+--> statement-breakpoint
+CREATE TABLE "organisations" (
+	"id" uuid PRIMARY KEY NOT NULL,
+	"name" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+-- 1. add it nullable, so the column can exist alongside the rows that predate it
+ALTER TABLE "applications" ADD COLUMN "organisation_id" uuid;--> statement-breakpoint
+-- 2. backfill: one organisation per orphan, id carried across for traceability
+INSERT INTO "organisations" ("id", "name")
+SELECT a."id", 'migrated: ' || a."name" FROM "applications" a WHERE a."organisation_id" IS NULL;--> statement-breakpoint
+UPDATE "applications" SET "organisation_id" = "id" WHERE "organisation_id" IS NULL;--> statement-breakpoint
+-- 3. and only now is the constraint true of every row
+ALTER TABLE "applications" ALTER COLUMN "organisation_id" SET NOT NULL;--> statement-breakpoint
+ALTER TABLE "applications" ADD COLUMN "created_at" timestamp with time zone DEFAULT now() NOT NULL;--> statement-breakpoint
+ALTER TABLE "memberships" ADD CONSTRAINT "memberships_organisation_id_organisations_id_fk" FOREIGN KEY ("organisation_id") REFERENCES "public"."organisations"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "memberships" ADD CONSTRAINT "memberships_human_id_humans_id_fk" FOREIGN KEY ("human_id") REFERENCES "public"."humans"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "applications" ADD CONSTRAINT "applications_organisation_id_organisations_id_fk" FOREIGN KEY ("organisation_id") REFERENCES "public"."organisations"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "environments" ADD CONSTRAINT "environments_application_kind_unique" UNIQUE("application_id","kind");
+```
+
+Backfill cho mỗi orphaned application một organisation riêng và reuse uuid của
+application làm uuid của organisation, nên sau đó lineage vẫn đọc được: một
+organisation có id khớp với một application là organisation do migration này
+invent. Sau khi apply, cả 237 applications đều có organisation và column là NOT
+NULL, đó là bằng chứng duy nhất đáng kể.
+
+## Signup: một act, năm rows
+
+Provisioning thuộc về *admin surface* của repository layer — function duy nhất
+trong file đó luôn được phép chạy không cần tenant scope, vì nó là operation
+tạo ra tenant. Nó đã tồn tại, và 2.1 đã giải thích: `createEnvironment` mint
+một application và một environment. Giờ nó mint thêm một organisation, và có
+một sibling làm toàn bộ việc cho signup.
+
+```diff title="services/api/src/db/repository.ts"
+@@ -3,15 +3,25 @@
+ import { and, asc, desc, eq, gt, lt, sql, type SQL } from "drizzle-orm";
+
+ import type { Db } from "./client";
+-import { channels, members, messages, users } from "./schema";
++import {
++  applications,
++  channels,
++  environments,
++  humans,
++  members,
++  memberships,
++  messages,
++  organisations,
++  users,
++} from "./schema";
+
+ // The repository layer — the ONE place data access lives (ADR-04's single
+ // writer, constitution I). Two surfaces with a bright line between them:
+ //
+-//   createEnvironment — the ADMIN surface. It creates tenants, so it is the
+-//   only operation here that is not tenant-scoped. It also inserts a stub
+-//   application row to satisfy environments' NOT NULL foreign key (recorded
+-//   decision: the real application lifecycle belongs to Part 3).
++//   createEnvironment / provisionOrganisation — the ADMIN surface. These
++//   create tenants, so they are the only operations here that are not
++//   tenant-scoped. As of chapter 3.1 they build the whole container stack:
++//   organisation -> application -> environment, with no stubs left.
+ //
+ //   Repository — everything else. The constructor REQUIRES an
+ //   environment_id; every query is scoped by it HERE, in one home — never
+@@ -34,18 +44,199 @@
+   db: Db,
+   { name, kind = "development" }: { name: string; kind?: Environment["kind"] },
+ ): Promise<Environment> {
++  const organisationId = randomUUID();
+   const applicationId = randomUUID();
+   const environmentId = randomUUID();
+   // The admin surface writes through the same Db handle but carries no
+   // tenant scope — it is the operation that MINTS the scope.
++  //
++  // Chapter 3.1 added the organisation above the application, and this
++  // function had to grow with it the same day: `applications.organisation_id`
++  // is NOT NULL, and this is the function every Part 2 suite, the e2e harness
++  // and three walk scripts use to make a tenant. A schema change whose only
++  // writer is left behind is not a migration, it is an outage.
+   await db.execute(
+-    sql`INSERT INTO applications (id, name) VALUES (${applicationId}, ${name})`,
++    sql`INSERT INTO organisations (id, name) VALUES (${organisationId}, ${name})`,
++  );
++  await db.execute(
++    sql`INSERT INTO applications (id, organisation_id, name)
++        VALUES (${applicationId}, ${organisationId}, ${name})`,
+   );
+   await db.execute(
+     sql`INSERT INTO environments (id, application_id, kind, signing_secret)
+         VALUES (${environmentId}, ${applicationId}, ${kind}, ${randomUUID()})`,
+   );
+   return { id: environmentId, kind };
++}
++
++/** What a signup produced — or found. `created` answers "was an organisation
++ * created on this call?", NOT "was the identity new": a known human who owned
++ * nothing gets `created: true`, because one really was created for them. */
++export interface Provisioned {
++  organisation: { id: string; name: string };
++  application: { id: string; name: string };
++  environment: { id: string; kind: Environment["kind"] };
++  human: { id: string; provider: string; provider_account_id: string };
++  created: boolean;
++}
++
++/** Signup (chapter 3.1, FR-TEN-01/02). The admin surface's second entrance:
++ * it mints a tenant, so like createEnvironment it carries no tenant scope —
++ * it is the operation that creates one.
++ *
++ * ATOMIC: one transaction. A half-built tenant — an application with no
++ * environment — is unusable and invisible to the person who just signed up,
++ * so there is no state between "nothing" and "everything".
++ *
++ * IDEMPOTENT ON THE OWNED ORGANISATION, which is the only rule that is defined
++ * for every reachable case:
++ *
++ *   unknown identity           -> five rows; created: true
++ *   known, owns an org         -> that org; nothing written; created: false
++ *   known, owns none           -> four rows (no new human); created: true
++ *
++ * The third case cannot happen until invitations exist, and the rule is stated
++ * now because "return the existing organisation" is undefined for a human who
++ * only belongs to someone ELSE's — a state FR-TEN-07 makes legal the moment
++ * membership management arrives. Signing up gives you your own workspace; it
++ * never hands you somebody else's.
++ */
++export async function provisionOrganisation(
++  db: Db,
++  {
++    provider,
++    providerAccountId,
++    displayName,
++    email,
++    organisationName,
++  }: {
++    provider: string;
++    providerAccountId: string;
++    displayName?: string | null;
++    email?: string | null;
++    organisationName: string;
++  },
++): Promise<Provisioned> {
++  return db.transaction(async (tx) => {
++    // The identity, or the row that already speaks for it. The unique index on
++    // (provider, provider_account_id) is what decides under concurrency — a
++    // read-then-write check here would let two simultaneous first clicks both
++    // believe they were first (2.3's lesson, on a different table).
++    const [existingHuman] = await tx
++      .select({
++        id: humans.id,
++        provider: humans.provider,
++        provider_account_id: humans.providerAccountId,
++      })
++      .from(humans)
++      .where(
++        and(
++          eq(humans.provider, provider),
++          eq(humans.providerAccountId, providerAccountId),
++        ),
++      );
++
++    if (existingHuman) {
++      // Does this identity already OWN an organisation? Membership is not
++      // ownership: being a member of someone else's does not count.
++      const [owned] = await tx
++        .select({
++          id: organisations.id,
++          name: organisations.name,
++        })
++        .from(memberships)
++        .innerJoin(
++          organisations,
++          eq(organisations.id, memberships.organisationId),
++        )
++        .where(
++          and(
++            eq(memberships.humanId, existingHuman.id),
++            eq(memberships.role, "owner"),
++          ),
++        )
++        .orderBy(asc(memberships.joinedAt))
++        .limit(1);
++
++      if (owned) {
++        const [application] = await tx
++          .select({ id: applications.id, name: applications.name })
++          .from(applications)
++          .where(eq(applications.organisationId, owned.id))
++          .orderBy(asc(applications.createdAt))
++          .limit(1);
++        const [environment] = await tx
++          .select({
++            id: environments.id,
++            kind: sql<Environment["kind"]>`${environments.kind}`,
++          })
++          .from(environments)
++          .where(eq(environments.applicationId, application!.id))
++          .orderBy(asc(environments.kind))
++          .limit(1);
++        return {
++          organisation: owned,
++          application: application!,
++          environment: environment!,
++          human: existingHuman,
++          created: false,
++        };
++      }
++    }
++
++    const human =
++      existingHuman ??
++      (
++        await tx
++          .insert(humans)
++          .values({
++            id: randomUUID(),
++            provider,
++            providerAccountId,
++            displayName: displayName ?? null,
++            email: email ?? null,
++          })
++          .returning({
++            id: humans.id,
++            provider: humans.provider,
++            provider_account_id: humans.providerAccountId,
++          })
++      )[0]!;
++
++    const organisationId = randomUUID();
++    const applicationId = randomUUID();
++    const environmentId = randomUUID();
++
++    await tx
++      .insert(organisations)
++      .values({ id: organisationId, name: organisationName });
++    await tx.insert(applications).values({
++      id: applicationId,
++      organisationId,
++      name: organisationName,
++    });
++    await tx.insert(environments).values({
++      id: environmentId,
++      applicationId,
++      // FR-TEN-02: development, and only development. The production
++      // environment is possible (FR-TEN-04) but not automatic.
++      kind: "development",
++      signingSecret: randomUUID(),
++    });
++    await tx.insert(memberships).values({
++      organisationId,
++      humanId: human.id,
++      role: "owner", // FR-TEN-07's vocabulary; management of it is later
++    });
++
++    return {
++      organisation: { id: organisationId, name: organisationName },
++      application: { id: applicationId, name: organisationName },
++      environment: { id: environmentId, kind: "development" as const },
++      human,
++      created: true,
++    };
++  });
+ }
+
+ export interface UserRow {
+```
+
+Chú ý điều *không* xảy ra: không có cánh cửa thứ hai dẫn tới tenant creation.
+Principle I giữ rằng isolation sống ở một nơi, và "thứ tạo tenants" chính xác
+là loại operation không nên reachable từ hai hướng.
+
+<Why source="FR-TEN-01 · FR-TEN-07 · FR-MSG-04's shape" locale="vi">
+
+Vì sao signup idempotent trên *owned* organisation thay vì chỉ "trên identity"?
+Vì "return existing organisation" không được define cho một human thuộc
+organisation của người khác. FR-TEN-07 làm state đó hợp lệ — organisations có
+members với roles — nên ngay khi invitations tồn tại, một identity có thể đã
+được system biết đến nhưng không own gì cả. Một rule keyed chỉ trên identity
+sau đó sẽ phải chọn một organisation để return, và lựa chọn nào cũng sai: đưa
+workspace của người khác cho một người vừa sign up là tenancy bug có gương mặt
+thân thiện.
+
+Vì vậy rule được stated cho mọi reachable case. Unknown identity nhận năm rows.
+Known identity đang giữ membership `owner` nhận lại organisation đó và không có
+gì được write. Known identity chỉ giữ memberships non-`owner` nhận bốn rows —
+một organisation mới của riêng họ, existing memberships giữ nguyên. Case thứ ba
+không thể xảy ra cho tới khi một chapter sau build invitations, và nó được ghi
+lại ngay bây giờ vì alternative là phát hiện ambiguity sau này, trong
+production, cùng với data. Mechanism là của 2.3: unique index quyết định, không
+phải read-then-write check mà hai simultaneous first clicks đều có thể pass.
+
+</Why>
+
+<Figure
+  caption="Flow end to end. State check xảy ra trước mọi provider call — một unverified callback không bao giờ được khiến server này nói chuyện với GitHub thay attacker."
+  code={figSignup}
+/>
+
+## State parameter không phải trang trí
+
+Authorization-code flow có ba steps, và ở đây nó được viết tay vì cùng lý do
+chapter 2.5 wire WebSocket upgrade bằng tay: strategy library sẽ giấu đúng phần
+bạn đến để học, và thêm dependencies vào một service mà constitution nói boring
+by design. `fetch` của Node làm hai HTTP calls; zod validate cả hai answers, vì
+một unvalidated payload không fail tại nơi nó arrive — và ở đây payload quyết
+định *một người là ai*.
+
+```ts title="services/api/src/tenancy/oauth.schema.ts"
+import { z } from "zod";
+
+// What a provider is allowed to say back (chapter 3.1). Two responses cross
+// this boundary — the token exchange and the profile fetch — and both are
+// parsed, not assumed.
+//
+// The habit is 1.3's and it has paid every time since: an unvalidated payload
+// does not fail where it arrives, it fails three layers away as an `undefined`
+// somebody has to trace back. Here the stakes are higher than usual, because
+// the thing being parsed decides who a person is.
+
+/** GitHub answers a failed exchange with HTTP 200 and an error body. Parsing
+ * only the success shape would read `access_token: undefined` as a token. */
+export const providerErrorSchema = z.object({
+  error: z.string().min(1),
+  error_description: z.string().optional(),
+});
+
+export const tokenResponseSchema = z.object({
+  access_token: z.string().min(1),
+  token_type: z.string().optional(),
+  scope: z.string().optional(),
+});
+
+/** The profile, narrowed to what signup is allowed to want. FR-TEN-01 says
+ * "providing no information beyond that granted by the provider" — so this
+ * takes an id, a name if there is one, an email if the provider released one,
+ * and nothing else. `id` arrives as a number from GitHub and a string from
+ * Google; both become a string, because it is an opaque key here. */
+export const profileSchema = z.object({
+  id: z.union([z.string().min(1), z.number().int()]).transform(String),
+  login: z.string().min(1).optional(),
+  name: z.string().min(1).nullish(),
+  email: z.string().email().nullish(),
+});
+
+export type TokenResponse = z.infer<typeof tokenResponseSchema>;
+export type Profile = z.infer<typeof profileSchema>;
+```
+
+Tiếp theo là phần rất dễ sai một cách tinh vi. `state` tồn tại để chứng minh
+callback thuộc về browser đã start flow. Rất dễ bị cám dỗ làm nó stateless —
+sign một random value, verify signature khi return, không cần cookie. Version
+đó verify rất đẹp và không chặn gì: attacker tự start flow, lấy state hoàn toàn
+valid mà server đã mint, rồi feed callback URL cho victim. Signature check pass,
+vì server thật sự đã mint nó. Thứ browser của victim không có là cookie.
+
+```ts title="services/api/src/tenancy/state-cookie.ts"
+import { randomBytes, timingSafeEqual } from "node:crypto";
+
+// The CSRF binding for the OAuth flow (chapter 3.1).
+//
+// `state` exists to prove that the callback belongs to the browser that
+// started the flow. A signed-but-stateless state proves the SERVER minted it
+// and nothing more — an attacker can start a flow, take the state, and feed
+// the victim a callback URL that still verifies. Binding needs something only
+// that browser holds, which is a cookie. Five lines of header parsing, and no
+// dependency for it.
+
+export const STATE_COOKIE = "relay_oauth_state";
+const MAX_AGE_SECONDS = 600;
+
+export function mintState(): string {
+  return randomBytes(16).toString("hex");
+}
+
+/** `Path=/auth` keeps it off every other request; `SameSite=Lax` still allows
+ * the provider's top-level redirect back; `HttpOnly` keeps script away from
+ * it. `Secure` is omitted only when the base URL is plain http, which is the
+ * local case — a reader on localhost would otherwise never receive it. */
+export function stateCookie(value: string, secure: boolean): string {
+  const parts = [
+    `${STATE_COOKIE}=${value}`,
+    "HttpOnly",
+    "SameSite=Lax",
+    "Path=/auth",
+    `Max-Age=${value === "" ? 0 : MAX_AGE_SECONDS}`,
+  ];
+  if (secure) parts.push("Secure");
+  return parts.join("; ");
+}
+
+export function clearStateCookie(secure: boolean): string {
+  return stateCookie("", secure);
+}
+
+/** Read one cookie out of a raw header. No parser dependency: the format is
+ * `a=1; b=2`, and anything that does not match that is not a cookie we set. */
+export function readCookie(
+  header: string | undefined,
+  name: string,
+): string | undefined {
+  if (!header) return undefined;
+  for (const pair of header.split(";")) {
+    const eq = pair.indexOf("=");
+    if (eq < 0) continue;
+    if (pair.slice(0, eq).trim() === name) return pair.slice(eq + 1).trim();
+  }
+  return undefined;
+}
+
+/** Constant-time comparison. The state is not a secret in the way a password
+ * is, but it is compared on every callback and the cost of doing it properly
+ * is one function call. */
+export function statesMatch(
+  fromQuery: string | undefined,
+  fromCookie: string | undefined,
+): boolean {
+  if (!fromQuery || !fromCookie) return false;
+  const a = Buffer.from(fromQuery);
+  const b = Buffer.from(fromCookie);
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(a, b);
+}
+```
+
+`SameSite=Lax` thay vì `Strict`, vì redirect quay về từ provider là cross-site
+navigation và `Strict` sẽ withholding cookie đúng lúc nó cần được gửi.
+`Secure` ở mọi nơi trừ plain-http base URL, vì nếu không reader trên localhost
+sẽ không bao giờ nhận cookie và sẽ không có gì để chỉ vào khi flow fail.
+
+```ts title="services/api/src/tenancy/oauth.provider.ts"
+import {
+  profileSchema,
+  providerErrorSchema,
+  tokenResponseSchema,
+  type Profile,
+} from "./oauth.schema";
+
+// The authorization-code flow, by hand (chapter 3.1).
+//
+// No Passport, no strategy plugin. The flow is three steps and this chapter
+// exists to teach them; a library would hide exactly the part the reader came
+// for, and would add two dependencies to a service whose constitution says
+// boring by design. Chapter 2.5 wired the WebSocket upgrade by hand for the
+// same reason.
+//
+// Endpoints are configuration, not constants. That is what lets the test lane
+// point at a local stand-in and stay offline and deterministic (2.1's
+// two-lane gate, 2.8's no-flakes rule) — and it is also what a real
+// deployment needs for GitHub Enterprise.
+
+export class ProviderError extends Error {
+  constructor(
+    message: string,
+    readonly kind: "denied" | "unusable",
+  ) {
+    super(message);
+    this.name = "ProviderError";
+  }
+}
+
+export interface ProviderConfig {
+  clientId: string;
+  clientSecret: string;
+  authorizeUrl: string;
+  tokenUrl: string;
+  userUrl: string;
+  scope: string;
+}
+
+const GITHUB_DEFAULTS = {
+  authorizeUrl: "https://github.com/login/oauth/authorize",
+  tokenUrl: "https://github.com/login/oauth/access_token",
+  userUrl: "https://api.github.com/user",
+  scope: "read:user user:email",
+};
+
+/** Configuration for a provider, or undefined when it is not set up. An
+ * unconfigured provider is a 404 rather than a redirect into a broken flow. */
+export function providerConfig(name: string): ProviderConfig | undefined {
+  if (name !== "github") return undefined;
+  const clientId = process.env.RELAY_OAUTH_GITHUB_CLIENT_ID;
+  const clientSecret = process.env.RELAY_OAUTH_GITHUB_CLIENT_SECRET;
+  if (!clientId || !clientSecret) return undefined;
+  return {
+    clientId,
+    clientSecret,
+    authorizeUrl:
+      process.env.RELAY_OAUTH_GITHUB_AUTHORIZE_URL ??
+      GITHUB_DEFAULTS.authorizeUrl,
+    tokenUrl:
+      process.env.RELAY_OAUTH_GITHUB_TOKEN_URL ?? GITHUB_DEFAULTS.tokenUrl,
+    userUrl: process.env.RELAY_OAUTH_GITHUB_USER_URL ?? GITHUB_DEFAULTS.userUrl,
+    scope: GITHUB_DEFAULTS.scope,
+  };
+}
+
+export function redirectUri(provider: string): string {
+  const base = process.env.RELAY_OAUTH_REDIRECT_BASE ?? "http://localhost:4000";
+  return `${base}/auth/${provider}/callback`;
+}
+
+/** Step one: where to send the browser. */
+export function authorizeUrl(
+  provider: string,
+  config: ProviderConfig,
+  state: string,
+): string {
+  const url = new URL(config.authorizeUrl);
+  url.searchParams.set("client_id", config.clientId);
+  url.searchParams.set("redirect_uri", redirectUri(provider));
+  url.searchParams.set("scope", config.scope);
+  url.searchParams.set("state", state);
+  return url.toString();
+}
+
+/** Steps two and three: trade the code for a token, then ask who it belongs
+ * to. Both responses are parsed; neither is trusted for its shape. */
+export async function exchangeCodeForProfile(
+  provider: string,
+  config: ProviderConfig,
+  code: string,
+): Promise<Profile> {
+  const tokenRes = await fetch(config.tokenUrl, {
+    method: "POST",
+    headers: { accept: "application/json", "content-type": "application/json" },
+    body: JSON.stringify({
+      client_id: config.clientId,
+      client_secret: config.clientSecret,
+      code,
+      redirect_uri: redirectUri(provider),
+    }),
+  });
+  if (!tokenRes.ok) {
+    throw new ProviderError(
+      `token endpoint answered ${tokenRes.status}`,
+      "unusable",
+    );
+  }
+  const tokenBody: unknown = await tokenRes.json();
+
+  // The provider's own refusal is a 400 to our caller, not a 502: nothing is
+  // broken, the person declined or the code expired.
+  const denied = providerErrorSchema.safeParse(tokenBody);
+  if (denied.success) {
+    throw new ProviderError(denied.data.error, "denied");
+  }
+  const token = tokenResponseSchema.safeParse(tokenBody);
+  if (!token.success) {
+    throw new ProviderError(
+      "token response did not match the contract",
+      "unusable",
+    );
+  }
+
+  const userRes = await fetch(config.userUrl, {
+    headers: {
+      accept: "application/json",
+      authorization: `Bearer ${token.data.access_token}`,
+      // GitHub rejects requests without one.
+      "user-agent": "relay",
+    },
+  });
+  if (!userRes.ok) {
+    throw new ProviderError(
+      `user endpoint answered ${userRes.status}`,
+      "unusable",
+    );
+  }
+  const profile = profileSchema.safeParse(await userRes.json());
+  if (!profile.success) {
+    throw new ProviderError("profile did not match the contract", "unusable");
+  }
+  return profile.data;
+}
+```
+
+Một provider quirk đáng có một dòng code và một câu giải thích: GitHub trả lời
+bad code bằng **HTTP 200** và một error object. Code chỉ parse success shape sẽ
+đọc `access_token: undefined` như một token rồi đi tiếp. Vì vậy error shape
+được parse trước, và vì vậy hai failures được tách biệt khi trả ra — một người
+decline là 400, còn provider trả thứ contract không cho phép là 502, vì caller
+không làm gì sai.
+
+```ts title="services/api/src/tenancy/signup.controller.ts"
+import {
+  BadGatewayException,
+  BadRequestException,
+  Controller,
+  Get,
+  Headers,
+  NotFoundException,
+  Param,
+  Query,
+  Res,
+} from "@nestjs/common";
+import { createDb, createPool } from "../db/client";
+import { provisionOrganisation } from "../db/repository";
+import {
+  authorizeUrl,
+  exchangeCodeForProfile,
+  providerConfig,
+  ProviderError,
+} from "./oauth.provider";
+import {
+  STATE_COOKIE,
+  clearStateCookie,
+  mintState,
+  readCookie,
+  stateCookie,
+  statesMatch,
+} from "./state-cookie";
+
+// Signup (chapter 3.1, FR-TEN-01/02). Two routes, both necessarily
+// unauthenticated: they exist to establish who somebody is, and no tenant
+// exists yet for a header to name. Note what is absent — the
+// EnvironmentContextGuard every other controller carries (2.2). The guard is
+// applied per controller, so a pre-tenant route simply does not use it, and
+// the seam it guards is untouched by this chapter (3.2 retires it).
+//
+// What these routes do NOT do: issue a session. A session is a credential,
+// credentials are 3.2's subject, and the dashboard that would consume one is
+// Part 5. The callback reports what it created and stops there.
+
+/** The two things this controller needs from the response object.
+ *
+ * `@Res()` puts a handler in Nest's library-specific mode, which normally
+ * means importing express's `Response` type — and express 5 ships no types, so
+ * that would mean adding `@types/express` for two method signatures. Declaring
+ * the shape instead keeps the api's dependency list exactly where 1.4 left it,
+ * and states plainly what these routes actually touch. */
+interface HttpResponse {
+  setHeader(name: string, value: string): void;
+  redirect(status: number, url: string): void;
+}
+
+const db = createDb(createPool());
+
+@Controller("auth")
+export class SignupController {
+  @Get(":provider/start")
+  start(@Param("provider") provider: string, @Res() res: HttpResponse): void {
+    const config = providerConfig(provider);
+    // An unconfigured or unknown provider is a 404 — never a redirect built
+    // from unvalidated input.
+    if (!config) throw new NotFoundException("unknown provider");
+
+    const state = mintState();
+    const secure = !(
+      process.env.RELAY_OAUTH_REDIRECT_BASE ?? "http://localhost:4000"
+    ).startsWith("http://");
+    res.setHeader("set-cookie", stateCookie(state, secure));
+    res.redirect(302, authorizeUrl(provider, config, state));
+  }
+
+  @Get(":provider/callback")
+  async callback(
+    @Param("provider") provider: string,
+    @Query("code") code: string | undefined,
+    @Query("state") state: string | undefined,
+    @Query("error") providerError: string | undefined,
+    @Headers("cookie") cookieHeader: string | undefined,
+    @Res({ passthrough: true }) res: HttpResponse,
+  ) {
+    const config = providerConfig(provider);
+    if (!config) throw new NotFoundException("unknown provider");
+
+    const secure = !(
+      process.env.RELAY_OAUTH_REDIRECT_BASE ?? "http://localhost:4000"
+    ).startsWith("http://");
+
+    // THE BINDING IS CHECKED FIRST, before anything else is even read. An
+    // unverified callback must never make this server talk to the provider on
+    // an attacker's behalf — and a state that merely validates as
+    // well-formed proves nothing about WHICH browser began the flow.
+    const expected = readCookie(cookieHeader, STATE_COOKIE);
+    if (!statesMatch(state, expected)) {
+      res.setHeader("set-cookie", clearStateCookie(secure));
+      throw new BadRequestException("state does not match");
+    }
+    res.setHeader("set-cookie", clearStateCookie(secure));
+
+    if (providerError) throw new BadRequestException(providerError);
+    if (!code) throw new BadRequestException("missing code");
+
+    let profile;
+    try {
+      profile = await exchangeCodeForProfile(provider, config, code);
+    } catch (error) {
+      if (error instanceof ProviderError) {
+        // The person declining is a 400 — nothing is broken. A provider that
+        // answers something the contract does not allow is a 502: the fault
+        // is upstream, and saying "bad request" would blame the caller.
+        throw error.kind === "denied"
+          ? new BadRequestException(error.message)
+          : new BadGatewayException(error.message);
+      }
+      throw error;
+    }
+
+    const result = await provisionOrganisation(db, {
+      provider,
+      providerAccountId: profile.id,
+      displayName: profile.name ?? profile.login ?? null,
+      email: profile.email ?? null,
+      // No form to fill in (FR-TEN-01): the name comes from what the provider
+      // granted, and nothing else is asked for.
+      organisationName: `${profile.login ?? profile.name ?? "relay"}'s org`,
+    });
+
+    return {
+      organisation: result.organisation,
+      application: result.application,
+      environment: result.environment,
+      created: result.created,
+    };
+  }
+}
+```
+
+```ts title="services/api/src/tenancy/tenancy.module.ts"
+import { Module } from "@nestjs/common";
+
+import { SignupController } from "./signup.controller";
+
+// Signup's home (chapter 3.1). Deliberately thin, and deliberately NOT
+// importing MessagesModule: nothing here is tenant-scoped, so it needs none of
+// the request-scoped machinery 2.2 built. The provisioning it calls lives in
+// the repository's admin surface, which is a module-free function for exactly
+// this reason — it runs before any tenant exists to scope to.
+@Module({
+  controllers: [SignupController],
+})
+export class TenancyModule {}
+```
+
+```diff title="services/api/src/app.module.ts"
+@@ -8,6 +8,7 @@
+ import { HealthController } from "./health.controller";
+ import { InternalModule } from "./internal/internal.module";
+ import { MessagesModule } from "./messages/messages.module";
++import { TenancyModule } from "./tenancy/tenancy.module";
+ import { LOGGER, apiLogger } from "./logger";
+ import { ProtocolErrorFilter } from "./protocol-error.filter";
+ import { RequestContextMiddleware } from "./request-context.middleware";
+@@ -17,7 +18,7 @@
+ // provider (APP_FILTER) instead of wiring it in main.ts means every entry
+ // point — including tests — gets the same error envelope for free.
+ @Module({
+-  imports: [MessagesModule, InternalModule],
++  imports: [MessagesModule, InternalModule, TenancyModule],
+   controllers: [HealthController],
+   providers: [
+     { provide: LOGGER, useFactory: apiLogger },
+```
+
+Nhìn thứ controller này *không* mang: `EnvironmentContextGuard` mà mọi
+controller khác đã đeo từ 2.2. Hai routes này tồn tại để establish một người là
+ai, và lúc đó chưa có tenant nào để header gọi tên. Guard được apply per
+controller, nên pre-tenant route đơn giản là không dùng guard — và seam mà
+guard bảo vệ không bị chương này đụng tới.
+
+## Tự setup
+
+Endpoints là configuration, không phải constants, nhờ vậy test lane có thể
+point vào local stand-in và real deployment có thể point vào GitHub Enterprise.
+Để chạy real flow, register một OAuth application với provider của bạn, set
+callback thành `http://localhost:4000/auth/github/callback`, rồi export:
+
+```bash
+RELAY_OAUTH_GITHUB_CLIENT_ID=…       # from the provider's app page
+RELAY_OAUTH_GITHUB_CLIENT_SECRET=…   # runtime only — never a build argument
+RELAY_OAUTH_REDIRECT_BASE=http://localhost:4000
+# optional, for GitHub Enterprise or a local stand-in:
+RELAY_OAUTH_GITHUB_AUTHORIZE_URL=…
+RELAY_OAUTH_GITHUB_TOKEN_URL=…
+RELAY_OAUTH_GITHUB_USER_URL=…
+```
+
+Khi không có client id và secret, `/auth/github/start` trả 404 thay vì redirect
+vào một flow không thể complete. Và cùng rule đã áp dụng cho `DATABASE_URL` từ
+1.2 cũng áp dụng cho client secret đó: chỉ runtime configuration — không bao
+giờ là build argument, không bao giờ baked vào image layer, không bao giờ trong
+client bundle.
+
+## Chương này cố ý để lại gì cho sau
+
+Ba thứ một real product sẽ có, và các chapters sở hữu chúng:
+
+**Không session.** Sau callback bạn nhận JSON body mô tả thứ đã được tạo, rồi
+server quên bạn. Session là credential; credentials là subject của 3.2 ("two
+credentials, one mistake"), và dashboard consume nó là Phần 5. Invent một
+credential thứ ba ở đây để 3.2 lập tức rework chính là điều Principle VII tồn
+tại để ngăn.
+
+**Không role management.** Signup biến authenticating human thành `owner`, và
+role vocabulary (`owner`, `admin`, `member`) tồn tại trong schema vì FR-TEN-07
+gọi tên nó. Invitations, promotions và removals chưa được build.
+
+**Dev-mode seams vẫn ở lại.** Mọi surface của Phần 2 vẫn gọi tên tenant bằng
+header `x-relay-environment`, và gateway vẫn verify tokens bằng dev secret.
+Real tenancy phía trên chúng không làm cái nào trustworthy hơn, và 3.2 là nơi
+cả hai retire. Không có gì trong chương này là lý do để tin header đó.
+
+## Tests, và chúng giữ gì
+
+Bảy invariants, split giữa các lanes theo thứ chúng cần. Binding và provider
+contract là pure functions của input, nên chúng chạy trong Docker-free lane mà
+reader dùng mỗi lần save:
+
+```ts title="services/api/src/tenancy/oauth.test.ts"
+import { describe, expect, it } from "vitest";
+
+import {
+  profileSchema,
+  providerErrorSchema,
+  tokenResponseSchema,
+} from "./oauth.schema";
+import {
+  STATE_COOKIE,
+  clearStateCookie,
+  mintState,
+  readCookie,
+  stateCookie,
+  statesMatch,
+} from "./state-cookie";
+
+// Invariants 5 and 6 (chapter 3.1), in the Docker-free lane: the CSRF binding
+// and the provider contract. Neither needs a database, and neither should wait
+// for one — this is the lane a reader runs on every save (2.1's gate).
+
+describe("the state binding (invariant 5)", () => {
+  it("mints a value with enough entropy to be unguessable", () => {
+    const a = mintState();
+    const b = mintState();
+    expect(a).toHaveLength(32); // 128 bits, hex
+    expect(a).not.toBe(b);
+  });
+
+  it("refuses a callback whose state does not match the cookie", () => {
+    const minted = mintState();
+    // The attack this closes: an attacker starts the flow, takes the state
+    // value, and feeds a victim the callback URL. The value is real, so a
+    // server that only checked "is this well formed?" would accept it. What
+    // the victim's browser does NOT have is the cookie.
+    expect(statesMatch(minted, undefined)).toBe(false);
+    expect(statesMatch(minted, mintState())).toBe(false);
+    expect(statesMatch(undefined, minted)).toBe(false);
+    expect(statesMatch("", "")).toBe(false);
+    expect(statesMatch(minted, minted)).toBe(true);
+  });
+
+  it("does not leak length through an early return", () => {
+    // A shorter or longer candidate is refused, not compared byte-for-byte.
+    expect(statesMatch("abc", "abcd")).toBe(false);
+  });
+
+  it("sets the cookie so a script cannot read it and the provider can return through it", () => {
+    const header = stateCookie("abc123", true);
+    expect(header).toContain(`${STATE_COOKIE}=abc123`);
+    expect(header).toContain("HttpOnly");
+    // Lax, not Strict: the provider's redirect back IS a cross-site
+    // navigation, and Strict would withhold the cookie exactly when it is
+    // needed.
+    expect(header).toContain("SameSite=Lax");
+    expect(header).toContain("Path=/auth");
+    expect(header).toContain("Secure");
+  });
+
+  it("omits Secure only when the base URL is plain http", () => {
+    // A reader on localhost would never receive a Secure cookie over http,
+    // and the flow would fail with nothing to point at.
+    expect(stateCookie("abc", false)).not.toContain("Secure");
+  });
+
+  it("expires the cookie when clearing it", () => {
+    expect(clearStateCookie(false)).toContain("Max-Age=0");
+  });
+
+  it("reads one cookie out of a header full of them", () => {
+    const header = `other=1; ${STATE_COOKIE}=wanted; third=3`;
+    expect(readCookie(header, STATE_COOKIE)).toBe("wanted");
+    expect(readCookie(header, "missing")).toBeUndefined();
+    expect(readCookie(undefined, STATE_COOKIE)).toBeUndefined();
+    // A name that is a suffix of another must not match it.
+    expect(readCookie(`x${STATE_COOKIE}=no`, STATE_COOKIE)).toBeUndefined();
+  });
+});
+
+describe("the provider contract (invariant 6)", () => {
+  it("recognises a provider's error body, which arrives with HTTP 200", () => {
+    // GitHub answers a bad code with 200 and an error object. Parsing only the
+    // success shape would read `access_token: undefined` as a token.
+    const parsed = providerErrorSchema.safeParse({
+      error: "bad_verification_code",
+      error_description: "The code passed is incorrect or expired.",
+    });
+    expect(parsed.success).toBe(true);
+  });
+
+  it("rejects a token response with no token", () => {
+    expect(
+      tokenResponseSchema.safeParse({ token_type: "bearer" }).success,
+    ).toBe(false);
+    expect(tokenResponseSchema.safeParse({ access_token: "" }).success).toBe(
+      false,
+    );
+    expect(
+      tokenResponseSchema.safeParse({ access_token: "gho_x" }).success,
+    ).toBe(true);
+  });
+
+  it("accepts an id whether the provider sends a number or a string", () => {
+    // GitHub sends a number, Google a string. It is an opaque key here, so
+    // both become a string rather than the api caring which provider it is.
+    expect(profileSchema.parse({ id: 4711, login: "tuan" }).id).toBe("4711");
+    expect(profileSchema.parse({ id: "4711", login: "tuan" }).id).toBe("4711");
+  });
+
+  it("tolerates a withheld email but not a missing id", () => {
+    // FR-TEN-01: nothing beyond what the provider granted. A provider that
+    // releases no email is normal, and identity does not depend on it.
+    expect(
+      profileSchema.safeParse({ id: 1, login: "tuan", email: null }).success,
+    ).toBe(true);
+    expect(profileSchema.safeParse({ login: "tuan" }).success).toBe(false);
+  });
+
+  it("rejects a profile whose email is not an email", () => {
+    expect(
+      profileSchema.safeParse({ id: 1, email: "not-an-email" }).success,
+    ).toBe(false);
+  });
+});
+```
+
+Phần còn lại cần real database, và một test cần provider — nên suite start một
+provider trên real port, trả lời đúng thứ test nói. Flow không bị stub; chỉ
+party ở đầu bên kia là stand-in.
+
+```ts title="services/api/src/tenancy/signup.itest.ts"
+import "reflect-metadata";
+
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
+
+import { Test } from "@nestjs/testing";
+import type { INestApplication } from "@nestjs/common";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+
+import { AppModule } from "../app.module";
+import { createDb, createPool } from "../db/client";
+import { provisionOrganisation, Repository } from "../db/repository";
+import { STATE_COOKIE } from "./state-cookie";
+
+// Signup against the real database (chapter 3.1) — invariants 1–4 and 7.
+//
+// The OAuth provider is a stand-in served from this file: a token endpoint and
+// a user endpoint, on a real port. Nothing about the flow is stubbed except who
+// answers it, which is what keeps this lane offline and deterministic while
+// still exercising the same code path a reader points at GitHub (research R8).
+
+/** A provider that answers exactly what the test tells it to. */
+function standInProvider(profile: unknown, tokenBody?: unknown) {
+  const server = createServer((req, res) => {
+    res.setHeader("content-type", "application/json");
+    if (req.url?.startsWith("/token")) {
+      res.end(JSON.stringify(tokenBody ?? { access_token: "gho_test" }));
+      return;
+    }
+    res.end(JSON.stringify(profile));
+  });
+  return new Promise<{ port: number; close: () => Promise<void> }>(
+    (resolve) => {
+      server.listen(0, () => {
+        const { port } = server.address() as AddressInfo;
+        resolve({
+          port,
+          close: () => new Promise<void>((done) => server.close(() => done())),
+        });
+      });
+    },
+  );
+}
+
+describe("signup", () => {
+  let app: INestApplication;
+  let url: string;
+  let db: ReturnType<typeof createDb>;
+  let provider: Awaited<ReturnType<typeof standInProvider>>;
+
+  beforeAll(async () => {
+    db = createDb(createPool());
+    provider = await standInProvider({
+      id: 90210,
+      login: "tuan",
+      name: "Tuan",
+    });
+    // The provider's endpoints are configuration, so pointing them at the
+    // stand-in is all the wiring this needs.
+    process.env.RELAY_OAUTH_GITHUB_CLIENT_ID = "test-client";
+    process.env.RELAY_OAUTH_GITHUB_CLIENT_SECRET = "test-secret";
+    process.env.RELAY_OAUTH_GITHUB_TOKEN_URL = `http://127.0.0.1:${provider.port}/token`;
+    process.env.RELAY_OAUTH_GITHUB_USER_URL = `http://127.0.0.1:${provider.port}/user`;
+    process.env.RELAY_OAUTH_GITHUB_AUTHORIZE_URL = `http://127.0.0.1:${provider.port}/authorize`;
+    app = (
+      await Test.createTestingModule({ imports: [AppModule] }).compile()
+    ).createNestApplication({ logger: false });
+    await app.listen(0);
+    url = await app.getUrl();
+  }, 60_000);
+
+  afterAll(async () => {
+    await app.close();
+    await provider.close();
+  });
+
+  /** Walk the flow the way a browser would: start, keep the cookie, come back
+   * with the state the server minted. */
+  async function signUp(code = "code-1") {
+    const start = await fetch(`${url}/auth/github/start`, {
+      redirect: "manual",
+    });
+    const setCookie = start.headers.get("set-cookie") ?? "";
+    const state = new URL(start.headers.get("location")!).searchParams.get(
+      "state",
+    )!;
+    const cookie = setCookie.split(";")[0]!;
+    const res = await fetch(
+      `${url}/auth/github/callback?code=${code}&state=${state}`,
+      { headers: { cookie } },
+    );
+    return {
+      status: res.status,
+      body: (await res.json()) as {
+        organisation: { id: string; name: string };
+        application: { id: string; name: string };
+        environment: { id: string; kind: string };
+        created: boolean;
+      },
+    };
+  }
+
+  /** Run a block against a provider that reports a fresh identity. Signup is
+   * idempotent PER IDENTITY, so a test that wants to observe a first signup
+   * needs an identity no earlier test has used — otherwise it is asserting
+   * against the suite's history rather than the behaviour. */
+  async function withFreshIdentity<T>(
+    accountId: string,
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    const fresh = await standInProvider({
+      id: accountId,
+      login: `u-${accountId}`,
+    });
+    const tokenUrl = process.env.RELAY_OAUTH_GITHUB_TOKEN_URL;
+    const userUrl = process.env.RELAY_OAUTH_GITHUB_USER_URL;
+    process.env.RELAY_OAUTH_GITHUB_TOKEN_URL = `http://127.0.0.1:${fresh.port}/token`;
+    process.env.RELAY_OAUTH_GITHUB_USER_URL = `http://127.0.0.1:${fresh.port}/user`;
+    try {
+      return await fn();
+    } finally {
+      process.env.RELAY_OAUTH_GITHUB_TOKEN_URL = tokenUrl;
+      process.env.RELAY_OAUTH_GITHUB_USER_URL = userUrl;
+      await fresh.close();
+    }
+  }
+
+  it("provisions the whole trio from one authentication (FR-TEN-01, FR-TEN-02)", async () => {
+    const { status, body } = await withFreshIdentity(`trio-${Date.now()}`, () =>
+      signUp(),
+    );
+    expect(status).toBe(200);
+    expect(body.created).toBe(true);
+    expect(body.organisation.id).toBeTruthy();
+    expect(body.application.id).toBeTruthy();
+    // FR-TEN-02 names the kind: development, and only development.
+    expect(body.environment.kind).toBe("development");
+
+    // Five rows, and the fifth is the one that says who owns it.
+    const rows = await db.execute(
+      `SELECT
+         (SELECT count(*) FROM organisations WHERE id = '${body.organisation.id}') AS orgs,
+         (SELECT count(*) FROM applications WHERE organisation_id = '${body.organisation.id}') AS apps,
+         (SELECT count(*) FROM environments WHERE application_id = '${body.application.id}') AS envs,
+         (SELECT count(*) FROM memberships WHERE organisation_id = '${body.organisation.id}' AND role = 'owner') AS owners`,
+    );
+    const counts = rows.rows[0] as Record<string, string>;
+    expect(Number(counts.orgs)).toBe(1);
+    expect(Number(counts.apps)).toBe(1);
+    expect(Number(counts.envs)).toBe(1);
+    expect(Number(counts.owners)).toBe(1);
+  });
+
+  it("writes the full set or nothing when provisioning fails (invariant 1)", async () => {
+    const before = await db.execute(
+      `SELECT count(*)::int AS n FROM organisations`,
+    );
+    // Force a failure inside the transaction, after the organisation insert:
+    // an organisation name that is fine and a provider value the CHECK
+    // constraint refuses.
+    await expect(
+      provisionOrganisation(db, {
+        provider: "not-a-provider",
+        providerAccountId: "x",
+        organisationName: "doomed org",
+      }),
+    ).rejects.toThrow();
+    const after = await db.execute(
+      `SELECT count(*)::int AS n FROM organisations`,
+    );
+    // Nothing survived — no half-built tenant, which is the whole point of the
+    // single transaction.
+    expect((after.rows[0] as { n: number }).n).toBe(
+      (before.rows[0] as { n: number }).n,
+    );
+    const orphan = await db.execute(
+      `SELECT count(*)::int AS n FROM organisations WHERE name = 'doomed org'`,
+    );
+    expect((orphan.rows[0] as { n: number }).n).toBe(0);
+  });
+
+  it("recognises a returning owner instead of creating a second organisation (invariant 2)", async () => {
+    const accountId = `returning-${Date.now()}`;
+    const { first, second } = await withFreshIdentity(accountId, async () => ({
+      first: await signUp("code-a"),
+      second: await signUp("code-b"),
+    }));
+    expect(first.body.created).toBe(true);
+    expect(second.body.created).toBe(false);
+    expect(second.body.organisation.id).toBe(first.body.organisation.id);
+    expect(second.body.environment.id).toBe(first.body.environment.id);
+    // One human, one owned organisation — the unique index decided, not a
+    // read-then-write check.
+    const owned = await db.execute(
+      `SELECT count(*)::int AS n FROM memberships m
+         JOIN humans h ON h.id = m.human_id
+        WHERE h.provider_account_id = '${accountId}' AND m.role = 'owner'`,
+    );
+    expect((owned.rows[0] as { n: number }).n).toBe(1);
+  });
+
+  it("refuses a third environment for one application (invariant 3, FR-TEN-04)", async () => {
+    // Its own identity, so its own application: this test adds a production
+    // environment, and the database is not truncated between runs — reusing a
+    // shared identity would hand the second run an application that already
+    // had one (the per-suite-environment lesson from 2.1, one level up).
+    const { body } = await withFreshIdentity(`envcap-${Date.now()}`, () =>
+      signUp("code-c"),
+    );
+    const appId = body.application.id;
+    // Production is legal — two environments are what FR-TEN-04 allows.
+    await db.execute(
+      `INSERT INTO environments (id, application_id, kind, signing_secret)
+       VALUES (gen_random_uuid(), '${appId}', 'production', gen_random_uuid())`,
+    );
+    // A second development environment is not, and the database is what says
+    // so — no application-level guard to lose a race to.
+    await expect(
+      db.execute(
+        `INSERT INTO environments (id, application_id, kind, signing_secret)
+         VALUES (gen_random_uuid(), '${appId}', 'development', gen_random_uuid())`,
+      ),
+    ).rejects.toThrow();
+    const kinds = await db.execute(
+      `SELECT count(*)::int AS n FROM environments WHERE application_id = '${appId}'`,
+    );
+    expect((kinds.rows[0] as { n: number }).n).toBe(2);
+  });
+
+  it("keeps two organisations blind to each other (invariant 4, FR-TEN-05)", async () => {
+    // Two tenants, each with a message of its own.
+    const a = await provisionOrganisation(db, {
+      provider: "github",
+      providerAccountId: `iso-a-${Date.now()}`,
+      organisationName: "org a",
+    });
+    const b = await provisionOrganisation(db, {
+      provider: "github",
+      providerAccountId: `iso-b-${Date.now()}`,
+      organisationName: "org b",
+    });
+    const repoA = new Repository(db, a.environment.id);
+    const repoB = new Repository(db, b.environment.id);
+    const userA = await repoA.createUser("a-user");
+    const channelA = await repoA.createChannel("a-channel", "public");
+    await repoA.addMember(channelA.id, userA.id);
+    await repoA.sendMessage(channelA.id, {
+      text: "a secret",
+      userId: userA.id,
+    });
+
+    // B asks for A's channel by id and gets nothing — not an error that would
+    // confirm it exists (FR-TEN-05).
+    expect(await repoB.listMessages(channelA.id, { limit: 10 })).toEqual([]);
+    expect(await repoB.getChannelByExternalId("a-channel")).toBeNull();
+    expect(await repoB.listChannels()).toEqual([]);
+    // And A still sees its own.
+    expect((await repoA.listMessages(channelA.id, { limit: 10 })).length).toBe(
+      1,
+    );
+  });
+
+  it("exposes provisioning nowhere but the signup path (invariant 7, spec FR-011)", async () => {
+    // The admin surface is a module-free function: it is not a provider, so no
+    // controller can be handed it by injection, and the tenancy module declares
+    // no providers at all. What a reader can check from outside is that no
+    // route creates a tenant on request.
+    for (const path of [
+      "/v1/channels/00000000-0000-0000-0000-000000000000/messages",
+      "/internal/memberships",
+      "/internal/backfill",
+    ]) {
+      const res = await fetch(`${url}${path}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{}",
+      });
+      // Whatever these answer, it is never "here is a new tenant".
+      expect(res.status).not.toBe(200);
+      const text = await res.text();
+      expect(text).not.toContain("organisation");
+    }
+    const before = await db.execute(
+      `SELECT count(*)::int AS n FROM organisations`,
+    );
+    await fetch(`${url}/internal/memberships`, {
+      headers: {
+        "x-relay-environment": "00000000-0000-0000-0000-000000000000",
+      },
+    });
+    const after = await db.execute(
+      `SELECT count(*)::int AS n FROM organisations`,
+    );
+    expect((after.rows[0] as { n: number }).n).toBe(
+      (before.rows[0] as { n: number }).n,
+    );
+  });
+
+  it("refuses a callback whose state does not match the cookie (invariant 5, over HTTP)", async () => {
+    const start = await fetch(`${url}/auth/github/start`, {
+      redirect: "manual",
+    });
+    const cookie = (start.headers.get("set-cookie") ?? "").split(";")[0]!;
+    // An attacker's state value with the victim's cookie: refused.
+    const res = await fetch(
+      `${url}/auth/github/callback?code=c&state=deadbeefdeadbeefdeadbeefdeadbeef`,
+      { headers: { cookie } },
+    );
+    expect(res.status).toBe(400);
+    // And with no cookie at all.
+    const state = new URL(start.headers.get("location")!).searchParams.get(
+      "state",
+    )!;
+    const naked = await fetch(
+      `${url}/auth/github/callback?code=c&state=${state}`,
+    );
+    expect(naked.status).toBe(400);
+    expect(cookie).toContain(STATE_COOKIE);
+  });
+
+  it("answers 502 when the provider breaks its contract (invariant 6, over HTTP)", async () => {
+    const broken = await standInProvider({ login: "no-id-here" });
+    process.env.RELAY_OAUTH_GITHUB_USER_URL = `http://127.0.0.1:${broken.port}/user`;
+    process.env.RELAY_OAUTH_GITHUB_TOKEN_URL = `http://127.0.0.1:${broken.port}/token`;
+    const start = await fetch(`${url}/auth/github/start`, {
+      redirect: "manual",
+    });
+    const cookie = (start.headers.get("set-cookie") ?? "").split(";")[0]!;
+    const state = new URL(start.headers.get("location")!).searchParams.get(
+      "state",
+    )!;
+    const res = await fetch(
+      `${url}/auth/github/callback?code=c&state=${state}`,
+      { headers: { cookie } },
+    );
+    // 502, not 400: the caller did nothing wrong.
+    expect(res.status).toBe(502);
+    await broken.close();
+    process.env.RELAY_OAUTH_GITHUB_USER_URL = `http://127.0.0.1:${provider.port}/user`;
+    process.env.RELAY_OAUTH_GITHUB_TOKEN_URL = `http://127.0.0.1:${provider.port}/token`;
+  });
+});
+```
+
+```text
+✓ signup > provisions the whole trio from one authentication (FR-TEN-01, FR-TEN-02)
+✓ signup > writes the full set or nothing when provisioning fails (invariant 1)
+✓ signup > recognises a returning owner instead of creating a second organisation (invariant 2)
+✓ signup > refuses a third environment for one application (invariant 3, FR-TEN-04)
+✓ signup > keeps two organisations blind to each other (invariant 4, FR-TEN-05)
+✓ signup > exposes provisioning nowhere but the signup path (invariant 7, spec FR-011)
+✓ signup > refuses a callback whose state does not match the cookie (invariant 5, over HTTP)
+✓ signup > answers 502 when the provider breaks its contract (invariant 6, over HTTP)
+```
+
+Hai test trong số đó đã sai trước khi đúng, và lý do đáng để bạn chú ý. Cả hai
+đều assume fresh identity — nhưng signup idempotent per identity, và database
+không bị truncate giữa các runs. Version đầu của returning-owner test assert
+`created: true` trên một signup có identity mà một test trước trong cùng file
+đã dùng, và environment-cap test inherit một application mà *run trước của
+suite* đã thêm production environment vào rồi. Không cái nào là product bug; cả
+hai là tests assert vào history của suite thay vì behaviour. Fix là bài học của
+2.1 nâng lên một level: cho mỗi test identity riêng, giống như mỗi integration
+suite có environment riêng.
+
+Tại tag, các lanes đọc là: **86 unit tests** không Docker (config 6,
+service-kit 3, protocol 26, api 18, gateway 33) và **60 integration tests trên
+11 files** — 44 của api chạy với Postgres, 8 của gateway chạy với Redis, và
+journey suite của 2.8 vẫn 8, không đụng tới.
+
+## Walk it — signup bằng tay
+
+Walk không cần provider account: nó start một stand-in trên fixed port và point
+api vào đó.
+
+```js title="scripts/signup-walk.mjs"
+// Chapter 3.1's walk: sign up, and then sign up again.
+//
+// The first run creates an organisation, an application and a development
+// environment from one authentication. The second run, with the same provider
+// identity, creates nothing and hands back what already exists. Both are the
+// same code path a reader points at GitHub — only the provider is local, so
+// the walk needs no account and no network (research R8).
+//
+// The stand-in listens on a FIXED port, because the api has to be told where
+// the provider is before it starts:
+//
+//   PROVIDER=http://127.0.0.1:4199
+//   RELAY_OAUTH_GITHUB_CLIENT_ID=walk \
+//   RELAY_OAUTH_GITHUB_CLIENT_SECRET=walk \
+//   RELAY_OAUTH_GITHUB_TOKEN_URL=$PROVIDER/token \
+//   RELAY_OAUTH_GITHUB_USER_URL=$PROVIDER/user \
+//   RELAY_OAUTH_GITHUB_AUTHORIZE_URL=$PROVIDER/authorize \
+//     node services/api/dist/main.js &
+//   node scripts/signup-walk.mjs
+import { createServer } from "node:http";
+
+const API = process.env.RELAY_API_URL ?? "http://127.0.0.1:4000";
+
+/** A stand-in GitHub: one token endpoint, one profile endpoint. */
+const ACCOUNT_ID = process.env.RELAY_WALK_ACCOUNT ?? `walk-${Date.now()}`;
+const provider = createServer((req, res) => {
+  res.setHeader("content-type", "application/json");
+  if (req.url?.startsWith("/token")) {
+    res.end(JSON.stringify({ access_token: "gho_walk", token_type: "bearer" }));
+    return;
+  }
+  res.end(JSON.stringify({ id: ACCOUNT_ID, login: "tuan", name: "Tuan" }));
+});
+const PROVIDER_PORT = Number(process.env.RELAY_WALK_PROVIDER_PORT ?? 4199);
+await new Promise((resolve) => provider.listen(PROVIDER_PORT, resolve));
+console.log(`stand-in provider on ${PROVIDER_PORT}, account ${ACCOUNT_ID}\n`);
+
+/** Walk the flow the way a browser does: follow the redirect, keep the cookie,
+ * come back with the state the server minted. */
+async function signUp(label) {
+  const start = await fetch(`${API}/auth/github/start`, { redirect: "manual" });
+  const location = start.headers.get("location");
+  const cookie = (start.headers.get("set-cookie") ?? "").split(";")[0];
+  console.log(`${label} → GET /auth/github/start`);
+  console.log(`    ${start.status} redirect to ${location?.slice(0, 60)}…`);
+  console.log(`    cookie: ${cookie?.split("=")[0]} (HttpOnly, SameSite=Lax)`);
+
+  const state = new URL(location).searchParams.get("state");
+  const res = await fetch(
+    `${API}/auth/github/callback?code=walk-code&state=${state}`,
+    { headers: { cookie } },
+  );
+  const body = await res.json();
+  console.log(`${label} → GET /auth/github/callback`);
+  console.log(`    ${res.status} created=${body.created}`);
+  console.log(`    organisation ${body.organisation?.id}`);
+  console.log(`    application  ${body.application?.id}`);
+  console.log(
+    `    environment  ${body.environment?.id} (${body.environment?.kind})\n`,
+  );
+  return body;
+}
+
+const first = await signUp("first authentication ");
+const second = await signUp("second authentication");
+
+console.log(
+  first.organisation?.id === second.organisation?.id
+    ? "same organisation both times — one identity, one workspace (FR-TEN-01/02)"
+    : "DIFFERENT organisations — signup is not idempotent, which is a bug",
+);
+
+// And the state binding, refused: the value is real, the cookie is not sent.
+const start = await fetch(`${API}/auth/github/start`, { redirect: "manual" });
+const stolen = new URL(start.headers.get("location")).searchParams.get("state");
+const forged = await fetch(
+  `${API}/auth/github/callback?code=walk-code&state=${stolen}`,
+);
+console.log(
+  `\nsame state, no cookie: ${forged.status} — the binding is what makes state work`,
+);
+
+provider.close();
+process.exit(0);
+```
+
+```text
+stand-in provider on 4199, account walk-1786186996322
+
+first authentication  → GET /auth/github/start
+    302 redirect to http://127.0.0.1:4199/authorize?client_id=walk&redirect_uri=…
+    cookie: relay_oauth_state (HttpOnly, SameSite=Lax)
+first authentication  → GET /auth/github/callback
+    200 created=true
+    organisation 63de1195-4f28-4c46-a3bd-85ebcb6f8869
+    application  2eb17d73-72f0-4fb6-bf5c-dcb9808abcab
+    environment  dbd313f4-5818-480d-bf5a-b5a79cf25cdc (development)
+
+second authentication → GET /auth/github/start
+    302 redirect to http://127.0.0.1:4199/authorize?client_id=walk&redirect_uri=…
+    cookie: relay_oauth_state (HttpOnly, SameSite=Lax)
+second authentication → GET /auth/github/callback
+    200 created=false
+    organisation 63de1195-4f28-4c46-a3bd-85ebcb6f8869
+    application  2eb17d73-72f0-4fb6-bf5c-dcb9808abcab
+    environment  dbd313f4-5818-480d-bf5a-b5a79cf25cdc (development)
+
+same organisation both times — one identity, one workspace (FR-TEN-01/02)
+
+same state, no cookie: 400 — the binding is what makes state work
+```
+
+Đọc hai giá trị `created` cùng nhau. Một authentication build một tenant;
+authentication thứ hai không build gì và trả lại cùng ba ids. Và dòng cuối là
+trap phía trên bị refuse: một real state value không có cookie phía sau thì
+không đáng gì.
+
+<ForwardRef part="Phần 3 và xa hơn" locale="vi">
+
+Environment chương này tạo ra có `signing_secret` và chưa có API key, chính là
+mở đầu của 3.2: keys có prefix và hash, user tokens, dev-token endpoint
+(FR-AUT-09), và việc retire cả hai dev-mode seams. Outbox (3.3) sẽ làm mọi
+committed write publish một event, đóng REST-fan-out gap mà 2.6 đã gọi tên.
+Quotas (3.6) được count per application, đó là lý do level này tồn tại. Và 3.7
+attack trực tiếp boundary của chương này: cross-tenant gauntlet trên mọi
+endpoint, cộng second-external-developer test. Xa hơn nữa, FR-DSH-01 muốn một
+development API key trên màn hình đầu tiên sau signup — việc đó cần key của 3.2
+và dashboard của Phần 5, và chương này là thứ khiến có một "first screen after
+signup" để nói tới.
+
+</ForwardRef>
+
+## Đến lượt bạn
+
+Exercise là build. Sau đó để boundary tự chứng minh:
+
+1. Thử cho một application environment thứ ba, trực tiếp từ `psql`. Nhìn
+   database refuse nó, và chú ý rằng không có application code nào tham gia vào
+   refusal đó.
+2. Thêm `environment_id` vào `humans` như nullable column và chạy lại isolation
+   tests. Chúng pass — đó là điểm của TRAP. Rồi viết ra guarantee nào bạn vừa
+   chuyển từ schema vào trí nhớ của ai đó.
+3. Complete một signup, rồi hand-craft callback thứ hai dùng cùng `state` từ
+   một terminal khác không có cookie. 400, trước mọi network call: confirm bằng
+   logs của api rằng provider chưa từng được contact.
+4. Sign up hai lần với hai provider accounts khác nhau và confirm mỗi account
+   có organisation, application và environment riêng — rồi thử đọc channel của
+   tenant A bằng environment header của tenant B và nhận empty answer mà
+   FR-TEN-05 yêu cầu.
+
+Nếu bạn mắc kẹt, tag giữ answer key: `part3-ch1`.
+
+## Takeaways
+
+- **Ba containers, mỗi cái có một job**: organisation là billing và ownership,
+  application là product, và environment là tenant — level duy nhất nơi
+  isolation là một column (FR-TEN-03/04).
+- **Hai populations, không bao giờ merged** (ADR-18): single table rẻ hơn cần
+  nullable tenant column, và chính column đó biến structural guarantee thành
+  review comment.
+- **Unique index có thể là requirement**: `UNIQUE (application_id, kind)` với
+  CHECK hai values *chính là* FR-TEN-04, và không gì race qua nó được.
+- **Generated migrations phải được đọc**: `ADD COLUMN … NOT NULL` không thể
+  apply vào populated table, và generator không có cách nào biết existing rows
+  nên giữ gì.
+- **`state` cần cookie, không phải signature**: value server mint chứng minh
+  server đã mint nó, không chứng minh browser này đã yêu cầu nó.
+- **Signing up cho bạn workspace của riêng bạn**: idempotency keyed trên owned
+  organisation được define cho mọi case, bao gồm case invitations sẽ làm
+  reachable.
+
+<Checkpoint locale="vi">
+
+Trước khi bắt đầu chapter 3.2, bạn nên có: ba tenancy tables và stub
+`applications` đã biến mất; `UNIQUE (application_id, kind)` refuse environment
+thứ ba; signup provision organisation, application, `development` environment
+và một membership `owner` trong một transaction, idempotent per identity; state
+binding refuse cookie-less callback trước mọi provider call; ADR-18 đã record;
+và cả hai lanes green ở 86 unit và 60 integration tests. State đó là tag
+`part3-ch1`. Chapter 3.2 rút các dev-mode seams ra khỏi tất cả những thứ này và
+thay bằng credentials có ý nghĩa.
+
+</Checkpoint>
+
+<ChapterFooter id="3.1" locale="vi" />
