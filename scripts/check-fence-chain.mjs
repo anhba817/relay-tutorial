@@ -20,6 +20,14 @@
 //                 with the same title in the same chapter (docs/07 §2).
 //                 Chapters not yet translated are simply skipped.
 //
+// A fourth kind of fence exists outside the chapters entirely. Some changes to
+// fenced files are made by work that publishes no chapter — tooling, CI, a
+// dependency the series does not teach. Putting those into the last chapter that
+// happened to fence the file would make that chapter show a reader code it never
+// discusses. They live in `fences/post-series.md` instead, are applied AFTER the
+// last chapter, and are checked exactly as strictly. The chain stays byte-exact;
+// no chapter is made to lie.
+//
 // Usage: node scripts/check-fence-chain.mjs [--verbose]
 
 import { readdirSync, readFileSync, existsSync, statSync } from "node:fs";
@@ -195,6 +203,36 @@ if (!existsSync(PLATFORM)) {
 
 const en = replay("en", problems);
 
+// POST-SERIES: amendments no chapter teaches, applied after the last chapter.
+const POST_SERIES = join(APP_ROOT, "fences", "post-series.md");
+if (existsSync(POST_SERIES)) {
+  for (const f of fencesIn(POST_SERIES)) {
+    const where = `fences/post-series.md:${f.line}`;
+    if (NOT_A_FILE(f.title)) continue;
+    if (f.lang !== "diff") {
+      problems.push({
+        kind: "APPLY",
+        where,
+        detail: `${f.title} must be a diff — a post-series fence amends, it never restates`,
+      });
+      continue;
+    }
+    if (!en.state.has(f.title)) {
+      problems.push({
+        kind: "APPLY",
+        where,
+        detail: `${f.title} is amended here but no chapter ever showed it`,
+      });
+      continue;
+    }
+    const next = applyHunks(en.state.get(f.title), f.body, where, problems);
+    if (next) {
+      en.state.set(f.title, next);
+      en.source.set(f.title, where);
+    }
+  }
+}
+
 // HEAD: the chain's end state must be the repository, byte for byte.
 for (const [title, final] of en.state) {
   const disk = fileLines(title);
@@ -274,7 +312,8 @@ const translated = [...vi.perChapter.keys()].length;
 console.log(
   `check-fence-chain: ${en.state.size} fenced files replay onto relay-platform ` +
     `across ${en.perChapter.size} chapters (${translated} translated, fences mirrored` +
-    `${en.deleted.size ? `, ${en.deleted.size} retired` : ""})`,
+    `${en.deleted.size ? `, ${en.deleted.size} retired` : ""}` +
+    `${existsSync(POST_SERIES) ? ", plus post-series amendments" : ""})`,
 );
 if (VERBOSE) {
   for (const [title, where] of [...en.source].sort()) {
