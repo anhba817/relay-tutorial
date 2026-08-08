@@ -1,0 +1,1937 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figTheGap, figOutbox, figTwoGuarantees } from "./figures";
+
+export const metadata = {
+  title: "The outbox — Building Relay",
+  description:
+    "Every state change owes the outside world an event, and the obvious way to send one loses events in a window nobody can see. This chapter reproduces that loss with a real SIGKILL, then commits the event with the message so it cannot happen.",
+  alternates: {
+    canonical: "/part-3/chapter-03/the-outbox",
+    languages: {
+      en: "/part-3/chapter-03/the-outbox",
+      vi: "/vi/part-3/chapter-03/the-outbox",
+    },
+  },
+};
+
+<ChapterHeader id="3.3" />
+
+The platform can now tell who is asking (3.2) and which tenant they belong to
+(3.1). What it cannot do is tell anyone else that something happened.
+
+Webhooks need that. So does analytics, and the live dashboard, and — least
+forgivingly — metering, which FR-ANL-06 requires to agree with operational data
+to within 0.1%. All of them are consumers of one thing the platform does not
+yet produce: **an event per state change**.
+
+The obvious way to produce one is two lines long, and it is wrong. Not
+subtly-wrong, not wrong-at-scale — wrong in a way that loses data silently, on a
+good day, on a healthy machine. This chapter starts by making it lose an event
+in front of you.
+
+<SkipAhead>
+
+If you must skip: an `outbox` table joins the schema — quoted from SAD §6.1 for
+once rather than derived — with a partial index over unpublished rows. The event
+row is written inside the transaction that writes the message, on the inserted
+branch only, so a recognised idempotent retry produces no second event. A relay
+inside the api drains it with `SELECT … FOR UPDATE SKIP LOCKED`, publishes to
+JetStream, and marks rows published *after* the broker acknowledges — which
+makes delivery at-least-once, permanently and deliberately. Ordering is **not**
+guaranteed; `data.seq` is what orders messages. The chapter-end state is tag
+**`part3-ch3`**.
+
+</SkipAhead>
+
+## The two-line version, and the window inside it
+
+Here is the whole bug, written the way anyone would write it first:
+
+```ts title="the naive version (excerpt)"
+const message = await repo.sendMessage(channelId, body);   // commits
+await publisher.publish(eventFor(message));                // then publishes
+```
+
+Nothing about those two lines is careless. They run in the right order — commit
+first, so no event describes a message that rolled back. There is error handling
+around them in any real codebase. They work.
+
+They work *almost* always, which is the problem.
+
+<Figure
+  caption="The dual-write problem. Between the commit and the publish there is a window in which the message exists and the event does not — and a process that dies there leaves nothing behind to say an event was ever owed."
+  code={figTheGap}
+/>
+
+Run the chapter's walk in that mode and kill it in the gap. This is not a
+thought experiment: the script prints a marker between the commit and the
+publish, and a parent process sends it `SIGKILL` the moment it appears.
+
+```console
+$ naive, killed in the gap
+environment                0e9d99cb-e8a2-46f5-9e53-3a2729e8ed38
+mode                       naive
+messages committed         1
+outbox rows                0
+MARKER kill-me-now
+  [process killed with SIGKILL at the marker]
+```
+
+Now look at what is in the database:
+
+```text
+naive  env 0e9d99cb: messages=1 outbox=0
+```
+
+One message. No event. **And no error anywhere** — no exception was thrown, no
+retry queue has an entry, no log line says anything is wrong. The customer's
+webhook will never fire for that message. The meter will be off by one, forever,
+and FR-ANL-06's daily reconciliation will raise an alert that nobody can explain
+because there is nothing left to explain it with.
+
+That is what makes this failure different from the ones Part 2 dealt with. A
+dropped WebSocket frame is recoverable — chapter 2.7 recovers it from Postgres,
+because Postgres still knows. Here Postgres does not know either. The evidence
+died with the process.
+
+<Why source="ADR-06 · FR-ANL-06 · NFR-REL-02">
+
+**Why not just publish first, then commit?**
+
+Because it fails in the other direction, and the other direction is worse.
+
+Publish-before-commit turns lost events into **phantom** events: the broker
+carries `message.created` for a message whose transaction then rolled back. A
+webhook fires for a message that does not exist. A customer's system creates a
+record for it. Support gets a ticket about a message nobody can find.
+
+Losing an event is an internal problem — bad, quiet, ours. Inventing one is a
+lie told *outward*, to a customer's system, which will then be wrong in ways we
+cannot see or fix. Given a choice between the two failure modes, the industry
+picked the internal one, and ADR-06 records that choice.
+
+The third option is to stop choosing. That is what the outbox does.
+
+</Why>
+
+## What the fourth option costs
+
+ADR-06 weighed four designs, and it is worth seeing the one that was rejected on
+*operational* grounds rather than on correctness, because that is the kind of
+rejection this series is trying to teach.
+
+**Change-data-capture** — tail Postgres's write-ahead log with something like
+Debezium and derive events from it — is architecturally the most correct answer
+available. The WAL is *already* a transactional event log; deriving events from
+it means the event and the state change cannot possibly disagree, because they
+are the same bytes.
+
+It was rejected anyway. Debezium means running Kafka Connect or an equivalent,
+mapping schema to events in configuration, and coupling to a WAL format that is
+not a public API. That is an operational subsystem larger than the problem it
+solves, run by one person (driver D8).
+
+The outbox is about fifty lines: an `INSERT` inside a transaction, and a loop
+that does `SELECT … FOR UPDATE SKIP LOCKED`, publishes, and marks. That
+asymmetry — fifty lines against a subsystem — is the whole argument, and ADR-06
+names the volume at which it stops holding (~50k events/s, at which point the
+team is large enough to run Debezium).
+
+## The table, quoted rather than invented
+
+For the first time in Part 3, the schema is not a derivation. SAD §6.1 defines
+this table outright, so the chapter can quote it:
+
+```diff title="services/api/src/db/schema.ts"
+@@ -1,5 +1,6 @@
+ import { sql } from "drizzle-orm";
+ import {
++  bigserial,
+   bigint,
+   check,
+   index,
+@@ -20,9 +21,9 @@ import {
+ // definitions, and the generated SQL is reviewed against §6.1 before the
+ // runner applies it. The four tenant-bearing tables reproduce §6.1
+ // column-for-column, constraints and DR citations included. Deliberately
+-// absent, with named arrivals: message_edits (edit chapter), outbox
+-// (ADR-06's chapter), emoji/media tables (their parts), messages
+-// partitioning (SAD growth note -> retention chapter).
++// absent, with named arrivals: message_edits (edit chapter), emoji/media
++// tables (their parts), messages partitioning (SAD growth note -> retention
++// chapter). The outbox arrived in 3.3 and is at the bottom of this file.
+ 
+ // The tenancy hierarchy (chapter 3.1). Everything from here to `members`
+ // below sits ABOVE the environment boundary: these rows say who owns a
+@@ -281,3 +282,46 @@ export const members = pgTable(
+     index("members_user_channel").on(t.userId, t.channelId),
+   ],
+ );
++
++// The outbox (chapter 3.3, ADR-06). For the first time in Part 3 this table is
++// QUOTED rather than derived: SAD §6.1 defines it column-for-column, so nothing
++// about its shape is a chapter invention.
++//
++// Three absences are deliberate and worth knowing about.
++//
++// No environment_id. Every other table below the tenant boundary carries one
++// (FR-TEN-06); this one does not, because an outbox row is not tenant data — it
++// is work the platform owes itself. The environment travels inside `subject`
++// and `payload`, so a consumer can filter, but nothing reads this table on a
++// tenant's behalf. Same family of exception as 3.2's unscoped key lookup, and
++// recorded for the same reason.
++//
++// No status column. `published_at IS NULL` is the queue: a row is pending or it
++// is done, and there is no third state to get stuck in.
++//
++// No attempts or last_error. Retry accounting belongs to webhook delivery
++// (FR-WHK-03/06, chapter 3.5). This relay retries by not marking a row done.
++export const outbox = pgTable(
++  "outbox",
++  {
++    id: bigserial("id", { mode: "number" }).primaryKey(),
++    subject: text("subject").notNull(),
++    payload: jsonb("payload").notNull(),
++    createdAt: timestamp("created_at", { withTimezone: true })
++      .notNull()
++      .defaultNow(),
++    publishedAt: timestamp("published_at", { withTimezone: true }),
++  },
++  (t) => [
++    // DECISION (chapter 3.3): SAD §6.1 defines this table but no index for it.
++    // The relay's only query is "the oldest rows with published_at IS NULL",
++    // and without an index that degrades into a full scan over a table which is
++    // 99.9% published rows. The predicate is PARTIAL on purpose: the index
++    // covers only what the relay reads, so published rows cost nothing to keep
++    // and pruning stays optional rather than urgent (ADR-06 calls pruning
++    // trivial; it still needs a scheduler this platform does not have).
++    index("outbox_unpublished")
++      .on(t.createdAt)
++      .where(sql`${t.publishedAt} IS NULL`),
++  ],
++);
+```
+
+Three absences are worth naming, because each one is a thing you might expect.
+
+<Why source="FR-TEN-06 · constitution I · ADR-18">
+
+**Why does this table have no `environment_id`, when every other table below the
+boundary must?**
+
+Because an outbox row is not tenant data. It is work the platform owes itself.
+
+The rule it appears to break is a real one: FR-TEN-06 puts an `environment_id`
+on every row below the tenant boundary, the repository constructor refuses to
+exist without one, and chapter 2.1's isolation suite attacks that column and
+nothing else. An exception to that rule is not something to make quietly.
+
+But look at who reads this table. Not a request, not a tenant, not any code path
+a customer can reach — only the relay, which drains every environment's events
+because it is the platform's own bookkeeping. Scoping it would mean either one
+relay per environment (a loop per tenant, which is absurd at the second tenant)
+or a scoped query that immediately unscopes itself, which is a rule observed in
+letter and broken in spirit.
+
+The environment still travels — in the subject and in the payload — so consumers
+filter on it and a foreign event is addressable to exactly one tenant. What is
+gone is the *illusion* that this table is scoped.
+
+This is the second such exception in Part 3, after 3.2's key lookup, and both
+are written down in the schema next to the column that is missing. An
+unexplained exception to an isolation rule is how isolation rules erode: the
+next person sees a table without the column, concludes the rule is advisory, and
+leaves it off one that needed it.
+
+</Why>
+
+**No status column.** `published_at IS NULL` *is* the queue. A row is pending or
+it is done; there is no third state for a row to get stuck in, and no enum to
+add a fourth value to next year.
+
+**No attempts counter, no last error, no dead-letter table.** That is retry
+accounting, it belongs to webhook delivery (FR-WHK-03, FR-WHK-06), and it is
+chapter 3.5's. This relay retries by *not marking a row done*, which needs no
+column at all.
+
+The one thing §6.1 does not define is an index, so that part is a chapter
+decision and says so in the schema. It is partial — it covers only rows the
+relay reads — which is what makes keeping published rows around cost nothing.
+
+```sql title="services/api/migrations/0004_outbox.sql"
+-- Chapter 3.3 — the transactional outbox (ADR-06).
+--
+-- REVIEW DISPOSITION: drizzle-kit generated this file from schema.ts and it was
+-- read line by line before being applied (the ADR-16 workflow). Nothing was
+-- rewritten, and this time there is a stronger reason than "no existing rows":
+-- SAD §6.1 DEFINES this table, so the generated SQL was compared against the
+-- document rather than only against the TypeScript. It matches column for
+-- column — id BIGSERIAL PRIMARY KEY, subject TEXT NOT NULL, payload JSONB NOT
+-- NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), published_at TIMESTAMPTZ.
+--
+-- The INDEX is the one thing §6.1 does not define, and it is a chapter
+-- derivation (see the DECISION in schema.ts). It is PARTIAL: it covers only
+-- rows the relay actually reads — `published_at IS NULL` — so a table that is
+-- almost entirely published rows costs almost nothing to index, and pruning
+-- stays an option rather than an obligation.
+--
+-- Deliberately absent: any status enum, attempts counter or last_error column.
+-- `published_at IS NULL` is the whole queue, and retry accounting belongs to
+-- webhook delivery in chapter 3.5.
+
+CREATE TABLE "outbox" (
+	"id" bigserial PRIMARY KEY NOT NULL,
+	"subject" text NOT NULL,
+	"payload" jsonb NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"published_at" timestamp with time zone
+);
+--> statement-breakpoint
+CREATE INDEX "outbox_unpublished" ON "outbox" USING btree ("created_at") WHERE "outbox"."published_at" IS NULL;
+```
+
+## The event commits with the message
+
+Here is the change that fixes the bug. It is one `INSERT`, and its entire power
+comes from which side of a `COMMIT` it sits on.
+
+```diff title="services/api/src/db/repository.ts"
+@@ -13,8 +13,10 @@ import {
+   memberships,
+   messages,
+   organisations,
++  outbox,
+   users,
+ } from "./schema";
++import { messageCreatedEvent } from "../outbox/event";
+ import {
+   mintApiKey,
+   parseApiKeyCredential,
+@@ -218,6 +220,87 @@ export async function environmentSigningSecret(
+   return row ?? null;
+ }
+ 
++// ---------------------------------------------------------------------------
++// The outbox drain (chapter 3.3, ADR-06). Part of the ADMIN surface for the
++// same reason the credential lookup is: it runs on behalf of the platform
++// rather than of a tenant, and it is deliberately NOT scoped by environment —
++// one relay drains every environment's events, because an outbox row is work
++// the platform owes itself.
++//
++// The SQL lives here rather than in the relay module because the query engine
++// lives inside this layer and nowhere else (constitution I, ADR-16). The relay
++// supplies WHAT to do with a row; this supplies HOW rows are claimed and
++// retired.
++// ---------------------------------------------------------------------------
++
++export interface OutboxRow {
++  id: number;
++  subject: string;
++  payload: unknown;
++}
++
++/** Claim up to `limit` unpublished rows, hand each to `publish`, and mark the
++ * ones that succeeded — all inside ONE transaction.
++ *
++ * `FOR UPDATE SKIP LOCKED` is what makes a second relay safe: competing
++ * drainers skip each other's claimed rows instead of blocking on them, so
++ * horizontal scaling is a property of this query rather than of a coordination
++ * mechanism nobody wants to operate (ADR-06).
++ *
++ * PUBLISH THEN MARK, never the reverse. A crash between the two republishes on
++ * restart, which is at-least-once and is the accepted cost. Marking first would
++ * make it at-most-once and reintroduce exactly the loss this chapter removes
++ * (research R3).
++ *
++ * A publisher that throws aborts the batch: rows already published in this
++ * batch are marked, the failing row and everything after it stay pending, and
++ * the next pass tries again from there.
++ */
++export async function drainOutbox(
++  db: Db,
++  limit: number,
++  publish: (row: OutboxRow) => Promise<void>,
++): Promise<number> {
++  return db.transaction(async (tx) => {
++    const claimed = (await tx.execute(
++      sql`SELECT id, subject, payload
++            FROM outbox
++           WHERE published_at IS NULL
++           ORDER BY created_at, id
++           LIMIT ${limit}
++             FOR UPDATE SKIP LOCKED`,
++    )) as unknown as { rows: OutboxRow[] };
++
++    const published: number[] = [];
++    try {
++      for (const row of claimed.rows) {
++        await publish(row);
++        published.push(row.id);
++      }
++    } finally {
++      // In the `finally` on purpose: whatever went wrong with row N+1, rows 1..N
++      // really did reach the broker and must not be sent a second time by this
++      // instance's next pass.
++      if (published.length > 0) {
++        await tx.execute(
++          sql`UPDATE outbox SET published_at = now()
++               WHERE id = ANY(${sql.raw(`ARRAY[${published.join(",")}]::bigint[]`)})`,
++        );
++      }
++    }
++    return published.length;
++  });
++}
++
++/** How far behind the relay is. The single number worth alarming on later, and
++ * the one the chapter shows going up while the broker is down. */
++export async function outboxDepth(db: Db): Promise<number> {
++  const result = (await db.execute(
++    sql`SELECT count(*)::int AS pending FROM outbox WHERE published_at IS NULL`,
++  )) as unknown as { rows: { pending: number }[] };
++  return result.rows[0]?.pending ?? 0;
++}
++
+ /** What a signup produced — or found. `created` answers "was an organisation
+  * created on this call?", NOT "was the identity new": a known human who owned
+  * nothing gets `created: true`, because one really was created for them. */
+@@ -599,11 +682,18 @@ export class Repository {
+     channelId: string,
+     {
+       userId,
++      userExternalId,
+       text,
+       metadata,
+       idempotencyKey,
+     }: {
+       userId?: string;
++      /** Chapter 3.3: the sender as a CONSUMER will see them. Threaded from the
++       * caller rather than looked up here — the internal route already holds it
++       * (it is the token's subject), and an extra SELECT inside the write
++       * transaction is a cost every message would pay forever. Absent on the
++       * public REST route, where a key-authenticated send is unattributed. */
++      userExternalId?: string;
+       text: string;
+       metadata?: unknown;
+       idempotencyKey?: string;
+@@ -669,12 +759,46 @@ export class Repository {
+         .set({ lastSequence: seq })
+         .where(eq(channels.id, channel.id));
+ 
++      const createdAt = toIso(inserted[0]!.createdAt);
++
++      // THE EVENT COMMITS WITH THE MESSAGE (chapter 3.3, ADR-06).
++      //
++      // This insert is inside the transaction that already guards the write, so
++      // the two share a fate: no message without its event, no event without
++      // its message. Publishing after the commit instead would leave a gap —
++      // crash in it and the message exists while the event never did, silently,
++      // with nothing to reconcile against.
++      //
++      // It sits on the INSERTED branch only. A recognised idempotent retry
++      // returned above without writing anything and must consume no event
++      // either, or a client retrying on a flaky link fires a second webhook for
++      // one message (FR-MSG-04, research R1).
++      //
++      // The envelope is built complete here and never touched again: the relay
++      // moves bytes, it does not author them (ADR-04).
++      const event = messageCreatedEvent({
++        eventId: randomUUID(),
++        environmentId: this.environmentId,
++        message: {
++          id,
++          channel_id: channel.id,
++          seq,
++          user: userExternalId ?? null,
++          text,
++          created_at: createdAt,
++        },
++      });
++      await tx.insert(outbox).values({
++        subject: event.subject,
++        payload: event.payload,
++      });
++
+       return {
+         id,
+         channel_id: channel.id,
+         seq,
+         text,
+-        created_at: toIso(inserted[0]!.createdAt),
++        created_at: createdAt,
+       };
+     });
+   }
+```
+
+Two details in there matter more than they look.
+
+**It is on the inserted branch only.** Chapter 2.3 taught the write path to
+recognise a retry: present the same idempotency key and you get the original
+message back, and the sequence is not consumed because nothing was written. An
+event written on that branch would mean a client retrying on a flaky link fires
+*two* webhooks for one message — the exact duplicate 2.3 exists to prevent,
+reintroduced one layer up. There is a test for it, and it is the invariant I
+would keep if I could keep only one.
+
+**The envelope is built complete, inside the transaction.** The relay adds
+nothing later: not a timestamp, not an id, not a field. That is not tidiness —
+it is what makes a republished event byte-identical to its first attempt, which
+is what makes deduplication work at all.
+
+```ts title="services/api/src/outbox/event.ts"
+// The event envelope (chapter 3.3). Built in ONE place, complete, inside the
+// transaction that caused it — so the relay is a mover of bytes and never an
+// author of them (ADR-04, research R7).
+//
+// Nothing in this file reads the clock or generates an id. Both arrive from the
+// caller, which is what makes a republished event byte-identical to its first
+// attempt: the deduplication key a consumer sees after a crash is the same key
+// it would have seen without one.
+
+/** A message as the PUBLIC api returns it. Consumers are customers: they get
+ * external ids and the field names the REST surface uses. `user_id` does not
+ * cross this boundary. */
+export interface MessageCreatedData {
+  id: string;
+  channel_id: string;
+  seq: number;
+  user: string | null;
+  text: string | null;
+  created_at: string;
+}
+
+export interface OutboxEvent {
+  /** UUID, generated in the transaction. The consumer's deduplication key. */
+  id: string;
+  /** FR-WHK-02's name for this event, spelled as that requirement spells it. */
+  type: "message.created";
+  environment_id: string;
+  /** When the state change happened — the message's own timestamp, not the
+   * moment this object was constructed. */
+  occurred_at: string;
+  data: MessageCreatedData;
+}
+
+export interface PendingEvent {
+  subject: string;
+  payload: OutboxEvent;
+}
+
+/** `events.msg.created.{environment_id}` — the shape SAD §6.1's own comment
+ * gives. The full subject taxonomy for FR-WHK-02's other seven types, and any
+ * per-environment sharding, belongs to chapter 3.4. */
+export function subjectFor(type: string, environmentId: string): string {
+  const leaf = type.replace(/^message\./, "msg.");
+  return `events.${leaf}.${environmentId}`;
+}
+
+export function messageCreatedEvent({
+  eventId,
+  environmentId,
+  message,
+}: {
+  eventId: string;
+  environmentId: string;
+  message: MessageCreatedData;
+}): PendingEvent {
+  // Refused rather than defaulted. An event with no deduplication key looks
+  // deliverable and cannot be deduplicated, which is worse than no event.
+  if (!eventId) throw new Error("an event id is required");
+  if (!environmentId) throw new Error("an environment id is required");
+
+  return {
+    subject: subjectFor("message.created", environmentId),
+    payload: {
+      id: eventId,
+      type: "message.created",
+      environment_id: environmentId,
+      occurred_at: message.created_at,
+      data: message,
+    },
+  };
+}
+```
+
+<Figure
+  caption="The outbox. The event commits with the message, so the two share a fate; a separate relay moves rows to the broker and marks them only after the broker has acknowledged."
+  code={figOutbox}
+/>
+
+Now the same kill, in the same place, with this version:
+
+```console
+$ outbox, killed in the gap
+environment                c0f83026-0e9b-4094-92e4-90ad5c7a7faf
+mode                       outbox
+messages committed         1
+outbox rows waiting        1
+MARKER kill-me-now
+  [process killed with SIGKILL at the marker]
+```
+
+```text
+outbox env c0f83026: messages=1 outbox=1 unpublished=1
+```
+
+The event survived the process that was going to publish it. Nothing is lost,
+nothing needs an operator, and the next relay to run will send it.
+
+<Trap>
+
+I wrote that test with a thrown exception first — simulate the crash, assert the
+event survives. It passed immediately, and it proved nothing.
+
+An exception runs your error path. `finally` blocks run. Connection pools drain.
+Transactions roll back *cleanly*, which is precisely the behaviour under test
+and precisely what a real crash does not do. A test that simulates a crash by
+throwing is testing the code's manners, not its durability.
+
+So the crash is a real one: a child process, and `SIGKILL` from the parent the
+moment the child says it is in the gap.
+
+```ts title="services/api/src/outbox/outbox.itest.ts (excerpt)"
+child.stdout.on("data", (chunk: Buffer) => {
+  out += chunk.toString();
+  if (!killed && out.includes("MARKER kill-me-now")) {
+    killed = true;
+    child.kill("SIGKILL");
+  }
+});
+```
+
+`SIGKILL` and not `process.exit()`, for the same reason: a process that exits
+cooperatively gets to flush, and flushing is the thing being disproved.
+
+</Trap>
+
+## The relay, and the ordering that matters
+
+The loop is smaller than the argument for it:
+
+```ts title="services/api/src/outbox/relay.ts"
+import type { Logger } from "@relay/service-kit";
+
+import type { Db } from "../db/client";
+import { drainOutbox } from "../db/repository";
+import { publishPending, type Publisher } from "./publisher";
+
+// The relay (chapter 3.3, ADR-06): the loop that moves committed events to the
+// broker. It owns no state of its own — its entire progress is visible in the
+// table it drains, which is what makes "promotable to its own deployment" true
+// rather than aspirational.
+//
+// It is NOT on the request path. A write commits its event and returns; whether
+// the broker is reachable is this loop's problem and nobody else's (research
+// R9). That inversion is the whole point of an outbox.
+
+/** Rows per pass. Small enough that a failing publisher costs one short
+ * transaction rather than a long one; large enough that a backlog drains in
+ * sensible steps. A batch is a transaction, and long transactions hold locks. */
+const BATCH_SIZE = 100;
+
+/** Wake-ups per second when idle. FR-ANL-04 allows 60 seconds for an event to
+ * become queryable and this budget has two orders of magnitude of headroom, so
+ * the interval is chosen for tidiness rather than for latency: a poll every
+ * 200ms is invisible to Postgres and keeps the demonstration snappy. If this
+ * ever needs to be lower, `LISTEN`/`NOTIFY` is the answer — and the poll still
+ * has to exist underneath it as the correctness path (research R2). */
+const IDLE_INTERVAL_MS = 200;
+
+export interface Relay {
+  /** Runs until `stop()`. Never rejects: a broker that is down is an expected
+   * state, not a crash. */
+  start(): void;
+  stop(): Promise<void>;
+  /** One pass, for tests and for the walk script — the same code path `start`
+   * runs, so nothing is proven about a loop that only tests exercise. */
+  drainOnce(): Promise<number>;
+}
+
+export function createRelay({
+  db,
+  publisher,
+  logger,
+  batchSize = BATCH_SIZE,
+  intervalMs = IDLE_INTERVAL_MS,
+}: {
+  db: Db;
+  publisher: Publisher;
+  logger: Logger;
+  batchSize?: number;
+  intervalMs?: number;
+}): Relay {
+  let running = false;
+  let loop: Promise<void> = Promise.resolve();
+
+  async function drainOnce(): Promise<number> {
+    return drainOutbox(db, batchSize, async (row) => {
+      await publishPending(publisher, {
+        subject: row.subject,
+        payload: row.payload as { id: string },
+      });
+    });
+  }
+
+  async function run(): Promise<void> {
+    while (running) {
+      try {
+        const published = await drainOnce();
+        if (published > 0) {
+          // Counts and durations, never payloads. A message body in a log line
+          // is a tenant's data in an operator's terminal (NFR-SEC-06).
+          logger.log("info", "outbox.published", { count: published });
+          continue; // straight back for more; a backlog should not wait
+        }
+      } catch (error) {
+        // The broker being unreachable lands here, and it is not an error the
+        // relay can do anything about except try again. Rows stay pending,
+        // which is exactly the buffering SAD §7 promises.
+        logger.log("error", "outbox.drain_failed", { error: String(error) });
+      }
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    }
+  }
+
+  return {
+    start() {
+      if (running) return;
+      running = true;
+      loop = run();
+    },
+    async stop() {
+      running = false;
+      await loop;
+      await publisher.close();
+    },
+    drainOnce,
+  };
+}
+```
+
+`FOR UPDATE SKIP LOCKED` is the line to look at. Two api instances is the
+*ordinary* deployment — the service is stateless and runs more than once — so
+two relays draining one table is the normal case, not an edge case. `SKIP
+LOCKED` makes competing drainers step around each other's claimed rows instead
+of queueing behind them, which means horizontal scaling is a property of this
+query rather than of a leader election nobody wants to operate.
+
+The other line is the order of the last two steps: **publish, then mark**. Do it
+the other way and a crash between them loses the event again, which is the whole
+bug wearing a different hat. Doing it this way means a crash between them
+*republishes* — the row was never marked, so the next pass sends it a second
+time.
+
+That is at-least-once, and it is permanent. ADR-06's phrasing is worth adopting:
+embraced, not mitigated.
+
+## What at-least-once asks of everybody else
+
+A duplicate has to be absorbed somewhere, and "somewhere" is the consumer. Every
+event carries an `id` that survives republishing, and a consumer that ignores it
+is broken no matter how careful this relay is:
+
+```json title="the event envelope (excerpt)"
+{
+  "id": "8f14e45f-ceea-4f6a-9b2c-1d2e3f4a5b6c",
+  "type": "message.created",
+  "environment_id": "3f2a…",
+  "occurred_at": "2026-08-08T13:31:09.229Z",
+  "data": { "id": "…", "channel_id": "…", "seq": 1, "user": "tuan", "text": "…", "created_at": "…" }
+}
+```
+
+That id is generated in the transaction and stored in the row, so a republish
+sends the *same* key rather than a fresh one. It is also handed to JetStream as
+the message's deduplication id, which collapses the common case inside the
+broker's dedupe window — but that window is a convenience, not the guarantee.
+The guarantee is the field.
+
+**And now the thing most likely to hurt you later: this chapter does not promise
+event ordering.** Two relays publishing concurrently can interleave. A batch
+that fails partway republishes from an earlier point. Nothing in the SRS asks
+for ordered events, and building an ordering guarantee into a `SKIP LOCKED`
+drain would mean giving up the property that makes it scale.
+
+What *is* ordered is messages within a channel, by `data.seq`, exactly as
+FR-MSG-03 and ADR-03 have promised since chapter 2.2. A consumer that needs
+order should read that field. A consumer that infers order from arrival will be
+wrong eventually, and the day it is wrong will not look like a bug in the
+consumer.
+
+## Why there are two paths now
+
+Chapter 2.6 already built a way to tell other machines that a message happened:
+Redis pub/sub, one subject per channel. It would be reasonable to ask why this
+chapter does not just use it.
+
+<Figure
+  caption="Two delivery paths, deliberately. Live frames are at-most-once because a resume can recover them; durable events are at-least-once because nothing else can."
+  code={figTwoGuarantees}
+/>
+
+They answer different questions. Redis pub/sub is **at-most-once** by design
+(ADR-07): if no gateway is subscribed to a channel at the instant of publish, the
+frame is gone, and that is fine — the client reconnects, presents a cursor, and
+chapter 2.7's backfill hands it everything it missed from Postgres. The cost of
+a dropped live frame is bounded by a resume.
+
+An event has no resume. If a `message.created` never reaches the webhook
+dispatcher, no customer system will notice a gap and ask for it; the webhook
+simply never fires and the meter is quietly wrong. So this path is
+**at-least-once**, durable, and slower — seconds rather than milliseconds, well
+inside FR-ANL-04's 60-second budget.
+
+Same event, two paths, two guarantees, because the consequences of loss are not
+the same on both.
+
+## The broker is not allowed to matter
+
+An event spine that takes the write path down with it is worse than no event
+spine. So the relay connects lazily, the api starts whether or not the broker is
+reachable, and a publish failure leaves rows exactly where they are.
+
+```ts title="services/api/src/outbox/jetstream.publisher.ts"
+import {
+  connect,
+  type JetStreamClient,
+  type NatsConnection,
+} from "nats";
+
+import type { Publisher, PublishedMessage } from "./publisher";
+
+// The one adapter that knows what a broker is (chapter 3.3, ADR-02).
+//
+// Everything upstream of this file speaks in subjects and payloads; swapping
+// JetStream for something else means writing another file like this one and
+// changing nothing that produces events. That is the reversibility ADR-06
+// claims for the outbox, expressed as a module boundary rather than a promise.
+
+export const DEFAULT_NATS_URL = "nats://localhost:4222";
+
+/** One stream over `events.>`, file-backed. This is the MINIMUM a publisher
+ * needs in order to be provable — publishing into a broker with no stream is
+ * fire-and-forget, and the chapter's claim would be false at the last hop.
+ *
+ * The real design of the subject space — FR-WHK-02's full event-type list,
+ * per-environment sharding, retention, replicas — belongs to chapter 3.4 along
+ * with every consumer. */
+const STREAM = "EVENTS";
+const SUBJECTS = ["events.>"];
+
+export function createJetStreamPublisher({
+  url = process.env.RELAY_NATS_URL ?? DEFAULT_NATS_URL,
+}: { url?: string } = {}): Publisher {
+  let connection: NatsConnection | null = null;
+  let js: JetStreamClient | null = null;
+
+  /** Connection is LAZY and re-attempted. The api must start and accept writes
+   * with the broker unreachable — a service that refuses to boot without its
+   * event spine has made the spine a dependency of the write path, which is the
+   * opposite of what an outbox is for (research R9). */
+  async function client(): Promise<JetStreamClient> {
+    if (js && connection && !connection.isClosed()) return js;
+    const nc = await connect({ servers: url });
+    const jsm = await nc.jetstreamManager();
+    // Created if absent, left alone if present: two api instances starting
+    // together must not fight over it.
+    const existing = await jsm.streams
+      .info(STREAM)
+      .then(() => true)
+      .catch(() => false);
+    if (!existing) {
+      await jsm.streams.add({ name: STREAM, subjects: [...SUBJECTS] });
+    }
+    connection = nc;
+    js = nc.jetstream();
+    return js;
+  }
+
+  return {
+    async publish({ subject, id, payload }: PublishedMessage): Promise<void> {
+      const stream = await client();
+      // `msgID` is the broker's deduplication key, and it is the ENVELOPE's id
+      // — so a republish after a crash is recognisable as the same event rather
+      // than as a second one. JetStream will collapse it inside its dedupe
+      // window; consumers must still deduplicate for the general case, which is
+      // why the id is in the payload too (ADR-06's system-wide discipline).
+      await stream.publish(subject, new TextEncoder().encode(JSON.stringify(payload)), {
+        msgID: id,
+      });
+    },
+    async close(): Promise<void> {
+      if (connection && !connection.isClosed()) {
+        await connection.drain();
+      }
+      connection = null;
+      js = null;
+    },
+  };
+}
+```
+
+SAD §7's failure matrix already claimed this behaviour — "broker down, events
+accumulate in Postgres, relay drains on recovery". Claims like that are worth
+running:
+
+```console
+$ docker compose stop nats
+$ node scripts/dual-write-walk.mjs --mode=outbox --messages=3
+messages committed         3
+outbox rows waiting        3
+$ psql -tAc "SELECT count(*) FROM outbox WHERE published_at IS NULL"
+3
+
+$ docker compose start nats
+$ node scripts/dual-write-walk.mjs --mode=outbox --messages=1
+events published           4
+outbox rows waiting        0
+```
+
+Three events waited out the outage; a fourth arrived after it; all four
+published without anyone doing anything. The number an operator watches is that
+`count(*)` — outbox depth — and it is the one signal worth alarming on when
+this becomes somebody's job to run.
+
+## What this chapter leaves for later, on purpose
+
+**The subject taxonomy, streams, and every consumer (3.4).** This chapter
+creates one stream over `events.>` because a publisher needs somewhere to
+publish and a relay pointing at nothing proves nothing. FR-WHK-02's other seven
+event types, per-environment sharding, retention, and the first durable pull
+consumer are the next chapter's, and designing them here would be designing them
+twice.
+
+**Webhook delivery, signing, retry tiers and dead-lettering (3.5).** The reason
+this table has no `attempts` column.
+
+**Pruning.** ADR-06 calls deleting published rows trivial, and it is — but it
+needs a scheduler this platform does not have, and inventing one to delete rows
+that currently cost nothing (the index is partial) would be work for its own
+sake.
+
+**FR-ANL-06's reconciliation job.** The question "how would anyone know if an
+event went missing?" now has an answer — compare message counts against event
+counts, both of which are in Postgres — but the job that asks it daily belongs
+with the analytics path in Part 4.
+
+<ForwardRef>The one event type that exists here, `message.created`, is the only
+one the platform can currently produce: it is the only public state change that
+has a route. The other seven arrive as their features do, and the envelope's
+shape — five fields, same every time — is what makes adding one additive rather
+than a redesign.</ForwardRef>
+
+## The tests, and what they hold
+
+Twelve invariants. Nine run against Postgres, two are pure, and one rides on the
+crash test:
+
+```console
+$ pnpm --filter @relay/api test:integration src/outbox/outbox.itest.ts
+✓ invariant 1: a committed message leaves exactly one outbox row
+✓ invariant 2: a rolled-back write leaves no outbox row
+✓ invariant 3: a recognised idempotent retry adds no second event
+✓ invariant 4: both doors produce one event each, identical in shape
+✓ invariant 7: the relay publishes pending rows, marks them, and does not republish
+✓ invariant 8: two concurrent relays publish every row exactly once
+✓ invariant 11: a relay log line carries counts, never payloads
+✓ invariant 6: publish-after-commit LOSES the event when the process dies in the gap
+✓ invariant 5: the outbox SURVIVES the same kill, and invariant 10's id survives with it
+✓ invariant 9: the broker can be absent — writes succeed, events accumulate, the backlog drains
+✓ a failing publisher leaves the row pending rather than losing it
+Tests  11 passed (11)
+```
+
+Invariant 6 is the unusual one: a test whose job is to prove the *broken*
+version is still broken. If the naive walk ever stops losing its event, this
+chapter's argument has quietly stopped being true, and I would rather find that
+out from a red test than from a reader.
+
+```ts title="services/api/src/outbox/outbox.itest.ts"
+import "reflect-metadata";
+
+import { spawn } from "node:child_process";
+import { join } from "node:path";
+
+import { createLogger, type Logger } from "@relay/service-kit";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+
+import { createDb, createPool, type Db } from "../db/client";
+import {
+  createEnvironment,
+  outboxDepth,
+  Repository,
+} from "../db/repository";
+import { createJetStreamPublisher } from "./jetstream.publisher";
+import { createRelay } from "./relay";
+import type { Publisher, PublishedMessage } from "./publisher";
+
+// The outbox, against the real database (chapter 3.3). Invariants 1-4, 7-8 and
+// 11 live here; the crash cases (5, 6, 10) and the broker outage (9) are added
+// below, because both need a process to kill or a container to stop.
+//
+// The relay is driven by hand — `drainOnce()`, the same code path the loop runs
+// — so these assertions are deterministic. The background loop is off in this
+// lane (RELAY_OUTBOX_RELAY=off); a loop marking rows published mid-assertion
+// would make every test here flaky for no teaching value.
+
+const silent: Logger = createLogger("outbox-itest", () => {});
+
+/** A destination that is not a broker. Same shape the port promises, so the
+ * relay cannot tell the difference — which is invariant 12, exercised here as a
+ * side effect of every other test. */
+function recordingPublisher(): Publisher & {
+  sent: PublishedMessage[];
+  failNext: (times: number) => void;
+} {
+  const sent: PublishedMessage[] = [];
+  let failures = 0;
+  return {
+    sent,
+    failNext(times: number) {
+      failures = times;
+    },
+    async publish(message) {
+      if (failures > 0) {
+        failures -= 1;
+        throw new Error("broker unreachable");
+      }
+      sent.push(message);
+    },
+    async close() {},
+  };
+}
+
+const unpublishedFor = async (db: Db, environmentId: string) => {
+  const rows = (await db.execute(
+    `SELECT id, subject, payload FROM outbox
+      WHERE published_at IS NULL
+        AND payload->>'environment_id' = '${environmentId}'
+      ORDER BY id`,
+  )) as unknown as { rows: { id: number; subject: string; payload: { id: string; data: { seq: number; user: string | null; text: string } } }[] };
+  return rows.rows;
+};
+
+describe("the outbox", () => {
+  let db: Db;
+  let env: { id: string };
+  let repo: Repository;
+  let channelId: string;
+  let tuan: { id: string };
+
+  beforeAll(async () => {
+    db = createDb(createPool());
+    env = await createEnvironment(db, { name: `outbox-itest-${Date.now()}` });
+    repo = new Repository(db, env.id);
+    tuan = await repo.createUser("tuan", "Tuan");
+    channelId = (await repo.createChannel("fleet", "public")).id;
+    await repo.addMember(channelId, tuan.id);
+  }, 60_000);
+
+  afterAll(async () => {
+    // Leave the table as we found it for this environment, so a rerun starts
+    // from zero rather than from the last run's backlog.
+    await db.execute(
+      `DELETE FROM outbox WHERE payload->>'environment_id' = '${env.id}'`,
+    );
+  });
+
+  it("invariant 1: a committed message leaves exactly one outbox row", async () => {
+    const before = await unpublishedFor(db, env.id);
+    const message = await repo.sendMessage(channelId, {
+      text: "B2, north ramp",
+      userId: tuan.id,
+      userExternalId: "tuan",
+    });
+    const after = await unpublishedFor(db, env.id);
+    expect(after.length).toBe(before.length + 1);
+
+    const row = after.at(-1)!;
+    expect(row.subject).toBe(`events.msg.created.${env.id}`);
+    expect(row.payload.data.seq).toBe(message.seq);
+    expect(row.payload.data.text).toBe("B2, north ramp");
+    expect(row.payload.data.user).toBe("tuan");
+  });
+
+  it("invariant 2: a rolled-back write leaves no outbox row", async () => {
+    const before = await unpublishedFor(db, env.id);
+    // The transaction fails AFTER the message and its event are written: the
+    // channel does not exist in this tenant, so sendMessage throws before it
+    // commits. Event and state change share a fate.
+    await expect(
+      repo.sendMessage("00000000-0000-0000-0000-000000000000", {
+        text: "never happened",
+        userId: tuan.id,
+        userExternalId: "tuan",
+      }),
+    ).rejects.toThrow();
+    expect((await unpublishedFor(db, env.id)).length).toBe(before.length);
+  });
+
+  it("invariant 3: a recognised idempotent retry adds no second event", async () => {
+    // 2.3's conflict path returns the ORIGINAL message and writes nothing. It
+    // must consume no event either — otherwise a client retrying on a flaky
+    // link fires two webhooks for one message (FR-MSG-04, research R1).
+    const before = await unpublishedFor(db, env.id);
+    const key = `retry-${Date.now()}`;
+    const first = await repo.sendMessage(channelId, {
+      text: "sent twice",
+      userId: tuan.id,
+      userExternalId: "tuan",
+      idempotencyKey: key,
+    });
+    const afterFirst = await unpublishedFor(db, env.id);
+    expect(afterFirst.length).toBe(before.length + 1);
+
+    const retry = await repo.sendMessage(channelId, {
+      text: "sent twice",
+      userId: tuan.id,
+      userExternalId: "tuan",
+      idempotencyKey: key,
+    });
+    expect(retry.duplicate).toBe(true);
+    expect(retry.seq).toBe(first.seq);
+    expect((await unpublishedFor(db, env.id)).length).toBe(afterFirst.length);
+  });
+
+  it("invariant 4: both doors produce one event each, identical in shape", async () => {
+    // The public REST route and the socket's internal route reach ONE write
+    // path (ADR-04), so this is true by construction — and the test exists to
+    // notice the day someone adds a second path.
+    const before = await unpublishedFor(db, env.id);
+    await repo.sendMessage(channelId, {
+      text: "through the socket",
+      userId: tuan.id,
+      userExternalId: "tuan",
+    });
+    // The key-authenticated public send is unattributed (3.2's recorded bound),
+    // which is a CONTENT difference, not a shape one.
+    await repo.sendMessage(channelId, { text: "through REST" });
+    const rows = (await unpublishedFor(db, env.id)).slice(before.length);
+    expect(rows.length).toBe(2);
+    const shapes = rows.map((r) => Object.keys(r.payload).sort().join(","));
+    expect(shapes[0]).toBe(shapes[1]);
+    expect(rows[0]!.payload.data.user).toBe("tuan");
+    expect(rows[1]!.payload.data.user).toBeNull();
+  });
+
+  it("invariant 7: the relay publishes pending rows, marks them, and does not republish", async () => {
+    const publisher = recordingPublisher();
+    const relay = createRelay({ db, publisher, logger: silent });
+
+    const pending = await unpublishedFor(db, env.id);
+    expect(pending.length).toBeGreaterThan(0);
+
+    const published = await drainUntilClear(relay, db, env.id);
+    expect(published).toBeGreaterThanOrEqual(pending.length);
+    expect((await unpublishedFor(db, env.id)).length).toBe(0);
+
+    // Every event this environment produced reached the destination with its
+    // own id as the deduplication key.
+    const ids = publisher.sent.map((m) => m.id);
+    expect(new Set(ids).size).toBe(ids.length);
+
+    // A second pass has nothing of OURS to do — marked rows are done.
+    //
+    // Asserted per environment, not on the global count: `drainOnce()` returns
+    // how many rows it moved across the whole table, and other suites in this
+    // lane are writing events the entire time. The row-level property being
+    // tested is "a marked row is never sent again", so that is what the
+    // assertion says.
+    const oursBefore = publisher.sent.filter((m) =>
+      m.subject.endsWith(env.id),
+    ).length;
+    await relay.drainOnce();
+    const oursAfter = publisher.sent.filter((m) =>
+      m.subject.endsWith(env.id),
+    ).length;
+    expect(oursAfter).toBe(oursBefore);
+    expect((await unpublishedFor(db, env.id)).length).toBe(0);
+  });
+
+  it("invariant 8: two concurrent relays publish every row exactly once", async () => {
+    // `FOR UPDATE SKIP LOCKED` is the whole mechanism: competing drainers skip
+    // each other's claimed rows rather than blocking on them. Two api instances
+    // is the ORDINARY deployment, not an edge case.
+    for (let i = 0; i < 20; i++) {
+      await repo.sendMessage(channelId, {
+        text: `concurrent ${i}`,
+        userId: tuan.id,
+        userExternalId: "tuan",
+      });
+    }
+    const a = recordingPublisher();
+    const b = recordingPublisher();
+    const relayA = createRelay({ db, publisher: a, logger: silent, batchSize: 7 });
+    const relayB = createRelay({ db, publisher: b, logger: silent, batchSize: 7 });
+
+    // Run them at the same time, repeatedly, until the backlog is gone.
+    for (let pass = 0; pass < 20; pass++) {
+      if ((await outboxDepthFor(db, env.id)) === 0) break;
+      await Promise.all([relayA.drainOnce(), relayB.drainOnce()]);
+    }
+
+    expect(await outboxDepthFor(db, env.id)).toBe(0);
+    const all = [...a.sent, ...b.sent].map((m) => m.id);
+    expect(new Set(all).size).toBe(all.length);
+  });
+
+  it("invariant 11: a relay log line carries counts, never payloads", async () => {
+    // A message body in a log is a tenant's data in an operator's terminal
+    // (NFR-SEC-06). The relay logs what it did, not what it moved.
+    const lines: string[] = [];
+    const noisy: Logger = createLogger("outbox-itest", (line) =>
+      lines.push(typeof line === "string" ? line : JSON.stringify(line)),
+    );
+    await repo.sendMessage(channelId, {
+      text: "a secret worth keeping out of logs",
+      userId: tuan.id,
+      userExternalId: "tuan",
+    });
+    const relay = createRelay({
+      db,
+      publisher: recordingPublisher(),
+      logger: noisy,
+    });
+    await relay.drainOnce();
+    // The relay's own logging happens in the loop, so drive one iteration of it
+    // the way production does.
+    relay.start();
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await relay.stop();
+
+    const haystack = lines.join("\n");
+    expect(haystack).not.toContain("a secret worth keeping out of logs");
+    expect(haystack).not.toContain("north ramp");
+  });
+
+  it("invariant 6: publish-after-commit LOSES the event when the process dies in the gap (SC-003)", async () => {
+    // The chapter's opening failure, reproduced. The naive walk commits its
+    // messages and is killed before it publishes. Afterwards the messages are
+    // there and there is NO durable record that an event was ever owed — no
+    // row, no error, nothing to replay from. That silence is the whole problem:
+    // a message was sent, no webhook will fire, and nothing anywhere knows.
+    const environmentId = await killInTheGap("naive");
+
+    const messages = (await db.execute(
+      `SELECT count(*)::int AS n FROM messages m
+         JOIN channels c ON c.id = m.channel_id
+        WHERE c.environment_id = '${environmentId}'`,
+    )) as unknown as { rows: { n: number }[] };
+    expect(messages.rows[0]!.n).toBeGreaterThan(0);
+
+    const owed = (await db.execute(
+      `SELECT count(*)::int AS n FROM outbox
+        WHERE payload->>'environment_id' = '${environmentId}'`,
+    )) as unknown as { rows: { n: number }[] };
+    expect(owed.rows[0]!.n).toBe(0);
+  }, 60_000);
+
+  it("invariant 5: the outbox SURVIVES the same kill, and invariant 10's id survives with it (SC-002)", async () => {
+    // Same script, same signal, same moment. The difference is that the event
+    // committed with the message, so it is still here — pending, addressed, and
+    // carrying the deduplication key it was born with.
+    const environmentId = await killInTheGap("outbox");
+
+    const rows = (await db.execute(
+      `SELECT id, subject, payload FROM outbox
+        WHERE published_at IS NULL AND payload->>'environment_id' = '${environmentId}'
+        ORDER BY id`,
+    )) as unknown as {
+      rows: { id: number; subject: string; payload: { id: string } }[];
+    };
+    expect(rows.rows.length).toBeGreaterThan(0);
+    const survivor = rows.rows[0]!;
+    expect(survivor.subject).toBe(`events.msg.created.${environmentId}`);
+    expect(survivor.payload.id).toMatch(/^[0-9a-f-]{36}$/);
+
+    // Recovery needs no operator: a relay started afterwards publishes it, with
+    // the SAME id the row was written with — which is invariant 10's integration
+    // half. A deduplication key that changed on retry would make every
+    // consumer's dedupe useless.
+    const publisher = recordingPublisher();
+    const relay = createRelay({ db, publisher, logger: silent });
+    expect(
+      await drainUntilClear(relay, db, environmentId),
+    ).toBeGreaterThan(0);
+    expect(publisher.sent.map((m) => m.id)).toContain(survivor.payload.id);
+
+    await db.execute(
+      `DELETE FROM outbox WHERE payload->>'environment_id' = '${environmentId}'`,
+    );
+  }, 60_000);
+
+  it("invariant 9: the broker can be absent — writes succeed, events accumulate, the backlog drains (SC-007)", async () => {
+    // SAD §7 claims exactly this: "broker down, events accumulate in Postgres,
+    // relay drains on recovery". The claim is tested here rather than quoted.
+    //
+    // "Down" is a publisher pointed at a port with nothing behind it, driving
+    // the REAL JetStream client — so the failure path under test is the client's
+    // own connect failure, not a fake's throw.
+    const down = createJetStreamPublisher({ url: "nats://127.0.0.1:14999" });
+    const downRelay = createRelay({ db, publisher: down, logger: silent });
+
+    // Writes do not care. This is the inversion an outbox exists to create: the
+    // event spine is not a dependency of the write path (research R9).
+    for (let i = 0; i < 3; i++) {
+      const message = await repo.sendMessage(channelId, {
+        text: `while the broker is down ${i}`,
+        userId: tuan.id,
+        userExternalId: "tuan",
+      });
+      expect(message.seq).toBeGreaterThan(0);
+    }
+    const backlog = await outboxDepthFor(db, env.id);
+    expect(backlog).toBeGreaterThanOrEqual(3);
+
+    // The relay cannot publish, and says so by failing rather than by marking.
+    await expect(downRelay.drainOnce()).rejects.toThrow();
+    expect(await outboxDepthFor(db, env.id)).toBe(backlog);
+    await down.close();
+
+    // The broker returns. Nobody intervenes; the same loop drains what piled up.
+    const up = createJetStreamPublisher({
+      url: process.env.RELAY_NATS_URL ?? "nats://localhost:14222",
+    });
+    const upRelay = createRelay({ db, publisher: up, logger: silent });
+    const drained = await drainUntilClear(upRelay, db, env.id);
+    expect(drained).toBeGreaterThanOrEqual(backlog);
+    expect(await outboxDepthFor(db, env.id)).toBe(0);
+    await up.close();
+
+    // And the whole-table depth an operator would watch is a real number.
+    expect(await outboxDepth(db)).toBeGreaterThanOrEqual(0);
+  }, 60_000);
+
+  it("a failing publisher leaves the row pending rather than losing it", async () => {
+    // The publish-then-mark ordering, tested from the failure side: a broker
+    // that refuses must not advance the cursor.
+    const publisher = recordingPublisher();
+    await repo.sendMessage(channelId, {
+      text: "the broker will refuse this",
+      userId: tuan.id,
+      userExternalId: "tuan",
+    });
+    const depthBefore = await outboxDepthFor(db, env.id);
+    expect(depthBefore).toBeGreaterThan(0);
+
+    publisher.failNext(1);
+    const relay = createRelay({ db, publisher, logger: silent });
+    await expect(relay.drainOnce()).rejects.toThrow(/unreachable/);
+    expect(await outboxDepthFor(db, env.id)).toBe(depthBefore);
+
+    // And it drains on the next attempt, with nothing lost.
+    //
+    // The lane is quiet enough for this to be deterministic: the e2e journey's
+    // api children run with the relay off, precisely so that two test files do
+    // not race over one table. Within this file, `drainOnce()` is driven by
+    // hand and nothing else publishes.
+    expect(
+      await drainUntilClear(relay, db, env.id),
+    ).toBeGreaterThanOrEqual(depthBefore);
+    expect(await outboxDepthFor(db, env.id)).toBe(0);
+  });
+});
+
+/** Drain until this environment's backlog is gone.
+ *
+ * One `drainOnce()` is not enough, and the reason is worth stating: the relay is
+ * deliberately NOT tenant-scoped — one loop drains every environment's events,
+ * because an outbox row is work the platform owes itself. So a batch can be
+ * filled entirely by rows this suite did not write, and a test that assumes
+ * otherwise passes alone and fails in a full lane. (It did exactly that here.)
+ * Suites cannot isolate themselves by construction on this table the way 2.1's
+ * per-suite environments let them everywhere else. */
+async function drainUntilClear(
+  relay: { drainOnce: () => Promise<number> },
+  db: Db,
+  environmentId: string,
+  passes = 20,
+): Promise<number> {
+  let moved = 0;
+  for (let i = 0; i < passes; i++) {
+    if ((await outboxDepthFor(db, environmentId)) === 0) break;
+    const drained = await relay.drainOnce();
+    moved += drained;
+    if (drained === 0) break;
+  }
+  return moved;
+}
+
+/** Run the walk in one mode and `SIGKILL` it the moment it says it is in the
+ * gap between the commit and the publish.
+ *
+ * A real signal from the parent, not `process.exit()` from the child: a process
+ * that exits cooperatively gets to flush, and flushing is the thing being
+ * disproved. This is the difference between testing an error path and testing
+ * durability (research R4). */
+async function killInTheGap(mode: "naive" | "outbox"): Promise<string> {
+  // `__dirname`, not `import.meta`: this service compiles to CommonJS under
+  // NestJS (ADR-15), where the meta-property is a compile error.
+  const script = join(__dirname, "..", "..", "..", "..", "scripts", "dual-write-walk.mjs");
+  return new Promise((resolve, reject) => {
+    // A 30-second pause the child never actually waits out: the parent kills it
+    // the instant the marker appears. It was 3 seconds, and on a loaded lane the
+    // signal occasionally arrived AFTER the pause elapsed — at which point the
+    // child went on to drain the outbox, which is global, and published rows
+    // other tests in this file were still asserting on. The window only needs to
+    // exceed the parent's reaction time; making it long costs nothing because it
+    // is never spent.
+    const child = spawn("node", [script, `--mode=${mode}`, "--pause=30000"], {
+      env: { ...process.env },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let out = "";
+    let killed = false;
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error(`no marker within 30s; output was:\n${out}`));
+    }, 30_000);
+    child.stdout.on("data", (chunk: Buffer) => {
+      out += chunk.toString();
+      if (!killed && out.includes("MARKER kill-me-now")) {
+        killed = true;
+        child.kill("SIGKILL");
+      }
+    });
+    child.stderr.on("data", (chunk: Buffer) => (out += chunk.toString()));
+    child.on("exit", () => {
+      clearTimeout(timer);
+      if (!killed) return reject(new Error(`child finished before the marker:\n${out}`));
+      const env = /environment\s+(\S+)/.exec(out)?.[1];
+      if (!env) return reject(new Error(`no environment in output:\n${out}`));
+      resolve(env);
+    });
+  });
+}
+
+/** Depth for ONE environment. `outboxDepth` counts the whole table, which is
+ * right for an operator and wrong for a test sharing a database with others. */
+async function outboxDepthFor(db: Db, environmentId: string): Promise<number> {
+  const result = (await db.execute(
+    `SELECT count(*)::int AS pending FROM outbox
+      WHERE published_at IS NULL
+        AND payload->>'environment_id' = '${environmentId}'`,
+  )) as unknown as { rows: { pending: number }[] };
+  return result.rows[0]?.pending ?? 0;
+}
+```
+
+To check that the suite holds anything at all, move the outbox insert outside
+the transaction and run it again:
+
+```text
+× invariant 1: a committed message leaves exactly one outbox row
+× invariant 3: a recognised idempotent retry adds no second event
+× invariant 4: both doors produce one event each, identical in shape
+× invariant 7: the relay publishes pending rows, marks them, and does not republish
+× invariant 5: the outbox SURVIVES the same kill …
+× invariant 9: the broker can be absent …
+× a failing publisher leaves the row pending rather than losing it
+7 failed
+```
+
+Seven of eleven. A one-line change to the placement of an `INSERT` breaks most
+of what this chapter claims — which is the right amount of sensitivity for a
+suite guarding a durability property.
+
+## The rest of the blast radius
+
+Small, this time. The event path is added rather than a seam retired, so the
+files earlier chapters fenced change in ways that fit on a screen:
+
+```ts title="services/api/src/outbox/publisher.ts"
+// The port (chapter 3.3). ADR-06's quieter payoff is that the outbox is "the
+// abstraction seam that makes ADR-02 reversible": every event originates in a
+// Postgres table with a subject and a payload, and *which broker* is a relay
+// configuration detail. That sentence is only true if the seam exists in the
+// code, so here it is — three fields, none of them broker-specific.
+
+export interface PublishedMessage {
+  /** Where it goes. */
+  subject: string;
+  /** Which event this is — the envelope's own id, used as the broker's
+   * deduplication key. Not the outbox row's number: that is a cursor into this
+   * database and means nothing outside it (research R7). */
+  id: string;
+  /** What a consumer receives, already complete. */
+  payload: unknown;
+}
+
+export interface Publisher {
+  /** Resolves only when the destination has ACCEPTED the message. A publisher
+   * that resolves early turns at-least-once into at-most-once, because the
+   * relay marks a row published on this promise (research R3). */
+  publish(message: PublishedMessage): Promise<void>;
+  close(): Promise<void>;
+}
+
+/** Publish one row's worth of event. Trivial by design: the interesting parts
+ * are the transaction that wrote the row and the relay that decides when to
+ * mark it, and neither of them should have to know a broker's vocabulary. */
+export async function publishPending(
+  publisher: Publisher,
+  pending: { subject: string; payload: { id: string } },
+): Promise<void> {
+  await publisher.publish({
+    subject: pending.subject,
+    id: pending.payload.id,
+    payload: pending.payload,
+  });
+}
+```
+
+```ts title="services/api/src/outbox/outbox.module.ts"
+import { Inject, Injectable, Module, type OnModuleDestroy } from "@nestjs/common";
+
+import { createLogger } from "@relay/service-kit";
+
+import { createDb, createPool, type Db } from "../db/client";
+import { createJetStreamPublisher } from "./jetstream.publisher";
+import { createRelay, type Relay } from "./relay";
+
+// The relay's home (chapter 3.3). It lives INSIDE the api service because
+// ADR-06 put it there — "a small loop inside the API service initially,
+// promotable to its own deployment if outbox depth alarms fire". Promoting it
+// would mean moving this file and nothing else: the loop reads a table and
+// writes to a broker, and shares no state with the request path.
+
+export const OUTBOX_RELAY = "OUTBOX_RELAY";
+
+/** The relay runs WITH the service. It is not something an operator switches
+ * on — an event spine that only runs when someone remembers is not a spine.
+ *
+ * `RELAY_OUTBOX_RELAY=off` exists for the suites that want a quiet database:
+ * most integration tests assert on rows, and a background loop marking them
+ * published mid-assertion would make those tests flaky for no teaching value.
+ * The outbox suite turns it off and drives `drainOnce()` itself, which is the
+ * same code path the loop runs. */
+export function relayEnabled(): boolean {
+  return (process.env.RELAY_OUTBOX_RELAY ?? "on").toLowerCase() !== "off";
+}
+
+@Injectable()
+export class OutboxRelayService implements OnModuleDestroy {
+  constructor(@Inject(OUTBOX_RELAY) private readonly relay: Relay) {}
+
+  start(): void {
+    if (relayEnabled()) this.relay.start();
+  }
+
+  async onModuleDestroy(): Promise<void> {
+    await this.relay.stop();
+  }
+}
+
+@Module({
+  providers: [
+    {
+      provide: OUTBOX_RELAY,
+      useFactory: (): Relay =>
+        createRelay({
+          db: createDb(createPool()) as Db,
+          publisher: createJetStreamPublisher(),
+          logger: createLogger("outbox"),
+        }),
+    },
+    OutboxRelayService,
+  ],
+  exports: [OUTBOX_RELAY, OutboxRelayService],
+})
+export class OutboxModule {}
+```
+
+```diff title="services/api/src/app.module.ts"
+@@ -10,6 +10,7 @@ import { AuthenticateMiddleware } from "./auth/authenticate.middleware";
+ import { HealthController } from "./health.controller";
+ import { InternalModule } from "./internal/internal.module";
+ import { MessagesModule } from "./messages/messages.module";
++import { OutboxModule } from "./outbox/outbox.module";
+ import { TenancyModule } from "./tenancy/tenancy.module";
+ import { LOGGER, apiLogger } from "./logger";
+ import { ProtocolErrorFilter } from "./protocol-error.filter";
+@@ -20,7 +21,13 @@ import { RequestContextMiddleware } from "./request-context.middleware";
+ // provider (APP_FILTER) instead of wiring it in main.ts means every entry
+ // point — including tests — gets the same error envelope for free.
+ @Module({
+-  imports: [AuthModule, MessagesModule, InternalModule, TenancyModule],
++  imports: [
++    AuthModule,
++    MessagesModule,
++    InternalModule,
++    TenancyModule,
++    OutboxModule,
++  ],
+   controllers: [HealthController],
+   providers: [
+     { provide: LOGGER, useFactory: apiLogger },
+```
+
+```diff title="services/api/src/main.ts"
+@@ -4,6 +4,7 @@ import { NestFactory } from "@nestjs/core";
+ import { createLogger } from "@relay/service-kit";
+ 
+ import { AppModule } from "./app.module";
++import { OutboxRelayService } from "./outbox/outbox.module";
+ 
+ // Nest's own banner logger stays off: this workspace already decided what a
+ // log line looks like (one JSON object, NFR-OBS-01), and the framework does
+@@ -12,6 +13,14 @@ async function bootstrap(): Promise<void> {
+   const app = await NestFactory.create(AppModule, { logger: false });
+   const port = Number(process.env.PORT ?? 4000);
+   await app.listen(port);
++  // The relay starts AFTER the server is listening, and starting it cannot
++  // fail: the publisher connects lazily, so an unreachable broker leaves events
++  // accumulating in Postgres instead of preventing the api from serving writes
++  // (chapter 3.3, research R9).
++  app.get(OutboxRelayService).start();
++  // Nest calls onModuleDestroy on shutdown hooks; without this the relay's loop
++  // would outlive the process's intent to stop.
++  app.enableShutdownHooks();
+   createLogger("api").log("info", "listening", { port });
+ }
+ 
+```
+
+```diff title="services/api/src/messages/messages.service.ts"
+@@ -29,16 +29,22 @@ export class MessagesService {
+   async send(
+     channelId: string,
+     body: SendMessageBody,
+-    /** Chapter 2.6: who wrote it. Optional because the public REST route
+-     * has no authenticated user yet (its own chapter, Part 3); the
+-     * internal route always knows. */
++    /** Chapter 2.6: who wrote it. Optional because a key-authenticated public
++     * send is unattributed (3.2's recorded bound); the internal route always
++     * knows. */
+     userId?: string,
++    /** Chapter 3.3: the same person as a CONSUMER will see them. The event
++     * envelope carries external ids, and the internal route already holds this
++     * one — it is the token's subject — so threading it costs nothing where a
++     * lookup inside the write transaction would cost a query per message. */
++    userExternalId?: string,
+   ): Promise<MessageRow> {
+     try {
+       return await this.repo.sendMessage(channelId, {
+         text: body.text,
+         metadata: body.metadata,
+         ...(userId !== undefined && { userId }),
++        ...(userExternalId !== undefined && { userExternalId }),
+         ...(body.idempotency_key != null && {
+           idempotencyKey: body.idempotency_key,
+         }),
+```
+
+```diff title="services/api/src/internal/internal.controller.ts"
+@@ -75,6 +75,9 @@ export class InternalController {
+       // build a message.created frame without a sender, so the write path
+       // finally records the one it already had in its hand.
+       user.id,
++      // Chapter 3.3: and the external id travels too, because the event this
++      // write now emits is read by customers, who know users by that name.
++      userExternalId,
+     );
+     // `user` is echoed as the EXTERNAL id: internal uuids are ours, and
+     // the frame this becomes is client-facing.
+```
+
+```diff title="services/api/package.json"
+@@ -20,6 +20,7 @@
+     "@relay/service-kit": "workspace:*",
+     "drizzle-orm": "^0.45.2",
+     "jose": "^6.2.7",
++    "nats": "^2.29.3",
+     "pg": "^8.22.0",
+     "reflect-metadata": "^0.2.2",
+     "rxjs": "^7.8.2",
+```
+
+```diff title="services/gateway/package.json"
+@@ -17,6 +17,7 @@
+     "ws": "^8.21.1"
+   },
+   "devDependencies": {
++    "@relay/api": "workspace:*",
+     "@types/ws": "^8.18.1",
+     "tsx": "^4.23.1"
+   }
+```
+
+```diff title="packages/e2e/src/harness.ts"
+@@ -330,7 +330,18 @@ export async function boot({ gateways = 2 } = {}): Promise<System> {
+       "RELAY_POSTGRES_PORT",
+       "RELAY_REDIS_URL",
+       "RELAY_REDIS_PORT",
++      // Chapter 3.3: the api's relay needs the broker's address. Forwarded,
++      // never composed here — a harness that invents a URL becomes a second
++      // source of truth, which is exactly how this suite first failed.
++      "RELAY_NATS_URL",
++      "RELAY_NATS_PORT",
+     ),
++    // Chapter 3.3: the api children run WITHOUT the outbox relay. This journey
++    // asserts message delivery, and a background loop draining the outbox while
++    // 3.3's own suite asserts on that same table is a race between two test
++    // files, not a property of the system. The relay has its own suite, which
++    // drives it explicitly.
++    RELAY_OUTBOX_RELAY: "off",
+   };
+ 
+   const apiPort = Number(process.env.RELAY_E2E_API_PORT ?? 4100);
+```
+
+```diff title="turbo.json"
+@@ -18,13 +18,16 @@
+       "inputs": ["$TURBO_DEFAULT$", "$TURBO_ROOT$/compose.yaml"]
+     },
+     "test:integration": {
+-      "dependsOn": ["^build"],
++      "dependsOn": ["^build", "build"],
+       "cache": false,
+       "env": [
+         "DATABASE_URL",
+         "RELAY_POSTGRES_PORT",
+         "RELAY_REDIS_URL",
+         "RELAY_REDIS_PORT",
++        "RELAY_NATS_URL",
++        "RELAY_NATS_PORT",
++        "RELAY_OUTBOX_RELAY",
+         "RELAY_E2E_API_PORT"
+       ]
+     },
+```
+
+```js title="scripts/dual-write-walk.mjs"
+// The chapter 3.3 walk: the dual-write problem, and the fix, run side by side.
+//
+//   node scripts/dual-write-walk.mjs --mode=naive
+//   node scripts/dual-write-walk.mjs --mode=outbox
+//   node scripts/dual-write-walk.mjs --mode=outbox --messages=200
+//
+// Both modes write a message and then publish an event. They differ in ONE
+// respect — when the event becomes durable — and that difference is the whole
+// chapter.
+//
+// The script prints `MARKER kill-me-now` between the commit and the publish and
+// then waits, so a parent process can `SIGKILL` it exactly in the gap. That is
+// how outbox.itest.ts turns "the process died at the worst moment" into a
+// repeatable test rather than a story. Run by hand with nobody killing it, the
+// script simply carries on and reports what happened.
+//
+// DECISION (chapter 3.3): the naive publish-after-commit path lives HERE and in
+// no service. It is a teaching artifact, like split-brain.mjs — fenced, so it
+// cannot quietly stop compiling, and outside services/ so that nobody copying
+// the repository ships the bug (research R5).
+import { createDb, createPool } from "../services/api/dist/db/client.js";
+import {
+  createEnvironment,
+  Repository,
+  drainOutbox,
+} from "../services/api/dist/db/repository.js";
+import { messageCreatedEvent } from "../services/api/dist/outbox/event.js";
+import { createJetStreamPublisher } from "../services/api/dist/outbox/jetstream.publisher.js";
+
+const arg = (name, fallback) => {
+  const hit = process.argv.find((a) => a.startsWith(`--${name}=`));
+  return hit ? hit.slice(name.length + 3) : fallback;
+};
+
+const MODE = arg("mode", "outbox");
+const COUNT = Number(arg("messages", "1"));
+const PAUSE_MS = Number(arg("pause", "400"));
+
+if (MODE !== "naive" && MODE !== "outbox") {
+  console.error(`unknown --mode=${MODE} (expected naive or outbox)`);
+  process.exit(2);
+}
+
+const db = createDb(createPool());
+const env = await createEnvironment(db, { name: `dual-write-${Date.now()}` });
+const repo = new Repository(db, env.id);
+const tuan = await repo.createUser("tuan", "Tuan");
+const channel = await repo.createChannel("fleet", "public");
+await repo.addMember(channel.id, tuan.id);
+
+const show = (label, value) => console.log(`${label.padEnd(26)} ${value}`);
+show("environment", env.id);
+show("mode", MODE);
+
+const pending = async () => {
+  const rows = await db.execute(
+    `SELECT count(*)::int AS n FROM outbox
+      WHERE published_at IS NULL AND payload->>'environment_id' = '${env.id}'`,
+  );
+  return rows.rows[0].n;
+};
+
+if (MODE === "naive") {
+  // ── the way you would write it first ────────────────────────────────────
+  // Commit the message. Then publish the event. Nothing wrong with either
+  // step; everything wrong with the gap between them.
+  for (let i = 0; i < COUNT; i++) {
+    const id = crypto.randomUUID();
+    const seq = i + 1;
+    await db.execute(
+      `INSERT INTO messages (id, channel_id, sequence, user_id, text, metadata)
+       VALUES ('${id}', '${channel.id}', ${seq}, '${tuan.id}', 'B2, north ramp', '{}')`,
+    );
+    await db.execute(
+      `UPDATE channels SET last_sequence = ${seq} WHERE id = '${channel.id}'`,
+    );
+  }
+  show("messages committed", COUNT);
+  show("outbox rows", await pending());
+
+  console.log("MARKER kill-me-now");
+  await new Promise((r) => setTimeout(r, PAUSE_MS));
+
+  // A process that dies above this line has committed messages and owes
+  // events that no longer exist anywhere. Nothing errored. Nothing to replay.
+  const publisher = createJetStreamPublisher();
+  for (let i = 0; i < COUNT; i++) {
+    const event = messageCreatedEvent({
+      eventId: crypto.randomUUID(),
+      environmentId: env.id,
+      message: {
+        id: crypto.randomUUID(),
+        channel_id: channel.id,
+        seq: i + 1,
+        user: "tuan",
+        text: "B2, north ramp",
+        created_at: new Date().toISOString(),
+      },
+    });
+    await publisher.publish({
+      subject: event.subject,
+      id: event.payload.id,
+      payload: event.payload,
+    });
+  }
+  await publisher.close();
+  show("events published", COUNT);
+  show("durable record of them", "none — the publish WAS the record");
+} else {
+  // ── the way it survives ─────────────────────────────────────────────────
+  // The event row commits with the message. The publish is somebody else's
+  // problem, later, from a table.
+  for (let i = 0; i < COUNT; i++) {
+    await repo.sendMessage(channel.id, {
+      text: "B2, north ramp",
+      userId: tuan.id,
+      userExternalId: "tuan",
+    });
+  }
+  show("messages committed", COUNT);
+  show("outbox rows waiting", await pending());
+
+  console.log("MARKER kill-me-now");
+  await new Promise((r) => setTimeout(r, PAUSE_MS));
+
+  // A process that dies above this line has lost nothing: the rows are in
+  // Postgres and the next relay to run will publish them.
+  const publisher = createJetStreamPublisher();
+  let published = 0;
+  for (;;) {
+    const moved = await drainOutbox(db, 100, async (row) => {
+      await publisher.publish({
+        subject: row.subject,
+        id: row.payload.id,
+        payload: row.payload,
+      });
+    });
+    published += moved;
+    if (moved === 0) break;
+  }
+  await publisher.close();
+  show("events published", published);
+  show("outbox rows waiting", await pending());
+}
+
+process.exit(0);
+```
+
+And one fix-forward, which is the other kind of thing a chapter owes you.
+Chapter 3.1's signup suite asserted that a failed provisioning left the
+*global* organisation count unchanged. That passed for two chapters and failed
+here with `expected 884 to be 883`, because 3.3's crash tests spawn child
+processes that provision tenants of their own while it runs. The count was never
+the evidence — the assertion two lines below it, that no organisation named
+`doomed org` survived, always was. The global count is gone:
+
+```diff title="services/api/src/tenancy/signup.itest.ts"
+@@ -152,9 +152,6 @@ describe("signup", () => {
+   });
+ 
+   it("writes the full set or nothing when provisioning fails (invariant 1)", async () => {
+-    const before = await db.execute(
+-      `SELECT count(*)::int AS n FROM organisations`,
+-    );
+     // Force a failure inside the transaction, after the organisation insert:
+     // an organisation name that is fine and a provider value the CHECK
+     // constraint refuses.
+@@ -165,14 +162,14 @@ describe("signup", () => {
+         organisationName: "doomed org",
+       }),
+     ).rejects.toThrow();
+-    const after = await db.execute(
+-      `SELECT count(*)::int AS n FROM organisations`,
+-    );
+-    // Nothing survived — no half-built tenant, which is the whole point of the
+-    // single transaction.
+-    expect((after.rows[0] as { n: number }).n).toBe(
+-      (before.rows[0] as { n: number }).n,
+-    );
++    // REVISED by chapter 3.3: this used to count ALL organisations before and
++    // after and assert the totals matched. That is a global assertion in a lane
++    // where other suites create tenants concurrently — it passed for two
++    // chapters and then failed with "expected 884 to be 883" the day 3.3's
++    // crash tests started spawning child processes that provision their own.
++    // The precise assertion below was always the one carrying the weight: the
++    // doomed organisation must not survive its transaction. A count of
++    // everything was never evidence about this rollback.
+     const orphan = await db.execute(
+       `SELECT count(*)::int AS n FROM organisations WHERE name = 'doomed org'`,
+     );
+```
+
+That `turbo.json` change deserves a sentence, because it is a bug this chapter
+found rather than one it caused. Two suites now spawn a child process from
+`services/api/dist` — the gateway's socket cases from 3.2 and this chapter's
+crash test — and `nest build` deletes its output directory before rebuilding.
+The integration task depended on `^build` (dependencies' builds) but not on
+`build` (its own), so the api's build could run *while* the api's tests were
+reading `dist`, and the child died with `ERR_MODULE_NOT_FOUND`. It had been
+latent since 3.2 and only surfaced when a second suite needed the same files.
+
+<Checkpoint tag="part3-ch3">
+
+```bash
+docker compose up -d --wait postgres redis nats
+pnpm build
+DATABASE_URL="postgres://relay:relay@localhost:15432/relay" node services/api/dist/db/migrate.js
+
+pnpm lint && pnpm typecheck && pnpm test
+RELAY_POSTGRES_PORT=15432 RELAY_REDIS_PORT=16379 RELAY_NATS_PORT=14222 \
+  DATABASE_URL="postgres://relay:relay@localhost:15432/relay" \
+  RELAY_REDIS_URL="redis://localhost:16379" \
+  RELAY_NATS_URL="nats://localhost:14222" pnpm test:integration
+```
+
+Expected: **120 unit tests**, **87 integration tests**, all green — including
+chapter 2.8's journey, unchanged.
+
+Then watch the bug happen and then not happen:
+
+```bash
+node scripts/dual-write-walk.mjs --mode=naive
+node scripts/dual-write-walk.mjs --mode=outbox
+```
+
+Expected: both publish when nobody interrupts them. Kill either one between its
+`MARKER` line and the publish — the naive run leaves a message with no record
+that an event was owed; the outbox run leaves a row waiting.
+
+</Checkpoint>
+
+<ChapterFooter id="3.3" />

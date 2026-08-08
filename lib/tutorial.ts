@@ -329,12 +329,15 @@ export const series: Part[] = [
         id: "3.3",
         path: "/part-3/chapter-03/the-outbox",
         title: "The outbox",
-        status: "forthcoming",
+        status: "published",
+        translatedIn: ["vi"],
         readerProduces:
           "Transactional outbox + relay (ADR-06); the crash-in-the-gap test",
         sourceDoc: "docs/05-sad.md",
         readerMinutes: 90,
         titleVi: "Outbox",
+        readerProducesVi:
+          "Transactional outbox + relay (ADR-06); crash-in-the-gap test",
       },
       {
         id: "3.4",
