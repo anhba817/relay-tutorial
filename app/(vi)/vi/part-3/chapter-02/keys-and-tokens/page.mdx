@@ -1,0 +1,3417 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figTwoCredentials, figConnect, figAuthOrder } from "./figures";
+
+export const metadata = {
+  title: "Key và token — Building Relay",
+  description:
+    "Hai credentials, phân biệt bằng prefix: một API key có secret chỉ hiện một lần và được hash at rest, và một end-user token được api verify bằng signing secret riêng của environment. Chương cuối cùng xóa header mà mọi request đã tự assert từ 2.2.",
+  alternates: {
+    canonical: "/vi/part-3/chapter-02/keys-and-tokens",
+    languages: {
+      en: "/part-3/chapter-02/keys-and-tokens",
+      vi: "/vi/part-3/chapter-02/keys-and-tokens",
+    },
+  },
+};
+
+<ChapterHeader id="3.2" locale="vi" />
+
+Chương 3.1 build các containers nơi thế giới của một customer sống và signup
+tạo ra chúng. Nó chưa build cách để *chứng minh* bạn sở hữu một cái. Mọi
+request từ 2.2 đến giờ gọi tên tenant bằng một header mà nó chỉ đơn giản tự
+assert:
+
+```text
+x-relay-environment: 3f2a…
+```
+
+Ai truy cập được api cũng có thể gõ header đó, gọi tên bất kỳ environment nào, và
+đọc nó. Lúc đó tôi gọi nó là một dev-mode seam và hứa Phần 3 sẽ thay thế nó.
+Đây là chương đó, và seam này không sống sót qua chương.
+
+Có một seam thứ hai cùng tuổi. Gateway đã tự verify WebSocket tokens, bằng
+HS256 trên một `RELAY_DEV_JWT_SECRET` shared mà mọi service và mọi test đều
+biết. Cả hai seams bị xóa ở đây, trong hai increments riêng, vì blast radius của
+chúng khác nhau và tôi muốn bạn nhìn thấy cả hai con số.
+
+Thứ thay thế chúng là hai credentials — và chủ đề thật của chương không hẳn là
+credential nào trong hai cái. Nó là lỗi người ta mắc phải với cặp này.
+
+<SkipAhead locale="vi">
+
+Nếu bạn buộc phải đọc lướt: table `api_keys` nhập vào schema bên dưới tenant
+boundary, giữ một public lookup id, một salted SHA-256 của secret chỉ hiện đúng
+một lần, và prefix `rk_dev_`/`rk_live_` mirror environment kind. Authentication
+chạy trong **middleware** — đã đo, vì Nest build request-scoped providers trước
+guards — và tạo một `principal` mang `environmentId`, thứ repository factory
+bây giờ đọc thay cho header. End-user tokens được verify bởi **api**, không phải
+gateway: gateway post token tới `POST /internal/session` và được trả lời caller
+là ai và họ được nghe gì, thay thế memberships call nó vốn đã gọi, nên connect
+path không thêm round trip. Signup bàn giao key đầu tiên của environment, vì
+khi chưa có console session thì không có thứ nào khác bootstrap được nó. Trạng
+thái cuối chương là tag **`part3-ch2`**.
+
+</SkipAhead>
+
+## Hai populations, hai credentials
+
+Chương 3.1 vẽ một đường xuyên qua data: `humans` phía trên tenant boundary là
+những người sign in vào Relay, `users` phía dưới là những người bên trong
+product của customer, và hai nhóm này không bao giờ merge với nhau (ADR-18).
+Đường đó kéo theo một đường thứ hai. Có hai loại caller, và họ đang hỏi hai thứ
+khác nhau.
+
+Một **application** — backend của một công ty, giữ credential trong environment
+variables của chính nó — nói *tôi là environment này*. Nó gửi messages thay cho
+ai tùy ý, vì nó là customer. Một **end user** — tài xế trong xe tải, một browser
+tab — nói *tôi là người này trong environment đó*. Nó chỉ được act as chính nó.
+
+Một credential không thể trung thực mang cả hai claims, nên có hai credential.
+
+<Figure
+  caption="Hai credential classes, mỗi cái được present cho đâu, và hai refusals tạo thành chủ đề của chương này."
+  code={figTwoCredentials}
+/>
+
+Cả hai resolve về cùng một shape, và đó chính là điểm quan trọng.
+Authentication tạo ra một `principal`, principal mang `environmentId`, và mọi
+thứ downstream đọc field duy nhất đó. Hai classes chỉ khác nhau đúng hai chỗ:
+mỗi class được phép chạm tới đâu, và chuyện gì xảy ra khi ai đó nhầm chúng.
+
+```ts title="services/api/src/auth/principal.ts"
+// What authentication produces (chapter 3.2). Never persisted, never sent —
+// this is the shape the rest of a request reasons about instead of reading a
+// header somebody asserted.
+//
+// Two classes, because the platform has two populations to authenticate: the
+// APPLICATION integrating with Relay, and the END USER inside one of its
+// environments. ADR-18 drew that line through the data; this draws it through
+// the request.
+
+export interface ApplicationPrincipal {
+  kind: "application";
+  /** Resolved from the key, never from the caller's word for it. */
+  environmentId: string;
+  /** For last_used_at, and for 3.6's quota accounting. */
+  keyId: string;
+}
+
+export interface UserPrincipal {
+  kind: "user";
+  environmentId: string;
+  userExternalId: string;
+}
+
+export type Principal = ApplicationPrincipal | UserPrincipal;
+export type PrincipalKind = Principal["kind"];
+
+/** The request as everything downstream of the middleware sees it. The
+ * principal is optional at the type level for one honest reason: a request that
+ * presented nothing has none, and pre-credential routes (signup) are reached
+ * exactly that way. */
+export interface RequestWithPrincipal {
+  headers: Record<string, string | string[] | undefined>;
+  principal?: Principal;
+}
+
+/** How a credential class is named to a human. Used by the wrong-credential
+ * error, which must say what was presented and what was expected — and must
+ * never quote the credential (NFR-SEC-06). */
+export function describePrincipalKind(kind: PrincipalKind): string {
+  return kind === "application" ? "an API key" : "an end-user token";
+}
+
+/** The `Bearer <credential>` half of RFC 6750, and nothing else. Query strings
+ * are refused by omission: URLs reach logs and referrer headers, and NFR-SEC-06
+ * forbids a credential in either. (The WebSocket upgrade is the one exception,
+ * and it lives in the gateway where a browser gives no other choice.) */
+export function bearerCredential(
+  headers: RequestWithPrincipal["headers"],
+): string | null {
+  const raw = headers["authorization"];
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  if (typeof value !== "string") return null;
+  const match = /^Bearer (.+)$/i.exec(value.trim());
+  return match?.[1]?.trim() || null;
+}
+```
+
+## Một handle có thể lookup, và một secret thì không
+
+Một API key phải giải một vấn đề không query nào khác trong codebase này gặp.
+Mọi repository method từ 2.1 bắt đầu với một environment; riêng method này
+*sinh ra* một environment. Authentication xảy ra trước khi tenant scope tồn tại,
+nghĩa là key lookup là query unscoped duy nhất trong system.
+
+Điều đó loại bỏ design hiển nhiên. Nếu toàn bộ credential được hash, sẽ không
+còn gì để lookup, và mỗi request phải scan mọi key trên platform. Vì vậy
+credential có hai phần: một public handle được indexed và không phải secret, và
+một secret được hash rồi không bao giờ stored.
+
+```text
+rk_dev_9f4c1e8b0a7d2f3e5c6b8a9d0e1f2a3b_kQ7xN2mP…
+└──┬──┘└───────────────┬──────────────┘ └───┬───┘
+   │                   │                    └─ 32 random bytes, base64url.
+   │                   │                       Shown ONCE. Hashed at rest.
+   │                   └─ 16 random bytes, hex. Indexed. Globally unique.
+   └─ FR-AUT-03's visible prefix: which environment am I about to hit?
+```
+
+Prefix là requirement, không phải decoration. FR-AUT-03 yêu cầu key mang một
+environment marker nhìn thấy được, và lý do là một support ticket không ai muốn
+viết: `rk_live_` trong staging config file là lỗi bạn thấy ngay trong một cái
+liếc mắt, còn một opaque blob là lỗi bạn chỉ phát hiện sau đó.
+
+<Trap locale="vi">
+
+Tôi viết parser split ở underscore cuối cùng, vì design note nói vậy. Rồi key
+đầu tiên vừa mint đã parse fail.
+
+Cả hai nửa đều là base64url, và **alphabet của base64url có chứa `_`**. Một
+secret có underscore làm "split ở separator cuối" trở nên sai; một public id có
+underscore làm "split ở cái đầu tiên" trở nên sai. Không có cách split an toàn
+khi cả hai phía đều có thể chứa delimiter.
+
+Fix là đưa delimiter ra khỏi một alphabet: public handle là hex, không có `_` và
+có fixed length, nên boundary là chính xác bất kể secret tình cờ chứa gì. Cái
+giá là một character class và một test:
+
+```ts
+const CREDENTIAL = /^(rk_dev_|rk_live_)([0-9a-f]{32})_(.+)$/;
+```
+
+Design document nói "split ở separator cuối". Lần mint đầu tiên nói ngược lại.
+Đây là lần thứ ba trong series này một Phase 1 artifact được sửa bằng cách chạy
+code, và correction rẻ chính vì nó xảy ra trước khi bất cứ thứ gì được publish.
+
+</Trap>
+
+```ts title="services/api/src/auth/api-key.ts"
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+
+// The API key as a string, and the arithmetic behind it (chapter 3.2).
+// Framework-free on purpose: this is where the credential's rules live, and
+// they are testable without a server, a database or a request.
+//
+//   rk_dev_<public_id>_<secret>
+//   └──┬──┘└────┬────┘ └──┬───┘
+//      │        │          └─ 32 random bytes, base64url. Shown ONCE, hashed
+//      │        │             at rest, never recoverable (FR-AUT-02).
+//      │        └─ 16 random bytes, HEX. Indexed, globally unique, NOT secret.
+//      └─ FR-AUT-03's visible prefix: which environment am I about to hit?
+//
+// WHY the public id is hex when the secret is base64url: the two parts have to
+// be separable by a machine, and base64url's alphabet INCLUDES the separator
+// `_`. Splitting on the last underscore would corrupt any secret containing
+// one; splitting on the first would corrupt any public id containing one. Hex
+// has no `_` and a fixed length, so the boundary is exact whatever the secret
+// happens to contain. (data-model.md said "split on the last separator"; the
+// first mint that produced a secret with an underscore said otherwise.)
+
+export const KEY_PREFIXES = {
+  development: "rk_dev_",
+  production: "rk_live_",
+} as const;
+
+export type EnvironmentKind = keyof typeof KEY_PREFIXES;
+export type KeyPrefix = (typeof KEY_PREFIXES)[EnvironmentKind];
+
+const PUBLIC_ID_BYTES = 16;
+const SECRET_BYTES = 32;
+const SALT_BYTES = 16;
+
+const CREDENTIAL = /^(rk_dev_|rk_live_)([0-9a-f]{32})_(.+)$/;
+
+export interface MintedKey {
+  /** The whole credential, the only time it exists outside a hash. */
+  credential: string;
+  publicId: string;
+  prefix: KeyPrefix;
+  salt: string;
+  secretHash: string;
+}
+
+export function mintApiKey(kind: EnvironmentKind): MintedKey {
+  const prefix = KEY_PREFIXES[kind];
+  const publicId = randomBytes(PUBLIC_ID_BYTES).toString("hex");
+  const secret = randomBytes(SECRET_BYTES).toString("base64url");
+  const salt = randomBytes(SALT_BYTES).toString("base64url");
+  return {
+    credential: `${prefix}${publicId}_${secret}`,
+    publicId,
+    prefix,
+    salt,
+    secretHash: hashSecret(secret, salt),
+  };
+}
+
+export interface ParsedCredential {
+  prefix: KeyPrefix;
+  publicId: string;
+  secret: string;
+}
+
+/** Returns null rather than throwing. A thrown error would carry the presented
+ * string into a stack trace, and a stack trace is a log line (NFR-SEC-06). */
+export function parseApiKeyCredential(raw: string): ParsedCredential | null {
+  const match = CREDENTIAL.exec(raw);
+  if (!match) return null;
+  return {
+    prefix: match[1] as KeyPrefix,
+    publicId: match[2]!,
+    secret: match[3]!,
+  };
+}
+
+/** Which class is this? Decided by the prefix, before anything is verified —
+ * the whole reason FR-AUT-03 puts a visible prefix on the credential. */
+export function looksLikeApiKey(raw: string): boolean {
+  return raw.startsWith("rk_");
+}
+
+/** Salted SHA-256, not bcrypt or argon2 — and that is deliberate (research R3).
+ * A password KDF's slowness buys resistance to GUESSING a low-entropy secret.
+ * This secret is 256 bits from `randomBytes`; no work factor makes it more
+ * unguessable, and the cost would be paid on every authenticated request. What
+ * NFR-SEC-02 asks for is a salted hash, which this is. */
+export function hashSecret(secret: string, salt: string): string {
+  return createHash("sha256").update(`${salt}:${secret}`).digest("hex");
+}
+
+/** Constant-time comparison of the HASHES, never of the secrets. Two hashes are
+ * always the same length, so `timingSafeEqual` — which throws on a length
+ * mismatch — cannot be handed an absurd presented secret and turned into a 500. */
+export function secretMatches(
+  secret: string,
+  salt: string,
+  expectedHash: string,
+): boolean {
+  const presented = Buffer.from(hashSecret(secret, salt), "utf8");
+  const expected = Buffer.from(expectedHash, "utf8");
+  if (presented.length !== expected.length) return false;
+  return timingSafeEqual(presented, expected);
+}
+
+/** The prefix duplicates the environment's kind, and storing it is what makes a
+ * disagreement between them detectable instead of assumed (data-model). */
+export function prefixMatchesKind(prefix: string, kind: EnvironmentKind): boolean {
+  return prefix === KEY_PREFIXES[kind];
+}
+```
+
+<Why source="NFR-SEC-02 · FR-AUT-02 · research R3" locale="vi">
+
+**Vì sao salted SHA-256, khi ai cũng nói bcrypt?**
+
+Vì "luôn dùng password KDF" là lời khuyên cho *passwords*, còn đây không phải
+password.
+
+bcrypt và argon2 cố ý chậm. Sự chậm đó mua đúng một thứ: khả năng chống việc
+guess một low-entropy secret — một password do người chọn, lấy từ một space đủ
+nhỏ để search. Đó là lựa chọn đúng ở chỗ đó và là lý do không ai nên store
+password bằng SHA-256.
+
+Key secret ở đây là 32 bytes từ `crypto.randomBytes`: 256 bits, phân phối đều.
+Không có work factor nào làm nó guessable, và cũng không có work factor nào làm
+nó "khó guess hơn". Thứ KDF mua được là không gì cả; cái nó tốn là một delay cố
+ý trên **mọi authenticated request**, cộng thêm một native dependency, ngay
+trong code path chạy trước mọi thứ khác.
+
+Vậy: SHA-256 trên một random salt per-key, compare bằng `timingSafeEqual`. Salt
+xứng đáng có column riêng vì nó làm hai secrets giống hệt nhau hash ra khác
+nhau. NFR-SEC-02 yêu cầu salted hash và đây chính là salted hash — requirement
+được satisfy bằng cách đọc nó, không phải bằng cách với tới tool nghe có vẻ
+mạnh nhất.
+
+Cái trap thật nằm ngay cạnh đó, và nó là comparison chứ không phải hash:
+`timingSafeEqual` throw khi hai buffers khác length. Compare *secrets* thì một
+caller có thể crash endpoint bằng một string ngắn; compare *hashes* thì hai bên
+luôn là 32 bytes.
+
+</Why>
+
+Table chứa nó mang environment, như mọi thứ khác bên dưới boundary. Thứ nó
+không mang là constraint nào về số keys một environment được có — nhiều key
+active cùng lúc là feature, không phải oversight, vì đó là ý nghĩa của rotation
+without downtime.
+
+```diff title="services/api/src/db/schema.ts"
+@@ -132,6 +132,52 @@ export const environments = pgTable(
+   ],
+ );
+ 
++// DECISION (chapter 3.2): the SRS states the requirements this table serves
++// (FR-AUT-01…05, NFR-SEC-02) but no source document defines a key table —
++// SAD §6.1 does not have one. Its shape is a chapter derivation, recorded here
++// the way 2.1 recorded `members` and 3.1 recorded the tenancy containers.
++//
++// It sits BELOW the environment boundary, so it carries an environment_id like
++// every other table down here. The credential is two parts: `public_id` is an
++// indexed, non-secret lookup handle, and only a salted hash of the secret half
++// is ever stored. That split exists because authentication must resolve a
++// tenant BEFORE one is known — the single query in this file that cannot be
++// scoped, which is exactly why the lookup column is unique globally.
++export const apiKeys = pgTable(
++  "api_keys",
++  {
++    id: uuid("id").primaryKey(),
++    environmentId: uuid("environment_id")
++      .notNull()
++      .references(() => environments.id),
++    publicId: text("public_id").notNull(),
++    secretHash: text("secret_hash").notNull(),
++    salt: text("salt").notNull(),
++    prefix: text("prefix").notNull(),
++    name: text("name"),
++    createdAt: timestamp("created_at", { withTimezone: true })
++      .notNull()
++      .defaultNow(),
++    lastUsedAt: timestamp("last_used_at", { withTimezone: true }),
++    // Non-null means refused from that moment on. A timestamp rather than a
++    // DELETE: a deleted row loses the record of what once had access
++    // (FR-AUT-05).
++    revokedAt: timestamp("revoked_at", { withTimezone: true }),
++  },
++  (t) => [
++    // Globally unique, not per environment: the lookup happens before any
++    // environment is known, so it must resolve to at most one row on its own.
++    unique("api_keys_public_id_unique").on(t.publicId),
++    // FR-AUT-03's two prefixes and nothing else. Several ACTIVE keys per
++    // environment stay legal — that is what makes rotation possible without
++    // downtime (FR-AUT-04), so nothing here constrains the count.
++    check(
++      "api_keys_prefix_check",
++      sql`${t.prefix} IN ('rk_dev_','rk_live_')`,
++    ),
++  ],
++);
++
+ export const users = pgTable(
+   "users",
+   {
+```
+
+```sql title="services/api/migrations/0003_api_keys.sql"
+-- Chapter 3.2 — API keys (FR-AUT-01…05, NFR-SEC-02).
+--
+-- REVIEW DISPOSITION: drizzle-kit generated this file from schema.ts and it was
+-- read line by line before being applied (the ADR-16 workflow). Nothing was
+-- rewritten this time, and the reason is worth stating: 0002 needed a hand
+-- rewrite because it added a NOT NULL column to a populated table. This
+-- migration only CREATEs — there are no existing rows to say anything about, so
+-- the generated shape is already correct. Reviewing it was still the point; the
+-- workflow is "read the SQL", not "read the SQL when you expect a problem".
+--
+-- Two constraints carry requirements rather than convention:
+--   api_keys_public_id_unique  — the lookup runs before any tenant is known, so
+--                                the handle must resolve to at most one row
+--                                globally (research R2).
+--   api_keys_prefix_check      — FR-AUT-03's two prefixes, and nothing else.
+--
+-- Deliberately absent: any constraint on how many active keys an environment
+-- may have. Several at once is the feature, not an oversight (FR-AUT-04) —
+-- rotation with no downtime needs the old key to keep working while the new one
+-- is deployed.
+
+CREATE TABLE "api_keys" (
+	"id" uuid PRIMARY KEY NOT NULL,
+	"environment_id" uuid NOT NULL,
+	"public_id" text NOT NULL,
+	"secret_hash" text NOT NULL,
+	"salt" text NOT NULL,
+	"prefix" text NOT NULL,
+	"name" text,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"last_used_at" timestamp with time zone,
+	"revoked_at" timestamp with time zone,
+	CONSTRAINT "api_keys_public_id_unique" UNIQUE("public_id"),
+	CONSTRAINT "api_keys_prefix_check" CHECK ("api_keys"."prefix" IN ('rk_dev_','rk_live_'))
+);
+--> statement-breakpoint
+ALTER TABLE "api_keys" ADD CONSTRAINT "api_keys_environment_id_environments_id_fk" FOREIGN KEY ("environment_id") REFERENCES "public"."environments"("id") ON DELETE no action ON UPDATE no action;
+```
+
+## Secret bạn nhìn thấy một lần
+
+Một organisation hoàn toàn mới không thể authenticate request để xin key đầu
+tiên. Không có console session — 3.1 cố ý chưa build — nên phải có thứ gì đó
+bootstrap credential, và signup là hành động duy nhất đã biết bạn là ai.
+
+Vì vậy `provisionOrganisation` mint key đầu tiên của environment ngay trong
+cùng transaction với tenant mà nó thuộc về, và callback trả plaintext của nó
+đúng một lần. FR-DSH-01 muốn có development key trên màn hình đầu tiên sau
+signup; đây là nơi key đó đến từ.
+
+```diff title="services/api/src/db/repository.ts"
+@@ -4,6 +4,7 @@ import { and, asc, desc, eq, gt, lt, sql, type SQL } from "drizzle-orm";
+ 
+ import type { Db } from "./client";
+ import {
++  apiKeys,
+   applications,
+   channels,
+   environments,
+@@ -14,6 +15,13 @@ import {
+   organisations,
+   users,
+ } from "./schema";
++import {
++  mintApiKey,
++  parseApiKeyCredential,
++  prefixMatchesKind,
++  secretMatches,
++  type EnvironmentKind,
++} from "../auth/api-key";
+ 
+ // The repository layer — the ONE place data access lives (ADR-04's single
+ // writer, constitution I). Two surfaces with a bright line between them:
+@@ -69,6 +77,147 @@ export async function createEnvironment(
+   return { id: environmentId, kind };
+ }
+ 
++// ---------------------------------------------------------------------------
++// Credentials (chapter 3.2). Part of the ADMIN surface, and that placement is
++// the interesting bit: authentication has to resolve a tenant BEFORE one is
++// known, so these are the only queries in this file that cannot be scoped by an
++// environment. They are the operations that PRODUCE the scope everything else
++// is bound by — which is why they sit beside createEnvironment rather than
++// inside the request-scoped class below.
++// ---------------------------------------------------------------------------
++
++/** The parts of a minted key a caller may see. `credential` is the only time
++ * the secret exists outside a hash (FR-AUT-02); lose it and the answer is a new
++ * key, not a lookup. */
++export interface CreatedApiKey {
++  id: string;
++  credential: string;
++  publicId: string;
++  prefix: string;
++}
++
++/** A writer that may be the pool or a transaction. `provisionOrganisation`
++ * mints the first key inside its transaction, so this cannot take `Db` alone —
++ * a key written outside that transaction could survive a rolled-back tenant. */
++type Writer = Pick<Db, "insert" | "select" | "update">;
++
++/** FR-AUT-01. The kind is NOT a parameter: it is read from the environment, so
++ * the prefix and the environment can never disagree at creation time. */
++export async function createApiKey(
++  db: Writer,
++  { environmentId, name }: { environmentId: string; name?: string },
++): Promise<CreatedApiKey> {
++  const [environment] = await db
++    .select({ kind: sql<EnvironmentKind>`${environments.kind}` })
++    .from(environments)
++    .where(eq(environments.id, environmentId));
++  if (!environment) {
++    throw new Error(`no such environment: ${environmentId}`);
++  }
++  const minted = mintApiKey(environment.kind);
++  const id = randomUUID();
++  await db.insert(apiKeys).values({
++    id,
++    environmentId,
++    publicId: minted.publicId,
++    secretHash: minted.secretHash,
++    salt: minted.salt,
++    prefix: minted.prefix,
++    name: name ?? null,
++  });
++  return {
++    id,
++    credential: minted.credential,
++    publicId: minted.publicId,
++    prefix: minted.prefix,
++  };
++}
++
++/** What a verified key resolves to. Deliberately not the row: nothing outside
++ * this function needs the hash, the salt, or the name. */
++export interface AuthenticatedKey {
++  keyId: string;
++  environmentId: string;
++}
++
++/** One indexed lookup, then a constant-time comparison. No cache, on purpose:
++ * FR-AUT-05's revocation bound is true by construction when verification is
++ * live, on every instance, with nothing to invalidate (research R7).
++ *
++ * Returns null for every failure — unknown, revoked, wrong secret, mismatched
++ * prefix — because a caller learns nothing from being told which. */
++export async function authenticateApiKey(
++  db: Db,
++  credential: string,
++): Promise<AuthenticatedKey | null> {
++  const parsed = parseApiKeyCredential(credential);
++  if (!parsed) return null;
++
++  const [row] = await db
++    .select({
++      id: apiKeys.id,
++      environmentId: apiKeys.environmentId,
++      secretHash: apiKeys.secretHash,
++      salt: apiKeys.salt,
++      prefix: apiKeys.prefix,
++      revokedAt: apiKeys.revokedAt,
++      kind: sql<EnvironmentKind>`${environments.kind}`,
++    })
++    .from(apiKeys)
++    .innerJoin(environments, eq(environments.id, apiKeys.environmentId))
++    .where(eq(apiKeys.publicId, parsed.publicId));
++
++  if (!row) return null;
++  if (row.revokedAt !== null) return null;
++  if (!secretMatches(parsed.secret, row.salt, row.secretHash)) return null;
++  // A row whose prefix disagrees with its environment's kind is a data fault,
++  // not a credential to trust. Storing the prefix is what makes this checkable.
++  if (!prefixMatchesKind(row.prefix, row.kind)) return null;
++
++  // Touched at most once a minute rather than on every request: the column is
++  // for spotting a key nobody rotated, and that question does not need
++  // second-level precision or a write per authenticated call.
++  await db
++    .update(apiKeys)
++    .set({ lastUsedAt: new Date() })
++    .where(
++      and(
++        eq(apiKeys.id, row.id),
++        sql`(${apiKeys.lastUsedAt} IS NULL OR ${apiKeys.lastUsedAt} < now() - interval '1 minute')`,
++      ),
++    );
++
++  return { keyId: row.id, environmentId: row.environmentId };
++}
++
++/** FR-AUT-05. A timestamp, not a DELETE: the row is the record of what once had
++ * access, and the credential stops working on the next request either way. */
++export async function revokeApiKey(db: Db, keyId: string): Promise<boolean> {
++  const revoked = await db
++    .update(apiKeys)
++    .set({ revokedAt: new Date() })
++    .where(and(eq(apiKeys.id, keyId), sql`${apiKeys.revokedAt} IS NULL`))
++    .returning({ id: apiKeys.id });
++  return revoked.length > 0;
++}
++
++/** The environment's own signing secret, which is what makes an end-user token
++ * verifiable — and what keeps it verifiable ONLY by the service that owns the
++ * database (ADR-05, research R1). The gateway never sees this. */
++export async function environmentSigningSecret(
++  db: Db,
++  environmentId: string,
++): Promise<{ signingSecret: string; kind: EnvironmentKind } | null> {
++  const [row] = await db
++    .select({
++      signingSecret: environments.signingSecret,
++      kind: sql<EnvironmentKind>`${environments.kind}`,
++    })
++    .from(environments)
++    .where(eq(environments.id, environmentId));
++  return row ?? null;
++}
++
+ /** What a signup produced — or found. `created` answers "was an organisation
+  * created on this call?", NOT "was the identity new": a known human who owned
+  * nothing gets `created: true`, because one really was created for them. */
+@@ -78,6 +227,12 @@ export interface Provisioned {
+   environment: { id: string; kind: Environment["kind"] };
+   human: { id: string; provider: string; provider_account_id: string };
+   created: boolean;
++  /** Chapter 3.2, research R8: the environment's FIRST key, present only when
++   * this call created the tenant. With no console session, nothing else can
++   * bootstrap a credential — a brand-new organisation cannot authenticate a
++   * request to ask for one. A returning owner gets no key, because the old
++   * secret is unrecoverable and the answer to a lost secret is rotation. */
++  apiKey?: { prefix: string; secret: string };
+ }
+ 
+ /** Signup (chapter 3.1, FR-TEN-01/02). The admin surface's second entrance:
+@@ -229,12 +384,20 @@ export async function provisionOrganisation(
+       role: "owner", // FR-TEN-07's vocabulary; management of it is later
+     });
+ 
++    // The first credential, inside the same transaction as the tenant it
++    // belongs to (chapter 3.2). A key written outside this transaction could
++    // outlive a rolled-back organisation and authenticate against nothing.
++    // FR-DSH-01 wants a development key on the first screen after signup; this
++    // is where it comes from.
++    const key = await createApiKey(tx, { environmentId });
++
+     return {
+       organisation: { id: organisationId, name: organisationName },
+       application: { id: applicationId, name: organisationName },
+       environment: { id: environmentId, kind: "development" as const },
+       human,
+       created: true,
++      apiKey: { prefix: key.prefix, secret: key.credential },
+     };
+   });
+ }
+```
+
+Walk từ 3.1 bây giờ cho thấy nó bàn giao gì, và — hữu ích hơn — lần thứ hai nó
+không bàn giao gì:
+
+```console
+$ node scripts/signup-walk.mjs
+first authentication  → GET /auth/github/callback
+    200 created=true
+    organisation cc19528d-a1f7-4d16-b25a-e74b812922d1
+    application  85184e51-c6e5-4b48-804a-a7a25687f4b7
+    environment  98a995d7-fa28-442a-b67d-782ae08c002a (development)
+     api key      rk_dev_f373520fba4… (shown once)
+
+second authentication → GET /auth/github/callback
+    200 created=false
+    organisation cc19528d-a1f7-4d16-b25a-e74b812922d1
+    application  85184e51-c6e5-4b48-804a-a7a25687f4b7
+    environment  98a995d7-fa28-442a-b67d-782ae08c002a (development)
+     api key      none — the secret was shown at creation and is gone
+```
+
+Một returning owner không được trao secret mới. Secret cũ unrecoverable by
+construction, và câu trả lời cho lost key là rotation, không phải retrieval —
+mà câu trả lời đó chỉ usable vì có thể có nhiều key active cùng lúc.
+
+## Tokens do api sign, còn gateway thì không thể
+
+End-user tokens được signed bằng `signing_secret` riêng của environment. Column
+đó sống trong Postgres, và ADR-05 nói gateway không bao giờ chạm vào Postgres.
+
+Có hai đường ra. Ship signing secret của mọi environment tới gateway, hoặc hỏi
+service sở hữu chúng. Shipping nghĩa là một tenant-scoped secret nằm trong một
+process cố ý không giữ tenant state, nhân lên theo mọi gateway instance, cộng
+thêm câu chuyện rotation mỗi khi một cái thay đổi. Hỏi thì tốn một HTTP call.
+
+Và gateway vốn đã gọi một cái. Từ 2.5, lúc connect nó đã hỏi api "user này được
+nghe những channels nào?" Thay câu hỏi đó bằng "đây là ai, và họ được nghe gì?"
+tốn cùng một round trip và chuyển quyết định identity sang service duy nhất có
+thể ra quyết định đó.
+
+<Figure
+  caption="Connect sau chương này. Gateway forward token nó nhận được và được trả lời caller là ai — vẫn đúng một call nó đã gọi, chỉ hỏi câu tốt hơn."
+  code={figConnect}
+/>
+
+```ts title="services/api/src/auth/user-token.ts"
+import { SignJWT, decodeJwt, jwtVerify } from "jose";
+
+// End-user tokens (chapter 3.2, FR-AUT-06/07/08). HS256 over the
+// environment's own signing secret, verified by `jose` rather than by hand.
+//
+// WHY a dependency here, when 3.1 went out of its way to add none: hand-rolled
+// HS256 is thirty lines and three classic vulnerabilities — accepting whatever
+// algorithm the token names, forgetting to check `exp`, and comparing
+// signatures with `===`. A convenience is worth typing around; security code is
+// not (research R4).
+
+/** FR-AUT-07. Enforced at BOTH ends: this api will not mint a longer-lived
+ * token, and will not accept one either — including one signed with a secret it
+ * trusts, because a secret can leak and a bound that only applies at mint time
+ * is a bound on well-behaved callers. */
+export const MAX_TOKEN_LIFETIME_SECONDS = 86_400;
+
+const ALGORITHMS = ["HS256"] as const;
+
+export interface TokenClaims {
+  sub: string;
+  env: string;
+  iat: number;
+  exp: number;
+}
+
+export interface MintOptions {
+  user: string;
+  environmentId: string;
+  ttlSeconds: number;
+  /** Overridden only by tests that need a token issued in the past. */
+  issuedAt?: number;
+  /** Test-only escape hatch: mint a token this api would refuse, so the refusal
+   * can be proven rather than assumed. Never set by product code. */
+  allowOverLongLifetime?: boolean;
+}
+
+export async function mintUserToken(
+  signingSecret: string,
+  {
+    user,
+    environmentId,
+    ttlSeconds,
+    issuedAt,
+    allowOverLongLifetime = false,
+  }: MintOptions,
+): Promise<{ token: string; expiresAt: string }> {
+  if (!allowOverLongLifetime && ttlSeconds > MAX_TOKEN_LIFETIME_SECONDS) {
+    throw new Error(
+      `a token may not live longer than 24 hours (${MAX_TOKEN_LIFETIME_SECONDS}s)`,
+    );
+  }
+  const iat = issuedAt ?? Math.floor(Date.now() / 1000);
+  const exp = iat + ttlSeconds;
+  const token = await new SignJWT({ env: environmentId })
+    .setProtectedHeader({ alg: "HS256" })
+    .setSubject(user)
+    .setIssuedAt(iat)
+    .setExpirationTime(exp)
+    .sign(new TextEncoder().encode(signingSecret));
+  return { token, expiresAt: new Date(exp * 1000).toISOString() };
+}
+
+/** Reads the environment claim WITHOUT verifying anything, because the api has
+ * to know which environment's secret to check the signature with before it can
+ * check it. That is the only thing this function is for: the lookup is by
+ * claim, the trust is by signature (data-model). */
+export function environmentClaim(token: string): string | null {
+  try {
+    const claims = decodeJwt(token);
+    return typeof claims.env === "string" && claims.env.length > 0
+      ? claims.env
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Null for every failure, with no distinction between them: expired,
+ * malformed, mis-signed and foreign are one answer to a caller (FR-AUT-08's
+ * refusal), and telling them apart in a response body is how an attacker learns
+ * which half of a guess was right. */
+export async function verifyUserToken(
+  token: string,
+  signingSecret: string,
+  environmentId: string,
+): Promise<TokenClaims | null> {
+  try {
+    const { payload } = await jwtVerify(
+      token,
+      new TextEncoder().encode(signingSecret),
+      // The allow-list is the whole defence against algorithm confusion: `jose`
+      // refuses `alg: none` and any algorithm not named here BEFORE it looks at
+      // key material. Passing the token's own header back as the algorithm is
+      // the vulnerability this line exists to make impossible.
+      { algorithms: [...ALGORITHMS] },
+    );
+    const { sub, env, iat, exp } = payload;
+    if (typeof sub !== "string" || sub.length === 0) return null;
+    // Non-empty, and the environment we verified against. An empty env claim
+    // would be a session scoped to no tenant, which constitution I says must be
+    // unrepresentable rather than unlikely (2.5 found this the same way).
+    if (typeof env !== "string" || env !== environmentId) return null;
+    if (typeof iat !== "number" || typeof exp !== "number") return null;
+    if (exp - iat > MAX_TOKEN_LIFETIME_SECONDS) return null;
+    return { sub, env, iat, exp };
+  } catch {
+    // Includes the expiry check: `jose` throws on an expired token rather than
+    // returning it, so `exp` is enforced by the library and not by a comparison
+    // this file could forget to write.
+    return null;
+  }
+}
+```
+
+<Trap locale="vi">
+
+JWT vulnerability nổi tiếng nhất không phải là signature bị broken. Nó là hỏi
+token cách tự check chính nó.
+
+Header của JWT tự gọi tên algorithm của nó. Một verifier đọc field đó rồi làm
+theo sẽ accept `{"alg":"none"}` — một token có signature rỗng mà ai cũng viết
+được. Đổi sang `RS256` trước một verifier đang expect HMAC, và vài libraries sẽ
+vui vẻ dùng public key làm HMAC secret, trong khi nó là public.
+
+Defence là một argument:
+
+```ts
+await jwtVerify(token, key, { algorithms: ["HS256"] });
+```
+
+`jose` từ chối mọi thứ không nằm trong list đó trước khi nhìn vào key material.
+Test chứng minh điều này tự build một unsigned token, vì bạn không thể mint nó
+qua library:
+
+```ts
+const unsigned = `${base64url.encode(JSON.stringify({ alg: "none", typ: "JWT" }))}.${base64url.encode(
+  JSON.stringify({ sub: "attacker", env: ENV, iat, exp }),
+)}.`;
+expect(await verifyUserToken(unsigned, SECRET, ENV)).toBeNull();
+```
+
+Đây là toàn bộ lý do một dependency xuất hiện trong chương này sau khi 3.1 đã
+cố tránh thêm dependency nào. Hand-roll HS256 là khoảng ba mươi dòng và ba lỗi
+classic — lỗi này, quên `exp`, và compare signatures bằng `===`. Convenience có
+thể đáng để type quanh nó. Security code thì không.
+
+</Trap>
+
+Có một điểm tinh tế trong order of operations. Api phải biết dùng secret của
+environment *nào* để check signature, và nơi duy nhất có thông tin đó là bên
+trong token — chưa được verified. Vì vậy environment claim được đọc trước, không
+trust, chỉ để chọn key; signature sau đó mới quyết định có tin nó hay không.
+Đọc claim *sau* khi verify thì bạn không verify được gì cả; trust claim cho bất
+cứ việc nào khác thì token từ environment A đi vào environment B.
+
+Route ghép các phần đó lại thay thế hẳn `GET /internal/memberships`:
+
+```ts title="services/api/src/internal/session.controller.ts"
+import {
+  Controller,
+  HttpCode,
+  Inject,
+  Post,
+  Req,
+  UnauthorizedException,
+  UseGuards,
+} from "@nestjs/common";
+
+import type { InternalSessionResponse } from "@relay/protocol";
+
+import { AUTH_DB } from "../auth/authenticate.middleware";
+import { Accepts, CredentialGuard } from "../auth/credential.guard";
+import type { RequestWithPrincipal } from "../auth/principal";
+import type { Db } from "../db/client";
+import { Repository } from "../db/repository";
+
+// `POST /internal/session` (chapter 3.2) — the route that replaced
+// `GET /internal/memberships`.
+//
+// It answers the gateway's only question at connect: who is this, and what may
+// they hear? Both halves used to be answered in two different places — the
+// gateway verified the token locally and then asked the api for memberships.
+// Now the api does both, in the call the gateway was already making, so the
+// connect path costs exactly what it cost before (research R1).
+//
+// WHY IT IS A POST when it reads nothing: it presents a credential for
+// verification, and a credential does not belong in a URL — NFR-SEC-06 forbids
+// exactly that. The token arrives in the Authorization header like everywhere
+// else in this api; the POST is about not having a cacheable, loggable GET of a
+// credential-bearing request.
+@Controller("internal")
+@Accepts("user")
+@UseGuards(CredentialGuard)
+export class SessionController {
+  constructor(
+    @Inject(AUTH_DB) private readonly db: Db,
+    private readonly repo: Repository,
+  ) {}
+
+  @Post("session")
+  // 200: nothing is created. The POST is about keeping a credential out of a
+  // URL, not about creating a resource (contracts).
+  @HttpCode(200)
+  async session(
+    @Req() req: RequestWithPrincipal,
+  ): Promise<InternalSessionResponse> {
+    const principal = req.principal;
+    // The guard has already refused an absent, invalid or wrong-class
+    // credential, so reaching here with anything else is a wiring fault rather
+    // than a client error.
+    if (principal?.kind !== "user") {
+      throw new UnauthorizedException("a verified end-user token is required");
+    }
+
+    const user = await this.repo.getUserByExternalId(principal.userExternalId);
+    // A verified token for a user this environment has never seen is not an
+    // error: it is a user with no channels. The gateway's job is delivery, not
+    // identity forensics — 2.5's rule, and the reason a first connect from a
+    // brand-new user works before anything is seeded.
+    return {
+      environment_id: principal.environmentId,
+      user: principal.userExternalId,
+      channel_ids: user ? await this.repo.channelsForUser(user.id) : [],
+    };
+  }
+}
+```
+
+Và cánh cửa của gateway trở thành một call:
+
+```ts title="services/gateway/src/auth.ts"
+import type { ApiClient, Identity } from "./api-client.js";
+
+// The door (chapter 2.5, rebuilt by 3.2). Tokens are still checked BEFORE the
+// handshake completes — an unauthenticated socket never reaches session code —
+// but the gateway no longer does the checking.
+//
+// WHAT CHANGED, and why it is a narrowing rather than a complication: 2.5's
+// gateway verified tokens itself, with HS256 over a shared development secret.
+// Real tokens are signed with the ENVIRONMENT'S OWN secret, and that secret
+// lives in Postgres — which ADR-05 says this service may never touch. The two
+// ways out were to ship every environment's signing secret to the gateway, or to
+// ask the service that owns them. Shipping the secret means a tenant-scoped
+// secret inside a process that deliberately holds no tenant state, plus a
+// rotation story; asking costs one HTTP call the connect path was ALREADY making
+// for memberships (research R1).
+//
+// So the round-trip count is unchanged: the memberships lookup became a session
+// lookup that answers identity and memberships together. The gateway holds no
+// signing secret after this chapter.
+
+export type { Identity } from "./api-client.js";
+
+/** Three outcomes, not two. A refused token and an unreachable api both fail to
+ * open a socket, but they are not the same event and must not close the same
+ * way: 4001 tells a client its credential is wrong (retrying will not help),
+ * 1011 tells it we are broken (retrying will). 2.5 drew that line for the
+ * memberships lookup; moving verification here must not erase it. */
+export type Authentication =
+  | { outcome: "ok"; identity: Identity; channelIds: string[] }
+  | { outcome: "refused" }
+  | { outcome: "unavailable"; error: string };
+
+export async function authenticate(
+  api: ApiClient,
+  token: string | null,
+): Promise<Authentication> {
+  if (token === null || token.length === 0) return { outcome: "refused" };
+  try {
+    const session = await api.session(token);
+    // The api answered, and the answer was "no". Every refusal — expired,
+    // malformed, mis-signed, for another environment, over-long — arrives here
+    // as one outcome, because the socket has one close code for all of them.
+    if (session === null) return { outcome: "refused" };
+    return {
+      outcome: "ok",
+      identity: {
+        environmentId: session.environment_id,
+        userExternalId: session.user,
+        // Carried, not trusted: the internal hop forwards this instead of
+        // asserting an identity the gateway invented.
+        token,
+      },
+      channelIds: session.channel_ids,
+    };
+  } catch (error) {
+    return { outcome: "unavailable", error: String(error) };
+  }
+}
+```
+
+Nhìn kỹ type đó nói gì. Ba outcomes, không phải hai — vì chuyển verification
+sang api tạo ra một failure gateway chưa từng có: verifier bị *down*. Một token
+bị refused và một api không reach được đều làm socket không open, và trả lời
+chúng cùng một cách sẽ là nói dối theo một hướng. 4001 nói với client credential
+của nó sai, nên đừng retry; 1011 nói chúng ta đang broken, nên hãy retry.
+Chương 2.5 đã vẽ distinction đó cho memberships lookup, và việc move lookup
+không được âm thầm xóa nó.
+
+## Authentication chạy ở đâu, và vì sao tôi biết
+
+Chương 2.6 tốn của tôi một buổi chiều để biết rằng NestJS construct
+request-scoped providers **trước** khi enhancer chain chạy — đó là lý do
+repository factory của 2.2 tự đọc request thay vì trust rằng guard đã stash thứ
+gì đó. Finding đó ràng buộc chương này: authentication bây giờ liên quan tới
+database lookup, và guard vẫn sẽ chạy quá muộn đối với factory cần câu trả lời.
+
+Middleware chạy sớm hơn. Nhưng "chạy sớm hơn" là điều tôi tin chứ chưa đo trên
+path này, nên trước khi build dựa vào nó tôi log một dòng từ mỗi trong ba nơi
+và gửi một request:
+
+```text
+DIAG middleware
+DIAG repository-factory
+DIAG guard
+```
+
+Middleware, rồi factory, rồi guard. Design giữ được, fallback đã gọi tên không
+cần dùng, và phép đo mất bốn phút.
+
+<Figure
+  caption="Thứ tự được đo, không giả định. Authentication phải xảy ra trước khi factory đọc scope; job của guard hẹp hơn trước."
+  code={figAuthOrder}
+/>
+
+```ts title="services/api/src/auth/authenticate.middleware.ts"
+import { Inject, Injectable, type NestMiddleware } from "@nestjs/common";
+
+import type { Db } from "../db/client";
+import {
+  authenticateApiKey,
+  environmentSigningSecret,
+} from "../db/repository";
+import { looksLikeApiKey } from "./api-key";
+import { bearerCredential, type Principal, type RequestWithPrincipal } from "./principal";
+import { environmentClaim, verifyUserToken } from "./user-token";
+
+export const AUTH_DB = "AUTH_DB";
+
+/** Credential in, principal out. The one function that decides who a caller is;
+ * everything else in the api reads its answer.
+ *
+ * The two classes are told apart by the PREFIX, before either is verified —
+ * that is what FR-AUT-03's visible `rk_` buys beyond human readability.
+ *
+ * A token's environment claim is read UNVERIFIED, because the api has to know
+ * which environment's secret to check the signature with. The claim chooses the
+ * key; the signature decides whether to believe the claim. Getting that order
+ * backwards is how a token from environment A gets accepted for environment B.
+ */
+export async function resolvePrincipal(
+  db: Db,
+  credential: string,
+): Promise<Principal | null> {
+  if (looksLikeApiKey(credential)) {
+    const key = await authenticateApiKey(db, credential);
+    return key
+      ? {
+          kind: "application",
+          environmentId: key.environmentId,
+          keyId: key.keyId,
+        }
+      : null;
+  }
+
+  const environmentId = environmentClaim(credential);
+  if (!environmentId) return null;
+  const environment = await environmentSigningSecret(db, environmentId);
+  if (!environment) return null;
+  const claims = await verifyUserToken(
+    credential,
+    environment.signingSecret,
+    environmentId,
+  );
+  return claims
+    ? { kind: "user", environmentId, userExternalId: claims.sub }
+    : null;
+}
+
+/** Authentication runs in MIDDLEWARE, and that is a measured decision rather
+ * than a preference (research R5, verified in T004). Chapter 2.6 found that
+ * Nest constructs request-scoped providers BEFORE the enhancer chain, so a
+ * guard cannot be the thing that resolves tenant scope — whatever it stashes on
+ * the request is invisible to the factory that needs it. The observed order on
+ * this code path is:
+ *
+ *     middleware  ->  request-scoped factory  ->  guard
+ *
+ * which is exactly enough room: the middleware resolves the principal, the
+ * factory reads `req.principal.environmentId`, and the guard is left with the
+ * narrower job it is actually good at — deciding whether this route accepts
+ * this class of credential.
+ *
+ * It NEVER throws. A request that presents nothing simply has no principal, and
+ * pre-credential routes (signup, health) are reached that way on purpose. A
+ * request that presents something invalid also has no principal, so "absent"
+ * and "does not verify" arrive at the same 401 — which is all a caller should
+ * be able to learn.
+ */
+@Injectable()
+export class AuthenticateMiddleware implements NestMiddleware {
+  constructor(@Inject(AUTH_DB) private readonly db: Db) {}
+
+  async use(
+    req: RequestWithPrincipal,
+    _res: unknown,
+    next: () => void,
+  ): Promise<void> {
+    const credential = bearerCredential(req.headers);
+    if (credential !== null) {
+      const principal = await resolvePrincipal(this.db, credential);
+      if (principal !== null) req.principal = principal;
+    }
+    next();
+  }
+}
+```
+
+Guard còn lại nhỏ hơn guard nó thay thế. `EnvironmentContextGuard` resolve một
+tenant từ header; `CredentialGuard` không resolve gì cả. Nó hỏi đúng một câu —
+credential class này có được dùng route này không? — và tạo ra hai refusals mà
+chương này nói tới.
+
+```ts title="services/api/src/auth/credential.guard.ts"
+import {
+  ForbiddenException,
+  Injectable,
+  SetMetadata,
+  UnauthorizedException,
+  type CanActivate,
+  type ExecutionContext,
+} from "@nestjs/common";
+import { Reflector } from "@nestjs/core";
+
+import {
+  describePrincipalKind,
+  type PrincipalKind,
+  type RequestWithPrincipal,
+} from "./principal";
+
+const ACCEPTS = "relay:accepts";
+
+/** What a route accepts, declared on the route (research R6). The default is
+ * "either class", so a handler only says something when it is narrower than
+ * that — and the narrow cases are the interesting ones: FR-AUT-09's dev-token
+ * endpoint and FR-AUT-10's administrative operations want an API key
+ * specifically, not merely a valid credential. */
+export const Accepts = (...kinds: PrincipalKind[]) => SetMetadata(ACCEPTS, kinds);
+
+const EITHER: PrincipalKind[] = ["application", "user"];
+
+function expectation(kinds: PrincipalKind[]): string {
+  return kinds.map(describePrincipalKind).join(" or ");
+}
+
+/** The guard that used to be `EnvironmentContextGuard` (2.2), doing a smaller
+ * job. It no longer resolves anything — the middleware did that, from a
+ * credential rather than from a header the caller asserted — so all that is left
+ * is the question a guard can actually answer: may THIS class of credential use
+ * THIS route?
+ *
+ * The two refusals it produces are the chapter's subject:
+ *
+ *   401 — nothing valid was presented. Absent and invalid are the same answer.
+ *   403 `wrong_credential_type` — a perfectly good credential of the wrong kind.
+ *
+ * The 403's message names the CLASS presented and the class expected, and never
+ * the credential: "the key rk_dev_abc… is not valid" is how a live secret ends
+ * up in a support ticket (NFR-SEC-06, research R9).
+ */
+@Injectable()
+export class CredentialGuard implements CanActivate {
+  constructor(private readonly reflector: Reflector) {}
+
+  canActivate(context: ExecutionContext): boolean {
+    const accepted =
+      this.reflector.getAllAndOverride<PrincipalKind[]>(ACCEPTS, [
+        context.getHandler(),
+        context.getClass(),
+      ]) ?? EITHER;
+
+    const req = context.switchToHttp().getRequest<RequestWithPrincipal>();
+    const principal = req.principal;
+
+    if (!principal) {
+      throw new UnauthorizedException(
+        `this route requires a credential: ${expectation(accepted)}, presented as "Authorization: Bearer …"`,
+      );
+    }
+
+    if (!accepted.includes(principal.kind)) {
+      throw new ForbiddenException({
+        code: "wrong_credential_type",
+        message: `this route expects ${expectation(accepted)}; ${describePrincipalKind(
+          principal.kind,
+        )} was presented`,
+      });
+    }
+
+    return true;
+  }
+}
+```
+
+## Lỗi SRS đã dự đoán
+
+SRS có một design note dưới authentication requirements, và nó cụ thể khác
+thường:
+
+> Nhầm lẫn giữa API keys và user tokens là failure phổ biến nhất ở lần
+> integration đầu tiên. FR-AUT-03 và FR-AUT-09 tồn tại riêng để giảm nó, và
+> error message khi dùng sai credential type phải gọi tên lỗi đó một cách rõ
+> ràng.
+
+Một `401 unauthorized` generic satisfy status code và fail requirement đó hoàn
+toàn. Một người đang cầm credential hoàn toàn valid, nhưng present ở sai cửa,
+không học được gì khi bị nói là unauthorised — họ sẽ check secret, rotate key,
+và đọc docs lại, trong khi không cái nào là vấn đề.
+
+Vì vậy class sai có code riêng và message gọi tên cả hai phía:
+
+```json
+{
+  "code": "wrong_credential_type",
+  "message": "this route expects an API key; an end-user token was presented",
+  "docs_url": "https://relay.example/docs/errors/wrong_credential_type"
+}
+```
+
+Chú ý thứ message *không* chứa. Nó gọi tên **class**, không bao giờ gọi tên
+credential. "The key `rk_dev_abc…` is not valid" là cách một live secret lọt vào
+support ticket, screenshot, và log aggregator, và NFR-SEC-06 cấm chính xác việc
+đó. Có một test grep mọi log line và mọi error body sinh ra trong một batch
+failures cố ý, và fail nếu bất kỳ cái nào chứa secret.
+
+Walk cho thấy cả hai credentials đều hoạt động và cả hai refusals đều giữ:
+
+```console
+$ node scripts/credential-walk.mjs
+api key (shown once)       rk_dev_2777b9f8ef4…
+its prefix                 rk_dev_
+POST with the key          201 seq=1
+dev-token                  200 expires 2026-08-08T14:30:59.000Z
+socket with the token      open as tuan
+token → key-only route     403 wrong_credential_type
+                           "this route expects an API key; an end-user token was presented"
+key → socket               closed 4001
+
+heard as tuan; both credentials worked, both refusals held.
+```
+
+Endpoint ở giữa transcript đó là của FR-AUT-09, và nó tồn tại vì một lý do:
+nếu không có nó, authenticated message đầu tiên của developer bị chặn sau việc
+implement JWT minting. Nó nhận API key và trả token. Nó chỉ sống trong
+`development` — và cố ý trả `404` trong production thay vì `403`. 403 nói *bạn
+thiếu một permission*, mời người ta đi tìm permission để unlock nó. 404 nói
+*route này không tồn tại ở đây*, và đó là sự thật.
+
+```ts title="services/api/src/auth/dev-token.controller.ts"
+import {
+  BadRequestException,
+  Body,
+  Controller,
+  HttpCode,
+  Inject,
+  NotFoundException,
+  Post,
+  Req,
+  UseGuards,
+} from "@nestjs/common";
+import { z } from "zod";
+
+import type { Db } from "../db/client";
+import { environmentSigningSecret } from "../db/repository";
+import { AUTH_DB } from "./authenticate.middleware";
+import { Accepts, CredentialGuard } from "./credential.guard";
+import type { RequestWithPrincipal } from "./principal";
+import { MAX_TOKEN_LIFETIME_SECONDS, mintUserToken } from "./user-token";
+import { ZodValidationPipe } from "../messages/zod-validation.pipe";
+
+// FR-AUT-09: the development-only endpoint that turns an API key into an
+// end-user token. It exists so a developer reaches a first authenticated
+// message before writing any token-signing code of their own — the alternative
+// being a quickstart that starts with "implement JWT minting".
+//
+// The signing secret never leaves the api, which is the same reason the gateway
+// asks rather than verifies (research R1): a per-environment secret handed to a
+// second process is a secret in two places.
+
+const devTokenRequestSchema = z.object({
+  user: z.string().min(1),
+  ttl_seconds: z.number().int().positive().max(MAX_TOKEN_LIFETIME_SECONDS).optional(),
+});
+
+type DevTokenRequest = z.infer<typeof devTokenRequestSchema>;
+
+const DEFAULT_TTL_SECONDS = 3600;
+
+@Controller("auth")
+export class DevTokenController {
+  constructor(@Inject(AUTH_DB) private readonly db: Db) {}
+
+  @Post("dev-token")
+  // 200, not Nest's default 201 for a POST: nothing was created. The token is
+  // derived from a key that already existed, and the contract says 200.
+  @HttpCode(200)
+  // An API key and nothing else. A route that minted end-user tokens from an
+  // end-user token would let a leaked token extend itself indefinitely, and no
+  // requirement asks for it (research R8's rejected alternative, same shape).
+  @Accepts("application")
+  @UseGuards(CredentialGuard)
+  async mint(
+    @Body(new ZodValidationPipe(devTokenRequestSchema)) body: DevTokenRequest,
+    @Req() req: RequestWithPrincipal,
+  ): Promise<{ token: string; expires_at: string }> {
+    const principal = req.principal!;
+    const environment = await environmentSigningSecret(
+      this.db,
+      principal.environmentId,
+    );
+    if (!environment) throw new BadRequestException("unknown environment");
+
+    // 404 and not 403, deliberately (contracts). This is not a permission the
+    // caller lacks — it is a development affordance that does not exist in
+    // production, and a 403 would invite someone to go looking for the
+    // permission that would unlock it.
+    if (environment.kind !== "development") {
+      throw new NotFoundException("Cannot POST /auth/dev-token");
+    }
+
+    const { token, expiresAt } = await mintUserToken(environment.signingSecret, {
+      user: body.user,
+      environmentId: principal.environmentId,
+      ttlSeconds: body.ttl_seconds ?? DEFAULT_TTL_SECONDS,
+    });
+    // snake_case on the wire, camelCase inside — the same boundary rule every
+    // other response in this service follows.
+    return { token, expires_at: expiresAt };
+  }
+}
+```
+
+<Why source="NFR-SEC-06 · EIR-WS-05" locale="vi">
+
+**Vì sao token của socket nằm trong query string, khi credentials không bao giờ
+được nằm trong URLs?**
+
+Vì browser không thể set headers trên một WebSocket upgrade. Constructor
+`new WebSocket(url)` nhận một URL và không gì khác — không headers, không body.
+Mọi browser-based realtime product đều gặp vấn đề này, và các lựa chọn thành
+thật là query parameter, cookie, hoặc first frame sau khi socket open.
+
+Chúng ta dùng query parameter (shape của EIR-WS-05, không đổi từ 2.5), và đáng
+nói thẳng ra thay vì để nó trông như một contradiction. Những mitigations khiến
+nó defend được: token short-lived by construction (tối đa 24 giờ, FR-AUT-07),
+nó chỉ cấp quyền mà một end user được làm, và nó là nơi *duy nhất* trong system
+một credential xuất hiện trong URL — mọi thứ khác là bearer header, và api từ
+chối credentials từ query strings bằng cách đơn giản là không bao giờ đọc chúng
+từ đó.
+
+<ForwardRef part="Phần 5" locale="vi">Phương án first-frame — open socket khi
+chưa authenticated rồi authenticate bằng một frame — dù sao cũng là thứ protocol
+cần để client có thể bàn giao refreshed token giữa connection. Đó là clause thứ
+hai của FR-AUT-11, và nó đến cùng các chương SDK trong Phần 5.</ForwardRef>
+
+</Why>
+
+## Cả hai seams, biến mất
+
+Header trước. Retire nó là một increment riêng vì một seam half-retired còn tệ
+hơn cả hai trạng thái còn lại, và blast radius được đo chứ không đoán:
+**mười một files**, trong đó ba file là production code paths và phần còn lại là
+suites đang present header hoặc identity headers đi cùng nó.
+
+Shared development secret của gateway là increment thứ hai, và nó chạm thêm bảy
+file: cánh cửa của gateway, hai suites của nó, e2e harness, và ba walk scripts
+vốn đều tự mint tokens bằng một secret chúng biết.
+
+Check là mechanical, và tôi viết nó để expect zero thay vì "chỉ còn vài cái":
+
+```console
+$ grep -rn "x-relay-environment" services packages scripts --include=*.ts --include=*.mjs | grep -v itest
+$ grep -rn "RELAY_DEV_JWT_SECRET\|DEV_JWT_SECRET" services --include=*.ts | grep -v test
+$
+```
+
+Không gì cả. Không phải "không gì ngoài comments" — comments mô tả retired seam
+không quote nó, nên check không cần exclusions để sạch. Một check cần caveat là
+một check rồi sẽ có người explain away.
+
+File khởi đầu tất cả đi cùng chúng:
+
+```text title="services/api/src/messages/environment-context.guard.ts (deleted)"
+Retired by chapter 3.2. It resolved a tenant from a header any caller could
+type — the dev-mode seam 2.2 introduced with a named expiry date. Nothing
+replaces it one-for-one: the middleware resolves a principal from a verified
+credential, and CredentialGuard keeps only the question a guard can answer.
+```
+
+Và factory 2.2 viết đọc principal ở nơi trước đây nó đọc header. Đó là one-line
+swap mà chương đã hứa, và lý do nó vẫn là một dòng là seam đã được gọi tên và
+isolate từ ngày nó được introduce:
+
+```ts title="services/api/src/messages/messages.module.ts"
+import { Module, Scope } from "@nestjs/common";
+import { REQUEST } from "@nestjs/core";
+
+import { AuthModule } from "../auth/auth.module";
+import { createDb, createPool, type Db } from "../db/client";
+import type { RequestWithTenant } from "./request-with-tenant";
+import { Repository } from "../db/repository";
+import { MessagesController } from "./messages.controller";
+import { MessagesService } from "./messages.service";
+
+// The repository stays the plain 2.1 class — the framework's job is only
+// to construct it per request with the authenticated tenant (ADR-15's
+// scope note: guards authenticate, the data layer isolates).
+@Module({
+  imports: [AuthModule],
+  controllers: [MessagesController],
+  providers: [
+    {
+      provide: "DB",
+      useFactory: (): Db => createDb(createPool()),
+      scope: Scope.DEFAULT,
+    },
+    {
+      provide: Repository,
+      scope: Scope.REQUEST,
+      inject: ["DB", REQUEST],
+      useFactory: (db: Db, req: RequestWithTenant) =>
+        // The FACTORY reads the PRINCIPAL, not the guard's leftovers: Nest
+        // resolves request-scoped providers BEFORE the enhancer chain
+        // runs, so anything a guard stashes on the request is invisible
+        // here. Middleware runs earlier still, which is why chapter 3.2
+        // authenticates there (research R5, measured in T004).
+        //
+        // Chapter 3.2 changed WHERE the environment comes from and nothing
+        // else about this line. It used to be an environment header — a
+        // header any caller could type. It is now the environment resolved
+        // from a verified credential, so a request cannot name a tenant it
+        // has not proved it may act for. The empty-string fallback is the
+        // same as 2.2's: no principal means no scope, and the guard below
+        // turns that into a 401 before any handler runs.
+        new Repository(db, req.principal?.environmentId ?? ""),
+    },
+    MessagesService,
+  ],
+  exports: [Repository, MessagesService],
+})
+export class MessagesModule {}
+```
+
+## Những gì chương này cố ý để lại sau
+
+**Refreshed token trên một live connection (FR-AUT-11, clause thứ hai).** Một
+socket đã established sống lâu hơn token của nó — verification xảy ra lúc
+connect, và không timer nào re-check. Đó là clause đầu tiên, và nó đã được
+test. Nhưng internal hop forward cùng token đó, nên client giữ socket open quá
+expiry của token vẫn có thể *receive* và không còn *send* được. Thay vì để nó
+fail như "internal error", socket nói điều client thực sự có thể làm:
+
+```json
+{
+  "type": "error",
+  "payload": {
+    "code": "unauthorized",
+    "message": "the token this connection was opened with has expired; reconnect with a fresh one to send again",
+    "docs_url": "https://relay.example/docs/errors/unauthorized"
+  }
+}
+```
+
+Đóng gap đó đúng cách cần một protocol frame — một cách để client bàn giao token
+mới trên open connection — tức là change trên wire, và shape của wire thuộc về
+SDK nói chuyện với nó.
+
+**Rate-limited authentication failures (FR-AUT-12).** Quotas và rate limits là
+chủ đề của chương 3.6, và build nửa cái limiter ở đây nghĩa là build nó hai
+lần.
+
+**Key management.** Creating, listing và revoking keys qua API cần một console
+session để authenticate người thực hiện, và session là chương dashboard trong
+Phần 5. Revocation hôm nay đã được implement và test ở repository layer; thứ
+thiếu là cánh cửa, không phải mechanism.
+
+**Service-to-service credentials trên internal hop.** Gateway và api vẫn trust
+network giữa chúng, đúng như chương 2.5 đã record. Thứ thay đổi là gateway
+không còn *assert* identity: nó forward token của end user và api quyết định.
+Trust boundary đã đi đúng hướng; nó chưa biến mất.
+
+## Các tests, và thứ chúng giữ
+
+Mười hai invariants, mỗi cái có một cái tên nói nó protect điều gì. Chín cái
+chạy real HTTP against Postgres, hai cái pure, và một cái cần socket:
+
+```console
+$ pnpm --filter @relay/api test:integration src/auth/credentials.itest.ts
+✓ invariant 1: a key's secret is returned once and is unrecoverable afterwards
+✓ invariant 2: no credential is a 401 that names what the route expects
+✓ invariant 3: the wrong class is a 403 naming presented and expected
+✓ invariant 4: a foreign key sees nothing, and it looks exactly like absent
+✓ invariant 5: a revoked key is refused on the very next request
+✓ invariant 6: several active keys work at once, which is what rotation needs
+✓ invariant 7: a token is refused when expired, malformed, mis-signed, foreign, or over-long
+✓ invariant 9: the dev-token endpoint mints in development and does not exist in production
+✓ invariant 11: no credential appears in a log line or an error body
+✓ signup hands over exactly one key, and only when it creates something
+Tests  10 passed (10)
+```
+
+Invariant 4 là cái tôi sẽ giữ nếu chỉ được giữ một cái. Key của environment A
+present channel của environment B nhận 404 — và test assert response đó
+**byte-identical** với response bạn nhận khi channel không tồn tại ở bất kỳ đâu.
+Isolation mà leak sự tồn tại của neighbour thì không phải isolation; nó là một
+directory.
+
+```ts title="services/api/src/auth/credentials.itest.ts"
+import "reflect-metadata";
+
+import { Test } from "@nestjs/testing";
+import type { INestApplication } from "@nestjs/common";
+import { SignJWT } from "jose";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+
+import { AppModule } from "../app.module";
+import { createDb, createPool, type Db } from "../db/client";
+import {
+  createApiKey,
+  createEnvironment,
+  environmentSigningSecret,
+  provisionOrganisation,
+  Repository,
+  revokeApiKey,
+} from "../db/repository";
+import { MAX_TOKEN_LIFETIME_SECONDS } from "./user-token";
+
+// The refusals, over real HTTP against the compose Postgres (chapter 3.2).
+// Invariants 1-7, 9 and 11 of contracts/credentials.md live here; 8 and 12 are
+// pure and live in the unit lane; 10 needs a socket and lives in the gateway's
+// session.itest.ts.
+//
+// Every environment in this file is minted here. Two suites sharing an
+// environment would let one suite's key see another's channels — 2.1's
+// isolation property is what makes a test lane like this cheap.
+
+describe("credentials", () => {
+  let app: INestApplication;
+  let url: string;
+  let db: Db;
+
+  let env: { id: string };
+  let key: { id: string; credential: string };
+  let channelId: string;
+
+  let foreign: { id: string };
+  let foreignKey: { credential: string };
+  let foreignChannelId: string;
+
+  let production: { id: string };
+  let productionKey: { credential: string };
+
+  const post = (body: unknown, credential?: string, channel = channelId) =>
+    fetch(`${url}/v1/channels/${channel}/messages`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...(credential ? { authorization: `Bearer ${credential}` } : {}),
+      },
+      body: JSON.stringify(body),
+    });
+
+  const devToken = (credential: string, body: unknown = { user: "tuan" }) =>
+    fetch(`${url}/auth/dev-token`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${credential}`,
+      },
+      body: JSON.stringify(body),
+    });
+
+  /** A token this api would accept, or a deliberately broken variant of one —
+   * signed with the environment's own secret, the way the real minter does. */
+  const signToken = async (
+    over: {
+      env?: string;
+      sub?: string;
+      iat?: number;
+      exp?: number;
+      secret?: string;
+    } = {},
+  ) => {
+    const now = Math.floor(Date.now() / 1000);
+    const secret =
+      over.secret ?? (await environmentSigningSecret(db, env.id))!.signingSecret;
+    return new SignJWT({ env: over.env ?? env.id })
+      .setProtectedHeader({ alg: "HS256" })
+      .setSubject(over.sub ?? "tuan")
+      .setIssuedAt(over.iat ?? now)
+      .setExpirationTime(over.exp ?? now + 3600)
+      .sign(new TextEncoder().encode(secret));
+  };
+
+  beforeAll(async () => {
+    db = createDb(createPool());
+
+    env = await createEnvironment(db, { name: "credentials-itest" });
+    key = await createApiKey(db, { environmentId: env.id });
+    const repo = new Repository(db, env.id);
+    channelId = (await repo.createChannel("general", "public")).id;
+    await repo.createUser("tuan", "Tuan");
+
+    foreign = await createEnvironment(db, { name: "credentials-itest-other" });
+    foreignKey = await createApiKey(db, { environmentId: foreign.id });
+    foreignChannelId = (
+      await new Repository(db, foreign.id).createChannel("theirs", "public")
+    ).id;
+
+    production = await createEnvironment(db, {
+      name: "credentials-itest-prod",
+      kind: "production",
+    });
+    productionKey = await createApiKey(db, { environmentId: production.id });
+
+    app = (
+      await Test.createTestingModule({ imports: [AppModule] }).compile()
+    ).createNestApplication({ logger: false });
+    await app.listen(0);
+    url = await app.getUrl();
+  });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  it("invariant 1: a key's secret is returned once and is unrecoverable afterwards", async () => {
+    const minted = await createApiKey(db, {
+      environmentId: env.id,
+      name: "once",
+    });
+    const secret = minted.credential.split("_").at(-1)!;
+
+    // Nothing in the row it left behind contains what was returned. Read with
+    // a plain string rather than drizzle's `sql` helper: the query engine lives
+    // inside the repository layer and nowhere else (constitution I, ADR-16),
+    // and the lint rule that says so does not make an exception for tests.
+    const stored = JSON.stringify(
+      (
+        await db.execute(
+          `SELECT public_id, secret_hash, salt, prefix, name
+             FROM api_keys WHERE id = '${minted.id}'`,
+        )
+      ).rows,
+    );
+    expect(stored).not.toContain(secret);
+    expect(stored).not.toContain(minted.credential);
+
+    // And it still works — unrecoverable is not the same as unusable.
+    expect((await post({ text: "with the new key" }, minted.credential)).status).toBe(
+      201,
+    );
+  });
+
+  it("invariant 2: no credential is a 401 that names what the route expects", async () => {
+    const res = await post({ text: "anonymous" });
+    expect(res.status).toBe(401);
+    // EIR-API-04's envelope is flat — { code, message, docs_url } — the same
+    // shape 2.2 established and the WebSocket error frame mirrors.
+    const body = (await res.json()) as { code: string; message: string };
+    expect(body.code).toBe("unauthorized");
+    expect(body.message.toLowerCase()).toMatch(/credential|api key|token/);
+  });
+
+  it("invariant 3: the wrong class is a 403 naming presented and expected", async () => {
+    // The chapter's subject: an end-user token presented to a route that wants
+    // an API key. Not a 401 — the credential is valid, it is the wrong KIND.
+    const token = await signToken();
+    const res = await devToken(token);
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { code: string; message: string };
+    expect(body.code).toBe("wrong_credential_type");
+    expect(body.message).toMatch(/API key/i);
+    expect(body.message).toMatch(/end-user token/i);
+    // Never the credential itself (NFR-SEC-06).
+    expect(body.message).not.toContain(token);
+  });
+
+  it("invariant 4: a foreign key sees nothing, and it looks exactly like absent", async () => {
+    const foreignAnswer = await post({ text: "trespass" }, foreignKey.credential);
+    const absentAnswer = await post(
+      { text: "nowhere" },
+      key.credential,
+      "00000000-0000-0000-0000-000000000000",
+    );
+    expect(foreignAnswer.status).toBe(404);
+    expect(absentAnswer.status).toBe(404);
+    expect(await foreignAnswer.json()).toEqual(await absentAnswer.json());
+
+    // And the reverse direction, so the test cannot pass by both being broken.
+    expect(
+      (await post({ text: "mine" }, foreignKey.credential, foreignChannelId))
+        .status,
+    ).toBe(201);
+  });
+
+  it("invariant 5: a revoked key is refused on the very next request", async () => {
+    const doomed = await createApiKey(db, {
+      environmentId: env.id,
+      name: "doomed",
+    });
+    expect((await post({ text: "before" }, doomed.credential)).status).toBe(201);
+    await revokeApiKey(db, doomed.id);
+    // No wait, no cache to expire: verification is a live query (research R7).
+    expect((await post({ text: "after" }, doomed.credential)).status).toBe(401);
+  });
+
+  it("invariant 6: several active keys work at once, which is what rotation needs", async () => {
+    const second = await createApiKey(db, {
+      environmentId: env.id,
+      name: "rotation",
+    });
+    expect((await post({ text: "old key" }, key.credential)).status).toBe(201);
+    expect((await post({ text: "new key" }, second.credential)).status).toBe(201);
+  });
+
+  it("invariant 7: a token is refused when expired, malformed, mis-signed, foreign, or over-long", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const read = (credential?: string) =>
+      fetch(`${url}/v1/channels/${channelId}/messages`, {
+        headers: credential ? { authorization: `Bearer ${credential}` } : {},
+      });
+
+    // A good one first, so the refusals below mean something.
+    expect((await read(await signToken())).status).toBe(200);
+
+    expect((await read(await signToken({ exp: now - 60, iat: now - 3600 }))).status)
+      .toBe(401);
+    expect((await read("eyJhbGciOiJIUzI1NiJ9.not-a-token")).status).toBe(401);
+    expect((await read(await signToken({ secret: "wrong-secret" }))).status).toBe(
+      401,
+    );
+    expect((await read(await signToken({ env: foreign.id }))).status).toBe(401);
+    expect(
+      (
+        await read(
+          await signToken({
+            iat: now,
+            exp: now + MAX_TOKEN_LIFETIME_SECONDS + 60,
+          }),
+        )
+      ).status,
+    ).toBe(401);
+  });
+
+  it("invariant 9: the dev-token endpoint mints in development and does not exist in production", async () => {
+    const minted = await devToken(key.credential);
+    expect(minted.status).toBe(200);
+    const body = (await minted.json()) as { token: string; expires_at: string };
+    expect(typeof body.token).toBe("string");
+    expect(Date.parse(body.expires_at)).toBeGreaterThan(Date.now());
+
+    // The token it minted is a usable credential, which is the whole point of
+    // the endpoint existing (FR-AUT-09).
+    expect(
+      (
+        await fetch(`${url}/v1/channels/${channelId}/messages`, {
+          headers: { authorization: `Bearer ${body.token}` },
+        })
+      ).status,
+    ).toBe(200);
+
+    // A production key gets a 404, not a 403: the route is not a permission
+    // this caller lacks, it is an affordance that does not exist there.
+    const refused = await devToken(productionKey.credential);
+    expect(refused.status).toBe(404);
+
+    // FR-AUT-07's bound is enforced at the endpoint too.
+    expect(
+      (await devToken(key.credential, { user: "tuan", ttl_seconds: 86_401 }))
+        .status,
+    ).toBe(400);
+    expect((await devToken(key.credential, {})).status).toBe(400);
+  });
+
+  it("invariant 11: no credential appears in a log line or an error body", async () => {
+    // The one request-log line per request (1.4's middleware) plus every error
+    // envelope, captured while credentials are used and abused.
+    const captured: string[] = [];
+    const original = process.stdout.write.bind(process.stdout);
+    (process.stdout as unknown as { write: typeof original }).write = ((
+      chunk: string | Uint8Array,
+      ...rest: unknown[]
+    ) => {
+      captured.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString());
+      return (original as (...args: unknown[]) => boolean)(chunk, ...rest);
+    }) as typeof original;
+
+    const token = await signToken();
+    const bodies: string[] = [];
+    try {
+      for (const attempt of [
+        post({ text: "logged" }, key.credential),
+        post({ text: "logged" }, `${key.credential}-tampered`),
+        post({ text: "logged" }, foreignKey.credential),
+        devToken(token),
+        post({ text: "logged" }),
+      ]) {
+        bodies.push(await (await attempt).text());
+      }
+    } finally {
+      (process.stdout as unknown as { write: typeof original }).write = original;
+    }
+
+    const haystack = captured.join("") + bodies.join("");
+    const secret = key.credential.split("_").at(-1)!;
+    expect(haystack).not.toContain(key.credential);
+    expect(haystack).not.toContain(secret);
+    expect(haystack).not.toContain(foreignKey.credential);
+    expect(haystack).not.toContain(token);
+    // The prefix alone is not a secret and may legitimately appear.
+  });
+
+  it("signup hands over exactly one key, and only when it creates something", async () => {
+    // R8: with no console session, signup is the only thing that can bootstrap
+    // a first credential. The second call to the same identity must not mint a
+    // second one (FR-AUT-02: the old secret is gone, and rotation is the answer).
+    const account = `credentials-itest-${Date.now()}`;
+    const first = await provisionOrganisation(db, {
+      provider: "github",
+      providerAccountId: account,
+      organisationName: "first key co",
+    });
+    expect(first.created).toBe(true);
+    expect(first.apiKey).toBeDefined();
+    expect(first.apiKey!.secret.startsWith("rk_dev_")).toBe(true);
+
+    const again = await provisionOrganisation(db, {
+      provider: "github",
+      providerAccountId: account,
+      organisationName: "first key co",
+    });
+    expect(again.created).toBe(false);
+    expect(again.apiKey).toBeUndefined();
+
+    // And the key it did hand over works on the environment it belongs to.
+    const repo = new Repository(db, first.environment.id);
+    const channel = await repo.createChannel("signup-key", "public");
+    expect(
+      (await post({ text: "bootstrapped" }, first.apiKey!.secret, channel.id))
+        .status,
+    ).toBe(201);
+  });
+});
+```
+
+Revocation đáng có một câu về thứ *không* nằm ở đó. FR-AUT-05 đưa ra bound năm
+giây để revoked key ngừng hoạt động, điều thường được đọc là "invalidate cache
+của bạn đủ nhanh". Cách đọc rẻ hơn là không có cache: một indexed lookup per
+request, trong connection pool request đã dùng, và bound đúng by construction
+trên mọi instance mà không có gì cần invalidate. Nếu profiling sau này biến nó
+thành bottleneck, fix là cache cộng invalidation channel — tức fabric của chương
+2.6 làm thêm job thứ hai, và nó thuộc về chương nào đo được nhu cầu đó, không
+phải chương này.
+
+## Blast radius, từng file một
+
+Hai seam retirements chạm tới hai mươi chín files mà các chương trước đã cho
+bạn thấy. Tất cả đều ở đây, vì một chương thay đổi code bạn đã copy mà không
+nói ra chính là cách tutorial bắt đầu nói dối.
+
+Phần lớn là ba dòng: một header được đổi thành bearer credential trong một
+suite, một walk script hỏi api xin token thay vì tự sign token. Hãy đọc chúng
+như một thứ thay vì hai mươi chín thứ — đây là chi phí của một seam, trả đủ vào
+ngày nó được retire.
+
+```diff title="packages/protocol/src/codes.ts"
+@@ -21,6 +21,13 @@ export const ERROR_CODES = {
+   unknown_frame_type: "the type discriminator names no known frame",
+   unauthorized: "the connection is not authorized for this action",
+   rate_limited: "too many frames; slow down and retry",
++  // Chapter 3.2. The SRS singles this out as the most common first-integration
++  // failure, so it gets its own code instead of a generic `unauthorized`: the
++  // response has to say which class was presented and which the route wanted.
++  // The MESSAGE names the class and never the credential — "the key rk_dev_abc…
++  // is invalid" is how a live secret reaches a support ticket (NFR-SEC-06).
++  wrong_credential_type:
++    "the credential class presented cannot use this route; the message names presented and expected",
+ } as const;
+ 
+ export type ErrorCode = keyof typeof ERROR_CODES;
+```
+
+```diff title="packages/protocol/src/internal.ts"
+@@ -87,7 +87,27 @@ export const internalMembershipsResponseSchema = z.strictObject({
+   channel_ids: z.array(z.string().min(1)),
+ });
+ 
++/** api → gateway, chapter 3.2: who the presented token belongs to, and what it
++ * may hear — in ONE answer.
++ *
++ * This replaces the memberships response above rather than joining it. The
++ * gateway used to verify a token itself and then ask "what may this user hear";
++ * it now presents the token and is told both. The round-trip count at connect is
++ * unchanged, and the gateway stops being the thing that decides identity
++ * (research R1).
++ *
++ * `user` is the EXTERNAL id, as everywhere else on this contract: internal uuids
++ * are the api's business. */
++export const internalSessionResponseSchema = z.strictObject({
++  environment_id: z.string().min(1),
++  user: z.string().min(1),
++  channel_ids: z.array(z.string().min(1)),
++});
++
+ export type InternalSendRequest = z.infer<typeof internalSendRequestSchema>;
++export type InternalSessionResponse = z.infer<
++  typeof internalSessionResponseSchema
++>;
+ export type InternalSendResponse = z.infer<typeof internalSendResponseSchema>;
+ export type InternalMembershipsResponse = z.infer<
+   typeof internalMembershipsResponseSchema
+```
+
+```diff title="services/api/package.json"
+@@ -19,6 +19,7 @@
+     "@relay/protocol": "workspace:*",
+     "@relay/service-kit": "workspace:*",
+     "drizzle-orm": "^0.45.2",
++    "jose": "^6.2.7",
+     "pg": "^8.22.0",
+     "reflect-metadata": "^0.2.2",
+     "rxjs": "^7.8.2",
+```
+
+```diff title="services/api/src/app.module.ts"
+@@ -5,6 +5,8 @@ import {
+ } from "@nestjs/common";
+ import { APP_FILTER } from "@nestjs/core";
+ 
++import { AuthModule } from "./auth/auth.module";
++import { AuthenticateMiddleware } from "./auth/authenticate.middleware";
+ import { HealthController } from "./health.controller";
+ import { InternalModule } from "./internal/internal.module";
+ import { MessagesModule } from "./messages/messages.module";
+@@ -18,7 +20,7 @@ import { RequestContextMiddleware } from "./request-context.middleware";
+ // provider (APP_FILTER) instead of wiring it in main.ts means every entry
+ // point — including tests — gets the same error envelope for free.
+ @Module({
+-  imports: [MessagesModule, InternalModule, TenancyModule],
++  imports: [AuthModule, MessagesModule, InternalModule, TenancyModule],
+   controllers: [HealthController],
+   providers: [
+     { provide: LOGGER, useFactory: apiLogger },
+@@ -28,6 +30,12 @@ import { RequestContextMiddleware } from "./request-context.middleware";
+ })
+ export class AppModule implements NestModule {
+   configure(consumer: MiddlewareConsumer): void {
+-    consumer.apply(RequestContextMiddleware).forRoutes("{*path}");
++    // Order is the chain: the request gets its id first, then its principal.
++    // Chapter 3.2 put authentication HERE rather than in a guard because Nest
++    // constructs request-scoped providers before the enhancer chain runs — the
++    // finding 2.6 paid for, measured again on this path in T004.
++    consumer
++      .apply(RequestContextMiddleware, AuthenticateMiddleware)
++      .forRoutes("{*path}");
+   }
+ }
+```
+
+```ts title="services/api/src/auth/auth.module.ts"
+import { Module } from "@nestjs/common";
+
+import { createDb, createPool, type Db } from "../db/client";
+import { AUTH_DB, AuthenticateMiddleware } from "./authenticate.middleware";
+import { CredentialGuard } from "./credential.guard";
+import { DevTokenController } from "./dev-token.controller";
+
+// Authentication's home (chapter 3.2), beside messages/, internal/ and
+// tenancy/. It lives in the api and not in a package or a new service for one
+// reason: authentication is a question about data — which key is this, which
+// environment signs that token — and the api owns the data (ADR-04). The
+// gateway's share of the work is one call it was already making (research R1).
+//
+// The DB handle is its own provider rather than MessagesModule's: this module
+// runs BEFORE any tenant scope exists, and borrowing the request-scoped
+// machinery 2.2 built would invert the order it needs.
+@Module({
+  controllers: [DevTokenController],
+  providers: [
+    { provide: AUTH_DB, useFactory: (): Db => createDb(createPool()) },
+    AuthenticateMiddleware,
+    CredentialGuard,
+  ],
+  exports: [AUTH_DB, AuthenticateMiddleware, CredentialGuard],
+})
+export class AuthModule {}
+```
+
+```diff title="services/api/src/protocol-error.filter.ts"
+@@ -21,14 +21,33 @@ export class ProtocolErrorFilter implements ExceptionFilter {
+     // REST error codes by status (chapter 2.2 widened this: a 400 that
+     // calls itself "internal_error" is a lie the client cannot act on).
+     // The registry stays here until an API chapter owns a REST one.
++    //
++    // Chapter 3.2 widened this twice. A thrower may now NAME its code, because
++    // `wrong_credential_type` is a distinction the status alone cannot carry: a
++    // 403 that calls itself "forbidden" tells an integrator they lack a
++    // permission, when what they actually did was present the wrong kind of
++    // credential. And 403 finally has a fallback — it used to land in
++    // "internal_error", which was a lie in the same family as the 400 that 2.2
++    // fixed.
++    const response =
++      exception instanceof HttpException ? exception.getResponse() : null;
++    const named =
++      typeof response === "object" &&
++      response !== null &&
++      typeof (response as { code?: unknown }).code === "string"
++        ? (response as { code: string }).code
++        : null;
+     const code =
+-      status === 400
++      named ??
++      (status === 400
+         ? "invalid_request"
+         : status === 401
+           ? "unauthorized"
+-          : status === 404
+-            ? "not_found"
+-            : "internal_error";
++          : status === 403
++            ? "forbidden"
++            : status === 404
++              ? "not_found"
++              : "internal_error");
+     const message =
+       exception instanceof HttpException
+         ? exception.message
+```
+
+```diff title="services/api/src/messages/messages.controller.ts"
+@@ -8,7 +8,7 @@ import {
+   UseGuards,
+ } from "@nestjs/common";
+ 
+-import { EnvironmentContextGuard } from "./environment-context.guard";
++import { CredentialGuard } from "../auth/credential.guard";
+ import { MessagesService } from "./messages.service";
+ import { historyQuerySchema, sendMessageBodySchema } from "./messages.schema";
+ // `import type` is required, not stylistic: with isolatedModules and
+@@ -21,8 +21,14 @@ import { ZodValidationPipe } from "./zod-validation.pipe";
+ // The api's first product endpoint (chapter 2.2). Validation is zod at the
+ // boundary — the same schema family as @relay/protocol, so the REST body
+ // and the WebSocket frame payload cannot drift (1.3's payoff, again).
++//
++// Chapter 3.2 swapped the guard. `EnvironmentContextGuard` resolved a tenant
++// from a header the caller asserted; `CredentialGuard` only asks whether the
++// principal the middleware already resolved is allowed here. Both classes are
++// (FR-MSG-13 lets a server send on a user's behalf, and FR-AUT-10 does not
++// reserve these routes), so this one declares nothing narrower.
+ @Controller("v1/channels/:channelId/messages")
+-@UseGuards(EnvironmentContextGuard)
++@UseGuards(CredentialGuard)
+ export class MessagesController {
+   constructor(private readonly messages: MessagesService) {}
+ 
+```
+
+```ts title="services/api/src/internal/internal.controller.ts"
+import {
+  BadRequestException,
+  Body,
+  Controller,
+  Post,
+  Req,
+  UseGuards,
+} from "@nestjs/common";
+
+import { Accepts, CredentialGuard } from "../auth/credential.guard";
+import type { RequestWithPrincipal } from "../auth/principal";
+import { MessagesService } from "../messages/messages.service";
+import { Repository } from "../db/repository";
+import {
+  internalSendRequestSchema,
+  type InternalSendRequest,
+} from "@relay/protocol";
+
+import { ZodValidationPipe } from "../messages/zod-validation.pipe";
+
+/** The connected user, from the token the gateway forwarded. The guard has
+ * already refused anything that is not a user principal, so this narrowing is
+ * about the type system rather than about trust. */
+function principalUser(req: RequestWithPrincipal): string {
+  const principal = req.principal;
+  if (principal?.kind !== "user") {
+    throw new BadRequestException("internal routes act for an end user");
+  }
+  return principal.userExternalId;
+}
+
+// The internal surface (chapter 2.5): the routes the gateway calls on a
+// connected user's behalf. They reuse the SAME service methods as the
+// public routes — the write path has one implementation (ADR-04), and the
+// socket is a new door onto it, not a second path.
+//
+// DECISION (chapter 2.5, narrowed by 3.2): these routes are still
+// network-internal, and there is still no service-to-service credential between
+// the gateway and the api — that remains Part 3 hardening. What changed is what
+// they trust. The gateway used to ASSERT identity in two headers it invented
+// from a token it verified locally; it now forwards the END USER'S OWN token,
+// and the api resolves the identity itself. The seam got narrower, not wider:
+// the gateway can no longer claim to be somebody it cannot present a token for.
+@Controller("internal")
+// The end user's token, not a key: these routes exist to act for a connected
+// person, and a route that also accepted an application credential would let a
+// key act as any user without saying which (research R6).
+@Accepts("user")
+@UseGuards(CredentialGuard)
+export class InternalController {
+  constructor(
+    private readonly repo: Repository,
+    private readonly messages: MessagesService,
+  ) {}
+
+  @Post("messages")
+  async send(
+    @Body(new ZodValidationPipe(internalSendRequestSchema))
+    body: InternalSendRequest,
+    @Req() req: RequestWithPrincipal,
+  ) {
+    const userExternalId = principalUser(req);
+    const user = await this.repo.getUserByExternalId(userExternalId);
+    if (!user) throw new BadRequestException("unknown user");
+    const message = await this.messages.send(
+      body.channel_id,
+      {
+        text: body.text,
+        ...(body.idempotency_key !== undefined && {
+          idempotency_key: body.idempotency_key,
+        }),
+      },
+      // Chapter 2.6: the sender is RESOLVED here and, until now, dropped
+      // here — every socket-written row had user_id NULL. Fan-out cannot
+      // build a message.created frame without a sender, so the write path
+      // finally records the one it already had in its hand.
+      user.id,
+    );
+    // `user` is echoed as the EXTERNAL id: internal uuids are ours, and
+    // the frame this becomes is client-facing.
+    return { ...message, user: userExternalId };
+  }
+}
+```
+
+```ts title="services/api/src/internal/internal.module.ts"
+import { Module } from "@nestjs/common";
+
+import { MessagesModule } from "../messages/messages.module";
+import { AuthModule } from "../auth/auth.module";
+import { BackfillController } from "./backfill.controller";
+import { InternalController } from "./internal.controller";
+import { SessionController } from "./session.controller";
+
+// The internal routes reuse MessagesModule's providers wholesale — the
+// request-scoped Repository, the guard, the service. One write path, two
+// doors (ADR-04/05).
+@Module({
+  imports: [MessagesModule, AuthModule],
+  controllers: [InternalController, BackfillController, SessionController],
+})
+export class InternalModule {}
+```
+
+```diff title="services/api/src/internal/backfill.controller.ts"
+@@ -2,8 +2,8 @@ import {
+   BadRequestException,
+   Body,
+   Controller,
+-  Headers,
+   Post,
++  Req,
+   UseGuards,
+ } from "@nestjs/common";
+ 
+@@ -15,7 +15,8 @@ import {
+   type Message,
+ } from "@relay/protocol";
+ 
+-import { EnvironmentContextGuard } from "../messages/environment-context.guard";
++import { Accepts, CredentialGuard } from "../auth/credential.guard";
++import type { RequestWithPrincipal } from "../auth/principal";
+ import { Repository, type MessageWithSender } from "../db/repository";
+ import { ZodValidationPipe } from "../messages/zod-validation.pipe";
+ 
+@@ -29,7 +30,10 @@ import { ZodValidationPipe } from "../messages/zod-validation.pipe";
+ // gateway needs frames, and this is the boundary where one becomes the
+ // other (the same division of labour 2.6 settled for the public send).
+ @Controller("internal")
+-@UseGuards(EnvironmentContextGuard)
++// Chapter 3.2: the end user's own token, forwarded by the gateway, rather than
++// two headers the gateway asserted. Same trust boundary, narrower claim.
++@Accepts("user")
++@UseGuards(CredentialGuard)
+ export class BackfillController {
+   constructor(private readonly repo: Repository) {}
+ 
+@@ -37,10 +41,13 @@ export class BackfillController {
+   async backfill(
+     @Body(new ZodValidationPipe(internalBackfillRequestSchema))
+     body: InternalBackfillRequest,
+-    @Headers("x-relay-user") userExternalId?: string,
++    @Req() req: RequestWithPrincipal,
+   ): Promise<InternalBackfillResponse> {
+-    if (!userExternalId) throw new BadRequestException("missing x-relay-user");
+-    const user = await this.repo.getUserByExternalId(userExternalId);
++    const principal = req.principal;
++    if (principal?.kind !== "user") {
++      throw new BadRequestException("internal routes act for an end user");
++    }
++    const user = await this.repo.getUserByExternalId(principal.userExternalId);
+     // An unknown user resumes nothing — the same answer memberships gives,
+     // for the same reason: delivery is not identity forensics.
+     if (!user) return { channels: {} };
+```
+
+```diff title="services/api/src/tenancy/signup.controller.ts"
+@@ -35,7 +35,9 @@ import {
+ //
+ // What these routes do NOT do: issue a session. A session is a credential,
+ // credentials are 3.2's subject, and the dashboard that would consume one is
+-// Part 5. The callback reports what it created and stops there.
++// Part 5. The callback reports what it created — and, from 3.2, hands over the
++// environment's first API key, because with no session nothing else could
++// bootstrap one (research R8).
+ 
+ /** The two things this controller needs from the response object.
+  *
+@@ -127,6 +129,18 @@ export class SignupController {
+       organisation: result.organisation,
+       application: result.application,
+       environment: result.environment,
++      // Chapter 3.2, FR-AUT-02: the environment's first key, and the ONLY time
++      // its secret exists outside a hash. It is present only when this call
++      // created the tenant — a returning owner is not handed a new secret,
++      // because the old one is unrecoverable by design and the recovery for a
++      // lost key is rotation, not retrieval (research R8).
++      ...(result.apiKey && {
++        api_key: {
++          prefix: result.apiKey.prefix,
++          secret: result.apiKey.secret,
++          shown_once: true,
++        },
++      }),
+       created: result.created,
+     };
+   }
+```
+
+```diff title="services/gateway/src/api-client.ts"
+@@ -1,11 +1,12 @@
+ import {
+   internalBackfillResponseSchema,
+-  internalMembershipsResponseSchema,
+   internalSendResponseSchema,
++  internalSessionResponseSchema,
+   type InternalBackfillRequest,
+   type InternalBackfillResponse,
+   type InternalSendRequest,
+   type InternalSendResponse,
++  type InternalSessionResponse,
+ } from "@relay/protocol";
+ 
+ // The gateway's only road to state (chapter 2.5, ADR-05): internal HTTP to
+@@ -20,13 +21,39 @@ import {
+ // the day the api changes a field name, this fails loudly here instead of
+ // producing an `undefined` seq in an ack three layers away.
+ 
++/** A failed internal call, carrying the status. Chapter 3.2 needs the
++ * distinction: a 401 from the api means the CONNECTION'S credential is no longer
++ * good, which a client can act on by reconnecting, while a 500 means we are
++ * broken and it should not. `new Error("send failed")` could not tell them
++ * apart, so the socket answered both the same way. */
++export class ApiError extends Error {
++  readonly status: number;
++
++  constructor(what: string, status: number) {
++    super(`${what} failed: ${status}`);
++    this.name = "ApiError";
++    // Declared and assigned rather than a constructor parameter property:
++    // `erasableSyntaxOnly` is on everywhere except the api (ADR-15, chapter
++    // 1.4), and the gateway keeps that guarantee.
++    this.status = status;
++  }
++}
++
+ export interface Identity {
+   environmentId: string;
+   userExternalId: string;
++  /** Chapter 3.2: the token the client presented at connect, carried so the
++   * internal hop can FORWARD it instead of asserting who the caller is. The
++   * gateway holds it; it does not verify it and holds no secret that could. */
++  token: string;
+ }
+ 
+ export interface ApiClient {
+-  memberships(identity: Identity): Promise<string[]>;
++  /** Chapter 3.2: present the token, be told who it belongs to and what it may
++   * hear. Null means the api answered "not valid" — distinct from a throw, which
++   * means it could not answer at all, and the two must not close a socket the
++   * same way. */
++  session(token: string): Promise<InternalSessionResponse | null>;
+   /** Resume backfill (chapter 2.7): everything past the cursors, per
+    * channel, already shaped as wire frames. */
+   backfill(
+@@ -40,10 +67,14 @@ export interface ApiClient {
+ }
+ 
+ export function createApiClient(baseUrl: string): ApiClient {
++  // Chapter 3.2 retired two headers here. The gateway used to send
++  // an environment header and a user header — values it INVENTED from a token
++  // it verified with a shared development secret. It now forwards the token
++  // itself and is told who the caller is (research R1). One header instead of
++  // two, and the api is the only thing that decides identity.
+   const headers = (identity: Identity) => ({
+     "content-type": "application/json",
+-    "x-relay-environment": identity.environmentId,
+-    "x-relay-user": identity.userExternalId,
++    authorization: `Bearer ${identity.token}`,
+   });
+ 
+   async function parse<T>(
+@@ -51,7 +82,7 @@ export function createApiClient(baseUrl: string): ApiClient {
+     schema: { safeParse: (value: unknown) => { success: boolean; data?: T } },
+     what: string,
+   ): Promise<T> {
+-    if (!res.ok) throw new Error(`${what} failed: ${res.status}`);
++    if (!res.ok) throw new ApiError(what, res.status);
+     const parsed = schema.safeParse(await res.json());
+     if (!parsed.success || parsed.data === undefined) {
+       throw new Error(`${what} returned a payload the contract does not allow`);
+@@ -60,16 +91,19 @@ export function createApiClient(baseUrl: string): ApiClient {
+   }
+ 
+   return {
+-    async memberships(identity) {
+-      const res = await fetch(`${baseUrl}/internal/memberships`, {
+-        headers: headers(identity),
++    async session(token) {
++      const res = await fetch(`${baseUrl}/internal/session`, {
++        method: "POST",
++        headers: {
++          "content-type": "application/json",
++          authorization: `Bearer ${token}`,
++        },
+       });
+-      const body = await parse(
+-        res,
+-        internalMembershipsResponseSchema,
+-        "memberships",
+-      );
+-      return body.channel_ids;
++      // 401 is an ANSWER, not a failure: the api verified the token and refused
++      // it. Everything else falls through to `parse`, which throws — the api
++      // being unreachable is a different event with a different close code.
++      if (res.status === 401 || res.status === 403) return null;
++      return parse(res, internalSessionResponseSchema, "session");
+     },
+     async backfill(identity, cursors) {
+       const res = await fetch(`${baseUrl}/internal/backfill`, {
+```
+
+```diff title="services/gateway/src/session.ts"
+@@ -10,8 +10,8 @@ import {
+ import type { Logger } from "@relay/service-kit";
+ import { WebSocketServer, type WebSocket } from "ws";
+ 
+-import type { ApiClient } from "./api-client.js";
+-import { verifyToken, type Identity } from "./auth.js";
++import { ApiError, type ApiClient } from "./api-client.js";
++import { authenticate, type Identity } from "./auth.js";
+ import type { Fanout } from "./fanout.js";
+ import { Registry, type Connection } from "./registry.js";
+ import {
+@@ -112,16 +112,29 @@ export function attachSessions({
+     }
+     const token = url.searchParams.get("token");
+     void (async () => {
+-      const identity = token ? await verifyToken(token) : null;
++      // Chapter 3.2: the api verifies, and answers with the identity AND the
++      // memberships. This is the same one call the connect path already made —
++      // it just asks a better question than "what may this user hear".
++      const result = await authenticate(api, token);
+       wss.handleUpgrade(req, socket, head, (ws) => {
+-        if (!identity) {
++        if (result.outcome === "refused") {
+           // 4001: "invalid or expired token" (EIR-WS-05). The close code is
+           // the protocol package's, not a number invented here.
+           ws.close(4001, CLOSE_CODES[4001]);
+           logger.log("info", "connection.rejected", { reason: "bad_token" });
+           return;
+         }
+-        void open(ws, identity, req.url ?? "/");
++        if (result.outcome === "unavailable") {
++          // The api could not answer. Not the client's fault, so not 4001:
++          // 1011 tells it to retry, which is the honest instruction (the same
++          // distinction 2.5 drew for the memberships lookup).
++          ws.close(1011, "session lookup failed");
++          logger.log("error", "connection.session_failed", {
++            error: result.error,
++          });
++          return;
++        }
++        void open(ws, result.identity, result.channelIds, req.url ?? "/");
+       });
+     })();
+   });
+@@ -129,6 +142,7 @@ export function attachSessions({
+   async function open(
+     socket: WebSocket,
+     identity: Identity,
++    channelIds: string[],
+     url: string,
+   ): Promise<void> {
+     // Cursors are read BEFORE anything else, because their presence decides
+@@ -138,26 +152,16 @@ export function attachSessions({
+       id: randomUUID(),
+       identity,
+       socket,
+-      channelIds: new Set(),
++      // Chapter 3.2: memberships arrived with the identity, from the session
++      // call at the door. There is no second lookup to fail here — the api is
++      // still the only source of membership (ADR-05), it just answers both
++      // questions at once, and a failure now closes the socket before it opens.
++      channelIds: new Set(channelIds),
+       missedPings: 0,
+       phase: presented === undefined ? "live" : "buffering",
+       buffer: [],
+       overflowed: false,
+     };
+-    try {
+-      connection.channelIds = new Set(await api.memberships(identity));
+-    } catch (error) {
+-      // The api is the only source of membership (ADR-05). If it cannot
+-      // answer, we do not guess — we close, and the client retries with
+-      // backoff. A session with unknown memberships would deliver nothing
+-      // and look healthy doing it.
+-      logger.log("error", "connection.memberships_failed", {
+-        connection_id: connection.id,
+-        error: String(error),
+-      });
+-      socket.close(1011, "membership lookup failed");
+-      return;
+-    }
+ 
+     registry.add(connection);
+     // Subscriptions follow membership: the first local member of a channel
+@@ -410,6 +414,22 @@ export function attachSessions({
+         connection_id: connection.id,
+         error: String(error),
+       });
++      // Chapter 3.2. A 401 here means the token this connection was opened
++      // with has aged out: the socket is still up (FR-AUT-11 says expiry must
++      // not terminate it) and still RECEIVES, because delivery never asks the
++      // api anything. Writing does. Until FR-AUT-11's second clause exists — a
++      // frame that lets a client hand over a refreshed token on the open
++      // connection — the honest instruction is "reconnect", and saying so is
++      // more useful than an "internal error" the client cannot act on.
++      if (error instanceof ApiError && error.status === 401) {
++        sendError(
++          connection.socket,
++          "unauthorized",
++          "the token this connection was opened with has expired; " +
++            "reconnect with a fresh one to send again",
++        );
++        return;
++      }
+       sendError(connection.socket, "internal_error", "send failed");
+     }
+   }
+```
+
+```diff title="services/api/src/messages/messages.itest.ts"
+@@ -6,7 +6,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
+ 
+ import { AppModule } from "../app.module";
+ import { createDb, createPool } from "../db/client";
+-import { createEnvironment, Repository } from "../db/repository";
++import { createApiKey, createEnvironment, Repository } from "../db/repository";
+ 
+ // The endpoint path (chapter 2.2): guard → pipe → service → repository →
+ // filter, over real HTTP against the compose Postgres. Its own environment,
+@@ -17,6 +17,10 @@ describe("POST /v1/channels/:channelId/messages", () => {
+   let app: INestApplication;
+   let url: string;
+   let env: { id: string };
++  // Chapter 3.2: the tenant arrives as a CREDENTIAL now, not as a header. The
++  // suite mints its own key the same way signup does — through the repository's
++  // admin surface — so nothing here needs a test-only route to exist.
++  let credential: string;
+   let channelId: string;
+   let foreignChannelId: string;
+ 
+@@ -26,6 +30,7 @@ describe("POST /v1/channels/:channelId/messages", () => {
+     channelId = (
+       await new Repository(db, env.id).createChannel("general", "public")
+     ).id;
++    credential = (await createApiKey(db, { environmentId: env.id })).credential;
+     const other = await createEnvironment(db, { name: "messages-itest-other" });
+     foreignChannelId = (
+       await new Repository(db, other.id).createChannel("theirs", "public")
+@@ -41,12 +46,12 @@ describe("POST /v1/channels/:channelId/messages", () => {
+     await app.close();
+   });
+ 
+-  const send = (body: unknown, channel = channelId, environment = env.id) =>
++  const send = (body: unknown, channel = channelId, key = credential) =>
+     fetch(`${url}/v1/channels/${channel}/messages`, {
+       method: "POST",
+       headers: {
+         "content-type": "application/json",
+-        "x-relay-environment": environment,
++        authorization: `Bearer ${key}`,
+       },
+       body: JSON.stringify(body),
+     });
+@@ -75,11 +80,11 @@ describe("POST /v1/channels/:channelId/messages", () => {
+     // not answer two ways depending on the verb.
+     const foreign = await fetch(
+       `${url}/v1/channels/${foreignChannelId}/messages?limit=10`,
+-      { headers: { "x-relay-environment": env.id } },
++      { headers: { authorization: `Bearer ${credential}` } },
+     );
+     const missing = await fetch(
+       `${url}/v1/channels/${crypto.randomUUID()}/messages?limit=10`,
+-      { headers: { "x-relay-environment": env.id } },
++      { headers: { authorization: `Bearer ${credential}` } },
+     );
+     expect(foreign.status).toBe(404);
+     expect(missing.status).toBe(404);
+```
+
+```diff title="services/api/src/internal/internal.itest.ts"
+@@ -5,13 +5,18 @@ import type { INestApplication } from "@nestjs/common";
+ import { afterAll, beforeAll, describe, expect, it } from "vitest";
+ 
+ import {
+-  internalMembershipsResponseSchema,
+   internalSendResponseSchema,
++  internalSessionResponseSchema,
+ } from "@relay/protocol";
+ 
+ import { AppModule } from "../app.module";
+ import { createDb, createPool } from "../db/client";
+-import { createEnvironment, Repository } from "../db/repository";
++import {
++  createEnvironment,
++  environmentSigningSecret,
++  Repository,
++} from "../db/repository";
++import { mintUserToken } from "../auth/user-token";
+ 
+ // The internal boundary, tested as a CONTRACT (chapter 2.6). 2.5 built these
+ // routes and verified them only through the gateway's tests, where the api
+@@ -28,6 +33,10 @@ describe("the internal surface", () => {
+   let url: string;
+   let env: { id: string };
+   let channelId: string;
++  /** Chapter 3.2: the gateway forwards the END USER'S token instead of
++   * asserting two identity headers, so this suite mints tokens the same way the
++   * dev-token endpoint does — with the environment's own signing secret. */
++  let tokenFor: (user: string) => Promise<string>;
+ 
+   beforeAll(async () => {
+     const db = createDb(createPool());
+@@ -36,6 +45,16 @@ describe("the internal surface", () => {
+     const user = await repo.createUser("tuan", "Tuan");
+     channelId = (await repo.createChannel("fleet", "public")).id;
+     await repo.addMember(channelId, user.id);
++    const signingSecret = (await environmentSigningSecret(db, env.id))!
++      .signingSecret;
++    tokenFor = async (subject: string) =>
++      (
++        await mintUserToken(signingSecret, {
++          user: subject,
++          environmentId: env.id,
++          ttlSeconds: 3600,
++        })
++      ).token;
+     app = (
+       await Test.createTestingModule({ imports: [AppModule] }).compile()
+     ).createNestApplication({ logger: false });
+@@ -47,16 +66,15 @@ describe("the internal surface", () => {
+     await app.close();
+   });
+ 
+-  const headers = (user = "tuan") => ({
++  const headers = async (user = "tuan") => ({
+     "content-type": "application/json",
+-    "x-relay-environment": env.id,
+-    "x-relay-user": user,
++    authorization: `Bearer ${await tokenFor(user)}`,
+   });
+ 
+-  const send = (body: unknown, user = "tuan") =>
++  const send = async (body: unknown, user = "tuan") =>
+     fetch(`${url}/internal/messages`, {
+       method: "POST",
+-      headers: headers(user),
++      headers: await headers(user),
+       body: JSON.stringify(body),
+     });
+ 
+@@ -96,7 +114,7 @@ describe("the internal surface", () => {
+     );
+     const history = await fetch(
+       `${url}/v1/channels/${channelId}/messages?limit=50`,
+-      { headers: headers() },
++      { headers: await headers() },
+     );
+     const page = (await history.json()) as { messages: { id: string }[] };
+     // History does not expose `user` yet — 2.7's resume path is where the
+@@ -105,24 +123,43 @@ describe("the internal surface", () => {
+     expect(page.messages.some((m) => m.id === res.id)).toBe(true);
+   });
+ 
+-  it("emits a memberships response the shared contract accepts", async () => {
+-    const res = await fetch(`${url}/internal/memberships`, {
+-      headers: headers(),
++  // Chapter 3.2 replaced `GET /internal/memberships` with
++  // `POST /internal/session`. These two cases held that route's contract, and
++  // they move rather than disappear: the route changed, the guarantees did not.
++  // The answer now carries the identity as well, because the gateway no longer
++  // decides it (research R1).
++  it("emits a session response the shared contract accepts", async () => {
++    const res = await fetch(`${url}/internal/session`, {
++      method: "POST",
++      headers: await headers(),
+     });
+-    const parsed = internalMembershipsResponseSchema.safeParse(
+-      await res.json(),
+-    );
++    const parsed = internalSessionResponseSchema.safeParse(await res.json());
+     expect(parsed.error?.issues ?? []).toEqual([]);
+     expect(parsed.data?.channel_ids).toContain(channelId);
++    // The half that is new: the api says who the token belongs to.
++    expect(parsed.data?.user).toBe("tuan");
++    expect(parsed.data?.environment_id).toBe(env.id);
+   });
+ 
+   it("answers for an unknown user with no channels rather than an error", async () => {
+-    const res = await fetch(`${url}/internal/memberships`, {
+-      headers: headers("nobody-here"),
++    const res = await fetch(`${url}/internal/session`, {
++      method: "POST",
++      headers: await headers("nobody-here"),
+     });
+     expect(res.status).toBe(200);
+     expect(
+-      internalMembershipsResponseSchema.parse(await res.json()).channel_ids,
++      internalSessionResponseSchema.parse(await res.json()).channel_ids,
+     ).toEqual([]);
+   });
++
++  it("refuses an unverifiable token instead of answering for it", async () => {
++    // The refusal the gateway turns into a 4001. It exists here because the
++    // route that verifies is the route that must refuse — the gateway holds no
++    // secret and cannot tell a good token from a bad one any more.
++    const res = await fetch(`${url}/internal/session`, {
++      method: "POST",
++      headers: { authorization: "Bearer not-a-token" },
++    });
++    expect(res.status).toBe(401);
++  });
+ });
+```
+
+```diff title="services/api/src/internal/backfill.itest.ts"
+@@ -12,7 +12,12 @@ import {
+ 
+ import { AppModule } from "../app.module";
+ import { createDb, createPool } from "../db/client";
+-import { createEnvironment, Repository } from "../db/repository";
++import {
++  createEnvironment,
++  environmentSigningSecret,
++  Repository,
++} from "../db/repository";
++import { mintUserToken } from "../auth/user-token";
+ 
+ // The api's half of resume (chapter 2.7), against the compose Postgres. The
+ // gateway's suites prove the ORDERING; this one proves the read: everything
+@@ -27,6 +32,9 @@ describe("POST /internal/backfill", () => {
+   let quietChannelId: string;
+   let leftChannelId: string;
+   let tuan: { id: string };
++  /** Chapter 3.2: the gateway forwards the user's own token now, so the suite
++   * mints one per subject rather than asserting a name in a header. */
++  let tokenFor: (user: string) => Promise<string>;
+ 
+   beforeAll(async () => {
+     const db = createDb(createPool());
+@@ -44,6 +52,16 @@ describe("POST /internal/backfill", () => {
+     // Tuan is NOT a member of leftChannelId — the "removed while offline"
+     // case, which is indistinguishable from "never joined" by design.
+     await repo.addMember(leftChannelId, dispatcher.id);
++    const signingSecret = (await environmentSigningSecret(db, env.id))!
++      .signingSecret;
++    tokenFor = async (subject: string) =>
++      (
++        await mintUserToken(signingSecret, {
++          user: subject,
++          environmentId: env.id,
++          ttlSeconds: 3600,
++        })
++      ).token;
+     app = (
+       await Test.createTestingModule({ imports: [AppModule] }).compile()
+     ).createNestApplication({ logger: false });
+@@ -55,13 +73,12 @@ describe("POST /internal/backfill", () => {
+     await app.close();
+   });
+ 
+-  const ask = (cursors: Record<string, number>, user = "tuan") =>
++  const ask = async (cursors: Record<string, number>, user = "tuan") =>
+     fetch(`${url}/internal/backfill`, {
+       method: "POST",
+       headers: {
+         "content-type": "application/json",
+-        "x-relay-environment": env.id,
+-        "x-relay-user": user,
++        authorization: `Bearer ${await tokenFor(user)}`,
+       },
+       body: JSON.stringify({ cursors }),
+     });
+```
+
+```diff title="services/api/src/tenancy/signup.itest.ts"
+@@ -283,11 +283,11 @@ describe("signup", () => {
+     const before = await db.execute(
+       `SELECT count(*)::int AS n FROM organisations`,
+     );
+-    await fetch(`${url}/internal/memberships`, {
+-      headers: {
+-        "x-relay-environment": "00000000-0000-0000-0000-000000000000",
+-      },
+-    });
++    // Chapter 3.2: there is no header left to forge here. The assertion is
++    // unchanged — no route but signup creates a tenant — and a credential-free
++    // internal call is now refused before it reaches a handler, which is a
++    // stronger form of the same guarantee.
++    await fetch(`${url}/internal/memberships`);
+     const after = await db.execute(
+       `SELECT count(*)::int AS n FROM organisations`,
+     );
+```
+
+```diff title="services/gateway/src/session.test.ts"
+@@ -1,4 +1,3 @@
+-import { SignJWT } from "jose";
+ import { WebSocket } from "ws";
+ import { afterEach, describe, expect, it } from "vitest";
+ import type { Server } from "node:http";
+@@ -11,7 +10,6 @@ import type { Frame } from "@relay/protocol";
+ import type { InternalSendResponse, Message } from "@relay/protocol";
+ 
+ import type { ApiClient } from "./api-client.js";
+-import { DEV_JWT_SECRET } from "./auth.js";
+ import type { Fanout } from "./fanout.js";
+ import { attachSessions } from "./session.js";
+ 
+@@ -38,7 +36,14 @@ function committed(seq: number): InternalSendResponse {
+ 
+ function stubApi(overrides: Partial<ApiClient> = {}): ApiClient {
+   return {
+-    memberships: async () => [CHANNEL],
++    // Chapter 3.2: the api verifies tokens, so the stub is what decides which
++    // credential is good. That inversion is the point — the gateway holds no
++    // secret and cannot check a signature, so there is nothing left here to
++    // fake except the ANSWER.
++    session: async (token) =>
++      token === VALID_TOKEN
++        ? { environment_id: "env-1", user: "tuan", channel_ids: [CHANNEL] }
++        : null,
+     backfill: async () => ({}),
+     sendMessage: async () => committed(42),
+     ...overrides,
+@@ -59,11 +64,22 @@ function frame(seq: number, channel = CHANNEL): Message {
+   };
+ }
+ 
++/** The one credential the stubbed api recognises. */
++const VALID_TOKEN = "token-for-tuan";
++
++/** A token, from the gateway's point of view: an opaque string it forwards.
++ *
++ * This function used to SIGN one, with HS256 over a development secret both the
++ * gateway and this file knew. After chapter 3.2 neither of them holds a secret —
++ * tokens are signed with the environment's own, in the api — so any override
++ * here simply produces a DIFFERENT opaque string, which the stub refuses. The
++ * refusal cases below therefore test what they always tested: a credential the
++ * api will not accept never reaches session code. */
+ async function token(claims: Record<string, string> = {}): Promise<string> {
+-  return new SignJWT({ env: "env-1", ...claims })
+-    .setProtectedHeader({ alg: "HS256" })
+-    .setSubject("tuan")
+-    .sign(new TextEncoder().encode(DEV_JWT_SECRET));
++  const keys = Object.entries(claims);
++  return keys.length === 0
++    ? VALID_TOKEN
++    : `token-with-${keys.map(([k, v]) => `${k}=${v}`).join(",")}`;
+ }
+ 
+ interface Harness {
+@@ -190,6 +206,23 @@ describe("the socket (chapter 2.5)", () => {
+     }
+   });
+ 
++  it("closes 1011, not 4001, when the api cannot answer at all", async () => {
++    // New in chapter 3.2, and the reason `authenticate` has three outcomes
++    // rather than two. Moving verification to the api introduced a failure the
++    // gateway never had: the verifier being DOWN. Answering that with 4001
++    // would tell a client its credential is bad and stop it retrying, when the
++    // truth is that we are broken and it should.
++    harness = await boot(
++      stubApi({
++        session: async () => {
++          throw new Error("connect ECONNREFUSED");
++        },
++      }),
++    );
++    const socket = new WebSocket(`${harness.url}?token=${await token()}`);
++    expect(await closeCode(socket)).toBe(1011);
++  });
++
+   it("forwards message.send to the api and acks the committed sequence", async () => {
+     const sent: unknown[] = [];
+     harness = await boot(
+@@ -210,10 +243,16 @@ describe("the socket (chapter 2.5)", () => {
+     );
+     const ack = await nextFrame(socket, "message.ack");
+     expect(ack).toMatchObject({ type: "message.ack", payload: { seq: 7 } });
+-    // The gateway carried; the api decided. The identity travelled with it.
++    // The gateway carried; the api decided. The identity travelled with it —
++    // and after chapter 3.2 the TOKEN travels too, because the internal hop
++    // forwards the user's own credential rather than asserting who they are.
+     expect(sent).toEqual([
+       {
+-        identity: { userExternalId: "tuan", environmentId: "env-1" },
++        identity: {
++          userExternalId: "tuan",
++          environmentId: "env-1",
++          token: VALID_TOKEN,
++        },
+         body: { channel_id: "c1", text: "hello", idempotency_key: "k1" },
+       },
+     ]);
+```
+
+```diff title="services/gateway/src/resume.itest.ts"
+@@ -1,6 +1,5 @@
+ import { randomUUID } from "node:crypto";
+ 
+-import { SignJWT } from "jose";
+ import { WebSocket } from "ws";
+ import { afterEach, describe, expect, it } from "vitest";
+ import type { Server } from "node:http";
+@@ -10,7 +9,6 @@ import { createLogger, serve, type Logger } from "@relay/service-kit";
+ import type { Frame, Message } from "@relay/protocol";
+ 
+ import type { ApiClient } from "./api-client.js";
+-import { DEV_JWT_SECRET } from "./auth.js";
+ import { createFanout } from "./fanout.js";
+ import { attachSessions } from "./session.js";
+ 
+@@ -43,13 +41,16 @@ function frame(seq: number): Message {
+   };
+ }
+ 
++const VALID_TOKEN = "token-for-tuan";
++
++/** Chapter 3.2: the gateway holds no signing secret, so a test token is an
++ * opaque string the stubbed api agrees to recognise. What this suite proves —
++ * the resume race against a real broker — never depended on the signature. */
+ function token(): Promise<string> {
+-  return new SignJWT({ env: "env-1" })
+-    .setProtectedHeader({ alg: "HS256" })
+-    .setSubject("tuan")
+-    .sign(new TextEncoder().encode(DEV_JWT_SECRET));
++  return Promise.resolve(VALID_TOKEN);
+ }
+ 
++
+ interface Harness {
+   url: string;
+   close: () => Promise<void>;
+@@ -111,7 +112,11 @@ describe("resume across a real fabric", () => {
+     // different fanout client on the same subject — publishes into the
+     // window. Neither side coordinates; only the buffer saves this.
+     harness = await boot({
+-      memberships: async () => [CHANNEL],
++      session: async () => ({
++        environment_id: "env-1",
++        user: "tuan",
++        channel_ids: [CHANNEL],
++      }),
+       backfill: async () => {
+         await publishFromElsewhere(frame(43));
+         await settle(150); // give Redis time to actually deliver it
+@@ -138,7 +143,11 @@ describe("resume across a real fabric", () => {
+     // Committed after the backfill's snapshot: it exists ONLY in the buffer,
+     // and the flush is the only reason the client ever sees it.
+     harness = await boot({
+-      memberships: async () => [CHANNEL],
++      session: async () => ({
++        environment_id: "env-1",
++        user: "tuan",
++        channel_ids: [CHANNEL],
++      }),
+       backfill: async () => {
+         await publishFromElsewhere(frame(43));
+         await settle(150);
+@@ -159,7 +168,11 @@ describe("resume across a real fabric", () => {
+ 
+   it("goes live after the flush, with no buffering left behind", async () => {
+     harness = await boot({
+-      memberships: async () => [CHANNEL],
++      session: async () => ({
++        environment_id: "env-1",
++        user: "tuan",
++        channel_ids: [CHANNEL],
++      }),
+       backfill: async () => ({
+         [CHANNEL]: { messages: [frame(42)], truncated: false },
+       }),
+```
+
+```diff title="packages/e2e/src/harness.ts"
+@@ -5,7 +5,6 @@ import { createRequire } from "node:module";
+ import { dirname, join } from "node:path";
+ import { fileURLToPath } from "node:url";
+ 
+-import { SignJWT } from "jose";
+ import { WebSocket } from "ws";
+ 
+ import type { Frame, Message } from "@relay/protocol";
+@@ -32,8 +31,6 @@ const HERE = dirname(fileURLToPath(import.meta.url));
+ const REPO = join(HERE, "..", "..", "..");
+ const require_ = createRequire(import.meta.url);
+ 
+-const DEV_SECRET = process.env.RELAY_DEV_JWT_SECRET ?? "dev-secret";
+-
+ /** Store coordinates are FORWARDED, never invented. Each service already has
+  * a default (2.1's `DEFAULT_DATABASE_URL`, 2.6's `DEFAULT_REDIS_URL`), and a
+  * harness that composes its own URL from a port variable becomes a second
+@@ -60,6 +57,14 @@ interface Seeder {
+     db: unknown,
+     input: { name: string },
+   ) => Promise<{ id: string }>;
++  /** Chapter 3.2: the suite needs a real credential now, and it mints one the
++   * same way signup does. There is still no admin API for keys — that is the
++   * dashboard's chapter — so this stays a test-only seam with a named
++   * retirement, exactly like the rest of this interface. */
++  createApiKey: (
++    db: unknown,
++    input: { environmentId: string; name?: string },
++  ) => Promise<{ credential: string }>;
+   Repository: new (
+     db: unknown,
+     environmentId: string,
+@@ -276,6 +281,9 @@ export interface System {
+   serviceOutput: () => string;
+   seedConversation: () => Promise<{
+     environmentId: string;
++    /** An API key for that environment — the credential the REST assertions
++     * present now that the asserted header is gone (chapter 3.2). */
++    credential: string;
+     channel: string;
+     dispatcher: Client;
+     tuan: Client;
+@@ -323,7 +331,6 @@ export async function boot({ gateways = 2 } = {}): Promise<System> {
+       "RELAY_REDIS_URL",
+       "RELAY_REDIS_PORT",
+     ),
+-    RELAY_DEV_JWT_SECRET: DEV_SECRET,
+   };
+ 
+   const apiPort = Number(process.env.RELAY_E2E_API_PORT ?? 4100);
+@@ -367,11 +374,33 @@ export async function boot({ gateways = 2 } = {}): Promise<System> {
+     return new seeder.Repository(db, created.id);
+   };
+ 
+-  const token = (environmentId: string, subject: string) =>
+-    new SignJWT({ env: environmentId })
+-      .setProtectedHeader({ alg: "HS256" })
+-      .setSubject(subject)
+-      .sign(new TextEncoder().encode(DEV_SECRET));
++  /** Chapter 3.2: the harness cannot sign a token any more, and that is the
++   * point — nothing outside the api holds a signing secret. It asks the api's
++   * development endpoint instead, with the environment's own key, which is
++   * exactly the path a reader follows to get their first token (FR-AUT-09). */
++  const keys = new Map<string, string>();
++  const keyFor = async (environmentId: string) => {
++    const existing = keys.get(environmentId);
++    if (existing !== undefined) return existing;
++    const minted = await seeder.createApiKey(db, { environmentId });
++    keys.set(environmentId, minted.credential);
++    return minted.credential;
++  };
++
++  const token = async (environmentId: string, subject: string) => {
++    const res = await fetch(`${apiUrl}/auth/dev-token`, {
++      method: "POST",
++      headers: {
++        "content-type": "application/json",
++        authorization: `Bearer ${await keyFor(environmentId)}`,
++      },
++      body: JSON.stringify({ user: subject }),
++    });
++    if (!res.ok) {
++      throw new Error(`dev-token failed: ${res.status} ${await res.text()}`);
++    }
++    return ((await res.json()) as { token: string }).token;
++  };
+ 
+   let primaryEnvironment = "";
+ 
+@@ -391,6 +420,8 @@ export async function boot({ gateways = 2 } = {}): Promise<System> {
+       say(`seeded one channel with two members in ${primaryEnvironment}`);
+       return {
+         environmentId: primaryEnvironment,
++        // Chapter 3.2: the REST assertions present a credential, not a header.
++        credential: await keyFor(primaryEnvironment),
+         channel: channel.id,
+         dispatcher: new Client(
+           "dispatcher",
+```
+
+```diff title="packages/e2e/src/tuan.itest.ts"
+@@ -33,7 +33,7 @@ const sorted = (seqs: number[]): number[] => [...seqs].sort((a, b) => a - b);
+ describe("journey 4 — the message that survives the tunnel", () => {
+   let system: System;
+   let channel: string;
+-  let environmentId: string;
++  let credential: string;
+   let dispatcher: Client;
+   let tuan: Client;
+   let foreign: { channel: string; text: string };
+@@ -44,7 +44,7 @@ describe("journey 4 — the message that survives the tunnel", () => {
+   beforeAll(async () => {
+     system = await boot({ gateways: 2 });
+     const seeded = await system.seedConversation(); // 2.1
+-    ({ channel, environmentId, dispatcher, tuan } = seeded);
++    ({ channel, credential, dispatcher, tuan } = seeded);
+     foreign = await system.seedForeignTenant();
+ 
+     // ── stage 1: type and send ───────────────────────────────────────────
+@@ -199,12 +199,14 @@ describe("journey 4 — the message that survives the tunnel", () => {
+     expect(everything).not.toContain(foreign.text);
+     expect(everything).not.toContain(foreign.channel);
+ 
+-    // And through the REST door, with this tenant's header: a foreign
++    // And through the REST door, with this tenant's CREDENTIAL: a foreign
+     // channel is a 404, indistinguishable from one that does not exist
+-    // (FR-TEN-05).
++    // (FR-TEN-05). Chapter 3.2 changed what proves the tenant here — a key
++    // this environment was issued, rather than a header naming it — and the
++    // assertion is deliberately unchanged.
+     const res = await fetch(
+       `${system.apiUrl}/v1/channels/${foreign.channel}/messages?limit=10`,
+-      { headers: { "x-relay-environment": environmentId } },
++      { headers: { authorization: `Bearer ${credential}` } },
+     );
+     expect(res.status).toBe(404);
+   });
+@@ -215,7 +217,7 @@ describe("journey 4 — the message that survives the tunnel", () => {
+     // know now.
+     const res = await fetch(
+       `${system.apiUrl}/v1/channels/${channel}/messages?limit=50&direction=newer`,
+-      { headers: { "x-relay-environment": environmentId } },
++      { headers: { authorization: `Bearer ${credential}` } },
+     );
+     expect(res.status).toBe(200);
+     const body = (await res.json()) as { messages: Message[] };
+```
+
+```diff title="scripts/ws-walk.mjs"
+@@ -2,17 +2,16 @@
+ // reproducible rather than decorative). Seeds a user, channel and
+ // membership, mints a dev token, connects, sends, and retries with the
+ // SAME idempotency key so 2.3's recovery leg shows through the socket.
+-import { SignJWT } from "jose";
+ import WebSocket from "ws";
+ 
+ import { createDb, createPool } from "../services/api/dist/db/client.js";
+ import {
++  createApiKey,
+   createEnvironment,
+   Repository,
+ } from "../services/api/dist/db/repository.js";
+ 
+ const GATEWAY = process.env.RELAY_GATEWAY_URL ?? "ws://127.0.0.1:4001";
+-const SECRET = process.env.RELAY_DEV_JWT_SECRET ?? "dev-secret";
+ 
+ const db = createDb(createPool());
+ const env = await createEnvironment(db, { name: `ws-walk-${Date.now()}` });
+@@ -21,13 +20,28 @@ const user = await repo.createUser("tuan", "Tuan");
+ const channel = await repo.createChannel("fleet", "public");
+ await repo.addMember(channel.id, user.id);
+ 
+-const token = await new SignJWT({ env: env.id })
+-  .setProtectedHeader({ alg: "HS256" })
+-  .setSubject("tuan")
+-  .sign(new TextEncoder().encode(SECRET));
++const API = process.env.RELAY_API_URL ?? "http://127.0.0.1:4000";
++// Chapter 3.2: nothing outside the api can sign a token, so this walk gets one
++// the way a reader does — mint the environment's key, then ask the
++// development-only endpoint for a token (FR-AUT-09).
++const key = await createApiKey(db, { environmentId: env.id });
++const token = async (sub) => {
++  const res = await fetch(`${API}/auth/dev-token`, {
++    method: "POST",
++    headers: {
++      "content-type": "application/json",
++      authorization: `Bearer ${key.credential}`,
++    },
++    body: JSON.stringify({ user: sub }),
++  });
++  if (!res.ok) throw new Error(`dev-token failed: ${res.status}`);
++  return (await res.json()).token;
++};
++
++const tuanToken = await token("tuan");
+ 
+ const started = Date.now();
+-const socket = new WebSocket(`${GATEWAY}/v1/ws?token=${token}`);
++const socket = new WebSocket(`${GATEWAY}/v1/ws?token=${tuanToken}`);
+ const frame = {
+   type: "message.send",
+   payload: {
+```
+
+```diff title="scripts/split-brain.mjs"
+@@ -3,18 +3,17 @@
+ // the conversation split in half, and again after to see it whole. The
+ // script does not assert which outcome is correct — it REPORTS what the
+ // far side heard, so the same command tells you the truth in both states.
+-import { SignJWT } from "jose";
+ import WebSocket from "ws";
+ 
+ import { createDb, createPool } from "../services/api/dist/db/client.js";
+ import {
++  createApiKey,
+   createEnvironment,
+   Repository,
+ } from "../services/api/dist/db/repository.js";
+ 
+ const G1 = process.env.RELAY_GW1 ?? "ws://127.0.0.1:4001";
+ const G2 = process.env.RELAY_GW2 ?? "ws://127.0.0.1:4002";
+-const SECRET = process.env.RELAY_DEV_JWT_SECRET ?? "dev-secret";
+ 
+ const db = createDb(createPool());
+ const env = await createEnvironment(db, { name: `split-${Date.now()}` });
+@@ -25,11 +24,23 @@ const channel = await repo.createChannel("fleet", "public");
+ await repo.addMember(channel.id, dispatcher.id);
+ await repo.addMember(channel.id, driver.id);
+ 
+-const token = (sub) =>
+-  new SignJWT({ env: env.id })
+-    .setProtectedHeader({ alg: "HS256" })
+-    .setSubject(sub)
+-    .sign(new TextEncoder().encode(SECRET));
++const API = process.env.RELAY_API_URL ?? "http://127.0.0.1:4000";
++// Chapter 3.2: nothing outside the api can sign a token, so this walk gets one
++// the way a reader does — mint the environment's key, then ask the
++// development-only endpoint for a token (FR-AUT-09).
++const key = await createApiKey(db, { environmentId: env.id });
++const token = async (sub) => {
++  const res = await fetch(`${API}/auth/dev-token`, {
++    method: "POST",
++    headers: {
++      "content-type": "application/json",
++      authorization: `Bearer ${key.credential}`,
++    },
++    body: JSON.stringify({ user: sub }),
++  });
++  if (!res.ok) throw new Error(`dev-token failed: ${res.status}`);
++  return (await res.json()).token;
++};
+ 
+ const heard = [];
+ 
+```
+
+```diff title="scripts/tunnel-walk.mjs"
+@@ -10,17 +10,16 @@
+ //   node services/api/dist/main.js &
+ //   (cd services/gateway && PORT=4001 pnpm exec tsx src/main.ts &)
+ //   node scripts/tunnel-walk.mjs
+-import { SignJWT } from "jose";
+ import WebSocket from "ws";
+ 
+ import { createDb, createPool } from "../services/api/dist/db/client.js";
+ import {
++  createApiKey,
+   createEnvironment,
+   Repository,
+ } from "../services/api/dist/db/repository.js";
+ 
+ const GW = process.env.RELAY_GW ?? "ws://127.0.0.1:4001";
+-const SECRET = process.env.RELAY_DEV_JWT_SECRET ?? "dev-secret";
+ const BACKFILL_LIMIT = 500;
+ 
+ const db = createDb(createPool());
+@@ -35,11 +34,23 @@ for (const c of [channel, flood]) {
+   await repo.addMember(c.id, dispatcher.id);
+ }
+ 
+-const token = (sub) =>
+-  new SignJWT({ env: env.id })
+-    .setProtectedHeader({ alg: "HS256" })
+-    .setSubject(sub)
+-    .sign(new TextEncoder().encode(SECRET));
++const API = process.env.RELAY_API_URL ?? "http://127.0.0.1:4000";
++// Chapter 3.2: nothing outside the api can sign a token, so this walk gets one
++// the way a reader does — mint the environment's key, then ask the
++// development-only endpoint for a token (FR-AUT-09).
++const key = await createApiKey(db, { environmentId: env.id });
++const token = async (sub) => {
++  const res = await fetch(`${API}/auth/dev-token`, {
++    method: "POST",
++    headers: {
++      "content-type": "application/json",
++      authorization: `Bearer ${key.credential}`,
++    },
++    body: JSON.stringify({ user: sub }),
++  });
++  if (!res.ok) throw new Error(`dev-token failed: ${res.status}`);
++  return (await res.json()).token;
++};
+ 
+ /** Connect and report every frame, keeping a cursor the way a client would:
+  * the highest sequence it has actually applied, per channel. */
+```
+
+```diff title="scripts/signup-walk.mjs"
+@@ -57,6 +57,12 @@ async function signUp(label) {
+   console.log(`    application  ${body.application?.id}`);
+   console.log(
+     `    environment  ${body.environment?.id} (${body.environment?.kind})\n`,
++    // Chapter 3.2: the first API key, shown exactly once. Truncated here —
++    // this transcript ends up in a chapter, and NFR-SEC-06 does not make an
++    // exception for documentation.
++    body.api_key
++      ? `    api key      ${body.api_key.secret.slice(0, 18)}… (shown once)\n`
++      : `    api key      none — the secret was shown at creation and is gone\n`,
+   );
+   return body;
+ }
+```
+
+```js title="scripts/credential-walk.mjs"
+// The chapter 3.2 walk, as a script (so the transcript in the chapter is
+// reproducible rather than decorative).
+//
+// It follows the path a reader actually takes: mint a key, send with it, turn
+// it into an end-user token, open a socket with THAT, and then present each
+// credential where the other belongs. The last two steps are the point — the
+// SRS calls confusing the two the most common first-integration failure, and
+// this prints both refusals rather than describing them.
+//
+//   docker compose up -d --wait postgres redis
+//   pnpm build
+//   node services/api/dist/main.js &        # :4000
+//   node services/gateway/dist/main.js &    # :4001
+//   node scripts/credential-walk.mjs
+import WebSocket from "ws";
+
+import { createDb, createPool } from "../services/api/dist/db/client.js";
+import {
+  createApiKey,
+  createEnvironment,
+  Repository,
+} from "../services/api/dist/db/repository.js";
+
+const API = process.env.RELAY_API_URL ?? "http://127.0.0.1:4000";
+const GATEWAY = process.env.RELAY_GATEWAY_URL ?? "ws://127.0.0.1:4001";
+
+const show = (label, value) => console.log(`${label.padEnd(26)} ${value}`);
+/** Credentials are TRUNCATED on the way to the terminal. A walk whose output
+ * ends up pasted into a chapter must not carry a working secret with it
+ * (NFR-SEC-06), and showing the shape is the part that teaches anything. */
+const brief = (credential) => `${credential.slice(0, 18)}…`;
+
+const db = createDb(createPool());
+const env = await createEnvironment(db, {
+  name: `credential-walk-${Date.now()}`,
+});
+const repo = new Repository(db, env.id);
+const tuan = await repo.createUser("tuan", "Tuan");
+const channel = await repo.createChannel("fleet", "public");
+await repo.addMember(channel.id, tuan.id);
+
+// ── 1. the application's credential ─────────────────────────────────────────
+const key = await createApiKey(db, { environmentId: env.id, name: "walk" });
+show("api key (shown once)", brief(key.credential));
+show("its prefix", key.prefix);
+
+const sent = await fetch(`${API}/v1/channels/${channel.id}/messages`, {
+  method: "POST",
+  headers: {
+    "content-type": "application/json",
+    authorization: `Bearer ${key.credential}`,
+  },
+  body: JSON.stringify({ text: "B2, north ramp" }),
+});
+show("POST with the key", `${sent.status} seq=${(await sent.json()).seq}`);
+
+// ── 2. the end user's credential ────────────────────────────────────────────
+const minted = await fetch(`${API}/auth/dev-token`, {
+  method: "POST",
+  headers: {
+    "content-type": "application/json",
+    authorization: `Bearer ${key.credential}`,
+  },
+  body: JSON.stringify({ user: "tuan" }),
+});
+const { token, expires_at } = await minted.json();
+show("dev-token", `${minted.status} expires ${expires_at}`);
+
+const heard = await new Promise((resolve, reject) => {
+  const socket = new WebSocket(`${GATEWAY}/v1/ws?token=${token}`);
+  socket.on("message", (raw) => {
+    const frame = JSON.parse(raw.toString());
+    if (frame.type === "connection.ack") {
+      show("socket with the token", `open as ${frame.payload.user}`);
+      socket.close();
+      resolve(frame.payload.user);
+    }
+  });
+  socket.on("close", (code) => {
+    if (code !== 1000 && code !== 1005) reject(new Error(`closed ${code}`));
+  });
+  setTimeout(() => reject(new Error("no ack within 5s")), 5_000);
+});
+
+// ── 3. each credential where the other belongs ──────────────────────────────
+// The mistake, both ways round. Neither answer is a generic "unauthorized":
+// one names the classes, the other is a close code a client can act on.
+const wrongWay = await fetch(`${API}/auth/dev-token`, {
+  method: "POST",
+  headers: {
+    "content-type": "application/json",
+    authorization: `Bearer ${token}`,
+  },
+  body: JSON.stringify({ user: "tuan" }),
+});
+const refusal = await wrongWay.json();
+show("token → key-only route", `${wrongWay.status} ${refusal.code}`);
+console.log(`${"".padEnd(26)} "${refusal.message}"`);
+
+const keyOnSocket = await new Promise((resolve) => {
+  const socket = new WebSocket(`${GATEWAY}/v1/ws?token=${key.credential}`);
+  socket.on("close", (code) => resolve(code));
+  socket.on("error", () => undefined);
+});
+show("key → socket", `closed ${keyOnSocket}`);
+
+console.log(`\nheard as ${heard}; both credentials worked, both refusals held.`);
+process.exit(0);
+```
+
+```diff title="turbo.json"
+@@ -25,7 +25,6 @@
+         "RELAY_POSTGRES_PORT",
+         "RELAY_REDIS_URL",
+         "RELAY_REDIS_PORT",
+-        "RELAY_DEV_JWT_SECRET",
+         "RELAY_E2E_API_PORT"
+       ]
+     },
+```
+
+<Checkpoint tag="part3-ch2" locale="vi">
+
+```bash
+docker compose up -d --wait postgres redis
+pnpm build
+DATABASE_URL="postgres://relay:relay@localhost:15432/relay" node services/api/dist/db/migrate.js
+
+pnpm lint && pnpm typecheck && pnpm test
+RELAY_POSTGRES_PORT=15432 RELAY_REDIS_PORT=16379 \
+  DATABASE_URL="postgres://relay:relay@localhost:15432/relay" \
+  RELAY_REDIS_URL="redis://localhost:16379" pnpm test:integration
+```
+
+Expected: **109 unit tests**, **76 integration tests**, tất cả green — bao gồm
+journey suite của chương 2.8, giờ chạy hoàn toàn trên real credentials.
+
+Sau đó là seam check, thứ không được print gì cả:
+
+```bash
+grep -rn "x-relay-environment" services packages scripts --include=*.ts --include=*.mjs | grep -v itest
+grep -rn "RELAY_DEV_JWT_SECRET\|DEV_JWT_SECRET" services --include=*.ts | grep -v test
+```
+
+Và walk, khi cả hai services đang chạy:
+
+```bash
+node scripts/credential-walk.mjs
+```
+
+Expected: một key gửi được message, mint token, token open socket — rồi token bị
+refuse ở key-only route với `wrong_credential_type`, và key bị refuse ở socket
+với close code 4001.
+
+</Checkpoint>
+
+<ChapterFooter id="3.2" locale="vi" />

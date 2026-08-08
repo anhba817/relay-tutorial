@@ -34,6 +34,14 @@ const VERBOSE = process.argv.includes("--verbose");
 const NOT_A_FILE = (title) =>
   title.includes("(excerpt)") || title.includes(".naive.");
 
+/** A chapter that DELETES a file says so with a `(deleted)` title, and the
+ * fence body is the reason. The chain then ends for that path, and the check
+ * inverts: the file must NOT exist on disk. Added in chapter 3.2, which is the
+ * first chapter to retire a file rather than amend one — before it, a deleted
+ * path could only ever be reported as "does not exist", which is the same
+ * message a genuine mistake produces. */
+const DELETION = /^(.+) \(deleted\)$/;
+
 function walk(dir) {
   if (!existsSync(dir)) return [];
   return readdirSync(dir).flatMap((entry) => {
@@ -122,6 +130,7 @@ function applyHunks(state, body, where, problems) {
 function replay(locale, problems) {
   const state = new Map();
   const source = new Map();
+  const deleted = new Map();
   const perChapter = new Map();
   for (const page of pages(locale)) {
     const rel = relative(APP_ROOT, page.path);
@@ -141,6 +150,22 @@ function replay(locale, problems) {
       }
       list.push(f);
       if (NOT_A_FILE(f.title)) continue;
+      const gone = DELETION.exec(f.title);
+      if (gone) {
+        const path = gone[1];
+        if (!state.has(path)) {
+          problems.push({
+            kind: "APPLY",
+            where,
+            detail: `${path} is retired here but no earlier chapter ever showed it`,
+          });
+          continue;
+        }
+        state.delete(path);
+        source.delete(path);
+        deleted.set(path, where);
+        continue;
+      }
       if (f.lang === "diff") {
         if (!state.has(f.title)) {
           problems.push({
@@ -159,7 +184,7 @@ function replay(locale, problems) {
     }
     perChapter.set(page.key, { rel, fences: list });
   }
-  return { state, source, perChapter };
+  return { state, source, deleted, perChapter };
 }
 
 const problems = [];
@@ -187,6 +212,19 @@ for (const [title, final] of en.state) {
         `${title} differs at line ${n + 1}\n        chapters: ` +
         `${JSON.stringify((final[n] ?? "<eof>").slice(0, 64))}\n        repo:     ` +
         `${JSON.stringify((disk[n] ?? "<eof>").slice(0, 64))}`,
+    });
+  }
+}
+
+// The inverse of HEAD: a path a chapter retired must be gone from the
+// repository. A deletion that did not happen is exactly as much drift as an
+// amendment that did not.
+for (const [title, where] of en.deleted) {
+  if (fileLines(title) !== null) {
+    problems.push({
+      kind: "HEAD",
+      where,
+      detail: `${title} is shown as deleted but still exists in relay-platform`,
     });
   }
 }
@@ -235,7 +273,8 @@ if (problems.length) {
 const translated = [...vi.perChapter.keys()].length;
 console.log(
   `check-fence-chain: ${en.state.size} fenced files replay onto relay-platform ` +
-    `across ${en.perChapter.size} chapters (${translated} translated, fences mirrored)`,
+    `across ${en.perChapter.size} chapters (${translated} translated, fences mirrored` +
+    `${en.deleted.size ? `, ${en.deleted.size} retired` : ""})`,
 );
 if (VERBOSE) {
   for (const [title, where] of [...en.source].sort()) {

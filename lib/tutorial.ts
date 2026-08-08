@@ -315,12 +315,15 @@ export const series: Part[] = [
         id: "3.2",
         path: "/part-3/chapter-02/keys-and-tokens",
         title: "Keys and tokens — two credentials, one mistake",
-        status: "forthcoming",
+        status: "published",
+        translatedIn: ["vi"],
         readerProduces:
           "API keys (prefix, hash, rotation); user JWTs; the dev-token endpoint",
         sourceDoc: "docs/04-srs.md",
         readerMinutes: 100,
         titleVi: "Key và token — hai loại credential, một lỗi thường gặp",
+        readerProducesVi:
+          "API keys (prefix, hash, rotation); user JWTs; endpoint dev-token",
       },
       {
         id: "3.3",
