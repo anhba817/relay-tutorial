@@ -1,0 +1,2036 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figTheOtherGap, figOutcomes, figWhereItRuns } from "./figures";
+
+export const metadata = {
+  title: "JetStream và consumer đầu tiên — Building Relay",
+  description:
+    "Chương 3.3 để lại mười hai nghìn events trong một stream chưa từng có ai đọc. Chương này chọn từng setting trên stream đó, build consumer đầu tiên, và kill nó trong gap giữa làm xong work và thừa nhận điều đó.",
+  alternates: {
+    canonical: "/vi/part-3/chapter-04/jetstream-and-the-first-consumer",
+    languages: {
+      en: "/part-3/chapter-04/jetstream-and-the-first-consumer",
+      vi: "/vi/part-3/chapter-04/jetstream-and-the-first-consumer",
+    },
+  },
+};
+
+<ChapterHeader id="3.4" locale="vi" />
+
+Hỏi broker xem nó đang giữ gì:
+
+```text
+messages          12,930
+consumers         0
+subjects          ["events.>"]
+retention         limits
+storage           file
+num_replicas      1
+max_age           0            <- no limit; NFR-REL-08 asks for >= 24 h
+max_bytes         -1           <- unbounded
+discard           old
+duplicate_window  120 s        <- NATS's default, inherited
+```
+
+Mười hai nghìn chín trăm ba mươi events, được publish bởi relay của chương 3.3
+trong lúc viết chương 3.3, và **chưa một event nào từng được đọc**. Ba setting
+trong số đó do con người chọn. Phần còn lại là bất cứ thứ gì NATS làm khi bạn
+không nói rõ.
+
+Chương này fix cả hai nửa của việc đó. Mọi setting trở thành một decision có lý
+do đi kèm, và stream có reader đầu tiên — rồi hóa ra reader đó reintroduce,
+thêm một hop về sau, đúng failure mà 3.3 đã dành cả chương để loại bỏ.
+
+<SkipAhead locale="vi">
+
+Nếu bạn buộc phải đọc lướt: stream `EVENTS` được configure một cách cố ý —
+`max_age` bảy ngày vượt floor 24 giờ của NFR-REL-08, `max_bytes` 1 GiB với
+`discard: old`, replicas derived từ environment thay vì hardcoded — và việc
+apply configuration đó là idempotent, vì hai api instances start cùng lúc.
+Subject grammar `events.{domain}.{action}.{env}` move từ outbox module của api
+sang `@relay/protocol`, nơi cả producing side và consuming side cùng share
+được. Table `consumed_events` keyed `(consumer, event_id)` là deduplication
+ledger; claim trên nó và effect của handler commit trong một transaction, nên
+handler throw sẽ rollback claim cùng nó. Một durable pull consumer fetch theo
+batches 25, chỉ acknowledge sau khi claim commit, retry handler throw tối đa năm
+lần, và terminate unparseable payload ngay lập tức. Handler đầu tiên là một
+**scaffold** chỉ log và được retire bởi 3.5. Delivery là at-least-once; handling
+là once *in effect*, và ledger là thứ tạo ra khác biệt. Trạng thái cuối chương
+là tag **`part3-ch4`**.
+
+</SkipAhead>
+
+## Mọi default là một decision ai đó đã không đưa ra
+
+Chương 3.3 tạo stream trong bốn dòng, và đã nói rõ lúc đó: minimum mà publisher
+cần để provable. Đó là lượng design đúng cho một chương về outbox. Nó là lượng
+design sai cho một stream bây giờ đã có consumer phụ thuộc vào nó.
+
+Câu hỏi đầu tiên là setting nào trong số đó còn có thể thay đổi được, vì một
+stream đang giữ mười hai nghìn events không phải thứ có thể recreate tùy tiện.
+Vì vậy chúng ta hỏi broker thay vì documentation:
+
+| Setting | Update tại chỗ |
+|---|---|
+| `max_age`, `duplicate_window`, `max_msgs` / `max_bytes`, `discard` | mutable |
+| `retention` | **immutable** — "stream configuration update can not change retention policy to/from workqueue" |
+| `storage` | **immutable** — "stream configuration update can not change storage type" |
+
+Hai settings không bao giờ đổi được, và 3.3 tình cờ chọn đúng cả hai. Nếu nó
+dùng `memory` storage như một development convenience — điều hoàn toàn hợp lý,
+và nhanh hơn — thì apply configuration của chương này sẽ đồng nghĩa với xóa
+stream và mọi thứ trong đó. Điều đó đáng ngồi lại một giây: chi phí của default
+không được trả vào lúc bạn nhận nó.
+
+```diff title="services/api/src/outbox/jetstream.publisher.ts"
+@@ -1,5 +1,8 @@
+ import {
+   connect,
++  DiscardPolicy,
++  RetentionPolicy,
++  StorageType,
+   type JetStreamClient,
+   type NatsConnection,
+ } from "nats";
+@@ -15,16 +18,82 @@ import type { Publisher, PublishedMessage } from "./publisher";
+ 
+ export const DEFAULT_NATS_URL = "nats://localhost:4222";
+ 
+-/** One stream over `events.>`, file-backed. This is the MINIMUM a publisher
+- * needs in order to be provable — publishing into a broker with no stream is
+- * fire-and-forget, and the chapter's claim would be false at the last hop.
++/** One stream over `events.>`, file-backed.
+  *
+- * The real design of the subject space — FR-WHK-02's full event-type list,
+- * per-environment sharding, retention, replicas — belongs to chapter 3.4 along
+- * with every consumer. */
++ * Chapter 3.3 created this with a name, its subjects and file storage, and left
++ * everything else at whatever NATS defaults to — which on a development broker
++ * meant no age limit, no size limit, and a two-minute duplicate window nobody
++ * had chosen. Chapter 3.4 makes every setting a decision (research R2).
++ *
++ * Two of them can never be changed again, and both happen to be right:
++ * `retention` and `storage` are immutable on an existing stream (measured, R1).
++ * Had 3.3 taken memory storage as a convenience, applying this configuration
++ * would have meant deleting the stream and every event in it. */
+ const STREAM = "EVENTS";
+ const SUBJECTS = ["events.>"];
+ 
++const SECOND_NS = 1_000_000_000;
++
++/** NFR-REL-08 asks the queue to retain events for at least 24 hours so that a
++ * consumer outage is absorbed. Seven days is chosen over the floor for a reason
++ * the floor does not cover: an outage that starts on a Friday evening is not
++ * noticed until Monday. The floor protects a process crash; this protects a
++ * weekend. */
++const MAX_AGE_NS = 7 * 24 * 60 * 60 * SECOND_NS;
++
++/** An unbounded stream is a full disk with extra steps. The bound turns that
++ * into a number an operator can watch — and with `discard: old`, hitting it
++ * loses the OLDEST events rather than refusing new publishes. Refusing
++ * publishes would take the write path down with the event spine, which is the
++ * inversion chapter 3.3's outbox exists to prevent. */
++const MAX_BYTES = 1024 * 1024 * 1024;
++
++/** ADR-02 specifies R3 replication. The compose stack is a single node, so this
++ * is environment-derived rather than hardcoded to either value: a chapter that
++ * wrote `3` would not run locally, and one that wrote `1` would ship a
++ * single-replica event spine to production. */
++function replicaCount(): number {
++  const configured = Number(process.env.RELAY_NATS_REPLICAS ?? "");
++  if (Number.isInteger(configured) && configured > 0) return configured;
++  return process.env.NODE_ENV === "production" ? 3 : 1;
++}
++
++/** Apply the stream's configuration, whether or not it exists yet.
++ *
++ * Idempotent on purpose: two api instances starting together both run this, and
++ * the second must be a no-op rather than an error. On an existing stream the
++ * MUTABLE settings are merged onto whatever is there, and the immutable ones are
++ * carried through untouched — attempting to change `retention` or `storage` is
++ * an error the broker refuses rather than a difference it reconciles (R1).
++ *
++ * `duplicate_window` is deliberately left where 3.3 found it. Raising it looks
++ * like the fix for a republished event and is not: the outbox can republish
++ * hours after an outage, no window is a safe guess about the longest one, and a
++ * window measured in hours would hold that dedupe index in the broker's memory
++ * for hours. The guarantee belongs where the work happens — at the consumer
++ * (research R3, SAD risk R5). */
++export async function ensureStream(nc: NatsConnection): Promise<void> {
++  const jsm = await nc.jetstreamManager();
++  const mutable = {
++    subjects: [...SUBJECTS],
++    max_age: MAX_AGE_NS,
++    max_bytes: MAX_BYTES,
++    discard: DiscardPolicy.Old,
++    num_replicas: replicaCount(),
++  };
++  const existing = await jsm.streams.info(STREAM).catch(() => null);
++  if (existing === null) {
++    await jsm.streams.add({
++      name: STREAM,
++      retention: RetentionPolicy.Limits,
++      storage: StorageType.File,
++      ...mutable,
++    });
++    return;
++  }
++  await jsm.streams.update(STREAM, { ...existing.config, ...mutable });
++}
++
+ export function createJetStreamPublisher({
+   url = process.env.RELAY_NATS_URL ?? DEFAULT_NATS_URL,
+ }: { url?: string } = {}): Publisher {
+@@ -38,16 +107,7 @@ export function createJetStreamPublisher({
+   async function client(): Promise<JetStreamClient> {
+     if (js && connection && !connection.isClosed()) return js;
+     const nc = await connect({ servers: url });
+-    const jsm = await nc.jetstreamManager();
+-    // Created if absent, left alone if present: two api instances starting
+-    // together must not fight over it.
+-    const existing = await jsm.streams
+-      .info(STREAM)
+-      .then(() => true)
+-      .catch(() => false);
+-    if (!existing) {
+-      await jsm.streams.add({ name: STREAM, subjects: [...SUBJECTS] });
+-    }
++    await ensureStream(nc);
+     connection = nc;
+     js = nc.jetstream();
+     return js;
+```
+
+Mỗi con số mang lý do của nó trong code, đúng nơi reader sẽ đứng khi cần lý do
+đó. `max_age` là bảy ngày thay vì hai mươi bốn giờ của NFR-REL-08 vì floor bảo
+vệ một process crash, còn bảy ngày bảo vệ một cuối tuần: outage bắt đầu tối thứ
+Sáu sẽ không được nhận ra tới sáng thứ Hai. `max_bytes` tồn tại vì unbounded
+stream là full disk với thêm vài bước, và `discard: old` nghĩa là khi chạm bound
+thì mất oldest events thay vì *refuse new publishes* — refusing publishes sẽ kéo
+write path chết cùng event spine, tức inversion mà outbox của 3.3 tồn tại để
+ngăn.
+
+<Why source="ADR-02 · NFR-REL-08 · FR-WHK-02" locale="vi">
+
+**Vì sao là `limits` retention, khi thứ này trông như work queue?**
+
+Vì sẽ có nhiều hơn một consumer, và `workqueue` retention nghĩa là message bị
+delete khỏi stream ngay khi *bất kỳ* consumer nào acknowledge nó.
+
+Hôm nay có một consumer, và chiếc giày vừa chân. Nhưng SAD gọi tên ba consumer
+khác: webhook dispatcher (3.5), analytics ingester (Phần 4), và live stream của
+dashboard (Phần 5). Dưới `workqueue`, cái nào acknowledge event trước sẽ xóa nó
+ngay dưới chân những cái còn lại — dispatcher sẽ fire webhook còn meter sẽ không
+bao giờ thấy event, tức reconciliation 0.1% của FR-ANL-06 fail silently thay vì
+loudly.
+
+Dưới `limits`, stream giữ messages theo age và size, và mỗi durable consumer giữ
+position riêng. Ai cũng đọc mọi thứ. Đó cũng là thứ làm invariant 9 khả thi —
+consumer dừng trong N publishes sẽ nhận đủ N khi quay lại — và là thứ để mười
+hai nghìn events ngồi đó suốt một chương, không phải bug mà là design hoạt động
+khi chưa ai dùng nó.
+
+Và đó là setting không thể đổi sau này. Chọn `workqueue` hôm nay để tiết kiệm
+một chút disk sẽ phải undo bằng cách delete stream.
+
+</Why>
+
+## Grammar mà cả hai phía phải đồng ý
+
+ADR-02 specifies `events.{domain}.{action}.{env}` và đưa
+`events.msg.created.{env}` làm worked example. Chương 3.3 implement nó trong
+outbox module của api, trong sáu dòng, vì lúc đó chỉ api cần nó.
+
+Bây giờ consumer cần nó. Và consumer tự assemble subject filter từ cách nó tự đọc
+grammar là consumer sẽ âm thầm nhận *không gì cả* vào ngày grammar thay đổi —
+không error, không warning, chỉ có stream position không bao giờ advance. Vì vậy
+grammar move sang `@relay/protocol`, package mà từ chương 1.3 đã có toàn bộ job
+là các shapes hai phía share.
+
+```diff title="packages/protocol/src/internal.ts"
+@@ -82,6 +82,41 @@ export const internalBackfillResponseSchema = z.strictObject({
+   ),
+ });
+ 
++// ---------------------------------------------------------------------------
++// Event subjects (chapter 3.4, ADR-02).
++//
++// The grammar is `events.{domain}.{action}.{env}` — ADR-02's, verbatim. It lived
++// inside the api's outbox module in 3.3 because nothing else needed it. A
++// consumer needs it now, and the package whose whole job is the shapes both
++// sides share is where a shape shared by both sides belongs (1.3's premise).
++//
++// Built here and nowhere else. A consumer that filters on a subject it
++// assembled itself is a consumer that silently receives nothing the day the
++// grammar changes — no error, no warning, just an empty stream position.
++// ---------------------------------------------------------------------------
++
++/** Every subject the platform publishes on, and the wildcard that reads them
++ * all. One entry today; FR-WHK-02 names seven more, each arriving with the
++ * feature that can produce it. */
++export const EVENT_SUBJECT_PREFIX = "events";
++export const ALL_EVENTS_SUBJECT = `${EVENT_SUBJECT_PREFIX}.>`;
++
++/** `message.created` → `msg.created`: the domain abbreviation ADR-02's example
++ * uses (`events.msg.created.{env}`). Kept as a mapping rather than a string
++ * operation so that a type whose subject form is NOT its dotted name has an
++ * obvious place to be added. */
++const DOMAIN_ABBREVIATION: Record<string, string> = {
++  message: "msg",
++};
++
++export function subjectFor(type: string, environmentId: string): string {
++  if (!type) throw new Error("an event type is required");
++  if (!environmentId) throw new Error("an environment id is required");
++  const [domain, ...rest] = type.split(".");
++  const abbreviated = DOMAIN_ABBREVIATION[domain!] ?? domain!;
++  return [EVENT_SUBJECT_PREFIX, abbreviated, ...rest, environmentId].join(".");
++}
++
+ /** api → gateway: the channels this user may hear (FR-RTM-01). */
+ export const internalMembershipsResponseSchema = z.strictObject({
+   channel_ids: z.array(z.string().min(1)),
+```
+
+Api vẫn chạy vì `event.ts` re-export thứ nó từng define — và có thêm một thứ nó
+chưa có, quan trọng hơn cả việc move:
+
+```diff title="services/api/src/outbox/event.ts"
+@@ -1,3 +1,6 @@
++import { subjectFor } from "@relay/protocol";
++import { z } from "zod";
++
+ // The event envelope (chapter 3.3). Built in ONE place, complete, inside the
+ // transaction that caused it — so the relay is a mover of bytes and never an
+ // author of them (ADR-04, research R7).
+@@ -36,13 +39,10 @@ export interface PendingEvent {
+   payload: OutboxEvent;
+ }
+ 
+-/** `events.msg.created.{environment_id}` — the shape SAD §6.1's own comment
+- * gives. The full subject taxonomy for FR-WHK-02's other seven types, and any
+- * per-environment sharding, belongs to chapter 3.4. */
+-export function subjectFor(type: string, environmentId: string): string {
+-  const leaf = type.replace(/^message\./, "msg.");
+-  return `events.${leaf}.${environmentId}`;
+-}
++// The subject grammar moved to @relay/protocol in chapter 3.4, because a
++// consumer needs it too and both sides must agree on it. Imported for use
++// below and re-exported so 3.3's callers keep working.
++export { subjectFor };
+ 
+ export function messageCreatedEvent({
+   eventId,
+@@ -69,3 +69,26 @@ export function messageCreatedEvent({
+     },
+   };
+ }
++
++/** The envelope as a CONSUMER receives it (chapter 3.4).
++ *
++ * The producing side builds this object and knows it is well formed; the
++ * consuming side reads bytes off a broker and knows nothing. Chapter 2.5 made
++ * the same argument about the internal HTTP hop — an internal caller has no
++ * more right to assume a payload's shape than an external one does — and a
++ * message that has been sitting in a stream for six days has had even longer to
++ * stop matching what the code expects. */
++export const outboxEventSchema = z.strictObject({
++  id: z.string().uuid(),
++  type: z.literal("message.created"),
++  environment_id: z.string().min(1),
++  occurred_at: z.iso.datetime(),
++  data: z.strictObject({
++    id: z.string().min(1),
++    channel_id: z.string().min(1),
++    seq: z.number().int().positive(),
++    user: z.string().nullable(),
++    text: z.string().nullable(),
++    created_at: z.iso.datetime(),
++  }),
++});
+```
+
+`outboxEventSchema` là envelope như một *consumer* nhận nó. Producing side build
+object đó và biết nó well formed; consuming side đọc bytes từ broker và không
+biết gì cả. Đây là argument của chương 2.5 về internal HTTP hop — internal
+caller không có quyền assume shape của payload hơn external caller — cộng thêm
+một thập kỷ exposure, vì message nằm trong stream sáu ngày có thêm từng đó thời
+gian để ngừng match code đọc nó.
+
+Năm unit cases trong `packages/protocol/src/internal.test.ts` giữ grammar: rằng
+environment đi cuối, rằng `message` abbreviate thành `msg` như example của
+ADR-02, rằng domain không có abbreviation thì đi xuyên qua, rằng thiếu part sẽ
+throw thay vì tạo `events..created.`, và rằng output match wildcard mà mọi
+consumer subscribe.
+
+## Gap còn lại
+
+Đây là phần chương này ngừng nói về configuration.
+
+Toàn bộ chủ đề của chương 3.3 là window giữa committed message và published
+event — dual write, và process chết bên trong nó. Outbox đóng window đó bằng
+cách đặt event và message trong một transaction.
+
+Đọc event trở ra, và cùng window đó mở ra ở phía bên kia.
+
+<Figure
+  caption="Gap của consumer. Giữa làm work và acknowledge nó có một window nơi effect đã durable còn broker chưa biết — và process chết ở đó sẽ bị redeliver work đã xảy ra."
+  code={figTheOtherGap}
+/>
+
+Pull consumer fetch một message, làm gì đó với nó, rồi nói với broker rằng đã
+xong. Nếu nó chết sau phần *làm gì đó* và trước phần *nói*, broker có quyền —
+thật ra là có nghĩa vụ — deliver message đó lần nữa. Nó chưa nghe điều ngược
+lại. Đó là ý nghĩa của at-least-once từ phía nhận, và chương 3.3 đã promise
+bằng chữ: "embraced, not mitigated."
+
+Vậy hãy làm nó xảy ra thay vì mô tả nó. Walk script làm bằng tay thứ runtime làm
+trong loop, và chết trong gap:
+
+```console
+$ node scripts/consumer-walk.mjs --kill-before-ack
+durable consumer           walk-f74fc0ad
+environment                7d7d764e-4d01-474e-854d-7edeccaad53b
+published                  7678edc8-65cd-42c8-ac50-bdaeda79d069
+delivered                  7678edc8-65cd-42c8-ac50-bdaeda79d069 attempt=1 redelivered=false
+claim                      handled
+times handled              1
+MARKER kill-me-now
+Killed
+```
+
+`SIGKILL`, không phải thrown exception — vì lý do chương 3.3 đã đưa ra và chương
+này inherit: exception chạy error path của bạn, còn crash thì không. Dòng cuối
+đó là shell report signal, không phải script nói lời tạm biệt.
+
+Work đã xảy ra. Nó nằm trong Postgres — `times handled` nói vậy. Broker không
+biết. Nhặt lại cùng position đó và xem broker xử lý thế nào:
+
+```console
+$ node scripts/consumer-walk.mjs --resume=walk-f74fc0ad
+durable consumer           walk-f74fc0ad
+waiting                    nothing yet — the broker redelivers after ack_wait (30s)
+delivered                  7678edc8-65cd-42c8-ac50-bdaeda79d069 attempt=2 redelivered=true
+claim                      duplicate
+times handled              1
+acknowledged               7678edc8-65cd-42c8-ac50-bdaeda79d069
+```
+
+Attempt thứ hai, explicitly redelivered, và ledger refuse claim — nên effect
+vẫn là một lần và message cuối cùng được acknowledged. Không có dòng giữa đó,
+delivery thứ hai làm work lần thứ hai: webhook fire hai lần, meter count hai
+lần, và agreement 0.1% của FR-ANL-06 lệch nguyên một event mà không ai account
+được.
+
+Ba mươi giây `waiting` đáng được xem một lần thay vì skip. Đó là `ack_wait`
+đang trôi qua: broker giữ message cho consumer mà nó chưa từ bỏ.
+
+<Trap locale="vi">
+
+Ba integration tests đầu tiên của tôi ở đây timeout, và lý do đáng giá hơn bản
+fix.
+
+Tên của durable consumer không phải label. Nó là **position trong stream**,
+stored trên server, shared bởi mọi thứ dùng nó và sống lâu hơn mọi process dùng
+nó. Hai điều kéo theo, và tôi mắc cả hai.
+
+Thứ nhất, durable mới bắt đầu ở *beginning*. Tests của tôi mỗi cái publish một
+event rồi đợi nó — phía sau mười hai nghìn chín trăm events các chương trước để
+lại trong stream, tất cả đều phải được deliver trước. Đó không phải bug trong
+`limits` retention; đó chính là `limits` retention. Fix là cho runtime một
+`filterSubject`, điều contract đã anticipate cho dispatcher của 3.5, và scope
+mỗi test vào subject của environment riêng.
+
+Thứ hai, durables không tự dọn. Lần đầu `stream-info.mjs` print consumer list,
+nó thấy **mười hai** cái, bị bỏ lại bởi các lần chạy của một suite lần nào cũng
+pass. Không gì fail; không gì complain. Per-run names giữ các runs độc lập, đó
+là lý do chúng tồn tại — chúng không giữ broker gọn gàng. Suite bây giờ delete
+durables của chính nó trong `afterAll`.
+
+General shape, lần thứ ba trong series sau Redis subjects của 2.6 và outbox rows
+của 3.3: **shared store cần per-run handle, và per-run handle cần cleanup.**
+Isolation mà tenant column trao cho mọi suite khác không có sẵn trên
+infrastructure platform sở hữu tập thể.
+
+</Trap>
+
+## Ledger
+
+Delivery thứ hai phải được nhận ra, và nhận ra nó cần một memory sống sót qua
+process. Đó là một table.
+
+```diff title="services/api/src/db/schema.ts"
+@@ -325,3 +325,37 @@ export const outbox = pgTable(
+       .where(sql`${t.publishedAt} IS NULL`),
+   ],
+ );
++
++// The consumer's deduplication ledger (chapter 3.4).
++//
++// DECISION (chapter 3.4): no source document defines a table for this. SAD risk
++// R5 requires the BEHAVIOUR — "consumer template with dedup built in", so that
++// "a future consumer forgets to dedupe → double webhooks / double metering"
++// cannot happen — and leaves the shape open. This is therefore a chapter
++// derivation, recorded here the way 2.1 recorded `members`, 3.2 recorded
++// `api_keys` and 3.3 recorded the outbox's index.
++//
++// The PRIMARY KEY is the deduplication. Not a SELECT-then-INSERT: the insert
++// itself is the check, so two instances fetching the same message concurrently
++// cannot both decide they were first. 2.3 learned that on idempotency keys and
++// 3.1 learned it again on signup.
++//
++// Keyed per CONSUMER, not globally. The dispatcher and the ingester must each
++// receive every event; one ledger shared between them would let whichever
++// arrived first silence the other.
++//
++// No environment_id, for the reason the outbox has none: this is the platform's
++// own bookkeeping rather than tenant data (constitution I, 3.3's data model).
++// No event body either — recording that an event was handled needs none of a
++// tenant's message text (NFR-SEC-06).
++export const consumedEvents = pgTable(
++  "consumed_events",
++  {
++    consumer: text("consumer").notNull(),
++    eventId: uuid("event_id").notNull(),
++    handledAt: timestamp("handled_at", { withTimezone: true })
++      .notNull()
++      .defaultNow(),
++  },
++  (t) => [primaryKey({ columns: [t.consumer, t.eventId] })],
++);
+```
+
+Không source document nào define table này. SAD risk R5 yêu cầu *behaviour* —
+"future consumer forgets to dedupe → double webhooks / double metering", được
+mitigate bằng "consumer template with dedup built in" — và để shape mở, nên
+shape là chapter derivation và nói vậy trong schema, như 2.1 record `members`
+và 3.3 record partial index của outbox.
+
+Primary key **chính là** deduplication. Không phải `SELECT` rồi mới `INSERT`:
+insert tự nó là check, nên hai instances fetch cùng message cùng lúc không thể
+cùng kết luận mình là người đầu tiên. Chương 2.3 học điều đó trên idempotency
+keys và 3.1 học lại trên signup, tức tới giờ đã ba lần câu trả lời là "để
+database quyết định, trong một statement."
+
+```sql title="services/api/migrations/0005_consumed_events.sql"
+-- Chapter 3.4 — the consumer deduplication ledger (SAD risk R5).
+--
+-- REVIEW DISPOSITION: drizzle-kit generated this from schema.ts and it was read
+-- line by line before being applied (the ADR-16 workflow). Nothing was
+-- rewritten. Two things were checked rather than assumed:
+--
+--   * the PRIMARY KEY is composite, (consumer, event_id) — that constraint IS
+--     the deduplication, so a wrong key here would silently turn "handled once"
+--     into "handled once per consumer per restart";
+--   * there is no foreign key to anything. The ledger records that a consumer
+--     handled an event id, and the events themselves live in the broker, not in
+--     a table this could reference.
+--
+-- Deliberately absent: an environment_id (this is platform bookkeeping, like
+-- the outbox), an event body (recording that something was handled needs none
+-- of a tenant's message text, NFR-SEC-06), and any pruning. Rows stop earning
+-- their keep once an event is older than the stream's 7-day retention, because
+-- a message that can no longer be redelivered can no longer be a duplicate.
+
+CREATE TABLE "consumed_events" (
+	"consumer" text NOT NULL,
+	"event_id" uuid NOT NULL,
+	"handled_at" timestamp with time zone DEFAULT now() NOT NULL,
+	CONSTRAINT "consumed_events_consumer_event_id_pk" PRIMARY KEY("consumer","event_id")
+);
+```
+
+Và operation trên nó:
+
+```diff title="services/api/src/db/repository.ts"
+@@ -7,6 +7,7 @@ import {
+   apiKeys,
+   applications,
+   channels,
++  consumedEvents,
+   environments,
+   humans,
+   members,
+@@ -301,6 +302,77 @@ export async function outboxDepth(db: Db): Promise<number> {
+   return result.rows[0]?.pending ?? 0;
+ }
+ 
++// ---------------------------------------------------------------------------
++// The consumer's deduplication ledger (chapter 3.4, SAD risk R5). Admin surface
++// for the same reason the outbox drain is: it runs on behalf of the platform
++// rather than of a tenant, and one consumer reads every environment's events.
++// ---------------------------------------------------------------------------
++
++/** What happened when a consumer tried to take an event. */
++export type ClaimResult = "handled" | "duplicate";
++
++/** Claim an event for a consumer and run its effect — **in one transaction**.
++ *
++ * This is the shape chapter 3.3 used for the outbox row and the message it
++ * describes, pointed the other way: the ledger row and the effect share a fate.
++ * A handler that throws rolls the claim back with it, so the redelivery finds no
++ * claim and runs again. Claiming outside the transaction would mean a failed
++ * handler leaves a claim behind, and the redelivery would be waved through as a
++ * duplicate — an event silently never handled, which is worse than one handled
++ * twice.
++ *
++ * The INSERT is the check. `ON CONFLICT DO NOTHING` with a `RETURNING` tells us
++ * whether this call won the row; a SELECT-then-INSERT would let two instances
++ * fetching the same message both believe they were first (2.3's lesson on
++ * idempotency keys, 3.1's on signup).
++ *
++ * **The limit of this, stated because chapter 3.5 will meet it**: the effect has
++ * to be transactional for the fate to be shared, which means it has to be in
++ * Postgres. A handler whose effect is an HTTP call to a customer cannot be
++ * rolled back, and no ledger makes it so. That consumer must choose which way to
++ * be wrong, and choosing is its chapter's work.
++ */
++export async function claimEvent(
++  db: Db,
++  consumer: string,
++  eventId: string,
++  effect: () => Promise<void>,
++): Promise<ClaimResult> {
++  return db.transaction(async (tx) => {
++    const claimed = await tx
++      .insert(consumedEvents)
++      .values({ consumer, eventId })
++      .onConflictDoNothing({
++        target: [consumedEvents.consumer, consumedEvents.eventId],
++      })
++      .returning({ eventId: consumedEvents.eventId });
++
++    if (claimed.length === 0) return "duplicate";
++    await effect();
++    return "handled";
++  });
++}
++
++/** How many times a consumer has handled a given event. Zero or one, always —
++ * which is the assertion the redelivery test makes, and the reason this exists
++ * rather than the test reaching into the table itself. */
++export async function timesHandled(
++  db: Db,
++  consumer: string,
++  eventId: string,
++): Promise<number> {
++  const rows = await db
++    .select({ eventId: consumedEvents.eventId })
++    .from(consumedEvents)
++    .where(
++      and(
++        eq(consumedEvents.consumer, consumer),
++        eq(consumedEvents.eventId, eventId),
++      ),
++    );
++  return rows.length;
++}
++
+ /** What a signup produced — or found. `created` answers "was an organisation
+  * created on this call?", NOT "was the identity new": a known human who owned
+  * nothing gets `created: true`, because one really was created for them. */
+```
+
+<Why source="SAD risk R5 · ADR-06 · ADR-02" locale="vi">
+
+**Vì sao claim trong cùng transaction với effect, khi broker đã deduplicate?**
+
+Hai câu hỏi, và chúng có câu trả lời khác nhau.
+
+Transaction trước. Nếu claim commit riêng khỏi effect, handler fail giữa chừng
+để lại một claim — và redelivery, thứ tồn tại chính để retry failure đó, bị vẫy
+qua như duplicate. Event khi đó *không bao giờ* được handled, một cách im lặng,
+và có một row assert rằng nó đã handled. Event bị handled hai lần là một ngày
+tệ. Event được record là handled nhưng chưa từng handled là lời nói dối trong
+table, và không alert nào fire vì nó.
+
+Vì vậy claim và effect chung số phận, tức insight outbox của chương 3.3 quay
+ngược chiều: ở đó, event commit cùng message gây ra nó; ở đây, record của việc
+handling commit cùng handling.
+
+Bây giờ đến broker. JetStream *có* deduplicate, trên `msgID` relay cung cấp,
+bên trong `duplicate_window` — 120 giây trên stream này. Rất tempting để nâng
+window đó và gọi vấn đề là solved. Nó chưa solved: outbox có thể republish nhiều
+giờ sau outage, không con số nào là safe guess cho outage dài nhất, và window
+đo bằng giờ giữ dedupe index đó trong memory của broker suốt nhiều giờ. Window
+của broker collapse common case một cách rẻ và được để nguyên đúng nơi 3.3 tìm
+thấy nó. **Guarantee sống ở nơi work xảy ra.**
+
+</Why>
+
+## Runtime, và handler không phải là gì
+
+Mitigation của R5 là template có dedup built in. Cách làm cho việc quên trở nên
+bất khả là không để handler có gì để quên:
+
+```ts title="services/api/src/consumer/handler.ts"
+import type { OutboxEvent } from "../outbox/event";
+
+// What a handler is, and — more importantly — what it is not (chapter 3.4).
+//
+// SAD risk R5: "a future consumer forgets to dedupe → double webhooks / double
+// metering", mitigated by a "consumer template with dedup built in". The way to
+// make forgetting impossible is to leave a handler nothing to forget. It cannot
+// acknowledge, cannot negatively acknowledge, cannot retry, cannot deduplicate,
+// and cannot see the raw message. It can return, or it can throw.
+
+export interface EventContext {
+  /** The broker's delivery count for this message: 1 on the first attempt.
+   * A handler may LOG it. It must not use it to decide correctness — a handler
+   * that behaves differently on attempt three is a handler whose behaviour
+   * depends on a timeout somewhere else. */
+  attempt: number;
+}
+
+/** Returns → handled. Throws → not handled, try again. */
+export type EventHandler = (
+  event: OutboxEvent,
+  context: EventContext,
+) => Promise<void>;
+```
+
+Nó không thể acknowledge. Nó không thể negatively acknowledge, retry,
+deduplicate, hay nhìn raw message. Nó có thể return, hoặc throw. Mọi thứ khác
+là của runtime, và runtime là nơi decision table sống:
+
+<Figure
+  caption="Runtime làm gì với một delivery. Ba outcomes, trong đó một cái — terminate — là điểm cuối thành thật cho message không ai parse được."
+  code={figOutcomes}
+/>
+
+```ts title="services/api/src/consumer/runtime.ts"
+import {
+  AckPolicy,
+  connect,
+  DeliverPolicy,
+  type JsMsg,
+  type NatsConnection,
+} from "nats";
+import { ALL_EVENTS_SUBJECT } from "@relay/protocol";
+import type { Logger } from "@relay/service-kit";
+
+import { createDb, createPool, type Db } from "../db/client";
+import { claimEvent, type ClaimResult } from "../db/repository";
+import { outboxEventSchema, type OutboxEvent } from "../outbox/event";
+import { DEFAULT_NATS_URL, ensureStream } from "../outbox/jetstream.publisher";
+import type { EventHandler } from "./handler";
+
+// The consumer runtime (chapter 3.4). Fetch, decide, acknowledge — and
+// deduplicate, so that a handler cannot forget to.
+//
+// SAD risk R5 is the whole reason this file exists rather than a page of
+// instructions: "a future consumer forgets to dedupe → double webhooks / double
+// metering", mitigated by a "consumer template with dedup built in". Built in
+// means a handler is given no way to skip it.
+
+const STREAM = "EVENTS";
+
+/** Batch size per fetch. Small enough that a slow handler does not hold an
+ * acknowledgement deadline over a hundred messages; large enough that a backlog
+ * of twelve thousand drains in sensible steps rather than one round trip each. */
+const BATCH = 25;
+
+/** How long the broker waits for an acknowledgement before redelivering. Long
+ * enough for a real handler, short enough that a killed instance's work comes
+ * back promptly — which is also what makes the redelivery test tolerable to run
+ * (research R7). */
+const ACK_WAIT_NS = 30 * 1_000_000_000;
+
+/** Bounded, because forever is not a retry policy. After this many attempts the
+ * broker stops delivering and the message leaves the consumer's view entirely —
+ * measured, not assumed (research R4). Nothing catches it. A dead-letter store
+ * is FR-WHK-04's, in chapter 3.5. */
+const MAX_DELIVER = 5;
+
+/** Back-pressure: the broker stops handing out work when this much is
+ * outstanding, so a stalled consumer cannot accumulate an unbounded pile of
+ * unacknowledged messages. */
+const MAX_ACK_PENDING = 100;
+
+/** What the runtime does with a message. Extracted from the loop so the decision
+ * table can be read in one place — and tested without a broker. */
+export type Outcome = "acknowledge" | "retry" | "terminate";
+
+/** The decision, given a parsed payload and a way to claim it.
+ *
+ * `claim` receives the effect to run and reports whether this call won the
+ * ledger row. It is passed in rather than called directly so this function has
+ * no database of its own to reason about.
+ */
+export async function decideOutcome({
+  parsed,
+  attempt = 1,
+  claim,
+  handler,
+}: {
+  parsed: OutboxEvent | null;
+  attempt?: number;
+  claim: (effect: () => Promise<void>) => Promise<ClaimResult>;
+  handler?: EventHandler;
+}): Promise<Outcome> {
+  // A payload that will never parse must not consume five delivery attempts
+  // before being dropped anyway. The same bytes fail the same way every time.
+  if (parsed === null) return "terminate";
+
+  try {
+    const result = await claim(async () => {
+      await handler?.(parsed, { attempt });
+    });
+    // "duplicate" means somebody already handled this — including a previous
+    // delivery to this same consumer that crashed after committing. The message
+    // is acknowledged because it genuinely has been handled, just not now.
+    return result === "duplicate" ? "acknowledge" : "acknowledge";
+  } catch {
+    // The handler threw, so the claim rolled back with it (see `claimEvent`).
+    // Not acknowledging is how the runtime asks for a redelivery; the handler
+    // never sees an acknowledgement to withhold.
+    return "retry";
+  }
+}
+
+export interface ConsumerRuntime {
+  /** Runs until `stop()`. Never rejects: a broker that is down is an expected
+   * state, not a crash. */
+  start(): void;
+  stop(): Promise<void>;
+  /** One fetch-and-decide pass, for tests and for the walk script — the same
+   * code path `start` runs, so nothing is proven about a loop only tests use. */
+  pollOnce(): Promise<{ handled: number; duplicates: number; retried: number }>;
+}
+
+export function createConsumerRuntime({
+  durable,
+  handler,
+  logger,
+  db = createDb(createPool()),
+  url = process.env.RELAY_NATS_URL ?? DEFAULT_NATS_URL,
+  batch = BATCH,
+  filterSubject = ALL_EVENTS_SUBJECT,
+  fromNewOnly = false,
+}: {
+  durable: string;
+  handler: EventHandler;
+  logger: Logger;
+  db?: Db;
+  url?: string;
+  batch?: number;
+  /** Which subjects this consumer wants. The default is everything, which is
+   * what the recorder needs; a narrower filter is how chapter 3.5's dispatcher
+   * will subscribe to the event types a customer asked for, and how a test
+   * scopes itself to one environment's subject rather than replaying the whole
+   * stream (contracts §consumer). */
+  filterSubject?: string;
+  /** Start at the head rather than at the beginning. A durable consumer's
+   * default is to deliver everything the stream still holds — which is correct
+   * for a consumer that must not miss anything, and impractical for a test that
+   * would otherwise replay twelve thousand events from earlier chapters before
+   * reaching its own. */
+  fromNewOnly?: boolean;
+}): ConsumerRuntime {
+  let connection: NatsConnection | null = null;
+  let running = false;
+  let loop: Promise<void> = Promise.resolve();
+
+  /** Lazy, like the publisher's: the api must start and serve writes with the
+   * broker unreachable. The durable consumer is created if absent and left
+   * alone if present, so two instances starting together share the position
+   * rather than fighting over it (research R8). */
+  async function connection_(): Promise<NatsConnection> {
+    if (connection && !connection.isClosed()) return connection;
+    const nc = await connect({ servers: url });
+    await ensureStream(nc);
+    const jsm = await nc.jetstreamManager();
+    const exists = await jsm.consumers
+      .info(STREAM, durable)
+      .then(() => true)
+      .catch(() => false);
+    if (!exists) {
+      await jsm.consumers.add(STREAM, {
+        durable_name: durable,
+        ack_policy: AckPolicy.Explicit,
+        ack_wait: ACK_WAIT_NS,
+        max_deliver: MAX_DELIVER,
+        max_ack_pending: MAX_ACK_PENDING,
+        filter_subject: filterSubject,
+        ...(fromNewOnly ? { deliver_policy: DeliverPolicy.New } : {}),
+      });
+    }
+    connection = nc;
+    return nc;
+  }
+
+  function parse(message: JsMsg): OutboxEvent | null {
+    try {
+      const result = outboxEventSchema.safeParse(
+        JSON.parse(new TextDecoder().decode(message.data)),
+      );
+      return result.success ? result.data : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async function pollOnce(): Promise<{
+    handled: number;
+    duplicates: number;
+    retried: number;
+  }> {
+    const nc = await connection_();
+    const consumer = await nc.jetstream().consumers.get(STREAM, durable);
+    const messages = await consumer.fetch({
+      max_messages: batch,
+      expires: 1_000,
+    });
+
+    let handled = 0;
+    let duplicates = 0;
+    let retried = 0;
+
+    for await (const message of messages) {
+      const parsed = parse(message);
+      let result: ClaimResult = "duplicate";
+      const outcome = await decideOutcome({
+        parsed,
+        attempt: message.info.deliveryCount,
+        claim: async (effect) => {
+          result = await claimEvent(db, durable, parsed!.id, effect);
+          return result;
+        },
+        handler,
+      });
+
+      if (outcome === "terminate") {
+        // Stops the redelivery for good. The chapter says out loud that nothing
+        // catches what lands here.
+        message.term();
+        logger.log("error", "consumer.unparseable", {
+          consumer: durable,
+          stream_sequence: message.seq,
+        });
+        continue;
+      }
+      if (outcome === "retry") {
+        message.nak();
+        retried += 1;
+        continue;
+      }
+      message.ack();
+      if (result === "duplicate") duplicates += 1;
+      else handled += 1;
+    }
+
+    return { handled, duplicates, retried };
+  }
+
+  async function run(): Promise<void> {
+    while (running) {
+      try {
+        const { handled, duplicates, retried } = await pollOnce();
+        if (handled + duplicates + retried > 0) {
+          // Counts, never payloads. A message body in a log line is a tenant's
+          // data in an operator's terminal (NFR-SEC-06).
+          logger.log("info", "consumer.batch", {
+            consumer: durable,
+            handled,
+            duplicates,
+            retried,
+          });
+          continue;
+        }
+      } catch (error) {
+        logger.log("error", "consumer.poll_failed", {
+          consumer: durable,
+          error: String(error),
+        });
+      }
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+  }
+
+  return {
+    start() {
+      if (running) return;
+      running = true;
+      loop = run();
+    },
+    async stop() {
+      running = false;
+      await loop;
+      if (connection && !connection.isClosed()) await connection.drain();
+      connection = null;
+    },
+    pollOnce,
+  };
+}
+```
+
+`decideOutcome` được extract khỏi loop một cách cố ý: nó là toàn bộ argument của
+chương trong ba mươi dòng, và có thể test không cần broker. Năm unit cases trong
+`runtime.test.ts` cover nó — unparseable payload terminate, duplicate được
+acknowledged *mà không chạy handler*, handler return thì acknowledge, handler
+throw thì retry và không acknowledge, và handler chỉ được đưa attempt number
+cùng không gì khác. Ba case nữa trong cùng file giữ envelope schema against thứ
+3.3 publish.
+
+Các constants là số nhỏ nhưng có argument phía sau. Batch 25 đủ lớn để backlog
+mười hai nghìn drain theo steps thay vì round trips, và đủ nhỏ để slow handler
+không giữ acknowledgement deadline trên một trăm messages. `ack_wait` ba mươi
+giây đủ dài cho handler thật và đủ ngắn để work của killed instance quay lại
+promptly — cũng là thứ làm redelivery test còn chịu được khi chạy.
+
+Và handler đầu tiên gần như không làm gì, một cách cố ý:
+
+```ts title="services/api/src/consumer/recorder.ts"
+import type { Logger } from "@relay/service-kit";
+
+import type { EventHandler } from "./handler";
+
+// The first consumer (chapter 3.4) — and it is a SCAFFOLD, with a named
+// retirement, not a feature.
+//
+// Every consumer the SAD names belongs to a later chapter: the webhook
+// dispatcher (3.5), the analytics ingester and the media worker (Part 4), the
+// dashboard's live stream (Part 5). Giving this one a job would mean either
+// stealing 3.5's subject or inventing product nobody asked for, and Principle
+// VII forbids the second.
+//
+// So it does the smallest real thing: it observes that an event arrived. The
+// EFFECT — the row in `consumed_events` — is written by the runtime's claim, in
+// the same transaction, which is the entire mechanism this chapter exists to
+// demonstrate. This handler's body is nearly empty on purpose, and that
+// emptiness is the point: what makes the consumer correct is the runtime around
+// it, not the code inside it.
+//
+// RETIREMENT: chapter 3.5 replaces this with the webhook dispatcher, which is a
+// handler with the same signature and a great deal more to do.
+export function createRecorder(logger: Logger): EventHandler {
+  return async (event, context) => {
+    // Identifiers and counts only — never `event.data.text`. A tenant's message
+    // body has no business in the platform's own logs (NFR-SEC-06).
+    logger.log("info", "event.recorded", {
+      event_id: event.id,
+      type: event.type,
+      environment_id: event.environment_id,
+      attempt: context.attempt,
+    });
+  };
+}
+```
+
+Sự trống đó chính là point. Thứ làm consumer này đúng là runtime quanh nó, không
+phải code bên trong nó — và mọi consumer SAD gọi tên đều thuộc về chương sau.
+Cho consumer này một job nghĩa là hoặc ăn cắp subject của 3.5, hoặc invent
+product không ai yêu cầu.
+
+<ForwardRef part="Chương 3.5" locale="vi">Việc retire được gọi tên thay vì chỉ
+ngụ ý: chương 3.5 thay `createRecorder` bằng webhook dispatcher, có cùng
+signature và nhiều việc hơn hẳn — HMAC signing, retry schedule 1 s → 2 h của
+FR-WHK-03, và dead-letter path mà chương này chưa có.</ForwardRef>
+
+## Chuyện gì xảy ra với message không ai handle được
+
+Đây là nơi một chương rất dễ muốn ngừng nói. `max_deliver` là năm; handler luôn
+throw được retry năm lần; rồi sau đó thì sao?
+
+Chúng ta đo thay vì assume:
+
+```text
+round 0: got seq=1 deliveryCount=1 redelivered=false
+round 0: got seq=1 deliveryCount=2 redelivered=true
+round 1: got seq=1 deliveryCount=3 redelivered=true
+pending=0 ack_pending=0 redelivered=1
+```
+
+Sau attempt cuối, message ngừng được deliver và rời khỏi view của consumer hoàn
+toàn. **Không gì catch nó.** Không dead-letter stream, không table poison
+messages, không alert. Event vẫn ở trong stream — consumer khác với durable khác
+vẫn sẽ nhận nó, vì `limits` retention giữ nó — nhưng với consumer này thì nó đã
+biến mất, và trace duy nhất là một log line nói delivery đã terminated.
+
+Unparseable payload skip hẳn năm attempts và bị terminate ngay lần đầu thấy, vì
+cùng bytes fail cùng cách năm lần và đốt budget không thay đổi gì ngoài thời
+điểm message bị drop.
+
+FR-WHK-04 yêu cầu dead-letter queue có replay. Đó là của chương 3.5, và thật sự
+là của 3.5 chứ không phải bị defer để tránh việc: dead-lettering cần nơi đặt
+message, cách nhìn nó, và cách replay nó, và cả ba thứ đó được shape bởi nhu cầu
+của webhook dispatcher. Build một bản generic ở đây sẽ là build nó hai lần.
+
+Thứ chương này nợ bạn không phải feature. Nó là câu này: **ngay bây giờ, event
+có handler không thể succeed sẽ bị drop, và không ai được báo.** Một chương bỏ
+qua câu đó sẽ đang dạy một system có lỗ hổng và gọi lỗ hổng đó là finished.
+
+## Nó chạy ở đâu, và cái giá là gì
+
+<Figure
+  caption="Consumer sống bên trong api service — không phải vì convenience, mà vì ledger của nó là Postgres write, và ADR-04 chỉ cho phép đúng một service làm việc đó."
+  code={figWhereItRuns}
+/>
+
+```ts title="services/api/src/consumer/consumer.module.ts"
+import { Inject, Injectable, Module, type OnModuleDestroy } from "@nestjs/common";
+
+import { createLogger } from "@relay/service-kit";
+
+import { createRecorder } from "./recorder";
+import { createConsumerRuntime, type ConsumerRuntime } from "./runtime";
+
+// The consumer's home (chapter 3.4). It runs INSIDE the api service, and that
+// is a constraint rather than a convenience.
+//
+// Its deduplication ledger is a Postgres write, and ADR-04 makes the api the
+// only service that writes to Postgres — the SAD applies that strictly enough
+// that the media worker transitions state through an internal route precisely
+// so it never touches the database. A consumer deployed as its own service
+// would be a second writer.
+//
+// So it sits here, exactly as chapter 3.3's outbox relay does under ADR-06's
+// "a small loop inside the API service initially, promotable to its own
+// deployment". What that costs is named rather than discovered: chapter 3.5's
+// dispatcher IS meant to be its own service, and it will need either an
+// internal route for its ledger or an explicit ADR amendment (research R5).
+
+export const EVENT_CONSUMER = "EVENT_CONSUMER";
+
+/** The durable name. It is a POSITION in the stream, shared by every instance
+ * using it — which is what lets two api processes divide the work instead of
+ * each receiving everything (research R8). */
+export const RECORDER_DURABLE = "recorder";
+
+/** On by default: an event spine nobody reads is what chapter 3.3 left behind.
+ * `RELAY_EVENT_CONSUMER=off` exists for suites that want a quiet database —
+ * 3.3 learned the hard way that a background loop mutating a table two other
+ * test files assert on is a race between test files, not a property. */
+export function consumerEnabled(): boolean {
+  return (process.env.RELAY_EVENT_CONSUMER ?? "on").toLowerCase() !== "off";
+}
+
+@Injectable()
+export class EventConsumerService implements OnModuleDestroy {
+  constructor(@Inject(EVENT_CONSUMER) private readonly runtime: ConsumerRuntime) {}
+
+  start(): void {
+    if (consumerEnabled()) this.runtime.start();
+  }
+
+  async onModuleDestroy(): Promise<void> {
+    await this.runtime.stop();
+  }
+}
+
+@Module({
+  providers: [
+    {
+      provide: EVENT_CONSUMER,
+      useFactory: (): ConsumerRuntime => {
+        const logger = createLogger("consumer");
+        return createConsumerRuntime({
+          durable: RECORDER_DURABLE,
+          handler: createRecorder(logger),
+          logger,
+        });
+      },
+    },
+    EventConsumerService,
+  ],
+  exports: [EVENT_CONSUMER, EventConsumerService],
+})
+export class ConsumerModule {}
+```
+
+ADR-04 strict tới mức media worker transition state qua internal HTTP route chỉ
+để nó không bao giờ chạm database. Consumer deploy như service riêng, tự write
+ledger rows của nó, sẽ là writer thứ hai — nên consumer này ngồi bên trong api,
+đúng như relay của 3.3 làm dưới câu "a small loop inside the API service
+initially, promotable to its own deployment" của ADR-06.
+
+Đó là constraint thật với bill thật, và gọi tên nó bây giờ rẻ hơn phát hiện về
+sau: **dispatcher của chương 3.5 được định là service riêng.** Khi tới đó, nó
+sẽ cần hoặc internal route cho ledger của nó, hoặc amendment rõ ràng cho ADR-04.
+Một trong hai việc đó sẽ xảy ra trong 3.5, công khai.
+
+Start nó là hai dòng cạnh relay, vì cùng lý do — lazy connection, để broker
+không reachable vẫn để api serve writes:
+
+```diff title="services/api/src/main.ts"
+@@ -4,6 +4,7 @@ import { NestFactory } from "@nestjs/core";
+ import { createLogger } from "@relay/service-kit";
+ 
+ import { AppModule } from "./app.module";
++import { EventConsumerService } from "./consumer/consumer.module";
+ import { OutboxRelayService } from "./outbox/outbox.module";
+ 
+ // Nest's own banner logger stays off: this workspace already decided what a
+@@ -18,6 +19,10 @@ async function bootstrap(): Promise<void> {
+   // accumulating in Postgres instead of preventing the api from serving writes
+   // (chapter 3.3, research R9).
+   app.get(OutboxRelayService).start();
++  // And the first thing that reads what the relay publishes (chapter 3.4).
++  // Same placement, same reason, same lazy connection: an unreachable broker
++  // leaves the api serving writes.
++  app.get(EventConsumerService).start();
+   // Nest calls onModuleDestroy on shutdown hooks; without this the relay's loop
+   // would outlive the process's intent to stop.
+   app.enableShutdownHooks();
+```
+
+```diff title="services/api/src/app.module.ts"
+@@ -10,6 +10,7 @@ import { AuthenticateMiddleware } from "./auth/authenticate.middleware";
+ import { HealthController } from "./health.controller";
+ import { InternalModule } from "./internal/internal.module";
+ import { MessagesModule } from "./messages/messages.module";
++import { ConsumerModule } from "./consumer/consumer.module";
+ import { OutboxModule } from "./outbox/outbox.module";
+ import { TenancyModule } from "./tenancy/tenancy.module";
+ import { LOGGER, apiLogger } from "./logger";
+@@ -27,6 +28,7 @@ import { RequestContextMiddleware } from "./request-context.middleware";
+     InternalModule,
+     TenancyModule,
+     OutboxModule,
++    ConsumerModule,
+   ],
+   controllers: [HealthController],
+   providers: [
+```
+
+## Các tests, và thứ chúng giữ
+
+Mười hai invariants. Mười cái chạy against broker thật và database thật; hai cái
+pure và sống trong unit lane.
+
+```console
+$ pnpm --filter @relay/api test:integration src/consumer/consumer.itest.ts
+✓ invariant 1: the stream's settings read back exactly as configured
+✓ invariant 2: applying the configuration twice is a no-op, not an error
+✓ invariant 3: an event is delivered, handled once, and acknowledged
+✓ invariant 4: a kill between handling and acknowledgement is redelivered — and handled once (SC-003)
+✓ invariant 5: deduplication survives a restart
+✓ invariant 6: two instances sharing a durable name divide the work
+✓ invariant 7: a handler that always throws stops being retried
+✓ invariant 8: an unparseable payload is terminated on the first attempt
+✓ invariant 9: a consumer stopped for N publishes receives all N on restart
+✓ invariant 12: a consumer log line carries counts, never payloads
+Tests  10 passed (10)
+```
+
+Invariant 4 là cái chương này được build trên đó, và nó không simulate gì cả. Nó
+spawn walk script, đợi marker, gửi `SIGKILL`, rồi hỏi ledger thứ gì sống sót —
+handled một lần, chưa từng acknowledged. Sau đó nó start runtime trên durable
+name của process đã chết và đợi broker redeliver. Assertions là ba thứ quan
+trọng: redelivery đã đến, handler chạy **zero** lần, và ledger vẫn nói một.
+
+```ts title="services/api/src/consumer/consumer.itest.ts"
+import "reflect-metadata";
+
+import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { join } from "node:path";
+
+import { connect } from "nats";
+import { createLogger, type Logger } from "@relay/service-kit";
+import { subjectFor } from "@relay/protocol";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+
+import { createDb, createPool, type Db } from "../db/client";
+import { claimEvent, timesHandled } from "../db/repository";
+import { ensureStream } from "../outbox/jetstream.publisher";
+import { createConsumerRuntime } from "./runtime";
+import type { EventHandler } from "./handler";
+
+// The consumer, against a real broker and a real database (chapter 3.4).
+//
+// Every durable name here is unique per run. A durable consumer is a POSITION
+// in a shared stream that already holds tens of thousands of events from earlier
+// chapters — two runs sharing a name would inherit each other's progress, and
+// the second would look mysteriously empty. This is the same lesson 2.6 learned
+// about Redis subjects and 3.3 about the outbox table: a shared store needs a
+// per-run handle, because the isolation every other suite gets from a tenant
+// column is not available here.
+
+const silent: Logger = createLogger("consumer-itest", () => {});
+
+const ENV = () => randomUUID();
+
+/** Publish one event straight onto the stream, the way the relay would. */
+async function publish(
+  environmentId: string,
+  overrides: Record<string, unknown> = {},
+): Promise<string> {
+  const nc = await connect({
+    servers: process.env.RELAY_NATS_URL ?? "nats://localhost:4222",
+  });
+  const id = randomUUID();
+  const payload = {
+    id,
+    type: "message.created",
+    environment_id: environmentId,
+    occurred_at: new Date().toISOString(),
+    data: {
+      id: randomUUID(),
+      channel_id: randomUUID(),
+      seq: 1,
+      user: "tuan",
+      text: "B2, north ramp",
+      created_at: new Date().toISOString(),
+    },
+    ...overrides,
+  };
+  await nc
+    .jetstream()
+    .publish(
+      subjectFor("message.created", environmentId),
+      new TextEncoder().encode(JSON.stringify(payload)),
+      { msgID: id },
+    );
+  await nc.drain();
+  return id;
+}
+
+/** Publish something that is not an event at all. */
+async function publishGarbage(environmentId: string): Promise<void> {
+  const nc = await connect({
+    servers: process.env.RELAY_NATS_URL ?? "nats://localhost:4222",
+  });
+  await nc
+    .jetstream()
+    .publish(
+      subjectFor("message.created", environmentId),
+      new TextEncoder().encode("{ this is not an event }"),
+    );
+  await nc.drain();
+}
+
+/** A runtime whose durable name is unique to this test, filtered to one
+ * environment's subject so the stream's existing backlog stays out of the way. */
+function runtimeFor(
+  db: Db,
+  durable: string,
+  handler: EventHandler,
+  logger: Logger = silent,
+  environmentId?: string,
+) {
+  return createConsumerRuntime({
+    durable,
+    handler,
+    logger,
+    db,
+    // Scoped to one environment's subject. Without it every test here would
+    // replay the ~13,000 events earlier chapters left in the stream before
+    // reaching its own — which is what `limits` retention means, and is exactly
+    // the behaviour invariant 9 asserts on deliberately.
+    ...(environmentId
+      ? { filterSubject: subjectFor("message.created", environmentId) }
+      : {}),
+  });
+}
+
+/** Durables this suite created through a CHILD process rather than directly.
+ * The walk names its own — `walk-<uuid>` — so the suite cannot predict them and
+ * a prefix sweep would delete a reader's walk running alongside it. It records
+ * what it spawned instead, and cleans exactly that. */
+const spawnedDurables: string[] = [];
+
+/** Run the walk in its kill mode and SIGKILL it the moment it says it is in the
+ * gap between the committed effect and the acknowledgement. */
+async function killInTheGap(): Promise<{
+  durable: string;
+  eventId: string;
+  environmentId: string;
+}> {
+  const script = join(
+    __dirname,
+    "..",
+    "..",
+    "..",
+    "..",
+    "scripts",
+    "consumer-walk.mjs",
+  );
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      "node",
+      [script, "--kill-before-ack", "--pause=30000"],
+      { env: { ...process.env }, stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let out = "";
+    let killed = false;
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error(`no marker within 60s; output was:\n${out}`));
+    }, 60_000);
+    child.stdout.on("data", (chunk: Buffer) => {
+      out += chunk.toString();
+      if (!killed && out.includes("MARKER kill-me-now")) {
+        killed = true;
+        child.kill("SIGKILL");
+      }
+    });
+    child.stderr.on("data", (chunk: Buffer) => (out += chunk.toString()));
+    child.on("exit", () => {
+      clearTimeout(timer);
+      if (!killed) return reject(new Error(`child finished early:\n${out}`));
+      const durable = /durable consumer\s+(\S+)/.exec(out)?.[1];
+      const eventId = /published\s+(\S+)/.exec(out)?.[1];
+      const environmentId = /environment\s+([0-9a-f-]{36})/.exec(out)?.[1];
+      if (!durable || !eventId) {
+        return reject(new Error(`could not read the walk's output:\n${out}`));
+      }
+      spawnedDurables.push(durable);
+      resolve({ durable, eventId, environmentId: environmentId ?? "" });
+    });
+  });
+}
+
+describe("the consumer", () => {
+  let db: Db;
+
+  beforeAll(async () => {
+    db = createDb(createPool());
+    const nc = await connect({
+      servers: process.env.RELAY_NATS_URL ?? "nats://localhost:4222",
+    });
+    await ensureStream(nc);
+    await nc.drain();
+  }, 60_000);
+
+  afterAll(async () => {
+    await db.execute(`DELETE FROM consumed_events WHERE consumer LIKE 'itest-%'`);
+    for (const durable of spawnedDurables) {
+      await db.execute(
+        `DELETE FROM consumed_events WHERE consumer = '${durable}'`,
+      );
+    }
+    // And the durable consumers themselves. A durable is server-side state that
+    // outlives the process that made it: without this, every run of this suite
+    // left another handful behind on a shared broker, and `stream-info.mjs`
+    // found twelve of them the first time it looked. Per-run names keep runs
+    // independent; they do not clean up after themselves.
+    //
+    // Both kinds go: the ones this process named `itest-…`, and the `walk-…`
+    // ones its child processes named for themselves. Missing the second kind is
+    // how the first count reached twelve.
+    const nc = await connect({
+      servers: process.env.RELAY_NATS_URL ?? "nats://localhost:4222",
+    });
+    const jsm = await nc.jetstreamManager();
+    for await (const info of jsm.consumers.list("EVENTS")) {
+      if (info.name.startsWith("itest-") || spawnedDurables.includes(info.name)) {
+        await jsm.consumers.delete("EVENTS", info.name).catch(() => undefined);
+      }
+    }
+    await nc.drain();
+  }, 60_000);
+
+  it("invariant 1: the stream's settings read back exactly as configured", async () => {
+    const nc = await connect({
+      servers: process.env.RELAY_NATS_URL ?? "nats://localhost:4222",
+    });
+    const info = await (await nc.jetstreamManager()).streams.info("EVENTS");
+    const c = info.config;
+    expect(c.subjects).toEqual(["events.>"]);
+    // NFR-REL-08's floor is 24 hours; the chapter chose seven days so a Friday
+    // outage survives the weekend.
+    expect(c.max_age).toBe(7 * 24 * 60 * 60 * 1_000_000_000);
+    expect(c.max_bytes).toBe(1024 * 1024 * 1024);
+    expect(c.discard).toBe("old");
+    // Immutable once created, and both already right because 3.3 chose them.
+    expect(c.retention).toBe("limits");
+    expect(c.storage).toBe("file");
+    await nc.drain();
+  });
+
+  it("invariant 2: applying the configuration twice is a no-op, not an error", async () => {
+    const nc = await connect({
+      servers: process.env.RELAY_NATS_URL ?? "nats://localhost:4222",
+    });
+    const before = await (await nc.jetstreamManager()).streams.info("EVENTS");
+    await ensureStream(nc);
+    await ensureStream(nc);
+    const after = await (await nc.jetstreamManager()).streams.info("EVENTS");
+    // Same settings, and — the part that matters on a stream holding tens of
+    // thousands of events — nothing lost.
+    expect(after.config.max_age).toBe(before.config.max_age);
+    expect(after.state.messages).toBeGreaterThanOrEqual(before.state.messages);
+    await nc.drain();
+  });
+
+  it("invariant 3: an event is delivered, handled once, and acknowledged", async () => {
+    const environmentId = ENV();
+    const durable = `itest-basic-${Date.now()}`;
+    const seen: string[] = [];
+    const eventId = await publish(environmentId);
+
+    const runtime = runtimeFor(
+      db,
+      durable,
+      async (event) => {
+        seen.push(event.id);
+      },
+      silent,
+      environmentId,
+    );
+    for (let i = 0; i < 20 && !seen.includes(eventId); i++) {
+      await runtime.pollOnce();
+    }
+    await runtime.stop();
+
+    expect(seen.filter((id) => id === eventId)).toHaveLength(1);
+    expect(await timesHandled(db, durable, eventId)).toBe(1);
+  }, 120_000);
+
+  it("invariant 4: a kill between handling and acknowledgement is redelivered — and handled once (SC-003)", async () => {
+    // The chapter's centrepiece. The walk claims the event (which commits the
+    // effect), prints its marker, and is SIGKILLed before it acknowledges.
+    // The broker is entitled to redeliver — it never heard an acknowledgement —
+    // and the ledger is what makes the redelivery safe.
+    //
+    // A real signal from the parent, not a thrown exception: an exception runs
+    // the error path, and a crash does not (research R7, the shape 3.3 used).
+    const { durable, eventId, environmentId } = await killInTheGap();
+
+    // What the kill left behind: handled once, never acknowledged.
+    expect(await timesHandled(db, durable, eventId)).toBe(1);
+
+    // Now let a runtime pick up where the corpse left off. The broker redelivers
+    // after ack_wait; the ledger refuses the claim; the message is acknowledged
+    // because it genuinely has been handled.
+    let redeliveries = 0;
+    let handlerRuns = 0;
+    const runtime = createConsumerRuntime({
+      durable,
+      db,
+      logger: silent,
+      filterSubject: subjectFor("message.created", environmentId),
+      handler: async () => {
+        handlerRuns += 1;
+      },
+    });
+    for (let i = 0; i < 90; i++) {
+      const { duplicates } = await runtime.pollOnce();
+      redeliveries += duplicates;
+      if (redeliveries > 0) break;
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    await runtime.stop();
+
+    // Redelivered, recognised, and NOT handled a second time.
+    expect(redeliveries).toBeGreaterThan(0);
+    expect(handlerRuns).toBe(0);
+    expect(await timesHandled(db, durable, eventId)).toBe(1);
+
+    await db.execute(`DELETE FROM consumed_events WHERE consumer = '${durable}'`);
+  }, 180_000);
+
+  it("invariant 5: deduplication survives a restart", async () => {
+    // The ledger is in Postgres precisely so that a process restart does not
+    // reset it. A second runtime with the same durable name gets the same
+    // answer the first one would have.
+    const durable = `itest-restart-${Date.now()}`;
+    const eventId = randomUUID();
+
+    expect(await claimEvent(db, durable, eventId, async () => {})).toBe(
+      "handled",
+    );
+    expect(await claimEvent(db, durable, eventId, async () => {})).toBe(
+      "duplicate",
+    );
+    expect(await timesHandled(db, durable, eventId)).toBe(1);
+  });
+
+  it("invariant 6: two instances sharing a durable name divide the work", async () => {
+    // The ordinary deployment. A durable consumer is one position in the stream,
+    // so two api processes pulling from it share the work — the property the
+    // broker provides here that `SKIP LOCKED` provides for the outbox.
+    const durable = `itest-shared-${Date.now()}`;
+    const byA: string[] = [];
+    const byB: string[] = [];
+    const ids = [
+      await publish(ENV()),
+      await publish(ENV()),
+      await publish(ENV()),
+    ];
+
+    const a = runtimeFor(db, durable, async (e) => void byA.push(e.id));
+    const b = runtimeFor(db, durable, async (e) => void byB.push(e.id));
+    for (let i = 0; i < 400; i++) {
+      await Promise.all([a.pollOnce(), b.pollOnce()]);
+      if (ids.every((id) => byA.includes(id) || byB.includes(id))) break;
+    }
+    await a.stop();
+    await b.stop();
+
+    for (const id of ids) {
+      // Exactly one of them handled it, and the ledger agrees.
+      const handledBoth =
+        byA.filter((x) => x === id).length + byB.filter((x) => x === id).length;
+      expect(handledBoth).toBe(1);
+      expect(await timesHandled(db, durable, id)).toBe(1);
+    }
+  }, 120_000);
+
+  it("invariant 7: a handler that always throws stops being retried", async () => {
+    // `max_deliver` is 5. After that the broker stops delivering and the message
+    // leaves the consumer's view — measured in research R4, and the honest
+    // answer this chapter gives rather than a dead-letter path that does not
+    // exist yet.
+    const environmentId = ENV();
+    const durable = `itest-poison-${Date.now()}`;
+    const eventId = await publish(environmentId);
+    let attempts = 0;
+
+    const runtime = runtimeFor(
+      db,
+      durable,
+      async (event) => {
+        if (event.id === eventId) {
+          attempts += 1;
+          throw new Error("this handler never succeeds");
+        }
+      },
+      silent,
+      environmentId,
+    );
+    for (let i = 0; i < 60 && attempts < 6; i++) {
+      await runtime.pollOnce();
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    await runtime.stop();
+
+    expect(attempts).toBeGreaterThan(0);
+    expect(attempts).toBeLessThanOrEqual(5);
+    // And nothing was recorded as handled: a failed handler rolls its claim back
+    // with it, which is what makes the retry a real retry.
+    expect(await timesHandled(db, durable, eventId)).toBe(0);
+  }, 180_000);
+
+  it("invariant 8: an unparseable payload is terminated on the first attempt", async () => {
+    // Retrying malformed bytes five times changes nothing about them. The
+    // runtime terminates the message instead of burning the budget and dropping
+    // it anyway — and says so in a log line carrying no payload.
+    const environmentId = ENV();
+    const durable = `itest-garbage-${Date.now()}`;
+    const lines: string[] = [];
+    const noisy = createLogger("consumer-itest", (line) =>
+      lines.push(typeof line === "string" ? line : JSON.stringify(line)),
+    );
+    await publishGarbage(environmentId);
+    const marker = await publish(environmentId);
+
+    let sawMarker = false;
+    const runtime = runtimeFor(
+      db,
+      durable,
+      async (event) => {
+        if (event.id === marker) sawMarker = true;
+      },
+      noisy,
+      environmentId,
+    );
+    for (let i = 0; i < 20 && !sawMarker; i++) await runtime.pollOnce();
+    await runtime.stop();
+
+    expect(sawMarker).toBe(true);
+    const unparseable = lines.filter((l) => l.includes("consumer.unparseable"));
+    expect(unparseable.length).toBe(1);
+    expect(unparseable.join("")).not.toContain("this is not an event");
+  }, 180_000);
+
+  it("invariant 9: a consumer stopped for N publishes receives all N on restart", async () => {
+    // What `limits` retention means: the stream holds messages whether or not
+    // anybody is reading. The backlog waits.
+    const durable = `itest-catchup-${Date.now()}`;
+    const seen: string[] = [];
+    const runtime = runtimeFor(db, durable, async (e) => void seen.push(e.id));
+
+    // Get to the head of the stream first, so "everything published while away"
+    // is measurable rather than lost in twelve thousand older events.
+    for (let i = 0; i < 800; i++) {
+      const { handled, duplicates } = await runtime.pollOnce();
+      if (handled + duplicates === 0) break;
+    }
+    await runtime.stop();
+
+    const published = [
+      await publish(ENV()),
+      await publish(ENV()),
+      await publish(ENV()),
+    ];
+
+    const restarted = runtimeFor(db, durable, async (e) => void seen.push(e.id));
+    for (let i = 0; i < 100; i++) {
+      await restarted.pollOnce();
+      if (published.every((id) => seen.includes(id))) break;
+    }
+    await restarted.stop();
+
+    for (const id of published) expect(seen).toContain(id);
+  }, 240_000);
+
+  it("invariant 12: a consumer log line carries counts, never payloads", async () => {
+    const environmentId = ENV();
+    const durable = `itest-logs-${Date.now()}`;
+    const lines: string[] = [];
+    const noisy = createLogger("consumer-itest", (line) =>
+      lines.push(typeof line === "string" ? line : JSON.stringify(line)),
+    );
+    const eventId = await publish(environmentId, {
+      data: {
+        id: randomUUID(),
+        channel_id: randomUUID(),
+        seq: 1,
+        user: "tuan",
+        text: "a secret worth keeping out of logs",
+        created_at: new Date().toISOString(),
+      },
+    });
+
+    let seen = false;
+    const runtime = runtimeFor(
+      db,
+      durable,
+      async (event) => {
+        if (event.id === eventId) seen = true;
+      },
+      noisy,
+      environmentId,
+    );
+    for (let i = 0; i < 20 && !seen; i++) await runtime.pollOnce();
+    runtime.start();
+    await new Promise((r) => setTimeout(r, 300));
+    await runtime.stop();
+
+    expect(lines.join("\n")).not.toContain("a secret worth keeping out of logs");
+  }, 180_000);
+});
+```
+
+Walk script mà test kill là cùng script reader chạy bằng tay:
+
+```js title="scripts/consumer-walk.mjs"
+// The chapter 3.4 walk: a redelivery, made to happen on purpose.
+//
+//   node scripts/consumer-walk.mjs                     # consume normally
+//   node scripts/consumer-walk.mjs --kill-before-ack   # die in the gap
+//   node scripts/consumer-walk.mjs --resume=walk-1234  # pick the corpse back up
+//   node scripts/consumer-walk.mjs --from=all --limit=50
+//
+// The interesting pair is the middle two, run in that order. The kill mode does
+// by hand what the runtime does in a loop — fetch, claim (which commits the
+// effect), acknowledge — and prints `MARKER kill-me-now` between the commit and
+// the acknowledgement, where it dies. A parent watching stdout can SIGKILL it
+// there (the integration suite does); left alone it SIGKILLs itself, so the
+// demonstration is one command.
+//
+// Then `--resume` reuses that durable name — which is a POSITION, not a label —
+// and receives the same event again, because the broker never heard an
+// acknowledgement. The ledger recognises it, and the effect does not happen
+// twice. That is the chapter.
+import { randomUUID } from "node:crypto";
+
+import { connect, AckPolicy } from "../services/api/node_modules/nats/lib/src/mod.js";
+import { subjectFor } from "../packages/protocol/dist/index.js";
+import { createDb, createPool } from "../services/api/dist/db/client.js";
+import { claimEvent, timesHandled } from "../services/api/dist/db/repository.js";
+
+const arg = (name, fallback) => {
+  const hit = process.argv.find((a) => a.startsWith(`--${name}=`));
+  return hit ? hit.slice(name.length + 3) : fallback;
+};
+const flag = (name) => process.argv.includes(`--${name}`);
+
+const URL_ = process.env.RELAY_NATS_URL ?? "nats://127.0.0.1:4222";
+const LIMIT = Number(arg("limit", "5"));
+const PAUSE_MS = Number(arg("pause", "400"));
+const KILL_MODE = flag("kill-before-ack");
+const FROM_ALL = arg("from", "new") === "all";
+const RESUME = arg("resume", "");
+
+const show = (label, value) => console.log(`${label.padEnd(26)} ${value}`);
+
+const db = createDb(createPool());
+const nc = await connect({ servers: URL_ });
+const jsm = await nc.jetstreamManager();
+const js = nc.jetstream();
+
+// A durable per run: a durable name is a POSITION, and reusing one would make
+// this walk inherit the last run's progress. Which is precisely what --resume
+// wants, so it says the name out loud instead.
+const durable = RESUME || `walk-${randomUUID().slice(0, 8)}`;
+const environmentId = randomUUID();
+
+if (!RESUME) {
+  await jsm.consumers.add("EVENTS", {
+    durable_name: durable,
+    ack_policy: AckPolicy.Explicit,
+    ack_wait: 30 * 1e9,
+    max_deliver: 5,
+    filter_subject: FROM_ALL ? "events.>" : subjectFor("message.created", environmentId),
+  });
+}
+show("durable consumer", durable);
+if (!RESUME) show("environment", environmentId);
+
+if (!FROM_ALL && !RESUME) {
+  // Publish one event for this walk to find, the way the relay would.
+  const id = randomUUID();
+  await js.publish(
+    subjectFor("message.created", environmentId),
+    new TextEncoder().encode(
+      JSON.stringify({
+        id,
+        type: "message.created",
+        environment_id: environmentId,
+        occurred_at: new Date().toISOString(),
+        data: {
+          id: randomUUID(),
+          channel_id: randomUUID(),
+          seq: 1,
+          user: "tuan",
+          text: "B2, north ramp",
+          created_at: new Date().toISOString(),
+        },
+      }),
+    ),
+    { msgID: id },
+  );
+  show("published", id);
+}
+
+const consumer = await js.consumers.get("EVENTS", durable);
+
+/** One fetch, unless we are waiting for a redelivery — which cannot arrive
+ * before `ack_wait` has elapsed on the delivery nobody acknowledged. Thirty
+ * seconds of nothing happening is the guarantee working, not a hang. */
+async function nextBatch() {
+  const deadline = Date.now() + (RESUME ? 45_000 : 0);
+  let announced = false;
+  for (;;) {
+    const batch = await consumer.fetch({ max_messages: LIMIT, expires: 2_000 });
+    const messages = [];
+    for await (const message of batch) messages.push(message);
+    if (messages.length > 0 || Date.now() >= deadline) return messages;
+    if (!announced) {
+      announced = true;
+      show("waiting", "nothing yet — the broker redelivers after ack_wait (30s)");
+    }
+  }
+}
+
+let handled = 0;
+for (const message of await nextBatch()) {
+  const event = JSON.parse(new TextDecoder().decode(message.data));
+  show("delivered", `${event.id} attempt=${message.info.deliveryCount} redelivered=${message.redelivered}`);
+
+  // The claim and the effect commit together (chapter 3.4). After this line the
+  // work has HAPPENED, durably, and the broker still believes it has not.
+  const result = await claimEvent(db, durable, event.id, async () => {});
+  show("claim", result);
+  handled += result === "handled" ? 1 : 0;
+
+  if (KILL_MODE) {
+    show("times handled", await timesHandled(db, durable, event.id));
+    console.log("MARKER kill-me-now");
+    // The window a parent uses to kill this process from outside — which is what
+    // the integration suite does, watching stdout for the marker.
+    await new Promise((r) => setTimeout(r, PAUSE_MS));
+    // Nobody killed it, so it kills itself. SIGKILL to its own pid is a real
+    // uncatchable death, not a tidy `process.exit()`: no flush, no `finally`,
+    // no drain. The work above HAPPENED and was never acknowledged, which is
+    // exactly the state a redelivery is for. Run by hand, this is the whole
+    // demonstration in one command.
+    process.kill(process.pid, "SIGKILL");
+  }
+
+  if (RESUME) show("times handled", await timesHandled(db, durable, event.id));
+
+  message.ack();
+  show("acknowledged", event.id);
+}
+
+if (FROM_ALL) show("handled in this batch", handled);
+await nc.drain();
+process.exit(0);
+```
+
+Một artifact, chạy hai cách, để không bên nào có thể rot mà bên kia không nhận
+ra. Và inspector tạo ra các con số mở và đóng của chương này — nó đọc broker
+thay vì config file, vì configuration đã được viết không giống với configuration
+đã được applied:
+
+```js title="scripts/stream-info.mjs"
+// What the stream actually holds and how it is actually configured
+// (chapter 3.4). The chapter quotes the broker, not the config file — a
+// configuration that was written is not the same as a configuration that was
+// applied, and the difference is exactly what this chapter is about.
+//
+//   docker compose up -d --wait nats
+//   RELAY_NATS_URL=nats://localhost:14222 node scripts/stream-info.mjs
+import { connect } from "../services/api/node_modules/nats/lib/src/mod.js";
+
+const url = process.env.RELAY_NATS_URL ?? "nats://127.0.0.1:4222";
+const nc = await connect({ servers: url });
+const jsm = await nc.jetstreamManager();
+
+const seconds = (ns) => (ns === 0 ? "unlimited" : `${ns / 1e9}s`);
+const bytes = (n) => (n === -1 ? "unlimited" : `${(n / 1024 ** 3).toFixed(2)} GiB`);
+const show = (label, value) => console.log(`${label.padEnd(20)} ${value}`);
+
+const info = await jsm.streams.info("EVENTS");
+const c = info.config;
+
+console.log("stream EVENTS");
+show("  messages", info.state.messages);
+show("  bytes", `${(info.state.bytes / 1024 ** 2).toFixed(1)} MiB`);
+show("  consumers", info.state.consumer_count);
+console.log("configuration");
+show("  subjects", JSON.stringify(c.subjects));
+show("  retention", `${c.retention}   (immutable once created)`);
+show("  storage", `${c.storage}    (immutable once created)`);
+show("  replicas", c.num_replicas);
+show("  max_age", `${seconds(c.max_age)}   (NFR-REL-08 floor: 86400s)`);
+show("  max_bytes", bytes(c.max_bytes));
+show("  discard", `${c.discard}     (at the bound, drop the OLDEST)`);
+show("  duplicate_window", `${seconds(c.duplicate_window)}   (the broker's dedupe, not ours)`);
+
+console.log("consumers");
+for await (const ci of jsm.consumers.list("EVENTS")) {
+  show(
+    `  ${ci.name}`,
+    `pending=${ci.num_pending} ack_pending=${ci.num_ack_pending} redelivered=${ci.num_redelivered} max_deliver=${ci.config.max_deliver ?? "-"}`,
+  );
+}
+
+await nc.drain();
+process.exit(0);
+```
+
+Rồi đến câu hỏi một suite cỡ này phải trả lời: nó có giữ được gì không, hay chỉ
+đơn giản là pass? Remove ledger claim khỏi runtime — giữ mọi thứ khác y nguyên —
+làm fail ba trên mười:
+
+```text
+× invariant 3: an event is delivered, handled once, and acknowledged
+× invariant 4: a kill between handling and acknowledgement is redelivered — and handled once
+× invariant 6: two instances sharing a durable name divide the work
+3 failed | 7 passed
+```
+
+## Phần còn lại của blast radius
+
+Nhỏ, và mọi phần trong đó đều nói về background loops trong test lanes.
+
+```diff title="turbo.json"
+@@ -28,6 +28,8 @@
+         "RELAY_NATS_URL",
+         "RELAY_NATS_PORT",
+         "RELAY_OUTBOX_RELAY",
++        "RELAY_EVENT_CONSUMER",
++        "RELAY_NATS_REPLICAS",
+         "RELAY_E2E_API_PORT"
+       ]
+     },
+```
+
+```diff title="packages/e2e/src/harness.ts"
+@@ -342,6 +342,11 @@ export async function boot({ gateways = 2 } = {}): Promise<System> {
+     // files, not a property of the system. The relay has its own suite, which
+     // drives it explicitly.
+     RELAY_OUTBOX_RELAY: "off",
++    // Chapter 3.4: no event consumer in these children either, for the reason
++    // the line above exists — this journey asserts message delivery, and a
++    // background consumer writing to a table 3.4's suite asserts on is a race
++    // between test files rather than a property of the system.
++    RELAY_EVENT_CONSUMER: "off",
+   };
+ 
+   const apiPort = Number(process.env.RELAY_E2E_API_PORT ?? 4100);
+```
+
+`RELAY_EVENT_CONSUMER=off` tồn tại vì cùng lý do 3.3 thêm
+`RELAY_OUTBOX_RELAY=off`, và nó cần ở đúng hai nơi đó: end-to-end harness và
+session suite của gateway đều spawn real api child, và background consumer bên
+trong các child đó write vào table mà suite của chương này đang assert. Đó là
+race giữa test files, không phải property của system. Suite của gateway nhận
+cùng hai dòng; nó chưa từng được chapter nào fence, nên không hiện ở đây, nhưng
+change nằm trong repository.
+
+`RELAY_NATS_REPLICAS` nhập vào declared environment vì strict mode của Turborepo
+filter mọi thứ undeclared — variable mà tests set nhưng task không thấy là một
+debugging session đang chờ xảy ra.
+
+Coverage ratchet của feature 024 đi đúng hướng:
+`services/api/src/db/repository.ts` tăng branch coverage từ 85.91% lên
+**86.3%**, và project total từ 78.07% lên **79.01%**. Bar 100% của constitution
+cho ordering, idempotency và isolation code vẫn chưa được đáp ứng trên file đó,
+và chương này không giả vờ ngược lại — nó thêm branches vào file và để gap thuộc
+về một chương đặt mục tiêu đóng nó.
+
+## Những gì chương này cố ý để lại sau
+
+**Webhook delivery và dead-letter path (3.5).** Signing, retry tiers,
+auto-disable, và nơi để message không handle được đi tới.
+
+**Analytics ingester (Phần 4) và live stream của dashboard (Phần 5).** Cả hai
+là consumers của runtime này; cái thứ hai dùng ephemeral consumers thay vì
+durable ones, điều SAD đã sketch.
+
+**Bảy event types còn lại của FR-WHK-02.** Grammar nhận chúng mà không cần
+change. Mỗi cái đến cùng feature có thể produce nó, vì subject cho event không
+gì emit chỉ là guess.
+
+**Ordering.** Vẫn không promise, vì lý do 3.3 đã đưa ra: `data.seq` order
+messages trong một channel (FR-MSG-03), và consumer infer order từ arrival cuối
+cùng sẽ sai.
+
+<ForwardRef part="Phần 4" locale="vi">Reconciliation job mà FR-ANL-06 cần —
+tripwire mà SAD risk R5 gọi tên cạnh consumer template — giờ đã có cả hai nửa nó
+cần: message counts trong Postgres, và ledger nói thứ gì đã được handled. Job
+compare chúng hằng ngày thuộc về analytics path trong Phần 4.</ForwardRef>
+
+<Checkpoint tag="part3-ch4" locale="vi">
+
+```bash
+docker compose up -d --wait postgres redis nats
+pnpm build
+DATABASE_URL="postgres://relay:relay@localhost:15432/relay" node services/api/dist/db/migrate.js
+
+pnpm lint && pnpm typecheck && pnpm test
+RELAY_POSTGRES_PORT=15432 RELAY_REDIS_PORT=16379 RELAY_NATS_PORT=14222 \
+  DATABASE_URL="postgres://relay:relay@localhost:15432/relay" \
+  RELAY_REDIS_URL="redis://localhost:16379" \
+  RELAY_NATS_URL="nats://localhost:14222" pnpm test:integration
+```
+
+Expected: **133 unit tests**, **97 integration tests**, tất cả green — bao gồm
+journey của chương 2.8 và outbox suite của 3.3, không đổi.
+
+Sau đó nhìn xem stream đã trở thành gì, và làm redelivery xảy ra:
+
+```bash
+RELAY_NATS_URL=nats://localhost:14222 node scripts/stream-info.mjs
+RELAY_NATS_URL=nats://localhost:14222 \
+  DATABASE_URL="postgres://relay:relay@localhost:15432/relay" \
+  node scripts/consumer-walk.mjs
+```
+
+```console
+stream EVENTS
+  messages           12941
+  consumers          0
+configuration
+  subjects           ["events.>"]
+  retention          limits   (immutable once created)
+  storage            file    (immutable once created)
+  replicas           1
+  max_age            604800s   (NFR-REL-08 floor: 86400s)
+  max_bytes          1.00 GiB
+  discard            old     (at the bound, drop the OLDEST)
+  duplicate_window   120s   (the broker's dedupe, not ours)
+```
+
+Mười hai nghìn chín trăm bốn mươi mốt events, và bây giờ có thứ đọc chúng.
+
+</Checkpoint>
+
+<ChapterFooter id="3.4" locale="vi" />

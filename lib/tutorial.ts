@@ -343,11 +343,15 @@ export const series: Part[] = [
         id: "3.4",
         path: "/part-3/chapter-04/jetstream-and-the-first-consumer",
         title: "JetStream and the first consumer",
-        status: "forthcoming",
-        readerProduces: "NATS setup; subjects; durable pull consumers",
+        status: "published",
+        translatedIn: ["vi"],
+        readerProduces:
+          "Stream config; shared subject grammar; a durable pull consumer that dedupes",
         sourceDoc: "docs/05-sad.md",
         readerMinutes: 90,
         titleVi: "JetStream và consumer đầu tiên",
+        readerProducesVi:
+          "Cấu hình stream; subject grammar dùng chung; durable pull consumer tự dedupe",
       },
       {
         id: "3.5",
