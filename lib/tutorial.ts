@@ -357,12 +357,18 @@ export const series: Part[] = [
         id: "3.5",
         path: "/part-3/chapter-05/webhooks-that-survive-the-customer",
         title: "Webhooks that survive the customer",
-        status: "forthcoming",
+        status: "published",
+        translatedIn: ["vi"],
+        // NOT auto-disable. FR-WHK-07 and FR-WHK-06's attempt log are deferred
+        // to a later chapter, and a summary that promised them would be
+        // advertising something the chapter does not build.
         readerProduces:
-          "Dispatcher: HMAC signing, retry tiers, DLQ, auto-disable",
+          "A dispatcher service: HMAC signing, a due-time retry schedule, dead letters",
         sourceDoc: "docs/04-srs.md",
         readerMinutes: 100,
         titleVi: "Webhook sống sót qua phía khách hàng",
+        readerProducesVi:
+          "Một dispatcher service: ký HMAC, lịch retry theo thời điểm tới hạn, dead letter",
       },
       {
         id: "3.6",
