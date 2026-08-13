@@ -372,7 +372,23 @@ export const series: Part[] = [
       },
       {
         id: "3.6",
-        path: "/part-3/chapter-06/limits-and-quotas",
+        path: "/part-3/chapter-06/when-to-stop-trying",
+        title: "When to stop trying",
+        status: "forthcoming",
+        // Split out of 3.5 while 3.5 was being written. Auto-disable needs the
+        // attempt log to be defensible — switching off a paying customer's
+        // endpoint is a decision somebody has to explain afterwards.
+        readerProduces:
+          "The attempt log and auto-disable, with the evidence behind the decision",
+        sourceDoc: "docs/04-srs.md",
+        readerMinutes: 80,
+        titleVi: "Khi nào thì thôi cố",
+        readerProducesVi:
+          "Nhật ký lần thử và auto-disable, kèm bằng chứng đứng sau quyết định",
+      },
+      {
+        id: "3.7",
+        path: "/part-3/chapter-07/limits-and-quotas",
         title: "Limits and quotas",
         status: "forthcoming",
         readerProduces:
@@ -382,8 +398,8 @@ export const series: Part[] = [
         titleVi: "Giới hạn và quota",
       },
       {
-        id: "3.7",
-        path: "/part-3/chapter-07/milestone-the-isolation-gauntlet",
+        id: "3.8",
+        path: "/part-3/chapter-08/milestone-the-isolation-gauntlet",
         title: "Milestone: the isolation gauntlet",
         status: "forthcoming",
         readerProduces:
