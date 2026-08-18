@@ -40,23 +40,23 @@ writes to the api service and the thing making the request is not it.
 
 <SkipAhead>
 
-If you must skip: webhook endpoints are stored with an **envelope-encrypted**
+If you must skip: webhook endpoints are stored with an envelope-encrypted
 signing secret (AES-256-GCM), rotatable, with both the current and previous
 secret valid for a 24-hour window so a customer can roll a secret without a
 synchronised deployment. Requests are signed HMAC-SHA256 over the canonical
-string `v1:{timestamp}:{raw body}` — the **raw bytes as transmitted**, never a
-re-serialisation of the parsed object. An event is expanded into one
+string `v1:{timestamp}:{raw body}`, meaning the **raw bytes as transmitted** and
+never a re-serialisation of the parsed object. An event is expanded into one
 `webhook_deliveries` row per matching endpoint, written **inside** chapter 3.4's
 claim transaction, so a redelivered event cannot double a customer's webhooks.
 The retry schedule is a `next_attempt_at` column drained by a second relay in
-the api — chapter 3.3's `SELECT … FOR UPDATE SKIP LOCKED` loop with one more
-predicate — because a broker-held delay was **measured** to hold an
-acknowledgement slot while it waits, which lets dead endpoints starve healthy
-ones. Seven attempts (`now → 1s → 5s → 30s → 5min → 30min → 2h`), then a dead
-letter retained for seven days. The dispatcher is a **new deployable** that
-writes nothing to PostgreSQL and reaches state only over an internal HTTP seam.
-The last hop is **at-least-once, stated**, with the event id handed to the
-customer as the deduplication key. The chapter-end state is tag **`part3-ch5`**.
+the api, which is chapter 3.3's `SELECT … FOR UPDATE SKIP LOCKED` loop with one
+more predicate. A broker-held delay was measured to hold an acknowledgement slot
+while it waits, which lets dead endpoints starve healthy ones. Seven attempts
+(`now → 1s → 5s → 30s → 5min → 30min → 2h`), then a dead letter retained for
+seven days. The dispatcher is a new deployable that writes nothing to PostgreSQL
+and reaches state only over an internal HTTP seam. The last hop is at-least-once
+and says so, with the event id handed to the customer as the deduplication key.
+The chapter-end state is tag **`part3-ch5`**.
 
 </SkipAhead>
 
@@ -78,8 +78,8 @@ transaction commits, and rolling the transaction back does not un-send it.
 There is no arrangement of these two operations that makes them atomic, because
 one of them is not ours to roll back.
 
-So the question changes. It is no longer *how do we avoid a gap* — the gap is
-unavoidable — but **which way do we want to be wrong**:
+So the question changes. The gap cannot be closed, which leaves one thing to
+decide: **which way do we want to be wrong**:
 
 | Order | What a crash in the gap costs |
 |---|---|
@@ -88,19 +88,17 @@ unavoidable — but **which way do we want to be wrong**:
 
 <Figure caption="The gap that cannot be closed. What can be chosen is which side of it the crash falls on." code={figThePatternStops} />
 
-The platform takes the duplicate, and the reasoning is worth stating plainly
-rather than leaving as a preference. A loss nobody can detect is worse than a
-duplicate the recipient was handed the means to absorb. Chapter 3.3 spent an
-entire chapter removing exactly the first kind of failure from the publish path;
-reintroducing it at the last hop — the one the customer actually feels — would
+The platform takes the duplicate. A loss nobody can detect is worse than a
+duplicate the recipient was handed the means to absorb, and chapter 3.3 spent an
+entire chapter removing exactly the first kind of failure from the publish path.
+Reintroducing it at the last hop — the one the customer actually feels — would
 undo that work where it matters most.
 
-That decision has an obligation attached, and it is the obligation that makes it
-honest rather than convenient. **If you choose at-least-once, you must hand the
-recipient the means to deduplicate.** The event id travels in the envelope,
-documented, stable across every attempt of the same delivery. A customer who
-stores it and ignores repeats is correct; a customer who does not has been told
-what they are choosing.
+That decision comes with an obligation, and the obligation is what keeps it
+honest. **If you choose at-least-once, you must hand the recipient the means to
+deduplicate.** The event id travels in the envelope, documented, stable across
+every attempt of the same delivery. A customer who stores it and ignores repeats
+is correct; a customer who does not has been told what they are choosing.
 
 ```ts title="services/dispatcher/src/deliver.ts (excerpt)"
 //   claim BEFORE posting  → a crash in the gap loses the webhook silently.
@@ -111,12 +109,12 @@ what they are choosing.
 
 <Why>
 
-Both of these are at-least-once, and it is worth being precise about where the
+Both of these are at-least-once, so it is worth being precise about where the
 guarantee changes. *Inside* the platform, 3.4's ledger made handling
 once-in-effect: delivery was at-least-once, and the `consumed_events` claim
 absorbed the repeats. At the customer's hop there is no ledger we control, so
-the repeats arrive. The guarantee did not weaken because the design got worse —
-it weakened because the boundary moved to a machine that does not run our code.
+the repeats arrive. The guarantee did not weaken because the design got worse.
+It weakened because the boundary moved to a machine that does not run our code.
 
 </Why>
 
@@ -131,9 +129,9 @@ presented and compared, never reproduced. A signing secret is different. The
 dispatcher has to compute an HMAC with it on every attempt, and an HMAC needs
 the secret itself. A hash cannot sign.
 
-So this is envelope encryption rather than hashing — the same decision NFR-SEC-02
-already anticipated with two branches, one for credentials that are compared and
-one for secrets that are used:
+So the secret is encrypted, not hashed. NFR-SEC-02 anticipated this with two
+branches, one for credentials that are compared and one for secrets that are
+used:
 
 ```ts title="services/api/src/webhooks/secret.ts"
 import {
@@ -272,21 +270,21 @@ export function activeSigningSecrets(
 }
 ```
 
-Two details in there are decisions rather than mechanics.
+Two details in there are decisions, not mechanics.
 
-The **rotation window** is the first. `activeSigningSecrets` returns one secret
+The rotation window is the first. `activeSigningSecrets` returns one secret
 normally and *two* for twenty-four hours after a rotation, and the request
 carries a signature for each. A customer rotating a secret has to update their
 verifier and their configuration, and those two things are never simultaneous in
 a real deployment. Without the window, rotation means a chosen minute of
 verification failures; with it, both work and the old one expires on its own.
 
-The **key resolution** is the second, and it is smaller but it has bitten this
-repository before. `encryptionKey()` reads the environment on every call rather
-than at import time. A module that throws while being imported takes the whole
-service down at startup over a feature most requests never touch, and — worse
-for us — it makes the failure unreachable from a unit test, because the test
-file cannot import the module it wants to assert on.
+Key resolution is the second, and it is smaller, but it has bitten this
+repository before. `encryptionKey()` reads the environment on every call instead
+of at import time. A module that throws while being imported takes the whole
+service down at startup over a feature most requests never touch. Worse for us,
+it makes the failure unreachable from a unit test, because the test file cannot
+import the module it wants to assert on.
 
 <Trap>
 
@@ -309,9 +307,9 @@ environment variable at deploy time and removes an entire category of incident.
 
 ## The migration, and the surface on top of it
 
-Three tables arrive together, and the migration is reviewed before it is run —
-the discipline chapter 2.1 established after a generated migration was applied
-without being read:
+Three tables arrive together, and the migration is reviewed before it is run.
+That is the discipline chapter 2.1 established after a generated migration was
+applied without being read:
 
 ```sql title="services/api/migrations/0006_webhooks.sql"
 -- Chapter 3.5 — webhook endpoints, the delivery schedule, and dead letters.
@@ -529,17 +527,17 @@ export class WebhooksService {
 
 **The URL must be HTTPS and must not point inward.** An endpoint is a URL the
 platform will fetch on a customer's behalf, from inside the platform's own
-network — which is the definition of a server-side request forgery if nobody
+network. That is the definition of a server-side request forgery if nobody
 checks where it goes. Loopback, private ranges and link-local addresses are
 refused, and the refusal is a validation error the customer can read rather than
 a timeout they cannot.
 
-**Five endpoints per environment.** Not because five is special, but because
-"unbounded" is a number too, and it is the wrong one: expansion writes one row
-per matching endpoint, so an environment with ten thousand endpoints turns one
-event into ten thousand rows inside a single transaction.
+**Five endpoints per environment.** Five is arbitrary, but "unbounded" is a
+number too, and it is the wrong one: expansion writes one row per matching
+endpoint, so an environment with ten thousand endpoints turns one event into ten
+thousand rows inside a single transaction.
 
-**The secret is returned exactly once.** At creation, and never again — the
+**The secret is returned exactly once.** At creation, and never again. The
 column holds ciphertext, and the plaintext exists only for as long as the
 response takes to serialise:
 
@@ -718,8 +716,8 @@ export class WebhooksModule {}
 
 ## Signing what you actually send
 
-The signature covers a canonical string, and the string is built from the **raw
-body bytes** — the exact ones that go on the wire:
+The signature covers a canonical string built from the **raw body bytes**, the
+exact ones that go on the wire:
 
 ```ts title="services/dispatcher/src/signature.ts"
 import { createHmac } from "node:crypto";
@@ -795,7 +793,7 @@ export function signatureHeaders({
 
 The timestamp is in the signed material, not beside it, which is what stops a
 captured request being replayed indefinitely. And the body is a string that was
-serialised **once** and then both signed and sent. That is not an optimisation.
+serialised once and then both signed and sent. That is not an optimisation.
 
 <Trap>
 
@@ -810,14 +808,14 @@ const sig  = sign(JSON.stringify(JSON.parse(body)));   // ← a different string
 ```
 
 In Node, in the same process, that round trip usually hands back the bytes it
-was given — which is exactly why the bug survives every test written in the
+was given, which is exactly why the bug survives every test written in the
 service's own language. It appears the day a customer verifies in Go, or a proxy
 normalises the JSON, or somebody spreads the object into a new one to add a
 field.
 
 The walk script written for this chapter made this mistake against itself. Its
 `--print-signing-material` flag signed the payload object as the script had
-built it, while the platform signs what comes back out of `jsonb` — and
+built it, while the platform signs what comes back out of `jsonb`, and
 PostgreSQL does not preserve key order. The printed signature was for a
 rendering that never went on the wire, and it took a run against a real endpoint
 to notice.
@@ -838,7 +836,7 @@ can verify the signature, which is the only property that matters.
 ## The schedule is a column, and the reason is a measurement
 
 A customer's server will be down. The platform retries on a widening schedule
-and eventually gives up — that much is in the requirements. The interesting
+and eventually gives up; that much is in the requirements. The interesting
 question is where the *waiting* lives.
 
 The obvious answer is the broker. NATS lets a consumer negatively acknowledge a
@@ -857,7 +855,7 @@ Q2  do delayed messages hold the ack-pending budget?
     num_ack_pending=3  num_pending=2            YES — and that is the problem.
 ```
 
-Q1 is a clean pass — a delayed redelivery survives a process restart to within
+Q1 is a clean pass. A delayed redelivery survives a process restart to within
 three milliseconds, which is better than the design needed. On Q1 alone the
 broker-held delay is the right answer.
 
@@ -867,19 +865,19 @@ messages unfetchable — not slow, unfetchable. Scale that to a platform: one
 customer whose endpoint has been down for two hours occupies delivery capacity
 that belongs to every other customer, and the endpoints that are working are the
 ones that stop being served. FR-WHK-05 says one customer's endpoint must not
-delay deliveries to another, and the broker-held delay makes that false by
+delay deliveries to another, and a broker-held delay makes that false by
 construction.
 
 <Why>
 
-**The plan was re-done rather than adapted.** The measurement arrived after the
+**The plan was re-done, not patched.** The measurement arrived after the
 design was written, and the honest response to "the mechanism I planned has a
 property that violates a requirement" is to plan again, not to add a caveat and
 carry on. Research R1 and R13 record what changed and why.
 
 The replacement is smaller, which is the part worth noticing. The waiting
-becomes a `next_attempt_at` column, and the thing that drains it is chapter
-3.3's relay loop with one more predicate — a mechanism the reader already owns.
+becomes a `next_attempt_at` column, and what drains it is chapter 3.3's relay
+loop with one more predicate — a mechanism the reader already owns.
 
 </Why>
 
@@ -1067,9 +1065,9 @@ query only ever asks for rows that are `pending`, so an index that only contains
 `pending` rows stays small no matter how many delivered ones accumulate behind
 it.
 
-And the tier table lives in the **api**, not the dispatcher, which looks wrong
-until you notice who reads it. The tiers are consulted by `recordAttemptOutcome`
-when it computes the next `next_attempt_at` — and that is a database write, so
+And the tier table lives in the api, not the dispatcher, which looks wrong until
+you notice who reads it. The tiers are consulted by `recordAttemptOutcome` when
+it computes the next `next_attempt_at`, and that is a database write, so
 constitution IV puts it in the api. Putting the schedule in the dispatcher would
 feel natural and would be misplaced:
 
@@ -1864,14 +1862,14 @@ covers it:
 ```
 
 The `created` count and the `duplicate` flag both come back, and the dispatcher
-logs them. A duplicate is not an error — it is the claim doing its job, and an
-operator reading `duplicate=true` in a log line is seeing the mechanism work
-rather than a problem to investigate.
+logs them. A duplicate is not an error. It is the claim doing its job, and an
+operator reading `duplicate=true` in a log line is watching the mechanism work,
+not finding a problem to investigate.
 
 <Why>
 
 **Subscription filtering happens at expansion, not at delivery.** An endpoint
-that does not subscribe to `message.created` gets no row at all, rather than a
+that does not subscribe to `message.created` gets no row at all, instead of a
 row that is later skipped. A delivery row that exists and can never be sent is a
 retry schedule with a permanent no-op in it, and an operator reading the table
 has no way to tell it from work that is genuinely stuck.
@@ -1881,7 +1879,7 @@ has no way to tell it from work that is genuinely stuck.
 ## Why the dispatcher is its own service
 
 Chapter 3.3 added the outbox relay and chapter 3.4 added the consumer runtime,
-and both of them live **inside** the api. This chapter adds a third background
+and both of them live inside the api. This chapter adds a third background
 worker and puts it in a new deployable. That inconsistency needs an argument, or
 it is just a preference.
 
@@ -1891,7 +1889,7 @@ write.
 The relay reads the outbox and publishes; the consumer claims events and writes
 rows. Both touch PostgreSQL, and constitution IV says the api owns those writes,
 so both belong where the writes are. The dispatcher's effect is an HTTP request
-to a customer's server — it needs no database access at all, and giving it some
+to a customer's server. It needs no database access at all, and giving it some
 would mean a second service writing to PostgreSQL for no reason beyond
 convenience.
 
@@ -1899,8 +1897,8 @@ convenience.
 
 What the split *buys* is a property that would otherwise be an argument. Inside
 the api, "webhooks do not delay end users" is a claim about event loops and
-connection pools — something you reason about and hope. Across a process
-boundary it is a claim about processes, and you settle it by not starting one:
+connection pools: something you reason about and hope. Across a process boundary
+it is a claim about processes, and you settle it by not starting one:
 
 ```ts title="packages/e2e/src/webhooks.itest.ts"
 import { createRequire } from "node:module";
@@ -2055,16 +2053,16 @@ describe("journey: webhooks never stand between the platform and its users", () 
 ```
 
 The dispatcher is never started in that file. It does not exist for the duration
-of the journey, and the platform is expected not to notice — messages reach end
+of the journey, and the platform is expected not to notice: messages reach end
 users, and the customer's endpoint hears nothing at all.
 
-What the split **costs** is worth stating with the same directness, because a
-chapter that lists only the benefits of its own decision is advertising:
+What the split costs is worth the same directness, because a chapter that lists
+only the benefits of its own decision is advertising:
 
 - **A network hop where a function call used to be.** Every state change the
   dispatcher makes is an HTTP round trip to the api. That is latency, a
-  connection pool, and a new failure mode — the api being unreachable — that has
-  to be handled rather than assumed away.
+  connection pool, and a new failure mode (the api being unreachable) that has
+  to be handled instead of assumed away.
 - **A credential to manage.** Service-to-service authentication did not exist in
   this platform before; now it does, and it is one more secret with a rotation
   story that somebody owns.
@@ -2152,7 +2150,7 @@ through the api. That means a new kind of caller, and a new kind of principal:
 ```
 
 Look at `environmentId?: undefined` on the platform principal. That is not
-decoration — it is the type system being made to enforce constitution I. A
+decoration; it is the type system being made to enforce constitution I. A
 platform credential reaches every environment, so it has no single environment
 to be scoped to, and any code that reads `.environmentId` off a principal union
 must now handle the case where there is not one. The compiler found the first
@@ -2161,9 +2159,9 @@ such site immediately, in a controller written three chapters ago.
 <Trap>
 
 **A credential that reaches every environment must never be accepted on a public
-route.** If it were, a caller holding it could read any tenant's data through the
-ordinary API, which is a cross-tenant hole with a valid credential in front of
-it — the exact failure constitution I exists to prevent.
+route.** If it were, a caller holding it could read any tenant's data through
+the ordinary API, which is a cross-tenant hole with a valid credential in front
+of it: the exact failure constitution I exists to prevent.
 
 The middleware refuses it by kind rather than by route list, because a route
 list is something a future route can forget to be on:
@@ -2222,10 +2220,10 @@ list is something a future route can forget to be on:
 ```
 
 The test for this began life reading `RELAY_INTERNAL_CREDENTIAL` from the
-environment and returning early when it was absent — and CI never set it. For
-several builds, the one assertion standing between a platform credential and a
-public route did nothing at all, and reported success. A security test that
-skips itself is worse than no test: it answers a question it never asked.
+environment and returning early when it was absent. CI never set it. For several
+builds, the one assertion standing between a platform credential and a public
+route did nothing at all, and reported success. A security test that skips
+itself is worse than no test: it answers a question it never asked.
 
 </Trap>
 
@@ -2271,9 +2269,8 @@ The fix is to stop asking the environment and start deciding:
 
 The compiler found the other consequence of the new principal on its own. A
 controller written in chapter 3.2 read `.environmentId` off a principal that can
-now be a platform one, and stopped compiling the moment the union changed —
-which is the entire value of making the distinction a type rather than a
-convention:
+now be a platform one, and stopped compiling the moment the union changed. That
+is the entire value of making the distinction a type instead of a convention:
 
 ```diff title="services/api/src/auth/dev-token.controller.ts"
 @@ -52,12 +52,20 @@ export class DevTokenController {
@@ -2299,9 +2296,9 @@ convention:
 ```
 
 The seam itself is three operations, and they are shaped by what the dispatcher
-is *not* allowed to do rather than by what it wants. It cannot expand an event,
-so it asks. It cannot read a secret, so it asks. It cannot record an outcome, so
-it reports one:
+is *not* allowed to do, not by what it wants. It cannot expand an event, so it
+asks. It cannot read a secret, so it asks. It cannot record an outcome, so it
+reports one:
 
 ```diff title="packages/protocol/src/internal.ts"
 @@ -136,12 +136,124 @@ export const internalMembershipsResponseSchema = z.strictObject({
@@ -2432,8 +2429,8 @@ it reports one:
 ```
 
 Both sides import those schemas, which is what stops the contract drifting: the
-dispatcher cannot send a shape the api does not parse, because the shape is one
-definition rather than two that agree today.
+dispatcher cannot send a shape the api does not parse, because there is one
+definition and not two that happen to agree today.
 
 ```ts title="services/api/src/internal/dispatch.controller.ts"
 import {
@@ -2617,12 +2614,12 @@ export class DispatchController {
 
 <Trap>
 
-`InternalModule` provides its own `"DB"` rather than importing one, and the
-missing provider was worth a lost afternoon. `MessagesModule` *provides* `"DB"`
-but does not *export* it, so a module that assumed it could reach it resolved
-nothing — and Nest reports that as a runtime failure in whatever route touches
-the database first, not as a wiring error at startup. The unit lane dropped from
-156 tests to 40 and two whole suites failed before the cause was obvious.
+`InternalModule` provides its own `"DB"` instead of importing one, and the
+missing provider cost me an afternoon. `MessagesModule` *provides* `"DB"` but
+does not *export* it, so a module that assumed it could reach it resolved
+nothing. Nest reports that as a runtime failure in whatever route touches the
+database first, not as a wiring error at startup. The unit lane dropped from 156
+tests to 40 and two whole suites failed before the cause was obvious.
 
 </Trap>
 
@@ -2805,14 +2802,14 @@ export function createDeliveryRelay({
 }
 ```
 
-`SELECT … FOR UPDATE SKIP LOCKED` does the same job it did in 3.3 — two api
-instances draining the same table take different rows rather than fighting over
-the same one — and `next_attempt_at <= now()` is the new half. A row whose time
-has not come is simply not selected. It holds nothing, blocks nothing, and costs
+`SELECT … FOR UPDATE SKIP LOCKED` does the same job it did in 3.3: two api
+instances draining the same table take different rows instead of fighting over
+the same one. The new half is `next_attempt_at <= now()`. A row whose time has
+not come is simply not selected. It holds nothing, blocks nothing, and costs
 nothing but an index entry.
 
-One thing did have to change in 3.3's publisher, and it is a small correction to
-an assumption rather than a new mechanism. The publisher ensured the `EVENTS`
+One thing did have to change in 3.3's publisher, and it is a corrected
+assumption rather than a new mechanism. The publisher ensured the `EVENTS`
 stream on connect, because in 3.3 that was the only stream there was. A second
 stream made "which stream do I guarantee exists" a parameter:
 
@@ -3185,22 +3182,22 @@ if (import.meta.url === `file://${process.argv[1]}`) {
 ```
 
 The grouping in `drainByEndpoint` is the isolation property, and it is
-structural rather than a tuning choice. FR-WHK-05 says one customer's endpoint
-must not delay deliveries to another. Process a batch one message at a time and
-that becomes false the moment a single endpoint hangs, because every delivery
-behind it waits out a timeout it had nothing to do with. Grouping by endpoint
-and running the groups concurrently makes the property hold by construction.
+structural, not a tuning choice. FR-WHK-05 says one customer's endpoint must not
+delay deliveries to another. Process a batch one message at a time and that
+becomes false the moment a single endpoint hangs, because every delivery behind
+it waits out a timeout it had nothing to do with. Grouping by endpoint and
+running the groups concurrently makes the property hold by construction.
 
 Serialising *within* an endpoint matters too, in the other direction. Two
 attempts at once against the same customer would let a retry overtake the
-attempt it is retrying — and a customer whose server is already struggling is
-the last one to hand extra concurrency.
+attempt it is retrying. And a customer whose server is already struggling is the
+last one to hand extra concurrency.
 
 <Trap>
 
 **A broker redelivery is not a customer retry, and conflating them spends one
 budget on the other.** `max_deliver: 10` on the consumer bounds how many times
-the *broker* hands back a job the dispatcher failed to process at all — a crash,
+the *broker* hands back a job the dispatcher failed to process at all: a crash,
 or an api that was unreachable. The seven attempts in the tier table bound how
 many times the *customer* is contacted. They are different numbers counting
 different things, and the code says so where somebody would otherwise have to
@@ -3400,8 +3397,8 @@ export function createApiClient(
 }
 ```
 
-The attempt itself is deliberately dull, which is the point — everything
-interesting was decided before it ran:
+The attempt itself is dull, and that is the point. Everything interesting was
+decided before it ran:
 
 ```ts title="services/dispatcher/src/deliver.ts"
 import type { Logger } from "@relay/service-kit";
@@ -3545,7 +3542,7 @@ throws, and the message is left unacknowledged so the work comes back.
 ## The dead letter
 
 Seven attempts is not "until it works". It is a decision that some deliveries
-will never succeed, and that the platform stops rather than retrying forever:
+will never succeed, and that the platform stops instead of retrying forever:
 
 ```ts title="services/api/src/db/repository.ts (excerpt)"
     // Attempts exhausted. The dead letter and the state change commit together —
@@ -3570,20 +3567,20 @@ will never succeed, and that the platform stops rather than retrying forever:
 
 The dead letter keeps the payload and the last status, because the customer will
 eventually ask what happened and "it failed" is not an answer. It is retained
-for seven days and it is **replayable** — and the replay reuses the original
-event id, which is the detail that matters. A replay is the same event being
-delivered again, not a new one, and a customer deduplicating on the event id
-will treat it correctly without being told anything extra.
+for seven days and it is replayable, and the replay reuses the original event
+id. That is the detail that matters: a replay is the same event being delivered
+again, not a new one, so a customer deduplicating on the event id will treat it
+correctly without being told anything extra.
 
 <Why>
 
 **Why not auto-disable an endpoint that has failed for days?** FR-WHK-06's
 attempt log and FR-WHK-07's auto-disable are both deferred to a later chapter,
-and the deferral is deliberate rather than an oversight. Auto-disable is a
-policy decision with a customer-visible consequence — it stops delivering
-webhooks to somebody who is paying for them — and it needs the attempt log to
-justify itself to the customer afterwards. Shipping the mechanism without the
-evidence would mean disabling endpoints and being unable to explain why.
+and the deferral is deliberate. Auto-disable is a policy decision with a
+customer-visible consequence — it stops delivering webhooks to somebody who is
+paying for them — and it needs the attempt log to justify itself to the customer
+afterwards. Shipping the mechanism without the evidence would mean disabling
+endpoints and being unable to explain why.
 
 </Why>
 
@@ -4230,7 +4227,7 @@ the change is not the interesting part:
 
 </Trap>
 
-The regression test is the walk, made to run in CI — and it was verified to fail
+The regression test is the walk, made to run in CI, and it was verified to fail
 against the old key before it was kept:
 
 ```ts title="services/dispatcher/src/dispatcher.itest.ts (excerpt)"
@@ -4240,8 +4237,8 @@ against the old key before it was kept:
 ## What the suites actually hold
 
 Three unit suites and three integration suites arrive with this chapter. The
-unit ones are cheap and pin the arithmetic — the tier table, the encryption
-round trip, the signature recipe:
+unit ones are cheap and pin the arithmetic: the tier table, the encryption round
+trip, the signature recipe:
 
 ```ts title="services/api/src/webhooks/schedule.test.ts"
 import { describe, expect, it } from "vitest";
@@ -6274,9 +6271,9 @@ reached expansion by calling the repository against the database directly, so
 the consumer that decodes an event, asks the api to expand it, and decides
 ack-or-terminate had never once executed under test.
 
-And `repository.ts` went *down* — 86.30% branches to 78.22%, failing four
+And `repository.ts` went *down*, from 86.30% branches to 78.22%, failing four
 thresholds at once. `deliveryMaterial` and `pendingDeliveryDepth` are called
-only by the dispatcher, whose suite runs the api as a **child process**, and a
+only by the dispatcher, whose suite runs the api as a child process, and a
 child's coverage is not attributable. The one function in the platform that
 hands back a customer's signing secret in plaintext was, by the only measure the
 constitution names, untested.
@@ -6423,13 +6420,13 @@ export default defineConfig({
 ## Three services, three containers
 
 The dispatcher is the first thing in this repository that has to be *deployed*
-rather than run, and that turned out to expose something. Two services had been
-running for eight chapters with no container image between them, because
-`pnpm dev` was always enough. A third service made "how does this actually
-ship" a question that could not be deferred any longer.
+rather than run, and that exposed something. Two services had been running for
+eight chapters with no container image between them, because `pnpm dev` was
+always enough. A third service made "how does this actually ship" a question
+that could not be deferred any longer.
 
 So all three get a Dockerfile in the same chapter, and the api's is the one to
-read — the other two are the same shape with less in them:
+read. The other two are the same shape with less in them:
 
 ```dockerfile title="services/api/Dockerfile"
 # The api (chapter 3.5). The repository's containers arrive with the dispatcher:
@@ -6500,9 +6497,9 @@ mention the flag that makes it work.
 
 </Trap>
 
-The dispatcher is a new workspace package, frameworkless and ESM — ADR-15 binds
+The dispatcher is a new workspace package, frameworkless and ESM. ADR-15 binds
 NestJS to the api service alone, and a second Nest application would be adopting
-a framework by momentum rather than by decision:
+a framework by momentum instead of by decision:
 
 ```json title="services/dispatcher/package.json"
 {
@@ -6530,7 +6527,7 @@ a framework by momentum rather than by decision:
 }
 ```
 
-The gateway needed one more thing before it could be containerised at all — it
+The gateway needed one more thing before it could be containerised at all: it
 had been running through `tsx` this whole time and had no build or start script
 of its own:
 
@@ -6552,8 +6549,8 @@ of its own:
      "@relay/protocol": "workspace:*",
 ```
 
-The new package joins the build graph, which is a one-line change that would be
-invisible until something did not rebuild:
+The new package joins the build graph. One line, and invisible until something
+did not rebuild:
 
 ```diff title="turbo.json"
 @@ -25,12 +25,15 @@
@@ -6640,7 +6637,7 @@ invisible until something did not rebuild:
 ```
 
 The compose file gains the three services behind a profile, so the default
-`docker compose up -d --wait` still brings up four stores and nothing else — a
+`docker compose up -d --wait` still brings up four stores and nothing else, so a
 reader following chapter 1.2 gets what that chapter promised:
 
 ```diff title="compose.yaml"
@@ -6743,7 +6740,7 @@ The `extra_hosts` entry is there for one specific reason. A dispatcher inside a
 container resolves `127.0.0.1` to the container's own loopback, so a webhook
 endpoint running on the developer's machine is unreachable from it. Without that
 line the quickstart's "stop the dispatcher and watch the backlog drain" step
-could not be run as written — the endpoint would never receive anything, and the
+could not be run as written: the endpoint would never receive anything, and the
 demonstration would look like a bug in the platform.
 
 The end-to-end harness needed the encryption key too, since it spawns real
