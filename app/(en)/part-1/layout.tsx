@@ -10,7 +10,7 @@ export default function PartZeroLayout({ children }: { children: ReactNode }) {
   return (
     <ReadingLayout locale="en">
       <div className="py-12">
-        <article className="prose mx-auto">{children}</article>
+        <article className="prose chapter-measure mx-auto">{children}</article>
       </div>
     </ReadingLayout>
   );
