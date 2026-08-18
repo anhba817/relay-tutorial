@@ -374,17 +374,18 @@ export const series: Part[] = [
         id: "3.6",
         path: "/part-3/chapter-06/when-to-stop-trying",
         title: "When to stop trying",
-        status: "forthcoming",
+        status: "published",
+        translatedIn: ["vi"],
         // Split out of 3.5 while 3.5 was being written. Auto-disable needs the
         // attempt log to be defensible — switching off a paying customer's
         // endpoint is a decision somebody has to explain afterwards.
         readerProduces:
-          "The attempt log and auto-disable, with the evidence behind the decision",
+          "Attempt records on an analytics stream, and auto-disable from two triggers",
         sourceDoc: "docs/04-srs.md",
         readerMinutes: 80,
         titleVi: "Khi nào thì thôi cố",
         readerProducesVi:
-          "Nhật ký lần thử và auto-disable, kèm bằng chứng đứng sau quyết định",
+          "Bản ghi lần thử trên stream analytics, và auto-disable từ hai trigger",
       },
       {
         id: "3.7",
