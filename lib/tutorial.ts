@@ -389,7 +389,26 @@ export const series: Part[] = [
       },
       {
         id: "3.7",
-        path: "/part-3/chapter-07/limits-and-quotas",
+        path: "/part-3/chapter-07/commit-and-publish-are-two-instants",
+        title: "Commit and publish are two instants",
+        status: "forthcoming",
+        // Inserted after 3.6 shipped. Chapter 2.7 is the chapter this series
+        // calls its flagship bug and it did not close the race it is named for:
+        // a message committed before a resuming client's backfill and announced
+        // to the fabric after that resume completes is delivered twice. The
+        // seam is 3.3's, 3.5's and 3.6's, in the one path built before the
+        // reader had the concept.
+        readerProduces:
+          "The resume duplicate closed: a high-water mark that outlives the buffer",
+        sourceDoc: "docs/04-srs.md",
+        readerMinutes: 60,
+        titleVi: "Commit và publish là hai thời điểm",
+        readerProducesVi:
+          "Khép lại lỗi trùng lặp khi resume: một high-water mark sống lâu hơn buffer",
+      },
+      {
+        id: "3.8",
+        path: "/part-3/chapter-08/limits-and-quotas",
         title: "Limits and quotas",
         status: "forthcoming",
         readerProduces:
@@ -399,8 +418,8 @@ export const series: Part[] = [
         titleVi: "Giới hạn và quota",
       },
       {
-        id: "3.8",
-        path: "/part-3/chapter-08/milestone-the-isolation-gauntlet",
+        id: "3.9",
+        path: "/part-3/chapter-09/milestone-the-isolation-gauntlet",
         title: "Milestone: the isolation gauntlet",
         status: "forthcoming",
         readerProduces:
