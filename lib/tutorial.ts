@@ -421,12 +421,12 @@ export const series: Part[] = [
         // Carries the email transport chapter 3.6 deferred: FR-WHK-07's
         // notification rows have had `delivered_at` null since 3.6 shipped.
         readerProduces:
-          "Per-environment token buckets, the headers on every response, and the notification transport 3.6 was owed",
+          "Per-environment request counters, the headers on every response, and the notification transport 3.6 was owed",
         sourceDoc: "docs/04-srs.md",
         readerMinutes: 90,
         titleVi: "Những giới hạn bạn thấy trước",
         readerProducesVi:
-          "Token bucket theo từng environment, các header trên mọi response, và phương tiện gửi thông báo mà 3.6 còn nợ",
+          "Bộ đếm request theo từng environment, các header trên mọi response, và phương tiện gửi thông báo mà 3.6 còn nợ",
       },
       {
         id: "3.9",
