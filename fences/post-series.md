@@ -314,7 +314,13 @@ it.
 
 ---
 
-## `services/api/src/webhooks/deliveries.itest.ts` — a sweep test that depended on a clean database (chapter 3.7 baseline)
+## `services/api/src/webhooks/deliveries.itest.ts` — two tests that depended on being alone (chapter 3.7)
+
+Two separate faults in the same file, found at either end of chapter 3.7's work
+and amended in one diff because they share a shape: a test calling a **global,
+unscoped** operation and then asserting about its own row.
+
+### One — the sweep, found at the baseline
 
 Chapter 3.6's sweep is global: it takes the hundred oldest endpoints whose failure
 run has outrun the hour. The test that proves it works aged its own endpoint by 64
@@ -334,12 +340,125 @@ something".
 The five calls now pass an explicit limit large enough to reach the endpoint under
 test whatever else is eligible.
 
-**No chapter owns this.** 3.6 fenced the file and teaches auto-disable, not the
-batch size of a test's sweep call. 3.7 is about the resume duplicate and never
-mentions webhooks.
+### Two — the drain, found on run 2 of twenty
+
+Chapter 3.7 ran the integration lane twenty times after its fix to show the change
+caused no regression. Run 2 failed on a different test in the same file:
+
+```text
+FAIL  deliveries.itest.ts > the relay drains only what is due >
+      invariant 10: a not-yet-due delivery holds no acknowledgement slot
+AssertionError: expected null not to be null
+```
+
+The delivery was unambiguously due and had not been published.
+
+`drainDueDeliveries` claims its batch `FOR UPDATE SKIP LOCKED`. When a suite in a
+parallel vitest worker holds that row inside its own open transaction, this call
+**skips** it and returns having done nothing about it — and a single call is then
+indistinguishable from the relay declining to publish something due, which is
+exactly the failure this test exists to report. Vitest runs `*.itest.ts` files in
+parallel by default and `attempts.itest.ts` drains globally too.
+
+The comment already sitting above the helper had the principle right — *assert the
+property, not the observer; whoever claims the row, a due delivery ends up
+dispatched* — and the implementation was one call short of it. The drain is now
+retried until the row this suite owns has settled, bounded at ten passes. If the
+property is genuinely false, nothing dispatches the row and the test fails with
+the same message a second later.
+
+**This is the third instance of the same disease in this file's neighbourhood.**
+Chapter 3.6's `test-event.itest.ts` carries a long comment about the first: another
+suite's global drain claimed its delivery, stamped `dispatched_at`, and discarded
+it, so the route under test waited out ten seconds and reported `delivered: false`
+for an endpoint that had answered 200. It passed alone and failed in the lane.
+
+So does this one, and more rarely: once in twenty runs rather than most of them.
+That is worse, not better. A suite that fails every time in the lane gets fixed
+the day it lands; one that fails once in twenty gets blamed on the network.
+
+**No chapter owns either of these.** 3.6 fenced the file and teaches auto-disable
+and the attempt record, not the batch size of a test's sweep call or the locking
+behaviour of a claim it does not describe. 3.7 is about the resume duplicate and
+never mentions webhooks.
 
 ```diff title="services/api/src/webhooks/deliveries.itest.ts"
-@@ -1131,7 +1131,17 @@ describe("the failure run", () => {
+@@ -285,7 +285,37 @@ describe("the relay drains only what is due", () => {
+    * observer. Whoever claims the row, a due delivery ends up dispatched and a
+    * not-yet-due one does not. */
+   const drainEverythingDue = async (): Promise<void> => {
+-    await drainDueDeliveries(db, 500, async () => {});
++    await drainDueDeliveries(db, 50_000, async () => {});
++  };
++
++  /** The same drain, retried until a row this suite owns has settled.
++   *
++   * FOUND AT CHAPTER 3.7'S POST-FIX MEASUREMENT, on run 2 of 20: "expected null
++   * not to be null" for a delivery that was unambiguously due. The comment above
++   * had the principle right and the implementation one call short.
++   *
++   * `drainDueDeliveries` claims `FOR UPDATE SKIP LOCKED`. When a suite running in
++   * a parallel worker holds this row inside its own open transaction, this call
++   * SKIPS it and returns having done nothing about it — and one call is then
++   * indistinguishable from "the relay declined to publish a due delivery", which
++   * is the failure this test is meant to report. Draining again once the other
++   * transaction has ended finds the row either already dispatched by that suite
++   * or free to claim here. Either outcome satisfies the invariant; neither is
++   * visible to a single call.
++   *
++   * Bounded rather than open-ended: if the property is genuinely false the row is
++   * never dispatched and this fails after the budget with the same message, one
++   * second later. */
++  const drainUntilSettled = async (delivery: {
++    id: string;
++    event_id: string;
++  }): Promise<void> => {
++    for (let attempt = 0; attempt < 10; attempt++) {
++      await drainEverythingDue();
++      const rows = await repo.listDeliveriesForEvent(delivery.event_id);
++      if (rows.find((r) => r.id === delivery.id)?.dispatched_at !== null) return;
++      await new Promise((resolve) => setTimeout(resolve, 100));
++    }
+   };
+ 
+   const stateOf = async (delivery: { id: string; event_id: string }) => {
+@@ -319,7 +349,7 @@ describe("the relay drains only what is due", () => {
+   it("invariant 10: publishes a delivery that is due", async () => {
+     const delivery = await seed();
+ 
+-    await drainEverythingDue();
++    await drainUntilSettled(delivery);
+ 
+     expect((await stateOf(delivery)).dispatched_at).not.toBeNull();
+   });
+@@ -361,7 +391,7 @@ describe("the relay drains only what is due", () => {
+     }
+ 
+     const healthy = await seed();
+-    await drainEverythingDue();
++    await drainUntilSettled(healthy);
+ 
+     expect((await stateOf(healthy)).dispatched_at).not.toBeNull();
+     for (const s of sleeping) {
+@@ -372,7 +402,7 @@ describe("the relay drains only what is due", () => {
+   it("invariant 9: a claimed delivery is not claimed twice", async () => {
+     const delivery = await seed();
+ 
+-    await drainEverythingDue();
++    await drainUntilSettled(delivery);
+     const first = await stateOf(delivery);
+     await drainEverythingDue();
+     const second = await stateOf(delivery);
+@@ -400,7 +430,7 @@ describe("the relay drains only what is due", () => {
+ 
+     // Tier 2 is one second out.
+     await new Promise((resolve) => setTimeout(resolve, 1_500));
+-    await drainEverythingDue();
++    await drainUntilSettled(delivery);
+ 
+     expect((await stateOf(delivery)).dispatched_at).not.toBeNull();
+   });
+@@ -1131,7 +1161,17 @@ describe("the failure run", () => {
      // Still enabled: nothing has happened since, which is the whole point.
      expect((await runOf(endpoint.id)).enabled).toBe(true);
  
@@ -358,7 +477,7 @@ mentions webhooks.
      expect(disabled).toBeGreaterThanOrEqual(1);
  
      const after = await runOf(endpoint.id);
-@@ -1160,9 +1170,9 @@ describe("the failure run", () => {
+@@ -1160,9 +1200,9 @@ describe("the failure run", () => {
      await failTimes(scoped.id, scopedRepo, endpoint.id, 5, 503);
      await ageRun(endpoint.id, 64);
  
@@ -371,7 +490,7 @@ mentions webhooks.
  
      expect(await notificationsFor(endpoint.id)).toHaveLength(1);
    }, 120_000);
-@@ -1179,7 +1189,7 @@ describe("the failure run", () => {
+@@ -1179,7 +1219,7 @@ describe("the failure run", () => {
      // Inside the hour: five failures, but the window has not elapsed.
      await ageRun(recent.id, 30);
  
