@@ -409,18 +409,46 @@ export const series: Part[] = [
       },
       {
         id: "3.8",
-        path: "/part-3/chapter-08/limits-and-quotas",
-        title: "Limits and quotas",
+        path: "/part-3/chapter-08/limits-you-can-see-coming",
+        title: "Limits you can see coming",
         status: "forthcoming",
+        // Split from the original "Limits and quotas" entry. A rate limit is
+        // ephemeral and may be lost, so Redis is the right store and failing open
+        // is the right default; a quota is money and must be durable. One chapter
+        // teaching both would teach one storage decision as though it covered
+        // both. Quotas also need metering that arrives with Part 4.
+        //
+        // Carries the email transport chapter 3.6 deferred: FR-WHK-07's
+        // notification rows have had `delivered_at` null since 3.6 shipped.
         readerProduces:
-          "Redis token buckets; standard headers; spending caps",
+          "Per-environment token buckets, the headers on every response, and the notification transport 3.6 was owed",
         sourceDoc: "docs/04-srs.md",
         readerMinutes: 90,
-        titleVi: "Giới hạn và quota",
+        titleVi: "Những giới hạn bạn thấy trước",
+        readerProducesVi:
+          "Token bucket theo từng environment, các header trên mọi response, và phương tiện gửi thông báo mà 3.6 còn nợ",
       },
       {
         id: "3.9",
-        path: "/part-3/chapter-09/milestone-the-isolation-gauntlet",
+        path: "/part-3/chapter-09/quotas-and-what-they-cost",
+        title: "Quotas and what they cost",
+        status: "forthcoming",
+        // The half of FR-RTL that is money rather than traffic: monthly usage
+        // quotas, the hard cap that suspends and the soft threshold that only
+        // alerts, and the 50/80/100% email. FR-RTL-06 is a purchasing
+        // requirement, not a technical one — unbounded cost exposure is David's
+        // principal objection at the diligence phase.
+        readerProduces:
+          "Monthly quotas, spending caps, and degradation that rejects sends without touching history",
+        sourceDoc: "docs/04-srs.md",
+        readerMinutes: 90,
+        titleVi: "Quota và cái giá của nó",
+        readerProducesVi:
+          "Quota theo tháng, hạn mức chi tiêu, và cách suy giảm chỉ chặn gửi mà không ảnh hưởng history",
+      },
+      {
+        id: "3.10",
+        path: "/part-3/chapter-10/milestone-the-isolation-gauntlet",
         title: "Milestone: the isolation gauntlet",
         status: "forthcoming",
         readerProduces:
