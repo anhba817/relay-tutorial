@@ -592,3 +592,80 @@ never mentions webhooks.
      expect((await runOf(healthy.id)).enabled).toBe(true);
      expect((await runOf(recent.id)).enabled).toBe(true);
 ```
+
+---
+
+## `services/api/src/tenancy/signup.itest.ts` — the global count chapter 3.3 already removed once (chapter 3.7)
+
+Chapter 3.3 carries this fix-forward:
+
+> Chapter 3.1's signup suite asserted that a failed provisioning left the
+> *global* organisation count unchanged. That passed for two chapters and failed
+> here with `expected 884 to be 883`, because 3.3's crash tests spawn child
+> processes that provision tenants of their own while it runs. The count was
+> never the evidence.
+
+It removed the count from invariant 1. **The identical assertion at invariant 7,
+about a hundred lines further down the same file, was not looked for.**
+
+It failed during chapter 3.7's lane runs with `expected 9918 to be 9917` — the
+same sentence, four chapters and nine thousand organisations later. The test
+compared `count(*) FROM organisations` before and after a single credential-free
+`fetch`, which in a lane running these files in parallel is the claim that nobody
+anywhere signed up during that one request.
+
+What replaces it is the property asserted where it can be attributed to this
+call: the route refuses, and a request refused before it reaches a handler has
+created nothing. The surrounding loop already made exactly that assertion for the
+same path with `POST`.
+
+**The lesson is not about counts.** Fixing an instance is not fixing a class, and
+the cheapest moment to grep for the other instances is while the first one is
+still on the screen. A chapter that writes "the count was never the evidence" and
+then leaves a second count in the same file has diagnosed the disease and treated
+a symptom. Every `count(*)` in every integration suite was checked after this one;
+the remaining seven are all scoped to an environment, an endpoint or an account.
+
+**No chapter owns this.** 3.1 wrote the assertion and 3.3 fenced the file last;
+both are about tenancy and the outbox, not about which assertions survive a
+parallel lane. 3.7 is about the resume duplicate.
+
+```diff title="services/api/src/tenancy/signup.itest.ts"
+@@ -277,20 +277,25 @@ describe("signup", () => {
+       const text = await res.text();
+       expect(text).not.toContain("organisation");
+     }
+-    const before = await db.execute(
+-      `SELECT count(*)::int AS n FROM organisations`,
+-    );
+-    // Chapter 3.2: there is no header left to forge here. The assertion is
++    // Chapter 3.2: there is no header left to forge here. The property is
+     // unchanged — no route but signup creates a tenant — and a credential-free
+     // internal call is now refused before it reaches a handler, which is a
+     // stronger form of the same guarantee.
+-    await fetch(`${url}/internal/memberships`);
+-    const after = await db.execute(
+-      `SELECT count(*)::int AS n FROM organisations`,
+-    );
+-    expect((after.rows[0] as { n: number }).n).toBe(
+-      (before.rows[0] as { n: number }).n,
+-    );
++    //
++    // THIS USED TO COMPARE `count(*) FROM organisations` BEFORE AND AFTER, and
++    // that assertion was not about this request. The count is global, every other
++    // suite in the lane signs organisations up while this runs, and vitest runs
++    // these files in parallel — so it asserted that nobody anywhere created a
++    // tenant during one `fetch`. Chapter 3.7's lane runs caught it at 9,917
++    // organisations: `expected 9918 to be 9917`.
++    //
++    // What is left is the property itself, asserted where it can be attributed to
++    // this call: the route refuses, and a request refused before it reaches a
++    // handler has created nothing. Same reasoning as `test-event.itest.ts`, which
++    // finds its own row rather than calling a global drain.
++    const refused = await fetch(`${url}/internal/memberships`);
++    expect(refused.status).not.toBe(200);
++    expect(await refused.text()).not.toContain("organisation");
+   });
+ 
+   it("refuses a callback whose state does not match the cookie (invariant 5, over HTTP)", async () => {
+```
