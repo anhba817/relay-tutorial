@@ -311,3 +311,73 @@ it.
      "build": "turbo run build"
    },
 ```
+
+---
+
+## `services/api/src/webhooks/deliveries.itest.ts` — a sweep test that depended on a clean database (chapter 3.7 baseline)
+
+Chapter 3.6's sweep is global: it takes the hundred oldest endpoints whose failure
+run has outrun the hour. The test that proves it works aged its own endpoint by 64
+minutes and then called the sweep with the default limit.
+
+Every earlier run of that suite leaves endpoints behind with an open failure run,
+and those are older. Once enough of them accumulate — 781 by the time chapter 3.7
+measured its baseline — they fill the batch, the test's own endpoint is never
+reached, and the assertion fails. On a fresh database it passes every time.
+
+**Which assertion caught it is the interesting part.** The test checks
+`disabled >= 1` first, and that PASSED: the sweep had just disabled a hundred
+endpoints belonging to nobody in particular. Only the assertion about *this*
+endpoint could tell the difference between "the sweep works" and "the sweep did
+something".
+
+The five calls now pass an explicit limit large enough to reach the endpoint under
+test whatever else is eligible.
+
+**No chapter owns this.** 3.6 fenced the file and teaches auto-disable, not the
+batch size of a test's sweep call. 3.7 is about the resume duplicate and never
+mentions webhooks.
+
+```diff title="services/api/src/webhooks/deliveries.itest.ts"
+@@ -1131,7 +1131,17 @@ describe("the failure run", () => {
+     // Still enabled: nothing has happened since, which is the whole point.
+     expect((await runOf(endpoint.id)).enabled).toBe(true);
+ 
+-    const disabled = await sweepDisabledEndpoints(db);
++    // A LIMIT BIG ENOUGH TO REACH THIS ENDPOINT. The sweep is global and takes the
++    // hundred oldest eligible endpoints; every earlier run of this suite leaves
++    // endpoints with an open failure run behind, and those are older than this
++    // one, so they fill the batch and this endpoint is never reached. The suite
++    // then fails on a shared database and passes on a fresh one.
++    //
++    // Found at chapter 3.7's baseline, after 781 endpoints had accumulated an open
++    // run. Note which assertion caught it: `disabled >= 1` PASSED, because the
++    // sweep had just disabled a hundred endpoints belonging to nobody. Only the
++    // assertion about THIS endpoint could tell the difference.
++    const disabled = await sweepDisabledEndpoints(db, 10_000);
+     expect(disabled).toBeGreaterThanOrEqual(1);
+ 
+     const after = await runOf(endpoint.id);
+@@ -1160,9 +1170,9 @@ describe("the failure run", () => {
+     await failTimes(scoped.id, scopedRepo, endpoint.id, 5, 503);
+     await ageRun(endpoint.id, 64);
+ 
+-    await sweepDisabledEndpoints(db);
+-    await sweepDisabledEndpoints(db);
+-    await sweepDisabledEndpoints(db);
++    await sweepDisabledEndpoints(db, 10_000);
++    await sweepDisabledEndpoints(db, 10_000);
++    await sweepDisabledEndpoints(db, 10_000);
+ 
+     expect(await notificationsFor(endpoint.id)).toHaveLength(1);
+   }, 120_000);
+@@ -1179,7 +1189,7 @@ describe("the failure run", () => {
+     // Inside the hour: five failures, but the window has not elapsed.
+     await ageRun(recent.id, 30);
+ 
+-    await sweepDisabledEndpoints(db);
++    await sweepDisabledEndpoints(db, 10_000);
+ 
+     expect((await runOf(healthy.id)).enabled).toBe(true);
+     expect((await runOf(recent.id)).enabled).toBe(true);
+```
