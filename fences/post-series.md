@@ -55,7 +55,9 @@ resolve a package's devDependency from above it.
 
 ---
 
-## `services/api/src/consumer/consumer.itest.ts` — a teardown that deleted another suite's consumer (chapter 3.6 baseline)
+## `services/api/src/consumer/consumer.itest.ts` — two tests that outgrew a shared stream (chapters 3.6 and 3.7)
+
+### One — a teardown that deleted another suite's consumer (chapter 3.6 baseline)
 
 Chapter 3.4's consumer suite cleaned up after itself by deleting every durable
 consumer on `EVENTS` whose name began with `itest-`. Chapter 3.5's dispatcher
@@ -73,13 +75,47 @@ The fix is a prefix that names this suite rather than every suite. The sweep use
 `itest-consumer`, so it still tidies up after a run that crashed before its own
 teardown, and the durables themselves stay unique per run.
 
-**No chapter owns this.** 3.4 fenced the file and is about the claim ledger; the
-teardown is test-harness hygiene it never discusses. 3.6 does not discuss the
-consumer suite at all. Putting the amendment in either would make that chapter
+### Two — a catch-up test with a fixed budget on a growing stream (chapter 3.7)
+
+Invariant 9 asserts that a consumer stopped for N publishes receives all N when it
+restarts. To make "everything published while away" measurable it first drove a
+fresh durable to the head of the stream, capped at 800 polls.
+
+It called `ENV()` three times for its three publishes — and `ENV` is
+`() => randomUUID()`, so the three events went to three different subjects and no
+`filterSubject` could cover them. Without a filter the durable starts at the
+beginning of a stream that earlier chapters have left about thirteen thousand
+events in, and all of those had to be drained inside the 800 before the three
+under test were reachable.
+
+That worked until the stream outgrew the budget. Chapter 3.7 ran the integration
+lane twenty times and it failed on run 11 and again on run 12:
+
+```text
+FAIL  src/consumer/consumer.itest.ts > the consumer >
+      invariant 9: a consumer stopped for N publishes receives all N on restart
+AssertionError: expected [ …(2756) ] to include 'd3dbb0a4-…'
+```
+
+**Not a flake — a threshold.** 2,756 events drained and the backlog still not
+cleared. Ten clean runs then two failures in a row is the signature of a test that
+was passing on headroom rather than on correctness, and the twenty runs are the
+only reason anyone saw the crossover rather than a lone red build.
+
+The three publishes now share one environment and both runtimes filter on its
+subject, which is the pattern every other test in the file already used and the
+reason its `runtimeFor` helper takes an `environmentId` at all. Scoped, the drain
+has nothing to drain. The invariant is untouched: the stream holds messages
+whether or not anybody is reading, and the backlog waits.
+
+**No chapter owns either of these.** 3.4 fenced the file and is about the claim
+ledger; a teardown prefix and a subject filter are test-harness hygiene it never
+discusses. 3.6 does not discuss the consumer suite at all, and 3.7 is about the
+resume duplicate. Putting either amendment in one of them would make that chapter
 show a reader code it never mentions, which is what this file exists to avoid.
 
 ```diff title="services/api/src/consumer/consumer.itest.ts"
-@@ -102,6 +102,33 @@ function runtimeFor(
+@@ -102,6 +102,33 @@
    });
  }
  
@@ -113,7 +149,7 @@ show a reader code it never mentions, which is what this file exists to avoid.
  /** Durables this suite created through a CHILD process rather than directly.
   * The walk names its own — `walk-<uuid>` — so the suite cannot predict them and
   * a prefix sweep would delete a reader's walk running alongside it. It records
-@@ -172,7 +199,7 @@ describe("the consumer", () => {
+@@ -172,7 +199,7 @@
    }, 60_000);
  
    afterAll(async () => {
@@ -122,7 +158,7 @@ show a reader code it never mentions, which is what this file exists to avoid.
      for (const durable of spawnedDurables) {
        await db.execute(
          `DELETE FROM consumed_events WHERE consumer = '${durable}'`,
-@@ -184,15 +211,18 @@ describe("the consumer", () => {
+@@ -184,15 +211,18 @@
      // found twelve of them the first time it looked. Per-run names keep runs
      // independent; they do not clean up after themselves.
      //
@@ -143,7 +179,7 @@ show a reader code it never mentions, which is what this file exists to avoid.
          await jsm.consumers.delete("EVENTS", info.name).catch(() => undefined);
        }
      }
-@@ -234,7 +264,7 @@ describe("the consumer", () => {
+@@ -234,7 +264,7 @@
  
    it("invariant 3: an event is delivered, handled once, and acknowledged", async () => {
      const environmentId = ENV();
@@ -152,7 +188,7 @@ show a reader code it never mentions, which is what this file exists to avoid.
      const seen: string[] = [];
      const eventId = await publish(environmentId);
  
-@@ -303,7 +333,7 @@ describe("the consumer", () => {
+@@ -303,7 +333,7 @@
      // The ledger is in Postgres precisely so that a process restart does not
      // reset it. A second runtime with the same durable name gets the same
      // answer the first one would have.
@@ -161,7 +197,7 @@ show a reader code it never mentions, which is what this file exists to avoid.
      const eventId = randomUUID();
  
      expect(await claimEvent(db, durable, eventId, async () => {})).toBe(
-@@ -319,7 +349,7 @@ describe("the consumer", () => {
+@@ -319,7 +349,7 @@
      // The ordinary deployment. A durable consumer is one position in the stream,
      // so two api processes pulling from it share the work — the property the
      // broker provides here that `SKIP LOCKED` provides for the outbox.
@@ -170,7 +206,7 @@ show a reader code it never mentions, which is what this file exists to avoid.
      const byA: string[] = [];
      const byB: string[] = [];
      const ids = [
-@@ -352,7 +382,7 @@ describe("the consumer", () => {
+@@ -352,7 +382,7 @@
      // answer this chapter gives rather than a dead-letter path that does not
      // exist yet.
      const environmentId = ENV();
@@ -179,7 +215,7 @@ show a reader code it never mentions, which is what this file exists to avoid.
      const eventId = await publish(environmentId);
      let attempts = 0;
  
-@@ -386,7 +416,7 @@ describe("the consumer", () => {
+@@ -386,7 +416,7 @@
      // runtime terminates the message instead of burning the budget and dropping
      // it anyway — and says so in a log line carrying no payload.
      const environmentId = ENV();
@@ -188,16 +224,72 @@ show a reader code it never mentions, which is what this file exists to avoid.
      const lines: string[] = [];
      const noisy = createLogger("consumer-itest", (line) =>
        lines.push(typeof line === "string" ? line : JSON.stringify(line)),
-@@ -416,7 +446,7 @@ describe("the consumer", () => {
+@@ -416,12 +446,38 @@
    it("invariant 9: a consumer stopped for N publishes receives all N on restart", async () => {
      // What `limits` retention means: the stream holds messages whether or not
      // anybody is reading. The backlog waits.
 -    const durable = `itest-catchup-${Date.now()}`;
 +    const durable = `${RUN}-catchup-${Date.now()}`;
      const seen: string[] = [];
-     const runtime = runtimeFor(db, durable, async (e) => void seen.push(e.id));
+-    const runtime = runtimeFor(db, durable, async (e) => void seen.push(e.id));
++    // ONE environment for all three publishes, and the consumer filtered to it.
++    //
++    // This test used to call `ENV()` three times — and `ENV` mints a fresh uuid
++    // on every call, so the three events went to three different subjects and no
++    // filter could cover them. Without a filter the durable starts at the head of
++    // a stream holding ~13,000 events from earlier chapters, and the loop below
++    // had to drain all of them inside a fixed budget of 800 polls before the
++    // three under test were even reachable.
++    //
++    // Found on run 11 of chapter 3.7's twenty post-fix lane runs: `expected
++    // [ …(2756) ] to include '<uuid>'`. 2,756 events drained and the backlog
++    // still not cleared. It is the same shape as the sweep and the drain in
++    // `deliveries.itest.ts` — a test riding a shared, growing resource with a
++    // fixed budget, which passes until the resource outgrows the budget.
++    //
++    // Scoped, the drain below has nothing to drain and the assertion is about
++    // exactly the three events it published. The invariant is unchanged: the
++    // stream holds messages whether or not anybody is reading, and the backlog
++    // waits.
++    const environmentId = ENV();
++    const runtime = runtimeFor(
++      db,
++      durable,
++      async (e) => void seen.push(e.id),
++      silent,
++      environmentId,
++    );
  
-@@ -446,7 +476,7 @@ describe("the consumer", () => {
+     // Get to the head of the stream first, so "everything published while away"
+-    // is measurable rather than lost in twelve thousand older events.
++    // is measurable rather than lost among older events.
+     for (let i = 0; i < 800; i++) {
+       const { handled, duplicates } = await runtime.pollOnce();
+       if (handled + duplicates === 0) break;
+@@ -429,12 +485,18 @@
+     await runtime.stop();
+ 
+     const published = [
+-      await publish(ENV()),
+-      await publish(ENV()),
+-      await publish(ENV()),
++      await publish(environmentId),
++      await publish(environmentId),
++      await publish(environmentId),
+     ];
+ 
+-    const restarted = runtimeFor(db, durable, async (e) => void seen.push(e.id));
++    const restarted = runtimeFor(
++      db,
++      durable,
++      async (e) => void seen.push(e.id),
++      silent,
++      environmentId,
++    );
+     for (let i = 0; i < 100; i++) {
+       await restarted.pollOnce();
+       if (published.every((id) => seen.includes(id))) break;
+@@ -446,7 +508,7 @@
  
    it("invariant 12: a consumer log line carries counts, never payloads", async () => {
      const environmentId = ENV();
