@@ -391,7 +391,8 @@ export const series: Part[] = [
         id: "3.7",
         path: "/part-3/chapter-07/commit-and-publish-are-two-instants",
         title: "Commit and publish are two instants",
-        status: "forthcoming",
+        status: "published",
+        translatedIn: ["vi"],
         // Inserted after 3.6 shipped. Chapter 2.7 is the chapter this series
         // calls its flagship bug and it did not close the race it is named for:
         // a message committed before a resuming client's backfill and announced
@@ -402,7 +403,7 @@ export const series: Part[] = [
           "The resume duplicate closed: a high-water mark that outlives the buffer",
         sourceDoc: "docs/04-srs.md",
         readerMinutes: 60,
-        titleVi: "Commit và publish là hai thời điểm",
+        titleVi: "Commit và publish là hai khoảnh khắc",
         readerProducesVi:
           "Khép lại lỗi trùng lặp khi resume: một high-water mark sống lâu hơn buffer",
       },

@@ -1,0 +1,872 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figTwoInstants, figFourQuadrants, figWhereTheMarkLives } from "./figures";
+
+export const metadata = {
+  title: "Commit và publish là hai khoảnh khắc — Building Relay",
+  description:
+    "Chương 2.7 là chương mà loạt bài này gọi là con bug chủ lực của mình, và nó đã không đóng được cuộc đua nó mang tên. Một message bền vững ở một khoảnh khắc và được loan báo ở một khoảnh khắc khác, và mọi thứ đọc vào quãng giữa đều thấy một trạng thái mà không khoảnh khắc nào mô tả.",
+  alternates: {
+    canonical: "/vi/part-3/chapter-07/commit-and-publish-are-two-instants",
+    languages: {
+      en: "/part-3/chapter-07/commit-and-publish-are-two-instants",
+      vi: "/vi/part-3/chapter-07/commit-and-publish-are-two-instants",
+    },
+  },
+};
+
+<ChapterHeader id="3.7" locale="vi" />
+
+Chương 2.7 là chương mà loạt bài này gọi là con bug chủ lực của mình. Nó dựng
+resume protocol, phát biểu cuộc đua trùng-lặp/hụt-mất bằng đúng ngần ấy chữ, đóng
+lại bằng lập luận chồng-lấn-cộng-khử-trùng, rồi chứng minh lập luận ấy bằng ba test.
+
+Nó đã không đóng được.
+
+Một client kết nối lại vẫn có thể nhận đúng một message hai lần. Tính chất ấy là
+của FR-RTM-03 — *không hụt và không trùng* — và bộ milestone của chương 2.8 khẳng
+định nó ở mỗi lần chạy. Suốt bốn chương, nó sai.
+
+Chương này là bốn dòng logic, và một cái nhìn dài về vì sao chúng đã vắng mặt.
+
+<SkipAhead>
+
+Nếu bạn buộc phải bỏ qua: gateway commit một message qua api rồi **sau đó** mới
+publish lên Redis fabric. Giữa hai câu lệnh ấy, message đã bền vững nhưng chưa được
+loan báo. Một client đang resume mà truy vấn backfill rơi vào đúng quãng đó sẽ nhận
+message từ backfill, đặt high-water mark, flush, chuyển sang live — rồi publish mới
+tới, đập vào một connection mà cửa sổ khử trùng đã đóng, bởi vì marks của chương 2.7
+là một biến cục bộ mà `resume()` vứt đi. Bản sửa giữ marks trên `Connection` và tra
+cứu chúng trong `deliver()`. Chúng **không bao giờ bị thu hồi**: hai gateway instance
+publish mà không phối hợp với nhau, nên một sequence cao hơn có thể tới trước một
+sequence thấp hơn bị chậm, và một quy tắc thu hồi khi thấy số cao hơn sẽ trao lại
+đúng con lỗi trùng lặp. Trạng thái giữ lại bị chặn trên bởi `MAX_RESUME_CHANNELS`,
+thứ vốn đã chặn số cursor mà nó được thu hẹp theo. Trạng thái cuối chương là tag
+**`part3-ch7`**.
+
+</SkipAhead>
+
+## Hai khoảnh khắc
+
+Đây là đường gửi của gateway, không đổi từ chương 2.6:
+
+```ts title="services/gateway/src/session.ts (excerpt)"
+const committed = await api.send(connection.identity, { … });
+…
+if (!committed.duplicate && committed.text !== null) {
+  await fanout?.publish({ id: committed.id, channel: committed.channel_id, seq: committed.seq, … });
+}
+```
+
+Hãy đọc hai chữ `await` đó như hai thời điểm, chứ đừng đọc như một thao tác.
+
+Sau chữ thứ nhất, message đã nằm trong PostgreSQL với một sequence được cấp. Nó bền
+vững. Mọi truy vấn — kể cả backfill của một client đang resume — đều thấy nó.
+
+Sau chữ thứ hai, fabric mới biết. Mọi gateway đang subscribe sẽ giao nó đi.
+
+**Ở quãng giữa, message tồn tại mà chưa được loan báo**, và không có gì trong lập
+luận của chương 2.7 gọi tên trạng thái đó.
+
+<Figure caption="Truy vấn backfill rơi vào giữa commit và publish. Đến lúc fabric bắt kịp thì resume đã xong." code={figTwoInstants} />
+
+Toàn bộ chỗ lỗi là thế. Backfill của một connection đang resume trả về sequence 4,
+nên high-water mark của nó thành 4. Nó flush, chuyển sang live, *rồi* publish bị
+chậm mới tới — đập vào một connection không còn buffer nữa, giao đi một sequence mà
+client vừa được trao khoảnh khắc trước.
+
+<Why title="Vì sao lập luận của chương 2.7 suýt nữa thì đúng">
+
+Phần mở đầu của nó lập luận qua hai thứ tự và bác cả hai. Backfill-rồi-subscribe
+đánh rơi mọi thứ được publish trong cửa sổ backfill. Subscribe-rồi-giao thì gửi hai
+lần phần chồng lấn. Kết luận — "cách sửa không phải là một thứ tự khéo hơn: nó là
+chồng lấn cộng khử trùng" — là đúng, và phần cài đặt làm đúng như vậy.
+
+Chỗ hụt nằm ở mô hình, không nằm ở code. Mô hình coi một message tồn tại tại một
+khoảnh khắc, nên "được publish trong lúc resume" và "được commit trong lúc resume"
+là cùng một sự kiện. Chúng không phải, và khoảng cách giữa chúng là một vòng đi về
+qua mạng cộng thêm một lệnh publish vào Redis.
+
+Chính comment của journey e2e phơi ra điểm mù, bằng lời của người viết: *"frame có
+thể nằm trong backfill, nằm trong buffer, hoặc cả hai, và kết quả phải như nhau
+trong mọi trường hợp."* Cả ba trường hợp ấy đều được xử lý. Trường hợp thứ tư —
+nằm trong backfill, và được giao live *sau đó* — không có trong danh sách, bởi người
+viết mặc định rằng một frame publish trong lúc resume thì sẽ rơi vào buffer. Nó chỉ
+rơi vào đó nếu lệnh publish xảy ra khi connection còn đang buffer.
+
+</Why>
+
+## Ba trên bốn ô
+
+`resume.itest.ts` có ba test khi chương này bắt đầu. Đặt chúng lên hai trục — frame
+được publish lúc nào, và sequence của nó có ở mức mark trở xuống hay không — thì
+hình dạng của chỗ thiếu hiện ra ngay.
+
+<Figure caption="Một mô hình ba trường hợp đẻ ra một bộ test ba bài. Ma trận thì có bốn ô." code={figFourQuadrants} />
+
+Test thứ ba publish `frame(44)` sau khi resume đã xong và khẳng định nó tới nơi.
+Test còn thiếu publish `frame(42)` — một sequence mà backfill đã gửi rồi — và khẳng
+định nó không tới.
+
+**Cách nhau đúng một con số.** Đó không phải trùng hợp; đó là chuyện xảy ra khi một
+bộ test được viết ra từ một mô hình. Mô hình có ba trường hợp thì bộ test có ba bài,
+và không ai vẽ ma trận ra cả.
+
+Đây là ba test mà chương này thêm vào:
+
+```diff title="services/gateway/src/resume.itest.ts"
+@@ -192,4 +192,120 @@ describe("resume across a real fabric", () => {
+     expect(created(frames)).toEqual([42, 44]);
+     socket.close();
+   });
++
++  it("suppresses a frame the backfill already delivered, published after the resume", async () => {
++    // THE FOURTH QUADRANT, and the defect this chapter exists to close.
++    //
++    // The three tests above cover: published while buffering and in the backfill
++    // (deduplicated by `flushable`); published while buffering and NOT in the
++    // backfill (delivered by the flush); published after going live with a
++    // sequence ABOVE the mark (delivered). The cell they leave empty is this one —
++    // published after going live, with a sequence the backfill already sent.
++    //
++    // It is not a contrived case. A message is durable at one instant and
++    // announced at another: the gateway commits through the api and only then
++    // publishes to Redis. A backfill query landing between those two instants
++    // returns a message the fabric has not yet delivered, and the delivery arrives
++    // after the resume has finished — when chapter 2.7's dedup window has already
++    // closed, because `marks` was a local variable that `resume()` discarded.
++    //
++    // One number different from the test above it. That is the whole bug.
++    harness = await boot({
++      session: async () => ({
++        environment_id: "env-1",
++        user: "tuan",
++        channel_ids: [CHANNEL],
++      }),
++      backfill: async () => ({
++        [CHANNEL]: { messages: [frame(42)], truncated: false },
++      }),
++      sendMessage: async () => {
++        throw new Error("not used");
++      },
++    });
++    const socket = new WebSocket(
++      `${harness.url}?token=${await token()}&cursor=${CHANNEL}:41`,
++    );
++    const frames = record(socket);
++    await settle(400);
++    // The resume has completed. NOW the fabric catches up with a message the
++    // backfill already delivered — the publish that was still in flight while the
++    // backfill query ran.
++    await publishFromElsewhere(frame(42));
++    await settle(300);
++
++    expect(created(frames)).toEqual([42]);
++    socket.close();
++  });
++
++  it("still suppresses when two instances publish out of order", async () => {
++    // Sequences COMMIT in order under a channel row lock; they are PUBLISHED by
++    // whichever gateway instance handled each send, and those do not coordinate.
++    // A prompt publish of 43 can precede a stalled publish of 42.
++    //
++    // This is the case that made the spec's first design unsafe. It proposed
++    // retiring the mark once a higher sequence arrived — which would see the 43,
++    // drop the mark, and then deliver the 42 (research R3).
++    harness = await boot({
++      session: async () => ({
++        environment_id: "env-1",
++        user: "tuan",
++        channel_ids: [CHANNEL],
++      }),
++      backfill: async () => ({
++        [CHANNEL]: { messages: [frame(42)], truncated: false },
++      }),
++      sendMessage: async () => {
++        throw new Error("not used");
++      },
++    });
++    const socket = new WebSocket(
++      `${harness.url}?token=${await token()}&cursor=${CHANNEL}:41`,
++    );
++    const frames = record(socket);
++    await settle(400);
++    // 43 is ABOVE the mark and must be delivered. A rule that retired the mark on
++    // seeing it would then have nothing left to compare the delayed 42 against.
++    await publishFromElsewhere(frame(43));
++    await settle(150);
++    // 42 is the mark itself, arriving late from an instance that stalled between
++    // its api call and its publish. It must still be suppressed.
++    await publishFromElsewhere(frame(42));
++    await settle(300);
++
++    expect(created(frames)).toEqual([42, 43]);
++    socket.close();
++  });
++
++  it("suppresses nothing when the resume degraded", async () => {
++    // A degraded resume tells the client to page history for every channel, so the
++    // backfill it received is a fragment or nothing at all. A mark taken from it
++    // would suppress messages the client never got — turning this chapter's
++    // duplicate into a gap, which constitution II ranks worse.
++    harness = await boot({
++      session: async () => ({
++        environment_id: "env-1",
++        user: "tuan",
++        channel_ids: [CHANNEL],
++      }),
++      backfill: async () => {
++        throw new Error("backfill unavailable");
++      },
++      sendMessage: async () => {
++        throw new Error("not used");
++      },
++    });
++    const socket = new WebSocket(
++      `${harness.url}?token=${await token()}&cursor=${CHANNEL}:41`,
++    );
++    const frames = record(socket);
++    await settle(400);
++    // A sequence at or below the presented cursor. With no mark retained it must
++    // still arrive: the client was told to page history, not to expect silence.
++    await publishFromElsewhere(frame(41));
++    await settle(300);
++
++    expect(created(frames)).toEqual([41]);
++    socket.close();
++  });
+ });
+```
+
+Chạy chúng trên code của chương 3.6 thì hai bài hỏng:
+
+```console
+$ pnpm --filter @relay/gateway test:integration src/resume.itest.ts
+ × suppresses a frame the backfill already delivered, published after the resume
+ × still suppresses when two instances publish out of order
+ Tests  2 failed | 4 passed (6)
+
+AssertionError: expected [ 42, 42 ] to deeply equal [ 42 ]
+```
+
+`[ 42, 42 ]`. Trong bốn giây, lần nào cũng vậy, với một api giả lập và một Redis thật.
+
+<Trap title="Test thứ ba đậu từ trước khi sửa, và như thế là đúng">
+
+Bài test resume-suy-giảm — publish một sequence thấp sau một lần resume hỏng, và
+đòi nó phải tới nơi — đậu trên code chưa sửa. Chưa có gì chặn gì cả, nên tất nhiên
+là nó tới.
+
+Đó không phải một test dở, cũng không thừa. Nó canh đúng cái hướng mà thay đổi này
+có thể làm hỏng: chặn trùng biến thành đánh mất. Hiến chương II xếp một chỗ hụt nặng
+hơn một bản trùng, nên chương này cần một test hỏng nếu bản sửa chặn quá tay, và một
+test chỉ bắt đầu chạy được sau khi sửa thì không làm được việc đó.
+
+Hãy để ý xem test hồi quy nào của bạn đậu từ *trước* khi thay đổi. Những bài đó
+thường chính là những bài đang bảo vệ bạn khỏi chính thay đổi ấy.
+
+</Trap>
+
+## Giữ lại cái mark
+
+Phần khử trùng vốn đã có. `flushable` so các frame trong buffer với mark ở bước 4, và
+comment của nó giải thích chuyện lệch-một rất kỹ. Thứ còn thiếu là đúng phép so ấy,
+muộn hơn một bước:
+
+```diff title="services/gateway/src/resume.ts"
+@@ -107,6 +107,51 @@ export function flushable(
+   return buffer.filter((frame) => frame.seq > (marks[frame.channel] ?? 0));
+ }
+ 
++/** Step 5's half, and the reason this chapter exists (FR-RTM-03).
++ *
++ * `flushable` answers this question for frames sitting in the buffer. This answers
++ * it for frames arriving AFTER the connection has gone live, which is the case
++ * chapter 2.7 did not have — its marks were a local variable that `resume()`
++ * discarded the moment it flushed.
++ *
++ * A message is durable at one instant and announced at another: the gateway
++ * commits through the api and only then publishes to the fabric. A backfill query
++ * landing between those two instants returns a message the fabric has not yet
++ * delivered, so the delivery arrives once the resume is over — and before this
++ * function there was nothing left to compare it against.
++ *
++ * `<=`, not `<`. The mark IS a sequence the backfill delivered rather than the one
++ * after it, which is the same off-by-one `flushable` documents one screen up. */
++export function suppressed(
++  marks: Record<string, number> | null,
++  frame: Message,
++): boolean {
++  if (marks === null) return false;
++  const mark = marks[frame.channel];
++  return mark !== undefined && frame.seq <= mark;
++}
++
++/** The marks a connection keeps, bounded to the channels it actually presented
++ * cursors for.
++ *
++ * `highWaterMarks` seeds from the cursors and then adds a key for every channel
++ * the backfill answered with, so on its own it bounds nothing. The api derives its
++ * response from the cursors it was given, so the two agree today — but a bound
++ * this service claims should not live in another service's response shape. This is
++ * `scopeCursors` applied one step later, and it is here rather than in `session.ts`
++ * so that a unit test can reach it.
++ *
++ * At most `MAX_RESUME_CHANNELS` entries, because that is what the resume contract
++ * already caps the cursor map at. */
++export function scopeMarks(
++  marks: Record<string, number>,
++  cursors: Record<string, number>,
++): Record<string, number> {
++  return Object.fromEntries(
++    Object.entries(marks).filter(([channelId]) => channelId in cursors),
++  );
++}
++
+ /** A promise that resolves false instead of hanging forever. */
+ export async function withDeadline(
+   work: Promise<unknown>,
+```
+
+`suppressed` là câu hỏi của `flushable`, hỏi trên một connection đang live.
+`scopeMarks` chặn phần được giữ lại.
+
+Rồi cái mark cần một chỗ để sống, và chỗ đó là một field:
+
+```diff title="services/gateway/src/registry.ts"
+@@ -29,6 +29,24 @@ export interface Connection {
+   /** Set when the buffer hit its ceiling. The frames are gone, so the
+    * client must be told to page history instead of trusting the stream. */
+   overflowed: boolean;
++  /** Chapter 3.7. Per channel, the highest sequence this connection's backfill
++   * delivered — kept for the connection's life so that a frame the fabric
++   * announces AFTER the resume has finished can still be recognised as one the
++   * client already holds.
++   *
++   * Three states, and the middle one is not the same as the first:
++   *
++   *   null            a fresh connect, or a resume that degraded — suppress nothing
++   *   {}              a resume whose cursor set was empty after scoping
++   *   { chan: 42 }    suppress at or below 42 on that channel
++   *
++   * NEVER RETIRED while the connection lives. Retiring on a higher sequence looks
++   * like the natural way to bound this and hands the duplicate straight back:
++   * sequences commit in order under a channel row lock but are published by
++   * whichever gateway instance handled each send, so a prompt 43 can beat a stalled
++   * 42. Bounded instead by `MAX_RESUME_CHANNELS`, which already caps the cursors
++   * these are scoped to. */
++  marks: Record<string, number> | null;
+ }
+ 
+ export class Registry {
+```
+
+Cùng ba chỗ gọi — đặt khi thành công, xoá ở mọi lần suy giảm, tra cứu khi giao:
+
+```diff title="services/gateway/src/session.ts"
+@@ -19,6 +19,8 @@ import {
+   SUBSCRIBE_DEADLINE_MS,
+   flushable,
+   highWaterMarks,
++  scopeMarks,
++  suppressed,
+   parseCursors,
+   scopeCursors,
+   withDeadline,
+@@ -94,6 +96,13 @@ export function attachSessions({
+         connection.buffer.push(message);
+         continue;
+       }
++      // Chapter 3.7. A live connection is not necessarily a connection with
++      // nothing to remember: a frame at or below what its backfill already
++      // delivered is one it has, however long ago the resume finished. Before
++      // this, delivery consulted `phase` and nothing else, and the marks were
++      // discarded the moment the connection went live — which is precisely when
++      // the fabric could still be catching up.
++      if (suppressed(connection.marks, message)) continue;
+       send(connection.socket, { type: "message.created", payload: message });
+     }
+   }
+@@ -161,6 +170,9 @@ export function attachSessions({
+       phase: presented === undefined ? "live" : "buffering",
+       buffer: [],
+       overflowed: false,
++      // A fresh connect suppresses nothing; a resume fills this in when it
++      // succeeds, and leaves it null when it degrades.
++      marks: null,
+     };
+ 
+     registry.add(connection);
+@@ -263,6 +275,11 @@ export function attachSessions({
+      * fragment of a stream the client is about to refetch in full. */
+     const degrade = (reason: string): void => {
+       connection.buffer = [];
++      // AND THE MARKS. A degraded resume tells the client to page history for
++      // every channel, so the backfill behind these marks is a fragment or
++      // nothing at all — suppressing on them would turn this chapter's duplicate
++      // into a gap, which constitution II ranks worse.
++      connection.marks = null;
+       connection.phase = "live";
+       ack(connection, {
+         cursor: cursors,
+@@ -337,6 +354,10 @@ export function attachSessions({
+       send(connection.socket, { type: "message.created", payload: message });
+     }
+     connection.buffer = [];
++    // KEPT, where chapter 2.7 discarded them. Scoped to the cursors this
++    // connection actually presented, so the bound is this service's rather than
++    // one inherited from the shape of the api's response.
++    connection.marks = scopeMarks(marks, cursors);
+     // Step 5.
+     connection.phase = "live";
+     logger.log("info", "resume.completed", {
+```
+
+<Figure caption="Bước 5 trước đây vứt H đi. Giờ nó giữ lại." code={figWhereTheMarkLives} />
+
+Một trong các diff ấy xoá đi một câu, và chính câu đó mới là phần đáng chú ý.
+`Connection.phase` từng mang comment này:
+
+> Delivery reads this field and nothing else — the resume machinery is invisible
+> to it.
+
+Đó là chỗ lỗi được viết ra thành một nguyên tắc thiết kế, và nó đọc lên như một ưu
+điểm. Phần giao *nên* đơn giản; bộ máy resume *nên* được gói kín. Rắc rối là ở chỗ
+chính sự gói kín ấy đóng cửa sổ khử trùng, mà cửa sổ đó phải mở lâu hơn bản thân lần
+resume một chút.
+
+## Vì sao cái mark không bao giờ bị thu hồi
+
+Giữ một số nguyên cho mỗi channel suốt đời một connection thì mời gọi một tối ưu
+hiển nhiên: bỏ nó đi khi thấy một sequence cao hơn tới, vì chắc chắn cửa sổ đã đóng
+rồi.
+
+Chưa đóng, và lý do lại đúng là bài toán hai-khoảnh-khắc, ở một tầng cao hơn.
+Sequence được cấp dưới một row lock trên channel ở chương 2.2, nên sequence 4 commit
+trước sequence 5. **Chúng được publish bởi bất kỳ gateway instance nào xử lý lần gửi
+tương ứng**, và các instance ấy không phối hợp với nhau. Instance A có thể commit 4
+rồi khựng lại trước khi publish, trong khi instance B commit 5 và publish ngay:
+
+```text
+resume completes, mark = 4
+seq 5 arrives  → above the mark → deliver, and RETIRE
+seq 4 arrives  → no mark left   → deliver   ← the duplicate, again
+```
+
+Quy tắc thu hồi trao thẳng lại cái cửa sổ. Bản đặc tả của chương này ban đầu đòi
+đúng như vậy, và phần nghiên cứu đã lật lại bản đặc tả.
+
+**Bị chặn trên mà không cần thu hồi.** Các mark được thu hẹp theo đúng những cursor
+client đã đưa ra, và hợp đồng resume vốn đã từ chối nhiều hơn `MAX_RESUME_CHANNELS`
+cursor — 200 số nguyên cho mỗi connection, không đổi suốt đời nó.
+
+<Trap title="Cái chặn trên phải là của service này, không phải của api">
+
+`highWaterMarks` khởi từ các cursor rồi thêm một khoá cho mỗi channel mà backfill
+trả lời. Tự thân nó không chặn gì cả: một api trả về những channel không ai hỏi sẽ
+làm map phình ra vô hạn.
+
+Hôm nay chuyện đó không xảy ra được, vì backfill controller dựng câu trả lời từ
+chính các cursor nó nhận. Nhưng một giới hạn mà service này tuyên bố thì không nên
+phụ thuộc vào hình dạng câu trả lời của một service khác — đó là một lời hứa được
+giữ ở nơi bạn không nhìn thấy. `scopeMarks` chính là `scopeCursors` áp dụng muộn hơn
+một bước, và nó tồn tại để lời bảo đảm sống trong đúng file đưa ra lời bảo đảm ấy.
+
+</Trap>
+
+## Cùng một đường nối, bốn lần
+
+Đây là chủ đề trở đi trở lại của Phần 3, và đường fan-out là trường hợp được dựng
+lên trước khi người đọc có khái niệm.
+
+| Chương | Đường nối | Câu trả lời |
+|---|---|---|
+| 3.3 | outbox | làm hai khoảnh khắc thành nguyên tử — một transaction, không có khe |
+| 3.5 | giao webhook | gửi trước, báo sau; khách hàng gánh phần trùng lặp |
+| 3.6 | bản ghi lần thử | publish sau khi commit; bản ghi có thể mất |
+| **3.7** | **fan-out và resume** | **chồng lấn, rồi khử trùng ở phía đọc** |
+
+Bốn trường hợp của *bền vững ở một lúc, loan báo ở một lúc khác*, và bốn câu trả lời
+đúng khác nhau. Câu trả lời phụ thuộc vào cái khe ấy có thể làm mất gì. Mất một bản
+ghi analytics thì mất một dashboard; mất một message thì mất sản phẩm. Chương 2.6
+dựng fan-out trước khi chương 3.3 gọi tên khuôn mẫu, và đó là toàn bộ lý do trường
+hợp này không ai nhận ra.
+
+## Nó được tìm ra thế nào, và cái giá phải trả
+
+Không phải bằng suy luận. Bằng một lần hỏng chập chờn trong phép đo nền của chương
+3.6, trên một lane đang đỏ cùng lúc vì ba lý do không liên quan — một suite xoá mất
+broker consumer của suite khác, một wildcard consumer ăn mất event của suite bên
+cạnh, và một khẳng định bảo mật đã thoái hoá thành "không dòng log nào chứa chữ I".
+
+Một lần hỏng e2e thi thoảng, giữa đám ấy, trông y hệt phần còn lại. Nó sống sót vì
+một lane đỏ giấu những lỗi thật giữa những lỗi giả, và đó là lập luận thực tế cho
+việc dọn flake ngay cả khi flake là của người khác.
+
+<Trap title="Tỉ lệ chúng tôi đo được không phải là tỉ lệ thật">
+
+Chương 3.6 thấy một lần hỏng trên sáu lần chạy. Chương này chạy lane hai mươi lần
+trước khi đổi bất cứ thứ gì và thấy **không lần nào**.
+
+Chỗ lỗi không hiếm đi. Điều kiện phơi bày nó biến mất. Cuộc đua cần một truy vấn
+backfill rơi vào đúng khe giữa commit và publish, và khe ấy rộng ra khi máy tải nặng.
+Lúc 3.6 đo, lane mất chín phút vì database đang giữ bốn nghìn webhook delivery chờ
+xử lý, mỗi cái thử lại vào những endpoint đã chết với ba giây một lần. Đống tồn ấy
+được dọn sạch ở cuối 3.6, giờ lane mất ba phút, và cửa sổ hẹp lại tương ứng.
+
+Điều đó biến tiêu chí thành công mà chương này tự đặt ra cho mình — *hai mươi lần
+đậu liên tiếp sau khi sửa* — thành một tiêu chí không thể trượt. Hai mươi lần đậu
+liên tiếp xảy ra từ trước khi sửa.
+
+Nó được giữ lại, vì hai mươi lần chạy sau khi sửa vẫn cho thấy thay đổi này không
+gây hồi quy, và bị hạ cấp bằng chữ viết. Bài test tất định mới là thứ chứng minh
+bản trùng đã hết. **Lần hỏng chập chờn là cách chỗ lỗi được tìm ra; nó không phải
+cách bản sửa được chứng minh.**
+
+</Trap>
+
+## Một số hiệu chương là một tham chiếu sẽ già đi
+
+Việc chèn chương này đẩy hạn mức sang 3.8 và trường đấu cách ly sang 3.9, và ba
+comment trong source của nền tảng đang trích đúng những con số ấy. Một trong ba đã
+sai từ lần chèn trước:
+
+```diff title="services/api/src/db/schema.ts"
+@@ -372,7 +372,15 @@ export const consumedEvents = pgTable(
+ // the platform's own bookkeeping AND no tenant-visible content. An endpoint is
+ // customer configuration; a dead letter holds a payload that was being sent to a
+ // customer. Both fail the test on both halves, so both are scoped and both join
+-// chapter 3.7's cross-tenant gauntlet as targets.
++// the cross-tenant gauntlet as targets.
++//
++// NAMED, NOT NUMBERED. This line used to say "chapter 3.7's cross-tenant
++// gauntlet". The gauntlet was 3.7 when that was written, became 3.8 when a chapter
++// was inserted ahead of it, and is now 3.9 after a second insertion — and the
++// comment was carried neither time. A chapter number in a source comment is a
++// reference that ages every time the plan changes, and this file is fenced
++// byte-exact into a published chapter, so correcting it costs a fence amendment.
++// The subject does not move; the ordinal does.
+ // ---------------------------------------------------------------------------
+ 
+ // DECISION (chapter 3.5): no source document defines this table. FR-WHK-01 and
+@@ -593,8 +601,9 @@ export const webhookDeadLetters = pgTable(
+ // `deliveredAt` is the honest column, and it exists in this chapter solely in
+ // order to be null. FR-WHK-07 asks for the endpoint to be disabled "and the
+ // organisation notified by email", and this platform has no email transport of
+-// any kind. Chapter 3.7 needs the same transport for quotas, so building one here
+-// would mean building it for its second consumer first.
++// any kind. A later chapter needs the same transport for quotas, so building one
++// here would mean building it for its second consumer first. (Named rather than
++// numbered: see the note on the dead-letter table above.)
+ //
+ // A schema that recorded only the disablement would let a future reader believe
+ // the requirement was finished. This one says, in a column, which half is
+```
+
+Điều đáng giữ lại là phân biệt giữa một **con dấu xuất xứ** và một **lời hứa về sau**.
+"Chương 3.7 thêm field này" đúng mãi mãi — các chương không đánh số lùi. "Chương 3.7
+sẽ dựng phương tiện gửi cho hạn mức" thì cũ đi ngay khoảnh khắc có gì đó được chèn
+vào trước nó, mà nó lại nằm trong một file được fence byte-exact vào một chương đã
+xuất bản, nên sửa nó tốn một lần tu chỉnh fence.
+
+Script walk cũng mang đúng lời hứa ấy:
+
+```diff title="scripts/webhook-walk.mjs"
+@@ -450,7 +450,7 @@ if (WATCH_DISABLE) {
+     console.log("  `delivered_at` is null and stays null. FR-WHK-07 asks for the");
+     console.log("  organisation to be notified BY EMAIL, and this platform has no email");
+     console.log("  transport of any kind. The row is the obligation; the null is the");
+-    console.log("  admission. Chapter 3.7 needs the same transport for quotas.\n");
++    console.log("  admission. A later chapter needs the same transport for quotas.\n");
+ 
+     // Running it again must change nothing. At most once per run, enforced by the
+     // `enabled = true` predicate in the update rather than by a check.
+```
+
+## Các bộ test giữ những gì
+
+Predicate và phép thu hẹp đều thuần, nên test của chúng không cần socket, không cần
+broker, không cần đồng hồ:
+
+```diff title="services/gateway/src/resume.test.ts"
+@@ -7,6 +7,8 @@ import {
+   highWaterMarks,
+   parseCursors,
+   scopeCursors,
++  scopeMarks,
++  suppressed,
+   withDeadline,
+ } from "./resume.js";
+ 
+@@ -134,3 +136,85 @@ describe("withDeadline", () => {
+     );
+   });
+ });
++
++// Chapter 3.7. `flushable` decides what a resuming connection may hand over from
++// its buffer; `suppressed` decides what a LIVE connection must still refuse. The
++// two comparisons are the same and the second one did not exist, which is the
++// whole of the defect.
++describe("suppressed", () => {
++  const at = (channel: string, seq: number): Message => ({
++    id: `id-${seq}`,
++    channel,
++    seq,
++    user: "dispatcher",
++    text: `m${seq}`,
++    created_at: "2026-08-19T00:00:00.000Z",
++  });
++
++  it("suppresses a frame at the mark", () => {
++    // `<=`, not `<`: the mark IS a sequence the backfill delivered.
++    expect(suppressed({ a: 42 }, at("a", 42))).toBe(true);
++  });
++
++  it("suppresses a frame below the mark", () => {
++    expect(suppressed({ a: 42 }, at("a", 7))).toBe(true);
++  });
++
++  it("delivers a frame above the mark", () => {
++    // The half that matters most: suppression must never become a gap.
++    expect(suppressed({ a: 42 }, at("a", 43))).toBe(false);
++  });
++
++  it("delivers on a channel with no mark", () => {
++    expect(suppressed({ a: 42 }, at("b", 1))).toBe(false);
++  });
++
++  it("suppresses nothing when the connection never resumed", () => {
++    expect(suppressed(null, at("a", 1))).toBe(false);
++  });
++
++  it("suppresses nothing when the mark set is empty", () => {
++    expect(suppressed({}, at("a", 1))).toBe(false);
++  });
++
++  it("keeps channels apart", () => {
++    // A mark on one channel must never silence another. Two connections' worth of
++    // confusion would look exactly like message loss.
++    const marks = { a: 42, b: 1 };
++    expect(suppressed(marks, at("a", 40))).toBe(true);
++    expect(suppressed(marks, at("b", 40))).toBe(false);
++  });
++});
++
++describe("scopeMarks", () => {
++  it("drops a channel the cursors never named", () => {
++    // `highWaterMarks` adds a key for every channel the BACKFILL answered with.
++    // The api derives its response from the cursors it was given, so this cannot
++    // happen today — and a bound this service claims should not depend on another
++    // service's response shape.
++    expect(scopeMarks({ a: 42, surprise: 9 }, { a: 41 })).toEqual({ a: 42 });
++  });
++
++  it("keeps every channel the cursors did name", () => {
++    expect(scopeMarks({ a: 42, b: 7 }, { a: 41, b: 1 })).toEqual({ a: 42, b: 7 });
++  });
++
++  it("never exceeds the cursor set, which the resume contract already caps", () => {
++    const cursors = Object.fromEntries(
++      Array.from({ length: 200 }, (_, i) => [`c${i}`, i]),
++    );
++    const marks = { ...cursors, extra: 1 };
++    expect(Object.keys(scopeMarks(marks, cursors))).toHaveLength(200);
++  });
++
++  it("keeps a cursor far above anything the channel holds", () => {
++    // A client-supplied cursor is checked only for being a non-negative integer.
++    // A nonsense value seeds a mark rather than being clamped, and that is the
++    // documented consequence rather than a defect: the client asserted it holds
++    // those sequences, and the backfill has always taken that at face value.
++    // The blast radius is one connection and reconnecting recovers it.
++    expect(scopeMarks({ a: 999_999_999 }, { a: 999_999_999 })).toEqual({
++      a: 999_999_999,
++    });
++  });
++});
+```
+
+Còn phần đấu dây — rằng `deliver()` có tra cứu các mark hay không — thì được giữ với
+một fabric giả lập:
+
+```diff title="services/gateway/src/session.test.ts"
+@@ -467,6 +467,73 @@ describe("the socket (chapter 2.5)", () => {
+     socket.close();
+   });
+ 
++  it("chapter 3.7: a frame at the mark, arriving after the resume, is not delivered", async () => {
++    // The same property `resume.itest.ts` proves against a real broker, held here
++    // against a stubbed one so it fails fast and without Redis. This is the wiring
++    // rather than the predicate: that `deliver()` consults the marks at all.
++    const fanout = stubFanout();
++    harness = await boot(
++      stubApi({
++        backfill: async () => ({
++          [CHANNEL]: { messages: [frame(42)], truncated: false },
++        }),
++      }),
++      undefined,
++      fanout,
++    );
++    const socket = new WebSocket(
++      `${harness.url}?token=${await token()}&cursor=${CHANNEL}:41`,
++    );
++    const frames = record(socket);
++    await nextFrame(socket, "connection.ack");
++    await settle();
++    // The resume is over. The fabric catches up with what the backfill sent.
++    fanout.emit(frame(42));
++    await settle();
++    expect(created(frames)).toEqual([42]);
++    socket.close();
++  });
++
++  it("chapter 3.7: a frame above the mark, arriving after the resume, IS delivered", async () => {
++    // The half that stops a duplicate fix becoming a gap (FR-RTM-03 is one
++    // property, not two: no gap AND no double).
++    const fanout = stubFanout();
++    harness = await boot(
++      stubApi({
++        backfill: async () => ({
++          [CHANNEL]: { messages: [frame(42)], truncated: false },
++        }),
++      }),
++      undefined,
++      fanout,
++    );
++    const socket = new WebSocket(
++      `${harness.url}?token=${await token()}&cursor=${CHANNEL}:41`,
++    );
++    const frames = record(socket);
++    await nextFrame(socket, "connection.ack");
++    await settle();
++    fanout.emit(frame(43));
++    await settle();
++    expect(created(frames)).toEqual([42, 43]);
++    socket.close();
++  });
++
++  it("chapter 3.7: a connection that never resumed suppresses nothing", async () => {
++    // A fresh connect presents no cursor, so it holds no marks and behaves
++    // exactly as chapter 2.6 left it.
++    const fanout = stubFanout();
++    harness = await boot(stubApi({}), undefined, fanout);
++    const socket = new WebSocket(`${harness.url}?token=${await token()}`);
++    const frames = record(socket);
++    await nextFrame(socket, "connection.ack");
++    await settle();
++    fanout.emit(frame(1));
++    await settle();
++    expect(created(frames)).toEqual([1]);
++    socket.close();
++  });
++
+   it("stages the other interleaving: published during backfill, absent from it", async () => {
+     // Same window, the other order: seq 43 committed AFTER the backfill
+     // query's snapshot, so it exists ONLY in the buffer. This is the
+```
+
+Cái chốt cóc nhích lên, và dừng lại trước 100 một cách có chủ ý:
+
+```diff title="vitest.coverage.config.mts"
+@@ -116,8 +116,18 @@ export default defineConfig({
+           lines: 100,
+           statements: 100,
+         },
++        // CHAPTER 3.7 RAISED THIS, 93 -> 95. The chapter added two pure functions
++        // to this file — the live-path suppression predicate and the scoping that
++        // bounds the marks — and both are fully covered.
++        //
++        // Not 100, and the missing branch is named rather than chased: it is
++        // `if (timer)` in chapter 2.7's `withDeadline`, whose falsy arm cannot be
++        // reached because a Promise executor runs synchronously and always assigns
++        // the timer before the `finally` can see it. Pinning 100 here would pin a
++        // number the file cannot reach without deleting a defensive check that
++        // costs nothing.
+         "services/gateway/src/resume.ts": {
+-          branches: 93,
++          branches: 95,
+           functions: 100,
+           lines: 100,
+           statements: 100,
+```
+
+## Loạt phá hoại
+
+Năm đột biến, mỗi đột biến áp vào code thật, mỗi đột biến được hoàn nguyên với file
+được kiểm chứng giống hệt đến từng byte:
+
+```console
+=============== mutation 1: never keep the marks after a successful resume
+  RESULT: caught  × suppresses a frame the backfill already delivered…
+=============== mutation 2: use < instead of <= in the predicate
+  RESULT: caught  × suppresses a frame the backfill already delivered…
+=============== mutation 3: suppress on any channel rather than the frame's own
+  RESULT: caught  × delivers on a channel with no mark
+                  × keeps channels apart
+=============== mutation 4: ignore the cursors when scoping the marks
+  RESULT: caught  × drops a channel the cursors never named
+=============== mutation 5: retire a mark once a higher sequence is delivered
+  RESULT: caught  × still suppresses when two instances publish out of order
+=============== files restored byte-identical?
+  YES
+```
+
+Hai trong năm đột biến ấy lần đầu viết ra đã không đúng, và cả hai lần sửa đều đáng
+giá hơn những lần đậu.
+
+**Đột biến thứ tư theo kế hoạch không thể trượt được.** Nó định là "giữ lại các mark
+qua một lần resume suy giảm". Đọc code trước khi chạy: mọi `return degrade(...)` đều
+xảy ra trước khi các mark được gán, nên trên mọi đường suy giảm chúng vẫn đang là
+`null` và lệnh xoá bên trong `degrade` chẳng đổi gì cả. Yêu cầu ấy được giữ *về mặt
+cấu trúc* — các mark chỉ được đặt trên đường thành công — chứ không phải vì dòng đó
+chạy. Dòng đó ở lại như một lớp canh; đột biến thì được thay bằng một đột biến tấn
+công phép thu hẹp.
+
+**Đột biến thứ năm sống sót, và lỗi nằm ở bài test.** Trường hợp sai-thứ-tự publish
+sequence 43 rồi 42 trên một mark bằng 43. Cả hai đều ở mức mark trở xuống, nên phép
+thu hồi mà đột biến thêm vào không bao giờ kích hoạt. Kịch bản cần một frame *trên*
+mark trước — 43 được giao, mark bị thu hồi, rồi 42 bị chậm được giao lần thứ hai.
+Bài test giờ dựng đúng cảnh ấy.
+
+<Why title="Một bài test mang tên một tính chất mà nó không hề chạm tới">
+
+Bài test ấy đáng lẽ đã đậu mãi mãi. Nó có cái tên đúng, nó nằm đúng file, nó cho hai
+gateway instance publish sai thứ tự — và nó chưa từng chạm vào cơ chế mà nó tồn tại
+để bảo vệ.
+
+Không gì ngoài một đột biến tìm ra được chuyện đó. Đọc thì không: cái tên mô tả ý
+định, còn các khẳng định thì nhất quán với ý định. Chạy thì không: nó đậu. Câu hỏi
+duy nhất tách một bài test thật khỏi một bài test trang trí là gỡ cơ chế đi thì nó
+có hỏng không.
+
+Quyết định thiết kế trung tâm của chương này là *không bao giờ thu hồi mark*. Trước
+loạt phá hoại, nó không có test nào đứng sau.
+
+</Why>
+
+<Checkpoint>
+
+Cả hai lane và cổng coverage:
+
+```console
+$ pnpm test && pnpm test:integration && pnpm coverage
+ Tests  198 passed (198)
+ Tests  191 passed (191)
+ Tests  380 passed (380)
+```
+
+Một client kết nối lại không còn bị trưng ra một message nó đã có, dù fabric bắt kịp
+trong lúc resume hay sau đó. Cái mark làm nên điều ấy là một số nguyên cho mỗi
+channel, giữ suốt đời một socket, và không bao giờ bị thu hồi — bởi vì hai gateway
+instance publish mà không phối hợp có thể giao một sequence cao hơn trước một
+sequence thấp hơn, và một cửa sổ đóng lại khi thấy số cao hơn là một cửa sổ chưa bao
+giờ đóng.
+
+FR-RTM-03 giờ đã đúng. Suốt bốn chương nó đã không đúng, trong chính chương mà loạt
+bài này gọi là con bug chủ lực của mình.
+
+</Checkpoint>
+
+<ChapterFooter id="3.7" locale="vi" />
