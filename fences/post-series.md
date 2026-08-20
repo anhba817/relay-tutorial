@@ -669,3 +669,64 @@ parallel lane. 3.7 is about the resume duplicate.
  
    it("refuses a callback whose state does not match the cookie (invariant 5, over HTTP)", async () => {
 ```
+
+---
+
+## `services/dispatcher/src/dispatcher.itest.ts` — the sixth global drain (chapter 3.8 baseline)
+
+Chapter 3.7's baseline found four tests asserting a local fact about a global
+operation, and fixed `drainDueDeliveries` in `deliveries.itest.ts` twice: an
+explicit limit for the sweep, and a settle loop for the drain. It never looked at
+the dispatcher's suite, which reaches the same global drain through a different
+door.
+
+`publishDue()` builds a delivery relay and calls `drainOnce()` with no batch size,
+so it takes `BATCH_SIZE = 50` — the fifty oldest due deliveries in the platform,
+oldest first. This suite's own delivery is the newest. Once more than fifty
+accumulate from earlier suites the batch fills before reaching it, `pollUntil`
+times out at eight seconds, and the reader sees:
+
+```text
+FAIL  dispatcher.itest.ts > the dispatcher >
+      invariant 7: delivers an event the endpoint subscribes to
+AssertionError: expected 0 to be greater than 0
+```
+
+**Only in the coverage lane.** `vitest.coverage.config.mts` sets
+`fileParallelism: false` — every suite in one process against one database — so
+the dispatcher runs after everything else has filled the queue. The integration
+lane runs packages separately and starts clean: three integration runs found
+nothing, one coverage run in two did.
+
+**And it reads as a flake because the failing run drains the backlog itself**, so
+the next one passes. It returns whenever the queue rebuilds past fifty.
+
+**No chapter owns this.** 3.5 fenced the file and teaches the dispatcher, not the
+batch size of a test helper's drain call. 3.8 is about rate limiting and never
+mentions webhook delivery.
+
+```diff title="services/dispatcher/src/dispatcher.itest.ts"
+@@ -264,6 +264,22 @@ describe("the dispatcher", () => {
+         ensure: relay.ensureDeliveriesStream,
+       }),
+       logger: kit.createLogger("itest-relay"),
++      // A BATCH BIG ENOUGH TO REACH THIS TEST'S OWN DELIVERY. `drainOnce` is
++      // global: it takes the fifty oldest due deliveries in the platform,
++      // oldest first, and this suite's is the newest. Every earlier suite in the
++      // run leaves due deliveries behind, so once more than fifty of them
++      // accumulate the batch fills before reaching ours, the poll times out at
++      // eight seconds, and `expected 0 to be greater than 0` is what a reader
++      // sees.
++      //
++      // It only bites in the COVERAGE lane, where `fileParallelism: false` puts
++      // every suite in one process against one database. The failing run drains
++      // the backlog itself, so the next run passes — which is why it reads as a
++      // flake rather than as the threshold it is.
++      //
++      // Found at chapter 3.8's baseline. Chapter 3.7 fixed the same global drain
++      // in `deliveries.itest.ts` twice and never looked at this door.
++      batchSize: 10_000,
+     });
+     return r.drainOnce();
+   };
+```
