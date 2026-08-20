@@ -1,0 +1,3372 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figTwoDirections, figTwoPositions, figBoundaryBurst, figOutboxThrice } from "./figures";
+
+export const metadata = {
+  title: "Limits you can see coming — Building Relay",
+  description:
+    "A rate limiter is easy. Two of them, failing in opposite directions on purpose, is the chapter. Redis is not a source of truth — so the tenant limiter serves when it is gone, and the auth limiter must not.",
+  alternates: {
+    canonical: "/part-3/chapter-08/limits-you-can-see-coming",
+    languages: {
+      en: "/part-3/chapter-08/limits-you-can-see-coming",
+    },
+  },
+};
+
+<ChapterHeader id="3.8" />
+
+Chapter 1.3 wrote down a word the platform has never said.
+
+```ts title="packages/protocol/src/codes.ts (excerpt)"
+rate_limited: "too many requests",
+```
+
+Exported, typed, and emitted by nothing for seventeen chapters. So is close code
+`4008`, "quota exhausted", and `4009`, "server shutdown (drain)". So, differently,
+is the fourth field of the error envelope constitution V has required since 1.3 —
+`request_id`, above a comment promising it *"joins in Part 2, when a gateway
+exists to mint one"*. A gateway arrived in 1.4 and minted nothing.
+
+This chapter enforces two of the four, explains why the third stays unused on
+purpose, and says what the fourth is waiting for.
+
+The limiter itself is easy. Two of them, failing in opposite directions
+deliberately, is the chapter.
+
+<SkipAhead>
+
+If you must skip: per-environment fixed-window counters in Redis, keyed
+`rl:{env}:{op}:{window}`, incremented with `INCR` and expired with `PEXPIRE` — no
+Lua, because there is nothing to make atomic that `INCR` does not already make
+atomic. Three headers on **every** 2xx as well as every 429, which is the
+requirement an afterthought fails. Policy is three nullable columns on
+`environments`; null means "use the default" and is **not** zero, because
+refuse-everything has to stay expressible. The tenant limiter **fails open** when
+Redis is gone, and the failed-authentication limiter **must not** — it degrades
+to an in-process counter at the same threshold instead. The gateway holds its own
+counter and its own client, and still has no database. The second half of the
+chapter builds the email transport chapter 3.6 deferred, which is the outbox
+pattern for the third time. The chapter-end state is tag **`part3-ch8`**.
+
+</SkipAhead>
+
+## The requirement an afterthought fails
+
+Here is FR-RTL-02, and it is worth reading twice:
+
+> Every response — 2xx as well as 429 — carries `X-RateLimit-Limit`,
+> `X-RateLimit-Remaining` and `X-RateLimit-Reset`.
+
+The 429 half is what everybody builds. The 2xx half is the requirement. A client
+that only learns its allowance at the moment it runs out has learned it too late:
+it can back off, but it could not have paced itself. The journey map says the same
+thing from the developer's side, in the Test phase, as a complaint about somebody
+else's API:
+
+> rate limits that return `429` with no headers indicating remaining quota or
+> reset time
+
+That is FR-RTL-02 written by the person it happens to. A limiter bolted onto a
+finished service sets headers where the refusal is written, because that is the
+branch that knows about limits. Putting them on the success path means it runs on
+**every** request and writes to responses it is not refusing — a different design,
+decided before the code rather than after.
+
+## Why the window is fixed
+
+The obvious alternative is a token bucket, and it is the better algorithm on
+almost every axis: it smooths bursts, it has no boundary, and it is what you
+would reach for if the only requirement were "limit the rate".
+
+<Figure caption="The fixed window's cost, and what it buys." chart={figBoundaryBurst} />
+
+A fixed window can be spent twice at a boundary: 600 requests in the last second
+of one minute and 600 in the first second of the next is 1,200 in two seconds
+against a limit of 600 per minute. That is real and no amount of comment fixes it.
+
+It is the price of `X-RateLimit-Reset`.
+
+<Why title="A refilling bucket cannot answer the question the header asks">
+
+`Reset` names **one moment**: the instant the allowance returns. A fixed window
+has one, and every response inside it reports the same value — which is why the
+three responses below all say `1787197740`.
+
+A token bucket has no such moment. Its allowance returns continuously, so the
+honest answer to "when may I retry" is a slope: one slot in 0.1 seconds, ten in
+one second, six hundred in sixty. Pick a point on that curve and call it `Reset`
+and you have invented a number the algorithm does not have, told to a client that
+will trust it.
+
+Relay's promise here is a header, not a shaping guarantee. So: fixed window, the
+boundary burst named rather than hidden, and a `Reset` that means what it says.
+
+</Why>
+
+Because the window is fixed, the counter is two Redis commands and no Lua:
+
+```ts title="services/api/src/limits/store.ts (excerpt)"
+const count = await redis.incr(key);
+if (count === 1) await redis.pexpire(key, windowMs);
+```
+
+There is nothing here to make atomic. `INCR` is atomic and returns the new value,
+so the read and the write are one operation. `PEXPIRE` is guarded on
+`count === 1` because only the request that created the key sets its lifetime. A
+Lua script here would satisfy a habit rather than a race.
+
+## The arithmetic, and where it lives
+
+Three functions, no store, no clock:
+
+```ts title="services/api/src/limits/bucket.ts"
+// The fixed-window arithmetic (chapter 3.8, research R1).
+//
+// FIXED WINDOW, NOT A TOKEN BUCKET, and the SAD's own row is why the question
+// arose: §6.3 lists `rl:{env}:{bucket}` as "Token buckets" with a TTL of
+// "window", which are two different algorithms. The TTL column wins, for three
+// reasons in order of weight.
+//
+// `X-RateLimit-Reset` decides it. The header names the moment an allowance
+// returns, and a fixed window has exactly one. A continuously refilling bucket
+// does not — the honest answer to "when do I have my full allowance back" is a
+// curve, and the header is an integer. A limiter whose reset header is a lie
+// fails FR-RTL-02 in the way that matters, because that requirement exists so a
+// client can schedule against it.
+//
+// Then atomicity: `INCR` returns the new value on its own and `EXPIRE` on the
+// first increment gives the window. Two commands, no Lua, no read-modify-write
+// race between api instances.
+//
+// Then cleanup: the key expires when its window ends, so nothing accumulates.
+// That matters more than it sounds — chapter 3.7 spent a baseline on four suites
+// that broke because a shared store grew without bound, and this chapter's own
+// baseline found a fifth.
+//
+// THE COST, stated rather than hidden: up to twice the limit across a boundary.
+// 600 in the last instant of one window and 600 in the first instant of the next
+// is 1,200 inside two minutes. The limit bounds sustained load; it does not
+// smooth instantaneous rate. `bucket.test.ts` asserts it so the claim is checked
+// rather than merely written down.
+//
+// Everything here is pure and takes the instant it should reason about. Nothing
+// reads a clock, so a boundary is a test rather than a wait.
+
+/** The window an instant belongs to, floored — and the key's own suffix.
+ *
+ * Two api instances compute this from the same wall clock and agree without
+ * talking to each other, which is what closes the clock-skew case by
+ * construction. A stored reset time would be a value they could disagree about,
+ * and `Retry-After` is exactly where that disagreement would surface. */
+export function windowStart(nowMs: number, windowMs: number): number {
+  return Math.floor(nowMs / windowMs) * windowMs;
+}
+
+/** When the allowance returns: the end of the current window, in milliseconds.
+ *
+ * One moment, which is the whole argument for this algorithm over a bucket that
+ * refills. Never in the past — the window an instant belongs to always ends
+ * after it. */
+export function resetAt(nowMs: number, windowMs: number): number {
+  return windowStart(nowMs, windowMs) + windowMs;
+}
+
+/** How many operations are left, after counting the one in hand.
+ *
+ * Clamped at zero. A limit lowered while a window is open — an operator dropping
+ * an environment from 600 to 2 with forty already counted — would otherwise
+ * produce `-38`, and a client would parse that as a number and act on it. Zero
+ * is both true and safe. */
+export function remaining(count: number, limit: number): number {
+  return Math.max(0, limit - count);
+}
+```
+
+
+`windowStart` floors, which is what lets two api instances and a gateway agree on
+which bucket they are incrementing without exchanging a word. Nobody coordinates;
+they all divide the same clock the same way.
+
+Being pure, a window boundary is `windowStart(59_999, 60_000) === 0` asserted
+rather than slept through.
+
+## Policy: three columns, and null is not zero
+
+```sql title="services/api/migrations/0008_limit_policy.sql"
+-- Chapter 3.8 — per-environment rate limit policy (FR-RTL-04, FR-007).
+--
+-- NULLABLE, AND NULL IS NOT ZERO. A null column means "no override, use the
+-- documented default", resolved at read time. A zero means "refuse everything",
+-- which has to stay expressible — an environment can be switched off
+-- deliberately — so the absent state and the refuse-everything state cannot
+-- share a representation.
+--
+-- ON `environments` RATHER THAN IN A TABLE OF ITS OWN. FR-RTL-04's independence
+-- is per environment, there is exactly one row per environment with no history
+-- and no versioning, and a separate table would be a join for a value read on
+-- every request.
+--
+-- The shape has a slot for an environment and NONE FOR A ROUTE, which forecloses
+-- SRS Appendix C question 5 — whether the dev-token endpoint should be limited
+-- more aggressively than the rest of its environment. That question stays open
+-- and this is why (research R30).
+
+ALTER TABLE environments
+  ADD COLUMN rest_limit_per_minute    integer,
+  ADD COLUMN send_limit_per_minute    integer,
+  ADD COLUMN connect_limit_per_minute integer;
+
+ALTER TABLE environments
+  ADD CONSTRAINT environments_rest_limit_non_negative
+    CHECK (rest_limit_per_minute IS NULL OR rest_limit_per_minute >= 0),
+  ADD CONSTRAINT environments_send_limit_non_negative
+    CHECK (send_limit_per_minute IS NULL OR send_limit_per_minute >= 0),
+  ADD CONSTRAINT environments_connect_limit_non_negative
+    CHECK (connect_limit_per_minute IS NULL OR connect_limit_per_minute >= 0);
+```
+
+
+Nullable, all three, and the nullability is the decision.
+
+<Why title="Null means use the default; zero means refuse everything">
+
+The tempting shape is `NOT NULL DEFAULT 600`, which is tidier and has one fewer
+state. It also makes "refuse everything" unrepresentable: zero becomes
+indistinguishable from an environment nobody configured, and switching one off
+deliberately — for an abusive tenant or a compromised key — is a thing an
+operator needs.
+
+So three states: null is "whatever the default is today", a number is that
+number, and zero is zero. The default resolves in the repository rather than at
+the call site, because "null means the default" is a property of the column and a
+caller who had to remember it would forget.
+
+</Why>
+
+`environments` already had a column that looked right for this, and it was
+deliberately not used:
+
+```ts title="services/api/src/db/schema.ts (excerpt)"
+quotaConfig: jsonb("quota_config").notNull().default({}),
+```
+
+Declared in 2.1, named in SRS §6.1, empty for seventeen chapters — and named for
+**quotas**. A rate limit and a quota are different promises: one is ephemeral and
+may be lost, the other is money and must be durable. Putting one into a field
+named for the other would collapse in the schema exactly what this chapter spends
+its length drawing.
+
+## Where the defaults came from
+
+Four numbers, and each was derived rather than chosen:
+
+| Operation | Default | Derived from |
+|---|---|---|
+| REST requests | 600/min | NFR-PRF-01's P95 budget at a sustainable rate |
+| Message sends | 600/min | the same, and deliberately equal |
+| Connections | 3,000/min | NFR-SCL-01's 10,000 per gateway instance |
+| Failed authentications | 10/min/IP | slow enough to stop a sweep, fast enough not to lock out a typo |
+
+The connect limit was originally 60/min, and wrong by a factor of fifty.
+NFR-SCL-01 is a P1 requirement for ten thousand connections per gateway instance;
+at 60 a minute that takes **167 minutes**. A limit that makes a P1 capacity
+requirement unreachable in under three hours is a bug with a policy column.
+
+<Trap title="Even at 3,000, one promise only half holds">
+
+NFR-REL-03 asks that clients reconnect after a gateway restart. At 3,000 a
+minute, a ten-thousand-connection environment takes over three minutes to come
+back — and that is the *good* case, where it fits on one instance. Spread across
+instances, the shared counter refuses reconnections from all of them at once.
+
+The proper answer is a drain grace period, and close code **`4009`** exists for
+exactly it — "server shutdown (drain)", emitted by nothing, because no drain
+exists to emit it. FR-045 leaves the exemption to whichever chapter builds one.
+
+Named rather than fixed. A chapter that quietly shipped a limit conflicting with
+a reliability requirement would be worse than one that says where the conflict
+is.
+
+</Trap>
+
+## Two positions in the chain, both forced
+
+<Figure caption="The middleware chain, and why each limiter sits where it does." chart={figTwoPositions} />
+
+The tenant limiter runs **after** `AuthenticateMiddleware` and has no choice: the
+limit belongs to an environment, and nothing knows which one until the credential
+is resolved. The failed-authentication counter runs **inside** it, and has no
+choice either: it counts the case where there is no principal, so it cannot run
+anywhere that assumes one.
+
+```ts title="services/api/src/auth/authenticate.middleware.ts (excerpt)"
+const address = clientAddress(req);
+if (await this.authLimiter.isOverThreshold(address)) {
+  req[OVER_AUTH_THRESHOLD] = true;
+}
+const principal = await resolvePrincipal(this.db, credential);
+if (principal !== null) {
+  req.principal = principal;
+} else {
+  await this.authLimiter.recordFailure(address);
+}
+```
+
+The failure is *observed* here and *refused* elsewhere: this middleware has never
+thrown, since chapter 3.2, so it sets a flag and `CredentialGuard` raises the 429
+from it.
+
+<Trap title="`req.url` is `/`, and the request log has said so since chapter 2.2">
+
+The first version of the limiter counted nothing. Express rewrites `req.url`
+relative to the mount point, so inside a middleware mounted at the app root it
+reads `/` for every request in the system, and `operationsFor("POST", "/")`
+returns `[]`.
+
+The full path is `req.originalUrl`. Fixing the limiter turned up the same bug one
+file over, in code nobody had suspected:
+
+```ts title="services/api/src/request-context.middleware.ts (excerpt)"
+path: req.originalUrl,   // was: req.url
+```
+
+Every structured log line this platform has emitted since chapter 2.2 recorded
+`path: "/"`. Nothing failed and no test noticed. A bug in an observability field
+is invisible by construction: the thing that would tell you is the thing that is
+broken.
+
+</Trap>
+
+## What gets counted, and what does not
+
+```ts title="services/api/src/limits/rate-limit.middleware.ts (excerpt)"
+export function operationsFor(method: string, path: string): LimitedOperation[] {
+  if (!path.startsWith(PUBLIC_PREFIX)) return [];
+  if (method === "POST" && SEND_PATH.test(path)) return ["rest", "send"];
+  return ["rest"];
+}
+```
+
+A message send costs **two** budgets, one request and one message. Everything else
+under `/v1/` costs one request, and anything outside it costs nothing — `/healthz`,
+the gateway's internal seam, the dispatcher's outcome reporting.
+
+<Why title="The internal seam cannot be exempted by looking at the principal">
+
+The obvious exemption is "don't limit the platform's own credential", and it does
+not work. Chapter 3.2 decided the gateway forwards the **end user's** token rather
+than asserting an identity of its own, so its internal calls resolve to
+`kind: "user"` and are indistinguishable from customer traffic at the principal.
+Exempt only the platform credential and an environment at its REST limit loses its
+sockets, for a budget a socket never spends. The exemption has to key off the
+**path**.
+
+The dispatcher is exempt twice over: by path, and by having no environment to key
+on. That redundancy is not design; it fell out of the two rules, and the sabotage
+battery is what made it visible. Removing the path rule left the dispatcher
+working and broke the gateway — which is the clearest possible statement of which
+exemption is load-bearing for which caller.
+
+</Why>
+
+Throttling the dispatcher would turn one customer's webhook backlog into a stall
+for every customer, which FR-WHK-05 forbids in as many words.
+
+## The two directions
+
+Here is the chapter.
+
+<Figure caption="One outage, two limiters, two opposite answers — and both are right." chart={figTwoDirections} />
+
+Redis goes away. The tenant limiter cannot count, so it **serves the request**:
+
+```
+$ POST /v1/channels/{id}/messages   # 1 of 4, limit is 2
+HTTP 201
+x-ratelimit-limit: 2
+x-ratelimit-remaining: (absent)
+x-ratelimit-reset: (absent)
+
+$ POST /v1/channels/{id}/messages   # 4 of 4, limit is 2
+HTTP 201
+x-ratelimit-limit: 2
+x-ratelimit-remaining: (absent)
+x-ratelimit-reset: (absent)
+```
+
+Four requests against a limit of two, all served. SAD §6.3 says Redis is not a
+source of truth, and refusing everything because the counter is unavailable turns
+a cache outage into a platform outage — a much larger failure than the one it
+prevents.
+
+Notice which headers survive. `Limit` stays: it is policy read from Postgres and
+is not degraded. `Remaining` and `Reset` vanish, because they existed only as long
+as something was counting. Absent is the honest answer; `-1` is a sentinel a
+client that does not know the convention parses as a number and reads as "over
+your limit".
+
+Now the same outage, the same process, the same instant, against the
+failed-authentication limiter:
+
+```
+$ POST /auth/dev-token   # bad credential 1 of 5, threshold is 3
+HTTP 401
+$ POST /auth/dev-token   # bad credential 2 of 5, threshold is 3
+HTTP 401
+$ POST /auth/dev-token   # bad credential 3 of 5, threshold is 3
+HTTP 401
+$ POST /auth/dev-token   # bad credential 4 of 5, threshold is 3
+HTTP 429
+$ POST /auth/dev-token   # bad credential 5 of 5, threshold is 3
+HTTP 429
+```
+
+Refused. Run the tenant limiter's reasoning here and it gives the wrong answer: an
+unlimited window on failed logins is not a degradation, it is a hole, and an
+attacker who waits for a cache outage gets an unthrottled password sweep.
+
+<Why title="Failing closed is not the answer either">
+
+The instinct is to invert the rule: if failing open is wrong, fail closed. That
+turns a Redis restart into an authentication outage for every customer, including
+the ones nobody is attacking — preventing a rare failure by guaranteeing a common
+one.
+
+The third answer is an in-process counter at the same threshold. The guarantee
+weakens from *N per window across the fleet* to *N per window per instance* — a
+small multiple rather than infinity — and the platform keeps authenticating.
+
+The map is **bounded**, because it is keyed by attacker-controlled input and an
+unbounded one would close a brute-force hole by opening a memory-exhaustion hole.
+At the cap it **stops admitting new keys** rather than evicting old ones, because
+eviction is what an attacker drives: flood ten thousand fresh addresses and every
+tracked attacker falls out of the map. A key it could not admit is reported as
+unknown, and unknown is refused.
+
+</Why>
+
+One line in the log, rate-limited to one per ten seconds, because a Redis outage
+under load would otherwise emit one per attempt and turn one outage into two:
+
+```json
+{"time":"2026-08-20T03:48:30.986Z","level":"error","service":"api",
+ "msg":"limits.auth_degraded",
+ "detail":"counter store unreachable; counting failed authentications in process",
+ "tracked":0}
+```
+
+No credential and no address, per NFR-SEC-06. `tracked` is how many addresses the
+fallback holds, which is what tells an operator whether the cap is close.
+
+## Whose failure was that?
+
+The counter is keyed by the **client's** address, not the caller's, and getting it
+wrong is a hole rather than an inconvenience. A handshake authenticated through
+the gateway reaches the api *from the gateway*; key on the caller and every
+customer's failures land in one bucket, so one attacker exhausts a threshold that
+then refuses everybody — a denial of service with a rate limiter for a weapon.
+
+## The gateway: two limits, two shapes of refusal
+
+The socket has an establishment limit and a send limit, and its two refusals do
+not look alike. An over-limit **handshake** gets an HTTP 429, written onto the raw
+upgrade socket before `wss.handleUpgrade` is ever called:
+
+```ts title="services/gateway/src/session.ts (excerpt)"
+if (decision.over) {
+  refuseUpgrade(socket, decision);   // 429 · Retry-After · the three headers
+  return;
+}
+wss.handleUpgrade(req, socket, head, (ws) => { … });
+```
+
+An over-limit **frame** gets an `error` frame, and the connection stays open.
+
+<Why title="A refusal has to say when to come back, and a close frame has nowhere to put it">
+
+`Retry-After` is an HTTP header. A close frame carries a code and a short reason
+string, and "4008, try later" is not something a client can schedule against. So
+the handshake refusal happens while there is still an HTTP response to write
+headers onto.
+
+That is deliberately unlike the 4001 path immediately below it, which
+**completes** the handshake in order to close it, because EIR-WS-05 asks for a
+close code on a bad token and a close code needs a socket to arrive on. Two
+refusals, two shapes, each because of what it has to carry.
+
+The frame refusal keeps the connection open for a reason worth stating: closing it
+would make the client reconnect, a reconnect costs a handshake, and a handshake
+spends the **establishment** allowance. A limiter that closed the socket would be
+punishing the limited into hitting a second limit.
+
+</Why>
+
+## One request, two opposite kinds of trust
+
+The gateway is exempt from the tenant limiter — its internal calls cost the
+customer nothing — and simultaneously not trusted to say who caused a failed
+login. One request, both judgements.
+
+That reads like an inconsistency and is not. *"Should this call count against a
+customer's budget?"* is about **whose work** it is, and the gateway's work is the
+customer's own socket traffic, already counted at the frame. *"Whose failure was
+that?"* is about **where a credential came from**, and the gateway relays that
+credential rather than originating it. Trusting a service to be infrastructure is
+not the same as trusting it to be an origin.
+
+The other thing the gateway cannot do is read a database. ADR-05 forbids it, and
+chapter 3.2 already paid a round trip rather than ship every environment's signing
+secret to a service holding no tenant state. So the limits ride the authentication
+response the gateway was already making:
+
+```ts title="packages/protocol/src/internal.ts (excerpt)"
+limits: z.strictObject({
+  connect: z.number().int().nonnegative(),
+  send: z.number().int().nonnegative(),
+}),
+```
+
+<Trap title="A socket's limit is fixed for its lifetime, and that is a stated property">
+
+The limits are cached on the `Connection` when it opens, beside the marks chapter
+3.7 put there. A policy changed while a socket is open does **not** reach it until
+the client reconnects. The alternative is a Postgres read per frame, from a service
+that holds no database client, on the hot path of the thing the limit protects.
+
+Asserted rather than assumed: a test opens a socket, sets the environment's send
+limit to zero, sends a frame and expects an **ack** — then opens a second socket
+and expects `rate_limited`. A consequence somebody accepted is worth a test;
+otherwise it is a surprise waiting for a support ticket.
+
+</Trap>
+
+Adding one required field to that schema broke seven hand-written fixtures, all
+found by the compiler before a test ran. Making it optional with a default would
+have broken nothing — and every one of those seven would then have silently
+exercised the default path, including the two tests whose entire subject is a
+**configured** limit.
+
+## Two services, one counter
+
+A socket send and a REST send spend the same budget — a client that could double
+its allowance by opening a WebSocket has no allowance — which is why the counter
+lives in Redis rather than in either process. Neither can see the other's memory.
+
+The gateway therefore holds its own Redis client, forced rather than preferred.
+`Fanout` is a closed interface exposing neither of the two clients it holds; one
+of them is a **subscriber**, and a connection in subscribe mode cannot run `INCR`;
+and `fanout` is optional in the session server, so a limiter riding its lifecycle
+would vanish in every configuration with no fabric.
+
+One integration test carries the claim, and it is the only one in the chapter that
+cannot be made cheaper: a real api child process, a real gateway, a real Redis.
+Five sends over REST and five `message.send` frames leave the shared `send` bucket
+at **10** and `rest` at **5**. Two separate counters read 5 and 5 and pass every
+other test in the suite.
+
+<Trap title="There is no batch send, and that is why FR-008 was rewritten">
+
+An earlier draft justified two budgets by imagining a request carrying several
+messages. There is no such endpoint: `sendMessageBodySchema` and
+`messageSendSchema` each carry one `text`.
+
+So on **one** transport alone the two counters move together, and a limiter
+counting requests is indistinguishable from one counting messages. The test that
+can tell them apart is the cross-transport one above, where five frames move
+`send` and leave `rest` untouched.
+
+</Trap>
+
+## Why 4008 stays unused
+
+`4008` reads "quota exhausted". There is no quota yet.
+
+Reaching for it because it was declared would collapse the distinction this
+chapter is built on. A rate limit says *slow down, come back in forty seconds,
+nothing is wrong*. A quota says *you have used what you bought*. They fail in
+different directions, and one belongs in Redis while the other cannot.
+
+So there is a test asserting nothing in the gateway sends it:
+
+```ts title="services/gateway/src/session.test.ts (excerpt)"
+for (const text of source) {
+  expect(text).not.toMatch(/close\(\s*400[89]/);
+}
+expect(source.join("")).toMatch(/close\(\s*400[12]/);
+```
+
+The second line is the important one. A claim about **absence** cannot be
+demonstrated by any input — there is no frame you can send to observe a code that
+is never sent — so the check reads the source. But a regex aimed at a code nobody
+sends passes whether or not the regex is correct. Running the same pattern against
+the codes the gateway *does* send is what makes the negative assertion worth
+anything.
+
+## The fourth field
+
+`request_id` is now on every error the platform emits — the REST envelope, the
+socket's `error` frame, the framework's error filter. Not just the 429.
+
+It broke four tenant-isolation tests, and they were right to break. Each compared
+two error bodies for equality:
+
+```ts
+expect(await foreign.json()).toEqual(await missing.json());
+```
+
+The property is real: a credential for the wrong environment and one for a
+nonexistent resource must be **indistinguishable**, or the error becomes an oracle
+that enumerates what exists. A per-request id makes the bodies differ in a field
+carrying no information about either, so the tests now strip it and compare the
+rest — a more precise statement of what they always meant.
+
+## A limit a developer is meant to hit
+
+The journey map's Test phase has the developer driving a rate limit **on purpose**,
+to see what her client library does with a 429. She is the one user in the map who
+reaches 600 a minute deliberately.
+
+Which is why FR-046 says a development environment's limits are meant to be
+raised. The columns are per environment, so raising one for load testing does not
+move production's ceiling — and a shared policy would mean exactly that.
+
+<Trap title="The test named after tenant isolation was not the one testing it">
+
+The sabotage battery included a mutation that makes every environment share one
+counter — a cross-tenant fault of precisely the kind constitution I exists to
+prevent. Three tests failed. The one called *"an override applies to ONE
+environment, not to every environment"* was **not** among them.
+
+It seeds two environments, gives one a low limit, and checks the low one is
+refused first. With a shared counter it still is — the lower limit reaches its
+number first, whoever is spending. The test asserts a consequence that survives
+the fault it is named after.
+
+What caught it gives the two environments **different** configured limits and
+checks each is enforced at its own number, which a shared counter cannot fake. A
+test named after a property is not evidence the property is tested.
+
+</Trap>
+
+## What the capture found that the tests did not
+
+The chapter captures its transcripts rather than describing them. The first
+capture of a 429 printed this:
+
+```
+HTTP 429
+x-ratelimit-limit: 3
+retry-after: 22
+{"code":"rate_limited","message":"too many messages for this environment; …"}
+```
+
+`Limit: 3` above "too many messages", on an environment whose send limit is 2.
+
+Both budgets reach zero remaining on that request while only one is over: with
+`rest` at 3 and `send` at 2, the third send leaves rest at 3 of 3 — spent, not
+over — and send at 3 of 2, which is. The headers describe whichever has fewest
+remaining, the tie goes to the first, and the first is `rest`. So the body named
+the budget that refused and the headers named the other one. A client reads
+`Limit: 3`, paces itself at three a minute, and is refused at two.
+
+The fix is one line: a refusal describes the budget that refused, and "fewest
+remaining" governs only responses being served. Eighteen integration tests covered
+that middleware and none caught it, because each asserted one field and nobody had
+looked at a whole response.
+
+Corrected:
+
+```
+$ POST /v1/channels/{id}/messages   # the first send
+HTTP 201
+x-ratelimit-limit: 2
+x-ratelimit-remaining: 1
+x-ratelimit-reset: 1787197740
+
+$ POST /v1/channels/{id}/messages   # the second
+HTTP 201
+x-ratelimit-limit: 2
+x-ratelimit-remaining: 0
+x-ratelimit-reset: 1787197740
+
+$ POST /v1/channels/{id}/messages   # over the send limit
+HTTP 429
+x-ratelimit-limit: 2
+x-ratelimit-remaining: 0
+x-ratelimit-reset: 1787197740
+retry-after: 51
+{
+  "code": "rate_limited",
+  "message": "too many messages for this environment; retry after 51 seconds",
+  "docs_url": "https://relay.example/docs/errors/rate_limited",
+  "request_id": "67219aad-436e-434c-8da2-a6a8c9a16754"
+}
+```
+
+`x-ratelimit-reset` is the same value on all three, which is the fixed window
+being a fixed window. And the body has four fields, which it has not had before
+this chapter.
+
+## What this chapter changed outside the code
+
+Three things, each of which a chapter is obliged to say out loud.
+
+### It amended the SRS
+
+EIR-API-04 documented an error body nested under an `error` key:
+
+```json
+{ "error": { "code": "…", "message": "…", "docs_url": "…" } }
+```
+
+The platform has never emitted that. Every error since chapter 1.3 has been flat,
+constitution V's envelope is flat, and the fence chain has been replaying flat
+error bodies into published chapters ever since.
+
+Two documents disagreed and one was wrong. Wrapping every error response to match
+the SRS is a breaking change to a public contract — which CON-05 makes a
+versioning event — for a shape nobody has ever received. So the document was
+brought to the code: `docs/04-srs.md` revision **1.3** records five top-level
+fields and unwraps the example. A chapter that changes a source requirement says
+so, which is the discipline the fence chain enforces for code applied to the
+documents the code is built from.
+
+### It completes SRS Phase 2's requirement set
+
+§7.3 lists Phase 2 as FR-TEN, FR-AUT, FR-WHK and FR-RTL at P2, and FR-RTL-01…04
+is the last of the four. The phase's **exit criterion** is a different thing and
+belongs to the isolation gauntlet: *"an external developer integrates using only
+public documentation, with no assistance."* Requirements complete here; the phase
+exits when somebody outside this repository can use what they describe.
+
+### `docs_url` is still a placeholder, and that now costs something
+
+Every error carries a `docs_url` pointing at
+`https://relay.example/docs/errors/{code}`, which does not exist.
+
+Harmless since chapter 1.3, because the codes it named were ones a developer meets
+while doing something wrong. `rate_limited` is different: it is the first error a
+working integration receives **routinely**, at the moment its author wants to look
+something up.
+
+The timing is pointed. This chapter closes the requirement set for a phase that
+exits on integration from public documentation alone, while shipping the error
+code most likely to send someone looking for documentation that is not there.
+Constitution V requires every code to have a reachable page; none does. A docs
+site is not this chapter's to build, but a URL implying otherwise is worse than an
+absent one.
+
+<ForwardRef>
+
+SRS Appendix C question 5 asks: *"Should the dev-mode token endpoint be rate
+limited more aggressively?"* The SRS lists it as blocking FR-AUT-12, and this
+chapter does not answer it.
+
+What changed: the route had no limit and now carries its environment's REST limit,
+plus the failed-authentication counter on the credential it rejects.
+
+What did not: the policy is three columns on `environments`, so it has a slot for
+an environment and **none for a route**. "More aggressive on this one endpoint" is
+not expressible in the shape this chapter chose.
+
+The shape is still right — FR-RTL-04's isolation is per environment, and a
+per-route table would be a join on every request. But nobody noticed, while
+choosing it, that it closed off an open question the SRS had already written down.
+Recorded so the next chapter to touch policy starts from the constraint rather
+than rediscovering it.
+
+</ForwardRef>
+
+## The chapter in full
+
+Everything above, as the repository holds it.
+
+### The counters themselves
+
+Four files with no framework in them, and one migration. `bucket.ts` and the
+migration are above; these are the rest.
+
+```ts title="services/api/src/limits/policy.ts"
+// The limit policy: what each environment is allowed, and what each number rests
+// on (chapter 3.8, research R26).
+//
+// R4 chose all four of these by judgement and checked none of them against a
+// document stating this platform's scale. The fourteenth analysis pass read the
+// SRS's NFR tables and found that one of them made a P1 requirement unreachable,
+// so all four were re-derived rather than the broken one patched.
+//
+// WHAT WENT WRONG IS WORTH KEEPING. The connect limit was 60/min, on the
+// reasoning that "sixty establishments a minute per environment is a client
+// reconnecting hard, not a client working". True of a client. The limit is per
+// ENVIRONMENT, and an environment is a tenant — NFR-SCL-01 puts ten thousand
+// concurrent connections on one gateway instance and FR-RTM-09 allows five per
+// user, so filling one instance from cold would have taken 167 minutes.
+//
+// Each number below names what it rests on, including the one that rests on
+// nothing. That is the actual fix; the new value is a consequence of it.
+
+/** Per environment, per minute. Overridable per environment (FR-RTL-04, FR-007);
+ * these apply when a column is null, which means "no override" and never zero —
+ * refuse-everything has to stay expressible. */
+export const DEFAULT_LIMITS = {
+  /** NO ANCHOR, and recorded as such. No SRS requirement caps a tenant's request
+   * rate; NFR-PRF-02's p95 under 150 ms is a latency target, not a throughput
+   * bound. Matched to the send limit because a REST send consumes both budgets
+   * (FR-036), and two different ceilings on one operation would mean a client
+   * hitting one while the other says it has room. */
+  rest: 600,
+
+  /** 1% of NFR-SCL-03's stated 1,000 messages per second aggregate — 60,000 a
+   * minute across the platform. So a hundred environments at their ceiling
+   * saturate it, and the hundred-and-first is what this protects. */
+  send: 600,
+
+  /** NFR-SCL-01's ten thousand connections per gateway instance, divided by
+   * FR-RTM-09's five per user, re-established inside one window so a deploy stays
+   * one reconnection cycle (NFR-REL-03).
+   *
+   * IT IS STILL A LIMIT. Its job is to stop a client reconnecting in a tight
+   * loop, which does thousands a minute and is refused well before a legitimate
+   * fleet is. It is not there to shape a tenant's capacity, and the old number
+   * had those two jobs confused. */
+  connect: 3_000,
+} as const;
+
+export type LimitedOperation = keyof typeof DEFAULT_LIMITS;
+
+/** Failed authentications per source address per minute.
+ *
+ * NOT a per-environment column: the caller has not proved which environment they
+ * are, which is the point of the limiter. Configuration, and configuration the
+ * lane has to be able to raise — the api's own integration suites assert `401`
+ * twenty-six times from one loopback address inside about 110 seconds, so a
+ * threshold nothing could lift would refuse this project's own tests
+ * (research R15).
+ *
+ * THE DEFAULT ENFORCES. Chapter 3.6's `RELAY_DISABLE_SWEEP` states the rule: a
+ * flag whose default disabled a requirement would be a requirement nobody had
+ * built.
+ *
+ * THE COST IT CARRIES, which R4 did not name: shared egress. An office behind one
+ * NAT is one source address, so ten failed logins a minute is a whole building's
+ * budget — and the refusal is deliberately indistinguishable from a wrong
+ * credential (FR-028), so they will experience it as a broken login. Kept anyway;
+ * the alternative is a threshold high enough to be worthless against the attack
+ * it exists for. */
+export const DEFAULT_AUTH_FAILURES_PER_MINUTE = 10;
+
+export function authFailureThreshold(): number {
+  const raw = process.env["RELAY_AUTH_FAILURES_PER_MINUTE"];
+  if (raw === undefined) return DEFAULT_AUTH_FAILURES_PER_MINUTE;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0
+    ? parsed
+    : DEFAULT_AUTH_FAILURES_PER_MINUTE;
+}
+
+/** The window every counter uses. One minute, because every limit above is
+ * expressed per minute and a second unit would be a second thing to reason
+ * about. */
+export const WINDOW_MS = 60_000;
+```
+
+```ts title="services/api/src/limits/fallback.ts"
+// The in-process counter the AUTH limiter falls back to when Redis is gone
+// (chapter 3.8, research R3).
+//
+// THE TENANT LIMITER FAILS OPEN AND THIS ONE MUST NOT, and that asymmetry is the
+// chapter's whole argument. Both are the same mechanism; what differs is what is
+// on the other side of the limit. The tenant limiter protects Relay's capacity
+// from a customer's traffic, and over-serving a paying customer for the length of
+// a cache outage costs some capacity. This one protects a customer's credentials
+// from an attacker, and over-serving an attacker costs the customer their
+// account.
+//
+// So neither of the two obvious answers is right. Failing open is unbounded — a
+// hole rather than a degradation. Failing closed converts a Redis restart into an
+// authentication outage, which is worse than the attack it prevents for every
+// customer who is not being attacked. The third answer is this: count in memory,
+// same threshold, and let the guarantee weaken from "N per window across the
+// fleet" to "N per window per instance". Three api instances give an attacker
+// three times the attempts for the duration of the outage — a small multiple
+// rather than infinity.
+//
+// THE CAP IS PART OF THE DECISION, NOT A DETAIL. A map keyed by
+// attacker-controlled source address is a memory-exhaustion vector if it is
+// unbounded, and a fallback that closed a brute-force hole by opening a worse one
+// would not be worth having.
+//
+// AND IT STOPS ADMITTING RATHER THAN EVICTING. An eviction policy on this map is
+// a policy the attacker drives: fill it, evict the entry that was counting them,
+// start again. Refusing new keys degrades to "addresses already being tracked
+// stay tracked", which is the safe direction.
+
+interface Entry {
+  count: number;
+  windowStart: number;
+}
+
+export interface FallbackCounter {
+  /** Count one failure against a key, returning the new count — or `null` when
+   * the key could not be admitted because the map is full. A caller that gets
+   * `null` has learned nothing about that address and must not treat it as
+   * "under the threshold". */
+  increment(key: string, nowMs: number): number | null;
+  /** The current count for a key WITHOUT adding to it, or `null` when the key is
+   * not tracked and the map is full.
+   *
+   * `null` and `0` are different answers and the caller must tell them apart:
+   * zero means "tracked, nothing counted", null means "we have no idea". While
+   * degraded, refusing an address we cannot track is the safe direction, and the
+   * cap makes that a bounded population rather than everybody. */
+  peek(key: string, nowMs: number): number | null;
+  /** Live keys. Exposed for the test that proves the bound holds. */
+  size(): number;
+}
+
+export function createFallbackCounter({
+  windowMs,
+  maxKeys,
+}: {
+  windowMs: number;
+  maxKeys: number;
+}): FallbackCounter {
+  const entries = new Map<string, Entry>();
+
+  return {
+    increment(key, nowMs) {
+      const start = Math.floor(nowMs / windowMs) * windowMs;
+      const existing = entries.get(key);
+
+      if (existing !== undefined) {
+        if (existing.windowStart === start) {
+          existing.count += 1;
+          return existing.count;
+        }
+        // Same key, new window: reuse the slot rather than counting against the
+        // cap twice.
+        existing.count = 1;
+        existing.windowStart = start;
+        return 1;
+      }
+
+      if (entries.size >= maxKeys) {
+        // Sweep what the current window has already outlived before refusing.
+        // The cap is on LIVE keys, not on keys ever seen — an outage lasting
+        // hours must not permanently refuse to count anybody new.
+        for (const [k, v] of entries) {
+          if (v.windowStart !== start) entries.delete(k);
+        }
+      }
+      if (entries.size >= maxKeys) return null;
+
+      entries.set(key, { count: 1, windowStart: start });
+      return 1;
+    },
+
+    peek(key, nowMs) {
+      const start = Math.floor(nowMs / windowMs) * windowMs;
+      const existing = entries.get(key);
+      if (existing === undefined) {
+        return entries.size >= maxKeys ? null : 0;
+      }
+      return existing.windowStart === start ? existing.count : 0;
+    },
+
+    size() {
+      return entries.size;
+    },
+  };
+}
+```
+
+```ts title="services/api/src/limits/store.ts"
+import { Redis } from "ioredis";
+
+import { WINDOW_MS } from "./policy";
+
+// The counter store (chapter 3.8, research R1).
+//
+// THE ONLY MODULE IN THE API PERMITTED TO HOLD A REDIS CLIENT, enforced by
+// `no-restricted-imports` in `eslint.config.mjs` — the same confinement the
+// database driver has, for the same stated reason. The keys are per environment,
+// so an unrestricted client would let any handler read or write another tenant's
+// counter, and constitution I makes that a correctness property rather than a
+// convention.
+//
+// TWO COMMANDS, NO LUA. `INCR` returns the new value atomically on its own, and
+// `EXPIRE` is set only when the increment returns 1 — the first write of a
+// window. A token bucket would need read-timestamp-compute-write, which across
+// instances needs a script, which is a second language in the request path
+// (constitution VII).
+//
+// The TTL does the cleanup: a key dies when its window ends and nothing
+// accumulates. Chapter 3.7's baseline and this chapter's own both found suites
+// broken by shared stores that grew without bound, so a counter that tidies
+// itself is worth the sentence.
+
+export interface CounterStore {
+  /** Count one operation against a key, returning the new count — or `null` when
+   * the store could not be reached.
+   *
+   * NULL IS NOT ZERO AND NOT AN ERROR. It means "we are not counting", and each
+   * caller decides what that is worth: the tenant limiter serves the request
+   * (FR-010, Redis is not a source of truth), and the auth limiter falls back to
+   * counting in memory rather than letting an attacker through (FR-011). Same
+   * signal, opposite conclusions, which is the chapter's argument in one return
+   * type. */
+  increment(key: string, nowMs: number): Promise<number | null>;
+  /** The current count without adding to it, or `null` when the store could not
+   * be reached. Asking "is this address over the threshold" must not itself push
+   * it over — a limiter whose check is also a write refuses on its own
+   * questions. */
+  get(key: string): Promise<number | null>;
+  close(): Promise<void>;
+}
+
+export const DEFAULT_REDIS_URL = "redis://localhost:6379";
+
+/** The key. `rl:` is the prefix SAD §6.3 specifies; the operation and the
+ * window's start are appended so one `INCR` reaches the right counter and the key
+ * expires itself.
+ *
+ * That EXTENDS the SAD's three-segment `rl:{env}:{bucket}` rather than matching
+ * it, and the extension is what makes the TTL do the cleanup. */
+export function counterKey(
+  scope: string,
+  operation: string,
+  windowStartMs: number,
+): string {
+  return `rl:${scope}:${operation}:${windowStartMs}`;
+}
+
+/** The auth counter's key, keyed by source address rather than environment.
+ *
+ * A SEPARATE PREFIX, not an `operation` value on the tenant key, because it is
+ * keyed by something else entirely and because the two have opposite failure
+ * behaviour. Sharing a prefix would invite sharing a code path, and the whole
+ * point is that they must not.
+ *
+ * THE PREFIX IS OVERRIDABLE, and that is test isolation rather than
+ * configuration. The integration lane runs files in PARALLEL — only the coverage
+ * config sets `fileParallelism: false` — so every suite asserting a `401` from
+ * loopback lands in one bucket. Raising a threshold survives that; a suite that
+ * needs a LOW threshold needs its own key, or it compares a count filled by other
+ * workers against a deliberately small number and refuses requests that had
+ * nothing to do with it (research R21).
+ *
+ * The same pattern `attempts.itest.ts` uses for its durable name, and for the
+ * same reason. */
+export function authKey(
+  address: string,
+  windowStartMs: number,
+  prefix: string = process.env["RELAY_AUTH_KEY_PREFIX"] ?? "rlauth",
+): string {
+  return `${prefix}:${address}:${windowStartMs}`;
+}
+
+export function createCounterStore(
+  url: string = process.env["RELAY_REDIS_URL"] ?? DEFAULT_REDIS_URL,
+): CounterStore {
+  // `lazyConnect` so constructing the store never blocks start-up.
+  //
+  // THE OFFLINE QUEUE STAYS ON, and the first draft had it off. With it off, the
+  // very first command is rejected because the lazy connection has not been
+  // established yet — so the first request an api instance ever serves reports no
+  // count, degrades, and looks like a Redis outage. The integration suite caught
+  // it as `expected null to be '599'` on the first test and three passes after
+  // it.
+  //
+  // Failing fast on a store that is genuinely down is then `maxRetriesPerRequest:
+  // 0` and a short `connectTimeout`: a queued command rejects as soon as the
+  // connection attempt fails rather than waiting out a retry schedule. A limiter
+  // that waits is worse than one that does not count, because the request it is
+  // holding is a customer's.
+  const redis = new Redis(url, {
+    lazyConnect: true,
+    maxRetriesPerRequest: 0,
+    connectTimeout: 1_000,
+  });
+
+  // FAILING OPEN IS NOT FREE IF IT FAILS SLOWLY, and the first version of this
+  // file was slow. With the store gone, every command waits out its connect
+  // timeout before giving up — so each request paid a second or more, twice,
+  // and the integration test for the degraded path timed out rather than
+  // asserting anything.
+  //
+  // That is worse than it looks. The tenant limiter fails open so a cache outage
+  // does not refuse paid traffic; an outage that instead adds seconds to every
+  // request has refused it in a slower way, and NFR-PRF-02 asks for a p95 under
+  // 150 ms.
+  //
+  // So a known-down store is not retried on the request path. The first failure
+  // opens a window; while it is open every call answers `null` immediately, which
+  // is the same signal the caller already handles. One probe per window is what
+  // notices the store coming back.
+  const DOWN_WINDOW_MS = 5_000;
+  let downUntil = 0;
+
+  const guard = async <T>(op: () => Promise<T>): Promise<T | null> => {
+    if (Date.now() < downUntil) return null;
+    try {
+      const result = await op();
+      downUntil = 0;
+      return result;
+    } catch {
+      downUntil = Date.now() + DOWN_WINDOW_MS;
+      return null;
+    }
+  };
+  // A dead store is an expected state here, not an exception. Without a listener
+  // ioredis emits `error` on an EventEmitter with none attached, which Node turns
+  // into an unhandled exception and the api dies for the thing it was designed to
+  // survive.
+  redis.on("error", () => {});
+
+  return {
+    async increment(key, nowMs) {
+      void nowMs;
+      return guard(async () => {
+        const count = await redis.incr(key);
+        if (count === 1) {
+          await redis.pexpire(key, WINDOW_MS);
+        }
+        return count;
+      });
+    },
+
+    async get(key) {
+      return guard(async () => {
+        const raw = await redis.get(key);
+        return raw === null ? 0 : Number.parseInt(raw, 10);
+      });
+    },
+
+    async close() {
+      redis.disconnect();
+    },
+  };
+}
+```
+
+```ts title="services/api/src/limits/client-address.ts"
+import type { RequestWithPrincipal } from "../auth/principal";
+
+// Whose failure was that? (chapter 3.8, FR-039, research R14.)
+//
+// THE API SEES THE GATEWAY, not the client. A WebSocket handshake is
+// authenticated by the gateway forwarding the end user's token to
+// `/internal/session`, so the TCP peer is the gateway for every customer at
+// once. Counting the peer would put every customer's failed handshakes in one
+// bucket, and one attacker would exhaust a threshold that then refused
+// everybody.
+//
+// A FIELD ON THE INTERNAL CONTRACT, NOT A HEADER. A header the caller asserts is
+// a header the caller can forge — the exact pattern chapter 3.2 removed when it
+// retired the two identity headers the gateway used to send. This one is
+// accepted only from a caller already trusted enough to reach the internal
+// routes, and it is trusted for exactly one thing: naming who was on the other
+// end. The same request is trusted enough not to be throttled and not trusted to
+// be the origin.
+
+/** The field the gateway sets on its internal calls. Read from the parsed body
+ * rather than a header, so an ordinary customer cannot set it. */
+export const CLIENT_ADDRESS_FIELD = "client_address";
+
+export function clientAddress(
+  req: RequestWithPrincipal & {
+    socket?: { remoteAddress?: string | undefined };
+    body?: unknown;
+  },
+): string {
+  const body = req.body;
+  if (typeof body === "object" && body !== null) {
+    const forwarded = (body as Record<string, unknown>)[CLIENT_ADDRESS_FIELD];
+    if (typeof forwarded === "string" && forwarded.length > 0) {
+      return forwarded;
+    }
+  }
+  return req.socket?.remoteAddress ?? "unknown";
+}
+```
+
+```ts title="services/api/src/limits/auth-limiter.ts"
+import { Inject, Injectable } from "@nestjs/common";
+import type { Logger } from "@relay/service-kit";
+
+import { LOGGER } from "../logger";
+import { windowStart } from "./bucket";
+import { createFallbackCounter } from "./fallback";
+import { COUNTER_STORE } from "./limits.module";
+import { authFailureThreshold, WINDOW_MS } from "./policy";
+import { authKey, type CounterStore } from "./store";
+
+// The limiter that counts FAILED AUTHENTICATIONS by source address
+// (chapter 3.8, FR-AUT-12, research R3).
+//
+// THE ONE THAT MUST NOT FAIL OPEN, and that is the chapter's whole argument. The
+// tenant limiter serves the request when Redis is gone, because Redis is not a
+// source of truth and a cache outage is not a reason to refuse paid traffic. Run
+// the same reasoning here and it gives the opposite answer: an unlimited window
+// on failed logins is not a degradation, it is a hole.
+//
+// FAILING CLOSED IS NOT THE ANSWER EITHER — it turns a Redis restart into an
+// authentication outage, which is worse than the attack it prevents for every
+// customer who is not being attacked. So: an in-process fallback at the same
+// threshold, weakening the guarantee from N per window across the fleet to N per
+// window per instance. A small multiple rather than infinity.
+//
+// WHOSE ADDRESS. The client's, not the caller's. A handshake authenticated
+// through the gateway reaches the api FROM the gateway, so counting the caller
+// would put every customer's failures in one bucket and let one attacker exhaust
+// a threshold that then refuses everybody (research R14).
+
+/** Bounded, and the bound is the decision rather than a detail: this map is keyed
+ * by attacker-controlled input, so unbounded it would be a memory-exhaustion
+ * vector — a fallback that closed a brute-force hole by opening a worse one. */
+const FALLBACK_MAX_KEYS = 10_000;
+
+@Injectable()
+export class AuthLimiter {
+  private readonly fallback = createFallbackCounter({
+    windowMs: WINDOW_MS,
+    maxKeys: FALLBACK_MAX_KEYS,
+  });
+
+  private lastDegradationLog = 0;
+
+  constructor(
+    @Inject(COUNTER_STORE) private readonly store: CounterStore,
+    @Inject(LOGGER) private readonly logger: Logger,
+  ) {}
+
+  /** Count one failed authentication. */
+  async recordFailure(address: string): Promise<void> {
+    const now = Date.now();
+    const key = authKey(address, windowStart(now, WINDOW_MS));
+    if ((await this.store.increment(key, now)) === null) {
+      this.degradation();
+      this.fallback.increment(address, now);
+    }
+  }
+
+  /** Has this address already spent its allowance?
+   *
+   * READS WITHOUT COUNTING. A check that also writes would refuse on its own
+   * questions, and this one runs on every request that presents a credential —
+   * including the valid ones.
+   *
+   * When the shared store is unreachable it answers from the in-process count,
+   * which is the whole point: the guarantee gets weaker, not absent. A key the
+   * fallback could not admit answers `true` — refusing an address we cannot track
+   * is the safe direction while degraded, and the cap makes that a bounded
+   * population rather than everybody. */
+  async isOverThreshold(address: string): Promise<boolean> {
+    const now = Date.now();
+    const threshold = authFailureThreshold();
+    const shared = await this.store.get(
+      authKey(address, windowStart(now, WINDOW_MS)),
+    );
+    if (shared !== null) return shared >= threshold;
+
+    this.degradation();
+    const local = this.fallback.peek(address, now);
+    return local === null ? true : local >= threshold;
+  }
+
+  /** One line, rate limited at the logger. A Redis outage under load would
+   * otherwise emit one per attempt, which is how one outage becomes two. No
+   * credential and no address (NFR-SEC-06); the count of tracked addresses is
+   * what an operator actually needs. */
+  private degradation(): void {
+    const now = Date.now();
+    if (now - this.lastDegradationLog < 10_000) return;
+    this.lastDegradationLog = now;
+    this.logger.log("error", "limits.auth_degraded", {
+      detail:
+        "counter store unreachable; counting failed authentications in process",
+      tracked: this.fallback.size(),
+    });
+  }
+}
+```
+
+```ts title="services/api/src/limits/rate-limit.middleware.ts"
+import type { IncomingMessage, ServerResponse } from "node:http";
+
+import { Inject, Injectable, type NestMiddleware } from "@nestjs/common";
+import type { Logger } from "@relay/service-kit";
+
+import type { Db } from "../db/client";
+import { environmentLimits } from "../db/repository";
+import type { RequestWithPrincipal } from "../auth/principal";
+import { LOGGER } from "../logger";
+import { remaining, resetAt, windowStart } from "./bucket";
+import { clientAddress } from "./client-address";
+import { COUNTER_STORE, LIMITS_DB } from "./limits.module";
+import { authFailureThreshold, WINDOW_MS, type LimitedOperation } from "./policy";
+import { authKey, counterKey, type CounterStore } from "./store";
+
+/** Read once per call site so a test that freezes time sees one instant. */
+const now0 = (): number => Date.now();
+
+// The tenant limiter (chapter 3.8, FR-RTL-01…04).
+//
+// MIDDLEWARE, NOT A GUARD, for two reasons. Chapter 3.2's: Nest constructs
+// request-scoped providers before the enhancer chain, so a guard cannot be the
+// thing that resolves tenant scope. And one of its own: FR-RTL-02 wants the three
+// headers on SUCCESSFUL responses, and a guard that returns `true` has no natural
+// place to set a header on a response the handler has not produced yet.
+//
+// AFTER `AuthenticateMiddleware`, and the order is forced: the counters are keyed
+// by environment and the environment comes from the credential.
+//
+// COUNT EACH OPERATION ONCE, AT THE DOOR IT ENTERED (research R17). The exemption
+// cannot key off the principal, because the gateway forwards the END USER's token
+// on all three of its api calls — `/internal/session`, `/internal/backfill`,
+// `/internal/messages` are all `@Accepts("user")` and resolve exactly like
+// customer traffic. Only the dispatcher carries the platform credential. So the
+// route decides, not the caller:
+//
+//   /v1/…            counted. A message send decrements both budgets (FR-036).
+//   /internal/…      not counted. The gateway already counted the handshake
+//                    against `connect` and the frame against `send`; counting
+//                    again here would charge the socket twice and make a
+//                    reconnect storm eat a customer's request budget.
+//   /healthz         never limited. Docker polls it every five seconds and
+//                    `up -d --wait` depends on the answer; a limiter that can
+//                    refuse it can stop a deployment.
+
+const PUBLIC_PREFIX = "/v1/";
+const SEND_PATH = /^\/v1\/channels\/[^/]+\/messages\/?$/;
+/** Account creation (FR-041). Limited per SOURCE ADDRESS, because it has no
+ * tenant to key on — that is the point of it — and an unlimited
+ * account-creation route is not acceptable in a platform that limits everything
+ * else. It also has no guard, so T027a's refusal cannot reach it. */
+const SIGNUP_PATH = /^\/auth\/[^/]+\/(start|callback)\/?$/;
+
+interface Decision {
+  operation: LimitedOperation;
+  limit: number;
+  remaining: number;
+  resetSeconds: number;
+  refused: boolean;
+  counted: boolean;
+}
+
+/** Which budgets a path spends. Empty means the route is not counted at all. */
+export function operationsFor(
+  method: string,
+  path: string,
+): LimitedOperation[] {
+  if (!path.startsWith(PUBLIC_PREFIX)) return [];
+  if (method === "POST" && SEND_PATH.test(path)) return ["rest", "send"];
+  return ["rest"];
+}
+
+@Injectable()
+export class RateLimitMiddleware implements NestMiddleware {
+  constructor(
+    @Inject(LIMITS_DB) private readonly db: Db,
+    @Inject(COUNTER_STORE) private readonly store: CounterStore,
+    @Inject(LOGGER) private readonly logger: Logger,
+  ) {}
+
+  async use(
+    req: RequestWithPrincipal & IncomingMessage,
+    res: ServerResponse,
+    next: () => void,
+  ): Promise<void> {
+    // `originalUrl`, NOT `url`. Express rewrites `req.url` relative to the mount
+    // point, and a middleware applied through `forRoutes("{*path}")` is mounted
+    // at the match — so `req.url` is `/` for every request and the route rules
+    // below would never match anything. Found by probe at implementation, and
+    // the same read is why the request log recorded `/` for every request from
+    // chapter 2.2 until this chapter fixed it.
+    const raw =
+      (req as unknown as { originalUrl?: string }).originalUrl ?? req.url ?? "/";
+    const path = raw.split("?")[0] ?? "/";
+    const operations = operationsFor(req.method ?? "GET", path);
+    const principal = req.principal;
+
+    // Account creation first: no tenant, no guard, so it is neither counted like
+    // customer traffic nor refusable by `CredentialGuard`. Same counter family
+    // and same threshold as failed authentication (FR-041, research R17).
+    if (SIGNUP_PATH.test(path)) {
+      const address = clientAddress(req);
+      const count = await this.store.increment(
+        authKey(address, windowStart(now0(), WINDOW_MS)) + ":signup",
+        now0(),
+      );
+      if (count !== null && count > authFailureThreshold()) {
+        res.statusCode = 429;
+        res.setHeader("Retry-After", "60");
+        res.setHeader("content-type", "application/json");
+        res.end(
+          JSON.stringify({
+            code: "rate_limited",
+            message: "too many sign-up attempts from this address; retry shortly",
+            docs_url: "https://relay.example/docs/errors/rate_limited",
+            request_id: String(res.getHeader("X-Request-Id") ?? ""),
+          }),
+        );
+        return;
+      }
+      next();
+      return;
+    }
+
+    // An environment to key on, or nothing to do. A platform principal has none
+    // by construction — the dispatcher's credential belongs to a deployment, not
+    // a tenant — and an absent principal means the guard is about to refuse this
+    // or the route is pre-credential.
+    const environmentId =
+      principal !== undefined && "environmentId" in principal
+        ? principal.environmentId
+        : undefined;
+    if (operations.length === 0 || environmentId === undefined) {
+      next();
+      return;
+    }
+
+    const limits = await environmentLimits(this.db, environmentId);
+    if (limits === null) {
+      next();
+      return;
+    }
+
+    const now = Date.now();
+    const start = windowStart(now, WINDOW_MS);
+    const resetSeconds = Math.ceil(resetAt(now, WINDOW_MS) / 1000);
+    const decisions: Decision[] = [];
+
+    for (const operation of operations) {
+      const limit = limits[operation];
+      const count = await this.store.increment(
+        counterKey(environmentId, operation, start),
+        now,
+      );
+      decisions.push({
+        operation,
+        limit,
+        remaining: count === null ? limit : remaining(count, limit),
+        resetSeconds,
+        refused: count !== null && count > limit,
+        counted: count !== null,
+      });
+    }
+
+    const refusal = decisions.find((d) => d.refused);
+
+    // THE HEADERS DESCRIBE WHICHEVER HAS FEWER REMAINING, because that is the one
+    // that will refuse first and the only value a client can schedule against. A
+    // client with 400 request-slots and 12 send-slots needs to hear 12; reporting
+    // 400 would be a header that lies by omission. A tie reports the first, which
+    // is `rest` (research R11).
+    //
+    // EXCEPT WHEN ONE OF THEM ACTUALLY REFUSED, and that exception was found by
+    // capturing the transcript rather than by a test. Both budgets can reach
+    // zero remaining in the same request while only one of them is over: with
+    // `rest` at 3 and `send` at 2, the third send leaves both at zero remaining
+    // and only `send` refused. "Fewest remaining" then picks `rest` on the tie,
+    // and the response says `X-RateLimit-Limit: 3` above a body reading "too many
+    // messages" — two numbers describing different budgets in one refusal
+    // (research R41). A refusal describes the budget that refused.
+    const nearest =
+      refusal ?? decisions.reduce((a, b) => (b.remaining < a.remaining ? b : a));
+    const degraded = decisions.some((d) => !d.counted);
+
+    res.setHeader("X-RateLimit-Limit", String(nearest.limit));
+    if (degraded) {
+      // `Limit` only. It is policy read from Postgres and is not degraded; the
+      // other two exist only because something was counting, and inventing them
+      // is the failure FR-014 forbids. NOT a sentinel — a client that does not
+      // know `-1` would parse it as a number and conclude it was over its limit
+      // (research R6).
+      this.degradation(environmentId, req);
+    } else {
+      res.setHeader("X-RateLimit-Remaining", String(nearest.remaining));
+      res.setHeader("X-RateLimit-Reset", String(nearest.resetSeconds));
+    }
+
+    if (refusal !== undefined) {
+      const retryAfter = Math.max(1, refusal.resetSeconds - Math.floor(now / 1000));
+      res.setHeader("Retry-After", String(retryAfter));
+      res.setHeader("X-RateLimit-Remaining", "0");
+      // The message names WHICH limit was reached: "too many requests" and "too
+      // many messages" are different problems, one saying batch and the other
+      // saying slow down. Neither names a credential (NFR-SEC-06).
+      const what =
+        refusal.operation === "send" ? "messages" : "requests";
+      res.statusCode = 429;
+      res.setHeader("content-type", "application/json");
+      res.end(
+        JSON.stringify({
+          code: "rate_limited",
+          message: `too many ${what} for this environment; retry after ${retryAfter} seconds`,
+          docs_url: "https://relay.example/docs/errors/rate_limited",
+          request_id: String(res.getHeader("X-Request-Id") ?? ""),
+        }),
+      );
+      return;
+    }
+
+    next();
+  }
+
+  private lastDegradationLog = 0;
+
+  /** One line, rate limited at the logger. A Redis outage under load would
+   * otherwise emit one per request, which is how one outage becomes two. Carries
+   * the request id and the environment — NFR-OBS-01 asks for request id, tenant
+   * id and correlation id, and the platform mints no correlation id yet. Carries
+   * no credential (NFR-SEC-06). */
+  private degradation(environmentId: string, req: IncomingMessage): void {
+    const now = Date.now();
+    if (now - this.lastDegradationLog < 10_000) return;
+    this.lastDegradationLog = now;
+    void req;
+    // `error`, not `info`: the limiter is doing the right thing by serving, and
+    // an unreachable store is still an operational fault somebody should see.
+    // The logger's two levels are the service-kit's, unchanged since 1.4.
+    this.logger.log("error", "limits.degraded", {
+      environment_id: environmentId,
+      detail: "counter store unreachable; serving without counting",
+    });
+  }
+}
+```
+
+```ts title="services/gateway/src/limits.ts"
+import { Redis } from "ioredis";
+
+// The gateway's counter (chapter 3.8, research R12, R20).
+//
+// ITS OWN CLIENT, not fanout's, and that is forced rather than preferred.
+// `Fanout` is a closed interface — `onDelivery`, `publish`, `subscribe`,
+// `unsubscribe`, `close` — and exposes neither of the two clients it holds. One
+// of them is a SUBSCRIBER, and a Redis connection in subscribe mode cannot run
+// `INCR`. And `fanout` is optional in the session server, so a limiter riding its
+// lifecycle would vanish in every configuration that has no fabric — which is
+// every chapter-2.5 test.
+//
+// So: one more client, and a `close()` the session server calls. `fanout.ts`
+// already sets that precedent for this service.
+//
+// THE SAME KEYS THE API USES. Two services increment one bucket, which is why
+// the counter lives in Redis rather than in either process: neither can see the
+// other's memory, and a socket send has to count against the same `send` budget a
+// REST send does or a client could double its allowance by opening a socket
+// (research R11).
+
+export const DEFAULT_REDIS_URL = "redis://localhost:6379";
+
+/** The window an instant belongs to. Floored, so two instances agree without
+ * coordinating — the same arithmetic as the api's, deliberately duplicated
+ * rather than shared: a package for two small functions would be an abstraction
+ * constitution VII asks to be justified, and this one could not be. */
+export function windowStartFor(nowMs: number, windowMs: number): number {
+  return Math.floor(nowMs / windowMs) * windowMs;
+}
+
+/** Is this count past the allowance?
+ *
+ * `null` — the store could not be reached — is NOT over. Both of the gateway's
+ * limits are tenant limits, so they fail open like the api's: Redis is not a
+ * source of truth, and a cache outage is not a reason to refuse a paying
+ * customer's traffic. */
+export function overLimit(count: number | null, limit: number): boolean {
+  if (count === null) return false;
+  return count > limit;
+}
+
+/** What one counted operation decided, and everything a refusal has to say.
+ *
+ * The api reports the same four numbers in three headers plus `Retry-After`;
+ * the gateway needs them for the handshake refusal, which IS an HTTP response
+ * and can carry headers. The frame refusal cannot — there is nowhere on an
+ * `error` frame to put them — which is why the socket's two refusals do not
+ * look alike (research R7). */
+export interface Decision {
+  over: boolean;
+  limit: number;
+  remaining: number;
+  /** Unix seconds, matching `X-RateLimit-Reset`. */
+  resetSeconds: number;
+  /** Whole seconds until the window turns over, for `Retry-After`. At least 1:
+   * `Retry-After: 0` invites an immediate retry that is certain to fail. */
+  retryAfterSeconds: number;
+}
+
+/** The arithmetic, with no store in it — so a window boundary is a test rather
+ * than a wait. A `null` count means the store could not be reached. */
+export function decide(
+  count: number | null,
+  limit: number,
+  nowMs: number,
+  windowMs: number,
+): Decision {
+  const reset = windowStartFor(nowMs, windowMs) + windowMs;
+  return {
+    over: overLimit(count, limit),
+    limit,
+    remaining: Math.max(0, limit - (count ?? 0)),
+    resetSeconds: Math.ceil(reset / 1_000),
+    retryAfterSeconds: Math.max(1, Math.ceil((reset - nowMs) / 1_000)),
+  };
+}
+
+export interface GatewayLimits {
+  /** Count one operation and report what that decided. */
+  spend(
+    environmentId: string,
+    operation: "connect" | "send",
+    limit: number,
+  ): Promise<Decision>;
+  close(): Promise<void>;
+}
+
+const WINDOW_MS = 60_000;
+const DOWN_WINDOW_MS = 5_000;
+
+export function createGatewayLimits(
+  url: string = process.env["RELAY_REDIS_URL"] ?? DEFAULT_REDIS_URL,
+): GatewayLimits {
+  const redis = new Redis(url, {
+    lazyConnect: true,
+    maxRetriesPerRequest: 0,
+    connectTimeout: 1_000,
+  });
+  // A dead store is an expected state, not an exception. Without a listener
+  // ioredis emits `error` on an EventEmitter with none attached and Node turns
+  // that into an unhandled exception — the gateway would die for the thing it is
+  // designed to survive.
+  redis.on("error", () => {});
+
+  // A known-down store is not retried on the connect path. Waiting out a connect
+  // timeout per handshake would turn a cache outage into a slow one, and
+  // NFR-PRF-04 asks for a handshake under a second (research R34).
+  let downUntil = 0;
+
+  return {
+    async spend(environmentId, operation, limit) {
+      const now = Date.now();
+      if (now < downUntil) return decide(null, limit, now, WINDOW_MS);
+      const key = `rl:${environmentId}:${operation}:${windowStartFor(now, WINDOW_MS)}`;
+      try {
+        const count = await redis.incr(key);
+        if (count === 1) await redis.pexpire(key, WINDOW_MS);
+        downUntil = 0;
+        return decide(count, limit, now, WINDOW_MS);
+      } catch {
+        downUntil = now + DOWN_WINDOW_MS;
+        return decide(null, limit, now, WINDOW_MS);
+      }
+    },
+
+    async close() {
+      redis.disconnect();
+    },
+  };
+}
+```
+
+### The vocabulary, finally spoken
+
+`rate_limited` and the fourth field. Three of these four files were written in
+Part 1 and have been waiting since.
+
+```diff title="packages/protocol/src/frames.ts"
+@@ -102,14 +102,26 @@ export const typingSchema = z.strictObject({
+ });
+ 
+ /** Protocol-level error — EIR-API-04's error shape, reused on the socket
+- * (this chapter's recorded decision). `request_id` joins in Part 2, when a
+- * gateway exists to mint one. */
++ * (chapter 1.3's recorded decision).
++ *
++ * `request_id` ARRIVED IN CHAPTER 3.8, not in Part 2. The comment here promised
++ * it "joins in Part 2, when a gateway exists to mint one"; Part 2 came and went,
++ * the gateway existed, and the field did not. Constitution V asks for four fields
++ * and the platform sent three for twenty-two chapters.
++ *
++ * REQUIRED, not optional, and that was a decision rather than an oversight. A
++ * server-initiated frame is arguably not a response to a request, so optional
++ * would have been defensible — and it would have been the fourth instance of the
++ * habit this chapter is about: `rate_limited`, close code 4008 and this field
++ * were all declared here and left unenforced. The gateway mints one per answered
++ * frame instead (research R13). */
+ export const errorFrameSchema = z.strictObject({
+   type: z.literal("error"),
+   payload: z.strictObject({
+     code: z.string().min(1),
+     message: z.string().min(1),
+     docs_url: z.string().min(1),
++    request_id: z.string().min(1),
+     field: z.string().min(1).optional(),
+   }),
+ });
+```
+
+```diff title="packages/protocol/src/frames.test.ts"
+@@ -43,6 +43,11 @@ const valid: Record<string, unknown> = {
+       code: "invalid_frame",
+       message: "no",
+       docs_url: "https://docs.example/errors/invalid_frame",
++      // Chapter 3.8: the fourth field, required rather than optional. The
++      // comment above this schema promised it "joins in Part 2, when a gateway
++      // exists to mint one" — Part 2 came and went, and constitution V has asked
++      // for four fields since 1.3.
++      request_id: "01JABCDEFGHJKMNPQRSTVWXYZ",
+     },
+   },
+ };
+```
+
+```diff title="packages/service-kit/src/index.ts"
+@@ -83,6 +83,10 @@ export function serve(options: ServeOptions): Server {
+         code: "not_found",
+         message: `no route for ${req.method ?? "?"} ${path}`,
+         docs_url: "https://relay.example/docs/errors/not_found",
++        // Chapter 3.8: the fourth field constitution V has asked for since 1.3.
++        // Everywhere, not only on the rate-limit error — four fields on one
++        // status and three on the others is worse than either consistent answer.
++        request_id: requestId,
+       };
+     }
+     res.statusCode = status;
+```
+
+```diff title="services/api/src/protocol-error.filter.ts"
+@@ -54,11 +54,24 @@ export class ProtocolErrorFilter implements ExceptionFilter {
+         : "unexpected internal error";
+     res.statusCode = status;
+     res.setHeader("content-type", "application/json");
++    // FOUR FIELDS AS OF CHAPTER 3.8, and constitution V has asked for four since
++    // chapter 1.3. `request_id` was promised "in Part 2, when a gateway exists to
++    // mint one"; the gateway arrived and the field did not. It is read back off
++    // the response rather than threaded through, because `RequestContextMiddleware`
++    // has already set `X-Request-Id` by the time anything can throw — one id, in
++    // the header and the body, from one place.
++    //
++    // TOP-LEVEL, NOT NESTED. EIR-API-04's worked example wrapped these in an
++    // `error` key until this chapter checked what the platform actually sends;
++    // it never sent that shape. Wrapping every error response would be a breaking
++    // change and CON-05 makes breaking changes a URL-versioning event, so the
++    // document was brought to the code — SRS 1.3 (research R27).
+     res.end(
+       JSON.stringify({
+         code,
+         message,
+         docs_url: `https://relay.example/docs/errors/${code}`,
++        request_id: String(res.getHeader("X-Request-Id") ?? ""),
+       }),
+     );
+   }
+```
+
+### The request path
+
+The chain, the principal it carries, and the policy it reads.
+
+```diff title="services/api/src/request-context.middleware.ts"
+@@ -17,11 +17,22 @@ export class RequestContextMiddleware implements NestMiddleware {
+   use(req: IncomingMessage, res: ServerResponse, next: () => void): void {
+     const requestId = newRequestId();
+     res.setHeader("X-Request-Id", requestId);
++    // `originalUrl` first, and this line was WRONG from chapter 2.2 until 3.8.
++    // Express rewrites `req.url` relative to the mount point, and this middleware
++    // is applied through `forRoutes("{*path}")`, so `req.url` is `/` — every
++    // request this api has logged recorded `/` as its path. NFR-OBS-06 asks for
++    // one structured line per request that an operator can grep; a line whose
++    // path is always `/` is one they cannot.
++    //
++    // Found by probe while wiring the rate limiter, which reads the same value
++    // to decide which routes it counts and would have counted nothing.
++    const path =
++      (req as { originalUrl?: string }).originalUrl ?? req.url ?? "/";
+     res.on("finish", () => {
+       this.logger.log("info", "request", {
+         request_id: requestId,
+         method: req.method,
+-        path: req.url,
++        path,
+         status: res.statusCode,
+       });
+     });
+```
+
+```diff title="services/api/src/auth/principal.ts"
+@@ -61,9 +61,23 @@ export type PrincipalKind = Principal["kind"];
+  * principal is optional at the type level for one honest reason: a request that
+  * presented nothing has none, and pre-credential routes (signup) are reached
+  * exactly that way. */
++/** Chapter 3.8. Set by `AuthenticateMiddleware` when this address has already
++ * spent its failed-authentication allowance, and read by `CredentialGuard`,
++ * which throws the 429.
++ *
++ * THE MIDDLEWARE NEVER THROWS, by documented design — pre-credential routes
++ * reach their handlers by having no principal — so the refusal has to be raised
++ * somewhere that already refuses. The guard owns the 401 that FR-028 wants this
++ * indistinguishable from, and it already throws the object form that carries a
++ * `code` (research R18). */
++export const OVER_AUTH_THRESHOLD = Symbol.for("relay:over-auth-threshold");
++
+ export interface RequestWithPrincipal {
+   headers: Record<string, string | string[] | undefined>;
+   principal?: Principal;
++  /** Chapter 3.8: set when this source address has spent its
++   * failed-authentication allowance. See `OVER_AUTH_THRESHOLD` above. */
++  [OVER_AUTH_THRESHOLD]?: boolean;
+ }
+ 
+ /** How a credential class is named to a human. Used by the wrong-credential
+```
+
+```diff title="services/api/src/auth/authenticate.middleware.ts"
+@@ -6,7 +6,14 @@ import {
+   environmentSigningSecret,
+ } from "../db/repository";
+ import { looksLikeApiKey } from "./api-key";
+-import { bearerCredential, type Principal, type RequestWithPrincipal } from "./principal";
++import { AuthLimiter } from "../limits/auth-limiter";
++import { clientAddress } from "../limits/client-address";
++import {
++  bearerCredential,
++  OVER_AUTH_THRESHOLD,
++  type Principal,
++  type RequestWithPrincipal,
++} from "./principal";
+ import { environmentClaim, verifyUserToken } from "./user-token";
+ 
+ export const AUTH_DB = "AUTH_DB";
+@@ -106,17 +113,32 @@ export async function resolvePrincipal(
+  */
+ @Injectable()
+ export class AuthenticateMiddleware implements NestMiddleware {
+-  constructor(@Inject(AUTH_DB) private readonly db: Db) {}
++  constructor(
++    @Inject(AUTH_DB) private readonly db: Db,
++    private readonly authLimiter: AuthLimiter,
++  ) {}
+ 
+   async use(
+-    req: RequestWithPrincipal,
++    req: RequestWithPrincipal & { socket?: { remoteAddress?: string } },
+     _res: unknown,
+     next: () => void,
+   ): Promise<void> {
+     const credential = bearerCredential(req.headers);
+     if (credential !== null) {
++      // Chapter 3.8 (FR-AUT-12). The failure is observable HERE — credential
++      // present, principal null — so this is where it is counted. It is not where
++      // it is refused: this middleware never throws, and `CredentialGuard` raises
++      // the 429 from the flag below (research R18).
++      const address = clientAddress(req);
++      if (await this.authLimiter.isOverThreshold(address)) {
++        req[OVER_AUTH_THRESHOLD] = true;
++      }
+       const principal = await resolvePrincipal(this.db, credential);
+-      if (principal !== null) req.principal = principal;
++      if (principal !== null) {
++        req.principal = principal;
++      } else {
++        await this.authLimiter.recordFailure(address);
++      }
+     }
+     next();
+   }
+```
+
+```diff title="services/api/src/auth/credential.guard.ts"
+@@ -1,5 +1,6 @@
+ import {
+   ForbiddenException,
++  HttpException,
+   Injectable,
+   SetMetadata,
+   UnauthorizedException,
+@@ -10,6 +11,7 @@ import { Reflector } from "@nestjs/core";
+ 
+ import {
+   describePrincipalKind,
++  OVER_AUTH_THRESHOLD,
+   type PrincipalKind,
+   type RequestWithPrincipal,
+ } from "./principal";
+@@ -58,6 +60,30 @@ export class CredentialGuard implements CanActivate {
+     const req = context.switchToHttp().getRequest<RequestWithPrincipal>();
+     const principal = req.principal;
+ 
++    // Chapter 3.8 (FR-011, FR-040, research R18). The refusal for an
++    // over-threshold address is thrown HERE and not in the middleware that
++    // counted it, because `AuthenticateMiddleware` never throws by documented
++    // design — pre-credential routes reach their handlers by having no principal.
++    //
++    // Three things fall out of putting it here. The invariant survives verbatim.
++    // Both refusals come from one place, which is what FR-028 needs: a caller
++    // must not be able to tell a rate-limited refusal from a wrong-credential
++    // one, or the limiter becomes an oracle. And the guard already throws the
++    // object form that carries a `code`, which is what the envelope needs.
++    //
++    // BEFORE the principal check, so an address over its allowance is refused
++    // whether or not the credential it just presented would have worked.
++    if (req[OVER_AUTH_THRESHOLD] === true) {
++      throw new HttpException(
++        {
++          code: "rate_limited",
++          message:
++            "too many failed authentication attempts from this address; retry shortly",
++        },
++        429,
++      );
++    }
++
+     if (!principal) {
+       throw new UnauthorizedException(
+         `this route requires a credential: ${expectation(accepted)}, presented as "Authorization: Bearer …"`,
+```
+
+```diff title="services/api/src/auth/auth.module.ts"
+@@ -1,6 +1,8 @@
+ import { Module } from "@nestjs/common";
+ 
+ import { createDb, createPool, type Db } from "../db/client";
++import { LimitsModule } from "../limits/limits.module";
++import { AuthLimiter } from "../limits/auth-limiter";
+ import { AUTH_DB, AuthenticateMiddleware } from "./authenticate.middleware";
+ import { CredentialGuard } from "./credential.guard";
+ import { DevTokenController } from "./dev-token.controller";
+@@ -15,12 +17,17 @@ import { DevTokenController } from "./dev-token.controller";
+ // runs BEFORE any tenant scope exists, and borrowing the request-scoped
+ // machinery 2.2 built would invert the order it needs.
+ @Module({
++  // Chapter 3.8: the failed-authentication counter. Imported rather than built
++  // here, because the counter store is one client with one lifecycle and two
++  // consumers — this module and the tenant limiter's middleware.
++  imports: [LimitsModule],
+   controllers: [DevTokenController],
+   providers: [
+     { provide: AUTH_DB, useFactory: (): Db => createDb(createPool()) },
++    AuthLimiter,
+     AuthenticateMiddleware,
+     CredentialGuard,
+   ],
+-  exports: [AUTH_DB, AuthenticateMiddleware, CredentialGuard],
++  exports: [AUTH_DB, AuthenticateMiddleware, CredentialGuard, AuthLimiter],
+ })
+ export class AuthModule {}
+```
+
+```diff title="services/api/src/app.module.ts"
+@@ -11,11 +11,14 @@ import { HealthController } from "./health.controller";
+ import { InternalModule } from "./internal/internal.module";
+ import { MessagesModule } from "./messages/messages.module";
+ import { ConsumerModule } from "./consumer/consumer.module";
++import { NotificationsModule } from "./notifications/notifications.module";
+ import { OutboxModule } from "./outbox/outbox.module";
+ import { WebhooksModule } from "./webhooks/webhooks.module";
+ import { TenancyModule } from "./tenancy/tenancy.module";
+ import { LOGGER, apiLogger } from "./logger";
+ import { ProtocolErrorFilter } from "./protocol-error.filter";
++import { LimitsModule } from "./limits/limits.module";
++import { RateLimitMiddleware } from "./limits/rate-limit.middleware";
+ import { RequestContextMiddleware } from "./request-context.middleware";
+ 
+ // The application described as a module graph — ADR-15's convention for the
+@@ -29,24 +32,30 @@ import { RequestContextMiddleware } from "./request-context.middleware";
+     InternalModule,
+     TenancyModule,
+     OutboxModule,
++    NotificationsModule,
+     ConsumerModule,
+     WebhooksModule,
++    LimitsModule,
+   ],
+   controllers: [HealthController],
+   providers: [
+     { provide: LOGGER, useFactory: apiLogger },
+     { provide: APP_FILTER, useClass: ProtocolErrorFilter },
+     RequestContextMiddleware,
++    RateLimitMiddleware,
+   ],
+ })
+ export class AppModule implements NestModule {
+   configure(consumer: MiddlewareConsumer): void {
+-    // Order is the chain: the request gets its id first, then its principal.
++    // Order is the chain: the request gets its id first, then its principal,
++    // then its allowance. The limiter is LAST and that is forced (chapter 3.8):
++    // it counts per environment and the environment comes from the credential,
++    // so nothing earlier in the chain knows which tenant is asking.
+     // Chapter 3.2 put authentication HERE rather than in a guard because Nest
+     // constructs request-scoped providers before the enhancer chain runs — the
+     // finding 2.6 paid for, measured again on this path in T004.
+     consumer
+-      .apply(RequestContextMiddleware, AuthenticateMiddleware)
++      .apply(RequestContextMiddleware, AuthenticateMiddleware, RateLimitMiddleware)
+       .forRoutes("{*path}");
+   }
+ }
+```
+
+```diff title="services/api/src/db/schema.ts"
+@@ -120,7 +120,33 @@ export const environments = pgTable(
+     // envelope-encrypted (NFR-SEC-02)
+     signingSecret: text("signing_secret").notNull(),
+     retentionDays: integer("retention_days"),
++    // DECLARED IN 2.1 AND STILL EMPTY. Named in SRS §6.1's Environment entity
++    // and SAD §338, read by nothing in seventeen chapters. Chapter 3.8
++    // deliberately did NOT put rate-limit policy here: the column is named for
++    // quotas, quotas are a later chapter, and the distinction between a limit
++    // that may be lost and a quota that is money is the thing 3.8 is about.
++    // (Deliberately not a chapter NUMBER: 3.7 renumbered quotas once already,
++    // and a comment in a file fenced byte-exact into a published page goes stale
++    // silently. Chapter 3.7's rule — cite what a thing is, never where it will
++    // be. A grep for forward references is the gate, so this comment must not
++    // trip it either.) Putting
++    // one in a field named for the other would collapse in the schema what the
++    // prose spends a chapter drawing (research R31).
+     quotaConfig: jsonb("quota_config").notNull().default({}),
++    // Chapter 3.8: per-environment rate limits (FR-RTL-04, FR-007).
++    //
++    // NULLABLE, AND NULL IS NOT ZERO. Null means "no override, use the
++    // documented default", resolved at read time. Zero means "refuse
++    // everything", which must stay expressible — an environment can be switched
++    // off deliberately — so the two states cannot share a representation.
++    //
++    // Three integers rather than a document, and a slot for an environment with
++    // NONE FOR A ROUTE. That forecloses SRS Appendix C question 5 — whether the
++    // dev-token endpoint should be limited more aggressively than the rest of
++    // its environment — and the question stays open because of it (R30).
++    restLimitPerMinute: integer("rest_limit_per_minute"),
++    sendLimitPerMinute: integer("send_limit_per_minute"),
++    connectLimitPerMinute: integer("connect_limit_per_minute"),
+   },
+   (t) => [
+     check(
+@@ -131,6 +157,18 @@ export const environments = pgTable(
+     // above, this unique index IS that rule: two legal kinds, one row each.
+     // No trigger, no counting query, nothing to lose a race to.
+     unique("environments_application_kind_unique").on(t.applicationId, t.kind),
++    check(
++      "environments_rest_limit_non_negative",
++      sql`${t.restLimitPerMinute} IS NULL OR ${t.restLimitPerMinute} >= 0`,
++    ),
++    check(
++      "environments_send_limit_non_negative",
++      sql`${t.sendLimitPerMinute} IS NULL OR ${t.sendLimitPerMinute} >= 0`,
++    ),
++    check(
++      "environments_connect_limit_non_negative",
++      sql`${t.connectLimitPerMinute} IS NULL OR ${t.connectLimitPerMinute} >= 0`,
++    ),
+   ],
+ );
+ 
+```
+
+```diff title="services/api/src/db/repository.ts"
+@@ -1,7 +1,19 @@
+ import { randomUUID } from "node:crypto";
+ 
+-import { and, asc, desc, eq, gt, isNull, lt, sql, type SQL } from "drizzle-orm";
+-
++import {
++  and,
++  asc,
++  desc,
++  eq,
++  gt,
++  inArray,
++  isNull,
++  lt,
++  sql,
++  type SQL,
++} from "drizzle-orm";
++
++import { DEFAULT_LIMITS, type LimitedOperation } from "../limits/policy";
+ import type { Db } from "./client";
+ import {
+   apiKeys,
+@@ -234,6 +246,37 @@ export async function environmentSigningSecret(
+   return row ?? null;
+ }
+ 
++/** An environment's rate limits, with nulls resolved to the documented defaults
++ * (chapter 3.8, FR-007, research R26).
++ *
++ * RESOLVED HERE RATHER THAN AT THE CALL SITE, because "null means use the
++ * default" is a property of the column and a caller that had to remember it
++ * would eventually forget. Null is NOT zero: zero means refuse everything, and an
++ * environment can be switched off deliberately.
++ *
++ * Returns null for an environment that does not exist, which the caller must tell
++ * apart from an environment with default limits — a request whose credential
++ * named a missing environment is not a request to serve generously. */
++export async function environmentLimits(
++  db: Db,
++  environmentId: string,
++): Promise<Record<LimitedOperation, number> | null> {
++  const [row] = await db
++    .select({
++      rest: environments.restLimitPerMinute,
++      send: environments.sendLimitPerMinute,
++      connect: environments.connectLimitPerMinute,
++    })
++    .from(environments)
++    .where(eq(environments.id, environmentId));
++  if (!row) return null;
++  return {
++    rest: row.rest ?? DEFAULT_LIMITS.rest,
++    send: row.send ?? DEFAULT_LIMITS.send,
++    connect: row.connect ?? DEFAULT_LIMITS.connect,
++  };
++}
++
+ // ---------------------------------------------------------------------------
+ // The outbox drain (chapter 3.3, ADR-06). Part of the ADMIN surface for the
+ // same reason the credential lookup is: it runs on behalf of the platform
+```
+
+### The socket
+
+The limits ride the authentication response, and the gateway caches them on the
+connection rather than reading them again.
+
+```diff title="packages/protocol/src/internal.ts"
+@@ -137,6 +137,23 @@ export const internalSessionResponseSchema = z.strictObject({
+   environment_id: z.string().min(1),
+   user: z.string().min(1),
+   channel_ids: z.array(z.string().min(1)),
++  /** Chapter 3.8. The two limits the gateway enforces, resolved from the
++   * environment's policy with nulls already turned into defaults.
++   *
++   * THEY RIDE THIS RESPONSE BECAUSE THE GATEWAY HAS NO DATABASE, and must not
++   * gain one — `registry.ts` states that as a design property: "no pg, no
++   * drizzle-orm, no repository import". The policy is three columns in Postgres
++   * and the api is the only service that reads Postgres, so the limits travel on
++   * the one call the gateway was already making at connect.
++   *
++   * The same move chapter 3.2 made on this call, whose comment records it: the
++   * api "answers with the identity AND the memberships … it just asks a better
++   * question than 'what may this user hear'". This asks it for one thing more
++   * (research R12). */
++  limits: z.strictObject({
++    connect: z.number().int().nonnegative(),
++    send: z.number().int().nonnegative(),
++  }),
+ });
+ 
+ /** The deliveries stream (chapter 3.5), and its subject grammar.
+```
+
+```diff title="services/api/src/internal/session.controller.ts"
+@@ -14,7 +14,8 @@ import { AUTH_DB } from "../auth/authenticate.middleware";
+ import { Accepts, CredentialGuard } from "../auth/credential.guard";
+ import type { RequestWithPrincipal } from "../auth/principal";
+ import type { Db } from "../db/client";
+-import { Repository } from "../db/repository";
++import { environmentLimits, Repository } from "../db/repository";
++import { DEFAULT_LIMITS } from "../limits/policy";
+ 
+ // `POST /internal/session` (chapter 3.2) — the route that replaced
+ // `GET /internal/memberships`.
+@@ -59,10 +60,19 @@ export class SessionController {
+     // error: it is a user with no channels. The gateway's job is delivery, not
+     // identity forensics — 2.5's rule, and the reason a first connect from a
+     // brand-new user works before anything is seeded.
++    // Chapter 3.8: the gateway's limits, resolved here because the gateway has no
++    // database and must not gain one (research R12). Null columns are already
++    // defaults by the time they leave the repository, so the gateway never has to
++    // know that "no override" is a state.
++    const limits = await environmentLimits(this.db, principal.environmentId);
+     return {
+       environment_id: principal.environmentId,
+       user: principal.userExternalId,
+       channel_ids: user ? await this.repo.channelsForUser(user.id) : [],
++      limits: {
++        connect: limits?.connect ?? DEFAULT_LIMITS.connect,
++        send: limits?.send ?? DEFAULT_LIMITS.send,
++      },
+     };
+   }
+ }
+```
+
+```diff title="services/gateway/src/auth.ts"
+@@ -26,7 +26,16 @@ export type { Identity } from "./api-client.js";
+  * 1011 tells it we are broken (retrying will). 2.5 drew that line for the
+  * memberships lookup; moving verification here must not erase it. */
+ export type Authentication =
+-  | { outcome: "ok"; identity: Identity; channelIds: string[] }
++  | {
++      outcome: "ok";
++      identity: Identity;
++      channelIds: string[];
++      /** Chapter 3.8. The environment's two socket allowances, read from
++       * Postgres by the api and carried on the same response — the gateway has
++       * no database client and R12 spent its whole argument on keeping it that
++       * way. */
++      limits: { connect: number; send: number };
++    }
+   | { outcome: "refused" }
+   | { outcome: "unavailable"; error: string };
+ 
+@@ -51,6 +60,7 @@ export async function authenticate(
+         token,
+       },
+       channelIds: session.channel_ids,
++      limits: session.limits,
+     };
+   } catch (error) {
+     return { outcome: "unavailable", error: String(error) };
+```
+
+```diff title="services/gateway/src/registry.ts"
+@@ -47,6 +47,16 @@ export interface Connection {
+    * 42. Bounded instead by `MAX_RESUME_CHANNELS`, which already caps the cursors
+    * these are scoped to. */
+   marks: Record<string, number> | null;
++  /** Chapter 3.8. The environment's send allowance, as it stood when this socket
++   * connected — carried on the session response because the gateway has no
++   * database and must not gain one (research R12).
++   *
++   * FIXED FOR THE LIFE OF THE CONNECTION, and that is a stated property rather
++   * than an accident: a limit changed while a socket is open does not reach it
++   * until the client reconnects. The alternative is a Postgres read per frame, on
++   * the hot path of the thing the limit protects. Beside `marks` for the same
++   * reason — it describes one socket and dies with it. */
++  sendLimit: number;
+ }
+ 
+ export class Registry {
+```
+
+```diff title="services/gateway/src/session.ts"
+@@ -1,5 +1,6 @@
+ import { randomUUID } from "node:crypto";
+ import type { IncomingMessage, Server } from "node:http";
++import type { Duplex } from "node:stream";
+ 
+ import {
+   CLOSE_CODES,
+@@ -7,12 +8,13 @@ import {
+   type Frame,
+   type Message,
+ } from "@relay/protocol";
+-import type { Logger } from "@relay/service-kit";
++import { newRequestId, type Logger } from "@relay/service-kit";
+ import { WebSocketServer, type WebSocket } from "ws";
+ 
+ import { ApiError, type ApiClient } from "./api-client.js";
+ import { authenticate, type Identity } from "./auth.js";
+ import type { Fanout } from "./fanout.js";
++import type { Decision, GatewayLimits } from "./limits.js";
+ import { Registry, type Connection } from "./registry.js";
+ import {
+   MAX_BUFFERED_FRAMES,
+@@ -39,14 +41,66 @@ function send(socket: WebSocket, frame: Frame): void {
+   socket.send(JSON.stringify(frame));
+ }
+ 
+-/** EIR-API-04's envelope, wearing its WebSocket clothes. */
+-function sendError(socket: WebSocket, code: string, message: string): void {
++/** EIR-API-04's envelope, wearing its WebSocket clothes.
++ *
++ * `request_id` ARRIVED IN CHAPTER 3.8, and the gateway had none to give — it
++ * minted no ids at all. The field is required on the frame rather than optional,
++ * because an optional fourth field would have been the fourth instance of the
++ * habit that chapter is about: `rate_limited`, close code 4008 and this field
++ * were all declared in 1.3 and left unenforced (research R13).
++ *
++ * WHAT THE ID IS FOR decides its shape. A developer quoting one in a support
++ * ticket needs it to find a single server-side log line, and on a socket the
++ * useful unit is the frame that failed — a client whose tenth `message.send` was
++ * refused needs to point at that refusal, not at the connection. So callers pass
++ * the id of the frame they are answering, and `sendError` mints one only for a
++ * frame nobody asked for. */
++/** The handshake refusal (chapter 3.8, FR-005). Written onto the raw upgrade
++ * socket by hand, because there is no `res` here — `server.on("upgrade")` hands
++ * over the socket and the unparsed head, and anything sent on it has to be a
++ * complete HTTP response including the blank line before the body.
++ *
++ * The same three headers the api sends on a 429, from the same numbers, plus
++ * `Retry-After` — a client should not have to learn a second dialect for the
++ * socket door. `Connection: close` because this socket is not becoming a
++ * WebSocket and is not being kept alive for a second request either. */
++function refuseUpgrade(socket: Duplex, decision: Decision): void {
++  const body = JSON.stringify({
++    code: "rate_limited",
++    message: "too many connections; retry after the window resets",
++    docs_url: "https://relay.example/docs/errors/rate_limited",
++    request_id: newRequestId(),
++  });
++  socket.write(
++    [
++      "HTTP/1.1 429 Too Many Requests",
++      "Content-Type: application/json",
++      `Content-Length: ${Buffer.byteLength(body)}`,
++      `Retry-After: ${decision.retryAfterSeconds}`,
++      `X-RateLimit-Limit: ${decision.limit}`,
++      `X-RateLimit-Remaining: ${decision.remaining}`,
++      `X-RateLimit-Reset: ${decision.resetSeconds}`,
++      "Connection: close",
++      "",
++      body,
++    ].join("\r\n"),
++  );
++  socket.destroy();
++}
++
++function sendError(
++  socket: WebSocket,
++  code: string,
++  message: string,
++  requestId: string = newRequestId(),
++): void {
+   send(socket, {
+     type: "error",
+     payload: {
+       code,
+       message,
+       docs_url: `https://relay.example/docs/errors/${code}`,
++      request_id: requestId,
+     },
+   });
+ }
+@@ -68,6 +122,12 @@ export interface SessionServerOptions {
+    * (chapter 2.7): the degrade branch is a contract, and a test should not
+    * have to sit through half a second to see it. */
+   resumeDeadlineMs?: number;
++  /** The shared counter (chapter 3.8). Optional for the same reason `fanout`
++   * is: 2.5's tests and a single-process dev run have no Redis, and a socket
++   * server that refused to start without one would be a worse default than an
++   * uncounted one. `main.ts` always supplies it, so the optionality is a test
++   * affordance rather than a deployment mode. */
++  limits?: GatewayLimits;
+ }
+ 
+ export function attachSessions({
+@@ -77,6 +137,7 @@ export function attachSessions({
+   fanout,
+   pingIntervalMs = PING_INTERVAL_MS,
+   resumeDeadlineMs = SUBSCRIBE_DEADLINE_MS,
++  limits,
+ }: SessionServerOptions): { registry: Registry; close: () => void } {
+   const registry = new Registry();
+ 
+@@ -125,6 +186,43 @@ export function attachSessions({
+       // memberships. This is the same one call the connect path already made —
+       // it just asks a better question than "what may this user hear".
+       const result = await authenticate(api, token);
++      // Chapter 3.8. THE ESTABLISHMENT LIMIT IS SPENT HERE, before
++      // `handleUpgrade`, and that placement is the whole difference between
++      // this refusal and the one below it.
++      //
++      // A refusal needs to say WHEN to come back. `Retry-After` is an HTTP
++      // header and a close frame has nowhere to put one — a close code and a
++      // short reason string is all the protocol offers, and "4008, try later"
++      // is not an instruction a client can schedule against. So an over-limit
++      // handshake is refused with an HTTP 429 on the upgrade request, which
++      // still has a response to write headers onto (research R7).
++      //
++      // That makes it deliberately unlike the 4001 path immediately below,
++      // which COMPLETES the handshake in order to close it — because EIR-WS-05
++      // asks for a close code on a bad token, and a close code needs a socket
++      // to arrive on. Two refusals, two shapes, each because of what it has to
++      // carry.
++      //
++      // AFTER authentication, not before: the limit belongs to an environment
++      // and nothing knows which environment this is until the api has said so.
++      // The cost is that an unauthenticated flood still reaches the api — which
++      // is what the auth limiter there is for, and why that one counts by
++      // source address instead.
++      if (result.outcome === "ok" && limits !== undefined) {
++        const decision = await limits.spend(
++          result.identity.environmentId,
++          "connect",
++          result.limits.connect,
++        );
++        if (decision.over) {
++          refuseUpgrade(socket, decision);
++          logger.log("info", "connection.rejected", {
++            reason: "rate_limited",
++            environment_id: result.identity.environmentId,
++          });
++          return;
++        }
++      }
+       wss.handleUpgrade(req, socket, head, (ws) => {
+         if (result.outcome === "refused") {
+           // 4001: "invalid or expired token" (EIR-WS-05). The close code is
+@@ -143,7 +241,13 @@ export function attachSessions({
+           });
+           return;
+         }
+-        void open(ws, result.identity, result.channelIds, req.url ?? "/");
++        void open(
++          ws,
++          result.identity,
++          result.channelIds,
++          req.url ?? "/",
++          result.limits.send,
++        );
+       });
+     })();
+   });
+@@ -153,6 +257,7 @@ export function attachSessions({
+     identity: Identity,
+     channelIds: string[],
+     url: string,
++    sendLimit: number,
+   ): Promise<void> {
+     // Cursors are read BEFORE anything else, because their presence decides
+     // whether this connection is born buffering or born live.
+@@ -173,6 +278,7 @@ export function attachSessions({
+       // A fresh connect suppresses nothing; a resume fills this in when it
+       // succeeds, and leaves it null when it degrades.
+       marks: null,
++      sendLimit,
+     };
+ 
+     registry.add(connection);
+@@ -399,6 +505,46 @@ export function attachSessions({
+       return;
+     }
+ 
++    // Chapter 3.8. THE SEND LIMIT IS SPENT ON THE FRAME, not on the api call
++    // it becomes — a socket send and a REST send count against one budget
++    // (FR-002), or a client could double its allowance by opening a socket.
++    //
++    // AND THE CONNECTION STAYS OPEN. Closing it would be the obvious move and
++    // the wrong one: a closed socket makes the client reconnect, a reconnect
++    // costs a handshake, and a handshake spends the ESTABLISHMENT allowance —
++    // a limiter that punishes the limited into hitting a second limit. The
++    // error frame says no to this frame and nothing more; the next one, after
++    // the window turns over, goes through on the connection that is still there.
++    //
++    // The limit is the one this socket was born with (`connection.sendLimit`),
++    // not one re-read per frame: the gateway has no database, and a Postgres
++    // read on the hot path of the thing the limit protects would be a strange
++    // way to protect it. A policy changed mid-connection reaches the client
++    // when it reconnects (research R12).
++    if (limits !== undefined) {
++      const decision = await limits.spend(
++        connection.identity.environmentId,
++        "send",
++        connection.sendLimit,
++      );
++      if (decision.over) {
++        // `rate_limited` — declared in chapter 1.3, emitted here for the first
++        // time. The numbers a 429 would carry in headers have nowhere to live
++        // on a frame, so the retry window goes in the message text; the code is
++        // what a client branches on.
++        sendError(
++          connection.socket,
++          "rate_limited",
++          `send rate limit exceeded; retry in ${decision.retryAfterSeconds}s`,
++        );
++        logger.log("info", "send.rate_limited", {
++          connection_id: connection.id,
++          environment_id: connection.identity.environmentId,
++        });
++        return;
++      }
++    }
++
+     const { channel, text, idem_key } = frame.data.payload;
+     try {
+       const committed = await api.sendMessage(connection.identity, {
+```
+
+```diff title="services/gateway/src/main.ts"
+@@ -3,6 +3,7 @@ import { createLogger, serve, type Logger } from "@relay/service-kit";
+ 
+ import { createApiClient } from "./api-client.js";
+ import { createFanout } from "./fanout.js";
++import { createGatewayLimits } from "./limits.js";
+ import { attachSessions } from "./session.js";
+ 
+ // The gateway — SAD §4.1: terminates WebSockets and never writes to the
+@@ -33,15 +34,22 @@ export function createServer(logger?: Logger) {
+   // here, and no instance knows how many others exist (ADR-07). Scaling
+   // out is adding a process.
+   const fanout = createFanout({ logger: log });
++  // Chapter 3.8. A SECOND Redis client, not fanout's — one of fanout's two is a
++  // subscriber, and a connection in subscribe mode cannot run `INCR`. It is
++  // created here rather than inside `attachSessions` so the tests that call
++  // that function directly stay Redis-free, and so its close has an owner.
++  const limits = createGatewayLimits();
+   const sessions = attachSessions({
+     server,
+     api: createApiClient(process.env.RELAY_API_URL ?? DEFAULT_API_URL),
+     logger: log,
+     fanout,
++    limits,
+   });
+   server.on("close", () => {
+     sessions.close();
+     void fanout.close();
++    void limits.close();
+   });
+   return server;
+ }
+```
+
+### What the suites hold
+
+Three of these are earlier chapters' suites, changed only because `request_id`
+made two error bodies that must be indistinguishable differ in a field that says
+nothing about either.
+
+```diff title="services/gateway/src/session.test.ts"
+@@ -1,16 +1,18 @@
+ import { WebSocket } from "ws";
+ import { afterEach, describe, expect, it } from "vitest";
++import { readFile } from "node:fs/promises";
+ import type { Server } from "node:http";
+ import type { AddressInfo } from "node:net";
+ 
+ import { createLogger, type Logger } from "@relay/service-kit";
+ import { serve } from "@relay/service-kit";
+-import type { Frame } from "@relay/protocol";
++import { CLOSE_CODES, type Frame } from "@relay/protocol";
+ 
+ import type { InternalSendResponse, Message } from "@relay/protocol";
+ 
+ import type { ApiClient } from "./api-client.js";
+ import type { Fanout } from "./fanout.js";
++import { decide, type GatewayLimits } from "./limits.js";
+ import { attachSessions } from "./session.js";
+ 
+ // The door, the frames, and the liveness clock — all provable without a
+@@ -42,7 +44,16 @@ function stubApi(overrides: Partial<ApiClient> = {}): ApiClient {
+     // fake except the ANSWER.
+     session: async (token) =>
+       token === VALID_TOKEN
+-        ? { environment_id: "env-1", user: "tuan", channel_ids: [CHANNEL] }
++        ? {
++            environment_id: "env-1",
++            user: "tuan",
++            channel_ids: [CHANNEL],
++            // Chapter 3.8. The limits ride the session response because the
++            // gateway has no database to read them from — so the stub supplies
++            // them, exactly as the api would. Generous by default: every test
++            // above this line is about something else.
++            limits: { connect: 3_000, send: 600 },
++          }
+         : null,
+     backfill: async () => ({}),
+     sendMessage: async () => committed(42),
+@@ -125,11 +136,34 @@ function stubFanout(): Fanout & {
+   };
+ }
+ 
++/** A counter with no Redis in it (chapter 3.8). The arithmetic is unit-tested
++ * in `limits.test.ts`; what these tests need is control over the ANSWER, so a
++ * refusal is a line of code instead of three thousand sockets. */
++function stubLimits(
++  allowances: { connect?: number; send?: number } = {},
++): GatewayLimits & { spent: { connect: number; send: number } } {
++  const spent = { connect: 0, send: 0 };
++  return {
++    spent,
++    spend: async (_environmentId, operation, limit) => {
++      spent[operation] += 1;
++      // The stub honours whichever allowance the test set, falling back to the
++      // limit the session response carried — which is what makes T034a's
++      // distinction visible: an allowance the test names here is the store's
++      // view, `limit` is the socket's cached one.
++      const allowed = allowances[operation] ?? limit;
++      return decide(spent[operation], allowed, 0, 60_000);
++    },
++    close: async () => {},
++  };
++}
++
+ async function boot(
+   api: ApiClient = stubApi(),
+   pingIntervalMs?: number,
+   fanout?: Fanout,
+   resumeDeadlineMs?: number,
++  limits?: GatewayLimits,
+ ): Promise<Harness> {
+   const server: Server = serve({
+     service: "gateway",
+@@ -143,6 +177,7 @@ async function boot(
+     ...(fanout !== undefined && { fanout }),
+     ...(pingIntervalMs !== undefined && { pingIntervalMs }),
+     ...(resumeDeadlineMs !== undefined && { resumeDeadlineMs }),
++    ...(limits !== undefined && { limits }),
+   });
+   await new Promise<void>((resolve) => server.listen(0, resolve));
+   const { port } = server.address() as AddressInfo;
+@@ -676,3 +711,246 @@ describe("the socket (chapter 2.5)", () => {
+     socket.close();
+   });
+ });
++
++// Chapter 3.8. The socket's two limits — one at the door, one on every frame —
++// and the two shapes a refusal takes, which are different because a handshake
++// has an HTTP response to write headers onto and a frame does not.
++describe("the socket's limits (chapter 3.8)", () => {
++  let harness: Harness | undefined;
++  afterEach(async () => {
++    await harness?.close();
++    harness = undefined;
++  });
++
++  /** The upgrade's HTTP answer, for the case where there is no WebSocket to
++   * ask. `ws` surfaces a non-101 as `unexpected-response`, which hands back the
++   * request and the raw `IncomingMessage` — status and headers included. */
++  function unexpectedResponse(
++    socket: WebSocket,
++  ): Promise<{ status: number; headers: Record<string, string | undefined> }> {
++    return new Promise((resolve, reject) => {
++      const timer = setTimeout(() => reject(new Error("no response")), 2000);
++      socket.on("unexpected-response", (_req, res) => {
++        clearTimeout(timer);
++        res.resume();
++        resolve({
++          status: res.statusCode ?? 0,
++          headers: res.headers as Record<string, string | undefined>,
++        });
++      });
++      socket.on("open", () => {
++        clearTimeout(timer);
++        reject(new Error("the handshake completed"));
++      });
++      socket.on("error", () => {});
++    });
++  }
++
++  it("refuses an over-limit handshake with an HTTP 429, before the handshake (FR-005)", async () => {
++    // An allowance of one, so the second connect is the refused one.
++    harness = await boot(
++      stubApi(),
++      undefined,
++      undefined,
++      undefined,
++      stubLimits({ connect: 1 }),
++    );
++    const first = new WebSocket(`${harness.url}?token=${await token()}`);
++    await nextFrame(first, "connection.ack");
++
++    const second = new WebSocket(`${harness.url}?token=${await token()}`);
++    const { status, headers } = await unexpectedResponse(second);
++    expect(status).toBe(429);
++    // The instruction, not just the refusal. This is the reason the limiter is
++    // a fixed window: `Retry-After` and `X-RateLimit-Reset` both name one
++    // moment, and a refilling bucket's honest answer would be a curve.
++    expect(Number(headers["retry-after"])).toBeGreaterThan(0);
++    expect(headers["x-ratelimit-limit"]).toBe("1");
++    expect(headers["x-ratelimit-remaining"]).toBe("0");
++    expect(headers["x-ratelimit-reset"]).toBeDefined();
++
++    first.close();
++  });
++
++  it("leaves already-open sockets alone when the door is shut (FR-005)", async () => {
++    // The refusal is about establishing connections, not about the ones that
++    // exist. A limiter that killed live sockets to enforce an establishment
++    // limit would be enforcing a concurrency limit, which is a different
++    // promise and one Relay has not made.
++    harness = await boot(
++      stubApi(),
++      undefined,
++      undefined,
++      undefined,
++      stubLimits({ connect: 1 }),
++    );
++    const open = new WebSocket(`${harness.url}?token=${await token()}`);
++    await nextFrame(open, "connection.ack");
++
++    const refused = new WebSocket(`${harness.url}?token=${await token()}`);
++    expect((await unexpectedResponse(refused)).status).toBe(429);
++
++    // Still there, and still working — a round trip rather than a readyState
++    // check, because "the socket object says OPEN" is not the same claim.
++    open.send(
++      JSON.stringify({
++        type: "message.send",
++        payload: { channel: CHANNEL, text: "hello", idem_key: "k1" },
++      }),
++    );
++    expect(await nextFrame(open, "message.ack")).toMatchObject({
++      payload: { seq: 42 },
++    });
++    open.close();
++  });
++
++  it("answers an over-limit frame with rate_limited and KEEPS THE CONNECTION OPEN (FR-004)", async () => {
++    harness = await boot(
++      stubApi(),
++      undefined,
++      undefined,
++      undefined,
++      stubLimits({ send: 1 }),
++    );
++    const socket = new WebSocket(`${harness.url}?token=${await token()}`);
++    await nextFrame(socket, "connection.ack");
++    const send = () =>
++      socket.send(
++        JSON.stringify({
++          type: "message.send",
++          payload: { channel: CHANNEL, text: "hello", idem_key: "k1" },
++        }),
++      );
++
++    send();
++    await nextFrame(socket, "message.ack");
++    send();
++    const error = await nextFrame(socket, "error");
++    // `rate_limited` was declared in chapter 1.3 and emitted by nothing until
++    // now. This is the first line of the codebase that sends it.
++    expect(error).toMatchObject({ payload: { code: "rate_limited" } });
++    // And every error frame carries an id now, which is the other contract
++    // chapter 1.3 wrote down and never wired.
++    expect((error as { payload: { request_id: string } }).payload.request_id)
++      .toBeTruthy();
++
++    // THE POINT: the socket is still up. Closing it would make the client
++    // reconnect, and a reconnect spends the ESTABLISHMENT allowance — a
++    // limiter that pushes the limited into a second limit.
++    expect(socket.readyState).toBe(WebSocket.OPEN);
++    socket.close();
++  });
++
++  it("enforces a CONFIGURED connect limit, not just the default (SC-011, FR-037)", async () => {
++    // The limit arrives on the authentication response, because the gateway has
++    // no database to read it from. A test that only exercised the default would
++    // pass with the plumbing missing entirely.
++    harness = await boot(
++      stubApi({
++        session: async () => ({
++          environment_id: "env-1",
++          user: "tuan",
++          channel_ids: [CHANNEL],
++          limits: { connect: 2, send: 600 },
++        }),
++      }),
++      undefined,
++      undefined,
++      undefined,
++      // No allowance override: the stub honours the limit the session response
++      // carried, so the number under test is the CONFIGURED one.
++      stubLimits(),
++    );
++    const first = new WebSocket(`${harness.url}?token=${await token()}`);
++    await nextFrame(first, "connection.ack");
++    const second = new WebSocket(`${harness.url}?token=${await token()}`);
++    await nextFrame(second, "connection.ack");
++
++    const third = new WebSocket(`${harness.url}?token=${await token()}`);
++    expect((await unexpectedResponse(third)).status).toBe(429);
++    first.close();
++    second.close();
++  });
++
++  it("does not apply a limit changed mid-connection until the client reconnects (research R12)", async () => {
++    // The consequence R12 accepted, asserted so it is a property rather than a
++    // surprise. The alternative is a Postgres read per frame, from a service
++    // that holds no database client, on the hot path of the thing the limit
++    // protects.
++    let configured = 600;
++    harness = await boot(
++      stubApi({
++        session: async () => ({
++          environment_id: "env-1",
++          user: "tuan",
++          channel_ids: [CHANNEL],
++          limits: { connect: 3_000, send: configured },
++        }),
++      }),
++      undefined,
++      undefined,
++      undefined,
++      stubLimits(),
++    );
++    const socket = new WebSocket(`${harness.url}?token=${await token()}`);
++    await nextFrame(socket, "connection.ack");
++
++    // The policy changes to "refuse everything" while the socket is open.
++    configured = 0;
++
++    socket.send(
++      JSON.stringify({
++        type: "message.send",
++        payload: { channel: CHANNEL, text: "hello", idem_key: "k1" },
++      }),
++    );
++    // Still allowed: this connection is spending the allowance it was born
++    // with. A new one would not be.
++    expect(await nextFrame(socket, "message.ack")).toMatchObject({
++      payload: { seq: 42 },
++    });
++
++    const reconnected = new WebSocket(`${harness.url}?token=${await token()}`);
++    await nextFrame(reconnected, "connection.ack");
++    reconnected.send(
++      JSON.stringify({
++        type: "message.send",
++        payload: { channel: CHANNEL, text: "hello", idem_key: "k1" },
++      }),
++    );
++    expect(await nextFrame(reconnected, "error")).toMatchObject({
++      payload: { code: "rate_limited" },
++    });
++
++    socket.close();
++    reconnected.close();
++  });
++
++  it("STILL emits close code 4008 from nowhere (quickstart V7)", async () => {
++    // 4008 reads "quota exhausted". There is no quota yet — quotas are a later
++    // chapter — and reaching for the code because it was declared would collapse
++    // the distinction this chapter is built on: a rate limit is a smoothing
++    // instruction, a quota is a commercial one, and they do not deserve the same
++    // signal. So does 4009, "server shutdown (drain)", for the same kind of
++    // reason (FR-045).
++    //
++    // Grep rather than behaviour, because the claim is about absence: no input
++    // makes the gateway send it, and the only way to check "no input" is to read
++    // what the source can send.
++    const source = await Promise.all(
++      ["session.ts", "limits.ts", "resume.ts", "main.ts"].map((file) =>
++        readFile(new URL(file, import.meta.url), "utf8"),
++      ),
++    );
++    for (const text of source) {
++      expect(text).not.toMatch(/close\(\s*400[89]/);
++    }
++    // A grep that can only pass is not a check. The SAME pattern, aimed at the
++    // codes this file does emit, has to match — otherwise "nothing sends 4008"
++    // would also be true of a typo in the regex.
++    expect(source.join("")).toMatch(/close\(\s*400[12]/);
++    // And the vocabulary still declares them, so this is "unused", not "gone".
++    expect(CLOSE_CODES[4008]).toBeDefined();
++    expect(CLOSE_CODES[4009]).toBeDefined();
++  });
++});
+```
+
+```diff title="services/gateway/src/resume.itest.ts"
+@@ -111,16 +111,19 @@ describe("resume across a real fabric", () => {
+     // The backfill leg is deliberately slow, and a DIFFERENT process — a
+     // different fanout client on the same subject — publishes into the
+     // window. Neither side coordinates; only the buffer saves this.
+     harness = await boot({
+       session: async () => ({
+         environment_id: "env-1",
+         user: "tuan",
+         channel_ids: [CHANNEL],
++        // Chapter 3.8: the limits ride the session response now. Generous, and
++        // beside the point of every test in this file.
++        limits: { connect: 3_000, send: 600 },
+       }),
+       backfill: async () => {
+         await publishFromElsewhere(frame(43));
+         await settle(150); // give Redis time to actually deliver it
+         return {
+           [CHANNEL]: { messages: [frame(42), frame(43)], truncated: false },
+         };
+       },
+@@ -142,16 +145,19 @@ describe("resume across a real fabric", () => {
+   it("delivers a mid-backfill frame that the backfill did not contain", async () => {
+     // Committed after the backfill's snapshot: it exists ONLY in the buffer,
+     // and the flush is the only reason the client ever sees it.
+     harness = await boot({
+       session: async () => ({
+         environment_id: "env-1",
+         user: "tuan",
+         channel_ids: [CHANNEL],
++        // Chapter 3.8: the limits ride the session response now. Generous, and
++        // beside the point of every test in this file.
++        limits: { connect: 3_000, send: 600 },
+       }),
+       backfill: async () => {
+         await publishFromElsewhere(frame(43));
+         await settle(150);
+         return { [CHANNEL]: { messages: [frame(42)], truncated: false } };
+       },
+       sendMessage: async () => {
+         throw new Error("not used");
+@@ -167,16 +173,19 @@ describe("resume across a real fabric", () => {
+   });
+ 
+   it("goes live after the flush, with no buffering left behind", async () => {
+     harness = await boot({
+       session: async () => ({
+         environment_id: "env-1",
+         user: "tuan",
+         channel_ids: [CHANNEL],
++        // Chapter 3.8: the limits ride the session response now. Generous, and
++        // beside the point of every test in this file.
++        limits: { connect: 3_000, send: 600 },
+       }),
+       backfill: async () => ({
+         [CHANNEL]: { messages: [frame(42)], truncated: false },
+       }),
+       sendMessage: async () => {
+         throw new Error("not used");
+       },
+     });
+@@ -210,16 +219,19 @@ describe("resume across a real fabric", () => {
+     // closed, because `marks` was a local variable that `resume()` discarded.
+     //
+     // One number different from the test above it. That is the whole bug.
+     harness = await boot({
+       session: async () => ({
+         environment_id: "env-1",
+         user: "tuan",
+         channel_ids: [CHANNEL],
++        // Chapter 3.8: the limits ride the session response now. Generous, and
++        // beside the point of every test in this file.
++        limits: { connect: 3_000, send: 600 },
+       }),
+       backfill: async () => ({
+         [CHANNEL]: { messages: [frame(42)], truncated: false },
+       }),
+       sendMessage: async () => {
+         throw new Error("not used");
+       },
+     });
+@@ -246,16 +258,19 @@ describe("resume across a real fabric", () => {
+     // This is the case that made the spec's first design unsafe. It proposed
+     // retiring the mark once a higher sequence arrived — which would see the 43,
+     // drop the mark, and then deliver the 42 (research R3).
+     harness = await boot({
+       session: async () => ({
+         environment_id: "env-1",
+         user: "tuan",
+         channel_ids: [CHANNEL],
++        // Chapter 3.8: the limits ride the session response now. Generous, and
++        // beside the point of every test in this file.
++        limits: { connect: 3_000, send: 600 },
+       }),
+       backfill: async () => ({
+         [CHANNEL]: { messages: [frame(42)], truncated: false },
+       }),
+       sendMessage: async () => {
+         throw new Error("not used");
+       },
+     });
+@@ -282,16 +297,19 @@ describe("resume across a real fabric", () => {
+     // backfill it received is a fragment or nothing at all. A mark taken from it
+     // would suppress messages the client never got — turning this chapter's
+     // duplicate into a gap, which constitution II ranks worse.
+     harness = await boot({
+       session: async () => ({
+         environment_id: "env-1",
+         user: "tuan",
+         channel_ids: [CHANNEL],
++        // Chapter 3.8: the limits ride the session response now. Generous, and
++        // beside the point of every test in this file.
++        limits: { connect: 3_000, send: 600 },
+       }),
+       backfill: async () => {
+         throw new Error("backfill unavailable");
+       },
+       sendMessage: async () => {
+         throw new Error("not used");
+       },
+     });
+```
+
+
+
+```diff title="services/api/src/messages/messages.itest.ts"
+@@ -8,6 +8,23 @@ import { AppModule } from "../app.module";
+ import { createDb, createPool } from "../db/client";
+ import { createApiKey, createEnvironment, Repository } from "../db/repository";
+ 
++// Chapter 3.8 added `request_id` to every error body (constitution V's fourth
++// field, promised since 1.3). It is unique per request BY DESIGN, so two error
++// bodies can no longer be compared whole — and comparing them whole is how this
++// suite proves a foreign resource is indistinguishable from an absent one, which
++// is a tenant-isolation property (constitution I).
++//
++// The id is the one field that reveals nothing about the resource, so it is the
++// one field the comparison must drop. Everything discriminating still has to
++// match exactly.
++function withoutRequestId(body: unknown): unknown {
++  if (typeof body !== "object" || body === null) return body;
++  const rest: Record<string, unknown> = { ...(body as Record<string, unknown>) };
++  delete rest["request_id"];
++  return rest;
++}
++
++
+ // The endpoint path (chapter 2.2): guard → pipe → service → repository →
+ // filter, over real HTTP against the compose Postgres. Its own environment,
+ // minted here — no truncate, because tenant isolation means this suite and
+@@ -88,7 +105,9 @@ describe("POST /v1/channels/:channelId/messages", () => {
+     );
+     expect(foreign.status).toBe(404);
+     expect(missing.status).toBe(404);
+-    expect(await foreign.json()).toEqual(await missing.json());
++    expect(withoutRequestId(await foreign.json())).toEqual(
++      withoutRequestId(await missing.json()),
++    );
+   });
+ 
+   it("answers a FOREIGN channel id with the same 404 as a missing one", async () => {
+@@ -97,6 +116,8 @@ describe("POST /v1/channels/:channelId/messages", () => {
+     expect(foreign.status).toBe(404);
+     expect(missing.status).toBe(404);
+     // Indistinguishable — no data, and no reveal that the id exists.
+-    expect(await foreign.json()).toEqual(await missing.json());
++    expect(withoutRequestId(await foreign.json())).toEqual(
++      withoutRequestId(await missing.json()),
++    );
+   });
+ });
+```
+
+```diff title="services/api/src/webhooks/attempts.itest.ts"
+@@ -22,6 +22,23 @@ import {
+ import { encryptSecret, mintSigningSecret } from "./secret";
+ import { MAX_ATTEMPTS } from "./schedule";
+ 
++// Chapter 3.8 added `request_id` to every error body (constitution V's fourth
++// field, promised since 1.3). It is unique per request BY DESIGN, so two error
++// bodies can no longer be compared whole — and comparing them whole is how this
++// suite proves a foreign resource is indistinguishable from an absent one, which
++// is a tenant-isolation property (constitution I).
++//
++// The id is the one field that reveals nothing about the resource, so it is the
++// one field the comparison must drop. Everything discriminating still has to
++// match exactly.
++function withoutRequestId(body: unknown): unknown {
++  if (typeof body !== "object" || body === null) return body;
++  const rest: Record<string, unknown> = { ...(body as Record<string, unknown>) };
++  delete rest["request_id"];
++  return rest;
++}
++
++
+ // The attempt record, against a real broker and a real api (chapter 3.6).
+ //
+ // Invariants 1, 2, 3 and 5 of contracts/attempts.md live here. Invariant 4 is the
+@@ -388,7 +405,9 @@ describe("the attempt record", () => {
+     const second = await report(body);
+     // The dispatcher is told the same thing both times — that is what idempotent
+     // means here — so the repeat is invisible to it.
+-    expect(await first.json()).toEqual(await second.json());
++    expect(withoutRequestId(await first.json())).toEqual(
++      withoutRequestId(await second.json()),
++    );
+ 
+     // Spend a real budget looking for a second event rather than checking once.
+     const events = await collected(scoped.id, 2, 5_000);
+```
+
+```diff title="services/api/src/webhooks/test-event.itest.ts"
+@@ -17,6 +17,23 @@ import {
+ } from "../db/repository";
+ import { encryptSecret, mintSigningSecret } from "./secret";
+ 
++// Chapter 3.8 added `request_id` to every error body (constitution V's fourth
++// field, promised since 1.3). It is unique per request BY DESIGN, so two error
++// bodies can no longer be compared whole — and comparing them whole is how this
++// suite proves a foreign resource is indistinguishable from an absent one, which
++// is a tenant-isolation property (constitution I).
++//
++// The id is the one field that reveals nothing about the resource, so it is the
++// one field the comparison must drop. Everything discriminating still has to
++// match exactly.
++function withoutRequestId(body: unknown): unknown {
++  if (typeof body !== "object" || body === null) return body;
++  const rest: Record<string, unknown> = { ...(body as Record<string, unknown>) };
++  delete rest["request_id"];
++  return rest;
++}
++
++
+ // Proving an endpoint works again (chapter 3.6, FR-013…FR-017, research R8).
+ //
+ // THIS SUITE PLAYS THE DISPATCHER. `POST /test` creates a real delivery and then
+@@ -478,7 +495,9 @@ describe("the test event", () => {
+     // other — and nothing was delivered.
+     const missing = await sendTest(randomUUID(), myKey.credential);
+     expect(missing.status).toBe(404);
+-    expect(await response.json()).toEqual(await missing.json());
++    expect(withoutRequestId(await response.json())).toEqual(
++      withoutRequestId(await missing.json()),
++    );
+     expect(received).toHaveLength(0);
+   }, 60_000);
+ 
+```
+
+```diff title="vitest.coverage.config.mts"
+@@ -53,7 +53,10 @@ export default defineConfig({
+         // Constitution VI, first clause: 70% of business logic. Set to what the
+         // constitution says, not to what the code achieves — a threshold tuned
+         // down to pass measures nothing. Currently met with room to spare
+-        // (86.55% statements, 78.07% branches at the time of writing).
++        // (89.50% statements, 82.73% branches after chapter 3.8, up from 86.55%
++        // and 78.07%). Ten new files, eight of them small and heavily branched,
++        // moved both figures up — which is not the usual direction for a chapter
++        // that adds code, and worth naming for that reason.
+         lines: 70,
+         functions: 70,
+         statements: 70,
+@@ -167,6 +170,76 @@ export default defineConfig({
+           lines: 100,
+           statements: 100,
+         },
++
++        // CHAPTER 3.8's limiter. Pinned at what the work achieves, which for the
++        // three pure files is everything — they hold no clock, no store and no
++        // framework, so a branch they miss is a case nobody thought of rather
++        // than a case nobody could reach.
++        //
++        // `bucket.ts`, `policy.ts` and `fallback.ts` are here at 100 on every
++        // metric. `fallback.ts` earns the strictest reading of constitution VI
++        // available: it is the mechanism the AUTH limiter degrades to, and R3's
++        // whole argument is that this one counter must not fail open. An
++        // unmeasured branch in it is a hole in the thing the chapter is about.
++        "services/api/src/limits/bucket.ts": {
++          branches: 100,
++          functions: 100,
++          lines: 100,
++          statements: 100,
++        },
++        "services/api/src/limits/policy.ts": {
++          branches: 100,
++          functions: 100,
++          lines: 100,
++          statements: 100,
++        },
++        "services/api/src/limits/fallback.ts": {
++          branches: 100,
++          functions: 100,
++          lines: 100,
++          statements: 100,
++        },
++
++        // The four that touch a store, a clock or Nest's request pipeline, pinned
++        // at measurement rather than at 100. Each shortfall is one branch that
++        // needs a real outage at a real instant to reach, and chasing it would
++        // mean mocking the thing under test.
++        //
++        // `store.ts` misses its `downUntil` reset; `auth-limiter.ts` misses the
++        // arm where the store answers AND the fallback has an entry;
++        // `client-address.ts` misses one shape of malformed body. The gateway's
++        // `limits.ts` misses the arm where a recovered store clears `downUntil`
++        // mid-window.
++        "services/api/src/limits/store.ts": {
++          branches: 91,
++          functions: 100,
++          lines: 100,
++          statements: 100,
++        },
++        "services/api/src/limits/auth-limiter.ts": {
++          branches: 87,
++          functions: 100,
++          lines: 100,
++          statements: 100,
++        },
++        "services/api/src/limits/client-address.ts": {
++          branches: 90,
++          functions: 100,
++          lines: 100,
++          statements: 100,
++        },
++        "services/api/src/limits/rate-limit.middleware.ts": {
++          branches: 85,
++          functions: 100,
++          lines: 96,
++          statements: 97,
++        },
++        "services/gateway/src/limits.ts": {
++          branches: 90,
++          functions: 100,
++          lines: 100,
++          statements: 100,
++        },
+       },
+     },
+   },
+```
+
+### Configuration
+
+The `ioredis` restriction is the same shape chapter 2.4 gave `pg`: a store keyed
+per tenant gets one home, and an unrestricted client anywhere else is a
+cross-tenant read waiting to be written.
+
+```diff title="eslint.config.mjs"
+@@ -16,8 +16,28 @@ export default tseslint.config(
+   {
+     // Isolation lives in data access, not in handlers (constitution I):
+     // only the repository layer may touch the driver.
++    //
++    // Chapter 3.8 added the SECOND per-tenant store and the same argument
++    // applies to it. The rate-limit counters are keyed `rl:{environment_id}:…`,
++    // so an unrestricted client would let any handler read or write another
++    // tenant's counter — which is the access this rule exists to prevent, and
++    // constitution I calls that a correctness property rather than a convention.
++    // `services/api/src/limits/**` is the Redis analogue of the repository
++    // layer; the gateway holds its own client in `services/gateway/src/limits.ts`
++    // and for fan-out in `fanout.ts`.
++    //
++    // `limits.itest.ts` is the one TEST allowed a raw client, and for a reason
++    // the rule cannot express: its whole subject is that the api and the gateway
++    // increment the SAME key, and the only way to check that is to read the key
++    // with neither of their code.
+     files: ["**/*.ts"],
+-    ignores: ["services/api/src/db/**"],
++    ignores: [
++      "services/api/src/db/**",
++      "services/api/src/limits/**",
++      "services/gateway/src/limits.ts",
++      "services/gateway/src/limits.itest.ts",
++      "services/gateway/src/fanout.ts",
++    ],
+     rules: {
+       "no-restricted-imports": [
+         "error",
+@@ -33,6 +53,11 @@ export default tseslint.config(
+               message:
+                 "The query engine lives inside the repository layer only (constitution I, ADR-16).",
+             },
++            {
++              name: "ioredis",
++              message:
++                "The counter store lives in services/api/src/limits and services/gateway/src/limits.ts only (constitution I, chapter 3.8). Its keys are per environment; an unrestricted client is a cross-tenant read.",
++            },
+           ],
+           patterns: [
+             {
+```
+
+```diff title="turbo.json"
+@@ -30,10 +30,15 @@
+         "RELAY_OUTBOX_RELAY",
+         "RELAY_DELIVERY_RELAY",
+         "RELAY_INTERNAL_CREDENTIAL",
++        "RELAY_AUTH_FAILURES_PER_MINUTE",
++        "RELAY_AUTH_KEY_PREFIX",
+         "RELAY_WEBHOOK_SECRET_KEY",
+         "RELAY_EVENT_CONSUMER",
+         "RELAY_NATS_REPLICAS",
+-        "RELAY_E2E_API_PORT"
++        "RELAY_E2E_API_PORT",
++        "RELAY_SMTP_URL",
++        "RELAY_MAILPIT_URL",
++        "RELAY_NOTIFICATION_RELAY"
+       ]
+     },
+     "//#lint:root": {
+```
+
+```diff title="packages/e2e/src/harness.ts"
+@@ -340,6 +340,18 @@ export async function boot({ gateways = 2 } = {}): Promise<System> {
+       // would be a second source of truth for a credential.
+       "RELAY_WEBHOOK_SECRET_KEY",
+       "RELAY_INTERNAL_CREDENTIAL",
++      // Chapter 3.8: the failed-authentication threshold and the counter's key
++      // prefix. Forwarded for the reason this list exists at all — turbo runs
++      // tasks in STRICT env mode, so an undeclared variable reaches a child as
++      // `undefined` and the `??` behind it silently wins. A suite that raised the
++      // threshold would raise it in the parent and not in the api the child runs.
++      "RELAY_AUTH_FAILURES_PER_MINUTE",
++      "RELAY_AUTH_KEY_PREFIX",
++      // Chapter 3.8's other half: where the notification relay posts its SMTP.
++      // The lane runs Mailpit on 11025 and the default is 1025, so an
++      // unforwarded variable is not a missing feature — it is a mailer talking
++      // confidently to a port nothing is listening on.
++      "RELAY_SMTP_URL",
+     ),
+     // Chapter 3.3: the api children run WITHOUT the outbox relay. This journey
+     // asserts message delivery, and a background loop draining the outbox while
+@@ -347,6 +359,10 @@ export async function boot({ gateways = 2 } = {}): Promise<System> {
+     // files, not a property of the system. The relay has its own suite, which
+     // drives it explicitly.
+     RELAY_OUTBOX_RELAY: "off",
++    // Chapter 3.8: and no notification relay either, for the same reason. This
++    // journey asserts message delivery; a loop marking rows delivered while
++    // 3.8's own suite asserts on that column is a race between test files.
++    RELAY_NOTIFICATION_RELAY: "off",
+     // Chapter 3.4: no event consumer in these children either, for the reason
+     // the line above exists — this journey asserts message delivery, and a
+     // background consumer writing to a table 3.4's suite asserts on is a race
+```
+
+```diff title="services/api/package.json"
+@@ -19,8 +19,10 @@
+     "@relay/protocol": "workspace:*",
+     "@relay/service-kit": "workspace:*",
+     "drizzle-orm": "^0.45.2",
++    "ioredis": "^6.0.0",
+     "jose": "^6.2.7",
+     "nats": "^2.29.3",
++    "nodemailer": "^9.0.5",
+     "pg": "^8.22.0",
+     "reflect-metadata": "^0.2.2",
+     "rxjs": "^7.8.2",
+@@ -30,6 +32,7 @@
+     "@nestjs/cli": "^11.0.24",
+     "@nestjs/testing": "^11.1.28",
+     "@swc/core": "^1.15.47",
++    "@types/nodemailer": "^8.0.1",
+     "@types/pg": "^8.20.3",
+     "drizzle-kit": "^0.31.10",
+     "unplugin-swc": "^1.5.9"
+```
+
+## What this chapter does not deliver
+
+**Quotas.** FR-RTL-05…08 — monthly caps, hard and soft spending limits, the
+50/80/100% email — are a chapter of their own, and the dependency is the reason
+rather than the length. A quota is metered consumption, and metering arrives with
+the analytics work in Part 4. Building quotas on a Redis counter that fails open
+would put money in a store this chapter has spent its length arguing is allowed to
+lose things.
+
+**FR-RTM-09's concurrent-connection cap**, which needs the `conn:{env}:{user}`
+registry the SAD specifies and the gateway does not have. Presence needs the same
+registry; they belong together.
+
+**Per-API-key limits.** The SRS says per tenant, and the environment is the
+boundary constitution I enforces. A key is a credential, not a tenant.
+
+**A dashboard showing remaining allowance.** There is no dashboard. The headers
+are the half of that promise constitution V requires.
+
+**A drain grace period**, without which the connect limit and NFR-REL-03 only half
+agree. Close code `4009` is declared and waiting.
+
+**A documentation site**, which this chapter is the one to make cost something.
+
+**The email transport.** The disablement notifications chapter 3.6 wrote and
+nothing delivered are built and shipping under this chapter's tag — the code is
+here, `delivered_at` is being set, and 3.6's backlog has drained. The chapter that
+explains it is the next one, because this one measured 4,700 words before that
+prose was written.
+
+Naming a dependency is the difference between a scope decision and a silent gap.
+
+<Checkpoint>
+
+- `rate_limited` emitted for the first time since 1.3 declared it — REST, the
+  frame refusal, and the pre-handshake 429.
+- `request_id` on every error the platform produces.
+- `4008` and `4009` still emitted by nothing, with a test that says so and can
+  fail.
+- Three headers on every 2xx as well as every 429, reporting the budget that
+  refused when one did and the nearest when none did.
+- The tenant limiter serves when Redis is gone; the auth limiter refuses.
+- Two services, one bucket: five REST sends and five frames leave
+  `rl:{env}:send:{window}` at 10.
+- Both lanes green; coverage 89.50% statements and 82.73% branches, up from
+  86.55% and 78.07%.
+- Tag `part3-ch8`.
+
+</Checkpoint>
+
+<ChapterFooter />

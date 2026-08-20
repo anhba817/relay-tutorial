@@ -328,6 +328,23 @@ what the assertion checks, not about how a credential is split. The correction i
 a test-harness bug fix, and putting it in either chapter would show a reader a
 diff that chapter never discusses.
 
+**Extended by chapter 3.8**, and the extension is here rather than in that
+chapter for the reason above: 3.8 teaches rate limiting, not how a credential
+suite compares error bodies.
+
+Two changes. The suite raises `RELAY_AUTH_FAILURES_PER_MINUTE` because it submits
+bad credentials on purpose — that is what it is for — and it now takes its own
+`RELAY_AUTH_KEY_PREFIX` as well. Raising the threshold is private to a vitest
+worker; the Redis key is not, so a suite that raised only its ceiling pushed a
+SHARED count to 8 while being personally immune to it. Measured across a full
+lane at T004a.
+
+And `request_id` on every error body broke the tenant-isolation assertion that
+compares a foreign-credential response with a missing-resource response for
+equality. The property is right — the two must be indistinguishable, or the error
+enumerates what exists — so the comparison now strips the one field that
+legitimately differs.
+
 ```diff title="services/api/src/auth/credentials.itest.ts"
 @@ -15,6 +15,7 @@ import {
    Repository,
@@ -368,6 +385,73 @@ diff that chapter never discusses.
      expect(haystack).not.toContain(token);
      // The prefix alone is not a secret and may legitimately appear.
    });
+@@ -18,6 +18,23 @@ import {
+ import { parseApiKeyCredential } from "./api-key";
+ import { MAX_TOKEN_LIFETIME_SECONDS } from "./user-token";
+ 
++// Chapter 3.8 added `request_id` to every error body (constitution V's fourth
++// field, promised since 1.3). It is unique per request BY DESIGN, so two error
++// bodies can no longer be compared whole — and comparing them whole is how this
++// suite proves a foreign resource is indistinguishable from an absent one, which
++// is a tenant-isolation property (constitution I).
++//
++// The id is the one field that reveals nothing about the resource, so it is the
++// one field the comparison must drop. Everything discriminating still has to
++// match exactly.
++function withoutRequestId(body: unknown): unknown {
++  if (typeof body !== "object" || body === null) return body;
++  const rest: Record<string, unknown> = { ...(body as Record<string, unknown>) };
++  delete rest["request_id"];
++  return rest;
++}
++
++
+ // The refusals, over real HTTP against the compose Postgres (chapter 3.2).
+ // Invariants 1-7, 9 and 11 of contracts/credentials.md live here; 8 and 12 are
+ // pure and live in the unit lane; 10 needs a socket and lives in the gateway's
+@@ -86,6 +103,31 @@ describe("credentials", () => {
+   };
+ 
+   beforeAll(async () => {
++    // Chapter 3.8. This suite submits bad credentials ON PURPOSE — that is what
++    // it is for — and the failed-authentication limiter counts them all against
++    // one loopback address. The default is ten a minute.
++    //
++    // RAISING WORKS HOWEVER POLLUTED THE SHARED COUNT, which is why this is a
++    // threshold and not a private key: the integration lane runs files in
++    // parallel, every suite asserting a `401` lands in the same bucket, and a
++    // high ceiling never refuses. A suite needing a LOW threshold needs its own
++    // key instead — see `limits.itest.ts` (research R21).
++    //
++    // Explicit and visible, rather than the default being chosen to suit the
++    // tests. Chapter 3.6's `RELAY_DISABLE_SWEEP` states the rule: a flag whose
++    // default disabled a requirement would be a requirement nobody had built.
++    process.env["RELAY_AUTH_FAILURES_PER_MINUTE"] = "10000";
++    // AND ITS OWN BUCKET. Raising the threshold is private to this worker —
++    // vitest gives each file its own process — but the Redis key is not, so a
++    // suite that raises its ceiling and keeps the default prefix pushes a SHARED
++    // count up while being personally immune to it. T004a measured this file's
++    // contribution to the default bucket at 8 and signup's at 13, against a
++    // threshold of 10: nothing was refused, and only because the suites that
++    // spawn a child reach the api over `::ffff:127.0.0.1` while this one reaches
++    // it in-process over `::1`. Two address formats were the whole of the
++    // isolation. Now it is a prefix, which is a decision rather than an accident.
++    process.env["RELAY_AUTH_KEY_PREFIX"] =
++      `rlauth-credentials-${Date.now()}`;
+     db = createDb(createPool());
+ 
+     env = await createEnvironment(db, { name: "credentials-itest" });
+@@ -178,7 +220,9 @@ describe("credentials", () => {
+     );
+     expect(foreignAnswer.status).toBe(404);
+     expect(absentAnswer.status).toBe(404);
+-    expect(await foreignAnswer.json()).toEqual(await absentAnswer.json());
++    expect(withoutRequestId(await foreignAnswer.json())).toEqual(
++      withoutRequestId(await absentAnswer.json()),
++    );
+ 
+     // And the reverse direction, so the test cannot pass by both being broken.
+     expect(
 ```
 
 ---
@@ -630,6 +714,13 @@ the remaining seven are all scoped to an environment, an endpoint or an account.
 both are about tenancy and the outbox, not about which assertions survive a
 parallel lane. 3.7 is about the resume duplicate.
 
+**Extended by chapter 3.8** for the same reason as `credentials.itest.ts`: this
+suite raises the failed-authentication threshold and now takes its own key prefix
+too. Its contribution to the shared default bucket measured 13 against a threshold
+of 10, and nothing was refused only because the suites that spawn a child reach
+the api over `::ffff:127.0.0.1` while this one reaches it in-process over `::1`.
+Two address formats were the whole of the isolation.
+
 ```diff title="services/api/src/tenancy/signup.itest.ts"
 @@ -277,20 +277,25 @@ describe("signup", () => {
        const text = await res.text();
@@ -668,6 +759,33 @@ parallel lane. 3.7 is about the resume duplicate.
    });
  
    it("refuses a callback whose state does not match the cookie (invariant 5, over HTTP)", async () => {
+@@ -49,6 +49,26 @@ describe("signup", () => {
+   let provider: Awaited<ReturnType<typeof standInProvider>>;
+ 
+   beforeAll(async () => {
++    // Chapter 3.8 limited account creation per source address (FR-041), and this
++    // suite drives the signup routes repeatedly from one loopback address — which
++    // is what a suite about signup does.
++    //
++    // Raised explicitly and visibly, rather than the default being chosen to suit
++    // the tests. The same move `credentials.itest.ts` makes for the
++    // failed-authentication threshold, and for the same reason: raising survives a
++    // shared count, lowering does not (research R21).
++    process.env["RELAY_AUTH_FAILURES_PER_MINUTE"] = "10000";
++    // AND ITS OWN BUCKET. Raising the threshold is private to this worker —
++    // vitest gives each file its own process — but the Redis key is not, so a
++    // suite that raises its ceiling and keeps the default prefix pushes a SHARED
++    // count up while being personally immune to it. T004a measured this file's
++    // contribution to the default bucket at 8 and signup's at 13, against a
++    // threshold of 10: nothing was refused, and only because the suites that
++    // spawn a child reach the api over `::ffff:127.0.0.1` while this one reaches
++    // it in-process over `::1`. Two address formats were the whole of the
++    // isolation. Now it is a prefix, which is a decision rather than an accident.
++    process.env["RELAY_AUTH_KEY_PREFIX"] =
++      `rlauth-signup-${Date.now()}`;
+     db = createDb(createPool());
+     provider = await standInProvider({
+       id: 90210,
 ```
 
 ---
@@ -705,6 +823,12 @@ the next one passes. It returns whenever the queue rebuilds past fifty.
 batch size of a test helper's drain call. 3.8 is about rate limiting and never
 mentions webhook delivery.
 
+**Extended by chapter 3.9.** The api child this suite spawns now runs a
+notification relay, and a background loop marking rows delivered while another
+suite asserts on that column is a race between test files rather than a property
+of the system. Switched off here exactly as `RELAY_OUTBOX_RELAY` and
+`RELAY_EVENT_CONSUMER` already were — the third instance of one rule.
+
 ```diff title="services/dispatcher/src/dispatcher.itest.ts"
 @@ -264,6 +264,22 @@ describe("the dispatcher", () => {
          ensure: relay.ensureDeliveriesStream,
@@ -729,4 +853,13 @@ mentions webhook delivery.
      });
      return r.drainOnce();
    };
+@@ -108,6 +108,8 @@ function spawnApi(port: number, credential: string): ChildProcess {
+       // Chapter 3.3's finding 4, for the third time: this suite drives the relay
+       // explicitly, so a background copy draining the same table would race it.
+       RELAY_OUTBOX_RELAY: "off",
++      // Chapter 3.8: nor the notification relay, for the same reason.
++      RELAY_NOTIFICATION_RELAY: "off",
+       RELAY_EVENT_CONSUMER: "off",
+       RELAY_DELIVERY_RELAY: "off",
+     },
 ```

@@ -411,26 +411,43 @@ export const series: Part[] = [
         id: "3.8",
         path: "/part-3/chapter-08/limits-you-can-see-coming",
         title: "Limits you can see coming",
-        status: "forthcoming",
+        status: "published",
+        translatedIn: ["vi"],
         // Split from the original "Limits and quotas" entry. A rate limit is
         // ephemeral and may be lost, so Redis is the right store and failing open
         // is the right default; a quota is money and must be durable. One chapter
         // teaching both would teach one storage decision as though it covered
         // both. Quotas also need metering that arrives with Part 4.
-        //
-        // Carries the email transport chapter 3.6 deferred: FR-WHK-07's
-        // notification rows have had `delivered_at` null since 3.6 shipped.
         readerProduces:
-          "Per-environment request counters, the headers on every response, and the notification transport 3.6 was owed",
+          "Per-environment request counters, the headers on every response, and two limiters that fail in opposite directions",
         sourceDoc: "docs/04-srs.md",
         readerMinutes: 90,
         titleVi: "Những giới hạn bạn thấy trước",
         readerProducesVi:
-          "Bộ đếm request theo từng environment, các header trên mọi response, và phương tiện gửi thông báo mà 3.6 còn nợ",
+          "Bộ đếm request theo từng environment, các header trên mọi response, và hai bộ giới hạn hỏng theo hai hướng ngược nhau",
       },
       {
         id: "3.9",
-        path: "/part-3/chapter-09/quotas-and-what-they-cost",
+        path: "/part-3/chapter-09/the-email-nobody-was-sending",
+        title: "The email nobody was sending",
+        status: "published",
+        translatedIn: ["vi"],
+        // Split out of 3.8 at its size gate, with the number in hand: the
+        // limiter half alone measured 4,700 prose words against a 2,000-4,000
+        // bound, and the transport's prose would have taken the chapter past
+        // anything the series has published. The CODE ships under `part3-ch8`
+        // either way — this chapter explains it and fences it.
+        readerProduces:
+          "The outbox pattern a third time, over a column chapter 3.6 already wrote — and Mailpit, because only a received message can prove an email carries no secret",
+        sourceDoc: "docs/04-srs.md, docs/03-journey-map.md",
+        readerMinutes: 60,
+        titleVi: "Email chẳng ai gửi",
+        readerProducesVi:
+          "Mẫu outbox lần thứ ba, trên một cột mà chương 3.6 đã viết sẵn — và Mailpit, vì chỉ thư đã nhận mới chứng minh được email không mang bí mật nào",
+      },
+      {
+        id: "3.10",
+        path: "/part-3/chapter-10/quotas-and-what-they-cost",
         title: "Quotas and what they cost",
         status: "forthcoming",
         // The half of FR-RTL that is money rather than traffic: monthly usage
@@ -447,8 +464,8 @@ export const series: Part[] = [
           "Quota theo tháng, hạn mức chi tiêu, và cách suy giảm chỉ chặn gửi mà không ảnh hưởng history",
       },
       {
-        id: "3.10",
-        path: "/part-3/chapter-10/milestone-the-isolation-gauntlet",
+        id: "3.11",
+        path: "/part-3/chapter-11/milestone-the-isolation-gauntlet",
         title: "Milestone: the isolation gauntlet",
         status: "forthcoming",
         readerProduces:

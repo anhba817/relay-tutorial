@@ -1,0 +1,1065 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figOutboxThrice, figHeadOfLine, figWhatMailpitProves } from "./figures";
+
+export const metadata = {
+  title: "The email nobody was sending — Building Relay",
+  description:
+    "Chapter 3.6 disabled failing webhook endpoints and wrote a row saying so. Nothing read it. The transport is the outbox pattern a third time — and the third time needed no migration at all.",
+  alternates: {
+    canonical: "/part-3/chapter-09/the-email-nobody-was-sending",
+    languages: {
+      en: "/part-3/chapter-09/the-email-nobody-was-sending",
+    },
+  },
+};
+
+<ChapterHeader id="3.9" />
+
+Chapter 3.6 built automatic webhook disablement. An endpoint that fails for an
+hour and twenty attempts gets switched off, and a row is written recording that
+the organisation is owed an explanation:
+
+```ts title="services/api/src/db/repository.ts (excerpt)"
+await tx.insert(webhookDisableNotifications).values({
+  id: randomUUID(),
+  …
+  // NOT SET, and that is the point. FR-WHK-07 asks for the organisation to be
+  // notified by email and this platform has no email; `delivered_at` exists in
+  // order to be null until a transport does.
+});
+```
+
+Two chapters later the rows are still there and `delivered_at` is still null on
+every one of them. FR-WHK-07 is half-delivered: the platform knows it owes an
+email and has no way to send one.
+
+This chapter sends it. The interesting part is not SMTP.
+
+<SkipAhead>
+
+If you must skip: the transport is the **outbox pattern for the third time** —
+claim undelivered rows oldest-first with `FOR UPDATE SKIP LOCKED`, send, mark —
+and the third time needed **no migration**, because chapter 3.6 already wrote a
+`delivered_at` column and left it null. The backlog drains on the first run as
+ordinary undelivered work, with no special case, because by the claim predicate's
+own definition that is what it is. Mailpit goes in `compose.yaml` as a fifth
+container, and the tests read what it **received** rather than what the sender
+passed — FR-021 forbids a secret in an email and only the received message can
+settle that. The pattern is copied from chapter 3.3 and then **deliberately
+diverged from**, because a mail server is up for most addresses and down for one,
+and copying the batch-abort behaviour gave the queue permanent head-of-line
+blocking. The chapter-end state is tag **`part3-ch9`**.
+
+</SkipAhead>
+
+## The table already had the right shape
+
+<Figure caption="Three outboxes, three chapters — and the third cost no schema change." chart={figOutboxThrice} />
+
+Chapter 3.3 drained the `outbox` table to NATS, keyed on `published_at IS NULL`.
+Chapter 3.5 drained `webhook_deliveries` to customers' endpoints, keyed on state
+and a due time. This chapter drains `webhook_disable_notifications` to SMTP, keyed
+on `delivered_at IS NULL`.
+
+That column has existed since chapter 3.6 and has been null on every row ever
+written. Which means the claim predicate the transport needs was written down two
+chapters before the transport existed — and the backlog those two chapters
+accumulated is not a migration problem. It is undelivered work, by the predicate's
+own definition:
+
+```sql title="services/api/src/db/repository.ts (excerpt)"
+WHERE n.delivered_at IS NULL
+ORDER BY n.disabled_at, n.id
+LIMIT $1
+  FOR UPDATE OF n SKIP LOCKED
+```
+
+<Why title="If the backlog needs special handling, the shape is wrong">
+
+The tempting thing is a one-off script: find the rows chapter 3.6 left behind,
+send those, then start the relay. It would work, and it would be evidence of a
+design mistake.
+
+A row written before any transport existed and a row written thirty seconds ago
+differ in exactly one way — their age — and the claim already orders by age.
+Writing code to distinguish them would be asserting they are different kinds of
+thing when they are the same kind of thing. There is a test that drives three
+separate disablements and drains all three on one ordinary pass, and it looks
+like every other test in the file, which is the point.
+
+</Why>
+
+`FOR UPDATE OF n SKIP LOCKED` is chapter 3.3's mechanism unchanged: two api
+instances can drain at once and skip each other's claimed rows rather than
+blocking on them. `OF n` is the addition — the claim joins `environments`,
+`applications` and `webhook_endpoints` to build the message, and locking those
+rows too would make sending an email block a customer editing their endpoint.
+
+## Mailpit, and constitution VII
+
+Constitution VII asks a fifth container to justify itself. Here is the
+justification, and it is FR-021:
+
+> The notification MUST NOT contain the endpoint's signing secret, an API key, or
+> any other credential.
+
+<Figure caption="Why the assertion needs a server rather than a stub." chart={figWhatMailpitProves} />
+
+That is a claim about the **contents of an email**. A stub mailer records the
+object the sender passed it, so a test asserting on the stub is reading its own
+input back — and a mailer that put a secret into a header the stub does not model
+would pass. The only artefact that can settle it is a message a server took
+delivery of, headers, encoding and all.
+
+So Mailpit: an SMTP server that accepts everything, delivers nothing, and exposes
+an HTTP API for reading what it caught. Ports `11025` and `18025`, off the
+defaults, matching the `15432`/`16379`/`14222` convention every other store in
+this compose file follows — so the lane cannot collide with a developer's own
+containers. A healthcheck, because without one `docker compose up -d --wait`
+waits for *running* rather than for *ready*, and the suite can read the API
+before it is serving. No volume: a test inbox that survived a restart would be a
+test inbox that leaks state between runs.
+
+<Trap title="`INFRA_SERVICES` knew about four containers and the gate could not tell">
+
+`packages/config/src/infra.test.ts` has checked since chapter 1.2 that every
+service named in `INFRA_SERVICES` appears in `compose.yaml`. It ran one way. A
+container added to compose and never registered was invisible — the constant
+would quietly stop naming the local infrastructure while the gate stayed green.
+
+Adding a fifth container is what found it. The reverse assertion is four lines:
+
+```ts title="packages/config/src/infra.test.ts (excerpt)"
+const services = compose.slice(0, compose.indexOf("\nvolumes:"));
+const declared = [...services.matchAll(/^ {2}([a-z][a-z0-9-]*):$/gm)]
+  .map((match) => match[1])
+  .filter((service) => !ours.has(service));
+expect([...declared].sort()).toEqual([...INFRA_SERVICES].sort());
+```
+
+The slice matters. Volume names sit at the same indentation one block down, so a
+sweep of the whole file reports `postgres-data` as an unregistered service — which
+is how the first version of this assertion failed, correctly, for the wrong
+reason.
+
+</Trap>
+
+## The message, and the seam that makes FR-021 true
+
+The mailer is two pieces, and the split is the security control.
+
+```ts title="services/api/src/notifications/mailer.ts (excerpt)"
+export interface DisableFacts {
+  endpointUrl: string;
+  environmentName: string;
+  disabledAt: Date;
+  runStartedAt: Date;
+  attempts: number;
+  /** Null when the endpoint never answered — a refused connection has no status. */
+  lastStatus: number | null;
+  lastError: string | null;
+}
+```
+
+`disableNotification(facts)` turns that into a subject and a body, touching no
+SMTP, no clock and no database — so what the email *says* is decided by a unit
+test. `createMailer()` is the part that talks to a server, and is thin enough
+that there is nothing in it to get wrong.
+
+`DisableFacts` has **no field for a secret**. The mailer cannot leak one it was
+never given, which makes FR-021 a property of the type rather than of a filter
+over the output — and a filter is what you write once the shape has already lost.
+
+The scan runs anyway, in both the unit test and against what Mailpit received,
+because "cannot happen" is a claim and a scan is evidence.
+
+<Trap title="A scan that forbids the word also forbids saying there isn’t one">
+
+The first version of the scan looked for `/\bsecret\b/i` anywhere in the message,
+and the message failed it. Not because it contained one — because the body says:
+
+> This message contains no signing secret and no credential. If you need the
+> secret to verify deliveries, read it from the dashboard.
+
+Which is a sentence worth keeping. A reader who has just been told their endpoint
+is off will wonder where the secret went, and answering costs two lines.
+
+So the scan splits. Values are forbidden absolutely — `rk_live_`, `whsec_`, a JWT
+by its base64 header, any run of forty base64 characters. Labels are forbidden
+only when a value follows: `/\bsecret\b\s*[:=]/`. A blunt word scan would push the
+prose into talking around the subject while a base64 blob three lines down went
+unnoticed, which is the wrong trade in both directions.
+
+And the label scan is proved able to fire:
+
+```ts title="services/api/src/notifications/mailer.test.ts (excerpt)"
+expect("signing secret: whsec_abc").toMatch(/\bsecret\b\s*[:=]/i);
+```
+
+</Trap>
+
+## Recipients, resolved at send time
+
+```ts title="services/api/src/db/repository.ts (excerpt)"
+SELECT DISTINCT h.email
+  FROM memberships m
+  JOIN humans h ON h.id = m.human_id
+ WHERE m.organisation_id = $1
+   AND h.email IS NOT NULL
+```
+
+The organisation comes from the **row**, not from the endpoint's current owner.
+Chapter 3.6 denormalised `organisation_id` onto the notification for exactly this,
+with the reason written into the schema at the time:
+
+> this row records an obligation AS IT STOOD when the endpoint was disabled, and
+> an application moving between organisations later must not silently retarget a
+> notification that was already owed to somebody else
+
+This chapter is the first code to depend on that, two chapters after the column
+was added. A denormalisation with a written reason and no reader is a bet; this is
+the bet paying.
+
+Every member with an address, not only the owners. `memberships.role` is one of
+owner, admin or member, and picking a subset here would be this chapter inventing
+a notification-preferences model — which is product.
+
+One message per recipient, never one message with several addresses on it. A
+customer's colleagues' email addresses are that customer's data, and a `To` header
+every recipient can read is a disclosure nobody asked for.
+
+## Nobody to write to
+
+`humans.email` is nullable. A human who signed in through a provider that returned
+no address has none, so an organisation whose every member is unaddressable is a
+state the schema permits — a branch, not a defensive `if`.
+
+```ts title="services/api/src/notifications/notification-relay.ts (excerpt)"
+if (recipients.length === 0) {
+  logger.log("error", "notifications.unaddressable", {
+    organisation_id: row.organisationId,
+    notification_id: row.id,
+    detail:
+      "webhook disablement could not be notified: no member has an email address",
+  });
+  return;
+}
+```
+
+Returning normally **marks the row delivered**, and that is deliberate. There is
+no address to retry to, and leaving it claimable means reclaiming the same
+undeliverable row every five seconds for ever. What replaces the email is the log
+line: the obligation is discharged as far as it can be, and the fact that it could
+not be met is recorded rather than swallowed.
+
+## The mutation that could not fail
+
+The chapter's sabotage battery includes one aimed at this file: **mark
+`delivered_at` before the send returns**. It must fail the test that says the mark
+comes after.
+
+It passed.
+
+<Why title="A transaction rolled back the thing the mutation was attacking">
+
+The batch was one transaction, copied from chapter 3.3. A send that threw escaped
+the transaction callback, Postgres rolled the whole thing back, and the `finally`
+block's `UPDATE … SET delivered_at = now()` went with it.
+
+So marking before the send and marking after it produced *identical* observable
+behaviour. The ordering the mutation attacks was not an ordering the system had —
+and the comment above the `finally`, inherited from 3.3, described a guarantee the
+rollback was quietly removing.
+
+</Why>
+
+Following that through found a worse fault than the mutation was looking for.
+
+<Figure caption="One address a mail server refuses, and the queue stops for ever." chart={figHeadOfLine} />
+
+Rows are claimed **oldest-first**. A row that always throws — an address a mail
+server rejects outright, which is an ordinary thing for an address to be — is
+therefore always claimed first, always aborts the batch, and every notification
+behind it is never delivered. Permanent head-of-line blocking of the whole queue,
+from one bad recipient.
+
+The fix is per-row isolation:
+
+```ts title="services/api/src/db/repository.ts (excerpt)"
+for (const raw of claimed.rows) {
+  try {
+    await deliver(row);
+    delivered.push(row.id);
+  } catch (error) {
+    // Not marked. The row stays claimable and the next pass tries it again,
+    // which is the whole reason this is a table rather than a call.
+    onError(row, error);
+  }
+}
+```
+
+Nothing rolls back now, so the ordering is real and the mutation fails as it
+should. And there is a test named after the failure nobody was looking for: one
+address Mailpit rejects, one good address behind it, and the good one goes.
+
+<Why title="Why this diverges from the outbox one screen up">
+
+`drainOutbox` lets a failing publish abort its batch, and that is right for it. A
+broker is up or down: a publish failing means the next one will too, so aborting
+loses nothing and the next pass retries the lot.
+
+A mail server is not like that. It is up for most addresses and down for one. The
+difference is in the dependency, not in the pattern — and copying the shape
+without re-deriving it for a new dependency is exactly how this got written the
+first time. The outbox pattern is right; "the same pattern" is not the same as
+"the same code".
+
+Whether `drainOutbox` has an equivalent problem is a real question this chapter
+does not answer. Its failure mode is milder — an all-or-nothing broker makes a
+single permanently-unpublishable row unlikely — but "unlikely" is not
+"impossible", and the file now has a neighbour that reads differently for a
+reason a reader can see.
+
+</Why>
+
+<Trap title="`git checkout --` ate the fix, in the chapter that warned about it">
+
+The sabotage battery's revert step is `git checkout -- <file>`. Chapter 3.6's
+battery lost an uncommitted correction to it and failed its own byte-identical
+check, so chapter 3.8's task list says **commit before running the battery**, in
+bold, twice.
+
+It happened again. The per-row fix was written in response to a mutation that had
+just passed, verified against nine green tests, and then destroyed by the revert
+step of that same mutation — because it had not been committed, and
+`git checkout --` cannot tell a correction from a sabotage.
+
+The instruction was not forgotten. It was insufficient: "commit before the
+battery" is satisfiable once, and the battery is a loop. The rule that survives
+contact is **commit before every mutation**.
+
+</Trap>
+
+## What the mail server going away costs
+
+Nothing, and there is a test that says so.
+
+Disabling an endpoint writes a row and returns; whether anybody can be emailed is
+this loop's problem and nobody else's. With the relay pointed at a port that
+answers nothing: no throw, no delivery, the row still claimable, and a second
+endpoint disables normally in the meantime. Message delivery, the API and webhook
+dispatch never touch SMTP at all.
+
+That is the reason the transport is a table and a loop rather than a call inside
+the disablement path. An SMTP timeout inside `sweepDisabledEndpoints` would make a
+mail outage into a webhook outage — trading the least important dependency in the
+system for one of the most.
+
+The relay polls every five seconds rather than the event relay's 200ms. Nothing is
+waiting on it: FR-WHK-07 asks that the organisation be told, not that it be told
+within the second, and a mail server polled five times a second by a service with
+nothing to send is a service being rude to its dependencies.
+
+## The chapter in full
+
+Everything above, as the repository holds it.
+
+### The transport
+
+Three new files. `mailer.ts` splits the message from the sending, because what
+an email SAYS is decided by a unit test and what SMTP does is not.
+
+```ts title="services/api/src/notifications/mailer.ts"
+import { createTransport, type Transporter } from "nodemailer";
+
+// The disablement notification (chapter 3.8, FR-021, FR-WHK-07).
+//
+// TWO PIECES, SEPARATED ON PURPOSE. `disableNotification` turns facts into a
+// message and touches nothing — no SMTP, no clock, no database — so what the
+// email SAYS is decided by a unit test. `createMailer` is the part that talks to
+// a server, and it is thin enough that there is nothing in it to get wrong.
+//
+// THE SEAM IS THE SECURITY CONTROL. `DisableFacts` has no field for a secret, so
+// the mailer cannot leak one it was never given — FR-021 is enforced by the
+// shape of the input rather than by a filter over the output, and a filter is
+// what you write when the shape already lost. The test scans the message anyway,
+// because "cannot happen" is a claim and a scan is evidence.
+
+/** Everything the message is allowed to know. */
+export interface DisableFacts {
+  endpointUrl: string;
+  environmentName: string;
+  disabledAt: Date;
+  runStartedAt: Date;
+  attempts: number;
+  /** Null when the endpoint never answered — a refused connection has no status. */
+  lastStatus: number | null;
+  lastError: string | null;
+}
+
+export interface Mail {
+  subject: string;
+  text: string;
+}
+
+/** How long the failing run went on, in whole minutes. Rounded up, because "0
+ * minutes" reads as "no time passed" for a run that lasted forty seconds. */
+function durationMinutes(from: Date, to: Date): number {
+  return Math.max(1, Math.ceil((to.getTime() - from.getTime()) / 60_000));
+}
+
+export function disableNotification(facts: DisableFacts): Mail {
+  const host = new URL(facts.endpointUrl).host;
+  // What it was failing WITH. A status when there was one, the transport error
+  // when the request never got far enough to have one. Printing `null` would be
+  // accurate and unusable.
+  const cause =
+    facts.lastStatus !== null
+      ? `HTTP ${facts.lastStatus}`
+      : (facts.lastError ?? "no response");
+  const minutes = durationMinutes(facts.runStartedAt, facts.disabledAt);
+
+  return {
+    subject: `Relay disabled your webhook endpoint at ${host}`,
+    text: [
+      `Relay has stopped delivering webhooks to:`,
+      ``,
+      `    ${facts.endpointUrl}`,
+      ``,
+      `Environment: ${facts.environmentName}`,
+      `Failing for: ${minutes} minute${minutes === 1 ? "" : "s"}`,
+      `Attempts:    ${facts.attempts}`,
+      `Last result: ${cause}`,
+      ``,
+      // The instruction, not just the state. A notification that reports a
+      // problem without naming the action is a notification that becomes a
+      // support ticket.
+      `Deliveries will not resume on their own. Fix the endpoint, then`,
+      `re-enable it from the webhook settings for this environment.`,
+      ``,
+      // Said explicitly, because the absence is the thing a reader will wonder
+      // about. Nothing here identifies the endpoint beyond its own URL.
+      `This message contains no signing secret and no credential. If you`,
+      `need the secret to verify deliveries, read it from the dashboard.`,
+    ].join("\n"),
+  };
+}
+
+export const DEFAULT_SMTP_URL = "smtp://localhost:1025";
+
+export interface Mailer {
+  send: (to: string, mail: Mail) => Promise<void>;
+  close: () => void;
+}
+
+/** A full URL with a default here, never a host and a port the caller composes.
+ * `harness.ts` records what the other shape costs: a caller that builds its own
+ * URL is a second source of truth for an address, which is how the e2e suite
+ * first failed. */
+export function createMailer(
+  url: string = process.env["RELAY_SMTP_URL"] ?? DEFAULT_SMTP_URL,
+  from = "Relay <relay@relay.example>",
+): Mailer {
+  const transport: Transporter = createTransport(url);
+  return {
+    send: async (to, mail) => {
+      await transport.sendMail({ from, to, ...mail });
+    },
+    close: () => {
+      transport.close();
+    },
+  };
+}
+```
+
+```ts title="services/api/src/notifications/notification-relay.ts"
+import type { Logger } from "@relay/service-kit";
+
+import type { Db } from "../db/client";
+import {
+  drainDisableNotifications,
+  organisationRecipients,
+  type DisableNotificationRow,
+} from "../db/repository";
+import { disableNotification, type Mailer } from "./mailer";
+
+// The notification relay (chapter 3.8, FR-018 to FR-023).
+//
+// THE OUTBOX A THIRD TIME, and deliberately the same shape as chapter 3.3's:
+// claim undelivered rows oldest-first with `FOR UPDATE SKIP LOCKED`, do the
+// side effect, mark what succeeded, and put the mark in a `finally`. A reader
+// who understood the event relay understands this one, which is the argument
+// for reaching for a pattern the codebase already has rather than a queue
+// library it does not (constitution VII).
+//
+// WHAT IS DIFFERENT is that the side effect is an email, which cannot be undone
+// and cannot be deduplicated by the recipient. That pushes every ambiguous case
+// the same way: send once too few rather than once too many is WRONG here —
+// FR-WHK-07 exists because an endpoint went quiet and nobody was told — so a
+// crash between the send and the mark resends, and the chapter says so.
+//
+// It also makes a failing row a ROW's problem rather than the batch's. The event
+// relay lets one bad publish abort its batch, because a broker is up or down;
+// one address a mail server refuses is one address, and aborting on it would
+// abort every batch for ever — it is claimed first, being oldest. The repository
+// catches per row and this callback is where the failure surfaces.
+//
+// NOT ON THE REQUEST PATH, for chapter 3.3's reason. Disabling an endpoint
+// writes a row and returns; whether a mail server is reachable is this loop's
+// problem. An SMTP timeout inside the dispatcher's disablement check would make
+// a mail outage into a webhook outage.
+
+/** Rows per pass. Smaller than the event relay's hundred because each row is a
+ * network round trip to a mail server rather than a publish to a local broker,
+ * and a batch is a transaction. */
+const BATCH_SIZE = 20;
+
+/** Slower than the event relay's 200ms, and it should be. Nothing is waiting on
+ * this: FR-WHK-07 asks that the organisation be told, not that it be told within
+ * the second, and a mail server polled five times a second by a service with
+ * nothing to send is a service being rude to its dependencies. */
+const IDLE_INTERVAL_MS = 5_000;
+
+export interface NotificationRelay {
+  start(): void;
+  stop(): Promise<void>;
+  /** One pass, for tests and for the walk script — the same code path `start`
+   * runs, so nothing is proven about a loop only tests exercise. */
+  drainOnce(): Promise<number>;
+}
+
+export function createNotificationRelay({
+  db,
+  mailer,
+  logger,
+  batchSize = BATCH_SIZE,
+  intervalMs = IDLE_INTERVAL_MS,
+}: {
+  db: Db;
+  mailer: Mailer;
+  logger: Logger;
+  batchSize?: number;
+  intervalMs?: number;
+}): NotificationRelay {
+  let running = false;
+  let loop: Promise<void> = Promise.resolve();
+
+  async function deliver(row: DisableNotificationRow): Promise<void> {
+    // Resolved from the ROW's organisation, not from the endpoint's current
+    // owner. Chapter 3.6 denormalised that column so this lookup could not
+    // follow an application that moved after the disablement (FR-022).
+    const recipients = await organisationRecipients(db, row.organisationId);
+
+    if (recipients.length === 0) {
+      // A REAL BRANCH, not a defensive `if`. `humans.email` is nullable — a
+      // human who signed in through a provider that returned no address has
+      // none — so an organisation whose every member is unaddressable is a
+      // state the schema permits and this code will meet (FR-023).
+      //
+      // The row is still marked delivered. There is no address to retry to, and
+      // leaving it claimable would mean this relay reclaimed the same
+      // undeliverable row every five seconds for ever. What replaces the email
+      // is this log line: the obligation is discharged as far as it can be, and
+      // the fact that it could not be met is recorded rather than swallowed.
+      logger.log("error", "notifications.unaddressable", {
+        organisation_id: row.organisationId,
+        notification_id: row.id,
+        detail:
+          "webhook disablement could not be notified: no member has an email address",
+      });
+      return;
+    }
+
+    const mail = disableNotification({
+      endpointUrl: row.endpointUrl,
+      environmentName: row.environmentName,
+      disabledAt: row.disabledAt,
+      runStartedAt: row.runStartedAt,
+      attempts: row.runAttempts,
+      lastStatus: row.lastStatus,
+      lastError: row.lastError,
+    });
+
+    // Sequential, and one message per recipient rather than one message with
+    // several addresses on it: a customer's colleagues' email addresses are
+    // that customer's data, and putting them in a header every recipient can
+    // read is a disclosure nobody asked for.
+    for (const to of recipients) {
+      await mailer.send(to, mail);
+    }
+    logger.log("info", "notifications.sent", {
+      notification_id: row.id,
+      recipients: recipients.length,
+    });
+  }
+
+  async function drainOnce(): Promise<number> {
+    return drainDisableNotifications(db, batchSize, deliver, (row, error) => {
+      // One row's failure, one line, and the batch keeps going. A mail server
+      // that is down produces one of these per claimed row and then a drain of
+      // zero, which the loop treats as idle — correct, because there is nothing
+      // this process can do but wait.
+      logger.log("error", "notifications.send_failed", {
+        notification_id: row.id,
+        error: String(error),
+      });
+    });
+  }
+
+  async function run(): Promise<void> {
+    while (running) {
+      try {
+        const sent = await drainOnce();
+        if (sent > 0) {
+          // A count and an id. Never an address: a recipient list in a log line
+          // is a customer's people in an operator's terminal (NFR-SEC-06).
+          logger.log("info", "notifications.drained", { count: sent });
+          continue;
+        }
+      } catch (error) {
+        // A mail server that is down lands here. Rows stay claimable and the
+        // next pass tries again, which is the whole reason this is a table
+        // rather than a call.
+        logger.log("error", "notifications.drain_failed", {
+          error: String(error),
+        });
+      }
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    }
+  }
+
+  return {
+    start() {
+      if (running) return;
+      running = true;
+      loop = run();
+    },
+    async stop() {
+      running = false;
+      await loop;
+      mailer.close();
+    },
+    drainOnce,
+  };
+}
+```
+
+```ts title="services/api/src/notifications/notifications.module.ts"
+import { Inject, Injectable, Module, type OnModuleDestroy } from "@nestjs/common";
+
+import { createLogger } from "@relay/service-kit";
+
+import { createDb, createPool, type Db } from "../db/client";
+import { createMailer } from "./mailer";
+import {
+  createNotificationRelay,
+  type NotificationRelay,
+} from "./notification-relay";
+
+// The notification relay's home (chapter 3.8). Same shape as the outbox
+// module's, deliberately: a loop that reads a table, does a side effect, and
+// shares no state with the request path — so promoting it out of this service
+// would mean moving this file and nothing else.
+
+export const NOTIFICATION_RELAY = "NOTIFICATION_RELAY";
+
+/** Off for the suites that want a quiet database, on everywhere else. Same
+ * switch and same reasoning as `RELAY_OUTBOX_RELAY`: most integration tests
+ * assert on rows, and a background loop marking them delivered mid-assertion is
+ * a race between test files rather than a property of the system.
+ *
+ * FLAPPING IS NOT SOLVED HERE, and is worth naming rather than discovering. An
+ * endpoint that is disabled, re-enabled and disabled again produces two rows and
+ * two emails, and nothing collapses them — the spec's own edge case says neither
+ * must suppress the other, because a second outage really is a second thing to
+ * be told about. An endpoint flapping hourly therefore sends hourly. Solving it
+ * means a notification-preferences model, which is product. */
+export function notificationRelayEnabled(): boolean {
+  return (
+    (process.env.RELAY_NOTIFICATION_RELAY ?? "on").toLowerCase() !== "off"
+  );
+}
+
+@Injectable()
+export class NotificationRelayService implements OnModuleDestroy {
+  constructor(
+    @Inject(NOTIFICATION_RELAY) private readonly relay: NotificationRelay,
+  ) {}
+
+  start(): void {
+    if (notificationRelayEnabled()) this.relay.start();
+  }
+
+  async onModuleDestroy(): Promise<void> {
+    await this.relay.stop();
+  }
+}
+
+@Module({
+  providers: [
+    {
+      provide: NOTIFICATION_RELAY,
+      useFactory: (): NotificationRelay =>
+        createNotificationRelay({
+          db: createDb(createPool()) as Db,
+          mailer: createMailer(),
+          logger: createLogger("notifications"),
+        }),
+    },
+    NotificationRelayService,
+  ],
+  exports: [NOTIFICATION_RELAY, NotificationRelayService],
+})
+export class NotificationsModule {}
+```
+
+### The claim, and where it is started
+
+The repository gains the drain and the recipient lookup; `main.ts` starts the
+loop beside the other two.
+
+```diff title="services/api/src/db/repository.ts"
+@@ -306,6 +349,169 @@ export async function drainOutbox(
+   });
+ }
+ 
++// ---------------------------------------------------------------------------
++// The disablement notifications (chapter 3.8, FR-018 to FR-020). THE OUTBOX A
++// THIRD TIME — after chapter 3.3's events and chapter 3.5's deliveries — and
++// this one needed no migration at all: chapter 3.6 gave the table a
++// `delivered_at` column and left it null throughout, which is a claim predicate
++// already written down.
++//
++// The backlog 3.6 accumulated therefore drains on the first run with NO SPECIAL
++// HANDLING. By the predicate's own definition those rows are undelivered work,
++// and code that treated them as a migration would be code asserting they are
++// different when they are not (FR-020).
++//
++// Admin surface, like `drainOutbox`: one relay serves every environment, because
++// a notification is an obligation the platform owes rather than tenant traffic.
++// ---------------------------------------------------------------------------
++
++export interface DisableNotificationRow {
++  id: string;
++  organisationId: string;
++  /** What to call the environment in an email. `environments` has a `kind` —
++   * development, staging, production — and no name of its own, so on its own it
++   * is ambiguous for an organisation with four applications. The application's
++   * name and the kind together are the shortest thing a reader can act on. */
++  environmentName: string;
++  endpointUrl: string;
++  disabledAt: Date;
++  runStartedAt: Date;
++  runAttempts: number;
++  lastStatus: number | null;
++  lastError: string | null;
++}
++
++/** Claim up to `limit` undelivered notifications, hand each to `deliver`, and
++ * mark the ones that went out — all inside ONE transaction.
++ *
++ * AN EXPLICIT LIMIT, no default. Chapter 3.7's baseline found four suites broken
++ * by tests that asserted local facts about a global, oldest-first operation, and
++ * this is another global operation: a caller that wants only its own rows drained
++ * has to say how many, and a test that forgets ends up asserting about somebody
++ * else's fixture.
++ *
++ * SEND THEN MARK: a crash between the two resends one email, which is the
++ * accepted cost, and marking first would lose it silently — a notification
++ * nobody received is the failure FR-WHK-07 exists to prevent.
++ *
++ * PER-ROW ISOLATION, and this is where it departs from `drainOutbox` one screen
++ * up. That one lets a failing publish abort the batch, on the reasoning that the
++ * broker is either up or down and a partial batch means down. An email is not
++ * like that: one address a server refuses is one address, and letting it abort
++ * the batch would make it abort EVERY batch — claimed first because it is
++ * oldest, throwing, rolling back, and no notification behind it ever going out.
++ * Head-of-line blocking, permanent, from one bad recipient.
++ *
++ * So a row that throws is reported through `onError` and simply not marked. It
++ * stays claimable and the rows behind it still go.
++ *
++ * A NOTE ON WHY THE ORDERING IS OBSERVABLE AT ALL. It was not, at first: with
++ * the mark in a `finally` and the throw escaping the transaction callback, the
++ * transaction rolled back and undid the mark, so marking BEFORE the send and
++ * marking after it produced identical behaviour. The chapter's own sabotage
++ * mutation could not fail (research R44). Catching per row is what makes the two
++ * different, because now nothing rolls back.
++ */
++export async function drainDisableNotifications(
++  db: Db,
++  limit: number,
++  deliver: (row: DisableNotificationRow) => Promise<void>,
++  onError: (row: DisableNotificationRow, error: unknown) => void = () => {},
++): Promise<number> {
++  return db.transaction(async (tx) => {
++    const claimed = (await tx.execute(
++      sql`SELECT n.id                AS "id",
++                 n.organisation_id   AS "organisationId",
++                 a.name || ' / ' || e.kind AS "environmentName",
++                 w.url               AS "endpointUrl",
++                 n.disabled_at       AS "disabledAt",
++                 n.run_started_at    AS "runStartedAt",
++                 n.run_attempts      AS "runAttempts",
++                 n.last_status       AS "lastStatus",
++                 n.last_error        AS "lastError"
++            FROM webhook_disable_notifications n
++            JOIN environments e ON e.id = n.environment_id
++            JOIN applications a ON a.id = e.application_id
++            JOIN webhook_endpoints w ON w.id = n.endpoint_id
++           WHERE n.delivered_at IS NULL
++           ORDER BY n.disabled_at, n.id
++           LIMIT ${limit}
++             FOR UPDATE OF n SKIP LOCKED`,
++    )) as unknown as {
++      rows: (Omit<DisableNotificationRow, "disabledAt" | "runStartedAt"> & {
++        disabledAt: string | Date;
++        runStartedAt: string | Date;
++      })[];
++    };
++
++    const delivered: string[] = [];
++    for (const raw of claimed.rows) {
++      // Timestamps back as `Date`, not as whatever the driver felt like. Raw
++      // SQL through `execute` skips drizzle's column mapping, and a timestamptz
++      // arrives as a string — which reaches the mailer as an object with no
++      // `getTime`, one call later and one file away. Coerced here, at the
++      // boundary that produced it, rather than defended against downstream.
++      const row: DisableNotificationRow = {
++        ...raw,
++        disabledAt: new Date(raw.disabledAt),
++        runStartedAt: new Date(raw.runStartedAt),
++      };
++      try {
++        await deliver(row);
++        delivered.push(row.id);
++      } catch (error) {
++        // Not marked. The row stays claimable and the next pass tries it again,
++        // which is the whole reason this is a table rather than a call.
++        onError(row, error);
++      }
++    }
++
++    if (delivered.length > 0) {
++      // The builder rather than raw SQL, unlike the outbox drain one screen up.
++      // That one interpolates `ARRAY[…]::bigint[]` through `sql.raw` because its
++      // ids are integers; these are uuids, and `sql` renders a JS array as a
++      // comma-separated parameter list — which Postgres reads as a row
++      // expression and rejects with "record type has too many columns".
++      await tx
++        .update(webhookDisableNotifications)
++        .set({ deliveredAt: new Date() })
++        .where(inArray(webhookDisableNotifications.id, delivered));
++    }
++    return delivered.length;
++  });
++}
++
++/** The addresses to notify for an organisation, at SEND TIME (FR-022).
++ *
++ * Resolved from the row's `organisation_id`, which chapter 3.6 denormalised onto
++ * the notification precisely so this lookup could not follow the endpoint's
++ * CURRENT owner. An application that moved between organisations after the
++ * disablement must not silently retarget an obligation already owed to somebody
++ * else — 3.6 wrote the reason down and this is the first code to depend on it.
++ *
++ * `humans.email` is nullable, so this can legitimately return nothing. That is a
++ * branch the caller has to handle, not a case that cannot arise.
++ *
++ * EVERY member, not only the owners. `memberships.role` is one of owner, admin
++ * or member, and picking a subset here would be this chapter inventing a
++ * notification-preferences model — which is product, and belongs to whichever
++ * chapter builds preferences. Everyone who can see the endpoint hears that it
++ * stopped. */
++export async function organisationRecipients(
++  db: Db,
++  organisationId: string,
++): Promise<string[]> {
++  const result = (await db.execute(
++    sql`SELECT DISTINCT h.email AS "email"
++          FROM memberships m
++          JOIN humans h ON h.id = m.human_id
++         WHERE m.organisation_id = ${organisationId}
++           AND h.email IS NOT NULL
++         ORDER BY h.email`,
++  )) as unknown as { rows: { email: string }[] };
++  return result.rows.map((row) => row.email);
++}
++
+ /** How far behind the relay is. The single number worth alarming on later, and
+  * the one the chapter shows going up while the broker is down. */
+ /** The name this consumer claims events under. One name, because the ledger is
+```
+
+```diff title="services/api/src/main.ts"
+@@ -5,6 +5,7 @@ import { createLogger } from "@relay/service-kit";
+ 
+ import { AppModule } from "./app.module";
+ import { EventConsumerService } from "./consumer/consumer.module";
++import { NotificationRelayService } from "./notifications/notifications.module";
+ import { OutboxRelayService } from "./outbox/outbox.module";
+ import { DeliveryRelayService } from "./webhooks/webhooks.module";
+ 
+@@ -20,6 +21,11 @@ async function bootstrap(): Promise<void> {
+   // accumulating in Postgres instead of preventing the api from serving writes
+   // (chapter 3.3, research R9).
+   app.get(OutboxRelayService).start();
++  // Chapter 3.8: the disablement notifications chapter 3.6 wrote and nothing
++  // delivered. Its backlog drains on this first start as ordinary undelivered
++  // work — no migration and no special case, because `delivered_at IS NULL` was
++  // already true of every one of those rows.
++  app.get(NotificationRelayService).start();
+   // And the second relay (chapter 3.5): the same loop over a different table,
+   // publishing deliveries that have become due. Started here for 3.3's reason —
+   // a retry schedule that only runs when someone remembers is not a schedule.
+```
+
+### The fifth container
+
+Mailpit, its healthcheck, and the registry entry that now has a gate running in
+both directions.
+
+```diff title="compose.yaml"
+@@ -73,6 +73,33 @@ services:
+       retries: 5
+       start_period: 15s
+ 
++  mailpit:
++    image: axllent/mailpit:v1.28
++    # Chapter 3.8. An SMTP server that accepts everything and delivers nothing,
++    # with an HTTP API for reading what it caught.
++    #
++    # WHY A CONTAINER RATHER THAN A FAKE. FR-021 says an email must not contain a
++    # signing secret, and the only artefact that can settle that is the message a
++    # server RECEIVED — a stub records what the sender passed, which is the same
++    # object the assertion would be reading, so a mailer that dropped the secret
++    # into a header the stub does not model would pass. Constitution VII asks a
++    # fifth container to justify itself; this is the justification (research R9).
++    #
++    # No volume. Mailpit holds messages in memory, and a test inbox that survived
++    # a restart would be a test inbox that leaks state between runs — the same
++    # reasoning as Redis's, which the entry above records.
++    ports:
++      - "${RELAY_MAILPIT_HTTP_PORT:-8025}:8025"
++      - "${RELAY_MAILPIT_SMTP_PORT:-1025}:1025"
++    healthcheck:
++      # Without one, `docker compose up -d --wait` waits for RUNNING rather than
++      # for READY, and V9 can read the API before it is serving. `infra.test.ts`
++      # says the same thing about the other four.
++      test: ["CMD", "/mailpit", "readyz"]
++      interval: 5s
++      timeout: 3s
++      retries: 5
++
+ 
+   # --- the services (chapter 3.5) -----------------------------------------
+   # Behind `--profile services`, for the reason above.
+@@ -85,6 +112,16 @@ services:
+     environment:
+       DATABASE_URL: postgres://relay:relay@postgres:5432/relay
+       RELAY_NATS_URL: nats://nats:4222
++      # Chapter 3.8. Container names, not localhost — the api's own default is
++      # `redis://localhost:6379`, which inside this container is not the Redis
++      # service. And the tenant limiter FAILS OPEN by design (FR-010), so a
++      # missing address would not crash anything: the composed stack would serve
++      # every request unlimited while reporting a limit. The constitution
++      # requires the full stack to start with one command, and this is what makes
++      # that true rather than merely quiet (research R24).
++      #
++      # RELAY_SMTP_URL joins in the transport phase, with the container it names.
++      RELAY_REDIS_URL: redis://redis:6379
+       # Development values. Both are secrets in anything that is not a laptop,
+       # and the api refuses to start in production without the first.
+       RELAY_WEBHOOK_SECRET_KEY: ${RELAY_WEBHOOK_SECRET_KEY:-}
+@@ -95,6 +132,7 @@ services:
+     depends_on:
+       postgres: { condition: service_healthy }
+       nats: { condition: service_healthy }
++      redis: { condition: service_healthy }
+     healthcheck:
+       test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:4000/healthz"]
+       interval: 5s
+```
+
+```diff title="packages/config/src/infra.ts"
+@@ -11,6 +11,10 @@ export const INFRA_SERVICES = [
+   "redis",
+   "nats",
+   "clickhouse",
++  // Chapter 3.8. The fifth, and the only one that is not a store: Mailpit
++  // catches the SMTP the notification relay sends so a test can read what was
++  // RECEIVED rather than what was passed (FR-021).
++  "mailpit",
+ ] as const;
+ 
+ export const DURABLE_VOLUMES = [
+```
+
+```diff title="packages/config/src/infra.test.ts"
+@@ -32,6 +32,27 @@ describe("the compose declaration agrees with @relay/config", () => {
+     expect(healthchecks.length).toBeGreaterThanOrEqual(INFRA_SERVICES.length);
+   });
+ 
++  it("REGISTERS every compose service, which is the direction this file lacked", () => {
++    // The assertion above runs one way: every registered service must appear in
++    // compose. Nothing ran the other way, so a container added to compose and
++    // never registered here was invisible — `INFRA_SERVICES` would quietly stop
++    // naming the local infrastructure while every test still passed. Chapter
++    // 3.8 added a fifth container and the gap is how it nearly went unnoticed.
++    //
++    // The services behind `--profile services` are Relay's own and are not
++    // infrastructure, so they are excluded by name rather than by pattern: a
++    // list is auditable and a pattern would silently absorb the next container.
++    const ours = new Set(["api", "gateway", "dispatcher"]);
++    // Only the `services:` block. Volume names sit at the same indentation one
++    // block down, and a match that swept the whole file would report
++    // `postgres-data` as an unregistered service.
++    const services = compose.slice(0, compose.indexOf("\nvolumes:"));
++    const declared = [...services.matchAll(/^ {2}([a-z][a-z0-9-]*):$/gm)]
++      .map((match) => match[1] as string)
++      .filter((service) => !ours.has(service));
++    expect([...declared].sort()).toEqual([...INFRA_SERVICES].sort());
++  });
++
+   it("persists exactly the durable stores — and never Redis", () => {
+     for (const volume of DURABLE_VOLUMES) {
+       expect(compose).toContain(`${volume}:`);
+```
+
+## What this chapter does not deliver
+
+**Anything about flapping.** An endpoint disabled, re-enabled and disabled again
+produces two rows and two emails, and nothing collapses them. That is deliberate
+— a second outage really is a second thing to be told about, and the spec's edge
+case says neither notification may suppress the other — but an endpoint flapping
+hourly will send hourly. Solving it means a notification-preferences model, which
+is product rather than plumbing.
+
+**Retry limits.** A row that fails for ever is retried for ever, every five
+seconds. It no longer blocks anything, which was the urgent half; a dead-letter
+state for notifications is the other half and is not here.
+
+**Deliverability.** No SPF, no DKIM, no bounce handling, no provider. Mailpit
+accepts everything, which is right for a test inbox and tells you nothing about
+whether a real mail server would.
+
+**Any other notification.** This is one email for one event. FR-RTL's quota
+thresholds want three more, and they arrive with quotas.
+
+<Checkpoint>
+
+- `delivered_at` is set for the first time since chapter 3.6 declared it.
+- The backlog 3.6 accumulated drained on the first run, with no special case.
+- Mailpit is the fifth container in `compose.yaml`, registered in
+  `INFRA_SERVICES`, and the gate now checks that registration in both directions.
+- FR-021 is asserted against what a server **received**, not what the sender
+  passed.
+- One undeliverable address no longer stops the queue, and there is a test named
+  after that.
+- Tag `part3-ch9`.
+
+</Checkpoint>
+
+<ChapterFooter />
