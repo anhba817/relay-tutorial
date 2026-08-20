@@ -300,6 +300,85 @@ show a reader code it never mentions, which is what this file exists to avoid.
        lines.push(typeof line === "string" ? line : JSON.stringify(line)),
 ```
 
+### Three — two runtimes with no filter, forty lines from the fix (feature 030)
+
+The amendment above scoped invariant 9's restarted runtime and left the test
+immediately below it alone. That test constructs two runtimes sharing one durable,
+publishes three events with `ENV()` called three times — the same detail that made
+invariant 9 unfilterable — and polls them 400 times.
+
+So both runtimes start at the head of the whole stream, and the 400 has to cover
+every event earlier chapters left in it. It is the identical fault, in the
+identical file, forty lines down, and chapter 3.7 fixed one and did not look at the
+other.
+
+It has never failed, which is the property of this class rather than a defence of
+it: a fixed budget against a growing shared resource passes until the resource
+outgrows the budget, and then it fails in whichever run happens to cross the line.
+Invariant 9 crossed on run 11 of twenty. This one has not crossed yet.
+
+The environments were incidental. What the test is about is two runtimes sharing
+one durable, each message handled exactly once, and that is unchanged by publishing
+the three events to one environment and filtering both runtimes to its subject.
+
+Found by grepping for the class while the first instance was on screen, which is a
+step feature 030 added to its own task list after chapter 3.7 recorded that fixing
+an instance is not fixing a class.
+
+```diff title="services/api/src/consumer/consumer.itest.ts"
+@@ -351,16 +351,45 @@ describe("the consumer", () => {
+     // broker provides here that `SKIP LOCKED` provides for the outbox.
+     const durable = `${RUN}-shared-${Date.now()}`;
+     const byA: string[] = [];
+     const byB: string[] = [];
++    // ONE environment, and both runtimes filtered to it (feature 030, T032).
++    //
++    // This used to call `ENV()` three times and construct both runtimes with no
++    // filter, which is instance 3 exactly — the fault chapter 3.7 fixed forty lines
++    // down in this same file, in the test above this one. Three environments means
++    // no single subject covers them, and an unfiltered durable starts at the head
++    // of a stream holding every event earlier chapters left behind; the 400-pass
++    // budget below then has to drain all of it before reaching these three.
++    //
++    // It has never failed, which is the whole problem with the class: it passes
++    // until the stream outgrows the budget, and then it fails in whichever run
++    // happens to cross the line. Fixing an instance is not fixing a class
++    // (research R46).
++    //
++    // The environments were incidental. What this test is about is two runtimes
++    // sharing one durable, and that is unchanged.
++    const environmentId = ENV();
+     const ids = [
+-      await publish(ENV()),
+-      await publish(ENV()),
+-      await publish(ENV()),
++      await publish(environmentId),
++      await publish(environmentId),
++      await publish(environmentId),
+     ];
+ 
+-    const a = runtimeFor(db, durable, async (e) => void byA.push(e.id));
+-    const b = runtimeFor(db, durable, async (e) => void byB.push(e.id));
++    const a = runtimeFor(
++      db,
++      durable,
++      async (e) => void byA.push(e.id),
++      silent,
++      environmentId,
++    );
++    const b = runtimeFor(
++      db,
++      durable,
++      async (e) => void byB.push(e.id),
++      silent,
++      environmentId,
++    );
+     for (let i = 0; i < 400; i++) {
+       await Promise.all([a.pollOnce(), b.pollOnce()]);
+       if (ids.every((id) => byA.includes(id) || byB.includes(id))) break;
+     }
+```
+
 ---
 
 ## `services/api/src/auth/credentials.itest.ts` — a leak assertion with a one-character needle (chapter 3.6 baseline)
@@ -862,4 +941,566 @@ of the system. Switched off here exactly as `RELAY_OUTBOX_RELAY` and
        RELAY_EVENT_CONSUMER: "off",
        RELAY_DELIVERY_RELAY: "off",
      },
+```
+
+---
+
+## `services/api/src/db/repository.ts` — two defaults that made forgetting silent (feature 030)
+
+Six times between chapters 3.3 and 3.9, an integration test asserted a local fact
+about a global operation, or performed one and damaged a neighbouring suite's
+fixture. Feature 030 is the work that makes that fail deterministically, and this
+is the smallest of its three parts: the admin functions in this file no longer
+supply a value the caller forgot to think about.
+
+`sweepDisabledEndpoints` was the last of the four batch-taking functions to carry
+`limit = 100`. Requiring the argument would not have prevented any of the six —
+the call that damaged a neighbour's fixture was `sweepDisabledEndpoints(db)`, and
+`sweepDisabledEndpoints(db, 10_000)` reaches *further* into other people's rows.
+It is a prompt to think about whose rows are in scope, and the comment says so
+rather than claiming to be a control.
+
+`drainDisableNotifications`'s `onError = () => {}` is the sharper one. It
+discarded a row's failure with no log line, and no caller in the tree has ever
+used it — `notification-relay.ts` is the only one and it has always passed a
+handler. It was found as the file's last uncovered function: `repository.ts`
+measured 98.7% functions against a ratchet of 100, and it had measured that
+before this feature touched anything.
+
+The block comment is the other half. Three separate documents asserted this file
+held "five" batch-taking functions; the answer is four, and the count kept slipping
+because the third category — functions that cross environments but take an id, so
+they are bounded by construction — has no home in a sentence about batch sizes.
+Whoever adds the next one reads this file, not a spec.
+
+**No chapter owns this.** 2.4 fenced the file and 3.5, 3.6 and 3.8 extended it;
+none of them is about the shape of a test lane, and a required parameter that
+exists to make an integration suite think twice would be code those chapters never
+mention.
+
+```diff title="services/api/src/db/repository.ts"
+@@ -415,9 +415,21 @@ export interface DisableNotificationRow {
+ export async function drainDisableNotifications(
+   db: Db,
+   limit: number,
+   deliver: (row: DisableNotificationRow) => Promise<void>,
+-  onError: (row: DisableNotificationRow, error: unknown) => void = () => {},
++  /** REQUIRED, as of feature 030, and for a sharper reason than `limit`'s.
++   *
++   * It carried `= () => {}`, a default that DISCARDS a row's failure without a
++   * log line — the swallowed-refusal shape twice over (research R13, R39). No
++   * caller in the tree has ever used it: `notification-relay.ts` is the only one
++   * and it has always passed a handler. So the default was dead code that existed
++   * only to make forgetting the handler silent.
++   *
++   * It also had a second life as the file's last uncovered function, which is how
++   * it was found: `repository.ts` measures 98.7% functions against a ratchet of
++   * 100, and it measured that before this feature touched anything (research
++   * R47). */
++  onError: (row: DisableNotificationRow, error: unknown) => void,
+ ): Promise<number> {
+   return db.transaction(async (tx) => {
+     const claimed = (await tx.execute(
+       sql`SELECT n.id                AS "id",
+@@ -1136,11 +1148,38 @@ export async function testDeliveryResult(
+  * and not two implementations of it.
+  *
+  * Returns how many it disabled, so the relay can log a number rather than a claim.
+  */
++/*
++ * THE FOUR CATEGORIES OF CROSS-ENVIRONMENT FUNCTION IN THIS FILE (feature 030). Three documents asserted there were five batch-taking functions; the
++ * answer is four, and the reason the count kept slipping is that the third
++ * category below has no home in a sentence about batch sizes:
++ *
++ *   1. TAKE A BATCH SIZE, and now all four REQUIRE one:
++ *      drainOutbox, drainDueDeliveries, drainDisableNotifications,
++ *      sweepDisabledEndpoints.
++ *   2. RETURN A GLOBAL COUNT and have nothing to bound: outboxDepth,
++ *      pendingDeliveryDepth. A count is one row; there is no batch to size. These
++ *      are restricted from tests by lint instead — a global count(*)
++ *      compared against itself is instance 4, twice in one file.
++ *   3. CROSS ENVIRONMENTS BUT TAKE AN ID, so they are bounded by construction:
++ *      recordAttemptOutcome, disableEndpoint. Nothing to require and nothing to
++ *      restrict.
++ *
++ * Whoever adds the next cross-environment function reads this file, not the spec.
++ */
+ export async function sweepDisabledEndpoints(
+   db: Db,
+-  limit = 100,
++  /** REQUIRED, as of feature 030 — the last of the four to carry a default.
++   *
++   * This would not have prevented instance 6 (research R8). The call that damaged
++   * a neighbour's fixture was `sweepDisabledEndpoints(db)`, and
++   * `sweepDisabledEndpoints(db, 10_000)` is worse rather than better: a bigger
++   * batch reaches further into other people's rows. The required argument is a
++   * prompt to think about WHOSE rows are in scope. The control is the trigger in
++   * `packages/test-harness/src/sentinel.sql`, and a comment here claiming
++   * otherwise would teach the wrong lesson. */
++  limit: number,
+ ): Promise<number> {
+   // An INTERVAL built from the same constant the pure policy uses, so the sweep and
+   // `shouldDisable` can never disagree about how long an hour is. Milliseconds
+   // rather than a literal `'1 hour'`: one definition, in `disable.ts`.
+```
+
+---
+
+## `services/api/src/webhooks/delivery-relay.ts` — the caller the compiler found (feature 030)
+
+One line, and it is here because the amendment above created it. Removing
+`sweepDisabledEndpoints`'s default broke exactly one production call site, which
+is the whole return on the change: the compiler enumerated the callers so nobody
+had to grep for them. The four call sites in `deliveries.itest.ts` already passed
+`10_000`, chapter 3.7's fix for the first recorded instance.
+
+```diff title="services/api/src/webhooks/delivery-relay.ts"
+@@ -165,9 +165,10 @@ export function createDeliveryRelay({
+    * every customer's webhooks. */
+   async function sweepOnce(): Promise<number> {
+     if (!sweepEnabled) return 0;
+     try {
+-      const disabled = await sweepDisabledEndpoints(db);
++      // The batch the default used to supply, now said out loud (feature 030).
++      const disabled = await sweepDisabledEndpoints(db, 100);
+       if (disabled > 0) {
+         // A COUNT, and only when it is not zero. This runs several times a second
+         // when the platform is idle, and a line per pass would bury every other
+         // line in the service.
+```
+
+---
+
+## `eslint.config.mjs` — the global admin functions, restricted in tests (feature 030)
+
+The rule this file already carried says isolation lives in data access: only the
+repository layer may import `pg`, `drizzle-orm` or `ioredis`. This adds the same
+idea one level up. Six functions in `repository.ts` operate across every
+environment in the database, and every one of the six recorded instances imported
+one of them into an `*.itest.ts` and called it as though the database held only
+its own rows.
+
+Two of the six are there for a different reason from the other four. `outboxDepth`
+and `pendingDeliveryDepth` take no batch size and cannot — a count is one row —
+and a global count compared against itself is the fourth recorded instance, which
+appeared twice in one file four chapters apart. An earlier draft of the rule said
+"every cross-environment function must require a batch size"; that was false of
+these two, so they are restricted rather than fixed.
+
+Both import spellings are entries, because `no-restricted-imports` matches the
+specifier as written. `../db/repository` covers most of the api's suites and
+`./repository` covers the two that live in `src/db` — measured by adding the
+import to each and running eslint, not assumed.
+
+The ignores list and `packages/test-harness/src/exempt.ts` name the same six
+files, and a test in the harness compares them, because a file exempt from the
+linter but not from the trigger is a trap for whoever adds the seventh.
+
+The comment also records what the rule does not catch — an indirect call through a
+helper, and raw SQL, both of which the trigger sees — and what neither catches: a
+consumer runtime constructed without a subject filter rides the broker rather than
+the database, and no import is wrong.
+
+The `pg` ignores list grows by one. The harness IS data access: its job is to
+plant rows the repository layer must never plant, and to hold a connection
+carrying an exemption no product code may carry.
+
+**No chapter owns this.** 2.5 fenced this file to introduce the driver
+restriction; the chapters that followed added rules to it without discussing them.
+This one is lane hygiene, which no chapter teaches.
+
+```diff title="eslint.config.mjs"
+@@ -36,8 +36,13 @@ export default tseslint.config(
+       "services/api/src/limits/**",
+       "services/gateway/src/limits.ts",
+       "services/gateway/src/limits.itest.ts",
+       "services/gateway/src/fanout.ts",
++      // The test harness IS data access — its whole job is to plant rows the
++      // repository layer must never plant and to hold a connection carrying an
++      // exemption no product code may carry (feature 030). Restricting it from
++      // `pg` would restrict it from existing.
++      "packages/test-harness/**",
+     ],
+     rules: {
+       "no-restricted-imports": [
+         "error",
+@@ -69,5 +74,87 @@ export default tseslint.config(
+         },
+       ],
+     },
+   },
++  {
++    // THE GLOBAL ADMIN FUNCTIONS, RESTRICTED IN INTEGRATION TESTS (feature 030).
++    //
++    // Six recorded instances of one fault: a test asserts a local fact about a
++    // global operation, or performs one and damages a neighbour's fixture. Each
++    // one imported one of these functions into an `*.itest.ts` and called it as
++    // though the database held only its own rows.
++    //
++    // The two `*Depth` functions are here for a different reason from the other
++    // four. They take no batch size and cannot — a count has nothing to bound —
++    // and a global count compared against itself is instance 4, which appeared
++    // twice in one file four chapters apart. An earlier draft of this rule said
++    // "every cross-environment function must require a batch size"; that was
++    // false of these two, which is why they are restricted rather than fixed.
++    //
++    // WHAT THIS RULE DOES NOT CATCH, and must not be trusted to:
++    //   * an indirect call — a helper in another file that calls the function,
++    //     imported here under an innocent name;
++    //   * raw SQL — `UPDATE webhook_endpoints SET enabled = false` names no
++    //     import at all.
++    // Both are covered by the trigger in `packages/test-harness/src/sentinel.sql`,
++    // which watches statements rather than imports. A rule trusted further than
++    // it goes is worse than no rule (contracts/guard.md).
++    //
++    // AND WHAT NEITHER CATCHES: instance 3 rode the JetStream stream rather than
++    // the database — an unfiltered `createConsumerRuntime` in a test replays every
++    // event earlier chapters left behind, on a fixed budget of polls. No trigger
++    // sees that and no import is wrong; the subject filter is the property, and
++    // the call site is the only place to notice it (research R43).
++    files: ["**/*.itest.ts"],
++    ignores: [
++      // The suites that drive a global drain on purpose. THIS LIST AND
++      // `packages/test-harness/src/exempt.ts` MUST AGREE: a file exempt from one
++      // and not the other is a trap for whoever adds the seventh instance.
++      "services/api/src/outbox/outbox.itest.ts",
++      "services/api/src/webhooks/deliveries.itest.ts",
++      "services/api/src/webhooks/test-event.itest.ts",
++      "services/api/src/webhooks/attempts.itest.ts",
++      "services/api/src/notifications/notifications.itest.ts",
++      "services/dispatcher/src/dispatcher.itest.ts",
++    ],
++    rules: {
++      "no-restricted-imports": [
++        "error",
++        {
++          // BOTH SPELLINGS. `no-restricted-imports` matches the specifier as
++          // written, so `../db/repository` and `./repository` are two rules —
++          // and the second is the one `db/repository.itest.ts` and
++          // `db/history-drift.itest.ts` would use, both of them non-exempt.
++          // Measured by adding the import to each and running eslint.
++          paths: [
++            {
++              name: "../db/repository",
++              importNames: [
++                "drainOutbox",
++                "drainDueDeliveries",
++                "drainDisableNotifications",
++                "sweepDisabledEndpoints",
++                "outboxDepth",
++                "pendingDeliveryDepth",
++              ],
++              message:
++                "This function operates across every environment in the database, and an integration test shares that database with every other suite. Assert on the rows this test created — read them back by id, or scope the count to your own environment_id — instead of on what a global batch happened to contain. If this suite's subject IS the global drain, add it to packages/test-harness/src/exempt.ts with a reason, and to the ignores list beside this rule.",
++            },
++            {
++              name: "./repository",
++              importNames: [
++                "drainOutbox",
++                "drainDueDeliveries",
++                "drainDisableNotifications",
++                "sweepDisabledEndpoints",
++                "outboxDepth",
++                "pendingDeliveryDepth",
++              ],
++              message:
++                "This function operates across every environment in the database, and an integration test shares that database with every other suite. Assert on the rows this test created — read them back by id, or scope the count to your own environment_id — instead of on what a global batch happened to contain. If this suite's subject IS the global drain, add it to packages/test-harness/src/exempt.ts with a reason, and to the ignores list beside this rule.",
++            },
++          ],
++        },
++      ],
++    },
++  },
+ );
+```
+
+---
+
+## The four vitest configs — wiring the guard into every lane (feature 030)
+
+Feature 030 installs a Postgres trigger that refuses any statement modifying a
+sentinel row from a connection that does not carry an exemption, and plants bait
+so that a test asserting on an unbounded global batch fails on the first run
+against a clean database. Both arrive through two vitest hooks: a `globalSetup`
+that migrates and then installs the trigger, and a `setupFiles` entry that sets
+the exemption for files on the harness's list and, where the lane carries bait,
+plants it per file.
+
+**Every lane pointed at the database needs the hooks, not just the one that
+installs them.** The trigger is database state and outlives whichever lane created
+it, so a lane with no way to answer meets it and fails six suites for the right
+reason and the wrong cause. The coverage lane is the sharp one: it runs every
+`*.itest.ts` in a single process with `fileParallelism: false`, so it would meet
+the trigger with no hook at all.
+
+**Bait goes to the api lane only.** The gateway and e2e lanes hold no reader-shape
+fault, and planting changes a suite's workload for no return. The dispatcher lane
+was on the list until it was measured: 200 bait deliveries failed 10 of its 16
+tests with the fault they were meant to catch already fixed, because that suite
+waits eight seconds on a shared FIFO broker rather than on a query. Bait that
+fails a suite whether or not the fault is present carries no information.
+
+**The relay flags are the other half, and they are a correction.** Nine suites in
+the api lane import `AppModule`, and each of the four relays defaults to on when
+its flag is unset — so nine of seventeen files were running background loops that
+sweep the whole database while every other suite's fixtures sat in it. A relay
+catches and logs its own errors, so the guard's refusal inside one is a log line
+and a green lane. Setting the flags in the config makes a quiet database a
+property of the lane rather than a convention nobody had applied.
+
+`services/dispatcher/vitest.integration.config.mts` gets the same treatment and no
+amendment here, because no chapter fences it.
+
+**No chapter owns any of this.** 2.1 introduced the integration lane, 2.6 and 2.8
+added lanes of their own, and 3.1 added the coverage lane. None of them is about
+what a shared database does to a suite that assumes it is alone.
+
+```diff title="services/api/vitest.integration.config.mts"
+@@ -6,7 +6,31 @@ import { defineConfig } from "vitest/config";
+ // the compose Postgres. (.mts because this package compiles to CommonJS —
+ // a .ts config would be loaded as CJS, which vitest refuses.)
+ export default defineConfig({
+   test: {
++    // Feature 030: the global-operation guard. `globalSetup` migrates and
++    // then installs the trigger once per lane; `setupFiles` sets the
++    // exemption for files on the harness's list and, where the lane carries
++    // bait, plants it per file.
++    globalSetup: ["../../packages/test-harness/src/global-setup.ts"],
++    setupFiles: ["../../packages/test-harness/src/setup.ts"],
++    // FEATURE 030, MEASURED: nine suites in this lane import `AppModule`, and none
++    // of them set a relay flag. Each relay defaults to on when its flag is unset
++    // (`process.env.RELAY_OUTBOX_RELAY ?? "on"`), so those nine booted four
++    // background loops that sweep the whole database while every other suite's
++    // fixtures sit in it. Research R13 recorded the exposure as nil on the strength
++    // of the four suites that spawn an api CHILD and set the flags in the child's
++    // env; it did not look at the suites that boot the app in process.
++    //
++    // A relay catches and logs its own errors, so the guard's refusal inside one is
++    // a log line and a green lane. Setting the flags here makes the quiet database
++    // a property of the lane rather than a convention nobody applied.
++    env: {
++      RELAY_HARNESS_BAIT: "on",
++      RELAY_OUTBOX_RELAY: "off",
++      RELAY_DELIVERY_RELAY: "off",
++      RELAY_NOTIFICATION_RELAY: "off",
++      RELAY_EVENT_CONSUMER: "off",
++    },
+     include: ["src/**/*.itest.ts"],
+   },
+ });
+```
+
+```diff title="services/gateway/vitest.integration.config.mts"
+@@ -5,7 +5,15 @@ import { defineConfig } from "vitest/config";
+ // include, and this config is what `pnpm --filter @relay/gateway
+ // test:integration` runs against the compose Redis.
+ export default defineConfig({
+   test: {
++    // Feature 030: the global-operation guard. `globalSetup` migrates and
++    // then installs the trigger once per lane; `setupFiles` sets the
++    // exemption for files on the harness's list and, where the lane carries
++    // bait, plants it per file. This lane gets exemption
++    // handling and NO bait: it holds no reader-shape fault, and planting
++    // would change its workload for no return (feature 030).
++    globalSetup: ["../../packages/test-harness/src/global-setup.ts"],
++    setupFiles: ["../../packages/test-harness/src/setup.ts"],
+     include: ["src/**/*.itest.ts"],
+   },
+ });
+```
+
+```diff title="packages/e2e/vitest.integration.config.mts"
+@@ -9,8 +9,16 @@ import { defineConfig } from "vitest/config";
+ // The whole suite is one journey, and it boots real processes — so it gets
+ // a real timeout, and it does not run its files in parallel.
+ export default defineConfig({
+   test: {
++    // Feature 030: the global-operation guard. `globalSetup` migrates and
++    // then installs the trigger once per lane; `setupFiles` sets the
++    // exemption for files on the harness's list and, where the lane carries
++    // bait, plants it per file. This lane gets exemption
++    // handling and NO bait: it holds no reader-shape fault, and planting
++    // would change its workload for no return (feature 030).
++    globalSetup: ["../../packages/test-harness/src/global-setup.ts"],
++    setupFiles: ["../../packages/test-harness/src/setup.ts"],
+     include: ["src/**/*.itest.ts"],
+     testTimeout: 60_000,
+     hookTimeout: 60_000,
+     fileParallelism: false,
+```
+
+```diff title="vitest.coverage.config.mts"
+@@ -18,8 +18,33 @@ import swc from "unplugin-swc";
+ // would silently resolve nothing. It is harmless for the packages that use no
+ // decorators.
+ export default defineConfig({
+   test: {
++    // Feature 030: the global-operation guard. `globalSetup` migrates and
++    // then installs the trigger once per lane; `setupFiles` sets the
++    // exemption for files on the harness's list and, where the lane carries
++    // bait, plants it per file. This lane gets exemption
++    // handling and NO bait: it holds no reader-shape fault, and planting
++    // would change its workload for no return (feature 030).
++    globalSetup: ["./packages/test-harness/src/global-setup.ts"],
++    // FEATURE 030, MEASURED: nine suites in this lane import `AppModule`, and none
++    // of them set a relay flag. Each relay defaults to on when its flag is unset
++    // (`process.env.RELAY_OUTBOX_RELAY ?? "on"`), so those nine booted four
++    // background loops that sweep the whole database while every other suite's
++    // fixtures sit in it. Research R13 recorded the exposure as nil on the strength
++    // of the four suites that spawn an api CHILD and set the flags in the child's
++    // env; it did not look at the suites that boot the app in process.
++    //
++    // A relay catches and logs its own errors, so the guard's refusal inside one is
++    // a log line and a green lane. Setting the flags here makes the quiet database
++    // a property of the lane rather than a convention nobody applied.
++    env: {
++      RELAY_OUTBOX_RELAY: "off",
++      RELAY_DELIVERY_RELAY: "off",
++      RELAY_NOTIFICATION_RELAY: "off",
++      RELAY_EVENT_CONSUMER: "off",
++    },
++    setupFiles: ["./packages/test-harness/src/setup.ts"],
+     include: [
+       "packages/*/src/**/*.test.ts",
+       "services/*/src/**/*.test.ts",
+       "packages/*/src/**/*.itest.ts",
+@@ -47,8 +72,12 @@ export default defineConfig({
+         // not by asserting on it. Counting them measures how much of `main.ts`
+         // a test happened to touch, which is not what "business logic" means.
+         "**/main.ts",
+         "**/*.module.ts",
++        // The lane's own scaffolding (feature 030). Same argument one step out:
++        // counting how much of the harness a test touched measures the harness,
++        // not the product.
++        "packages/test-harness/src/**",
+       ],
+       thresholds: {
+         // Constitution VI, first clause: 70% of business logic. Set to what the
+         // constitution says, not to what the code achieves — a threshold tuned
+```
+
+---
+
+## `services/api/src/outbox/outbox.itest.ts` — instances 7 and 9, found by the bait (feature 030)
+
+Two more of the same fault, in a file whose comments already explain the fault at
+length. Both were found by the seeder on the first run it did, before any
+deliberate reintroduction.
+
+**Invariants 7 and 8 drove a global relay on a fixed budget.**
+`drainUntilClear(relay, db, environmentId, passes = 20)` bounded the *driving* in
+units of batches while the work is bounded by the whole table. Twenty passes of
+the default batch move 2,000 rows; the seeder's bait alone is 3,400, so the loop
+returned with this environment's rows untouched and a correctly scoped assertion
+reported `expected 4 to be +0`. Invariant 8 was sharper still: `batchSize: 7`
+made twenty passes a budget of 140 rows.
+
+There is no right constant, which is the point. The relay is global and
+oldest-first, so reaching this suite's rows means draining everything older than
+them, and how much that is depends on who else is in the database. The loops now
+stop on the only two conditions that mean anything — this environment is clear, or
+a pass moved nothing — and each pass that moves rows reduces the backlog, so they
+terminate.
+
+**Invariant 7's deduplication assertion was global.** `publisher.sent` holds every
+row the relay moved out of a table it drains for everybody, so
+`expect(new Set(ids).size).toBe(ids.length)` asserted that no row anywhere in the
+outbox is ever published twice by anyone — a claim about the platform dressed up as
+a claim about three messages. It failed once in a full lane run,
+`expected 3001 to be 4800`, and passed when the file ran alone: the recurring
+fault's signature exactly. The sentence above the assertion — "every event this
+environment produced" — was describing the scoped version all along, and the file
+already used that idiom forty lines down.
+
+**No chapter owns this.** 3.3 fenced the file and is about the outbox pattern; how
+a test drives a global drain without asserting on other tenants' rows is not what
+3.3 teaches.
+
+```diff title="services/api/src/outbox/outbox.itest.ts"
+@@ -177,9 +177,22 @@ describe("the outbox", () => {
+     expect((await unpublishedFor(db, env.id)).length).toBe(0);
+ 
+     // Every event this environment produced reached the destination with its
+     // own id as the deduplication key.
+-    const ids = publisher.sent.map((m) => m.id);
++    //
++    // SCOPED, and it was not (feature 030, instance 9). `publisher.sent` holds
++    // every row this relay moved out of a table it drains globally, so the
++    // unfiltered version asserted that no row anywhere in the outbox is ever
++    // published twice by anybody — which is a claim about the whole platform
++    // dressed up as a claim about three messages. It failed once in a full lane
++    // run, `expected 3001 to be 4800`, and passed when the file ran alone: the
++    // recurring fault's signature. The scoped idiom is the one this file already
++    // uses forty lines down, and the sentence above the assertion was describing
++    // it all along.
++    const ids = publisher.sent
++      .filter((m) => m.subject.endsWith(env.id))
++      .map((m) => m.id);
++    expect(ids.length).toBeGreaterThan(0);
+     expect(new Set(ids).size).toBe(ids.length);
+ 
+     // A second pass has nothing of OURS to do — marked rows are done.
+     //
+@@ -214,12 +227,20 @@ describe("the outbox", () => {
+     const b = recordingPublisher();
+     const relayA = createRelay({ db, publisher: a, logger: silent, batchSize: 7 });
+     const relayB = createRelay({ db, publisher: b, logger: silent, batchSize: 7 });
+ 
+-    // Run them at the same time, repeatedly, until the backlog is gone.
+-    for (let pass = 0; pass < 20; pass++) {
++    // Run them at the same time, repeatedly, until THIS environment's backlog is
++    // gone. Same reader fix as `drainUntilClear`, and sharper here: `batchSize: 7`
++    // made twenty passes a budget of 140 rows, against a table holding thousands.
++    // The loop ends when our rows are done or when neither relay can move
++    // anything.
++    for (;;) {
+       if ((await outboxDepthFor(db, env.id)) === 0) break;
+-      await Promise.all([relayA.drainOnce(), relayB.drainOnce()]);
++      const [movedA, movedB] = await Promise.all([
++        relayA.drainOnce(),
++        relayB.drainOnce(),
++      ]);
++      if (movedA + movedB === 0) break;
+     }
+ 
+     expect(await outboxDepthFor(db, env.id)).toBe(0);
+     const all = [...a.sent, ...b.sent].map((m) => m.id);
+@@ -391,16 +412,35 @@ describe("the outbox", () => {
+  * filled entirely by rows this suite did not write, and a test that assumes
+  * otherwise passes alone and fails in a full lane. (It did exactly that here.)
+  * Suites cannot isolate themselves by construction on this table the way 2.1's
+  * per-suite environments let them everywhere else. */
++/*
++ * READER FIX (feature 030). The comment above was right about the table and wrong
++ * about the loop.
++ *
++ * `passes = 20` bounded the DRIVING in units of batches while the work is bounded
++ * by the whole table. Twenty passes of the default batch move 2,000 rows; the
++ * seeder's bait alone is 3,400, so the loop returned with this environment's rows
++ * untouched and the assertion below reported `expected 4 to be +0` — a correctly
++ * scoped read of a wrongly driven relay.
++ *
++ * There is no right constant here, which is the point: the relay is global and
++ * oldest-first, so reaching this suite's rows means draining everything older than
++ * them, and how much that is depends on who else is in the database. So the loop
++ * has no pass budget. It stops on the only two conditions that mean anything —
++ * this environment is clear, or a pass moved nothing and the relay is therefore
++ * done — and each pass that moves rows reduces the global backlog, so it
++ * terminates. `safety` exists to turn a hypothetical infinite loop into a failed
++ * test, and is derived from the work that actually exists rather than guessed.
++ */
+ async function drainUntilClear(
+   relay: { drainOnce: () => Promise<number> },
+   db: Db,
+   environmentId: string,
+-  passes = 20,
+ ): Promise<number> {
+   let moved = 0;
+-  for (let i = 0; i < passes; i++) {
++  const safety = (await outboxDepth(db)) + 100;
++  for (let i = 0; i < safety; i++) {
+     if ((await outboxDepthFor(db, environmentId)) === 0) break;
+     const drained = await relay.drainOnce();
+     moved += drained;
+     if (drained === 0) break;
 ```
