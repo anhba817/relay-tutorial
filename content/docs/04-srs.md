@@ -1,6 +1,6 @@
 # Relay — Software Requirements Specification
 
-**Version:** 1.0 (draft)
+**Version:** 1.3 (draft)
 **Status:** For review
 **Companion documents:** `01-product-vision.md`, `02-personas.md`, `03-journey-map.md`
 **Structure:** adapted from ISO/IEC/IEEE 29148
@@ -185,7 +185,7 @@ and React Native 0.72+.
 | EIR-API-01 | The system shall expose a JSON over HTTPS REST API at `/v1`. | P1 | I |
 | EIR-API-02 | All requests and responses shall use `application/json` with UTF-8 encoding. | P1 | T |
 | EIR-API-03 | The API shall use conventional HTTP status codes: 200, 201, 204, 400, 401, 403, 404, 409, 422, 429, 500, 503. | P1 | T |
-| EIR-API-04 | Error responses shall carry a machine-readable `code`, a human-readable `message`, an optional `field` naming the offending parameter, and a `docs_url`. | P1 | T |
+| EIR-API-04 | Error responses shall carry a machine-readable `code`, a human-readable `message`, an optional `field` naming the offending parameter, a `docs_url`, and the `request_id`. The five fields shall be **top-level in the response body**, not nested under an envelope key. | P1 | T |
 | EIR-API-05 | Every response shall include a unique `X-Request-Id` header, referenced in all error responses and in the request log. | P2 | T |
 | EIR-API-06 | List endpoints shall use opaque cursor pagination with `limit` and `cursor` parameters, returning `next_cursor` and `has_more`. Offset pagination shall not be offered. | P1 | T |
 | EIR-API-07 | An OpenAPI 3.1 specification shall be published, machine-readable and complete for every public endpoint. | P4 | I |
@@ -194,15 +194,25 @@ and React Native 0.72+.
 
 ```json
 {
-  "error": {
-    "code": "channel_member_limit_exceeded",
-    "message": "Channel has reached its maximum of 1000 members.",
-    "field": "user_ids",
-    "docs_url": "https://docs.relay.dev/errors/channel_member_limit_exceeded",
-    "request_id": "req_01HQ8X..."
-  }
+  "code": "channel_member_limit_exceeded",
+  "message": "Channel has reached its maximum of 1000 members.",
+  "field": "user_ids",
+  "docs_url": "https://docs.relay.dev/errors/channel_member_limit_exceeded",
+  "request_id": "req_01HQ8X..."
 }
 ```
+
+> **Amended in 1.3.** This example nested the five fields under an `error` key until
+> 2026-08-20. The implementation has emitted them top-level since the walking skeleton,
+> and the document is being brought to the code rather than the reverse — recorded
+> because the constitution's Governance section requires a conflict with this document to
+> be resolved by explicit amendment rather than ignored.
+>
+> The flat shape is also the one that keeps EIR-API-04's stated purpose intact. The same
+> five fields travel on the WebSocket surface inside a frame's `payload` (EIR-WS-02), so
+> a REST body nested under `error` would make the two surfaces differ in **two** ways
+> instead of one: the transport wrapper, which is unavoidable, and the field container,
+> which is not.
 
 ### 3.2 WebSocket interface
 
@@ -787,3 +797,4 @@ largest and should be watched for schedule risk.
 | 1.0 | 2026-07-26 | — | Initial draft |
 | 1.1 | 2026-07-26 | — | Added §4.13 FR-EMJ (Unicode emoji + custom emoji packs); DR-12/13/14; traceability, phase, and count updates |
 | 1.2 | 2026-07-30 | — | **Reversed the hosted-file-storage exclusion.** Added §4.14 FR-MED (hosted media: image/audio/video); revised FR-MSG-11; NFR-PRF-08/09; ASM-06; DR-15/16/17; Appendix B reversal record; counts to 224 |
+| 1.3 | 2026-08-20 | — | **EIR-API-04 brought to the implementation.** The error body's five fields are top-level, not nested under an `error` key, and `request_id` is now required rather than shown only in the example. Found while specifying chapter 3.8, which adds `request_id` to that envelope: the platform has emitted the flat shape since the walking skeleton and the document had said otherwise since 1.0 |
