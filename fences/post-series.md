@@ -756,6 +756,93 @@ never mentions webhooks.
      expect((await runOf(recent.id)).enabled).toBe(true);
 ```
 
+
+### Three — a delta over a global count still races (chapter 3.10 baseline)
+
+The two amendments above scoped a sweep and a drain. This one is the same class in
+its subtlest form yet, and the test's own comment defended it:
+
+```text
+// GLOBAL, and asserted as a delta for that reason — this is the number an
+// operator watches, so it counts every tenant's backlog, and another suite
+// seeding rows beside this one must not be able to break it.
+```
+
+A delta is two reads with a gap. Another suite **seeding** rows in that gap was
+defended against; another suite **delivering** one of its own was not, and that
+moves the second read by one more:
+
+```text
+FAIL src/webhooks/deliveries.itest.ts >
+     counts what is pending and stops counting it once it is delivered
+AssertionError: expected 22741 to be 22742
+```
+
+Found on the third of three lane runs at chapter 3.10's baseline, which is the
+twelfth occurrence of this fault and the third whose defence was a comment saying
+why this one was fine.
+
+The global function keeps a caller, because `pendingDeliveryDepth` is the number
+an operator watches and it needs one — it is now asked only what cannot race,
+which is that a backlog exists. The delta is asserted against this environment's
+own rows.
+
+**No chapter owns this.** 3.7 fenced the two amendments above and is about the
+resume duplicate; 3.10 is about quotas. A baseline fix belongs to whichever
+chapter's baseline found it, and that chapter teaches something else.
+
+```diff title="services/api/src/webhooks/deliveries.itest.ts"
+@@ -660,19 +660,40 @@ describe("the material for one attempt", () => {
+     expect(await deliveryMaterial(db, randomUUID())).toBeNull();
+   });
+ 
+   it("counts what is pending and stops counting it once it is delivered", async () => {
+-    const { deliveryId } = await seedDelivery();
++    const { deliveryId, envId } = await seedDelivery();
+ 
+-    // GLOBAL, and asserted as a delta for that reason — this is the number an
+-    // operator watches, so it counts every tenant's backlog, and another suite
+-    // seeding rows beside this one must not be able to break it.
+-    const before = await pendingDeliveryDepth(db);
+-    expect(before).toBeGreaterThan(0);
++    // THE DELTA USED TO BE ASSERTED ON THE GLOBAL COUNT, and the comment above it
++    // said a delta was safe because "another suite seeding rows beside this one
++    // must not be able to break it". It is not, and one did:
++    //
++    //   AssertionError: expected 22741 to be 22742
++    //
++    // A delta is two reads with a gap. Another suite delivering one of its own
++    // rows in that gap moves the second read by one more, and the assertion is a
++    // local fact about a global operation with an extra step — the twelfth
++    // occurrence of the fault this lane has been recording since chapter 3.3, and
++    // the third whose defence was a comment explaining why it was fine.
++    //
++    // The global function still has a caller, because it is the number an operator
++    // watches and it needs one. What it is asked is the part that cannot race:
++    // there is a backlog.
++    expect(await pendingDeliveryDepth(db)).toBeGreaterThan(0);
++
++    // The delta is asserted where it can be attributed — this environment, whose
++    // rows nobody else writes.
++    const pendingHere = async (): Promise<number> => {
++      const { rows } = (await db.execute(
++        `SELECT count(*)::int AS n FROM webhook_deliveries
++          WHERE environment_id = '${envId}' AND state = 'pending'`,
++      )) as unknown as { rows: { n: number }[] };
++      return rows[0]!.n;
++    };
+ 
++    expect(await pendingHere()).toBe(1);
+     await recordAttemptOutcome(db, { deliveryId, attempt: 1, status: 200 });
+-
+-    expect(await pendingDeliveryDepth(db)).toBe(before - 1);
++    expect(await pendingHere()).toBe(0);
+   });
+ });
+ 
+ // The answers nobody asks for on a good day.
+```
+
 ---
 
 ## `services/api/src/tenancy/signup.itest.ts` — the global count chapter 3.3 already removed once (chapter 3.7)
@@ -1503,4 +1590,107 @@ a test drives a global drain without asserting on other tenants' rows is not wha
      const drained = await relay.drainOnce();
      moved += drained;
      if (drained === 0) break;
+```
+
+---
+
+## The quota relay's flag, and a harness method (chapter 3.10)
+
+Chapter 3.10 adds the fourth relay in this codebase, and a relay needs a switch:
+`RELAY_QUOTA_RELAY`, off in the lanes that want a quiet database, on everywhere
+else. Same switch and same reasoning as the three before it — a background loop
+marking rows delivered mid-assertion is a race between test files rather than a
+property of the system, and feature 030's R39 found nine suites booting the whole
+app with every relay defaulting on.
+
+Three configs carry the other relay flags and now carry this one. `turbo.json`
+declares the variable, because Turborepo runs in strict env mode and an
+undeclared variable is invisible to the task that needs it.
+
+`packages/e2e/src/harness.ts` gains `setQuota`, because the e2e lane may not
+import `pg` — chapter 2.5's driver restriction, and this package is not on its
+ignores list — so the one place allowed to write is the one place that does.
+
+**No chapter owns any of it.** 3.10 teaches what a quota is and where it is
+enforced; which lanes switch a background loop off, and how a test harness sets a
+column, are hygiene it never discusses. A chapter may only fence a change it
+explains.
+
+```diff title="turbo.json"
+@@ -37,9 +37,10 @@
+         "RELAY_NATS_REPLICAS",
+         "RELAY_E2E_API_PORT",
+         "RELAY_SMTP_URL",
+         "RELAY_MAILPIT_URL",
+-        "RELAY_NOTIFICATION_RELAY"
++        "RELAY_NOTIFICATION_RELAY",
++        "RELAY_QUOTA_RELAY"
+       ]
+     },
+     "//#lint:root": {
+       "inputs": [
+```
+
+```diff title="services/api/vitest.integration.config.mts"
+@@ -29,8 +29,10 @@ export default defineConfig({
+       RELAY_OUTBOX_RELAY: "off",
+       RELAY_DELIVERY_RELAY: "off",
+       RELAY_NOTIFICATION_RELAY: "off",
+       RELAY_EVENT_CONSUMER: "off",
++      // Chapter 3.10's relay, the fourth. Same reason as the other three.
++      RELAY_QUOTA_RELAY: "off",
+     },
+     include: ["src/**/*.itest.ts"],
+   },
+ });
+```
+
+```diff title="vitest.coverage.config.mts"
+@@ -41,8 +41,10 @@ export default defineConfig({
+       RELAY_OUTBOX_RELAY: "off",
+       RELAY_DELIVERY_RELAY: "off",
+       RELAY_NOTIFICATION_RELAY: "off",
+       RELAY_EVENT_CONSUMER: "off",
++      // Chapter 3.10's relay, the fourth. Same reason as the other three.
++      RELAY_QUOTA_RELAY: "off",
+     },
+     setupFiles: ["./packages/test-harness/src/setup.ts"],
+     include: [
+       "packages/*/src/**/*.test.ts",
+```
+
+```diff title="packages/e2e/src/harness.ts"
+@@ -288,8 +288,15 @@ export interface System {
+     dispatcher: Client;
+     tuan: Client;
+   }>;
+   seedForeignTenant: () => Promise<{ channel: string; text: string }>;
++  /** Set an environment's quota policy (chapter 3.10).
++   *
++   * Here rather than in the test, because `packages/e2e` may not import `pg` —
++   * the driver restriction chapter 2.5 added, and this package is not on its
++   * ignores list. The harness already holds the api's own database handle, so
++   * the one place that may write is the one place that does. */
++  setQuota: (environmentId: string, config: unknown) => Promise<void>;
+   client: (name: string, environmentId: string) => Promise<Client>;
+   stop: () => Promise<void>;
+ }
+ 
+@@ -486,8 +493,16 @@ export async function boot({ gateways = 2 } = {}): Promise<System> {
+       await repo.sendMessage(channel.id, { text, userId: user.id });
+       say(`seeded a foreign tenant (${other}) with one message`);
+       return { channel: channel.id, text };
+     },
++    async setQuota(environmentId, config) {
++      await (
++        db as { execute: (q: string) => Promise<unknown> }
++      ).execute(
++        `UPDATE environments SET quota_config = '${JSON.stringify(config)}'::jsonb
++          WHERE id = '${environmentId}'`,
++      );
++    },
+     async client(name, environmentId) {
+       return new Client(name, await token(environmentId, name), say);
+     },
+     async stop() {
 ```

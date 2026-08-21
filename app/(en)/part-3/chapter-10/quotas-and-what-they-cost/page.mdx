@@ -1,0 +1,2098 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figTwoPromises, figWhereItIsEnforced, figNoSweep, figOutboxFourth } from "./figures";
+
+export const metadata = {
+  title: "Quotas and what they cost — Building Relay",
+  description:
+    "A rate limit is about this second and forgets. A quota is about this month and must not. The other half of FR-RTL, and the first chapter in this series that needed no global operation at all.",
+  alternates: {
+    canonical: "/part-3/chapter-10/quotas-and-what-they-cost",
+    languages: {
+      en: "/part-3/chapter-10/quotas-and-what-they-cost",
+    },
+  },
+};
+
+<ChapterHeader id="3.10" />
+
+Chapter 3.8 built a limiter. Six hundred requests a minute, counted in Redis,
+three headers on every response so a client can see the wall before it hits it.
+This chapter builds a quota, and the two are different problems wearing the same
+word.
+
+A rate limit is about **this second**. It forgets on purpose: the window closes,
+the counter resets, and the tenant who was refused a moment ago is served now. If
+the counter store is flushed, the cost is one window of over-service — a few
+hundred requests nobody was billed for, and by the next minute the system has
+forgotten the incident as thoroughly as it forgets everything else.
+
+A quota is about **this month**, and it must not forget. If its counter is lost,
+the tenant who has sent nine thousand messages against a cap of ten thousand
+starts again from zero, and the month's bill is wrong. That single sentence
+decides almost every design question in this chapter.
+
+<Figure code={figTwoPromises} caption="The same word, two promises. Everything below follows from the second row." />
+
+## The query we did not write
+
+The simplest way to know how many messages an environment sent this month is to
+count them.
+
+```sql title="the query this chapter argues against (excerpt)"
+select count(*), count(distinct m.user_id)
+  from messages m join channels c on c.id = m.channel_id
+ where c.environment_id = $1
+   and m.created_at >= date_trunc('month', now() at time zone 'utc');
+```
+
+It works, it needs no new tables, and a flush cannot touch it because the
+messages *are* the record. On the development database this repository has been
+accumulating since Part 2 — 198,690 messages across 26,331 environments — it
+runs in a quarter of a millisecond.
+
+Read the plan rather than the clock:
+
+```text
+->  Bitmap Heap Scan on messages m
+      Recheck Cond: (c.id = channel_id)
+      Filter: (created_at >= date_trunc('month'::text, (now() AT TIME ZONE 'utc'::text)))
+      Heap Blocks: exact=11
+Execution Time: 0.266 ms
+```
+
+The month predicate is a **Filter**, not an Index Cond. Every message that
+environment has ever sent is read off the heap and then discarded if it belongs
+to another month. There are 507 of them today. There is no index on
+`messages.created_at`, and `messages` carries no `environment_id` at all — it
+hangs off `channels`, so the plan is driven from the channel index and then walks
+the environment's whole history.
+
+<Why title="Why the number is not the argument">
+Quoting "0.266ms" would invite you to check it, get a different number on your
+machine, and conclude the case was overstated. The case is the `Filter` line. It
+says the work is proportional to what the tenant has sent since the day they
+signed up, and a send path that does work proportional to lifetime traffic is
+this project's most-recorded fault written into the product instead of into a
+test — twelve times across chapters 3.3 to 3.10, every one of them a fixed budget
+against a growing shared resource.
+</Why>
+
+So the count is a roll-up: one row per environment per month, incremented by the
+transaction that writes the message.
+
+## The test that is the whole chapter
+
+If a quota can be erased, it is not a quota. So the roll-up gets one test that
+chapter 3.8's limiter could not pass:
+
+```ts title="services/api/src/quotas/quotas.itest.ts (excerpt)"
+  it("reports identical figures across a FLUSHALL", async () => {
+    const env = await createEnvironment(db, {
+      name: `quota-flush-${randomUUID().slice(0, 8)}`,
+    });
+    const repo = new Repository(db, env.id);
+    const channel = await repo.createChannel(
+      `c-${randomUUID().slice(0, 8)}`,
+      "public",
+    );
+    const userId = (await repo.createUser(`u-${randomUUID().slice(0, 8)}`)).id;
+    for (let i = 0; i < 3; i++) {
+      await repo.sendMessage(channel.id, { text: `m${i}`, userId });
+    }
+
+    const before = await usageFor(db, env.id, PERIOD);
+    expect(before.messagesSent).toBe(3);
+
+    // The whole store, not this environment's keys. Chapter 3.8's counters and
+    // everything else go with it.
+    const redis = new Redis(
+      process.env["RELAY_REDIS_URL"] ?? "redis://localhost:6379",
+    );
+    try {
+      await redis.flushall();
+    } finally {
+      await redis.quit();
+    }
+
+    const after = await usageFor(db, env.id, PERIOD);
+    expect(after).toEqual(before);
+```
+
+Send three messages, read the figures, flush the entire counter store, read them
+again. Nothing changes, because nothing in the answer ever lived there.
+
+<Why title="Proving the test can fail">
+A test whose failure has never been seen is a test nobody has checked. Rebuilt
+chapter 3.8's way — the count's home moved to Redis, written by `sendMessage` and
+read back on the way out — the lane says:
+
+```text
+× reports identical figures across a FLUSHALL      102ms
+Tests  1 failed | 6 passed (7)
+```
+
+One failed and six did not. Every other assertion in the file passes under both
+designs, because both count correctly right up until something clears the store.
+This is the only test that knows the difference, which is exactly why FR-002
+exists.
+</Why>
+
+## The column that was already there
+
+`environments` needed a place to keep the caps, and it had one.
+
+```ts title="services/api/src/db/schema.ts (excerpt)"
+    quotaConfig: jsonb("quota_config").notNull().default({}),
+```
+
+Declared in chapter 2.1, named in SRS §6.1, and read by nothing for eighteen
+chapters. Chapter 3.8 was offered it for rate-limit policy and refused, in print:
+
+> Declared in 2.1, named in SRS §6.1, empty for seventeen chapters — and named
+> for **quotas**. A rate limit and a quota are different promises: one is
+> ephemeral and may be lost, the other is money and must be durable. Putting one
+> into a field named for the other would collapse in the schema exactly what this
+> chapter spends its length drawing.
+
+This is the later chapter. The shape:
+
+```json title="environments.quota_config (excerpt)"
+{
+  "messages":     { "hard": 10000, "soft": 8000 },
+  "active_users": { "hard": null,  "soft": 500  }
+}
+```
+
+<Trap title="Absent, null and zero are three different things">
+A cap of zero means *refuse everything* — an environment can be switched off
+deliberately — and it has to stay expressible. An absent key means *no cap*.
+Chapter 3.8 needed nullable columns to keep those apart; jsonb keeps them apart
+too, and it was worth checking rather than assuming: `#>> '{messages,hard}'`
+returns SQL `NULL` for an absent key and for a JSON `null` alike, and the string
+`'0'` for zero. A reader that treats null as zero suspends every tenant who never
+configured anything.
+</Trap>
+
+The schema enforces the rest of it:
+
+```sql title="services/api/migrations/0009_quotas.sql (excerpt)"
+ALTER TABLE environments
+  ADD CONSTRAINT environments_quota_config_shape CHECK (
+    jsonb_typeof(quota_config) = 'object'
+    AND (quota_config -> 'messages' IS NULL
+         OR jsonb_typeof(quota_config -> 'messages') = 'object')
+    AND (quota_config -> 'active_users' IS NULL
+         OR jsonb_typeof(quota_config -> 'active_users') = 'object')
+    AND (quota_config #>> '{messages,hard}' IS NULL
+         OR quota_config #>> '{messages,hard}' ~ '^[0-9]+$')
+    AND (quota_config #>> '{messages,soft}' IS NULL
+         OR quota_config #>> '{messages,soft}' ~ '^[0-9]+$')
+    AND (quota_config #>> '{active_users,hard}' IS NULL
+         OR quota_config #>> '{active_users,hard}' ~ '^[0-9]+$')
+    AND (quota_config #>> '{active_users,soft}' IS NULL
+         OR quota_config #>> '{active_users,soft}' ~ '^[0-9]+$')
+  );
+```
+
+That constraint **enumerates** the two dimensions, which means chapter 3.11's
+connection-minutes will cost one line here. A constraint that validated any
+dimension would need `jsonb_each`, and Postgres refuses:
+
+```text
+ERROR:  cannot use subquery in check constraint
+```
+
+The way around it is a PL/pgSQL validator, and a procedural function in a product
+migration is a constitution VII argument this chapter has not earned.
+
+<Why title="What a cap is denominated in">
+Messages and active users. Not money.
+
+FR-RTL-06 calls it a "hard spending cap", and there is no price anywhere in the
+SRS or the SAD — no unit cost, no currency, no rate card. The requirement's own
+design note calls it *"a purchasing requirement, not a technical one"*, whose
+stated harm is **unbounded cost exposure**, and a cap denominated in metered units
+bounds exactly that. Inventing a pricing primitive the specification never
+mentions would be new scope, and Principle VII asks what new scope buys before it
+asks anything else.
+</Why>
+
+## A count that cannot be incremented
+
+Messages are easy: plus one. Distinct users are not, and the reason is worth a
+minute.
+
+To increment a count of distinct senders you first have to know whether *this*
+sender has already been counted this month — which is a read, and a read that has
+to be correct under concurrency. The usual answer is a probabilistic sketch:
+HyperLogLog in Redis, a few kilobytes, approximately right.
+
+FR-002 refuses it. A flush would erase the month, and this chapter's whole subject
+is that the month must survive.
+
+So the row **is** the answer:
+
+```sql title="services/api/migrations/0009_quotas.sql (excerpt)"
+CREATE TABLE usage_active_users (
+  environment_id uuid        NOT NULL REFERENCES environments(id),
+  period         date        NOT NULL,
+  user_id        uuid        NOT NULL REFERENCES users(id),
+  first_seen_at  timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (environment_id, period, user_id)
+);
+```
+
+One row per user per period, written on every attributed send:
+
+```ts title="services/api/src/db/repository.ts (excerpt)"
+      // The distinct-user count, and the reason it is a row rather than a
+      // counter: incrementing it would need to know whether this user already
+      // sent this period, which is a read. The row IS the answer, and
+      // `ON CONFLICT DO NOTHING` makes the second send of the month free.
+      //
+      // ONLY WHEN THE SEND IS ATTRIBUTED. A key-authenticated REST send carries
+      // no `userId` — unattributed by design since chapter 3.3 — and counts
+      // toward the message quota and toward no user.
+      if (userId !== undefined) {
+        await tx
+          .insert(usageActiveUsers)
+          .values({ environmentId: this.environmentId, period, userId })
+          .onConflictDoNothing();
+      }
+```
+
+`ON CONFLICT DO NOTHING` makes the second message of the month free, and the count
+is an index-only scan over the key prefix. The table is bounded by the tenant's
+distinct users in a month rather than by their traffic, which is what makes it
+affordable — a tenant sending a million messages from four hundred people stores
+four hundred rows.
+
+<Trap title="An unattributed send counts toward the messages and toward nobody">
+A key-authenticated REST send carries no user — unattributed by design since
+chapter 3.3, because a server-side API key is not a person. It still costs a
+message against the message quota, and it writes no membership row at all. The
+alternative, inventing a synthetic user for it, would inflate the dimension the
+customer is actually being measured on.
+</Trap>
+
+## Where it is enforced, and why not where you would expect
+
+Chapter 3.8's limiter is middleware. The obvious thing is to put the quota check
+beside it.
+
+```ts title="services/api/src/limits/rate-limit.middleware.ts (excerpt)"
+export function operationsFor(
+  method: string,
+  path: string,
+): LimitedOperation[] {
+  if (!path.startsWith(PUBLIC_PREFIX)) return [];
+  if (method === "POST" && SEND_PATH.test(path)) return ["rest", "send"];
+  return ["rest"];
+```
+
+`operationsFor` returns an empty list for any path outside `/v1`, so the limiter
+never sees `/internal/messages` — and that is the route the gateway posts to when
+a WebSocket client sends a message. For a *rate* limit that is correct:
+`/internal` is service-to-service, and limiting it would limit the gateway rather
+than a tenant. For a quota it is wrong, because a quota is about what the tenant
+consumed regardless of which door it came through.
+
+<Figure code={figWhereItIsEnforced} caption="Two doors, one method. The limiter sees one of them; sendMessage sees both." />
+
+Both routes converge on `MessagesService.send`, which calls
+`Repository.sendMessage`. That method already opens the write transaction, so the
+check, the message, the event and the count commit together or none of them does.
+
+```ts title="services/api/src/db/repository.ts (excerpt)"
+      // THE CAP, CHECKED BEFORE THE MESSAGE IS WRITTEN (chapter 3.10, FR-007).
+      //
+      // Here rather than in middleware, because chapter 3.8's limiter never sees
+      // `/internal/messages` — `operationsFor` returns [] for anything outside
+      // `/v1` — and that is the route a WebSocket send arrives on. Both doors
+      // reach this method, and it already owns the write transaction, so the
+      // check and the increment commit together (research R3).
+      //
+      // A PLAIN READ, AND THE OVERSHOOT IS STATED RATHER THAN DEFENDED AGAINST.
+      //
+      // The first version took `FOR UPDATE` on the usage row, which bounds the
+      // overshoot to exactly one message. Two things retired it.
+      //
+      // The caps and the usage are now ONE joined read, and Postgres will not
+      // lock that:
+      //
+      //   ERROR:  FOR UPDATE cannot be applied to the nullable side of an outer join
+      //
+      // And the specification never asked for the lock. Its edge case reads: "the
+      // overshoot is bounded by concurrency, not unbounded, and this is stated
+      // rather than defended against." A few dozen sends in flight against a
+      // monthly cap of thousands is a bound worth naming rather than engineering
+      // around.
+      //
+      // WHAT THE QUOTA PATH COSTS, measured with the phases instrumented and the
+      // config toggled on one environment: 0.56ms per send at 32-way concurrency.
+      // The joined read is about 1.2ms of that and US1 needs it whether or not a
+      // cap exists. An earlier uncontrolled benchmark reported 273% and sent three
+      // separate hypotheses chasing what turned out to be warm-up (T033).
+      const quota = await this.assertWithinQuota(tx, period, userId);
+```
+
+## The sweep that was not needed
+
+Here is the design this chapter expected to build, and did not.
+
+Emailing an organisation at 50%, 80% and 100% of its quota sounds like a periodic
+job: every few minutes, walk every environment, compare usage against cap, send
+what is due. That job is a **global operation** — it reads and writes rows
+belonging to every tenant — and this codebase has spent a whole feature on what
+those cost. It would need an entry in the test harness's exemption list, a
+matching entry in the lint rule's ignores, and a test written carefully enough to
+survive both.
+
+None of it was necessary.
+
+<Figure code={figNoSweep} caption="Usage only rises because of a send, and the send already holds both numbers." />
+
+Usage rises for exactly one reason: somebody sent a message. The transaction that
+increments the count knows the value before and the value after, so it knows
+precisely which thresholds that one message crossed. It writes the rows itself,
+in the same transaction, and nothing periodic exists.
+
+```ts title="services/api/src/db/repository.ts (excerpt)"
+   * IN THE SAME TRANSACTION AS THE THING THAT CAUSED IT. The crossing and the
+   * message commit together or neither does, which is the same argument the
+   * event above them makes and the reason there is no periodic sweep in this
+   * chapter at all: usage only ever rises because of a send, and the send knows
+   * the value before and after, so it knows what it crossed (research R5).
+   *
+   * THE PERCENTAGE IS OF `hard ?? soft`. A soft threshold with no hard cap is
+   * still a figure an operator asked to be warned about, and 100% of it is worth
+   * an email even though nothing will be refused.
+   *
+   * `ON CONFLICT DO NOTHING` against `quota_notifications_once_per_threshold` is
+   * what makes it at-most-once (FR-015) — the schema, not this code. A concurrent
+   * double-crossing resolves to one row rather than two emails. */
+  private async recordCrossings(
+    tx: Db,
+    period: string,
+    dimension: Dimension,
+    before: number,
+    after: number,
+    caps: { hard: number | null; soft: number | null },
+    organisationId: string,
+  ): Promise<void> {
+    const reference = caps.hard ?? caps.soft;
+    if (reference === null) return;
+    const crossed = thresholdsCrossed(before, after, reference);
+    if (crossed.length === 0) return;
+
+    await tx
+      .insert(quotaNotifications)
+      .values(
+        crossed.map((threshold) => ({
+          id: randomUUID(),
+          environmentId: this.environmentId,
+          organisationId,
+          period,
+          dimension,
+          threshold,
+          quota: reference,
+          usageAtCrossing: after,
+        })),
+      )
+      .onConflictDoNothing();
+```
+
+<Why title="Why this is worth a section">
+The previous feature in this repository existed entirely because global operations
+in tests kept producing a fault that passed alone and failed in company — twelve
+occurrences across eight chapters. It built a Postgres trigger to catch them, an
+exemption list, and a lint rule.
+
+The first chapter written afterwards turns out not to need a global operation at
+all. Running the whole integration lane against a freshly baited database
+produces fifteen refusals from that trigger and **not one of them names a quota
+table**; every one is older residue on `webhook_endpoints`. No file joined the
+exemption list. The instrument changed the design rather than only the tests,
+which is the outcome its own success criteria hoped for and could not measure.
+</Why>
+
+## Running out, without going down
+
+FR-RTL-08 is unusually specific, and the specificity is the requirement: sends
+refused, history reads and existing connections unaffected. Refusing everything
+is easy and wrong.
+
+```ts title="services/api/src/messages/messages.service.ts (excerpt)"
+      if (error instanceof QuotaExceededError) {
+        // ONE THROW, AND IT IS THE ONLY ONE (chapter 3.10, FR-008).
+        //
+        // Both send routes reach this method — `internal.controller.ts` calls
+        // `messages.send`, the public controller calls it too — so there is one
+        // place to refuse from. An earlier draft of the plan costed "two
+        // controller mappings"; this service has no per-controller mappings to
+        // add one to, and adding two would be the drift EIR-API-04 and
+        // `ProtocolErrorFilter` exist to prevent (research R3).
+        //
+        // `402`, NOT `429`. Chapter 3.8 owns `429`, and a client that sleeps for
+        // `Retry-After` and retries is behaving correctly for a rate limit and
+        // wrongly for a quota — which will still be exhausted in an hour and in
+        // three weeks. There is a time at which sends resume and it is in the
+        // message, not in a header a client will act on.
+        //
+        // THE CODE IS NAMED HERE, and it has to be. `ProtocolErrorFilter` infers
+        // a code from the status for 400, 401, 403 and 404, and everything else
+        // becomes `internal_error` — so an unnamed `402` would emit a body
+        // calling itself an internal error while carrying a `402`. That is the
+        // lie chapter 2.2 fixed for 400 and chapter 3.2 for 403, and 3.2's
+        // mechanism — a thrower naming its own code — is what this uses. The
+        // filter builds the four-field envelope and derives `docs_url` from the
+        // code.
+        throw new HttpException(
+          {
+            code: "quota_exceeded",
+            message: error.publicMessage(),
+          },
+          HttpStatus.PAYMENT_REQUIRED,
+        );
+      }
+```
+
+The status is **402**, not 429. Chapter 3.8 owns 429, and a client that reads
+`Retry-After`, sleeps, and retries is behaving correctly for a rate limit and
+wrongly for a quota — which will still be exhausted in an hour and in three
+weeks. There is a moment at which sends resume and it is in the message, not in a
+header a client will act on.
+
+<Trap title="The code has to be named, or the body lies">
+`ProtocolErrorFilter` infers an error code from the status for 400, 401, 403 and
+404. Everything else falls through to `internal_error`. A `402` thrown without a
+code emits a body calling itself an internal error while carrying a payment
+status — the same lie chapter 2.2 fixed for 400 and chapter 3.2 for 403. The
+mechanism 3.2 added, a thrower naming its own code, is what this depends on, and
+the test asserts the emitted `code` rather than only the status.
+</Trap>
+
+What is *not* refused matters as much. History reads succeed. Open connections
+stay open — the gateway holds the socket and the api refuses the POST behind it,
+so a refusal cannot close anything. Webhook delivery continues for messages
+accepted before the cap was reached, because an acknowledged message is not
+un-acknowledged by a quota exceeded afterwards.
+
+## The outbox, a fourth time
+
+The threshold email needs a transport, and this series has built one three times
+already.
+
+<Figure code={figOutboxFourth} caption="The same shape, the fourth time. Say the number out loud." />
+
+```sql title="services/api/migrations/0009_quotas.sql (excerpt)"
+CREATE TABLE quota_notifications (
+  id                uuid        PRIMARY KEY,
+  environment_id    uuid        NOT NULL REFERENCES environments(id),
+  organisation_id   uuid        NOT NULL REFERENCES organisations(id),
+  period            date        NOT NULL,
+  dimension         text        NOT NULL,
+  threshold         integer     NOT NULL,
+  quota             bigint      NOT NULL,
+  usage_at_crossing bigint      NOT NULL,
+  crossed_at        timestamptz NOT NULL DEFAULT now(),
+  delivered_at      timestamptz,
+  last_error        text,
+  CONSTRAINT quota_notifications_dimension_check
+    CHECK (dimension IN ('messages', 'active_users')),
+  CONSTRAINT quota_notifications_threshold_check
+    CHECK (threshold IN (50, 80, 100)),
+  CONSTRAINT quota_notifications_once_per_threshold
+    UNIQUE (environment_id, period, dimension, threshold)
+);
+```
+
+`webhook_disable_notifications` cannot be reused: its `endpoint_id` is `NOT NULL`
+and a quota crossing has no endpoint. So this is a fourth table with the same
+claim predicate, drained by a fourth relay that looks like the third.
+
+<Why title="Four tables rather than one">
+The alternative is one `notifications` table with a `kind` column and a JSON
+payload. It removes a migration and adds a discriminated union to every read, and
+the four kinds have genuinely different columns — an endpoint URL, a percentage,
+a period, a delivery attempt count.
+
+Four concrete tables that look alike is a pattern. One abstract table serving four
+purposes is a framework, and a framework is a thing you maintain instead of the
+thing you were building.
+</Why>
+
+The unique constraint is the interesting part:
+
+```sql title="services/api/migrations/0009_quotas.sql (excerpt)"
+  CONSTRAINT quota_notifications_once_per_threshold
+    UNIQUE (environment_id, period, dimension, threshold)
+```
+
+That is "at most one email per threshold per quota per period" enforced by the
+schema rather than promised by the code that writes it. Two concurrent crossings
+resolve to one row, and they would do so even if the writing code were wrong —
+which is the difference between a guarantee and an intention.
+
+## What it costs
+
+The send path gains one query.
+
+```ts title="services/api/src/db/repository.ts (excerpt)"
+      // THE MONTH'S USAGE COMMITS WITH THE MESSAGE (chapter 3.10, FR-RTL-05).
+      //
+      // Same argument as the event above it, one requirement further on. A quota
+      // is about THIS MONTH and must not forget, so the count cannot live in the
+      // per-minute counter store chapter 3.8 built — a flush there costs one
+      // window of over-service, a flush here costs the month (FR-002).
+      //
+      // It is an increment rather than a query because the alternative is a read
+      // over `messages`, which carries no `environment_id` and no index on
+      // `created_at`: the month predicate becomes a Filter applied after every
+      // row the tenant has ever sent is read off the heap. Fast today, and
+      // proportional to lifetime traffic forever (research R1).
+      //
+      // On the INSERTED branch only, like the event. A recognised idempotent
+      // retry wrote no message and must consume no quota either, or a client
+      // retrying on a flaky link is billed twice for one message.
+      await tx
+        .insert(usagePeriods)
+        .values({ environmentId: this.environmentId, period, messagesSent: 1 })
+        .onConflictDoUpdate({
+          target: [usagePeriods.environmentId, usagePeriods.period],
+          set: { messagesSent: sql`${usagePeriods.messagesSent} + 1` },
+        });
+
+      // The distinct-user count, and the reason it is a row rather than a
+      // counter: incrementing it would need to know whether this user already
+      // sent this period, which is a read. The row IS the answer, and
+      // `ON CONFLICT DO NOTHING` makes the second send of the month free.
+      //
+      // ONLY WHEN THE SEND IS ATTRIBUTED. A key-authenticated REST send carries
+      // no `userId` — unattributed by design since chapter 3.3 — and counts
+      // toward the message quota and toward no user.
+      if (userId !== undefined) {
+        await tx
+          .insert(usageActiveUsers)
+          .values({ environmentId: this.environmentId, period, userId })
+          .onConflictDoNothing();
+```
+
+Both statements are index operations. The roll-up increment resolves its conflict
+against `usage_periods_pkey`, which is what storing the period rather than
+computing it buys — a lookup is the whole primary key, and a month boundary is a
+different row rather than a different filter.
+
+Measured with the phases instrumented and the configuration toggled on one
+environment, 32 concurrent sends across 32 channels:
+
+```text
+unconfigured           1.77ms per send    assertWithinQuota = 1.246ms
+configured             2.33ms per send    assertWithinQuota = 1.586ms
+back to unconfigured   1.77ms per send    assertWithinQuota = 1.121ms
+```
+
+Configuring a quota costs about half a millisecond per send.
+
+<Trap title="How that number was nearly wrong four times">
+The first benchmark built a fresh environment for each case and ran them in a
+fixed order. It reported 273%, then 341%, then 303%, then 411% — and each time a
+different cause looked obvious. A `FOR UPDATE` was serialising the environment.
+An organisation lookup was running on every send. Two round-trips were holding a
+pooled connection above the pool size.
+
+All three were acted on. None of them was it. The cause was the benchmark: each
+case carried its own warm-up and its own table growth, so the measurement was
+mostly measuring which loop ran second.
+
+Two of the three changes are better code and stayed — asking the free arithmetic
+before querying anything, and reading the caps and the usage in one join. The
+third cannot be undone even deliberately: once those two reads are one joined
+read, `FOR UPDATE cannot be applied to the nullable side of an outer join`. The
+overshoot is therefore bounded by the number of sends in flight rather than by
+one, which is what the specification asked for in the first place.
+</Trap>
+
+<Checkpoint>
+- Monthly usage counted in the transaction that writes the message, and identical
+  across a `FLUSHALL` of the counter store
+- A hard cap that refuses sends with `402 quota_exceeded` and touches nothing a
+  tenant can read
+- A soft threshold that alerts and refuses nothing
+- Emails at 50%, 80% and 100%, at most one each per quota per period, enforced by
+  a unique constraint
+- The outbox pattern for the fourth time, in `quota_notifications`
+- No periodic job, no global operation, and no new entry in the exemption list
+</Checkpoint>
+
+<ForwardRef>
+FR-RTL-05 names three metered dimensions and this chapter covers two. Messages
+and active users are already rows — `messages.user_id` has been in
+`0000_core_tables.sql` since Part 2 — so counting them is an aggregation question.
+A connection-minute is a duration nothing records, and the service that would have
+to record it is the gateway, **which owns no tables**. That is a different subject
+with a different lesson, and it is the next chapter.
+</ForwardRef>
+
+
+## The chapter in full
+
+The excerpts above are the parts worth arguing about. These are the files, whole
+where they are new and as diffs where they are not.
+
+**The suites are not here.** `quotas.itest.ts` runs to five hundred lines across
+twenty-four cases, and the assertions worth reading are quoted above — the flush,
+the refusal beside the successful history read, the three emails Mailpit actually
+received. The rest is setup, and a page that reprinted it would bury the four
+files that carry the argument.
+
+
+### The migration
+
+```sql title="services/api/migrations/0009_quotas.sql"
+-- Chapter 3.10 — monthly usage quotas (FR-RTL-05 to FR-RTL-08).
+--
+-- Chapter 3.8 built the per-minute limiter. This is the other half of FR-RTL and
+-- the two are different problems wearing the same word: a rate limit is about
+-- THIS SECOND and forgets, a quota is about THIS MONTH and must not. Everything
+-- below follows from the second half of that sentence.
+--
+-- WHY A ROLL-UP AND NOT A QUERY OVER `messages`. Deriving usage on read is one
+-- statement and needs no tables at all, and it is what this chapter argues
+-- against. `messages` carries no `environment_id` — it hangs off `channels` — and
+-- no index on `created_at`, so the month predicate is a FILTER applied after the
+-- rows are read:
+--
+--     ->  Bitmap Heap Scan on messages m
+--           Recheck Cond: (c.id = channel_id)
+--           Filter: (created_at >= date_trunc('month', ...))
+--
+-- The work is proportional to everything the tenant has ever sent. At 507
+-- messages it measures a quarter of a millisecond, which is why the argument is
+-- the plan and not the clock.
+
+-- ---------------------------------------------------------------------------
+-- The policy: the column chapter 2.1 left empty.
+-- ---------------------------------------------------------------------------
+--
+-- THERE IS NO NEW POLICY COLUMN, because `environments.quota_config` has been
+-- sitting there since `0000_core_tables.sql` — declared in chapter 2.1, named in
+-- SRS §6.1, and read by nothing for eighteen chapters. Chapter 3.8 was offered it
+-- for rate-limit policy and refused, in prose, on the grounds that "the column is
+-- named for quotas, quotas are a later chapter". This is that chapter.
+--
+-- Shape:
+--
+--     { "messages":     { "hard": 10000, "soft": 8000 },
+--       "active_users": { "hard": null,  "soft": 500  } }
+--
+-- ABSENT AND NULL BOTH MEAN NO CAP. ZERO MEANS REFUSE EVERYTHING. That is the
+-- same rule 0008 wrote for the limit columns, and jsonb keeps it expressible:
+-- `#>> '{messages,hard}'` returns SQL NULL for an absent key and for a JSON null
+-- alike, and the string `'0'` for zero. The distinction 3.8 needed nullable
+-- columns for survives the move.
+--
+-- WHAT THE JSONB BUYS: chapter 3.11 adds connection-minutes and FR-MED-12 later
+-- adds media bytes, and neither needs a table migration — a new dimension is a
+-- new key.
+--
+-- WHAT IT COSTS, said plainly rather than discovered later: the shape below is
+-- enforced by a CHECK that ENUMERATES the two dimensions, so a third one does
+-- cost a one-line constraint change to keep the guarantee. A constraint that
+-- validated any dimension would need `jsonb_each`, and a CHECK may not contain a
+-- subquery —
+--
+--     ERROR:  cannot use subquery in check constraint
+--
+-- which is the restriction feature 030's R37 met from the other side, in a
+-- trigger's WHEN clause. The alternative is a PL/pgSQL validator, and a procedural
+-- function in a PRODUCT migration is a constitution VII argument this chapter has
+-- not earned; feature 030's guard is exempt precisely because it is never a
+-- migration.
+--
+-- The regex rather than a cast: `(… )::bigint` inside a CHECK throws on bad input
+-- instead of rejecting the row, and a constraint that errors is worse than one
+-- that refuses.
+
+ALTER TABLE environments
+  ADD CONSTRAINT environments_quota_config_shape CHECK (
+    jsonb_typeof(quota_config) = 'object'
+    AND (quota_config -> 'messages' IS NULL
+         OR jsonb_typeof(quota_config -> 'messages') = 'object')
+    AND (quota_config -> 'active_users' IS NULL
+         OR jsonb_typeof(quota_config -> 'active_users') = 'object')
+    AND (quota_config #>> '{messages,hard}' IS NULL
+         OR quota_config #>> '{messages,hard}' ~ '^[0-9]+$')
+    AND (quota_config #>> '{messages,soft}' IS NULL
+         OR quota_config #>> '{messages,soft}' ~ '^[0-9]+$')
+    AND (quota_config #>> '{active_users,hard}' IS NULL
+         OR quota_config #>> '{active_users,hard}' ~ '^[0-9]+$')
+    AND (quota_config #>> '{active_users,soft}' IS NULL
+         OR quota_config #>> '{active_users,soft}' ~ '^[0-9]+$')
+  );
+
+-- ---------------------------------------------------------------------------
+-- The roll-up.
+-- ---------------------------------------------------------------------------
+--
+-- `period` IS STORED, NOT COMPUTED. It is the first day of the calendar month in
+-- UTC, and storing it makes a lookup the whole primary key rather than a
+-- predicate over a range — a month boundary becomes a different row instead of a
+-- different filter. `services/api/src/quotas/period.ts` is the one definition of
+-- which month an instant belongs to; nothing here repeats `date_trunc`.
+--
+-- THIS IS THE PROJECT'S FIRST `date` COLUMN, against 28 `timestamp` ones, and it
+-- is half a primary key. Drizzle's `date` reads and writes `YYYY-MM-DD` strings,
+-- so the TypeScript side hands strings across; a `Date` on one side of that
+-- comparison and a string on the other is a row that cannot be found rather than
+-- an error (research R7a).
+--
+-- `messages_sent` IS `bigint`, declared `{ mode: "number" }` in the schema like
+-- the two bigints this project already has. It is a cumulative count on the hot
+-- path, and an overflow here is a wrong bill rather than a wrapped counter.
+
+CREATE TABLE usage_periods (
+  environment_id uuid        NOT NULL REFERENCES environments(id),
+  period         date        NOT NULL,
+  messages_sent  bigint      NOT NULL DEFAULT 0,
+  created_at     timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (environment_id, period),
+  CONSTRAINT usage_periods_messages_sent_non_negative
+    CHECK (messages_sent >= 0)
+);
+
+-- ---------------------------------------------------------------------------
+-- The distinct-user membership.
+-- ---------------------------------------------------------------------------
+--
+-- A message count is `+1`. A DISTINCT-USER COUNT IS NOT: incrementing it requires
+-- knowing whether this user has already sent this period, which is a read. So the
+-- row is the answer — one per user per period, written `ON CONFLICT DO NOTHING`
+-- on every attributed send, and the count is an index-only scan over the key
+-- prefix.
+--
+-- Bounded by the tenant's distinct users per month rather than by their traffic,
+-- which is what makes it affordable and the reason it is a table and not a
+-- counter. HyperLogLog in Redis is the textbook answer and is refused by FR-002:
+-- a flush would erase the month.
+--
+-- A SEND WITH NO `user_id` WRITES NO ROW. A key-authenticated REST send is
+-- unattributed by design since chapter 3.3, and an unattributed send counts
+-- toward the message quota and toward no user.
+
+CREATE TABLE usage_active_users (
+  environment_id uuid        NOT NULL REFERENCES environments(id),
+  period         date        NOT NULL,
+  user_id        uuid        NOT NULL REFERENCES users(id),
+  first_seen_at  timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (environment_id, period, user_id)
+);
+
+-- ---------------------------------------------------------------------------
+-- The outbox, a fourth time.
+-- ---------------------------------------------------------------------------
+--
+-- Chapter 3.3 published events, 3.5 dispatched webhook deliveries, 3.9 sent
+-- disablement emails. Each is a table whose claim predicate starts null, drained
+-- by a relay, retried by falling due again. This is the fourth, and saying the
+-- number out loud is the point: four concrete tables that look alike is a
+-- pattern, one abstract table serving four purposes is a framework.
+--
+-- `webhook_disable_notifications` CANNOT BE REUSED — its `endpoint_id` is NOT
+-- NULL and a quota crossing has no endpoint.
+--
+-- THE UNIQUE CONSTRAINT IS FR-015. "At most one email per threshold per quota per
+-- period" is enforced by the schema rather than promised by the code that writes
+-- it, so a concurrent double-crossing resolves to one row instead of two emails.
+--
+-- `quota` and `usage_at_crossing` are STORED rather than looked up at send time,
+-- because the cap can change between the crossing and the delivery, and an email
+-- saying "you have used 80% of 10,000" should mean the 10,000 that was true when
+-- it happened.
+
+CREATE TABLE quota_notifications (
+  id                uuid        PRIMARY KEY,
+  environment_id    uuid        NOT NULL REFERENCES environments(id),
+  organisation_id   uuid        NOT NULL REFERENCES organisations(id),
+  period            date        NOT NULL,
+  dimension         text        NOT NULL,
+  threshold         integer     NOT NULL,
+  quota             bigint      NOT NULL,
+  usage_at_crossing bigint      NOT NULL,
+  crossed_at        timestamptz NOT NULL DEFAULT now(),
+  delivered_at      timestamptz,
+  last_error        text,
+  CONSTRAINT quota_notifications_dimension_check
+    CHECK (dimension IN ('messages', 'active_users')),
+  CONSTRAINT quota_notifications_threshold_check
+    CHECK (threshold IN (50, 80, 100)),
+  CONSTRAINT quota_notifications_once_per_threshold
+    UNIQUE (environment_id, period, dimension, threshold)
+);
+
+-- The claim predicate the relay drains on, matching chapter 3.9's shape.
+CREATE INDEX quota_notifications_undelivered
+  ON quota_notifications (crossed_at)
+  WHERE delivered_at IS NULL;
+```
+
+### Which month it is
+
+```ts title="services/api/src/quotas/period.ts"
+/** The usage period an instant belongs to: the first day of its calendar month,
+ * in UTC, as a plain `YYYY-MM-DD` string.
+ *
+ * ONE DEFINITION, IMPORTED BY EVERYTHING. The migration's default, the
+ * repository's predicate and the relay's read all name this function rather than
+ * repeating `date_trunc`, because a quota that disagrees with itself about which
+ * month it is counts a tenant twice in one and not at all in the other.
+ *
+ * A STRING, NOT A `Date`. The column is a Postgres `date` — this project's first,
+ * against 28 `timestamp` columns — and `period` is half the primary key of
+ * `usage_periods` and a third of `usage_active_users`'s. Drizzle's `date` in its
+ * default mode reads and writes `YYYY-MM-DD` strings, so a string here is the
+ * value the key is actually built from; handing a `Date` around instead would put
+ * a timezone-bearing object on both sides of a comparison that has no timezone,
+ * and the failure would be a row that cannot be found rather than an error
+ * (research R7a).
+ *
+ * UTC, and the tests say why. `date_trunc('month', now())` without a zone answers
+ * September on a server running ahead of UTC on the last evening of August, and
+ * the row lands in a period nobody reads. */
+export function periodOf(at: Date): string {
+  const year = at.getUTCFullYear();
+  const month = String(at.getUTCMonth() + 1).padStart(2, "0");
+  return `${year}-${month}-01`;
+}
+```
+
+### What an increase crossed
+
+```ts title="services/api/src/quotas/policy.ts"
+/** The percentages an organisation is emailed at (FR-RTL-07). */
+export const THRESHOLDS = [50, 80, 100] as const;
+
+/** Which thresholds a usage increase crossed, ascending.
+ *
+ * Called inside the send transaction, between the increment and the cap check,
+ * so it takes the two numbers the transaction already holds and asks nothing
+ * else. No database, no clock, no rounding policy hidden in a helper.
+ *
+ * `quota` is null for an environment with no cap configured, and null crosses
+ * nothing at any usage — the absent state stays absent rather than becoming
+ * `Infinity` or `-1` somewhere up the call stack.
+ *
+ * A quota of ZERO is a different thing from an absent one: it means refuse
+ * everything, and every threshold is already met. Guarded before the division
+ * rather than after it. */
+export function thresholdsCrossed(
+  before: number,
+  after: number,
+  quota: number | null,
+): number[] {
+  if (quota === null) return [];
+  if (after <= before) return [];
+  if (quota === 0) return [...THRESHOLDS];
+
+  const pct = (n: number) => (n / quota) * 100;
+  const from = pct(before);
+  const to = pct(after);
+  // `>` on the left and `>=` on the right: FR-014 says "reaches", so landing
+  // exactly on 50% crosses it, and starting exactly on 50% does not cross it
+  // again.
+  return THRESHOLDS.filter((t) => from < t && to >= t);
+}
+```
+
+### Reading the column 2.1 left
+
+```ts title="services/api/src/quotas/config.ts"
+import { z } from "zod";
+
+/** What `environments.quota_config` holds, and the only thing that reads it.
+ *
+ * THE COLUMN IS THE ONE CHAPTER 2.1 LEFT EMPTY. Declared in
+ * `0000_core_tables.sql`, named in SRS §6.1, read by nothing for eighteen
+ * chapters. Chapter 3.8 was offered it for rate-limit policy and refused in
+ * prose — "the column is named for quotas, quotas are a later chapter". This is
+ * that chapter.
+ *
+ * WHY A PARSER AT ALL. Chapter 3.8's limits are typed columns and need no
+ * parsing; a jsonb column arrives as `unknown` and something has to turn it into
+ * numbers before a cap can be compared. The alternative is a cast at each read
+ * site, which is three places to get wrong instead of one.
+ *
+ * The schema's CHECK constraint already refuses a negative, a non-number and a
+ * non-object — measured, not assumed. This is the second gate rather than the
+ * only one, and it exists because the constraint cannot express "and nothing
+ * else", while a parser can. */
+const capsSchema = z
+  .object({
+    /** Absent or null: no cap. Zero: refuse everything. */
+    hard: z.number().int().nonnegative().nullable().optional(),
+    /** Absent or null: no alert. Alerts, never refuses. */
+    soft: z.number().int().nonnegative().nullable().optional(),
+  })
+  .strict();
+
+export const quotaConfigSchema = z
+  .object({
+    messages: capsSchema.optional(),
+    active_users: capsSchema.optional(),
+  })
+  // `.strict()` so a dimension nobody implemented is a parse failure rather than
+  // a silently ignored cap. Chapter 3.11 adds connection-minutes by adding a key
+  // here and a line to the migration's CHECK — the cost the jsonb shape trades
+  // for not needing a table migration.
+  .strict();
+
+export type QuotaConfig = z.infer<typeof quotaConfigSchema>;
+
+/** One dimension's caps, resolved. `null` on either means no cap and no alert;
+ * the absent state stays absent all the way to the reader rather than becoming
+ * `Infinity` or `-1` somewhere up the stack. */
+export interface Caps {
+  hard: number | null;
+  soft: number | null;
+}
+
+export const NO_CAPS: Caps = { hard: null, soft: null };
+
+/** Read one dimension out of whatever the column held.
+ *
+ * FAILS CLOSED ON A PARSE ERROR — the caller gets `NO_CAPS` and a reason, and a
+ * quota that cannot be read refuses nothing rather than refusing everything. A
+ * malformed config is an operator's mistake, and suspending a tenant's sends
+ * because their configuration is unparseable would turn a typo into an outage.
+ * The caller logs; it does not swallow. */
+export function capsFor(
+  raw: unknown,
+  dimension: keyof QuotaConfig,
+): { caps: Caps; error: string | null } {
+  const parsed = quotaConfigSchema.safeParse(raw ?? {});
+  if (!parsed.success) {
+    return { caps: NO_CAPS, error: parsed.error.issues[0]?.message ?? "invalid" };
+  }
+  const d = parsed.data[dimension];
+  return {
+    caps: { hard: d?.hard ?? null, soft: d?.soft ?? null },
+    error: null,
+  };
+}
+```
+
+### The refusal
+
+```ts title="services/api/src/quotas/quota.error.ts"
+import type { QuotaConfig } from "./config";
+
+/** The dimensions a quota is measured in. `connection_minutes` is chapter 3.11. */
+export type Dimension = keyof QuotaConfig;
+
+/** Raised by the repository when a send would exceed a hard cap.
+ *
+ * NOT AN HTTP CONCERN. The repository layer does not know what status a caller
+ * will map this to, and it holds the four things the message has to name:
+ * which dimension, what was used, what was allowed, and which period. Turning
+ * that into a `402` is the service boundary's job, and turning it into an
+ * envelope is `ProtocolErrorFilter`'s — one place, not three (research R3). */
+export class QuotaExceededError extends Error {
+  readonly dimension: Dimension;
+  readonly usage: number;
+  readonly quota: number;
+  readonly period: string;
+
+  constructor(args: {
+    dimension: Dimension;
+    usage: number;
+    quota: number;
+    period: string;
+  }) {
+    super(
+      `${args.dimension} quota exhausted: ${args.usage} of ${args.quota} for ${args.period}`,
+    );
+    this.name = "QuotaExceededError";
+    this.dimension = args.dimension;
+    this.usage = args.usage;
+    this.quota = args.quota;
+    this.period = args.period;
+  }
+
+  /** The date sends resume: midnight UTC on the first of the next month.
+   *
+   * In the message rather than in a `Retry-After` header, and that is the whole
+   * argument for `402` over `429`. A client that sleeps for the header's value
+   * and retries is behaving correctly for a rate limit and wrongly for a quota,
+   * which will still be exhausted in an hour and in a week. */
+  resumesOn(): string {
+    const [y, m] = this.period.split("-").map(Number);
+    const nextMonth = m === 12 ? 1 : (m ?? 1) + 1;
+    const nextYear = m === 12 ? (y ?? 0) + 1 : y;
+    return `${nextYear}-${String(nextMonth).padStart(2, "0")}-01`;
+  }
+
+  /** The sentence a developer reads in a log at 3am. Four things in a fixed
+   * order: the dimension, the figure used, the figure allowed, and when it
+   * changes (contracts/quota.md §1). */
+  publicMessage(): string {
+    return (
+      `monthly ${this.dimension === "messages" ? "message" : "active user"} ` +
+      `quota exhausted: ${this.usage} of ${this.quota} for ${this.period}; ` +
+      `sends resume on ${this.resumesOn()}`
+    );
+  }
+}
+```
+
+### The email
+
+```ts title="services/api/src/quotas/quota-email.ts"
+import type { Mail } from "../notifications/mailer";
+
+export interface CrossingFacts {
+  /** "Fleet Ops / production" — how a dashboard would name it, never a uuid. */
+  environmentName: string;
+  period: string;
+  dimension: string;
+  threshold: number;
+  quota: number;
+  usageAtCrossing: number;
+  /** Whether a hard cap is in force right now, which decides whether this email
+   * reports a stoppage or a warning. */
+  hardCapInForce: boolean;
+}
+
+const NOUN: Record<string, string> = {
+  messages: "messages",
+  active_users: "active users",
+};
+
+/** The month, as a month. `2026-08-01` is a row key, not something to show a
+ * person who wants to know which bill this is. */
+function monthName(period: string): string {
+  const [y, m] = period.split("-");
+  const months = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+  ];
+  return `${months[Number(m) - 1] ?? m} ${y}`;
+}
+
+function resumesOn(period: string): string {
+  const [y, m] = period.split("-").map(Number);
+  const nextMonth = m === 12 ? 1 : (m ?? 1) + 1;
+  const nextYear = m === 12 ? (y ?? 0) + 1 : y;
+  return `${monthName(`${nextYear}-${String(nextMonth).padStart(2, "0")}-01`)}`;
+}
+
+/** What an organisation's admins are told when usage crosses a threshold
+ * (chapter 3.10, FR-014).
+ *
+ * NO SECRET, NO KEY, NO MESSAGE TEXT. Chapter 3.9 established that this is
+ * verified by reading what the mail server received rather than by asserting on
+ * the call, and the same test shape applies here.
+ *
+ * AT 100% WITH NO HARD CAP, IT SAYS NOTHING WAS REFUSED. An email that threatens
+ * a suspension which will not happen is worse than no email — it teaches the
+ * reader that the warnings are noise, which is the one thing a warning cannot
+ * afford. */
+export function quotaThreshold(facts: CrossingFacts): Mail {
+  const noun = NOUN[facts.dimension] ?? facts.dimension;
+  const subject =
+    `Relay: ${facts.environmentName} has used ${facts.threshold}% of its ` +
+    `monthly ${noun} quota`;
+
+  const consequence =
+    facts.threshold < 100
+      ? "Nothing has been refused. This is a warning so the month does not end in a surprise."
+      : facts.hardCapInForce
+        ? `Sends are now being refused with \`quota_exceeded\`. They resume in ${resumesOn(facts.period)}, or as soon as the quota is raised.`
+        : "Nothing has been refused: this environment has no hard cap, only the threshold you asked to be told about.";
+
+  const text = [
+    `${facts.environmentName} has used ${facts.usageAtCrossing} of ${facts.quota} ${noun} for ${monthName(facts.period)} — ${facts.threshold}%.`,
+    "",
+    consequence,
+    "",
+    "Usage resets at the start of the next calendar month.",
+  ].join("\n");
+
+  return { subject, text };
+}
+```
+
+### The relay, a fourth time
+
+```ts title="services/api/src/quotas/quota-relay.ts"
+import type { Logger } from "@relay/service-kit";
+
+import type { Db } from "../db/client";
+import {
+  drainQuotaNotifications,
+  organisationRecipients,
+  type QuotaNotificationRow,
+} from "../db/repository";
+import type { Mailer } from "../notifications/mailer";
+import { quotaThreshold } from "./quota-email";
+
+// THE OUTBOX PATTERN, A FOURTH TIME (chapter 3.10) — after 3.3's events, 3.5's
+// deliveries and 3.9's disablement emails. Same shape on purpose: a table whose
+// claim predicate starts null, a loop that reads it, a side effect, and no state
+// shared with the request path.
+//
+// Four concrete tables that look alike is a pattern; one abstract table serving
+// four purposes is a framework. The number is worth saying out loud, because a
+// reader who has now seen it three times deserves to be told the repetition is
+// deliberate rather than an oversight nobody got round to.
+
+const BATCH_SIZE = 100;
+const IDLE_INTERVAL_MS = 5_000;
+
+export interface QuotaRelay {
+  start(): void;
+  stop(): Promise<void>;
+  /** One pass — the same code path `start` runs, so nothing here is proven only
+   * about a loop that tests never enter. */
+  drainOnce(): Promise<number>;
+}
+
+export function createQuotaRelay({
+  db,
+  mailer,
+  logger,
+  batchSize = BATCH_SIZE,
+  intervalMs = IDLE_INTERVAL_MS,
+}: {
+  db: Db;
+  mailer: Mailer;
+  logger: Logger;
+  batchSize?: number;
+  intervalMs?: number;
+}): QuotaRelay {
+  let running = false;
+  let loop: Promise<void> = Promise.resolve();
+
+  async function deliver(row: QuotaNotificationRow): Promise<void> {
+    const recipients = await organisationRecipients(db, row.organisationId);
+
+    if (recipients.length === 0) {
+      // The same real branch chapter 3.9 met: `humans.email` is nullable, so an
+      // organisation whose every member is unaddressable is a state the schema
+      // permits. The row is marked delivered because there is no address to
+      // retry to, and leaving it claimable would mean reclaiming the same
+      // undeliverable row every five seconds for ever. The log line is what
+      // replaces the email — the obligation is discharged as far as it can be,
+      // and the fact that it could not be met is recorded rather than swallowed.
+      logger.log("error", "quotas.unaddressable", {
+        organisation_id: row.organisationId,
+        notification_id: row.id,
+        detail:
+          "quota threshold could not be notified: no member has an email address",
+      });
+      return;
+    }
+
+    const mail = quotaThreshold({
+      environmentName: row.environmentName,
+      period: row.period,
+      dimension: row.dimension,
+      threshold: row.threshold,
+      quota: row.quota,
+      usageAtCrossing: row.usageAtCrossing,
+      hardCapInForce: row.hardCapInForce,
+    });
+
+    // One message per recipient, never one message with several addresses on
+    // it: a customer's colleagues' addresses are that customer's data, and a
+    // header every recipient can read is a disclosure nobody asked for.
+    for (const to of recipients) {
+      await mailer.send(to, mail);
+    }
+    logger.log("info", "quotas.notified", {
+      notification_id: row.id,
+      recipients: recipients.length,
+    });
+  }
+
+  async function drainOnce(): Promise<number> {
+    return drainQuotaNotifications(db, batchSize, deliver, (row, error) => {
+      // One row's failure, one line, and the batch keeps going. A mail server
+      // that is down produces one of these per claimed row and then a drain of
+      // zero, which the loop treats as idle — correct, because there is nothing
+      // this process can do but wait.
+      logger.log("error", "quotas.send_failed", {
+        notification_id: row.id,
+        error: String(error),
+      });
+    });
+  }
+
+  async function run(): Promise<void> {
+    while (running) {
+      try {
+        const sent = await drainOnce();
+        if (sent > 0) {
+          // A count and an id. Never an address (NFR-SEC-06).
+          logger.log("info", "quotas.drained", { count: sent });
+          continue;
+        }
+      } catch (error) {
+        // A mail server that is down lands here. Rows stay claimable and the
+        // next pass tries again, which is the whole reason this is a table
+        // rather than a call.
+        logger.log("error", "quotas.drain_failed", { error: String(error) });
+      }
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    }
+  }
+
+  return {
+    start() {
+      if (running) return;
+      running = true;
+      loop = run();
+    },
+    async stop() {
+      running = false;
+      await loop;
+    },
+    drainOnce,
+  };
+}
+```
+
+### Its home
+
+```ts title="services/api/src/quotas/quotas.module.ts"
+import { Inject, Injectable, Module, type OnModuleDestroy } from "@nestjs/common";
+
+import { createLogger } from "@relay/service-kit";
+
+import { createDb, createPool, type Db } from "../db/client";
+import { createMailer } from "../notifications/mailer";
+import { createQuotaRelay, type QuotaRelay } from "./quota-relay";
+
+// The quota relay's home (chapter 3.10). Same shape as the notification
+// module's, which is the same shape as the outbox module's: a loop that reads a
+// table, does a side effect, and shares no state with the request path.
+
+export const QUOTA_RELAY = "QUOTA_RELAY";
+
+/** Off for the suites that want a quiet database, on everywhere else — the same
+ * switch and the same reasoning as `RELAY_NOTIFICATION_RELAY`. Feature 030's R39
+ * found nine suites booting `AppModule` with every relay defaulting on, so the
+ * three lane configs that carry the other flags carry this one too. */
+export function quotaRelayEnabled(): boolean {
+  return (process.env.RELAY_QUOTA_RELAY ?? "on").toLowerCase() !== "off";
+}
+
+@Injectable()
+export class QuotaRelayService implements OnModuleDestroy {
+  constructor(@Inject(QUOTA_RELAY) private readonly relay: QuotaRelay) {}
+
+  start(): void {
+    if (quotaRelayEnabled()) this.relay.start();
+  }
+
+  async onModuleDestroy(): Promise<void> {
+    await this.relay.stop();
+  }
+}
+
+@Module({
+  providers: [
+    {
+      provide: QUOTA_RELAY,
+      useFactory: (): QuotaRelay =>
+        createQuotaRelay({
+          db: createDb(createPool()) as Db,
+          mailer: createMailer(),
+          logger: createLogger("quotas"),
+        }),
+    },
+    QuotaRelayService,
+  ],
+  exports: [QUOTA_RELAY, QuotaRelayService],
+})
+export class QuotasModule {}
+```
+
+### What the existing files gained
+
+
+```diff title="services/api/src/db/schema.ts"
+@@ -3,8 +3,9 @@ import {
+   bigserial,
+   bigint,
+   boolean,
+   check,
++  date,
+   index,
+   integer,
+   jsonb,
+   pgTable,
+@@ -694,4 +695,119 @@ export const webhookDisableNotifications = pgTable(
+     // guessing at a query nobody has written.
+     index("webhook_disable_notifications_environment_idx").on(t.environmentId),
+   ],
+ );
++
++// ---------------------------------------------------------------------------
++// Chapter 3.10 — monthly usage quotas (FR-RTL-05 to FR-RTL-08).
++// ---------------------------------------------------------------------------
++//
++// The POLICY is not here, because it was already here. `environments.quotaConfig`
++// has been declared since chapter 2.1 and read by nothing for eighteen chapters;
++// 3.8 was offered it for rate-limit policy and refused it in prose, on the
++// grounds that the column is named for quotas and quotas are a later chapter.
++// This is that chapter. `quotas/config.ts` is the only thing that parses it.
++//
++// `date` IS THIS PROJECT'S FIRST, against 28 `timestamp` columns, and it is half
++// a primary key here and a third of one below. Drizzle's `date` in its default
++// mode reads and writes `YYYY-MM-DD` strings, which is what `quotas/period.ts`
++// produces — a `Date` on one side of that comparison and a string on the other is
++// a row that cannot be found rather than an error (research R7a).
++
++export const usagePeriods = pgTable(
++  "usage_periods",
++  {
++    environmentId: uuid("environment_id")
++      .notNull()
++      .references(() => environments.id),
++    period: date("period").notNull(),
++    // `{ mode: "number" }` like the two bigints this project already has
++    // (`channels.lastSequence`, `messages.sequence`). Drizzle requires a mode,
++    // and a cumulative count that overflowed would be a wrong bill rather than a
++    // wrapped counter.
++    messagesSent: bigint("messages_sent", { mode: "number" })
++      .notNull()
++      .default(0),
++    createdAt: timestamp("created_at", { withTimezone: true })
++      .notNull()
++      .defaultNow(),
++  },
++  (t) => [
++    primaryKey({ columns: [t.environmentId, t.period] }),
++    check(
++      "usage_periods_messages_sent_non_negative",
++      sql`${t.messagesSent} >= 0`,
++    ),
++  ],
++);
++
++// One row per user per period. A message count is `+1`; a distinct-user count is
++// not, because incrementing it needs to know whether this user already sent this
++// period — which is a read. The row IS the answer, written `ON CONFLICT DO
++// NOTHING`, and bounded by the tenant's users rather than by their traffic.
++export const usageActiveUsers = pgTable(
++  "usage_active_users",
++  {
++    environmentId: uuid("environment_id")
++      .notNull()
++      .references(() => environments.id),
++    period: date("period").notNull(),
++    userId: uuid("user_id")
++      .notNull()
++      .references(() => users.id),
++    firstSeenAt: timestamp("first_seen_at", { withTimezone: true })
++      .notNull()
++      .defaultNow(),
++  },
++  (t) => [primaryKey({ columns: [t.environmentId, t.period, t.userId] })],
++);
++
++// THE OUTBOX, A FOURTH TIME — after 3.3's events, 3.5's deliveries and 3.9's
++// disablement emails. Four concrete tables that look alike is a pattern; one
++// abstract table serving four purposes is a framework.
++//
++// `webhookDisableNotifications` cannot be reused: its `endpointId` is NOT NULL
++// and a quota crossing has no endpoint.
++export const quotaNotifications = pgTable(
++  "quota_notifications",
++  {
++    id: uuid("id").primaryKey(),
++    environmentId: uuid("environment_id")
++      .notNull()
++      .references(() => environments.id),
++    organisationId: uuid("organisation_id")
++      .notNull()
++      .references(() => organisations.id),
++    period: date("period").notNull(),
++    dimension: text("dimension").notNull(),
++    threshold: integer("threshold").notNull(),
++    // What the figures were WHEN IT HAPPENED. The cap can change between the
++    // crossing and the delivery, and an email saying "80% of 10,000" should mean
++    // the 10,000 that was true at the time.
++    quota: bigint("quota", { mode: "number" }).notNull(),
++    usageAtCrossing: bigint("usage_at_crossing", { mode: "number" }).notNull(),
++    crossedAt: timestamp("crossed_at", { withTimezone: true })
++      .notNull()
++      .defaultNow(),
++    deliveredAt: timestamp("delivered_at", { withTimezone: true }),
++    lastError: text("last_error"),
++  },
++  (t) => [
++    check(
++      "quota_notifications_dimension_check",
++      sql`${t.dimension} IN ('messages', 'active_users')`,
++    ),
++    check(
++      "quota_notifications_threshold_check",
++      sql`${t.threshold} IN (50, 80, 100)`,
++    ),
++    // THIS CONSTRAINT IS FR-015. At most one email per threshold per quota per
++    // period, enforced by the schema rather than promised by the code that writes
++    // it, so a concurrent double-crossing resolves to one row and not two emails.
++    unique("quota_notifications_once_per_threshold").on(
++      t.environmentId,
++      t.period,
++      t.dimension,
++      t.threshold,
++    ),
++  ],
++);
+```
+
+```diff title="services/api/src/db/repository.ts"
+@@ -26,15 +26,22 @@ import {
+   memberships,
+   messages,
+   organisations,
+   outbox,
++  quotaNotifications,
++  usageActiveUsers,
++  usagePeriods,
+   users,
+   webhookDeadLetters,
+   webhookDeliveries,
+   webhookDisableNotifications,
+   webhookEndpoints,
+ } from "./schema";
+ import { messageCreatedEvent } from "../outbox/event";
++import { capsFor, type Caps } from "../quotas/config";
++import { thresholdsCrossed } from "../quotas/policy";
++import { QuotaExceededError, type Dimension } from "../quotas/quota.error";
++import { periodOf } from "../quotas/period";
+ import { nextAttemptAt } from "../webhooks/schedule";
+ import {
+   DISABLE_AFTER_MS,
+   DISABLE_MIN_ATTEMPTS,
+@@ -276,8 +283,143 @@ export async function environmentLimits(
+     connect: row.connect ?? DEFAULT_LIMITS.connect,
+   };
+ }
+ 
++/** What an environment has consumed in a period, and what it is allowed
++ * (chapter 3.10, FR-RTL-05).
++ *
++ * ZEROS FOR A PERIOD WITH NO ROWS, not null and not an error. An environment that
++ * has sent nothing has used nothing, and making every caller tell "no usage" apart
++ * from "no row" would push a schema detail into each of them.
++ *
++ * A NULL QUOTA IS CARRIED THROUGH AS NULL rather than resolved to `Infinity` or
++ * `-1`. The absent state stays absent all the way to the reader — the same rule
++ * chapter 3.8's nullable limit columns encode, and the reason `capsFor` returns
++ * `null` rather than a sentinel.
++ *
++ * Admin surface: takes an environment id rather than being scoped by construction,
++ * because the relay and the internal route both read it on behalf of the platform.
++ * Bounded by an id, so it crosses environments and cannot run away (the third
++ * category in this file's taxonomy). */
++export async function usageFor(
++  db: Db,
++  environmentId: string,
++  period: string,
++): Promise<{
++  period: string;
++  messagesSent: number;
++  activeUsers: number;
++  messageQuota: number | null;
++  activeUserQuota: number | null;
++}> {
++  const [row] = await db
++    .select({
++      messagesSent: usagePeriods.messagesSent,
++      quotaConfig: environments.quotaConfig,
++    })
++    .from(environments)
++    .leftJoin(
++      usagePeriods,
++      and(
++        eq(usagePeriods.environmentId, environments.id),
++        eq(usagePeriods.period, period),
++      ),
++    )
++    .where(eq(environments.id, environmentId));
++
++  const [users] = await db
++    .select({ n: sql<number>`count(*)::int` })
++    .from(usageActiveUsers)
++    .where(
++      and(
++        eq(usageActiveUsers.environmentId, environmentId),
++        eq(usageActiveUsers.period, period),
++      ),
++    );
++
++  return {
++    period,
++    messagesSent: row?.messagesSent ?? 0,
++    activeUsers: users?.n ?? 0,
++    messageQuota: capsFor(row?.quotaConfig, "messages").caps.hard,
++    activeUserQuota: capsFor(row?.quotaConfig, "active_users").caps.hard,
++  };
++}
++
++/** One quota crossing waiting to be emailed. */
++export interface QuotaNotificationRow {
++  id: string;
++  organisationId: string;
++  environmentName: string;
++  period: string;
++  dimension: string;
++  threshold: number;
++  quota: number;
++  usageAtCrossing: number;
++  /** Whether a hard cap is in force for this dimension right now — which decides
++   * whether the email says sends have stopped or that nothing has changed. Read
++   * at delivery rather than stored, because it is a statement about the present
++   * and the operator may have raised the cap since. */
++  hardCapInForce: boolean;
++}
++
++/** The outbox drain, a FOURTH time (chapter 3.10) — after 3.3's events, 3.5's
++ * deliveries and 3.9's disablement emails. Same claim predicate, same
++ * per-row error handling, same required batch size.
++ *
++ * PER-ROW `try`/`catch` WITH A REQUIRED `onError`, and the default that used to
++ * sit on 3.9's version is not repeated here: it discarded a row's failure with no
++ * log line, and feature 030's R48 removed it after finding it as this file's last
++ * uncovered function. One bad recipient must not abort the batch and must not
++ * vanish either. */
++export async function drainQuotaNotifications(
++  db: Db,
++  limit: number,
++  deliver: (row: QuotaNotificationRow) => Promise<void>,
++  onError: (row: QuotaNotificationRow, error: unknown) => void,
++): Promise<number> {
++  return db.transaction(async (tx) => {
++    const claimed = (await tx.execute(
++      sql`SELECT q.id                AS "id",
++                 q.organisation_id   AS "organisationId",
++                 a.name || ' / ' || e.kind AS "environmentName",
++                 to_char(q.period, 'YYYY-MM-DD') AS "period",
++                 q.dimension         AS "dimension",
++                 q.threshold         AS "threshold",
++                 q.quota             AS "quota",
++                 q.usage_at_crossing AS "usageAtCrossing",
++                 (e.quota_config #>> ('{' || q.dimension || ',hard}')::text[])
++                   IS NOT NULL       AS "hardCapInForce"
++            FROM quota_notifications q
++            JOIN environments e ON e.id = q.environment_id
++            JOIN applications a ON a.id = e.application_id
++           WHERE q.delivered_at IS NULL
++           ORDER BY q.crossed_at
++           LIMIT ${limit}
++             FOR UPDATE OF q SKIP LOCKED`,
++    )) as unknown as { rows: QuotaNotificationRow[] };
++
++    let delivered = 0;
++    for (const row of claimed.rows) {
++      try {
++        await deliver(row);
++        await tx.execute(
++          sql`UPDATE quota_notifications SET delivered_at = now(), last_error = NULL
++               WHERE id = ${row.id}::uuid`,
++        );
++        delivered += 1;
++      } catch (error) {
++        onError(row, error);
++        await tx.execute(
++          sql`UPDATE quota_notifications SET last_error = ${String(error)}
++               WHERE id = ${row.id}::uuid`,
++        );
++      }
++    }
++    return delivered;
++  });
++}
++
+ // ---------------------------------------------------------------------------
+ // The outbox drain (chapter 3.3, ADR-06). Part of the ADMIN surface for the
+ // same reason the credential lookup is: it runs on behalf of the platform
+ // rather than of a tenant, and it is deliberately NOT scoped by environment —
+@@ -2230,8 +2372,16 @@ export class Repository {
+       idempotencyKey?: string;
+     },
+   ): Promise<MessageRow> {
+     return this.db.transaction(async (tx) => {
++      // ONE PERIOD FOR THE WHOLE TRANSACTION, taken before anything is checked.
++      // The cap check and the increment must agree about which month this is; a
++      // send that checked August and incremented September would be refused
++      // against one number and counted against another. The app clock rather
++      // than the database's, because both statements need the same value and
++      // only one of them can be `now()`.
++      const period = periodOf(new Date());
++
+       const [channel] = await tx
+         .select({ id: channels.id, lastSequence: channels.lastSequence })
+         .from(channels)
+         .where(
+@@ -2241,8 +2391,40 @@ export class Repository {
+           ),
+         )
+         .for("update");
+       if (!channel) throw new ChannelNotFoundError(channelId);
++
++      // THE CAP, CHECKED BEFORE THE MESSAGE IS WRITTEN (chapter 3.10, FR-007).
++      //
++      // Here rather than in middleware, because chapter 3.8's limiter never sees
++      // `/internal/messages` — `operationsFor` returns [] for anything outside
++      // `/v1` — and that is the route a WebSocket send arrives on. Both doors
++      // reach this method, and it already owns the write transaction, so the
++      // check and the increment commit together (research R3).
++      //
++      // A PLAIN READ, AND THE OVERSHOOT IS STATED RATHER THAN DEFENDED AGAINST.
++      //
++      // The first version took `FOR UPDATE` on the usage row, which bounds the
++      // overshoot to exactly one message. Two things retired it.
++      //
++      // The caps and the usage are now ONE joined read, and Postgres will not
++      // lock that:
++      //
++      //   ERROR:  FOR UPDATE cannot be applied to the nullable side of an outer join
++      //
++      // And the specification never asked for the lock. Its edge case reads: "the
++      // overshoot is bounded by concurrency, not unbounded, and this is stated
++      // rather than defended against." A few dozen sends in flight against a
++      // monthly cap of thousands is a bound worth naming rather than engineering
++      // around.
++      //
++      // WHAT THE QUOTA PATH COSTS, measured with the phases instrumented and the
++      // config toggled on one environment: 0.56ms per send at 32-way concurrency.
++      // The joined read is about 1.2ms of that and US1 needs it whether or not a
++      // cap exists. An earlier uncontrolled benchmark reported 273% and sent three
++      // separate hypotheses chasing what turned out to be warm-up (T033).
++      const quota = await this.assertWithinQuota(tx, period, userId);
++
+       const seq = channel.lastSequence + 1;
+       const id = randomUUID();
+ 
+       const insert = tx.insert(messages).values({
+@@ -2323,8 +2505,111 @@ export class Repository {
+         subject: event.subject,
+         payload: event.payload,
+       });
+ 
++      // THE MONTH'S USAGE COMMITS WITH THE MESSAGE (chapter 3.10, FR-RTL-05).
++      //
++      // Same argument as the event above it, one requirement further on. A quota
++      // is about THIS MONTH and must not forget, so the count cannot live in the
++      // per-minute counter store chapter 3.8 built — a flush there costs one
++      // window of over-service, a flush here costs the month (FR-002).
++      //
++      // It is an increment rather than a query because the alternative is a read
++      // over `messages`, which carries no `environment_id` and no index on
++      // `created_at`: the month predicate becomes a Filter applied after every
++      // row the tenant has ever sent is read off the heap. Fast today, and
++      // proportional to lifetime traffic forever (research R1).
++      //
++      // On the INSERTED branch only, like the event. A recognised idempotent
++      // retry wrote no message and must consume no quota either, or a client
++      // retrying on a flaky link is billed twice for one message.
++      await tx
++        .insert(usagePeriods)
++        .values({ environmentId: this.environmentId, period, messagesSent: 1 })
++        .onConflictDoUpdate({
++          target: [usagePeriods.environmentId, usagePeriods.period],
++          set: { messagesSent: sql`${usagePeriods.messagesSent} + 1` },
++        });
++
++      // The distinct-user count, and the reason it is a row rather than a
++      // counter: incrementing it would need to know whether this user already
++      // sent this period, which is a read. The row IS the answer, and
++      // `ON CONFLICT DO NOTHING` makes the second send of the month free.
++      //
++      // ONLY WHEN THE SEND IS ATTRIBUTED. A key-authenticated REST send carries
++      // no `userId` — unattributed by design since chapter 3.3 — and counts
++      // toward the message quota and toward no user.
++      if (userId !== undefined) {
++        await tx
++          .insert(usageActiveUsers)
++          .values({ environmentId: this.environmentId, period, userId })
++          .onConflictDoNothing();
++      }
++
++      // What this send crossed, if anything. Almost always nothing, which is why
++      // the caps are read first and the whole block skipped when none is set.
++      // WORK OUT WHETHER ANYTHING WAS CROSSED BEFORE ASKING THE DATABASE ANYTHING.
++      //
++      // `thresholdsCrossed` is pure arithmetic on two numbers the transaction
++      // already holds, and it answers "nothing" for almost every send. The first
++      // version looked up the organisation and counted the period's users FIRST
++      // and consulted the arithmetic afterwards, which put two extra queries on
++      // every send by an environment that merely HAS a quota — measured at 341%
++      // over the unconfigured path and mistaken, at first, for the cost of a lock
++      // (T033).
++      if (quota) {
++        const messageRef =
++          quota.caps.messages.hard ?? quota.caps.messages.soft;
++        const crossedMessages = thresholdsCrossed(
++          quota.sent,
++          quota.sent + 1,
++          messageRef,
++        );
++        // The user count is only worth asking for when a user cap exists AND this
++        // send could have added someone.
++        const userRef =
++          quota.caps.active_users.hard ?? quota.caps.active_users.soft;
++        const mayHaveAddedUser = userId !== undefined && userRef !== null;
++
++        if (crossedMessages.length > 0 || mayHaveAddedUser) {
++          const organisationId = await this.organisationOf(tx);
++          if (organisationId) {
++            if (crossedMessages.length > 0) {
++              await this.recordCrossings(
++                tx,
++                period,
++                "messages",
++                quota.sent,
++                quota.sent + 1,
++                quota.caps.messages,
++                organisationId,
++              );
++            }
++            if (mayHaveAddedUser) {
++              const [n] = await tx
++                .select({ n: sql<number>`count(*)::int` })
++                .from(usageActiveUsers)
++                .where(
++                  and(
++                    eq(usageActiveUsers.environmentId, this.environmentId),
++                    eq(usageActiveUsers.period, period),
++                  ),
++                );
++              const users = n?.n ?? 0;
++              await this.recordCrossings(
++                tx,
++                period,
++                "active_users",
++                users - 1,
++                users,
++                quota.caps.active_users,
++                organisationId,
++              );
++            }
++          }
++        }
++      }
++
+       return {
+         id,
+         channel_id: channel.id,
+         seq,
+@@ -2333,8 +2618,190 @@ export class Repository {
+       };
+     });
+   }
+ 
++  /** Refuse the send if a hard cap is already met (chapter 3.10, FR-007).
++   *
++   * Reads the caps and the usage in the transaction that is about to write, with
++   * the usage row taken `FOR UPDATE`. Both dimensions, because FR-005 configures
++   * a cap for each.
++   *
++   * THE ACTIVE-USER CHECK ONLY BITES ON A NEW SENDER. A tenant at its user cap is
++   * not cut off from the users it already has — the cap is on how many distinct
++   * people may send in a month, not on how much they may say. So a sender already
++   * counted this period passes, and only the one who would be the next new face
++   * is refused. Getting this backwards would suspend a whole tenant the moment
++   * their last allowed user sent their second message. */
++  private async assertWithinQuota(
++    tx: Db,
++    period: string,
++    userId: string | undefined,
++  ): Promise<{
++    caps: { messages: Caps; active_users: Caps };
++    sent: number;
++  } | null> {
++    // ONE QUERY, NOT TWO. The caps live on `environments` and the usage on
++    // `usage_periods`, and reading them separately costs two round-trips inside
++    // the write transaction — which holds a pooled connection for the duration.
++    // Above the pool size that queues, and T033 measured the two-query version at
++    // 7.95ms per send against 1.45ms unconfigured at 32-way concurrency. Joined,
++    // it is one round-trip on two primary keys.
++    const [env] = await tx
++      .select({
++        quotaConfig: environments.quotaConfig,
++        messagesSent: usagePeriods.messagesSent,
++      })
++      .from(environments)
++      .leftJoin(
++        usagePeriods,
++        and(
++          eq(usagePeriods.environmentId, environments.id),
++          eq(usagePeriods.period, period),
++        ),
++      )
++      .where(eq(environments.id, this.environmentId));
++
++    const messages_ = capsFor(env?.quotaConfig, "messages").caps;
++    const users_ = capsFor(env?.quotaConfig, "active_users").caps;
++    // Nothing configured at all — no cap and no threshold — and the whole block
++    // is skipped. The unconfigured tenant is the common case and pays one
++    // indexed read for it.
++    if (
++      messages_.hard === null &&
++      messages_.soft === null &&
++      users_.hard === null &&
++      users_.soft === null
++    ) {
++      return null;
++    }
++
++    const sent = env?.messagesSent ?? 0;
++
++    if (messages_.hard !== null && sent >= messages_.hard) {
++      // THE CROSSING IS WRITTEN BEFORE THE REFUSAL IS RAISED (FR-013a).
++      //
++      // Usually the send that reached the cap already recorded 100%. Two cases
++      // where it did not: a cap lowered below current usage, which no send
++      // crossed, and a soft threshold configured at the same value as the hard
++      // cap. The email has to survive the send that did not, so the row goes in
++      // first and the throw comes after. `ON CONFLICT DO NOTHING` makes the
++      // usual case free.
++      const organisationId = await this.organisationOf(tx);
++      if (organisationId) {
++        await this.recordCrossings(
++          tx,
++          period,
++          "messages",
++          sent - 1,
++          sent,
++          messages_,
++          organisationId,
++        );
++      }
++      throw new QuotaExceededError({
++        dimension: "messages",
++        usage: sent,
++        quota: messages_.hard,
++        period,
++      });
++    }
++
++    if (users_.hard === null || userId === undefined) {
++      return { caps: { messages: messages_, active_users: users_ }, sent };
++    }
++
++    const [already] = await tx
++      .select({ userId: usageActiveUsers.userId })
++      .from(usageActiveUsers)
++      .where(
++        and(
++          eq(usageActiveUsers.environmentId, this.environmentId),
++          eq(usageActiveUsers.period, period),
++          eq(usageActiveUsers.userId, userId),
++        ),
++      );
++    if (already) {
++      return { caps: { messages: messages_, active_users: users_ }, sent };
++    }
++
++    const [count] = await tx
++      .select({ n: sql<number>`count(*)::int` })
++      .from(usageActiveUsers)
++      .where(
++        and(
++          eq(usageActiveUsers.environmentId, this.environmentId),
++          eq(usageActiveUsers.period, period),
++        ),
++      );
++    const active = count?.n ?? 0;
++    if (active >= users_.hard) {
++      throw new QuotaExceededError({
++        dimension: "active_users",
++        usage: active,
++        quota: users_.hard,
++        period,
++      });
++    }
++    return { caps: { messages: messages_, active_users: users_ }, sent };
++  }
++
++  /** Write a row for each threshold a usage increase crossed (chapter 3.10,
++   * FR-014, FR-016).
++   *
++   * IN THE SAME TRANSACTION AS THE THING THAT CAUSED IT. The crossing and the
++   * message commit together or neither does, which is the same argument the
++   * event above them makes and the reason there is no periodic sweep in this
++   * chapter at all: usage only ever rises because of a send, and the send knows
++   * the value before and after, so it knows what it crossed (research R5).
++   *
++   * THE PERCENTAGE IS OF `hard ?? soft`. A soft threshold with no hard cap is
++   * still a figure an operator asked to be warned about, and 100% of it is worth
++   * an email even though nothing will be refused.
++   *
++   * `ON CONFLICT DO NOTHING` against `quota_notifications_once_per_threshold` is
++   * what makes it at-most-once (FR-015) — the schema, not this code. A concurrent
++   * double-crossing resolves to one row rather than two emails. */
++  private async recordCrossings(
++    tx: Db,
++    period: string,
++    dimension: Dimension,
++    before: number,
++    after: number,
++    caps: { hard: number | null; soft: number | null },
++    organisationId: string,
++  ): Promise<void> {
++    const reference = caps.hard ?? caps.soft;
++    if (reference === null) return;
++    const crossed = thresholdsCrossed(before, after, reference);
++    if (crossed.length === 0) return;
++
++    await tx
++      .insert(quotaNotifications)
++      .values(
++        crossed.map((threshold) => ({
++          id: randomUUID(),
++          environmentId: this.environmentId,
++          organisationId,
++          period,
++          dimension,
++          threshold,
++          quota: reference,
++          usageAtCrossing: after,
++        })),
++      )
++      .onConflictDoNothing();
++  }
++
++  /** The organisation an environment belongs to — who gets told. */
++  private async organisationOf(tx: Db): Promise<string | null> {
++    const [row] = await tx
++      .select({ organisationId: applications.organisationId })
++      .from(environments)
++      .innerJoin(applications, eq(applications.id, environments.applicationId))
++      .where(eq(environments.id, this.environmentId));
++    return row?.organisationId ?? null;
++  }
++
+   /** Fetch a message by its idempotency key within a channel — the
+    * recovery leg of 2.3's duplicate-recognised path. The channel join
+    * carries the tenant scope: every query in this layer answers only for
+    * its own environment, private helpers included (constitution I). */
+```
+
+```diff title="services/api/src/messages/messages.service.ts"
+@@ -1,6 +1,8 @@
+ import {
+   BadRequestException,
++  HttpException,
++  HttpStatus,
+   Injectable,
+   NotFoundException,
+ } from "@nestjs/common";
+ 
+@@ -9,8 +11,9 @@ import {
+   Repository,
+   type MessageRow,
+   type MessageWithSender,
+ } from "../db/repository";
++import { QuotaExceededError } from "../quotas/quota.error";
+ import { decodeCursor, encodeCursor } from "./cursor";
+ import type { HistoryQuery, SendMessageBody } from "./messages.schema";
+ 
+ // The thin layer between HTTP and the repository (chapters 2.2 + 2.3). It
+@@ -55,8 +58,40 @@ export class MessagesService {
+         // answer differ from the missing-id answer, and "different" is
+         // itself a disclosure (FR-TEN-05).
+         throw new NotFoundException("channel not found");
+       }
++      if (error instanceof QuotaExceededError) {
++        // ONE THROW, AND IT IS THE ONLY ONE (chapter 3.10, FR-008).
++        //
++        // Both send routes reach this method — `internal.controller.ts` calls
++        // `messages.send`, the public controller calls it too — so there is one
++        // place to refuse from. An earlier draft of the plan costed "two
++        // controller mappings"; this service has no per-controller mappings to
++        // add one to, and adding two would be the drift EIR-API-04 and
++        // `ProtocolErrorFilter` exist to prevent (research R3).
++        //
++        // `402`, NOT `429`. Chapter 3.8 owns `429`, and a client that sleeps for
++        // `Retry-After` and retries is behaving correctly for a rate limit and
++        // wrongly for a quota — which will still be exhausted in an hour and in
++        // three weeks. There is a time at which sends resume and it is in the
++        // message, not in a header a client will act on.
++        //
++        // THE CODE IS NAMED HERE, and it has to be. `ProtocolErrorFilter` infers
++        // a code from the status for 400, 401, 403 and 404, and everything else
++        // becomes `internal_error` — so an unnamed `402` would emit a body
++        // calling itself an internal error while carrying a `402`. That is the
++        // lie chapter 2.2 fixed for 400 and chapter 3.2 for 403, and 3.2's
++        // mechanism — a thrower naming its own code — is what this uses. The
++        // filter builds the four-field envelope and derives `docs_url` from the
++        // code.
++        throw new HttpException(
++          {
++            code: "quota_exceeded",
++            message: error.publicMessage(),
++          },
++          HttpStatus.PAYMENT_REQUIRED,
++        );
++      }
+       throw error;
+     }
+   }
+ 
+```
+
+```diff title="services/api/src/app.module.ts"
+@@ -11,8 +11,9 @@ import { HealthController } from "./health.controller";
+ import { InternalModule } from "./internal/internal.module";
+ import { MessagesModule } from "./messages/messages.module";
+ import { ConsumerModule } from "./consumer/consumer.module";
+ import { NotificationsModule } from "./notifications/notifications.module";
++import { QuotasModule } from "./quotas/quotas.module";
+ import { OutboxModule } from "./outbox/outbox.module";
+ import { WebhooksModule } from "./webhooks/webhooks.module";
+ import { TenancyModule } from "./tenancy/tenancy.module";
+ import { LOGGER, apiLogger } from "./logger";
+@@ -32,8 +33,9 @@ import { RequestContextMiddleware } from "./request-context.middleware";
+     InternalModule,
+     TenancyModule,
+     OutboxModule,
+     NotificationsModule,
++    QuotasModule,
+     ConsumerModule,
+     WebhooksModule,
+     LimitsModule,
+   ],
+```
+
+```diff title="services/api/src/main.ts"
+@@ -5,8 +5,9 @@ import { createLogger } from "@relay/service-kit";
+ 
+ import { AppModule } from "./app.module";
+ import { EventConsumerService } from "./consumer/consumer.module";
+ import { NotificationRelayService } from "./notifications/notifications.module";
++import { QuotaRelayService } from "./quotas/quotas.module";
+ import { OutboxRelayService } from "./outbox/outbox.module";
+ import { DeliveryRelayService } from "./webhooks/webhooks.module";
+ 
+ // Nest's own banner logger stays off: this workspace already decided what a
+@@ -25,8 +26,9 @@ async function bootstrap(): Promise<void> {
+   // delivered. Its backlog drains on this first start as ordinary undelivered
+   // work — no migration and no special case, because `delivered_at IS NULL` was
+   // already true of every one of those rows.
+   app.get(NotificationRelayService).start();
++  app.get(QuotaRelayService).start();
+   // And the second relay (chapter 3.5): the same loop over a different table,
+   // publishing deliveries that have become due. Started here for 3.3's reason —
+   // a retry schedule that only runs when someone remembers is not a schedule.
+   app.get(DeliveryRelayService).start();
+```
+
+<ChapterFooter id="3.10" />
