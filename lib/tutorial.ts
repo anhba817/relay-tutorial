@@ -449,7 +449,7 @@ export const series: Part[] = [
         id: "3.10",
         path: "/part-3/chapter-10/quotas-and-what-they-cost",
         title: "Quotas and what they cost",
-        status: "forthcoming",
+        status: "published",
         // The half of FR-RTL that is money rather than traffic: monthly usage
         // quotas, the hard cap that suspends and the soft threshold that only
         // alerts, and the 50/80/100% email. FR-RTL-06 is a purchasing
