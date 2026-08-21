@@ -465,7 +465,27 @@ export const series: Part[] = [
       },
       {
         id: "3.11",
-        path: "/part-3/chapter-11/milestone-the-isolation-gauntlet",
+        path: "/part-3/chapter-11/counting-a-connection",
+        title: "Counting a connection",
+        status: "forthcoming",
+        // The third dimension FR-RTL-05 names, and the only one the api cannot
+        // compute from its own tables. Messages and active users are already
+        // rows; a connection-minute is a duration nothing records, so the
+        // gateway has to account for it periodically — and the gateway owns no
+        // tables. Split out of 3.10 rather than deferred vaguely: 3.10 covers
+        // the two dimensions that need no new writer, this one covers the
+        // dimension that needs one.
+        readerProduces:
+          "Connection-minutes metered from a service that owns no tables, and a crash that does not bill the customer twice",
+        sourceDoc: "docs/04-srs.md, docs/05-sad.md",
+        readerMinutes: 90,
+        titleVi: "Đếm một kết nối",
+        readerProducesVi:
+          "Connection-minutes được đo từ một service không sở hữu bảng nào, và một cú crash không tính tiền khách hàng hai lần",
+      },
+      {
+        id: "3.12",
+        path: "/part-3/chapter-12/milestone-the-isolation-gauntlet",
         title: "Milestone: the isolation gauntlet",
         status: "forthcoming",
         readerProduces:
