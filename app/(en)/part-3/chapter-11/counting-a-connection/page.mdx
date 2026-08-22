@@ -1,0 +1,487 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figWhatABucketIs, figTotalsNotDeltas, figTwoHops, figWhatTheApiCannotTell } from "./figures";
+
+export const metadata = {
+  title: "Counting a connection — Building Relay",
+  description:
+    "Messages and users were already rows. A connection is not a row anywhere, and the only process that can see one owns no tables — and, until this chapter, no identity either.",
+  alternates: {
+    canonical: "/part-3/chapter-11/counting-a-connection",
+    languages: {
+      en: "/part-3/chapter-11/counting-a-connection",
+    },
+  },
+};
+
+<ChapterHeader id="3.11" />
+
+FR-RTL-05 names three metered dimensions: messages sent, unique active users, and
+connection-minutes. Chapter 3.10 built two of them and stopped, and the stopping
+place was chosen before a word of it was written.
+
+Messages and users were **already rows**. `messages.user_id` has been in
+`0000_core_tables.sql` since Part 2, so counting them was an aggregation question
+answered inside a transaction the api already owned. The send knew the figure
+before and after, so it knew what it had crossed, and the whole chapter came down
+to where to put a `+1`.
+
+A connection is not a row anywhere. Nothing records one. The only process that
+can see a connection is the gateway, which owns no tables — ADR-05 says the api
+is the only writer, and chapter 2.1 turned that into a lint rule so the mistake
+is a build failure rather than a review comment. `registry.ts` has stated the
+property in prose since chapter 2.5: *no pg, no drizzle-orm, no repository
+import.*
+
+So this chapter is not about counting. It is about **metering from a service that
+cannot write**: what it has to say, how often it has to say it, and what happens
+to the number when the thing saying it dies mid-sentence.
+
+## What a connection-minute is
+
+`docs/04-srs.md` records an open question, number four, addressed to Product and
+Billing: *does connection-minute metering need per-second precision, or is
+per-minute rounding acceptable?* A chapter that shipped without answering it
+would leave the unit to be discovered from a bill.
+
+The answer taken here: **a connection-minute is one calendar minute during which
+one connection was open for any part of it, charged per connection.**
+
+<Figure caption="A five-second socket costs one minute. A socket open from 00:00:59 to 00:01:01 costs two — it was present in two calendar minutes, and the unit is the minute it was present in." chart={figWhatABucketIs} />
+
+The alternatives are worth naming because they give visibly different bills. You
+could accumulate real seconds and round each connection up, which gives every
+socket a one-minute floor. Or accumulate seconds across the environment and round
+once at the end, which is the most literally accurate reading of the words
+"connection-minutes".
+
+A thousand five-second sockets separate them:
+
+| model | a thousand 5-second sockets | dedup key |
+|---|---|---|
+| minute buckets, per connection | up to 1,000 minutes | the bucket identity |
+| seconds, rounded per connection | 1,000 minutes | a per-connection accumulator |
+| seconds, rounded once at read | 83 minutes | a per-connection accumulator |
+
+The third charges a reconnect storm almost nothing. The first charges churn, and
+it has a second property that turns out to matter more than the billing argument:
+the set of minutes a connection has occupied only ever grows. A count of that set
+only grows too, and "credit the difference" becomes the entire deduplication
+story — a point we reach in two sections.
+
+<Why req="SRS open question 4">
+The question was addressed to Product and Billing and the SRS still carries it
+open. A tutorial can answer it or leave it, and leaving it means the reader meets
+the unit in a schema column instead of in a paragraph. Answered here, with the
+comparison that chose it.
+</Why>
+
+## A service that owns no tables, and no identity either
+
+The gateway's road to state is internal HTTP to the api. It has three calls —
+`/internal/session`, `/internal/backfill`, `/internal/messages` — and every one
+of them **forwards the end user's own token**. Chapter 3.2 made that so, and
+`api-client.ts` says why:
+
+> the token the client presented at connect, carried so the internal hop can
+> FORWARD it instead of asserting who the caller is. The gateway holds it; it
+> does not verify it and holds no secret that could.
+
+A usage report is nobody's action. It is this process's claim about many
+connections, potentially across many environments, about time that has already
+passed. No user's token authorises it.
+
+The obvious workaround is to report per connection using that connection's own
+token, and it fails in the worst possible place: a token expires while the socket
+stays open — `handleSend` already carries a branch for the 401 that produces —
+and the long-lived socket whose token has expired is precisely the socket with the
+most minutes on it.
+
+So the gateway speaks for itself, for the first time. Chapter 3.5 already built
+the credential class this needs: `PlatformPrincipal`, `@Accepts("platform")`, the
+`rk_svc_` prefix. The gateway becomes its second holder.
+
+<Trap>
+`resolvePlatformCredential` ended with a hardcoded `service: "dispatcher"`. That
+was accurate for exactly as long as the dispatcher was alone — and
+`PlatformPrincipal.service` is documented as *"which internal service presented
+it, for logs"*. With one shared secret and two callers, the one field in the
+principal that says who is asking becomes the one field that cannot be trusted.
+
+One credential per service, then. The second property is worth more than the log
+line: the gateway terminates connections from the public internet and the
+dispatcher does not, so a shared secret lets the more exposed service set the
+blast radius for both.
+
+The tempting alternative — keep one secret, have the caller name itself in a
+header, trust it only for logging — is the pattern chapter 3.2 spent itself
+removing. "It's only for logs" is the sentence under which an asserted header
+survives a review.
+</Trap>
+
+Chapter 3.2's fenced comment says the gateway "holds no signing secret", and that
+is still true after this chapter. A platform credential signs nothing and
+verifies nothing; it says which service is talking, on the one call that is the
+gateway's own rather than a user's.
+
+## Totals, not deltas
+
+Here is the decision the rest of the design falls out of.
+
+A report says what a connection has consumed **in total** in a period. Not what it
+consumed since the last report.
+
+<Figure caption="A delta protocol needs at-least-once delivery, a message identity to deduplicate on, and somewhere to keep what it could not send. A total protocol needs none of the three." chart={figTotalsNotDeltas} />
+
+Three properties come free:
+
+- a report that is **lost** is repaired by the next one, because the next one
+  carries the same total plus whatever accrued since;
+- a report delivered **twice** credits `max(0, reported − credited) = 0` the
+  second time;
+- a report that **cannot be delivered** is dropped rather than queued.
+
+That third one is the interesting one. The gateway keeps no outbox — which is the
+right amount of durable state for a service whose entire design is that it holds
+none. Three chapters of this series have built an outbox by now, and this is the
+chapter that gets to not build one.
+
+The arithmetic lives in two functions with no clock, no store and no framework,
+because those two lines *are* the protocol:
+
+```ts title="services/api/src/quotas/credit.ts (excerpt)"
+export function creditFor(reported: number, credited: number): number {
+  return Math.max(0, reported - credited);
+}
+
+export function highWaterMark(reported: number, credited: number): number {
+  return Math.max(reported, credited);
+}
+```
+
+The `max` in the first is not defensive decoration. The one thing this function
+must never do is subtract from a bill.
+
+<Why req="FR-RTL-05">
+The obvious place to remember what has been credited is a row per connection per
+minute — the bucket identity is the natural key, after all. At a thousand
+concurrent sockets that is 1,000 × 43,200 = **43.2 million rows a month**.
+
+Chapter 3.10 refused the same shape for distinct users and bounded it by users
+rather than by traffic. `usage_connections` holds one row per connection per
+period, which is bounded by connections rather than by elapsed time.
+</Why>
+
+## The socket that counted zero
+
+<Trap>
+The meter walks the registry every sixty seconds and reports what it finds. That
+is the whole design, and it counts a five-second socket as **zero**.
+
+`session.ts` removes a connection from the registry on the line after its `close`
+handler opens:
+
+```ts title="services/gateway/src/session.ts (excerpt)"
+socket.on("close", (code) => {
+  registry.remove(connection.id);
+```
+
+A socket that opens and closes between two reports is gone before anything can
+report it. And that is not a rounding error — it is the one thing the wall-clock
+minute unit was *chosen* to charge. A thousand five-second sockets would have
+cost nothing at all, which is exactly the outcome the comparison table two
+sections up rejected.
+
+The close handler tells the meter first, and the ordering is the fix:
+
+```ts title="services/gateway/src/session.ts (excerpt)"
+socket.on("close", (code) => {
+  meter?.closed(connection, new Date());
+  registry.remove(connection.id);
+```
+
+Not a synchronous report from the handler. That handler is already documented as
+"the last place that should throw", and a mass disconnect would turn one event
+into a burst of HTTP requests.
+</Trap>
+
+And this narrows the claim two sections ago, which is worth doing out loud rather
+than leaving for a reader to notice. "Reports carry totals, so nothing needs
+queueing" is true of a connection that is **still open** — its next report carries
+the same total plus what accrued. A connection that has **closed** has no next
+report. So its final total is retained until a report carrying it is accepted, the
+retained set is bounded, and a discard at the bound is logged and counted rather
+than dropped in silence.
+
+The gateway holds no queue, except for the one case where the reasoning stops
+applying. Saying that is better than a claim that is true of most of the design.
+
+## The shutdown that was not there
+
+A crash loses at most one reporting interval per open connection. That is the
+bound, it is stated, and nothing can be done about it: a process that is killed
+does not get to say goodbye.
+
+A deploy is different. A deploy is the frequent one, and a graceful stop knows its
+sockets are about to die. So the plan said: flush a final report on the way out,
+hanging it off the `server.on("close")` handler `main.ts` already has.
+
+That handler never runs.
+
+`serve()` returns a bare `node:http` Server. Nothing in the gateway calls
+`server.close()`, and nothing installs a signal handler — only the dispatcher
+does, at `main.ts:313`. On `docker stop` the process takes SIGTERM, Node's default
+disposition exits, and the handler the flush was hung on is never reached.
+
+Four documents said the flush happened: the research item, the requirement, the
+contract's loss table, and the task that wired it. They agreed with each other,
+which is what reading documents against each other proves, and **none of them was
+the thing that had to be true.**
+
+```diff title="services/gateway/src/main.ts"
+@@ -100,4 +110,32 @@ if (import.meta.main) {
++  for (const signal of ["SIGINT", "SIGTERM"] as const) {
++    process.on(signal, () => {
++      logger.log("info", "shutdown.signal", { signal });
++      server.close();
++      void server.shutdown().then(() => process.exit(0));
++    });
++  }
+ }
+```
+
+`sessions.close()` became async to go with it. A flush that is fired rather than
+awaited is the same non-guarantee one line lower down: the process leaves before
+the request does.
+
+<Why req="FR-RTL-05">
+`CLOSE_CODES[4009]` reads "server shutdown (drain)", fixed by SAD §7, and this
+chapter builds the first shutdown path the gateway has ever had — so the code is
+sitting right there. It stays unused. Draining means telling clients to reconnect
+elsewhere, which is a feature with its own semantics, and reaching for a code
+because a handler happened to arrive is the "declared, so use it" that chapter 3.8
+refused by name.
+</Why>
+
+## The cap, at the door
+
+FR-RTL-05 says *enforce*, not meter. Each dimension refuses the operation that
+consumes it: the messages cap refuses sends, and the connection-minutes cap
+refuses **connects**. A cap that only refused sends would leave an idle listener
+burning the metered resource with nothing to stop it, which is a cap that does not
+bound the thing it counts.
+
+FR-RTL-08's promise holds around it. Sockets already open stay open, keep
+delivering, and keep accruing; REST sends and history reads are untouched. The
+overshoot is real and its bound is honest: `(connections open when the cap was
+crossed) × (minutes until each closes) + one reporting interval`, and nothing in
+the platform bounds how long a client holds a socket. Better to say that than to
+invent a ceiling.
+
+<Figure caption="Two hops, two shapes. The api speaks HTTP and answers 402. The client speaks WebSocket and gets the socket's own vocabulary." chart={figTwoHops} />
+
+An earlier draft of this chapter forwarded the HTTP status onto the socket,
+borrowing chapter 3.8's raw 429 at the same door. That shape had a stated
+justification — *"a refusal needs to say WHEN to come back; `Retry-After` is an
+HTTP header and a close frame has nowhere to put one"* — and this refusal declines
+`Retry-After` on purpose, because a client that sleeps for a header and retries is
+right for a rate limit and wrong for a quota that will still be exhausted in an
+hour.
+
+Take away the header and the argument for the HTTP shape goes with it. What is
+left is the shape chapter 3.8 used for a **bad token**: complete the handshake so
+that a close code has a socket to arrive on. EIR-WS-05 asks that of an invalid
+credential; EIR-WS-06 asks the same of quota exhaustion.
+
+```ts title="services/gateway/src/session.ts (excerpt)"
+if (result.outcome === "over_quota") {
+  sendError(ws, "quota_exceeded", result.message);
+  ws.close(4008, CLOSE_CODES[4008]);
+  logger.log("info", "connection.rejected", { reason: "quota_exceeded" });
+  return;
+}
+```
+
+`CLOSE_CODES[4008]` has read `"quota exhausted"` since chapter 1.3 and nothing has
+ever sent it. Nineteen published chapters later, this is the one.
+
+<Trap>
+Chapter 3.8 shipped a test called **"STILL emits close code 4008 from nowhere"**,
+which greps the gateway's sources and asserts no match. Its comment says why:
+
+> 4008 reads "quota exhausted". There is no quota yet — quotas are a later
+> chapter — and reaching for the code because it was declared would collapse the
+> distinction this chapter is built on: a rate limit is a smoothing instruction, a
+> quota is a commercial one, and they do not deserve the same signal.
+
+This is the later chapter, and that test went red on the first run after
+`session.ts` changed. The distinction it was protecting survives and is now
+**visible on the wire** instead of asserted in a comment: a rate limit refuses the
+handshake with a raw 429 and a `Retry-After`; a quota completes it, sends an error
+frame carrying the resume date, and closes 4008. A client can tell them apart.
+
+The test inverts rather than disappearing. 4008 is asserted present, 4009 asserted
+absent, and the self-check that keeps it honest — *a grep that can only pass is not
+a check* — lives on through 4009.
+</Trap>
+
+The api's half is chapter 3.10's refusal, unchanged in shape and named by the
+thrower:
+
+```ts title="services/api/src/internal/session.controller.ts (excerpt)"
+if (error instanceof QuotaExceededError) {
+  throw new HttpException(
+    { code: "quota_exceeded", message: error.publicMessage() },
+    HttpStatus.PAYMENT_REQUIRED,
+  );
+}
+```
+
+Named, because `ProtocolErrorFilter` is `@Catch()`-all and infers a code for four
+statuses. 402 is not one of the four, so an unnamed refusal would have reached the
+gateway as `internal_error` — which is the finding chapter 3.10's second analysis
+pass spent itself on.
+
+## What the api cannot tell, and does not need to
+
+<Figure caption="A clean close and a killed gateway arrive at the same state. The api never learns which happened, and nothing in the design depends on knowing." chart={figWhatTheApiCannotTell} />
+
+The api is never told when a connection opens. The first it hears of any
+connection is a report — so "a connection I have never seen" and "this
+connection's first report" are the same state, and there is nothing to tell them
+apart with. Accepted as the first.
+
+What *is* refused is a report naming a connection whose row already carries a
+different environment. A connection does not move between tenants; reconciling one
+that appears to would mean inventing a fact about whose minutes these are. That is
+a 409, and it is a constitution I refusal rather than a data-quality one.
+
+The consequence worth stating: **there is no reaper.** No orphan sweep, no
+"connection still open?" question, no periodic job of any kind. Usage rises only
+when a report arrives, and the report transaction knows the figure before and
+after — so it writes its own threshold crossings, exactly as chapter 3.10's send
+transaction did. Second chapter running to reach that result by that argument, and
+feature 030's global-operation guard is engaged nowhere.
+
+<Why req="FR-RTL-07">
+The guard was verified rather than assumed: five triggers installed, twenty-seven
+sentinel environments, and a deliberate cross-environment sweep **refused** before
+the zero was believed. A guard check that sweeps an empty table is the same
+vacuous pass `no-trigger-in-migrations.test.ts` protects against.
+
+And what silence does not prove: the guard watches five tables and none of them is
+a usage or notification table. Silence about `usage_connections` means nobody is
+looking there, not that nothing happened.
+</Why>
+
+## What a third dimension cost
+
+Chapter 3.10 wrote the price down, twice — in `0009_quotas.sql` and in
+`quotas/config.ts`:
+
+> chapter 3.11 adds connection-minutes and FR-MED-12 later adds media bytes, and
+> neither needs a table migration — a new dimension is a new key … the shape below
+> is enforced by a CHECK that ENUMERATES the two dimensions, so a third one does
+> cost a one-line constraint change
+
+Counted, it is seven places:
+
+| place | what it cost |
+|---|---|
+| `quotaConfigSchema` | one key |
+| `environments_quota_config_shape` | one `jsonb_typeof` + two regex clauses, constraint dropped and rebuilt |
+| `quota_notifications_dimension_check` | one `IN` value, dropped and rebuilt |
+| `usage_periods` | one column and one CHECK, across two files |
+| `quota.error.ts` | a two-way ternary became two `Record` tables |
+| `quota-email.ts` | a key in `NOUN`, and a new `STOPPAGE` table |
+| `usageFor` | two fields on its return shape |
+
+The prediction was right about the shape and light about the size, and two of the
+seven it did not anticipate at all. There is no `ALTER CONSTRAINT` for a CHECK
+expression, so both enumerating constraints are dropped and rebuilt rather than
+amended.
+
+<Trap>
+The fifth row is the one that mattered. `publicMessage()` read:
+
+```ts
+`monthly ${this.dimension === "messages" ? "message" : "active user"} `
+```
+
+`Dimension` is `keyof QuotaConfig`. Adding `connection_minutes` to the config
+schema **widened that type on its own**, so a connection-minutes breach would have
+rendered "monthly ACTIVE USER quota exhausted" with the compiler entirely silent.
+
+A `Record<Dimension, string>` makes a missing dimension a build error. And the
+same fix caught a second wrongness beside it: the message ended "sends resume on
+…", and what resumes for this dimension is connecting. Naming the wrong operation
+at 3am sends somebody looking for a fault in the half that is fine.
+</Trap>
+
+<Checkpoint>
+```bash
+pnpm --filter @relay/api test:integration src/quotas/connections.itest.ts
+pnpm --filter @relay/gateway test:integration src/meter.itest.ts
+```
+
+The first drives a clock rather than waiting on one — nothing in this chapter's
+suite sleeps for a minute. The second is the exception and spawns a gateway
+process, because a signal is the one thing an in-process gateway cannot receive.
+
+Expected: a connection across three boundaries records the minutes it occupied, a
+replayed report answers `{"credited": 0}`, a SIGKILL leaves the figure frozen ten
+intervals later, and a SIGTERM loses nothing at all.
+</Checkpoint>
+
+## What this cost, measured
+
+The plan was wrong about one thing and a measurement is what said so.
+
+Research chose "a second call on the same request rather than a heavier
+`environmentLimits`", because chapter 3.10 had refused to put a usage join inside
+that function. That refusal was right and still is — `environmentLimits` has a
+second caller, the rate-limit middleware, on every `/v1` request, and it must not
+pay for a join it never reads.
+
+But two calls cost what a join would, at concurrency. Connect latency at 32-way
+went from **15.0 ms to 17.6 ms**, four runs clustered inside 0.7 ms, so a real
+regression rather than noise. Folding the connect path into its own single read
+recovered 0.8 ms of it. The mechanism is the one chapter 3.10 already recorded: an
+extra round trip holds a pooled connection for its duration, and above the pool
+size that queues.
+
+The baseline it was compared against was measured **once**, which was a mistake in
+an instrument built specifically to avoid chapter 3.10's uncontrolled benchmark.
+Three runs of the shipped build sit inside 0.4 ms; the single 15.001 does not, so
+the residual after the fold cannot be cleanly attributed. The `EXPLAIN` in
+`session.perf.itest.ts` is committed rather than ad-hoc, and it is what SC-012
+actually asks for: index lookups, no scan proportional to anything a tenant
+accumulates.
+
+And the twenty-run battery found three defects no amount of reading would have.
+The most instructive was a **fixed port**. `startApi()` bound 4123 and a new
+describe bound 4124, which is `limits.itest.ts`'s; vitest runs files in parallel.
+Worse, back to back the previous run's child still holds the port, the new child
+dies on `EADDRINUSE`, and the health check gets its 200 from the *old* api —
+holding a different environment's signing secret. Three assertions failed and none
+of them named the fixture:
+
+```console
+AssertionError: expected 'internal_error' to be 'unauthorized'
+AssertionError: expected 1011 to be 4001
+TypeError: fetch failed
+```
+
+I diagnosed it wrong twice before measuring, and both wrong theories reached code
+comments before the evidence arrived. What settled it was running one file alone,
+five times — two of five red — which killed every cross-file theory in a single
+measurement and should have been the first move rather than the fifth.
+
+<ForwardRef>
+The `docs_url` on `quota_exceeded` resolves to nothing, exactly as `rate_limited`'s
+has since chapter 3.8. Inherited deliberately and not compounded: this chapter
+adds no third instance. Chapter 3.12 owns it.
+</ForwardRef>
+
+<ChapterFooter id="3.11" />
