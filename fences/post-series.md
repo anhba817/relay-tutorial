@@ -1694,3 +1694,252 @@ explains.
      },
      async stop() {
 ```
+
+## Chapter 3.11's neighbours
+
+Four files chapter 3.11 changed and does not teach. The chapter's subject is
+metering a duration from a service that cannot write; a coverage ratchet, a lint
+list and two test fixtures are not that, and putting them on the page would show
+a reader code the chapter never discusses.
+
+- `vitest.coverage.config.mts` — three ratchet entries for the chapter's new
+  files. The convention is chapter 3.6's and 3.8's; the numbers are measurements.
+- `eslint.config.mjs` — `drainQuotaNotifications` joins the restricted family,
+  where chapter 3.10 should have put it. The chapter mentions the guard and not
+  the lint list.
+- `services/api/src/auth/credentials.itest.ts` — a latent flake fixed forward.
+  Invariant 1 took an api key's secret as `split("_").at(-1)`; base64url includes
+  the separator, so once in a while the last segment is a single character the
+  stored row contains by chance. Eleven chapters old, surfaced by chapter 3.11's
+  twenty-run battery.
+- `services/gateway/src/resume.itest.ts` — `boot` takes
+  `Omit<ApiClient, "reportUsage">` so six stubs did not each grow a no-op.
+
+```diff title="vitest.coverage.config.mts"
+@@ -271,6 +271,46 @@ export default defineConfig({
+           lines: 100,
+           statements: 100,
+         },
++
++        // CHAPTER 3.11's three, pinned at what they measure, with a reason each.
++        //
++        // `credit.ts` is here at 100 on everything and has no excuse not to be:
++        // two functions, no clock, no store, no framework, and between them they
++        // ARE the report protocol — a replay credits nothing, a lost report is
++        // repaid by the next, a late one lowers nothing. An unmeasured branch
++        // there is a hole in the thing the chapter is about.
++        //
++        // `usage.controller.ts` reached 100 second. It measured 88.88 / 50 with
++        // the 409 tested and the RETHROW beside it untested, which is the branch
++        // that separates "this connection moved tenants" from "something else
++        // broke". Swallowing the second as the first turns a broken caller into a
++        // conflict nobody investigates; the test that closed it reports usage for
++        // an environment that does not exist.
++        //
++        // `meter.ts` is 93.75 on branches and NOT 100, and the shortfall is
++        // named rather than chased: the remaining arm is the retention cap's
++        // `!closedEntries.has(key)` guard for a duplicate key arriving exactly at
++        // the ceiling. Reaching it needs four thousand closed connections and a
++        // repeat among them, which is a fixture that would take longer to read
++        // than the branch is worth.
++        "services/api/src/quotas/credit.ts": {
++          branches: 100,
++          functions: 100,
++          lines: 100,
++          statements: 100,
++        },
++        "services/api/src/internal/usage.controller.ts": {
++          branches: 100,
++          functions: 100,
++          lines: 100,
++          statements: 100,
++        },
++        "services/gateway/src/meter.ts": {
++          branches: 93,
++          functions: 100,
++          lines: 100,
++          statements: 100,
++        },
+       },
+     },
+   },
+```
+
+```diff title="eslint.config.mjs"
+@@ -123,24 +123,37 @@ export default tseslint.config(
+           // BOTH SPELLINGS. `no-restricted-imports` matches the specifier as
+           // written, so `../db/repository` and `./repository` are two rules —
+           // and the second is the one `db/repository.itest.ts` and
+           // `db/history-drift.itest.ts` would use, both of them non-exempt.
+           // Measured by adding the import to each and running eslint.
+           paths: [
+             {
+               name: "../db/repository",
+               importNames: [
+                 "drainOutbox",
+                 "drainDueDeliveries",
+                 "drainDisableNotifications",
++                // Chapter 3.11 added this one, and chapter 3.10 should have.
++                // `drainQuotaNotifications` claims undelivered rows across every
++                // environment, exactly as its three siblings above do, and 3.10
++                // listed it in neither this rule nor `exempt.ts` — whose comment
++                // says the two MUST AGREE.
++                //
++                // SAY WHAT THIS DOES NOT BUY. It protects a future DIRECT
++                // importer. It does not protect the suites that already drive the
++                // drain, because they reach it through `createQuotaRelay`, and
++                // the note above is explicit that an indirect call is what this
++                // rule cannot see. Scoping those assertions to rows the test
++                // created is the half that works.
++                "drainQuotaNotifications",
+                 "sweepDisabledEndpoints",
+                 "outboxDepth",
+                 "pendingDeliveryDepth",
+               ],
+               message:
+                 "This function operates across every environment in the database, and an integration test shares that database with every other suite. Assert on the rows this test created — read them back by id, or scope the count to your own environment_id — instead of on what a global batch happened to contain. If this suite's subject IS the global drain, add it to packages/test-harness/src/exempt.ts with a reason, and to the ignores list beside this rule.",
+             },
+             {
+               name: "./repository",
+               importNames: [
+                 "drainOutbox",
+                 "drainDueDeliveries",
+```
+
+```diff title="services/api/src/auth/credentials.itest.ts"
+@@ -16,6 +16,7 @@ import {
+   revokeApiKey,
+ } from "../db/repository";
+ import { parseApiKeyCredential } from "./api-key";
++import { resolvePrincipal } from "./authenticate.middleware";
+ import { MAX_TOKEN_LIFETIME_SECONDS } from "./user-token";
+ 
+ // Chapter 3.8 added `request_id` to every error body (constitution V's fourth
+@@ -164,7 +165,22 @@ describe("credentials", () => {
+       environmentId: env.id,
+       name: "once",
+     });
+-    const secret = minted.credential.split("_").at(-1)!;
++    // THE SECRET IS EVERYTHING AFTER THE PUBLIC ID, and it is not
++    // `split("_").at(-1)`. `api-key.ts` says why three lines from its own regex:
++    // "the public id is hex when the secret is base64url … base64url's alphabet
++    // INCLUDES the separator". So the secret contains underscores, and taking the
++    // last segment yields whatever happens to follow the final one — occasionally
++    // a single character, which the row below then contains by chance:
++    //
++    //     AssertionError: expected '[{"public_id":"9e5240d…' not to contain 'A'
++    //
++    // Latent since chapter 3.1 and found by chapter 3.11's twenty-run battery on
++    // the gate run after it. Parsed with the same shape the production code
++    // parses (`CREDENTIAL` in `api-key.ts`) rather than a guess about delimiters.
++    const secret = /^rk_(?:dev|live)_[0-9a-f]{32}_(.+)$/.exec(
++      minted.credential,
++    )![1]!;
++    expect(secret.length).toBeGreaterThan(20);
+ 
+     // Nothing in the row it left behind contains what was returned. Read with
+     // a plain string rather than drizzle's `sql` helper: the query engine lives
+@@ -424,4 +440,65 @@ describe("credentials", () => {
+       expect(JSON.stringify(body)).not.toContain(PLATFORM);
+     });
+   });
++
++  // --- chapter 3.11: one credential per service ---------------------------
++
++  describe("which service presented it", () => {
++    // SET, not read, for the reason the block above gives.
++    const DISPATCHER = "rk_svc_credentials_itest_0123456789abcdef01234";
++    const GATEWAY = "rk_svc_gateway_itest_fedcba98765432100fedcba9";
++    process.env["RELAY_INTERNAL_CREDENTIAL"] = DISPATCHER;
++    process.env["RELAY_INTERNAL_CREDENTIAL_GATEWAY"] = GATEWAY;
++
++    it("names the dispatcher for the dispatcher's secret", async () => {
++      expect(await resolvePrincipal(db, DISPATCHER)).toEqual({
++        kind: "platform",
++        service: "dispatcher",
++      });
++    });
++
++    it("names the GATEWAY for the gateway's secret", async () => {
++      // Until this chapter `resolvePlatformCredential` ended with a hardcoded
++      // `service: "dispatcher"`, which was true while there was one caller and
++      // became a lie the moment there were two. `PlatformPrincipal.service` is
++      // documented as "which internal service presented it, for logs".
++      expect(await resolvePrincipal(db, GATEWAY)).toEqual({
++        kind: "platform",
++        service: "gateway",
++      });
++    });
++
++    it("gives neither service the other's reach", async () => {
++      // The property beyond honest logs: the gateway terminates public traffic
++      // and the dispatcher does not, so one shared secret would let the more
++      // exposed service set the blast radius for both.
++      expect(DISPATCHER).not.toBe(GATEWAY);
++      const swapped = await resolvePrincipal(db, GATEWAY);
++      expect(swapped).not.toBeNull();
++      expect((swapped as { service: string }).service).not.toBe("dispatcher");
++    });
++
++    it("refuses a secret shorter than 32 characters, per service", async () => {
++      // A short secret is a misconfiguration, and the safe reading of one is
++      // "this service cannot authenticate" rather than "this service is open".
++      const short = "rk_svc_tooshort";
++      process.env["RELAY_INTERNAL_CREDENTIAL_GATEWAY"] = short;
++      expect(await resolvePrincipal(db, short)).toBeNull();
++      process.env["RELAY_INTERNAL_CREDENTIAL_GATEWAY"] = GATEWAY;
++    });
++
++    it("makes an unconfigured service unusable rather than universal", async () => {
++      delete process.env["RELAY_INTERNAL_CREDENTIAL_GATEWAY"];
++      expect(await resolvePrincipal(db, GATEWAY)).toBeNull();
++      // The dispatcher is untouched by its neighbour's absence.
++      expect(await resolvePrincipal(db, DISPATCHER)).not.toBeNull();
++      process.env["RELAY_INTERNAL_CREDENTIAL_GATEWAY"] = GATEWAY;
++    });
++
++    it("refuses a well-formed secret that matches nobody", async () => {
++      expect(
++        await resolvePrincipal(db, "rk_svc_nobodys_secret_0000000000000000000"),
++      ).toBeNull();
++    });
++  });
+ });
+```
+
+```diff title="services/gateway/src/resume.itest.ts"
+@@ -56,20 +56,29 @@ interface Harness {
+   close: () => Promise<void>;
+ }
+ 
+-async function boot(api: ApiClient): Promise<Harness> {
++/** Chapter 3.11 widened `ApiClient` with `reportUsage`, and every stub in this
++ * file is about resume rather than metering — so the method is supplied here
++ * once instead of six times, and the `Omit` says which half these tests speak
++ * to. */
++async function boot(api: Omit<ApiClient, "reportUsage">): Promise<Harness> {
+   const fanout = createFanout({ url, logger: silent });
+   const server: Server = serve({
+     service: "gateway",
+     health: () => ({}),
+     logger: silent,
+   });
+-  const sessions = attachSessions({ server, api, logger: silent, fanout });
++  const sessions = attachSessions({
++    server,
++    api: { ...api, reportUsage: async () => null },
++    logger: silent,
++    fanout,
++  });
+   await new Promise<void>((resolve) => server.listen(0, resolve));
+   const { port } = server.address() as AddressInfo;
+   return {
+     url: `ws://127.0.0.1:${port}/v1/ws`,
+     close: async () => {
+-      sessions.close();
++      await sessions.close();
+       await fanout.close();
+       await new Promise<void>((resolve) => server.close(() => resolve()));
+     },
+```
+

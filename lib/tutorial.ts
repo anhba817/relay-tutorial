@@ -467,7 +467,7 @@ export const series: Part[] = [
         id: "3.11",
         path: "/part-3/chapter-11/counting-a-connection",
         title: "Counting a connection",
-        status: "forthcoming",
+        status: "published",
         // The third dimension FR-RTL-05 names, and the only one the api cannot
         // compute from its own tables. Messages and active users are already
         // rows; a connection-minute is a duration nothing records, so the
@@ -476,12 +476,12 @@ export const series: Part[] = [
         // the two dimensions that need no new writer, this one covers the
         // dimension that needs one.
         readerProduces:
-          "Connection-minutes metered from a service that owns no tables, and a crash that does not bill the customer twice",
+          "Connection-minutes metered from a service that owns no tables, a crash that under-bills by a bounded amount rather than over-billing for ever, and close code 4008 emitted for the first time since chapter 1.3 declared it",
         sourceDoc: "docs/04-srs.md, docs/05-sad.md",
         readerMinutes: 90,
         titleVi: "Đếm một kết nối",
         readerProducesVi:
-          "Connection-minutes được đo từ một service không sở hữu bảng nào, và một cú crash không tính tiền khách hàng hai lần",
+          "Connection-minutes được đo từ một service không sở hữu bảng nào, một cú crash tính thiếu trong một giới hạn đã biết thay vì tính thừa mãi mãi, và close code 4008 lần đầu được gửi kể từ khi chương 1.3 khai báo nó",
       },
       {
         id: "3.12",
