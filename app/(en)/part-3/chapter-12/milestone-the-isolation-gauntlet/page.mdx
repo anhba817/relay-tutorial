@@ -44,6 +44,171 @@ So the first decision is that the suite does not hold a list of endpoints. It as
 the application:
 
 ```ts title="services/api/src/isolation/targets.ts"
+/** The gauntlet's target list (chapter 3.12, NFR-SEC-09).
+ *
+ * A LIST OF CLASSIFICATIONS, NOT A LIST OF TARGETS. The targets themselves are
+ * derived from the running application — `app.getHttpAdapter().getInstance().router.stack`
+ * — because the fault this suite exists to prevent is a route that exists and is
+ * unattacked, and only the router knows what exists. What lives here is the
+ * decision about each one, which no derivation can make.
+ *
+ * NOTHING MAY BE EXEMPT BY OMISSION. A derived target matching no entry fails the
+ * suite, and an entry matching no derived target fails it too — the second
+ * direction is the one that catches a stale exemption after a rename. That pair of
+ * assertions is the whole mechanism; feature 030's doctrine is that whatever
+ * silently absorbs the next case is the thing to remove. */
+
+/** What kind of attack a route takes.
+ *
+ * `credential` is the shape the specification did not anticipate.
+ * `POST /auth/dev-token` accepts no tenant-owned identifier, so a foreign-id attack
+ * has nothing to put in it — and it is tenant-scoped all the same, because the key
+ * it accepts resolves to exactly one environment. Filing it as `exempt` is how a
+ * route stops being attacked while looking accounted for (research R4). */
+export type Shape = "read" | "list" | "write" | "credential" | "exempt";
+
+/** Which credential class the route accepts, and therefore which attack applies.
+ *
+ * NOT IN `data-model.md` §2, and added here because T031 and T031a need it. The
+ * internal surface is two credential classes: three routes take an end-user token,
+ * which IS scoped to one environment, so a foreign credential is the attack; five
+ * take a platform credential, which carries no environment, so the attack is a
+ * request naming one environment with an identifier from another. A `write` shape
+ * alone cannot tell those apart, and an earlier draft of this chapter gave all
+ * eight the platform attack (research R5). */
+export type CredentialClass = "application" | "user" | "platform" | "none";
+
+interface Classified {
+  method: string;
+  path: string;
+  accepts: CredentialClass;
+}
+
+export type Classification =
+  | (Classified & { shape: Exclude<Shape, "exempt">; because?: string })
+  | (Classified & { shape: "exempt"; because: string });
+
+/** Every route the api serves, as measured by T008's derivation: 22 today.
+ *
+ * The five shapes sum to 22 — 3 exempt, 1 credential, 1 list, 2 read, 15 write —
+ * and that sum is the check that caught `POST /v1/webhooks` missing from an earlier
+ * draft of `data-model.md`'s shape table, where five rows accounted for 21. */
+export const CLASSIFICATIONS: readonly Classification[] = [
+  // ── exempt: no tenant-owned identifier and no tenant-scoped credential ───────
+  {
+    method: "GET",
+    path: "/healthz",
+    accepts: "none",
+    shape: "exempt",
+    because:
+      "liveness only. No credential, no identifier, and the body is a service name and an uptime.",
+  },
+  {
+    method: "GET",
+    path: "/auth/:provider/start",
+    accepts: "none",
+    shape: "exempt",
+    because:
+      "the OAuth redirect. Its parameter is a provider name, validated against a configured set; there is no tenant yet, which is what signup is for.",
+  },
+  {
+    method: "GET",
+    path: "/auth/:provider/callback",
+    accepts: "none",
+    shape: "exempt",
+    because:
+      "the OAuth return. Its authority is a state cookie bound to the browser that began the flow, and chapter 3.1's suite already attacks that binding directly.",
+  },
+
+  // ── credential: tenant-scoped without taking an identifier ──────────────────
+  {
+    method: "POST",
+    path: "/auth/dev-token",
+    accepts: "application",
+    shape: "credential",
+    because:
+      "no identifier to forge, so the attack is on the credential: a key for one environment must not mint a token that works in another.",
+  },
+
+  // ── list ────────────────────────────────────────────────────────────────────
+  { method: "GET", path: "/v1/webhooks", accepts: "application", shape: "list" },
+
+  // ── read ────────────────────────────────────────────────────────────────────
+  { method: "GET", path: "/v1/webhooks/:id", accepts: "application", shape: "read" },
+  {
+    method: "GET",
+    path: "/v1/channels/:channelId/messages",
+    accepts: "application",
+    shape: "read",
+  },
+
+  // ── write, public ───────────────────────────────────────────────────────────
+  { method: "POST", path: "/v1/channels/:channelId/messages", accepts: "application", shape: "write" },
+  // Chapter 3.12's two new routes, and the order they were added in is the point.
+  // The derivation found them first: `targets.itest.ts` went from 22 to 24 and
+  // named them as unclassified, on the build that registered the module and
+  // before anything here mentioned them. That is the failure the derivation
+  // exists to produce (FR-021), and the classification is what changed in answer
+  // to it — never the derivation.
+  { method: "POST", path: "/v1/channels", accepts: "application", shape: "write" },
+  { method: "POST", path: "/v1/channels/:channelId/members", accepts: "application", shape: "write" },
+  { method: "POST", path: "/v1/webhooks", accepts: "application", shape: "write" },
+  { method: "POST", path: "/v1/webhooks/:id/rotate-secret", accepts: "application", shape: "write" },
+  { method: "POST", path: "/v1/webhooks/:id/enable", accepts: "application", shape: "write" },
+  { method: "POST", path: "/v1/webhooks/:id/disable", accepts: "application", shape: "write" },
+  { method: "POST", path: "/v1/webhooks/:id/test", accepts: "application", shape: "write" },
+  { method: "DELETE", path: "/v1/webhooks/:id", accepts: "application", shape: "write" },
+
+  // ── write, internal, end-user token: scoped to one environment ──────────────
+  { method: "POST", path: "/internal/messages", accepts: "user", shape: "write" },
+  { method: "POST", path: "/internal/session", accepts: "user", shape: "write" },
+  { method: "POST", path: "/internal/backfill", accepts: "user", shape: "write" },
+
+  // ── write, internal, platform credential: carries no environment ────────────
+  { method: "POST", path: "/internal/usage/connections", accepts: "platform", shape: "write" },
+  { method: "POST", path: "/internal/dispatch/expand", accepts: "platform", shape: "write" },
+  { method: "POST", path: "/internal/dispatch/material", accepts: "platform", shape: "write" },
+  { method: "POST", path: "/internal/dispatch/outcome", accepts: "platform", shape: "write" },
+  { method: "POST", path: "/internal/dispatch/replay", accepts: "platform", shape: "write" },
+];
+
+/** The key a derived route and a classification are joined on. */
+export function targetKey(t: { method: string; path: string }): string {
+  return `${t.method.toUpperCase()} ${t.path}`;
+}
+
+/** Counts, for the suite to print and `baseline.txt` to record. Derived from the
+ * list rather than typed beside it, because a hand-maintained tally is the thing
+ * that goes stale first. */
+export function shapeCounts(): Record<Shape, number> {
+  const counts: Record<Shape, number> = { read: 0, list: 0, write: 0, credential: 0, exempt: 0 };
+  for (const c of CLASSIFICATIONS) counts[c.shape]++;
+  return counts;
+}
+
+/** One routable endpoint, as the running application reports it. */
+export interface DerivedTarget {
+  method: string;
+  path: string;
+}
+
+/** The shape of the express router this reaches into. Declared rather than
+ * imported: express 5 ships no types, and adding `@types/express` for one
+ * property read would move the api's dependency list for a test's benefit. */
+interface RouterLike {
+  stack?: Array<{ route?: { path?: string; methods?: Record<string, boolean> }; name?: string }>;
+}
+interface AdapterInstance {
+  router?: RouterLike;
+  _router?: RouterLike;
+}
+
+/** Where the router lives, and the fact that this is not public API.
+ *
+ * Express 5 exposes `router`; express 4 called it `_router`. Both are read, and
+ * which one answered is returned so a test can assert the derivation found
+ * something rather than silently finding nothing — the failure mode that would
+ * make this whole suite pass while attacking zero routes (research R2). */
 export function deriveTargets(instance: unknown): {
   targets: DerivedTarget[];
   middlewareLayers: number;
@@ -52,6 +217,25 @@ export function deriveTargets(instance: unknown): {
   const adapter = instance as AdapterInstance;
   const router = adapter.router ?? adapter._router;
   const property = adapter.router ? "router" : adapter._router ? "_router" : "none";
+  const targets: DerivedTarget[] = [];
+  let middlewareLayers = 0;
+  for (const layer of router?.stack ?? []) {
+    if (!layer.route) {
+      middlewareLayers++;
+      continue;
+    }
+    const path = layer.route.path ?? "";
+    for (const [verb, on] of Object.entries(layer.route.methods ?? {})) {
+      if (on) targets.push({ method: verb.toUpperCase(), path });
+    }
+  }
+  return { targets, middlewareLayers, property };
+}
+
+/** A route that has existed since chapter 2.2 and will exist for as long as this
+ * product does. If the derivation cannot find THIS, it has not found the mounted
+ * router, whatever else it returned. */
+export const CANARY_TARGET = "POST /v1/channels/:channelId/messages";
 ```
 
 Three properties instead of one, because Express 4 exposed `_router` and Express 5
@@ -70,12 +254,112 @@ the same green tick either way. That is why `property` exists and why the
 derivation asserts on it:
 
 ```ts title="services/api/src/isolation/targets.itest.ts"
-it("found a router at all, and says which property answered", () => {
-  expect(derived.property, "no router found on the adapter instance").not.toBe("none");
-});
+import "reflect-metadata";
 
-it("found routes — an empty list is a broken derivation, not a clean surface", () => {
-  expect(derived.targets.length).toBeGreaterThan(0);
+import { Test } from "@nestjs/testing";
+import type { INestApplication } from "@nestjs/common";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+
+import { AppModule } from "../app.module";
+import {
+  CANARY_TARGET,
+  CLASSIFICATIONS,
+  deriveTargets,
+  shapeCounts,
+  targetKey,
+  type DerivedTarget,
+} from "./targets";
+
+// THE DERIVATION'S OWN TESTS, and they matter more than they look.
+//
+// The gauntlet attacks a list it derives from the running application rather than
+// one somebody typed, because the fault NFR-SEC-09 exists to prevent is a route
+// that exists and is unattacked. But a derivation has a failure mode a typed list
+// does not: it can return NOTHING and pass. Express 5 renamed `_router` to
+// `router`; an upgrade that renamed it again would leave this suite green while it
+// attacked zero endpoints, which is worse than the hand-written list it replaces.
+//
+// So the derivation is checked before it is used: it found something, it found the
+// route we know is there, and every target it found is classified exactly once.
+
+describe("the gauntlet's target list derives from the running application", () => {
+  let app: INestApplication;
+  let derived: DerivedTarget[];
+  let middlewareLayers: number;
+  let property: string;
+
+  beforeAll(async () => {
+    const moduleRef = await Test.createTestingModule({ imports: [AppModule] }).compile();
+    app = moduleRef.createNestApplication();
+    await app.init();
+    const result = deriveTargets(app.getHttpAdapter().getInstance());
+    derived = result.targets;
+    middlewareLayers = result.middlewareLayers;
+    property = result.property;
+  });
+
+  afterAll(async () => {
+    await app?.close();
+  });
+
+  // ── T016: the three that keep the derivation honest ────────────────────────
+  it("found a router at all, and says which property answered", () => {
+    expect(property).not.toBe("none");
+    expect(["router", "_router"]).toContain(property);
+  });
+
+  it("found routes — an empty list is a broken derivation, not a clean surface", () => {
+    expect(derived.length).toBeGreaterThan(0);
+    // Middleware layers exist in any mounted express app. Zero of them alongside
+    // zero routes is the signature of reading the wrong object.
+    expect(middlewareLayers).toBeGreaterThan(0);
+  });
+
+  it("found the route that has existed since chapter 2.2", () => {
+    expect(derived.map(targetKey)).toContain(CANARY_TARGET);
+  });
+
+  // ── T017: every target is classified ──────────────────────────────────────
+  it("classifies every derived target exactly once", () => {
+    const entries = new Map<string, number>();
+    for (const c of CLASSIFICATIONS) entries.set(targetKey(c), (entries.get(targetKey(c)) ?? 0) + 1);
+    const unclassified = derived.map(targetKey).filter((k) => !entries.has(k));
+    const duplicated = [...entries].filter(([, n]) => n > 1).map(([k]) => k);
+    // Named in the failure, because "22 !== 23" sends a reader to count rows.
+    expect({ unclassified, duplicated }).toEqual({ unclassified: [], duplicated: [] });
+  });
+
+  // ── T018: and no classification outlives its route ────────────────────────
+  it("has no classification entry that matches no derived target", () => {
+    const found = new Set(derived.map(targetKey));
+    const stale = CLASSIFICATIONS.map(targetKey).filter((k) => !found.has(k));
+    // This is the direction that catches a rename. A route renamed with its
+    // exemption left behind is a route nobody attacks and nobody misses.
+    expect(stale).toEqual([]);
+  });
+
+  // ── T019 ──────────────────────────────────────────────────────────────────
+  it("gives every exempt entry a reason", () => {
+    const reasonless = CLASSIFICATIONS.filter(
+      (c) => c.shape === "exempt" && (!c.because || c.because.trim() === ""),
+    ).map(targetKey);
+    expect(reasonless).toEqual([]);
+  });
+
+  // ── T020: the number SC-001 reports comes off a run ───────────────────────
+  it("accounts for every derived target as attacked or exempt", () => {
+    const counts = shapeCounts();
+    const attacked = counts.read + counts.list + counts.write + counts.credential;
+    const exempt = counts.exempt;
+    // SC-001 asks for this number to be reported, and a number nobody can see is a
+    // number nobody checks. Visible under `--reporter=verbose`; the assertion below
+    // is what gates the build either way.
+    console.log(
+      `gauntlet targets: ${derived.length} derived, ${attacked} attacked, ${exempt} exempt ` +
+        `(read ${counts.read}, list ${counts.list}, write ${counts.write}, credential ${counts.credential})`,
+    );
+    expect(attacked + exempt).toBe(derived.length);
+  });
 });
 ```
 
@@ -89,7 +373,7 @@ Classification is a separate act, and deliberately not derivable. Whether a rout
 takes a tenant-owned identifier is a judgement, so it is written down with a
 reason:
 
-```ts title="services/api/src/isolation/targets.ts"
+```ts title="services/api/src/isolation/targets.ts (excerpt)"
 export const CLASSIFICATIONS: readonly Classification[] = [
   { method: "GET", path: "/v1/webhooks", accepts: "application", shape: "list" },
   { method: "GET", path: "/v1/webhooks/:id", accepts: "application", shape: "read" },
@@ -127,19 +411,104 @@ identifiers from. One environment can only prove that a made-up uuid is not foun
 which is a much weaker claim than the one constitution I makes.
 
 ```ts title="services/api/src/isolation/fixtures.ts"
+import { createApiKey, createEnvironment, Repository } from "../db/repository";
+import { encryptSecret, mintSigningSecret } from "../webhooks/secret";
+
+import type { Db } from "../db/client";
+
+/** Two tenants, so every attack has a victim and an attacker (chapter 3.12).
+ *
+ * The gauntlet's unit of assertion is a PAIR of requests — another tenant's
+ * identifier and an identifier that exists nowhere — and it needs a second tenant
+ * to borrow identifiers from. One environment can only prove that a made-up uuid
+ * is not found, which is a much weaker claim than the one constitution I makes.
+ *
+ * EVERY ROW IS SCOPED TO AN ENVIRONMENT THIS FUNCTION MINTED, and nothing here
+ * deletes anything. Feature 030's whole subject is a test that performs a global
+ * operation and asserts a local fact; a fixture that tidied up with a
+ * `DELETE FROM channels` would be the eleventh instance of it. The environments
+ * are disposable and the lane shares the database — that is the trade chapter 2.1
+ * made when it put `environment_id` in every table, and it pays for itself here.
+ *
+ * ONE OF EACH KIND OF ROW THE ROUTES TOUCH, because the write attacks read
+ * storage before and after: a channel and a message for the message routes, a
+ * user for membership and the session route, a webhook endpoint for the seven
+ * webhook routes. */
 export interface Tenant {
   environmentId: string;
+  /** An `rk_dev_…` credential for this environment, minted the way signup does. */
   credential: string;
   userId: string;
   userExternalId: string;
   channelId: string;
+  /** The customer-supplied identifier, so the create attack can present the other
+   * tenant's own external id. */
   channelExternalId: string;
   messageId: string;
   endpointId: string;
   repo: Repository;
 }
 
+export interface TwoTenants {
+  /** The caller. Its credential is the one every attack presents. */
+  attacker: Tenant;
+  /** The tenant whose identifiers the attacker borrows. Nothing it owns may move. */
+  victim: Tenant;
+}
+
+async function seedTenant(db: Db, label: string): Promise<Tenant> {
+  const environment = await createEnvironment(db, { name: `isolation-${label}` });
+  const key = await createApiKey(db, { environmentId: environment.id });
+  const repo = new Repository(db, environment.id);
+
+  const userExternalId = `${label}-user`;
+  const user = await repo.createUser(userExternalId, `${label} user`);
+  const channel = await repo.createChannel(`${label}-channel`, "public", `${label}`);
+  await repo.addMember(channel.id, user.id);
+  const message = await repo.sendMessage(channel.id, {
+    text: `${label} says something`,
+    userId: user.id,
+    userExternalId,
+  });
+  const endpoint = await repo.createEndpoint({
+    url: `https://${label}.example/hook`,
+    eventTypes: ["message.created"],
+    secretCiphertext: encryptSecret(mintSigningSecret()),
+  });
+
+  return {
+    environmentId: environment.id,
+    credential: key.credential,
+    userId: user.id,
+    userExternalId,
+    channelId: channel.id,
+    channelExternalId: `${label}-channel`,
+    messageId: message.id,
+    endpointId: endpoint.id,
+    repo,
+  };
+}
+
+/** Mint the pair. Labels carry a suffix so two suites running in parallel do not
+ * collide on `channels_environment_id_external_id_unique` — the identifiers are
+ * per environment, but the label is what a failure message shows a reader. */
 export async function seedTwoTenants(db: Db): Promise<TwoTenants> {
+  const stamp = Math.random().toString(36).slice(2, 8);
+  const [attacker, victim] = await Promise.all([
+    seedTenant(db, `a-${stamp}`),
+    seedTenant(db, `v-${stamp}`),
+  ]);
+  return { attacker, victim };
+}
+
+/** A well-formed identifier belonging to nobody — the other half of every pair.
+ *
+ * It has to be a valid uuid, or the endpoint refuses it for the wrong reason: a
+ * malformed id is a 400 from validation and a foreign id is a 404 from the
+ * repository, and comparing those two would pass a suite that proves nothing. */
+export function nowhereId(): string {
+  return "00000000-0000-4000-8000-" + Math.random().toString(16).slice(2, 14).padEnd(12, "0");
+}
 ```
 
 One of each kind of row the routes touch, because the write attacks read the
@@ -153,12 +522,130 @@ table.
 The socket half needs its own, because the gateway lane cannot import the api:
 
 ```ts title="services/gateway/src/isolation-fixtures.ts"
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+/** Two tenants and a user token each, for the socket half of the gauntlet
+ * (chapter 3.12, FR-007).
+ *
+ * WHY THE GATEWAY LANE AND NOT `packages/e2e`. A socket needs a real gateway, and
+ * this lane has spawned a live api child since chapter 3.2 — so the gateway runs
+ * in process, which is what lets a test drive its clock and read its state. The
+ * e2e package is excluded from the coverage run by name, so a suite living only
+ * there could not contribute to the branch figures FR-040 measures (research R1).
+ *
+ * SEEDING GOES THROUGH THE API'S BUILD OUTPUT, which is the test-only seam chapter
+ * 2.8 opened and 3.2 widened, for the reason it gave: there is no admin API for
+ * environments or keys, and inventing one for a test would be inventing product.
+ * Chapter 3.12 narrows that seam for channels and members — those get public
+ * endpoints in Phase 6 — and leaves environments and keys where they were, so this
+ * file states the same retirement its ancestors did.
+ *
+ * `createRequire` rather than an import, because this package may not depend on
+ * the api. That is also the escape hatch `packages/outsider` is forbidden from
+ * using, which is worth noticing while writing it: the seal there is a lint rule
+ * on paths, and this is what the rule exists to refuse. */
+const HERE = dirname(fileURLToPath(import.meta.url));
+const DIST = join(HERE, "..", "..", "api", "dist");
+const require_ = createRequire(import.meta.url);
+
+interface Seeder {
+  createEnvironment: (db: unknown, input: { name: string }) => Promise<{ id: string }>;
+  createApiKey: (db: unknown, input: { environmentId: string }) => Promise<{ credential: string }>;
+  Repository: new (
+    db: unknown,
+    environmentId: string,
+  ) => {
+    createUser: (externalId: string, name?: string) => Promise<{ id: string }>;
+    createChannel: (externalId: string, type: string, name?: string) => Promise<{ id: string }>;
+    addMember: (channelId: string, userId: string) => Promise<boolean>;
+    sendMessage: (
+      channelId: string,
+      input: { text: string; userId?: string; userExternalId?: string },
+    ) => Promise<{ id: string; seq: number }>;
+  };
+}
+
+export interface SocketTenant {
+  environmentId: string;
+  credential: string;
+  userExternalId: string;
+  channelId: string;
+  /** A token for `userExternalId`, minted through the api's own dev-token route so
+   * the signing secret never leaves the api — research R1's rule, and the reason
+   * the gateway asks rather than verifies. */
+  token: string;
+  /** Put a message in this tenant's channel, so a foreign subscriber has something
+   * it must not receive. */
+  say: (text: string) => Promise<{ id: string; seq: number }>;
+  /** This tenant's own channel history, read with its own credential through the
+   * public route. A write attack has to be checked against the victim's state and
+   * not against the attacker's refusal: a refusal that changed a row is still a
+   * breach, and only the victim's side of the wire can tell. */
+  history: () => Promise<string>;
+}
+
+export interface SocketTenants {
+  attacker: SocketTenant;
+  victim: SocketTenant;
+}
+
+async function mintToken(apiUrl: string, credential: string, user: string): Promise<string> {
+  const res = await fetch(`${apiUrl}/auth/dev-token`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${credential}` },
+    body: JSON.stringify({ user, ttl_seconds: 3600 }),
+  });
+  if (!res.ok) throw new Error(`dev-token for ${user}: ${res.status}`);
+  return ((await res.json()) as { token: string }).token;
+}
+
+/** Mint the pair against the api child this lane already runs. */
+export async function seedSocketTenants(apiUrl: string): Promise<SocketTenants> {
+  const client = require_(join(DIST, "db", "client.js")) as {
+    createDb: (pool: unknown) => unknown;
+    createPool: () => unknown;
+  };
+  const seeder = require_(join(DIST, "db", "repository.js")) as Seeder;
+  const db = client.createDb(client.createPool());
+  const stamp = Math.random().toString(36).slice(2, 8);
+
+  const seed = async (label: string): Promise<SocketTenant> => {
+    const environment = await seeder.createEnvironment(db, { name: `iso-ws-${label}-${stamp}` });
+    const repo = new seeder.Repository(db, environment.id);
+    const userExternalId = `${label}-user`;
+    const user = await repo.createUser(userExternalId, `${label} user`);
+    const channel = await repo.createChannel(`${label}-channel`, "public");
+    await repo.addMember(channel.id, user.id);
+    const key = await seeder.createApiKey(db, { environmentId: environment.id });
+    const token = await mintToken(apiUrl, key.credential, userExternalId);
+    return {
+      environmentId: environment.id,
+      credential: key.credential,
+      userExternalId,
+      channelId: channel.id,
+      token,
+      say: (text: string) =>
+        repo.sendMessage(channel.id, { text, userId: user.id, userExternalId }),
+      history: async () => {
+        const res = await fetch(`${apiUrl}/v1/channels/${channel.id}/messages?limit=100`, {
+          headers: { authorization: `Bearer ${key.credential}` },
+        });
+        if (!res.ok) throw new Error(`history for ${label}: ${res.status}`);
+        return res.text();
+      },
+    };
+  };
+
   // Sequential, not concurrent: both calls mint a token through the same api
   // child, and chapter 3.8's per-IP failed-auth limiter is the one bucket that
   // fails CLOSED. Two parallel signups are well under it, and a suite that
   // learns that the hard way learns it as an unrelated 429.
   const attacker = await seed("a");
   const victim = await seed("v");
+  return { attacker, victim };
+}
 ```
 
 ## Four shapes, and one oracle
@@ -169,18 +656,200 @@ by minting something that works elsewhere. So there are four attack functions, a
 each returns the evidence rather than a verdict:
 
 ```ts title="services/api/src/isolation/attack.ts"
+import { withoutRequestId } from "./compare";
+
+/** The four attacks, one per shape (chapter 3.12, NFR-SEC-09).
+ *
+ * THE UNIT OF ASSERTION IS A PAIR, not a request. Constitution I forbids revealing
+ * that another tenant's data exists, so the correct answer to a foreign identifier
+ * is whatever the platform says about an identifier that exists nowhere — and a
+ * single response cannot show that. Every attack here issues both and compares.
+ *
+ * A suite asserting `404` instead would be wrong about the list shape, would freeze
+ * today's status choices into a test, and would pass an endpoint that leaks through
+ * its prose: `messages.service.ts` keeps a CONSTANT message for exactly that reason,
+ * because echoing the id back makes the foreign answer differ from the absent one.
+ * So status, code and whole body are compared, minus the one field that reveals
+ * nothing (research R3). */
+
+export interface AttackRequest {
+  method: string;
+  /** Path with identifiers already substituted — `/v1/webhooks/<uuid>`. */
+  path: string;
+  body?: unknown;
+}
+
+export interface Answer {
+  status: number;
+  body: unknown;
+}
+
+/** What an attack found. `differences` is empty when the pair is indistinguishable;
+ * when it is not, it says what differed, because "expected true to be false" sends
+ * a reader back to the source and a named difference does not. */
 export interface Verdict {
   differences: string[];
   foreign: Answer;
   absent: Answer;
 }
 
+async function send(baseUrl: string, credential: string, req: AttackRequest): Promise<Answer> {
+  const res = await fetch(`${baseUrl}${req.path}`, {
+    method: req.method,
+    headers: {
+      authorization: `Bearer ${credential}`,
+      ...(req.body === undefined ? {} : { "content-type": "application/json" }),
+    },
+    ...(req.body === undefined ? {} : { body: JSON.stringify(req.body) }),
+  });
+  const text = await res.text();
+  let body: unknown = text;
+  try {
+    body = text === "" ? null : JSON.parse(text);
+  } catch {
+    /* a non-JSON body is itself the answer, and comparing it verbatim is correct */
+  }
+  return { status: res.status, body };
+}
+
+/** Exported for `attack.test.ts`. The arm that reports a DIFFERENCE never
+ * executes in a healthy lane — every attack in the gauntlet compares equal — so
+ * the one branch that matters here is the one a passing suite cannot reach. It is
+ * driven with made-up answers instead (chapter 3.12's Phase 7 argument, one layer
+ * down: an instrument that has never fired is untested). */
+export function comparePair(foreign: Answer, absent: Answer): string[] {
+  const differences: string[] = [];
+  if (foreign.status !== absent.status) {
+    differences.push(`status ${foreign.status} (foreign) vs ${absent.status} (absent)`);
+  }
+  const f = withoutRequestId(foreign.body);
+  const a = withoutRequestId(absent.body);
+  if (JSON.stringify(f) !== JSON.stringify(a)) {
+    differences.push(`body ${JSON.stringify(f)} (foreign) vs ${JSON.stringify(a)} (absent)`);
+  }
+  return differences;
+}
+
+/** T023. A read of another tenant's resource must answer as a read of nothing. */
 export async function readAttack(
   baseUrl: string,
   credential: string,
   foreignReq: AttackRequest,
   absentReq: AttackRequest,
-): Promise<Verdict>
+): Promise<Verdict> {
+  const foreign = await send(baseUrl, credential, foreignReq);
+  const absent = await send(baseUrl, credential, absentReq);
+  return { differences: comparePair(foreign, absent), foreign, absent };
+}
+
+/** T024. A list's correct answer to "nothing of yours here" is an empty result —
+ * and NOT A PAGE, on this platform, today. `GET /v1/webhooks` takes no `limit` and
+ * no `cursor` and returns a bare array, so EIR-API-06's cursor pagination is unmet
+ * on the only list route there is. The assertion is emptiness in whatever form the
+ * endpoint returns, and the gap is recorded as walked into rather than caused
+ * (research R27). */
+export interface ListVerdict {
+  status: number;
+  /** How many rows came back, however the endpoint chose to wrap them. */
+  count: number;
+  /** Any returned identifier that belongs to the other tenant. */
+  leaked: string[];
+  body: unknown;
+}
+
+/** THE ROWS IN A LIST RESPONSE, whatever shape it came in.
+ *
+ * Three shapes because the platform has two and a future route may have neither:
+ * `GET /v1/webhooks` answers a bare array, a paginated route answers
+ * `{ data: [...] }`, and anything else has no rows to count. Exported and pure
+ * because only ONE of those arms can execute against the routes that exist today,
+ * and a count of zero from an unrecognised shape reads exactly like a count of
+ * zero from a correctly-scoped list — which is the one answer this suite must
+ * never confuse with success. */
+export function rowsOf(body: unknown): unknown[] {
+  if (Array.isArray(body)) return body;
+  const data = (body as { data?: unknown } | null)?.data;
+  if (Array.isArray(data)) return data;
+  return [];
+}
+
+export async function listAttack(
+  baseUrl: string,
+  credential: string,
+  req: AttackRequest,
+  foreignIds: readonly string[],
+): Promise<ListVerdict> {
+  const answer = await send(baseUrl, credential, req);
+  const rows = rowsOf(answer.body);
+  const serialised = JSON.stringify(answer.body ?? "");
+  return {
+    status: answer.status,
+    count: rows.length,
+    leaked: foreignIds.filter((id) => serialised.includes(id)),
+    body: answer.body,
+  };
+}
+
+/** T025. A write against another tenant's identifier must change nothing, and the
+ * pair must still be indistinguishable.
+ *
+ * THE STATE READ IS THE POINT. A 404 that completed the write is the case no status
+ * code reveals, and it is the one a reader should worry about. `readVictimState` is
+ * supplied by the caller and goes through `Repository` methods rather than raw SQL:
+ * the restored lint ban (FR-043) forbids the query engine outside
+ * `services/api/src/db`, and this suite should not need an exemption. */
+export async function writeAttack(
+  baseUrl: string,
+  credential: string,
+  foreignReq: AttackRequest,
+  absentReq: AttackRequest,
+  readVictimState: () => Promise<unknown>,
+): Promise<Verdict & { stateChanged: boolean; before: unknown; after: unknown }> {
+  const before = await readVictimState();
+  const foreign = await send(baseUrl, credential, foreignReq);
+  const absent = await send(baseUrl, credential, absentReq);
+  const after = await readVictimState();
+  return {
+    differences: comparePair(foreign, absent),
+    foreign,
+    absent,
+    stateChanged: JSON.stringify(before) !== JSON.stringify(after),
+    before,
+    after,
+  };
+}
+
+/** T026. The shape the specification did not anticipate.
+ *
+ * `POST /auth/dev-token` accepts no tenant-owned identifier, so there is nothing to
+ * forge — and it is tenant-scoped all the same, because the key it accepts resolves
+ * to exactly one environment. The attack is therefore on the credential: mint a
+ * token with environment A's key and present it where only B's users belong. Filing
+ * this route as exempt is how a route stops being attacked while looking accounted
+ * for (research R4). */
+export interface CredentialVerdict {
+  minted: boolean;
+  /** The status the borrowed token got on the other tenant's resource. */
+  crossStatus: number;
+  crossBody: unknown;
+}
+
+export async function credentialAttack(
+  baseUrl: string,
+  attackerCredential: string,
+  user: string,
+  victimReq: AttackRequest,
+): Promise<CredentialVerdict> {
+  const mint = await fetch(`${baseUrl}/auth/dev-token`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${attackerCredential}`, "content-type": "application/json" },
+    body: JSON.stringify({ user }),
+  });
+  if (!mint.ok) return { minted: false, crossStatus: mint.status, crossBody: await mint.json() };
+  const { token } = (await mint.json()) as { token: string };
+  const answer = await send(baseUrl, token, victimReq);
+  return { minted: true, crossStatus: answer.status, crossBody: answer.body };
+}
 ```
 
 The oracle underneath all four is the one chapter 2.8 invented for a single test
@@ -188,6 +857,27 @@ and this chapter lifted into its own file: **a foreign identifier must be
 indistinguishable from an identifier that exists nowhere.**
 
 ```ts title="services/api/src/isolation/compare.ts"
+/** The indistinguishability oracle (chapter 3.12).
+ *
+ * LIFTED FROM `messages/messages.itest.ts`, WHERE IT WAS WRITTEN AND WHERE IT WAS
+ * RIGHT. Chapter 2.2's suite needed to prove that a foreign channel answers exactly
+ * as an absent one, chapter 3.8 added `request_id` to every error body and forced
+ * this helper into existence, and there it stayed — one file's private function
+ * doing the thing constitution I asks of every endpoint.
+ *
+ * That is the difference this chapter is about. A correct assertion written once and
+ * never generalised is what separates nine scattered isolation tests from a suite.
+ * It lives here so 24 routes can share it; `messages.itest.ts` imports it back.
+ *
+ * Chapter 3.8 added `request_id` to every error body (constitution V's fourth
+ * field, promised since 1.3). It is unique per request BY DESIGN, so two error
+ * bodies can no longer be compared whole — and comparing them whole is how a suite
+ * proves a foreign resource is indistinguishable from an absent one, which is a
+ * tenant-isolation property (constitution I).
+ *
+ * The id is the one field that reveals nothing about the resource, so it is the
+ * one field the comparison must drop. Everything discriminating still has to
+ * match exactly. */
 export function withoutRequestId(body: unknown): unknown {
   if (typeof body !== "object" || body === null) return body;
   const rest: Record<string, unknown> = { ...(body as Record<string, unknown>) };
@@ -214,7 +904,7 @@ the same thing to both.
 Writes get more than the pair, because a refusal that changed a row is still a
 breach:
 
-```ts title="services/api/src/isolation/attack.ts"
+```ts title="services/api/src/isolation/attack.ts (excerpt)"
 export async function writeAttack(
   baseUrl: string,
   credential: string,
@@ -242,20 +932,447 @@ variable, a route that answers 401 to everything — are *also* indistinguishabl
 They would pass every test in the file while attacking nothing at all.
 
 ```ts title="services/api/src/isolation/gauntlet.itest.ts"
-describe("the control: the attacking credential is a working credential", () => {
-  it("reaches its own webhook endpoint", async () => {
-    const res = await fetch(`${url}/v1/webhooks/${tenants.attacker.endpointId}`, {
-      headers: { authorization: `Bearer ${tenants.attacker.credential}` },
-    });
-    expect(res.status).toBe(200);
+import "reflect-metadata";
+
+import { Test } from "@nestjs/testing";
+import type { INestApplication } from "@nestjs/common";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+
+import { AppModule } from "../app.module";
+import { createDb, createPool } from "../db/client";
+import { mintUserToken } from "../auth/user-token";
+import { environmentSigningSecret } from "../db/repository";
+import { credentialAttack, listAttack, readAttack, writeAttack } from "./attack";
+import { nowhereId, seedTwoTenants, type TwoTenants } from "./fixtures";
+
+import type { Db } from "../db/client";
+
+// THE GAUNTLET (NFR-SEC-09, FR-TEN-05, constitution I).
+//
+// Every endpoint the api serves, attacked with another tenant's identifiers, on
+// every build. Constitution I has required this suite since it was written; what
+// the repository had instead was nine good isolation assertions in nine files, and
+// nothing anywhere that knew which endpoints had been attacked and which had merely
+// never been thought about.
+//
+// The target list is DERIVED, in `targets.itest.ts`, and classified in
+// `targets.ts` — a route that exists and matches no classification fails the build.
+// This file is the attacking half.
+//
+// ── WHAT THIS SUITE DOES NOT COVER, which matters as much as what it does ──────
+//
+// TIMING. A foreign id answering in 3 ms and an absent id in 30 ms is a disclosure
+// this suite cannot see. Measuring that stably in CI is a different discipline and
+// is not attempted here; the chapter names it as unaddressed rather than implying
+// it is covered.
+//
+// A LEAKED PLATFORM CREDENTIAL. FR-044 narrowed which routes each internal service
+// may call, and that is all it did. There is no rotation, and `service` is
+// self-reported by which variable matched — so the change shrinks the blast radius
+// of a leak and does not make one survivable.
+//
+// ROUTES THAT ARE UNSCOPED BY DESIGN. The four dispatch routes reach every tenant
+// because the dispatcher serves every tenant. This suite checks WHO MAY CALL them,
+// not whether they should exist.
+//
+// MESSAGE CONTENT BEYOND EQUALITY. The pair proves the two answers match. It does
+// not prove that what they say is wise: a constant message leaking a schema detail
+// would pass every assertion below.
+//
+// ANYTHING NOT ROUTED THROUGH THE HTTP ROUTER. A future admin socket, a CLI, a cron
+// job reading across environments — none of those appear in `router.stack`, so none
+// of them appear here.
+//
+// STORAGE-LEVEL LEAKS WITH NO ENDPOINT. `tenant-scope.itest.ts` checks that every
+// table carries a tenant path; it does not check that a query respects the one it
+// has. Those are two different claims and this file makes only the second.
+
+describe("the isolation gauntlet", () => {
+  let app: INestApplication;
+  let url: string;
+  let db: Db;
+  let tenants: TwoTenants;
+
+  beforeAll(async () => {
+    db = createDb(createPool());
+    tenants = await seedTwoTenants(db);
+    app = (
+      await Test.createTestingModule({ imports: [AppModule] }).compile()
+    ).createNestApplication({ logger: false });
+    await app.listen(0);
+    url = await app.getUrl();
+  }, 60_000);
+
+  afterAll(async () => {
+    await app?.close();
   });
 
-  it("reaches its own channel history, and sees its own message", async () => {
-    const res = await fetch(`${url}/v1/channels/${tenants.attacker.channelId}/messages`, {
-      headers: { authorization: `Bearer ${tenants.attacker.credential}` },
+  // ── THE CONTROL, and it is not decoration ──────────────────────────────────
+  //
+  // Every assertion below compares two refusals. Two refusals for an unrelated
+  // reason — an expired credential, a misconfigured lane, a route that 401s
+  // everything — are also indistinguishable, and would pass every test in this
+  // file while attacking nothing. So the suite first proves the attacker's
+  // credential WORKS on the attacker's own resources. Without this, a green
+  // gauntlet is compatible with a broken one.
+  describe("the control: the attacking credential is a working credential", () => {
+    it("reaches its own webhook endpoint", async () => {
+      const res = await fetch(`${url}/v1/webhooks/${tenants.attacker.endpointId}`, {
+        headers: { authorization: `Bearer ${tenants.attacker.credential}` },
+      });
+      expect(res.status).toBe(200);
     });
-    expect(res.status).toBe(200);
-    expect(await res.text()).toContain(tenants.attacker.messageId);
+
+    it("reaches its own channel history, and sees its own message", async () => {
+      const res = await fetch(`${url}/v1/channels/${tenants.attacker.channelId}/messages`, {
+        headers: { authorization: `Bearer ${tenants.attacker.credential}` },
+      });
+      expect(res.status).toBe(200);
+      expect(await res.text()).toContain(tenants.attacker.messageId);
+    });
+
+    it("can write to its own channel", async () => {
+      const res = await fetch(`${url}/v1/channels/${tenants.attacker.channelId}/messages`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${tenants.attacker.credential}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ text: "the control writes" }),
+      });
+      expect(res.status).toBe(201);
+    });
+  });
+
+  // ── T028: read ──────────────────────────────────────────────────────────────
+  describe("read: a foreign resource answers as an absent one", () => {
+    it("GET /v1/webhooks/:id", async () => {
+      const verdict = await readAttack(
+        url,
+        tenants.attacker.credential,
+        { method: "GET", path: `/v1/webhooks/${tenants.victim.endpointId}` },
+        { method: "GET", path: `/v1/webhooks/${nowhereId()}` },
+      );
+      expect(verdict.differences).toEqual([]);
+      // And it is a refusal, not a leak: a pair could be identical because both
+      // returned the victim's row.
+      expect(verdict.foreign.status).toBeGreaterThanOrEqual(400);
+    });
+
+    it("GET /v1/channels/:channelId/messages", async () => {
+      const verdict = await readAttack(
+        url,
+        tenants.attacker.credential,
+        { method: "GET", path: `/v1/channels/${tenants.victim.channelId}/messages` },
+        { method: "GET", path: `/v1/channels/${nowhereId()}/messages` },
+      );
+      expect(verdict.differences).toEqual([]);
+      // History is the one read whose refusal is an EMPTY PAGE and not a 404 —
+      // chapter 2.4's shape, asserted in `history.itest.ts` by name. So the check
+      // here is that nothing of the victim's came back, not that a status was 4xx.
+      expect(JSON.stringify(verdict.foreign.body)).not.toContain(tenants.victim.messageId);
+    });
+  });
+
+  // ── T029: list ──────────────────────────────────────────────────────────────
+  it("list: GET /v1/webhooks returns an empty result and no foreign row", async () => {
+    const empty = await seedTwoTenants(db); // a third tenant that owns no endpoint
+    const verdict = await listAttack(url, empty.attacker.credential, { method: "GET", path: "/v1/webhooks" }, [
+      tenants.victim.endpointId,
+    ]);
+    expect(verdict.status).toBe(200);
+    expect(verdict.leaked).toEqual([]);
+    // Its own endpoint is there; the other tenant's is not. A list that returned
+    // nothing at all would pass a leak check while being broken.
+    expect(verdict.count).toBe(1);
+  });
+
+  // ── T030: the seven public writes ───────────────────────────────────────────
+  describe("write: a foreign identifier changes nothing", () => {
+    const victimEndpoints = () => tenants.victim.repo.listEndpoints();
+    const victimMessages = () =>
+      tenants.victim.repo.listMessages(tenants.victim.channelId, { limit: 50 });
+
+    it("POST /v1/channels/:channelId/messages", async () => {
+      const verdict = await writeAttack(
+        url,
+        tenants.attacker.credential,
+        {
+          method: "POST",
+          path: `/v1/channels/${tenants.victim.channelId}/messages`,
+          body: { text: "written by the wrong tenant" },
+        },
+        { method: "POST", path: `/v1/channels/${nowhereId()}/messages`, body: { text: "nowhere" } },
+        victimMessages,
+      );
+      expect(verdict.differences).toEqual([]);
+      expect(verdict.stateChanged).toBe(false);
+    });
+
+    it("POST /v1/webhooks", async () => {
+      // The create route takes no identifier, so the attack is that a create by A
+      // cannot appear in B's list. Included because an earlier draft of the shape
+      // table omitted this route entirely and summed to 21 against a derived 22.
+      const verdict = await writeAttack(
+        url,
+        tenants.attacker.credential,
+        { method: "POST", path: "/v1/webhooks", body: { url: "https://a.example/x", event_types: ["message.created"] } },
+        { method: "POST", path: "/v1/webhooks", body: { url: "https://a.example/y", event_types: ["message.created"] } },
+        victimEndpoints,
+      );
+      expect(verdict.stateChanged).toBe(false);
+    });
+
+    it.each([
+      ["POST", "rotate-secret"],
+      ["POST", "enable"],
+      ["POST", "disable"],
+      ["POST", "test"],
+    ])("%s /v1/webhooks/:id/%s", async (method, action) => {
+      const verdict = await writeAttack(
+        url,
+        tenants.attacker.credential,
+        { method, path: `/v1/webhooks/${tenants.victim.endpointId}/${action}` },
+        { method, path: `/v1/webhooks/${nowhereId()}/${action}` },
+        victimEndpoints,
+      );
+      expect(verdict.differences).toEqual([]);
+      expect(verdict.stateChanged).toBe(false);
+    });
+
+    it("DELETE /v1/webhooks/:id", async () => {
+      const verdict = await writeAttack(
+        url,
+        tenants.attacker.credential,
+        { method: "DELETE", path: `/v1/webhooks/${tenants.victim.endpointId}` },
+        { method: "DELETE", path: `/v1/webhooks/${nowhereId()}` },
+        victimEndpoints,
+      );
+      expect(verdict.differences).toEqual([]);
+      expect(verdict.stateChanged).toBe(false);
+    });
+  });
+
+  // ── T026 / T028: the credential shape ───────────────────────────────────────
+  it("credential: a key for one environment cannot mint a token that works in another", async () => {
+    const verdict = await credentialAttack(url, tenants.attacker.credential, "borrowed", {
+      method: "GET",
+      path: `/v1/channels/${tenants.victim.channelId}/messages`,
+    });
+    expect(verdict.minted).toBe(true);
+    // The token is valid — it just belongs to another tenant, so the victim's
+    // channel must be as invisible to it as it is to the key that minted it.
+    expect(JSON.stringify(verdict.crossBody)).not.toContain(tenants.victim.messageId);
+  });
+
+  // ── T031a: the three internal routes that take an end-user token ────────────
+  // ── Chapter 3.12's own two routes, attacked on the build that added them ────
+  //
+  // FR-021: a chapter that adds an endpoint attacks it in the same chapter. The
+  // derivation found these before this file mentioned them — `targets.itest.ts`
+  // went from 22 to 24 and failed naming both as unclassified.
+  describe("write: the channel surface this chapter added", () => {
+    it("POST /v1/channels/:channelId/members", async () => {
+      const verdict = await writeAttack(
+        url,
+        tenants.attacker.credential,
+        {
+          method: "POST",
+          path: `/v1/channels/${tenants.victim.channelId}/members`,
+          body: { user_ids: ["intruder"] },
+        },
+        {
+          method: "POST",
+          path: `/v1/channels/${nowhereId()}/members`,
+          body: { user_ids: ["intruder"] },
+        },
+        () => tenants.victim.repo.listMembers(tenants.victim.channelId),
+      );
+      expect(verdict.differences).toEqual([]);
+      expect(verdict.stateChanged).toBe(false);
+    });
+
+    // POST /v1/channels CARRIES NO IDENTIFIER TO FORGE, so the pair here is not
+    // foreign-versus-absent. What a caller can present is the other tenant's own
+    // `external_id`, and the property is non-interference rather than
+    // indistinguishability: the call must SUCCEED — two tenants may use the same
+    // customer-supplied id, which is the whole point of scoping it per
+    // environment — and it must neither return the victim's channel nor touch it.
+    //
+    // Getting this wrong would not look like a leak. It would look like a
+    // convenience: "the channel already exists, here it is."
+    it("POST /v1/channels with the other tenant's external id makes a NEW channel", async () => {
+      const before = await tenants.victim.repo.getChannelByExternalId(
+        tenants.victim.channelExternalId,
+      );
+      expect(before).not.toBeNull();
+
+      const res = await fetch(`${url}/v1/channels`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${tenants.attacker.credential}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          external_id: tenants.victim.channelExternalId,
+          type: "public",
+        }),
+      });
+      expect(res.status).toBe(201);
+      const created = (await res.json()) as { id: string; external_id: string };
+      expect(created.external_id).toBe(tenants.victim.channelExternalId);
+      expect(created.id).not.toBe(tenants.victim.channelId);
+
+      // The victim's row is untouched — same id, same name.
+      const after = await tenants.victim.repo.getChannelByExternalId(
+        tenants.victim.channelExternalId,
+      );
+      expect(after).toEqual(before);
+    });
+  });
+
+  describe("internal, end-user token: a token minted in one environment is refused in another", () => {
+    let attackerToken: string;
+
+    beforeAll(async () => {
+      const secret = (await environmentSigningSecret(db, tenants.attacker.environmentId))!
+        .signingSecret;
+      attackerToken = (
+        await mintUserToken(secret, {
+          user: tenants.attacker.userExternalId,
+          environmentId: tenants.attacker.environmentId,
+          ttlSeconds: 3600,
+        })
+      ).token;
+    });
+
+    it("POST /internal/messages", async () => {
+      // The pair, not just a 4xx. "Refused" and "refused for the same reason a
+      // channel that does not exist is refused" are different claims, and only
+      // the second one is isolation: an answer that says "not yours" where the
+      // absent id says "no such channel" has disclosed that the channel exists.
+      const verdict = await writeAttack(
+        url,
+        attackerToken,
+        {
+          method: "POST",
+          path: "/internal/messages",
+          body: { channel_id: tenants.victim.channelId, text: "not mine" },
+        },
+        {
+          method: "POST",
+          path: "/internal/messages",
+          body: { channel_id: nowhereId(), text: "not mine" },
+        },
+        () => tenants.victim.repo.listMessages(tenants.victim.channelId, { limit: 50 }),
+      );
+      expect(verdict.differences).toEqual([]);
+      expect(verdict.stateChanged).toBe(false);
+      expect(JSON.stringify(verdict.after)).not.toContain("not mine");
+    });
+
+    it("POST /internal/backfill", async () => {
+      const verdict = await writeAttack(
+        url,
+        attackerToken,
+        {
+          method: "POST",
+          path: "/internal/backfill",
+          body: { cursor: { [tenants.victim.channelId]: 1 }, limit: 10 },
+        },
+        { method: "POST", path: "/internal/backfill", body: { cursor: { [nowhereId()]: 1 }, limit: 10 } },
+        () => tenants.victim.repo.listMessages(tenants.victim.channelId, { limit: 50 }),
+      );
+      expect(verdict.differences).toEqual([]);
+      expect(verdict.stateChanged).toBe(false);
+      expect(JSON.stringify(verdict.foreign.body)).not.toContain(tenants.victim.messageId);
+    });
+
+    it("POST /internal/session", async () => {
+      const res = await fetch(`${url}/internal/session`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${attackerToken}` },
+      });
+      expect(res.status).toBe(200);
+      const body = await res.text();
+      // The session names the channels this user may hear. The other tenant's is
+      // not one of them, and `channelsForUser` is scoped by the token's own
+      // environment — this is the assertion that the scoping is real.
+      expect(body).not.toContain(tenants.victim.channelId);
+    });
+  });
+  // ── T031: the five platform routes, and what isolation means for them ──────
+  //
+  // T031b, the comment the plan asked for: a platform credential is not
+  // tenant-scoped and is not meant to be. The dispatcher serves every tenant, so
+  // its credential reaches every tenant's deliveries. FR-044 narrowed WHICH
+  // ROUTES each service may call and changed nothing about that reach.
+  //
+  // So the attack shape differs here, and the difference is worth stating
+  // exactly. Only TWO of the five platform routes name an environment alongside
+  // an identifier — `dispatch/expand` (`environment_id` beside `event_id`) and
+  // `usage/connections` (an environment per connection). Those two can be told
+  // to act on environment A while carrying something from B, and both are
+  // attacked: expand below, connections by `usage.itest.ts`'s
+  // `connection_environment_conflict` assertion (T032).
+  //
+  // The other three — `material`, `outcome`, `replay` — take one opaque
+  // identifier and DERIVE the environment from the row they find. There is no
+  // cross-environment request to make, because the caller never says which
+  // environment it means. That is not a hole this suite declines to test; it is
+  // the absence of the parameter that would make the attack expressible. What
+  // guards them is FR-044 and nothing else — which is why `material`, the one
+  // response in the platform that returns a decrypted customer secret, is the
+  // route to watch first if a platform credential ever leaks.
+  describe("the platform routes (T031, T031b)", () => {
+    const dispatcher = process.env["RELAY_INTERNAL_CREDENTIAL"] ?? "";
+
+    // Through the victim's OWN repository, which is both scoped and the only
+    // place the query engine is allowed to live (FR-043).
+    const victimDeliveries = () =>
+      tenants.victim.repo.countDeliveriesForEndpoint(tenants.victim.endpointId);
+
+    it("expand reaches only the endpoints of the environment it names", async () => {
+      const before = await victimDeliveries();
+      const res = await fetch(`${url}/internal/dispatch/expand`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${dispatcher}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          event_id: crypto.randomUUID(),
+          environment_id: tenants.attacker.environmentId,
+          type: "message.created",
+          payload: { text: "expand names one environment" },
+        }),
+      });
+      expect(res.status).toBe(200);
+      // The attacker's own endpoint subscribes to this type, so the call did
+      // something — without this the assertion below passes on a no-op.
+      expect((await res.json()).created).toBeGreaterThan(0);
+      expect(await victimDeliveries()).toBe(before);
+    });
+
+    it("expand naming an environment that exists nowhere creates nothing", async () => {
+      const before = await victimDeliveries();
+      const res = await fetch(`${url}/internal/dispatch/expand`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${dispatcher}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          event_id: crypto.randomUUID(),
+          environment_id: nowhereId(),
+          type: "message.created",
+          payload: { text: "no such environment" },
+        }),
+      });
+      expect(res.status).toBe(200);
+      expect((await res.json()).created).toBe(0);
+      expect(await victimDeliveries()).toBe(before);
+    });
   });
 });
 ```
@@ -290,36 +1407,255 @@ Chapter 3.2 gave routes a way to say which credential **class** they accept. It 
 not give them a way to say which **service**, and that gap has a consequence this
 chapter found inside its own test suite:
 
-```ts title="services/api/src/auth/credential.guard.ts"
-export type AcceptSpec =
-  | "application"
-  | "user"
-  | { readonly platform: readonly PlatformService[] };
+```diff title="services/api/src/auth/credential.guard.ts"
+@@ -1,34 +1,66 @@
+ import {
+-  ForbiddenException,
+-  HttpException,
+   Injectable,
+   SetMetadata,
+   UnauthorizedException,
+   type CanActivate,
+   type ExecutionContext,
+ } from "@nestjs/common";
++
++import { protocolError } from "../protocol-error";
+ import { Reflector } from "@nestjs/core";
+ 
++import type { PlatformService } from "./authenticate.middleware";
+ import {
+   describePrincipalKind,
+   OVER_AUTH_THRESHOLD,
+-  type PrincipalKind,
+   type RequestWithPrincipal,
+ } from "./principal";
+ 
+ const ACCEPTS = "relay:accepts";
+ 
+-/** What a route accepts, declared on the route (research R6). The default is
+- * "either class", so a handler only says something when it is narrower than
+- * that — and the narrow cases are the interesting ones: FR-AUT-09's dev-token
+- * endpoint and FR-AUT-10's administrative operations want an API key
+- * specifically, not merely a valid credential. */
+-export const Accepts = (...kinds: PrincipalKind[]) => SetMetadata(ACCEPTS, kinds);
++/** What a route accepts (research R6, narrowed by chapter 3.12's FR-044).
++ *
++ * A tenant class is named by its own name. A PLATFORM credential must additionally
++ * name the services allowed, because there are two of them and they are not equally
++ * exposed — the gateway terminates connections from the public internet and the
++ * dispatcher does not. Chapter 3.11 gave each its own secret and stopped there, so
++ * both still resolved to one class and the gateway's credential reached every
++ * dispatch route, including `replay`, whose handler takes a dead-letter id and no
++ * environment.
++ *
++ * `@Accepts("platform")` DOES NOT COMPILE, and that is the point. An authorization
++ * that can be omitted is one that will be, and the omission is invisible: the route
++ * works, the tests pass, and the blast radius is one leaked secret wide. */
++export type AcceptSpec =
++  | "application"
++  | "user"
++  | { readonly platform: readonly PlatformService[] };
++
++export const Accepts = (...specs: AcceptSpec[]) => SetMetadata(ACCEPTS, specs);
++
++const EITHER: AcceptSpec[] = ["application", "user"];
+ 
+-const EITHER: PrincipalKind[] = ["application", "user"];
++function isPlatformSpec(
++  spec: AcceptSpec,
++): spec is { readonly platform: readonly PlatformService[] } {
++  return typeof spec === "object";
++}
+ 
+-function expectation(kinds: PrincipalKind[]): string {
+-  return kinds.map(describePrincipalKind).join(" or ");
++/** What the 401 and the 403 say a route wanted.
++ *
++ * `AcceptSpec` broke this and nothing in an earlier draft of chapter 3.12 fixed it:
++ * two client-visible strings are built from it, and widening the decorator's type
++ * without widening theirs leaves the part an integrator actually reads behind. The
++ * platform case names its services, because "an internal platform credential" is
++ * true of the one that was just refused. */
++function expectation(specs: readonly AcceptSpec[]): string {
++  return specs
++    .map((spec) =>
++      isPlatformSpec(spec)
++        ? `${describePrincipalKind("platform")} for ${spec.platform.join(" or ")}`
++        : describePrincipalKind(spec),
++    )
++    .join(" or ");
+ }
+ 
+ /** The guard that used to be `EnvironmentContextGuard` (2.2), doing a smaller
+@@ -52,7 +84,7 @@ export class CredentialGuard implements CanActivate {
+ 
+   canActivate(context: ExecutionContext): boolean {
+     const accepted =
+-      this.reflector.getAllAndOverride<PrincipalKind[]>(ACCEPTS, [
++      this.reflector.getAllAndOverride<AcceptSpec[]>(ACCEPTS, [
+         context.getHandler(),
+         context.getClass(),
+       ]) ?? EITHER;
+@@ -74,12 +106,9 @@ export class CredentialGuard implements CanActivate {
+     // BEFORE the principal check, so an address over its allowance is refused
+     // whether or not the credential it just presented would have worked.
+     if (req[OVER_AUTH_THRESHOLD] === true) {
+-      throw new HttpException(
+-        {
+-          code: "rate_limited",
+-          message:
+-            "too many failed authentication attempts from this address; retry shortly",
+-        },
++      throw protocolError(
++        "rate_limited",
++        "too many failed authentication attempts from this address; retry shortly",
+         429,
+       );
+     }
+@@ -90,13 +119,42 @@ export class CredentialGuard implements CanActivate {
+       );
+     }
+ 
+-    if (!accepted.includes(principal.kind)) {
+-      throw new ForbiddenException({
+-        code: "wrong_credential_type",
+-        message: `this route expects ${expectation(accepted)}; ${describePrincipalKind(
++    const matchingKind = accepted.filter((spec) =>
++      isPlatformSpec(spec) ? principal.kind === "platform" : spec === principal.kind,
++    );
++
++    if (matchingKind.length === 0) {
++      throw protocolError(
++        "wrong_credential_type",
++        `this route expects ${expectation(accepted)}; ${describePrincipalKind(
+           principal.kind,
+         )} was presented`,
+-      });
++        403,
++      );
++    }
++
++    // FR-044. The class is right; the question left is whether THIS SERVICE may
++    // call this route. Two platform credentials exist and `service` says which one
++    // answered — a fact chapter 3.11 recorded as being "for logs", which is where
++    // the gap was: a field nothing enforces is a field nothing protects.
++    //
++    // `principal.service` is a `string` and the permitted list is a union of the
++    // services that exist. The widening cast is here rather than on the principal
++    // because `principal.ts` must not import from the middleware that builds it —
++    // the dependency runs the other way — so the narrowing happens at the one place
++    // that compares them.
++    if (principal.kind === "platform") {
++      const permitted = matchingKind
++        .filter(isPlatformSpec)
++        .flatMap((spec) => spec.platform as readonly string[]);
++      if (!permitted.includes(principal.service)) {
++        throw protocolError(
++          "wrong_credential_service",
++          `"${principal.service}" is not permitted on this route ` +
++            `(${permitted.join(" or ")})`,
++          403,
++        );
++      }
+     }
+ 
+     return true;
 ```
 
 The service names are derived from the list of credentials rather than retyped
 beside it, so adding a third internal service cannot leave the two out of step:
 
-```ts title="services/api/src/auth/authenticate.middleware.ts"
-const PLATFORM_SERVICES = [
-  [PLATFORM_CREDENTIAL_ENV, "dispatcher"],
-  [GATEWAY_CREDENTIAL_ENV, "gateway"],
-] as const satisfies ReadonlyArray<readonly [string, string]>;
-
-export type PlatformService = (typeof PLATFORM_SERVICES)[number][1];
+```diff title="services/api/src/auth/authenticate.middleware.ts"
+@@ -60,10 +60,21 @@ const PLATFORM_PREFIX = "rk_svc_";
+ 
+ /** Which variable belongs to which service. The dispatcher's keeps its original
+  * name: renaming it would be a deployment change this chapter has not earned. */
+-const PLATFORM_SERVICES: ReadonlyArray<readonly [string, string]> = [
++const PLATFORM_SERVICES = [
+   [PLATFORM_CREDENTIAL_ENV, "dispatcher"],
+   [GATEWAY_CREDENTIAL_ENV, "gateway"],
+-];
++] as const satisfies ReadonlyArray<readonly [string, string]>;
++
++/** The internal services that exist, DERIVED FROM THE LIST ABOVE rather than
++ * retyped beside it (chapter 3.12, FR-044).
++ *
++ * `as const` is doing the work: without it `(typeof PLATFORM_SERVICES)[number][1]`
++ * widens to `string` and a route could declare a service nobody deploys. With it,
++ * adding a third internal service widens this union on its own and every route
++ * that must now decide about it stops compiling — which is chapter 3.11's lesson
++ * from `Dimension`, where adding a config key widened a type and the two-way
++ * ternary underneath it was the thing the compiler could not see. */
++export type PlatformService = (typeof PLATFORM_SERVICES)[number][1];
+ 
+ /** Constant-time-ish: compare lengths first, then every byte. A platform
+  * credential is a shared secret, and an early-exit compare on a shared secret is
 ```
 
 `as const` is what makes that work: without it the indexed access widens to
 `string` and the decorator would accept any word at all.
 
 ```diff title="services/api/src/internal/dispatch.controller.ts"
+@@ -48,7 +48,10 @@ import type { Publisher } from "../outbox/publisher";
+ // ignoring a tenant scope is the shape a cross-tenant hole takes.
+ @Controller("internal/dispatch")
+ @UseGuards(CredentialGuard)
 -@Accepts("platform")
++// FR-044 (chapter 3.12): the CLASS was never enough. Two platform credentials
++// exist, `service` said which one answered, and nothing checked it — so the more
++// exposed service set the blast radius for both. Here: delivery is the dispatcher's; the gateway has no business replaying a dead letter.
 +@Accepts({ platform: ["dispatcher"] })
+ export class DispatchController {
+   constructor(
+     @Inject("DB") private readonly db: Db,
 ```
 
 ```diff title="services/api/src/internal/usage.controller.ts"
+@@ -1,6 +1,5 @@
+ import {
+   Body,
+-  ConflictException,
+   Controller,
+   HttpCode,
+   Inject,
+@@ -8,6 +7,8 @@ import {
+   UseGuards,
+ } from "@nestjs/common";
+ 
++import { protocolError } from "../protocol-error";
++
+ import {
+   internalUsageReportRequestSchema,
+   type InternalUsageReportRequest,
+@@ -40,7 +41,10 @@ import { ZodValidationPipe } from "../messages/zod-validation.pipe";
+ // cross-tenant hole takes.
+ @Controller("internal/usage")
+ @UseGuards(CredentialGuard)
 -@Accepts("platform")
++// FR-044 (chapter 3.12): the CLASS was never enough. Two platform credentials
++// exist, `service` said which one answered, and nothing checked it — so the more
++// exposed service set the blast radius for both. Here: metering is the gateway's, and the gateway's only.
 +@Accepts({ platform: ["gateway"] })
+ export class UsageController {
+   constructor(@Inject("DB") private readonly db: Db) {}
+ 
+@@ -80,11 +84,11 @@ export class UsageController {
+       // a code for four statuses and calls everything else `internal_error`, and
+       // 409 is not one of the four.
+       if (error instanceof ConnectionEnvironmentConflictError) {
+-        throw new ConflictException({
+-          code: "connection_environment_conflict",
+-          message:
+-            "this connection was first reported for a different environment",
+-        });
++        throw protocolError(
++          "connection_environment_conflict",
++          "this connection was first reported for a different environment",
++          409,
++        );
+       }
+       throw error;
+     }
 ```
 
 <Trap title="The gap was in the test suite, passing, for a whole chapter">
@@ -338,14 +1674,25 @@ tells a developer where to look.
 
 </Trap>
 
-```diff title="services/api/src/internal/usage.itest.ts"
+```diff title="services/api/src/internal/usage.itest.ts (excerpt)"
 +describe("a platform credential is refused on another service's route (FR-044)", () => {
 +  it("refuses the dispatcher's credential on a usage route", async () => {
 +    const res = await report(DISPATCHER_CREDENTIAL, [connection()]);
 +    expect(res.status).toBe(403);
 +    expect((await res.json()).code).toBe("wrong_credential_service");
 +  });
++
++  it("accepts the gateway's credential on the same route", async () => {
++    const res = await report(PLATFORM, [connection()]);
++    expect(res.status).toBe(200);
++  });
 ```
+
+An excerpt, and marked as one: this file is 371 lines and has never been in the
+fence chain — no chapter has fenced it, so a diff here would have nothing to amend.
+The chapter discusses what the change REVEALED rather than asking a reader to build
+the file, so the illustration is the honest shape.
+
 
 And the platform routes are attacked differently, because only some of them **can**
 be. A cross-environment request needs a route that names an environment alongside
@@ -354,24 +1701,22 @@ an identifier, and only two of the five do: `dispatch/expand`, which takes
 environment per connection. The other three take one opaque identifier and derive
 the environment from the row they find.
 
-```ts title="services/api/src/isolation/gauntlet.itest.ts"
-it("expand reaches only the endpoints of the environment it names", async () => {
-  const before = await victimDeliveries();
-  const res = await fetch(`${url}/internal/dispatch/expand`, {
-    method: "POST",
-    headers: { authorization: `Bearer ${dispatcher}`, "content-type": "application/json" },
-    body: JSON.stringify({
-      event_id: crypto.randomUUID(),
-      environment_id: tenants.attacker.environmentId,
-      type: "message.created",
-      payload: { text: "expand names one environment" },
-    }),
+```ts title="services/api/src/isolation/gauntlet.itest.ts (excerpt)"
+describe("the control: the attacking credential is a working credential", () => {
+  it("reaches its own webhook endpoint", async () => {
+    const res = await fetch(`${url}/v1/webhooks/${tenants.attacker.endpointId}`, {
+      headers: { authorization: `Bearer ${tenants.attacker.credential}` },
+    });
+    expect(res.status).toBe(200);
   });
-  expect(res.status).toBe(200);
-  // The attacker's own endpoint subscribes to this type, so the call did
-  // something — without this the assertion below passes on a no-op.
-  expect((await res.json()).created).toBeGreaterThan(0);
-  expect(await victimDeliveries()).toBe(before);
+
+  it("reaches its own channel history, and sees its own message", async () => {
+    const res = await fetch(`${url}/v1/channels/${tenants.attacker.channelId}/messages`, {
+      headers: { authorization: `Bearer ${tenants.attacker.credential}` },
+    });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain(tenants.attacker.messageId);
+  });
 });
 ```
 
@@ -387,7 +1732,182 @@ a leak the first query that joins it will find, and nothing before that moment
 fails.
 
 ```ts title="services/api/src/db/catalogue.ts"
+import { sql } from "drizzle-orm";
+
+import type { Db } from "./client";
+
+// WHERE EVERY TABLE KEEPS ITS TENANT (FR-012, constitution I).
+//
+// The gauntlet attacks endpoints. This asks the other half of the question: a
+// table that carries no path back to an environment is a leak with no endpoint
+// yet — nothing is exposing it today, and the first query that joins it will.
+//
+// Derived from `information_schema` rather than from `schema.ts`, because the
+// database is what the queries run against. A table added by a migration and
+// never modelled in Drizzle is invisible to a check that reads the model, and
+// that is exactly the table this exists to catch.
+//
+// It lives HERE rather than in the test that calls it because this directory is
+// the only place the lint ban permits `drizzle-orm` (constitution I, ADR-16).
+// T069a restores that ban for integration tests, where a second flat-config
+// block had been replacing the rule instead of merging with it (R23) — so a
+// catalogue query written inline in the test would need an exemption for as long
+// as it lived.
+
+/** How a row in this table is traced back to one environment. */
 export type TenantPath = "direct" | "hop" | "spine";
+
+export interface TableClassification {
+  table: string;
+  /** `null` means the table matches none of the three, which fails the check. */
+  path: TenantPath | null;
+  /** For `hop`: the `direct` tables its foreign keys reach. */
+  via: string[];
+  /** For `spine`: why it has no tenant column. */
+  reason?: string;
+}
+
+// THE SPINE, as a list with a reason each and not a pattern.
+//
+// Feature 030 made this argument first and it holds here: a pattern silently
+// absorbs the next table that happens to match it, which is the opposite of what
+// this check is for. Adding a table to this list should be an edit somebody has
+// to justify.
+//
+// The first six are tenancy itself — the tables an environment_id would point
+// INTO. The last two are infrastructure, and they are the two worth arguing
+// about:
+//
+// `consumed_events` and `outbox` are not records, they are bookkeeping. Neither
+// is on a read path to any API caller. The outbox's only reader is the relay,
+// whose entire job is to publish every environment's events without regard to
+// which environment they came from — see the retention note below for what that
+// costs and what it does not cost.
+const SPINE: ReadonlyArray<readonly [string, string]> = [
+  ["organisations", "the root of the tenancy tree; nothing is above it to scope to"],
+  ["applications", "belongs to an organisation, which is the scope"],
+  ["environments", "IS the scope — an environment_id here would point at itself"],
+  ["humans", "a person, not a tenant's record; one human may belong to several organisations"],
+  ["memberships", "joins humans to organisations, above the environment level"],
+  ["consumed_events", "consumer bookkeeping, on no read path to any caller"],
+  ["schema_migrations", "the migration ledger; it predates tenancy and belongs to the database"],
+  // THE OUTBOX KEEPS MESSAGE TEXT FOR EVER, and that is a RETENTION finding
+  // rather than a tenancy one. An earlier draft of this feature had it in a
+  // fourth class called `unscoped`, on the reading that it violated Principle
+  // I's second clause. Three of the four arguments for that collapsed on
+  // checking, so the class had one member and then none (R7).
+  //
+  // What is true, measured rather than reasoned about (R7a):
+  //   - `drainOutbox` sets `published_at = now()` and never deletes.
+  //   - Nothing in the api deletes a row from any table. The only `.delete(` in
+  //     non-test source is an in-memory Map eviction in `limits/fallback.ts:85`.
+  //   - The payload is a full copy of the message, `data.text` included.
+  //   - 286,871 rows in the test lane.
+  //
+  // Four requirements collide with that. DR-06 and FR-MSG-08: a deleted message
+  // keeps its row with `text` cleared, and hard deletion runs only through the
+  // compliance endpoint — but the text survives in the payload, and a tombstone
+  // that leaves a copy behind is not a tombstone. FR-TEN-08: 30-day erasure of
+  // an application's operational data, unreachable for these rows by any
+  // mechanism that exists today. FR-MOD-06: per-environment retention with a
+  // scheduled hard-delete job, which is the requirement that owns the fix.
+  //
+  // The fix is one statement and needs no tenant identifier:
+  //
+  //     DELETE FROM outbox WHERE published_at < now() - interval 'N days'
+  //
+  // For the rare per-tenant compliance sweep, `subject`'s last segment already
+  // carries the environment id and the payload carries the key.
+  //
+  // Adding `environment_id` would have been the wrong fix, and the reasoning is
+  // the useful part. The outbox's legitimate mutation IS cross-environment, so a
+  // tenant column would make feature 030's guard refuse the relay's own sweep —
+  // `exempt.ts`'s line "`outbox` is not among them and needs no entry" was
+  // right. And a foreign key to `environments` would block deleting an
+  // environment while outbox rows existed, which makes FR-TEN-08 harder rather
+  // than easier.
+  //
+  // Owned by whichever chapter builds FR-MOD-06 — Phase 3 and Part 4, not this
+  // one. Named here with its numbers so it is not rediscovered a third time.
+  ["outbox", "platform bookkeeping; its only reader is the relay, which is global by design"],
+];
+
+/** The spine, for anyone who needs to state it rather than derive it. */
+export const SPINE_TABLES: readonly string[] = SPINE.map(([t]) => t);
+
+export interface CatalogueRow extends Record<string, unknown> {
+  table_name: string;
+  has_environment_id: boolean;
+  fk_targets: string[] | null;
+}
+
+/**
+ * Every base table in `public`, each classified into exactly one of the three
+ * paths — or into none, which is the answer that fails a build.
+ */
+export async function classifyTables(db: Db): Promise<TableClassification[]> {
+  const rows = (
+    await db.execute<CatalogueRow>(sql`
+      WITH base AS (
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+      ),
+      direct AS (
+        SELECT table_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public' AND column_name = 'environment_id'
+      )
+      SELECT
+        b.table_name,
+        (b.table_name IN (SELECT table_name FROM direct)) AS has_environment_id,
+        (
+          -- ::text is load-bearing. information_schema columns are
+          -- sql_identifier, and node-pg has no parser for an array of them --
+          -- the row arrives as the literal string {channels,users} and
+          -- iterating it yields a brace, which is how this was found.
+          -- (No backticks in here: this is inside a template literal.)
+          SELECT array_agg(DISTINCT ccu.table_name::text)
+          FROM information_schema.table_constraints tc
+          JOIN information_schema.constraint_column_usage ccu
+            ON ccu.constraint_name = tc.constraint_name
+           AND ccu.table_schema = tc.table_schema
+          WHERE tc.constraint_type = 'FOREIGN KEY'
+            AND tc.table_schema = 'public'
+            AND tc.table_name = b.table_name
+            AND ccu.table_name IN (SELECT table_name FROM direct)
+        ) AS fk_targets
+      FROM base b
+      ORDER BY b.table_name
+    `)
+  ).rows;
+
+  return rows.map(classifyRow);
+}
+
+/** THE CLASSIFICATION, SEPARATED FROM THE QUERY, and separated for a reason the
+ * coverage run made plain: the interesting arm is the one that returns `null`, and
+ * it cannot execute against a real database that has no unclassified table — which
+ * is exactly the state the check exists to keep. So the branch that fires only when
+ * somebody adds a table was the one branch nothing measured.
+ *
+ * Pure, so `catalogue.test.ts` drives all four arms with rows it makes up. Same
+ * argument as `webhooks/disable.ts` and `webhooks/analytics.ts`, which are pure and
+ * pinned at 100 for it: a file with nothing to mock has no reason to be partially
+ * tested. */
+export function classifyRow(row: CatalogueRow): TableClassification {
+  const via = row.fk_targets ?? [];
+  // ORDER MATTERS, and only in one place: a spine table with no environment_id
+  // and no foreign key would classify the same either way, but checking
+  // `direct` first means a future spine table that gains the column reports as
+  // `direct` and the list entry becomes visibly wrong rather than silently
+  // ignored.
+  if (row.has_environment_id) return { table: row.table_name, path: "direct", via };
+  if (via.length > 0) return { table: row.table_name, path: "hop", via };
+  const reason = new Map(SPINE).get(row.table_name);
+  if (reason !== undefined) return { table: row.table_name, path: "spine", via, reason };
+  return { table: row.table_name, path: null, via };
+}
 ```
 
 Derived from `information_schema` rather than from `schema.ts`, because the
@@ -421,14 +1941,110 @@ numbers live in `baseline.txt`.
 </Why>
 
 ```ts title="services/api/src/isolation/tenant-scope.itest.ts"
-it("classifies every base table as direct, hop or spine", () => {
-  const unclassified = tables.filter((t) => t.path === null).map((t) => t.table);
-  expect(
-    unclassified,
-    `these tables have no path to an environment: ${unclassified.join(", ")}. ` +
-      `Add environment_id, add a foreign key to a table that has one, or add it ` +
-      `to SPINE in db/catalogue.ts with a reason.`,
-  ).toEqual([]);
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+
+import { createDb, createPool } from "../db/client";
+import { classifyTables, SPINE_TABLES, type TableClassification } from "../db/catalogue";
+
+import type { Db } from "../db/client";
+
+// THE STRUCTURAL HALF (FR-012, SC-007, constitution I).
+//
+// `gauntlet.itest.ts` attacks the endpoints that exist. This asks about the leak
+// that has no endpoint yet: a table with no path back to an environment is
+// exposed by the first query that joins it, and nothing before that moment fails.
+//
+// The classification is derived in `db/catalogue.ts` — see its comments for the
+// spine's reasons, and for the outbox retention finding that came out of writing
+// them.
+//
+// WHAT THIS DOES NOT CHECK, and the distinction is easy to lose: that every table
+// HAS a tenant path, not that every QUERY respects the one it has. The gauntlet
+// makes the second claim, endpoint by endpoint. Neither implies the other.
+
+describe("every table has a path to one tenant", () => {
+  // `ReturnType` rather than `import type pg from "pg"`: the driver's own types
+  // are behind the same ban as the driver (FR-043), and a type-only import is
+  // still an import to `no-restricted-imports`.
+  let pool: ReturnType<typeof createPool>;
+  let db: Db;
+  let tables: TableClassification[];
+
+  beforeAll(async () => {
+    pool = createPool();
+    db = createDb(pool);
+    tables = await classifyTables(db);
+  }, 30_000);
+
+  afterAll(async () => {
+    await pool?.end();
+  });
+
+  it("classifies every base table as direct, hop or spine", () => {
+    const unclassified = tables.filter((t) => t.path === null).map((t) => t.table);
+    // The message names the tables, because the useful half of this failure is
+    // WHICH table appeared — a new migration's, almost always.
+    expect(
+      unclassified,
+      `these tables have no path to an environment: ${unclassified.join(", ")}. ` +
+        `Add environment_id, add a foreign key to a table that has one, or add it ` +
+        `to SPINE in db/catalogue.ts with a reason.`,
+    ).toEqual([]);
+  });
+
+  it("classifies each table exactly once", () => {
+    const seen = new Set<string>();
+    for (const t of tables) {
+      expect(seen.has(t.table), `${t.table} classified twice`).toBe(false);
+      seen.add(t.table);
+    }
+    expect(seen.size).toBe(tables.length);
+  });
+
+  // COUNTS ARE RECORDED, NOT ASSERTED (T038). `__sentinel_environments` is
+  // created by the test harness, so it exists on a database the lane has run
+  // against and not on a fresh one — "12 direct" is 11 or 12 depending on how
+  // this database was built, and an assertion on the number would fail for a
+  // reason that has nothing to do with tenancy. The numbers live in
+  // `baseline.txt`; the property lives above.
+  it("reports the counts", () => {
+    const by = (p: string) => tables.filter((t) => t.path === p);
+    const line =
+      `tenant paths: ${tables.length} base tables — ` +
+      `${by("direct").length} direct, ${by("hop").length} hop, ${by("spine").length} spine`;
+    console.log(line);
+    for (const t of by("hop")) console.log(`  hop: ${t.table} → ${t.via.join(", ")}`);
+    expect(tables.length).toBeGreaterThan(0);
+  });
+
+  it("keeps the spine list honest: every entry is a real table with no environment_id", () => {
+    const byName = new Map(tables.map((t) => [t.table, t]));
+    for (const name of SPINE_TABLES) {
+      const found = byName.get(name);
+      expect(found, `SPINE names ${name}, which is not a base table in public`).toBeDefined();
+      // A spine table that gains `environment_id` classifies as `direct`, and its
+      // list entry is then a stale claim rather than a harmless one. This is the
+      // assertion that makes the entry rot loudly.
+      expect(found?.path, `SPINE names ${name}, but it now has a tenant path of its own`).toBe(
+        "spine",
+      );
+    }
+  });
+
+  it("derives hops from foreign keys rather than from names", () => {
+    // `members` and `messages` each reach TWO direct tables — `channels` and
+    // `users`. The rule is existence, not uniqueness; an earlier draft of
+    // data-model.md said "exactly one foreign key", which would have classified
+    // neither and failed totality on both.
+    const hops = tables.filter((t) => t.path === "hop");
+    for (const hop of hops) {
+      expect(hop.via.length, `${hop.table} is a hop with no target`).toBeGreaterThan(0);
+      for (const target of hop.via) {
+        const t = tables.find((x) => x.table === target);
+        expect(t?.path, `${hop.table} hops through ${target}, which is not direct`).toBe("direct");
+      }
+    }
+  });
 });
 ```
 
@@ -476,7 +2092,7 @@ right for the reason it gave. So the class had one member and then none.
 
 What survived is a different problem, and four requirements care about it:
 
-```ts title="services/api/src/db/catalogue.ts"
+```ts title="services/api/src/db/catalogue.ts (excerpt)"
   // THE OUTBOX KEEPS MESSAGE TEXT FOR EVER, and that is a RETENTION finding
   // rather than a tenancy one. An earlier draft of this feature had it in a
   // fourth class called `unscoped`, on the reading that it violated Principle
@@ -531,23 +2147,429 @@ the gateway in process and the api as a child, the arrangement chapter 3.2
 established.
 
 ```ts title="services/gateway/src/isolation.itest.ts"
-it("a send into the other tenant's channel is refused, and that channel gains nothing", async () => {
-  const before = await tenants.victim.history();
-  const client = connect(tenants.attacker.token);
-  await client.waitFor("connection.ack");
-  const text = `not mine ${randomUUID()}`;
-  client.socket.send(
-    JSON.stringify({
-      type: "message.send",
-      payload: { idem_key: randomUUID(), channel: tenants.victim.channelId, text },
-    }),
+import { spawn, type ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import type { Server } from "node:http";
+import type { AddressInfo } from "node:net";
+
+import { createLogger, serve, type Logger } from "@relay/service-kit";
+import { frameSchema, docsUrl } from "@relay/protocol";
+import { WebSocket } from "ws";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+
+import { createApiClient } from "./api-client.js";
+import { attachSessions } from "./session.js";
+import { seedSocketTenants, type SocketTenants } from "./isolation-fixtures.js";
+
+// THE SOCKET HALF OF THE GAUNTLET (FR-007, NFR-SEC-09, constitution I).
+//
+// `services/api/src/isolation/gauntlet.itest.ts` attacks every HTTP route. None
+// of it reaches the socket: a WebSocket is not in `router.stack`, so the derived
+// target list cannot see it and this file is the only place the four socket
+// verbs — session, send, resume, subscribe — get attacked with another tenant's
+// identifiers.
+//
+// The arrangement is chapter 3.2's and 3.11 kept it for the same reason: the
+// gateway runs IN PROCESS and the api as a CHILD. In process, because a test that
+// cannot reach the gateway's own state cannot check what it subscribed to; as a
+// child, because importing the api would make this service depend on the api's
+// framework to test itself, and not knowing how the api is built is the whole of
+// ADR-05.
+
+const silent: Logger = createLogger("gateway", () => {});
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const REPO = join(HERE, "..", "..", "..");
+
+async function waitForHealth(url: string): Promise<void> {
+  const deadline = Date.now() + 30_000;
+  for (;;) {
+    try {
+      if ((await fetch(url)).ok) return;
+    } catch {
+      // not up yet
+    }
+    if (Date.now() > deadline) throw new Error("api never became healthy");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
+/** A RANDOM HIGH PORT, for the reason `session.itest.ts` records at length: a
+ * fixed port races the sibling file that also binds one, and a previous run's
+ * child still holding it makes `waitForHealth` succeed against an api serving a
+ * DIFFERENT environment — every token this run minted then gets refused by a
+ * service that has never heard of it. Three unrelated-looking assertions, one
+ * fixture. Its range is 4400-4600 and `limits.itest.ts` holds 4124, so this
+ * takes 4900-5100 — see the port map at the top of `limits.itest.ts`. The first
+ * draft took 4600-4800, which OVERLAPPED `meter.itest.ts`'s two ranges (4610-4670
+ * and 4710-4770); T077's audit is what found that, and a range chosen by looking
+ * at one neighbour instead of at all of them is how it happened.
+ *
+ * `+ children` rather than a second random draw: this file starts TWO api
+ * children, and two draws from one range can collide with each other — a 1-in-200
+ * failure that would read as a broken gateway rather than a broken fixture, which
+ * is the exact trap the fixed port was. */
+let children = 0;
+async function startApi(): Promise<{ url: string; stop: () => void }> {
+  const port = 4900 + ((Math.floor(Math.random() * 100) * 2 + children++) % 200);
+  const dist = join(REPO, "services", "api", "dist");
+  if (!existsSync(join(dist, "main.js"))) {
+    throw new Error(
+      "the api is not built — run `pnpm build` before this lane " +
+        "(the suite talks to the real service, not a stub)",
+    );
+  }
+  const child: ChildProcess = spawn("node", [join(dist, "main.js")], {
+    env: {
+      ...process.env,
+      PORT: String(port),
+      // Neither relay: this suite asserts on rows and on frames, and a
+      // background loop draining the tables another file is asserting on turns
+      // two unrelated suites into a race (chapters 3.3 and 3.8).
+      RELAY_OUTBOX_RELAY: "off",
+      RELAY_NOTIFICATION_RELAY: "off",
+      // Its own failed-authentication keyspace. Chapter 3.8's auth limiter counts
+      // failures per source address, every suite in this lane is 127.0.0.1, and
+      // vitest runs the files in parallel — so a neighbour's expected 401 becomes
+      // this file's 429.
+      RELAY_AUTH_KEY_PREFIX: `rlauth-iso-${randomUUID().slice(0, 8)}`,
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const url = `http://127.0.0.1:${port}`;
+  await waitForHealth(`${url}/healthz`);
+  return { url, stop: () => child.kill() };
+}
+
+/** A SOCKET WITH A BUFFER, and the buffer is the point.
+ *
+ * The obvious shape — await `open`, then attach a `message` listener, then read —
+ * loses the handshake. `connection.ack` is sent the moment the upgrade completes,
+ * and awaiting `open` yields to the event loop first: the frame arrives with no
+ * listener attached and is gone. Every test in this file that waited for a second
+ * frame timed out at exactly 5000ms until the listener moved to construction time.
+ *
+ * So frames are collected from the instant the socket exists, and `waitFor` reads
+ * the buffer before it waits. */
+interface Reader {
+  socket: WebSocket;
+  waitFor: <T = Record<string, unknown>>(type: string, timeoutMs?: number) => Promise<T>;
+  frames: () => { type: string }[];
+  opened: () => Promise<void>;
+}
+
+function read(socket: WebSocket): Reader {
+  const buffer: { type: string }[] = [];
+  let closed: number | null = null;
+  socket.on("message", (raw) => buffer.push(JSON.parse(raw.toString()) as { type: string }));
+  socket.on("close", (code) => {
+    closed = code;
+  });
+  socket.on("error", () => undefined);
+
+  const opened = () =>
+    new Promise<void>((resolve, reject) => {
+      if (socket.readyState === WebSocket.OPEN) return resolve();
+      socket.on("open", () => resolve());
+      socket.on("close", (code) => reject(new Error(`closed ${code} before opening`)));
+      setTimeout(() => reject(new Error("socket never opened")), 5_000);
+    });
+
+  const waitFor = async <T>(type: string, timeoutMs = 5_000): Promise<T> => {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const found = buffer.find((f) => f.type === type);
+      if (found) return found as T;
+      if (closed !== null) throw new Error(`closed ${closed} before a ${type} arrived`);
+      if (Date.now() > deadline) {
+        throw new Error(
+          `no ${type} within ${timeoutMs}ms — saw ${buffer.map((f) => f.type).join(", ") || "nothing"}`,
+        );
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  };
+
+  return { socket, waitFor, frames: () => [...buffer], opened };
+}
+
+/** Absence needs a deadline rather than a race, so three of the four attacks below
+ * wait a fixed window and then read what the buffer holds. */
+async function quiet(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+describe("the socket gauntlet", () => {
+  let api: { url: string; stop: () => void };
+  let server: Server;
+  let wsUrl: string;
+  let tenants: SocketTenants;
+  const sockets: WebSocket[] = [];
+
+  const connect = (token: string, query = ""): Reader => {
+    const socket = new WebSocket(`${wsUrl}/v1/ws?token=${token}${query}`);
+    sockets.push(socket);
+    return read(socket);
+  };
+
+  beforeAll(async () => {
+    api = await startApi();
+    tenants = await seedSocketTenants(api.url);
+    server = serve({
+      service: "gateway",
+      health: () => ({}),
+      logger: silent,
+      notFoundDocsUrl: docsUrl("not_found"),
+    });
+    attachSessions({ server, api: createApiClient(api.url), logger: silent });
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+    wsUrl = `ws://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  }, 90_000);
+
+  afterEach(() => {
+    for (const socket of sockets.splice(0)) socket.close();
+  });
+
+  afterAll(async () => {
+    await new Promise<void>((resolve) => server?.close(() => resolve()));
+    api?.stop();
+  });
+
+  // ── THE CONTROL, for the reason the HTTP gauntlet needed one ────────────────
+  //
+  // Three of the four attacks below assert that NOTHING happened. A socket that
+  // is broken, a token that is expired, a gateway that delivers to nobody — all
+  // of those also make nothing happen, and would pass this file while attacking
+  // nothing. So the attacker's socket is shown to work first.
+  describe("the control: the attacker's own socket works", () => {
+    it("connects and is acknowledged", async () => {
+      const ack = await connect(tenants.attacker.token).waitFor<{ payload: { user: string } }>(
+        "connection.ack",
+      );
+      expect(ack.payload.user).toBe(tenants.attacker.userExternalId);
+    });
+
+    it("sends into its own channel and is acked", async () => {
+      const client = connect(tenants.attacker.token);
+      await client.waitFor("connection.ack");
+      client.socket.send(
+        JSON.stringify({
+          type: "message.send",
+          payload: {
+            idem_key: randomUUID(),
+            channel: tenants.attacker.channelId,
+            text: "the control writes",
+          },
+        }),
+      );
+      const ack = await client.waitFor<{ payload: { seq: number } }>("message.ack");
+      expect(ack.payload.seq).toBeGreaterThan(0);
+    });
+  });
+
+  // ── T045: the session ──────────────────────────────────────────────────────
+  it("the session it is given names none of the other tenant's channels", async () => {
+    // `channel_ids` is the API's `/internal/session` response, not a field of
+    // `connection.ack` — the ack carries user, cursor, resume_ok and truncated.
+    // The gateway reads that response at connect (`auth.ts`) and it becomes the
+    // subscription set, so this is where a leak would start.
+    const res = await fetch(`${api.url}/internal/session`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${tenants.attacker.token}` },
+    });
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body).toContain(tenants.attacker.channelId);
+    expect(body).not.toContain(tenants.victim.channelId);
+  });
+
+  // ── T046: the send ─────────────────────────────────────────────────────────
+  it("a send into the other tenant's channel is refused, and that channel gains nothing", async () => {
+    const before = await tenants.victim.history();
+    const client = connect(tenants.attacker.token);
+    await client.waitFor("connection.ack");
+    const text = `not mine ${randomUUID()}`;
+    client.socket.send(
+      JSON.stringify({
+        type: "message.send",
+        payload: { idem_key: randomUUID(), channel: tenants.victim.channelId, text },
+      }),
+    );
+    const error = await client.waitFor<{ payload: { code: string } }>("error");
+    expect(error.payload.code).toBeTruthy();
+    // READ THE VICTIM'S STATE, do not infer it from the refusal. A refusal that
+    // wrote the row anyway is the failure this assertion exists for.
+    const after = await tenants.victim.history();
+    expect(after).not.toContain(text);
+    expect(after).toBe(before);
+  });
+
+  // ── T047: the resume ───────────────────────────────────────────────────────
+  it("a cursor naming the other tenant's channel backfills nothing", async () => {
+    await tenants.victim.say(`before the resume ${randomUUID()}`);
+    const client = connect(tenants.attacker.token, `&cursor=${tenants.victim.channelId}:1`);
+    const ack = await client.waitFor<{
+      payload: { cursor: Record<string, number>; resume_ok: boolean };
+    }>("connection.ack");
+    // The ack echoes what the server ACCEPTED. A channel this token cannot see is
+    // not in it, whatever the client presented.
+    expect(Object.keys(ack.payload.cursor)).not.toContain(tenants.victim.channelId);
+    await quiet(1_000);
+    expect(client.frames().filter((f) => f.type === "message.created")).toEqual([]);
+  });
+
+  // ── T048: the subscribe ────────────────────────────────────────────────────
+  it("nothing from the other tenant's channel is delivered", async () => {
+    const client = connect(tenants.attacker.token);
+    await client.waitFor("connection.ack");
+    await tenants.victim.say(`the victim speaks ${randomUUID()}`);
+    await quiet(1_500);
+    expect(client.frames().filter((f) => f.type === "message.created")).toEqual([]);
+  });
+});
+
+// ── T049, T050: the ten frames, classified ───────────────────────────────────
+//
+// THE MEMBER LIST IS DERIVED; THE DIRECTION IS NOT. `frameSchema.options` yields
+// all ten discriminator values at runtime, so a frame added to the union appears
+// here without an edit and fails the totality check until somebody classifies it
+// — the same property `targets.itest.ts` gives the route list.
+//
+// The DIRECTION cannot be derived, and an earlier draft of this task and of
+// `contracts/gauntlet.md` §4 both said it could. The union carries no direction
+// metadata: no inbound/outbound split, no client/server marker, nothing but the
+// discriminator. So each entry below is a classification with a reason, and the
+// authority for every one of them is `session.ts`, which refuses anything that is
+// not `message.send` with `unknown_frame_type` and close 4002.
+const DIRECTIONS: ReadonlyArray<readonly [string, "inbound" | "outbound", string]> = [
+  ["message.send", "inbound", "the only frame a client may utter (session.ts)"],
+  ["connection.ack", "outbound", "the server's answer to the handshake"],
+  ["message.ack", "outbound", "the server's answer to a send, after commit"],
+  ["message.created", "outbound", "a real-time event; the server decides who hears it"],
+  ["message.updated", "outbound", "as message.created"],
+  ["message.deleted", "outbound", "as message.created"],
+  ["membership.changed", "outbound", "membership is written through the api, never the socket"],
+  ["presence.changed", "outbound", "derived from connections the gateway holds, not claimed"],
+  ["typing", "outbound", "server-fanned; a client claiming one could type as anybody"],
+  ["error", "outbound", "the server's refusal shape"],
+];
+
+/** Something schema-valid for each type, so a refusal is `unknown_frame_type`
+ * rather than `invalid_frame` — the two are different findings and only one of
+ * them is about direction. */
+function sample(type: string, channel: string, user: string): unknown {
+  const message = {
+    id: randomUUID(),
+    channel,
+    seq: 1,
+    user,
+    text: "forged",
+    created_at: new Date().toISOString(),
+  };
+  switch (type) {
+    case "connection.ack":
+      return { type, payload: { user, cursor: {}, resume_ok: true, truncated: [] } };
+    case "message.ack":
+      return { type, payload: { seq: 1 } };
+    case "message.created":
+    case "message.updated":
+    case "message.deleted":
+      return { type, payload: message };
+    case "membership.changed":
+      return { type, payload: { channel, user, change: "added" } };
+    case "presence.changed":
+      return { type, payload: { user, state: "online" } };
+    case "typing":
+      return { type, payload: { channel, user } };
+    case "error":
+      return {
+        type,
+        payload: { code: "forged", message: "forged", docs_url: "/x", request_id: "x" },
+      };
+    default:
+      return { type, payload: { idem_key: randomUUID(), channel, text: "forged" } };
+  }
+}
+
+describe("every frame in the union is classified, in both directions", () => {
+  const members = frameSchema.options.map(
+    (option) => (option.shape.type as { value: string }).value,
   );
-  const error = await client.waitFor<{ payload: { code: string } }>("error");
-  expect(error.payload.code).toBeTruthy();
-  // READ THE VICTIM'S STATE, do not infer it from the refusal.
-  const after = await tenants.victim.history();
-  expect(after).not.toContain(text);
-  expect(after).toBe(before);
+
+  it("derives all ten members from the union itself", () => {
+    expect(members.length).toBe(10);
+  });
+
+  it("classifies every member exactly once", () => {
+    const classified = DIRECTIONS.map(([type]) => type);
+    const missing = members.filter((m) => !classified.includes(m));
+    expect(
+      missing,
+      `these frames are in frameSchema and classified nowhere: ${missing.join(", ")}`,
+    ).toEqual([]);
+    expect(new Set(classified).size).toBe(classified.length);
+  });
+
+  it("names no frame the union does not have", () => {
+    const stale = DIRECTIONS.map(([type]) => type).filter((t) => !members.includes(t));
+    expect(stale, `classified but no longer in frameSchema: ${stale.join(", ")}`).toEqual([]);
+  });
+
+  it("agrees with the gateway: exactly one member is inbound", () => {
+    const inbound = DIRECTIONS.filter(([, d]) => d === "inbound").map(([t]) => t);
+    // Not a taste assertion. `session.ts` compares against this one literal and
+    // closes 4002 on everything else, so a second inbound frame here would be a
+    // classification the code does not implement.
+    expect(inbound).toEqual(["message.send"]);
+  });
+});
+
+// The behavioural half: the classification above is checked against the running
+// gateway rather than believed. Nine sockets, one per outbound frame, because the
+// refusal closes the connection.
+describe("a client uttering a server frame is refused, frame by frame", () => {
+  let api: { url: string; stop: () => void };
+  let server: Server;
+  let wsUrl: string;
+  let tenants: SocketTenants;
+
+  beforeAll(async () => {
+    api = await startApi();
+    tenants = await seedSocketTenants(api.url);
+    server = serve({
+      service: "gateway",
+      health: () => ({}),
+      logger: silent,
+      notFoundDocsUrl: docsUrl("not_found"),
+    });
+    attachSessions({ server, api: createApiClient(api.url), logger: silent });
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+    wsUrl = `ws://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  }, 90_000);
+
+  afterAll(async () => {
+    await new Promise<void>((resolve) => server?.close(() => resolve()));
+    api?.stop();
+  });
+
+  for (const [type, direction] of DIRECTIONS.filter(([, d]) => d === "outbound")) {
+    it(`${type} (${direction}) is refused with unknown_frame_type`, async () => {
+      const client = read(new WebSocket(`${wsUrl}/v1/ws?token=${tenants.attacker.token}`));
+      await client.opened();
+      await client.waitFor("connection.ack");
+      client.socket.send(
+        JSON.stringify(
+          sample(type, tenants.attacker.channelId, tenants.attacker.userExternalId),
+        ),
+      );
+      const error = await client.waitFor<{ payload: { code: string } }>("error");
+      expect(error.payload.code).toBe("unknown_frame_type");
+      client.socket.close();
+    });
+  }
 });
 ```
 
@@ -559,7 +2581,7 @@ in the suite with no edit and fails totality until somebody classifies it. The
 client/server marker, nothing but the discriminator. An earlier draft of this
 chapter claimed otherwise.
 
-```ts title="services/gateway/src/isolation.itest.ts"
+```ts title="services/gateway/src/isolation.itest.ts (excerpt)"
 const DIRECTIONS: ReadonlyArray<readonly [string, "inbound" | "outbound", string]> = [
   ["message.send", "inbound", "the only frame a client may utter (session.ts)"],
   ["connection.ack", "outbound", "the server's answer to the handshake"],
@@ -697,38 +2719,266 @@ That is this chapter's own argument one layer down: an instrument that has never
 produced output has never had its output checked.
 
 ```ts title="services/api/src/isolation/attack.test.ts"
-it("names the statuses when they differ", () => {
-  const [first] = comparePair(answer(403, {}), answer(404, {}));
-  expect(first).toBe("status 403 (foreign) vs 404 (absent)");
+import { describe, expect, it } from "vitest";
+
+import { comparePair, rowsOf } from "./attack";
+
+// The oracle's REPORTING arm, which a passing gauntlet cannot reach.
+//
+// Every assertion in `gauntlet.itest.ts` asserts that `differences` is empty, so
+// the code that builds a difference string only ever runs when the platform is
+// broken. That is the same problem Phase 7's reintroductions solve for the suite
+// as a whole, one layer down: an instrument that has never produced output has
+// never had its output checked.
+
+const answer = (status: number, body: unknown) => ({ status, body });
+
+describe("comparing a foreign answer against an absent one", () => {
+  it("reports nothing when both agree", () => {
+    expect(comparePair(answer(404, { code: "not_found" }), answer(404, { code: "not_found" }))).toEqual(
+      [],
+    );
+  });
+
+  it("ignores request_id, which differs on every request by design", () => {
+    expect(
+      comparePair(
+        answer(404, { code: "not_found", request_id: "a" }),
+        answer(404, { code: "not_found", request_id: "b" }),
+      ),
+    ).toEqual([]);
+  });
+
+  it("names the statuses when they differ", () => {
+    const [first] = comparePair(answer(403, {}), answer(404, {}));
+    expect(first).toBe("status 403 (foreign) vs 404 (absent)");
+  });
+
+  it("names both bodies when they differ", () => {
+    const differences = comparePair(answer(404, { code: "forbidden" }), answer(404, { code: "not_found" }));
+    expect(differences).toHaveLength(1);
+    expect(differences[0]).toContain("forbidden");
+    expect(differences[0]).toContain("not_found");
+  });
+
+  it("reports both when both differ", () => {
+    expect(comparePair(answer(200, { messages: [1] }), answer(404, { code: "not_found" }))).toHaveLength(
+      2,
+    );
+  });
+
+  it("compares a non-object body without throwing", () => {
+    // `withoutRequestId` returns a non-object unchanged, and an html error page or
+    // an empty string is a real answer a misconfigured route can give.
+    expect(comparePair(answer(502, "bad gateway"), answer(404, ""))).toHaveLength(2);
+  });
+});
+
+describe("counting the rows in a list answer", () => {
+  it("reads a bare array", () => {
+    expect(rowsOf([1, 2, 3])).toEqual([1, 2, 3]);
+  });
+
+  it("reads a paginated envelope", () => {
+    expect(rowsOf({ data: [1, 2], next_cursor: "x" })).toEqual([1, 2]);
+  });
+
+  it("returns nothing for a shape it does not recognise", () => {
+    // The arm that matters. Zero rows from an unknown shape looks exactly like
+    // zero rows from a correctly-scoped list, and only one of those is a pass.
+    expect(rowsOf({ code: "not_found" })).toEqual([]);
+    expect(rowsOf(null)).toEqual([]);
+    expect(rowsOf("an html error page")).toEqual([]);
+    expect(rowsOf({ data: "not an array" })).toEqual([]);
+  });
 });
 ```
 
 ```ts title="services/api/src/isolation/targets.test.ts"
-it("says `none` rather than pretending the surface is empty", () => {
-  // The distinction the suite depends on: an empty target list from a found
-  // router is a clean surface, and an empty list from no router at all is a
-  // broken derivation. Only this field tells them apart.
-  const result = deriveTargets({});
-  expect(result.property).toBe("none");
-  expect(result.targets).toEqual([]);
+import { describe, expect, it } from "vitest";
+
+import { deriveTargets } from "./targets";
+
+// THE DERIVATION'S SHAPE-HANDLING, driven with fakes.
+//
+// `targets.itest.ts` runs `deriveTargets` against a real Nest application, which
+// is the assertion that matters — and a real application has exactly one router
+// shape, so the fallbacks for the others are unreachable there. Express 4 exposed
+// `_router`, Express 5 exposes `router`, and a future adapter may expose neither;
+// the branch that reports `none` is the one a reader of a failure most needs to be
+// working, because it is what turns "no routes found" into "no router found".
+
+const route = (path: string, methods: Record<string, boolean>) => ({ route: { path, methods } });
+
+describe("deriving targets from whatever the adapter exposes", () => {
+  it("reads Express 5's `router`", () => {
+    const result = deriveTargets({
+      router: { stack: [route("/v1/x", { get: true })] },
+    });
+    expect(result.property).toBe("router");
+    expect(result.targets).toEqual([{ method: "GET", path: "/v1/x" }]);
+  });
+
+  it("falls back to Express 4's `_router`", () => {
+    const result = deriveTargets({
+      _router: { stack: [route("/v1/y", { post: true })] },
+    });
+    expect(result.property).toBe("_router");
+    expect(result.targets).toEqual([{ method: "POST", path: "/v1/y" }]);
+  });
+
+  it("says `none` rather than pretending the surface is empty", () => {
+    // The distinction the suite depends on: an empty target list from a found
+    // router is a clean surface, and an empty list from no router at all is a
+    // broken derivation. Only this field tells them apart.
+    const result = deriveTargets({});
+    expect(result.property).toBe("none");
+    expect(result.targets).toEqual([]);
+  });
+
+  it("counts middleware layers, which have no route", () => {
+    const result = deriveTargets({
+      router: { stack: [{}, {}, route("/v1/z", { delete: true })] },
+    });
+    expect(result.middlewareLayers).toBe(2);
+    expect(result.targets).toEqual([{ method: "DELETE", path: "/v1/z" }]);
+  });
+
+  it("takes only the verbs a layer actually answers", () => {
+    // Express marks every verb on the layer and flags the live ones. Treating the
+    // keys as the answer would invent a target per HTTP verb per route.
+    const result = deriveTargets({
+      router: { stack: [route("/v1/w", { get: true, post: false, put: false })] },
+    });
+    expect(result.targets).toEqual([{ method: "GET", path: "/v1/w" }]);
+  });
+
+  it("handles a layer with a route but no methods, and one with no path", () => {
+    const result = deriveTargets({
+      router: { stack: [{ route: { path: "/v1/none" } }, { route: { methods: { get: true } } }] },
+    });
+    expect(result.targets).toEqual([{ method: "GET", path: "" }]);
+  });
 });
 ```
 
 ```ts title="services/api/src/db/catalogue.test.ts"
-it("IS NULL for a table with no path at all", () => {
-  expect(classifyRow(row({ table_name: "t042_scratch" }))).toEqual({
-    table: "t042_scratch",
-    path: null,
-    via: [],
+import { describe, expect, it } from "vitest";
+
+import { classifyRow, SPINE_TABLES } from "./catalogue";
+
+// The classification's four arms, driven with rows made up here rather than with
+// rows a database happens to hold (chapter 3.12, FR-040).
+//
+// The one that matters is `null`. It executes only when somebody adds a table with
+// no tenant path — which is the state `tenant-scope.itest.ts` exists to prevent —
+// so against a healthy database it is the one arm nothing can reach. T042 proved it
+// fires by creating a scratch table by hand; this proves it without a database and
+// without a hand.
+
+const row = (over: Partial<Parameters<typeof classifyRow>[0]>) => ({
+  table_name: "made_up",
+  has_environment_id: false,
+  fk_targets: null,
+  ...over,
+});
+
+describe("a table's tenant path", () => {
+  it("is direct when it carries environment_id", () => {
+    expect(classifyRow(row({ has_environment_id: true }))).toEqual({
+      table: "made_up",
+      path: "direct",
+      via: [],
+    });
+  });
+
+  it("is a hop when a foreign key reaches a direct table", () => {
+    expect(classifyRow(row({ fk_targets: ["channels", "users"] }))).toEqual({
+      table: "made_up",
+      path: "hop",
+      via: ["channels", "users"],
+    });
+  });
+
+  it("prefers direct over hop when a table has both", () => {
+    // The ordering the function's own comment argues for: a spine table that
+    // gains `environment_id` should report `direct` so its SPINE entry becomes
+    // visibly wrong rather than quietly ignored.
+    const both = classifyRow(row({ has_environment_id: true, fk_targets: ["channels"] }));
+    expect(both.path).toBe("direct");
+  });
+
+  it("is spine for a listed table, and carries its reason", () => {
+    const result = classifyRow(row({ table_name: "organisations" }));
+    expect(result.path).toBe("spine");
+    expect(result.reason).toBeTruthy();
+  });
+
+  it("IS NULL for a table with no path at all", () => {
+    expect(classifyRow(row({ table_name: "t042_scratch" }))).toEqual({
+      table: "t042_scratch",
+      path: null,
+      via: [],
+    });
+  });
+
+  it("gives every spine table a reason", () => {
+    for (const name of SPINE_TABLES) {
+      expect(classifyRow(row({ table_name: name })).reason, name).toBeTruthy();
+    }
   });
 });
 ```
 
 ```ts title="services/api/src/isolation/compare.test.ts"
-it("leaves a non-object body alone", () => {
-  // An html error page or an empty string is a real answer a misconfigured route
-  // can give, and comparing it verbatim is correct.
-  expect(withoutRequestId("bad gateway")).toBe("bad gateway");
+import { describe, expect, it } from "vitest";
+
+import { withoutRequestId } from "./compare";
+
+// The oracle's own tests. Pure — no database, no HTTP — because the thing being
+// checked is one comparison rule, and a rule that needs a stack to test is a rule
+// nobody re-reads.
+
+describe("withoutRequestId", () => {
+  it("makes two bodies differing only in request_id equal", () => {
+    const foreign = {
+      code: "not_found",
+      message: "channel not found",
+      docs_url: "https://relay.example/docs/errors/not_found",
+      request_id: "req_aaa",
+    };
+    const absent = { ...foreign, request_id: "req_bbb" };
+    expect(withoutRequestId(foreign)).toEqual(withoutRequestId(absent));
+  });
+
+  it("leaves two bodies differing in message unequal", () => {
+    // The case that matters: `messages.service.ts` keeps a CONSTANT message for
+    // exactly this reason — echoing the id back would make the foreign answer
+    // differ from the absent one, and "different" is itself a disclosure.
+    const foreign = { code: "not_found", message: "channel abc not found", request_id: "req_a" };
+    const absent = { code: "not_found", message: "channel not found", request_id: "req_b" };
+    expect(withoutRequestId(foreign)).not.toEqual(withoutRequestId(absent));
+  });
+
+  it("leaves two bodies differing in code unequal", () => {
+    const forbidden = { code: "forbidden", message: "no", request_id: "req_a" };
+    const missing = { code: "not_found", message: "no", request_id: "req_b" };
+    expect(withoutRequestId(forbidden)).not.toEqual(withoutRequestId(missing));
+  });
+
+  it("passes a non-object body through untouched", () => {
+    // A 204 has no body and a proxy may hand back a string. Neither is an error
+    // envelope, and neither should throw on the way to a comparison.
+    expect(withoutRequestId(null)).toBeNull();
+    expect(withoutRequestId("gateway timeout")).toBe("gateway timeout");
+    expect(withoutRequestId(undefined)).toBeUndefined();
+  });
+
+  it("does not mutate its argument", () => {
+    const body = { code: "not_found", request_id: "req_a" };
+    withoutRequestId(body);
+    expect(body.request_id).toBe("req_a");
+  });
 });
 ```
 
@@ -745,7 +2995,7 @@ file whose subject is real HTTP.
 
 The suite says so itself, at the top of the file a reader meets first:
 
-```ts title="services/api/src/isolation/gauntlet.itest.ts"
+```ts title="services/api/src/isolation/gauntlet.itest.ts (excerpt)"
 // TIMING. A foreign id answering in 3 ms and an absent id in 30 ms is a disclosure
 // this suite cannot see. Measuring that stably in CI is a different discipline and
 // is not attempted here; the chapter names it as unaddressed rather than implying
@@ -768,15 +3018,52 @@ twice. Conflating the first two is the property; conflating the third with them 
 a bug waiting for an endpoint:
 
 ```diff title="services/api/src/db/repository.itest.ts"
+@@ -60,19 +60,38 @@ describe("tenant isolation is structural (FR-TEN-05)", () => {
+   it("membership writes with foreign ids affect zero rows", async () => {
+     const user = await repoA.getUserByExternalId("tuan");
+     const channel = await repoA.getChannelByExternalId("support");
 -    expect(await repoA.addMember(channel!.id, user!.id)).toBe(true);
 -    // B holds A's REAL ids — and still cannot write or read through them.
 -    expect(await repoB.addMember(channel!.id, user!.id)).toBe(false);
 +    expect(await repoA.addMember(channel!.id, user!.id)).toBe("added");
++    // Asked twice is a SUCCESS and not a failure, and telling those apart is
++    // what chapter 3.12 changed here: the endpoint over this call has to be
++    // idempotent, and a unique violation reached the wire as `internal_error`.
 +    expect(await repoA.addMember(channel!.id, user!.id)).toBe("already_a_member");
 +    // B holds A's REAL ids — and still cannot write or read through them. The
 +    // answer is `not_found`, which is also what B gets for ids that exist
 +    // nowhere: three refusals, one word, on purpose.
 +    expect(await repoB.addMember(channel!.id, user!.id)).toBe("not_found");
+     expect(await repoB.listMembers(channel!.id)).toEqual([]);
+     expect(await repoB.channelsForUser(user!.id)).toEqual([]);
+     expect(await repoA.listMembers(channel!.id)).toEqual([user!.id]);
+   });
+ 
+   it("uniqueness is per-tenant (DR-02): both tenants may own the same external_id", async () => {
+-    await expect(
+-      repoB.createUser("tuan", "A different Tuan"),
+-    ).resolves.toBeTruthy();
+-    await expect(repoA.createUser("tuan", "Duplicate in A")).rejects.toThrow();
++    // B's own Tuan is a DIFFERENT row. That is the per-tenant half.
++    const inB = await repoB.createUser("tuan", "A different Tuan");
++    const inA = await repoA.getUserByExternalId("tuan");
++    expect(inB.id).not.toBe(inA!.id);
++
++    // THE OBSERVATION CHANGED IN CHAPTER 3.12 AND THE PROPERTY DID NOT. This
++    // used to assert that a repeat within one tenant REJECTS, which observed the
++    // unique index by watching it raise. `createUser` is now idempotent — the
++    // members endpoint creates a user on first membership, so a repeated request
++    // would otherwise have answered `internal_error` — and the index is what
++    // makes that work rather than something that got removed. So the assertion
++    // is now that a repeat returns THE SAME ROW: still one user per tenant per
++    // external id, observed through the outcome instead of through an exception.
++    const again = await repoA.createUser("tuan", "Duplicate in A");
++    expect(again.id).toBe(inA!.id);
++    // And the existing display name wins: a second call is not an update.
++    expect(again.display_name).toBe(inA!.display_name);
+   });
+ });
+ 
 ```
 
 The endpoint that needed the distinction is chapter 3.13's. The isolation half of
