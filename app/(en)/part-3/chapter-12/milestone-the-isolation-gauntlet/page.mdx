@@ -1,0 +1,812 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figDerivedTargets, figWhoMayCall, figWhatMaskedWhat } from "./figures";
+
+export const metadata = {
+  title: "Milestone: the isolation gauntlet — Building Relay",
+  description:
+    "The constitution has required a cross-tenant suite since it was written. What the repository had was eleven good assertions in eight files, and nothing anywhere that knew which endpoints had been attacked and which had merely never been thought about.",
+  alternates: {
+    canonical: "/part-3/chapter-12/milestone-the-isolation-gauntlet",
+    languages: {
+      en: "/part-3/chapter-12/milestone-the-isolation-gauntlet",
+    },
+  },
+};
+
+<ChapterHeader id="3.12" />
+
+The constitution's first principle calls FR-TEN-05 the single most important
+requirement in the system, and then asks for something specific: *an automated
+test suite verifying cross-tenant access is impossible, run on every build.*
+
+That suite did not exist. What existed was eleven assertions across eight files,
+each written by whichever chapter happened to be thinking about tenancy that week:
+a foreign channel's history in 2.4, a foreign external id in 2.1, a foreign key
+that looks like an absent key in 3.2, a webhook test against another environment
+in 3.5.
+
+Every one of them is a good assertion. Together they answer a question nobody
+asked. Count them — the number in this chapter's spec was **nine**, carried
+forward from a draft, and counting gave **eleven across eight files**. A number
+nobody could state is a poor foundation for a claim about every endpoint.
+
+And the deeper problem is not the count. It is that a list of assertions someone
+wrote cannot distinguish **an endpoint that was attacked and held** from **an
+endpoint nobody thought about**. Both look like silence.
+
+## The list has to derive itself
+
+<Figure caption="The target list comes from the running application's own router, not from a list somebody maintains. A route that exists and matches no classification fails the build, naming itself." chart={figDerivedTargets} />
+
+So the first decision is that the suite does not hold a list of endpoints. It asks
+the application:
+
+```ts title="services/api/src/isolation/targets.ts"
+export function deriveTargets(instance: unknown): {
+  targets: DerivedTarget[];
+  middlewareLayers: number;
+  property: "router" | "_router" | "none";
+} {
+  const adapter = instance as AdapterInstance;
+  const router = adapter.router ?? adapter._router;
+  const property = adapter.router ? "router" : adapter._router ? "_router" : "none";
+```
+
+Three properties instead of one, because Express 4 exposed `_router` and Express 5
+exposes `router`, and a future adapter may expose neither. The third value is the
+one that matters most and it is easy to leave out.
+
+<Trap title="An empty derivation looks exactly like a clean surface">
+
+`targets.length === 0` has two meanings. Either the application serves no routes
+that take a tenant-owned identifier — a clean surface, nothing to do — or the
+derivation failed to find the router at all and the suite is attacking nothing
+while reporting success.
+
+A suite that cannot tell those apart is worse than no suite, because it produces
+the same green tick either way. That is why `property` exists and why the
+derivation asserts on it:
+
+```ts title="services/api/src/isolation/targets.itest.ts"
+it("found a router at all, and says which property answered", () => {
+  expect(derived.property, "no router found on the adapter instance").not.toBe("none");
+});
+
+it("found routes — an empty list is a broken derivation, not a clean surface", () => {
+  expect(derived.targets.length).toBeGreaterThan(0);
+});
+```
+
+The second one has a message rather than a bare comparison, because
+`expected 0 to be greater than 0` tells whoever reads the failure nothing about
+which of the two things went wrong.
+
+</Trap>
+
+Classification is a separate act, and deliberately not derivable. Whether a route
+takes a tenant-owned identifier is a judgement, so it is written down with a
+reason:
+
+```ts title="services/api/src/isolation/targets.ts"
+export const CLASSIFICATIONS: readonly Classification[] = [
+  { method: "GET", path: "/v1/webhooks", accepts: "application", shape: "list" },
+  { method: "GET", path: "/v1/webhooks/:id", accepts: "application", shape: "read" },
+  { method: "POST", path: "/v1/channels/:channelId/messages", accepts: "application", shape: "write" },
+  // …
+  { method: "GET", path: "/healthz", exempt: "takes no identifier and answers before any guard" },
+];
+```
+
+Twenty-four routes on the build this chapter finished: twenty-one attacked, three
+exempt with a reason each. The counts are printed by the derivation rather than
+typed into prose, because a number in a comment goes stale silently:
+
+```
+gauntlet targets: 24 derived, 21 attacked, 3 exempt (read 2, list 1, write 17, credential 1)
+```
+
+<Why title="Why a list with reasons rather than a pattern">
+
+Feature 030 made this argument for its exemption list and it holds here: a pattern
+silently absorbs the next thing that happens to match it, which is the opposite of
+what a completeness check is for. `/healthz` is exempt because it takes no
+identifier. A future `/v1/healthz/:tenantId` would match any pattern written to
+excuse the first one, and would be excused for a reason that had stopped being
+true.
+
+Adding a route to this list should be an edit somebody has to justify.
+
+</Why>
+
+## Two tenants, and nothing that deletes
+
+Every assertion in the suite is a pair, so it needs a second tenant to borrow
+identifiers from. One environment can only prove that a made-up uuid is not found,
+which is a much weaker claim than the one constitution I makes.
+
+```ts title="services/api/src/isolation/fixtures.ts"
+export interface Tenant {
+  environmentId: string;
+  credential: string;
+  userId: string;
+  userExternalId: string;
+  channelId: string;
+  channelExternalId: string;
+  messageId: string;
+  endpointId: string;
+  repo: Repository;
+}
+
+export async function seedTwoTenants(db: Db): Promise<TwoTenants> {
+```
+
+One of each kind of row the routes touch, because the write attacks read the
+victim's own state back — and **nothing in this file deletes anything.** Feature
+030's whole subject is a test that performs a global operation and asserts a local
+fact; a fixture that tidied up with a `DELETE FROM channels` would be the eleventh
+recorded instance of it. The environments are disposable and the lane shares the
+database, which is the trade chapter 2.1 made when it put `environment_id` in every
+table.
+
+The socket half needs its own, because the gateway lane cannot import the api:
+
+```ts title="services/gateway/src/isolation-fixtures.ts"
+  // Sequential, not concurrent: both calls mint a token through the same api
+  // child, and chapter 3.8's per-IP failed-auth limiter is the one bucket that
+  // fails CLOSED. Two parallel signups are well under it, and a suite that
+  // learns that the hard way learns it as an unrelated 429.
+  const attacker = await seed("a");
+  const victim = await seed("v");
+```
+
+## Four shapes, and one oracle
+
+An attack is not one thing. A read leaks by answering; a write leaks by changing a
+row while answering correctly; a list leaks by including a row; a credential leaks
+by minting something that works elsewhere. So there are four attack functions, and
+each returns the evidence rather than a verdict:
+
+```ts title="services/api/src/isolation/attack.ts"
+export interface Verdict {
+  differences: string[];
+  foreign: Answer;
+  absent: Answer;
+}
+
+export async function readAttack(
+  baseUrl: string,
+  credential: string,
+  foreignReq: AttackRequest,
+  absentReq: AttackRequest,
+): Promise<Verdict>
+```
+
+The oracle underneath all four is the one chapter 2.8 invented for a single test
+and this chapter lifted into its own file: **a foreign identifier must be
+indistinguishable from an identifier that exists nowhere.**
+
+```ts title="services/api/src/isolation/compare.ts"
+export function withoutRequestId(body: unknown): unknown {
+  if (typeof body !== "object" || body === null) return body;
+  const rest: Record<string, unknown> = { ...(body as Record<string, unknown>) };
+  delete rest["request_id"];
+  return rest;
+}
+```
+
+`request_id` is removed because it differs on every request by design. Everything
+else is compared: the status, and the whole body.
+
+<Why title="Why indistinguishable, and not merely refused">
+
+A 403 for a foreign resource and a 404 for an absent one is a difference, and a
+difference is an oracle. Send ids, watch which answer comes back, keep the ones
+that answer *not yours* — that is enumeration of another customer's resources,
+built out of two error codes that both look like refusals.
+
+FR-TEN-05 asks for the stronger property, and the strong version is cheap: answer
+the same thing to both.
+
+</Why>
+
+Writes get more than the pair, because a refusal that changed a row is still a
+breach:
+
+```ts title="services/api/src/isolation/attack.ts"
+export async function writeAttack(
+  baseUrl: string,
+  credential: string,
+  foreignReq: AttackRequest,
+  absentReq: AttackRequest,
+  readVictimState: () => Promise<unknown>,
+): Promise<Verdict & { stateChanged: boolean; before: unknown; after: unknown }> {
+  const before = await readVictimState();
+  const foreign = await send(baseUrl, credential, foreignReq);
+  const absent = await send(baseUrl, credential, absentReq);
+  const after = await readVictimState();
+```
+
+That fifth argument earns its place later in this chapter, under a reintroduction
+that the response comparison could not see.
+
+## The control, and why fourteen passing tests meant nothing
+
+The first time the gauntlet ran it reported fourteen passes, and that number was
+not evidence of anything.
+
+Every assertion in the file compares two refusals for sameness. Two refusals for
+an unrelated reason — an expired credential, a lane missing an environment
+variable, a route that answers 401 to everything — are *also* indistinguishable.
+They would pass every test in the file while attacking nothing at all.
+
+```ts title="services/api/src/isolation/gauntlet.itest.ts"
+describe("the control: the attacking credential is a working credential", () => {
+  it("reaches its own webhook endpoint", async () => {
+    const res = await fetch(`${url}/v1/webhooks/${tenants.attacker.endpointId}`, {
+      headers: { authorization: `Bearer ${tenants.attacker.credential}` },
+    });
+    expect(res.status).toBe(200);
+  });
+
+  it("reaches its own channel history, and sees its own message", async () => {
+    const res = await fetch(`${url}/v1/channels/${tenants.attacker.channelId}/messages`, {
+      headers: { authorization: `Bearer ${tenants.attacker.credential}` },
+    });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain(tenants.attacker.messageId);
+  });
+});
+```
+
+Three tests that prove the attacker can do things, so that its failure to do other
+things means something. Without them, a green gauntlet is compatible with a
+completely broken one.
+
+<Trap title="Two attempts to check this from outside the suite both failed">
+
+The instinct was to verify it with a scratch script rather than a permanent test.
+The first attempt could not resolve `reflect-metadata` outside the workspace. The
+second, run under `tsx` inside it, threw `UndefinedDependencyException` when
+booting `AppModule` — because `tsx` emits no decorator metadata, which is exactly
+why the vitest configs use the SWC plugin.
+
+Both failures were about the harness and neither was about the platform. A
+permanent test in the suite was the cheaper answer as well as the better one.
+
+</Trap>
+
+## The internal surface answers to a different question
+
+<Figure caption="An end-user token carries one environment, so the ordinary attack applies. A platform credential carries none — the dispatcher serves every tenant — so the question is not which environment it may reach but which routes it may call." chart={figWhoMayCall} />
+
+Eight internal routes, and they do not take one shape. Three accept an end-user
+token, which is scoped to one environment: those get the ordinary attack, a token
+minted in A used against a resource in B. Five accept a platform credential, which
+is scoped to nothing.
+
+Chapter 3.2 gave routes a way to say which credential **class** they accept. It did
+not give them a way to say which **service**, and that gap has a consequence this
+chapter found inside its own test suite:
+
+```ts title="services/api/src/auth/credential.guard.ts"
+export type AcceptSpec =
+  | "application"
+  | "user"
+  | { readonly platform: readonly PlatformService[] };
+```
+
+The service names are derived from the list of credentials rather than retyped
+beside it, so adding a third internal service cannot leave the two out of step:
+
+```ts title="services/api/src/auth/authenticate.middleware.ts"
+const PLATFORM_SERVICES = [
+  [PLATFORM_CREDENTIAL_ENV, "dispatcher"],
+  [GATEWAY_CREDENTIAL_ENV, "gateway"],
+] as const satisfies ReadonlyArray<readonly [string, string]>;
+
+export type PlatformService = (typeof PLATFORM_SERVICES)[number][1];
+```
+
+`as const` is what makes that work: without it the indexed access widens to
+`string` and the decorator would accept any word at all.
+
+```diff title="services/api/src/internal/dispatch.controller.ts"
+-@Accepts("platform")
++@Accepts({ platform: ["dispatcher"] })
+```
+
+```diff title="services/api/src/internal/usage.controller.ts"
+-@Accepts("platform")
++@Accepts({ platform: ["gateway"] })
+```
+
+<Trap title="The gap was in the test suite, passing, for a whole chapter">
+
+`usage.itest.ts` presented **the dispatcher's** credential to **the gateway's**
+route, and had done since chapter 3.11. It passed, because the route asked only
+whether the credential was a platform credential.
+
+The moment the route declared its service, nine of that file's fifteen tests turned
+403. Not because the change broke them — because the change revealed that the file
+had never been exercising the credential it claimed to be exercising. The refusal
+gets its own code rather than a generic `forbidden`, for the reason chapter 3.2
+gave when it introduced `wrong_credential_type`: *you lack a permission* and *that
+credential belongs to another service* are different facts, and only one of them
+tells a developer where to look.
+
+</Trap>
+
+```diff title="services/api/src/internal/usage.itest.ts"
++describe("a platform credential is refused on another service's route (FR-044)", () => {
++  it("refuses the dispatcher's credential on a usage route", async () => {
++    const res = await report(DISPATCHER_CREDENTIAL, [connection()]);
++    expect(res.status).toBe(403);
++    expect((await res.json()).code).toBe("wrong_credential_service");
++  });
+```
+
+And the platform routes are attacked differently, because only some of them **can**
+be. A cross-environment request needs a route that names an environment alongside
+an identifier, and only two of the five do: `dispatch/expand`, which takes
+`environment_id` beside `event_id`, and `usage/connections`, which names an
+environment per connection. The other three take one opaque identifier and derive
+the environment from the row they find.
+
+```ts title="services/api/src/isolation/gauntlet.itest.ts"
+it("expand reaches only the endpoints of the environment it names", async () => {
+  const before = await victimDeliveries();
+  const res = await fetch(`${url}/internal/dispatch/expand`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${dispatcher}`, "content-type": "application/json" },
+    body: JSON.stringify({
+      event_id: crypto.randomUUID(),
+      environment_id: tenants.attacker.environmentId,
+      type: "message.created",
+      payload: { text: "expand names one environment" },
+    }),
+  });
+  expect(res.status).toBe(200);
+  // The attacker's own endpoint subscribes to this type, so the call did
+  // something — without this the assertion below passes on a no-op.
+  expect((await res.json()).created).toBeGreaterThan(0);
+  expect(await victimDeliveries()).toBe(before);
+});
+```
+
+That is not a hole the suite declines to test. It is the absence of the parameter
+that would make the attack expressible — and it is worth writing down, because
+`material` is the one response in the platform that returns a decrypted customer
+secret, and what guards it is the service check above and nothing else.
+
+## The leak that has no endpoint yet
+
+Endpoints are not the only way out. A table with no path back to an environment is
+a leak the first query that joins it will find, and nothing before that moment
+fails.
+
+```ts title="services/api/src/db/catalogue.ts"
+export type TenantPath = "direct" | "hop" | "spine";
+```
+
+Derived from `information_schema` rather than from `schema.ts`, because the
+database is what queries run against: a table a migration added and nobody modelled
+in Drizzle is invisible to a check that reads the model, and that is exactly the
+table this exists to catch.
+
+```
+tenant paths: 22 base tables — 12 direct, 2 hop, 8 spine
+hop: members  → channels, users
+hop: messages → channels, users
+```
+
+Writing the query corrected the plan. `data-model.md` said a `hop` was a table
+where **exactly one** foreign key reaches a table carrying `environment_id`. Both
+hop tables reach **two** — `channels` and `users` are each `direct` — so the
+uniqueness reading would have classified neither and failed totality on the two
+tables it was written to describe. The rule is existence.
+
+<Why title="Why the counts are recorded and not asserted">
+
+`__sentinel_environments` is created by the test harness, so it exists on a
+database the lane has run against and not on a fresh one. "12 direct" is 11 or 12
+depending on how the database was built, and an assertion on the number would fail
+for a reason that has nothing to do with tenancy.
+
+So the suite asserts **totality** — every table falls into exactly one of three
+classes, and a table matching none fails until somebody classifies it — and the
+numbers live in `baseline.txt`.
+
+</Why>
+
+```ts title="services/api/src/isolation/tenant-scope.itest.ts"
+it("classifies every base table as direct, hop or spine", () => {
+  const unclassified = tables.filter((t) => t.path === null).map((t) => t.table);
+  expect(
+    unclassified,
+    `these tables have no path to an environment: ${unclassified.join(", ")}. ` +
+      `Add environment_id, add a foreign key to a table that has one, or add it ` +
+      `to SPINE in db/catalogue.ts with a reason.`,
+  ).toEqual([]);
+});
+```
+
+The failure names the table and the three ways out of it, because the useful half
+of this failure is which table appeared:
+
+```
+these tables have no path to an environment: t042_scratch. Add environment_id,
+add a foreign key to a table that has one, or add it to SPINE in db/catalogue.ts
+with a reason.
+```
+
+<Trap title="`::text` is load-bearing, and the bug was legible only by accident">
+
+`information_schema` columns are `sql_identifier`, and node-pg has no parser for
+an array of them. `array_agg(DISTINCT ccu.table_name)` arrives as the literal
+string `{channels,users}`, and iterating a string yields its first character — so
+the assertion read:
+
+```
+members hops through {, which is not direct
+```
+
+which names the bug precisely, because the message interpolates the value. A
+boolean assertion would have said `false is not true`.
+
+</Trap>
+
+## The finding that was wrong first
+
+The structural check's `spine` list is where a table goes when it has no tenant
+path and should not have one — the tenancy tables themselves, and two pieces of
+infrastructure. Writing the reason for one of those two produced this chapter's
+largest finding and its only reversal, and the reversal is the more useful half.
+
+The first draft had a **fourth** class, `unscoped`, holding `outbox` alone, on the
+reading that Principle I's second clause was being violated: a table with no path
+to an environment, on a read path, in the system the principle is about.
+
+Checking the four arguments for that, three collapsed. The outbox is not on a read
+path to any API caller. Its only reader is the relay, whose entire job is to publish
+every environment's events without regard to which environment they came from. And
+`exempt.ts`'s existing line — *`outbox` is not among them and needs no entry* — was
+right for the reason it gave. So the class had one member and then none.
+
+What survived is a different problem, and four requirements care about it:
+
+```ts title="services/api/src/db/catalogue.ts"
+  // THE OUTBOX KEEPS MESSAGE TEXT FOR EVER, and that is a RETENTION finding
+  // rather than a tenancy one. An earlier draft of this feature had it in a
+  // fourth class called `unscoped`, on the reading that it violated Principle
+  // I's second clause. Three of the four arguments for that collapsed on
+  // checking, so the class had one member and then none (R7).
+  //
+  // What is true, measured rather than reasoned about (R7a):
+  //   - `drainOutbox` sets `published_at = now()` and never deletes.
+  //   - Nothing in the api deletes a row from any table. The only `.delete(` in
+  //     non-test source is an in-memory Map eviction in `limits/fallback.ts:85`.
+  //   - The payload is a full copy of the message, `data.text` included.
+  //   - 286,871 rows in the test lane.
+  ["outbox", "platform bookkeeping; its only reader is the relay, which is global by design"],
+```
+
+DR-06 and FR-MSG-08 say a deleted message keeps its row with `text` cleared and
+that hard deletion runs only through the compliance endpoint — but the text
+survives in the payload, and a tombstone that leaves a copy behind is not a
+tombstone. FR-TEN-08 promises 30-day erasure of an application's operational data,
+unreachable for these rows by any mechanism that exists. FR-MOD-06 asks for
+per-environment retention with a scheduled hard delete, and owns the fix.
+
+The fix is one statement and needs no tenant identifier:
+
+```sql
+DELETE FROM outbox WHERE published_at < now() - interval 'N days'
+```
+
+<Why title="Why adding `environment_id` would have been the wrong fix">
+
+The reasoning is the useful part, because a tenant column is the obvious move.
+
+The outbox's legitimate mutation **is** cross-environment: the relay drains every
+environment's rows in one pass, which is what it is for. A tenant column would put
+that sweep inside feature 030's guard, and the guard would refuse it. And a foreign
+key to `environments` would block deleting an environment while outbox rows existed,
+which makes FR-TEN-08 harder rather than easier.
+
+For the rare per-tenant compliance sweep, `subject`'s last segment already carries
+the environment id.
+
+</Why>
+
+A milestone chapter that reported only the findings that survived would be
+reporting a tidier pass than the one that happened.
+
+## The socket is not in the router
+
+A WebSocket does not appear in `router.stack`, so the derived target list cannot
+see it. Four verbs — session, send, resume, subscribe — get their own suite, with
+the gateway in process and the api as a child, the arrangement chapter 3.2
+established.
+
+```ts title="services/gateway/src/isolation.itest.ts"
+it("a send into the other tenant's channel is refused, and that channel gains nothing", async () => {
+  const before = await tenants.victim.history();
+  const client = connect(tenants.attacker.token);
+  await client.waitFor("connection.ack");
+  const text = `not mine ${randomUUID()}`;
+  client.socket.send(
+    JSON.stringify({
+      type: "message.send",
+      payload: { idem_key: randomUUID(), channel: tenants.victim.channelId, text },
+    }),
+  );
+  const error = await client.waitFor<{ payload: { code: string } }>("error");
+  expect(error.payload.code).toBeTruthy();
+  // READ THE VICTIM'S STATE, do not infer it from the refusal.
+  const after = await tenants.victim.history();
+  expect(after).not.toContain(text);
+  expect(after).toBe(before);
+});
+```
+
+The frame union gets the same treatment the route list got, with one difference
+worth stating precisely. `frameSchema.options` yields all ten discriminator values
+at runtime, so **the member list is derived** — a frame added to the union appears
+in the suite with no edit and fails totality until somebody classifies it. The
+**direction** is not derivable: the union carries no inbound/outbound split, no
+client/server marker, nothing but the discriminator. An earlier draft of this
+chapter claimed otherwise.
+
+```ts title="services/gateway/src/isolation.itest.ts"
+const DIRECTIONS: ReadonlyArray<readonly [string, "inbound" | "outbound", string]> = [
+  ["message.send", "inbound", "the only frame a client may utter (session.ts)"],
+  ["connection.ack", "outbound", "the server's answer to the handshake"],
+  ["message.created", "outbound", "a real-time event; the server decides who hears it"],
+  ["typing", "outbound", "server-fanned; a client claiming one could type as anybody"],
+  // …
+];
+```
+
+One inbound, nine outbound — and the classification is checked against the running
+gateway rather than believed. Each of the nine outbound frames is sent by a client
+and must come back `unknown_frame_type` with close code 4002, which is what
+`session.ts` has always done and what nothing had ever asserted frame by frame.
+
+<Trap title="Twelve tests timed out at exactly 5000ms, and none of it was about tenancy">
+
+Await `open`, then attach a `message` listener, then read: that shape loses the
+handshake. `connection.ack` is sent the instant the upgrade completes, and awaiting
+`open` yields to the event loop first — the frame arrives with no listener attached
+and is gone.
+
+Every test that waited for a *second* frame timed out. The fix is to collect from
+the moment the socket exists and let `waitFor` read the buffer before it waits,
+which also made the timeout message useful: it now names the frames that did
+arrive.
+
+</Trap>
+
+## Has it ever caught anything?
+
+A suite that has never failed is an untested test. Three deliberate
+reintroductions, and the first one is the reason this section is worth reading.
+
+**Reintroduction 1.** Drop `environment_id` from `listMessages`' scoping helper —
+a repository SELECT on the history read path. Run the gauntlet. **Twenty-one of
+twenty-one passed.**
+
+<Figure caption="The first reintroduction changed nothing observable. `channelExists` is scoped and runs first, so the unscoped query below it was never reached — the suite is sensitive to the outermost check on a path and blind to an inner one a live outer check masks." chart={figWhatMaskedWhat} />
+
+That is not a defect in the reintroduction and it was not reshaped until it failed.
+It is a fact about the suite's range, and it went into the chapter rather than into
+a second attempt: `GET /v1/channels/:channelId/messages` calls `channelExists`
+first — chapter 2.8's fix for the two doors disagreeing — and that read is scoped.
+A foreign id is refused there and `listMessages` is never reached.
+
+With both checks dropped, two assertions fired:
+
+```
+× read: a foreign resource answers as an absent one > GET /v1/channels/:channelId/messages
+  "status 200 (foreign) vs 404 (absent)"
+  "body {"messages":[{"id":"0e6c372a-…","user":"v-nom4bg-user",
+   "text":"v-nom4bg says something"…}]} (foreign) vs
+   {"code":"not_found","message":"channel not found"…} (absent)"
+```
+
+**Reintroduction 2** is where the write shape earned its keep. Drop
+`environment_id` from one `UPDATE` — `setEndpointEnabled`'s — and leave every read
+scoped:
+
+```
+× write: a foreign identifier changes nothing > POST /v1/webhooks/:id/disable
+  expected true to be false        (verdict.stateChanged)
+```
+
+`differences` stayed **empty**. The endpoint answered 404 to both halves of the
+pair, because the read after the update is still scoped — so the response was
+indistinguishable and the write went through anyway. A suite comparing only
+responses passes this.
+
+**Reintroduction 3** taught the shape of the fault rather than confirming a guess.
+The task said "change one endpoint's 404 to a 403" — and doing that at the route
+level moves *both* halves of the pair to 403, which the oracle cannot see by
+construction. To make them differ, the code has to learn something the tenant scope
+hides:
+
+```ts
+// services/api/src/webhooks/webhooks.service.ts — DELIBERATELY UNTITLED.
+// The fence chain replays every titled fence onto the repository, and this code
+// was reverted the moment it was measured. A title here would put a
+// reintroduction into the canonical tree, which is the one thing FR-015 forbids.
+if (!row) {
+  // T066's REINTRODUCTION — reverted immediately after measuring.
+  if (await this.repo.anyEndpointExists(id)) {
+    throw new ForbiddenException("that endpoint belongs to another environment");
+  }
+  throw new NotFoundException("no such webhook endpoint");
+}
+```
+
+```
+"status 403 (foreign) vs 404 (absent)"
+```
+
+Breaking indistinguishability requires an unscoped read. That is a more useful
+sentence than "the suite caught a 403", and it came out of the reintroduction going
+differently than planned.
+
+<Why title="What three reintroductions measure, and what they do not">
+
+Three faults chosen by the author of the suite that catches them measure
+sensitivity to three faults. They are not coverage of the class, and the first
+attempt is the proof: it was picked as an obvious leak and was not one, for a reason
+nobody had written down.
+
+What they do establish, precisely: a dropped scope on the outermost read of a path
+is caught by the pair; a dropped scope on a write is caught by the state comparison
+alone, with responses still identical; and a leak of existence is caught by the
+pair and requires an unscoped read to create.
+
+What stays unmeasured is in the suite's own header — timing, a leaked platform
+credential, the four dispatch routes' reach, message wisdom beyond equality, and
+anything not routed through the HTTP router.
+
+</Why>
+
+Every reintroduction was reverted with `git checkout` against a committed tree,
+which is the practice this project writes down and the reason the first one cost
+five minutes instead of an afternoon.
+
+## The instruments had never produced output
+
+Coverage put a number on something that reads as a paradox. Three of this
+chapter's new files sat well below the rest, and every uncovered arm was in code
+that only runs when the platform is broken.
+
+`attack.ts` measured 61% branches because **every assertion in the gauntlet asserts
+that `differences` is empty** — so the code that builds a difference string runs
+only when something has leaked. `targets.ts` measured 50% because a real Nest
+application has exactly one router shape, so the fallbacks for the others are
+unreachable there. `catalogue.ts` measured 87.5% because the arm that returns
+`null` — the unclassified table — cannot execute against a database that has no
+unclassified table, which is the state the check exists to keep.
+
+That is this chapter's own argument one layer down: an instrument that has never
+produced output has never had its output checked.
+
+```ts title="services/api/src/isolation/attack.test.ts"
+it("names the statuses when they differ", () => {
+  const [first] = comparePair(answer(403, {}), answer(404, {}));
+  expect(first).toBe("status 403 (foreign) vs 404 (absent)");
+});
+```
+
+```ts title="services/api/src/isolation/targets.test.ts"
+it("says `none` rather than pretending the surface is empty", () => {
+  // The distinction the suite depends on: an empty target list from a found
+  // router is a clean surface, and an empty list from no router at all is a
+  // broken derivation. Only this field tells them apart.
+  const result = deriveTargets({});
+  expect(result.property).toBe("none");
+  expect(result.targets).toEqual([]);
+});
+```
+
+```ts title="services/api/src/db/catalogue.test.ts"
+it("IS NULL for a table with no path at all", () => {
+  expect(classifyRow(row({ table_name: "t042_scratch" }))).toEqual({
+    table: "t042_scratch",
+    path: null,
+    via: [],
+  });
+});
+```
+
+```ts title="services/api/src/isolation/compare.test.ts"
+it("leaves a non-object body alone", () => {
+  // An html error page or an empty string is a real answer a misconfigured route
+  // can give, and comparing it verbatim is correct.
+  expect(withoutRequestId("bad gateway")).toBe("bad gateway");
+});
+```
+
+Closing them meant separating the decision from the transport in three places —
+`classifyRow` from the catalogue query, `comparePair` and `rowsOf` from the HTTP
+call. All three reached 100% branches afterwards, and the separation is the finding
+rather than the number.
+
+Two arms stay uncovered and are named rather than chased: `send`'s empty-body arm
+and `credentialAttack`'s mint-failure arm, both of which need an HTTP fake in a
+file whose subject is real HTTP.
+
+## What the suite does not cover
+
+The suite says so itself, at the top of the file a reader meets first:
+
+```ts title="services/api/src/isolation/gauntlet.itest.ts"
+// TIMING. A foreign id answering in 3 ms and an absent id in 30 ms is a disclosure
+// this suite cannot see. Measuring that stably in CI is a different discipline and
+// is not attempted here; the chapter names it as unaddressed rather than implying
+// it is covered.
+//
+// A LEAKED PLATFORM CREDENTIAL. FR-044 narrowed which routes each internal service
+// may call, and that is all it did. There is no rotation, and `service` is
+// self-reported by which variable matched — so the change shrinks the blast radius
+// of a leak and does not make one survivable.
+//
+// MESSAGE CONTENT BEYOND EQUALITY. The pair proves the two answers match. It does
+// not prove that what they say is wise: a constant message leaking a schema detail
+// would pass every assertion below.
+```
+
+The eleven are still there, and one of them got sharper rather than being left
+alone. `repository.itest.ts`'s membership assertion read `false` for three
+different refusals — the channel is not yours, the user is not yours, and you asked
+twice. Conflating the first two is the property; conflating the third with them is
+a bug waiting for an endpoint:
+
+```diff title="services/api/src/db/repository.itest.ts"
+-    expect(await repoA.addMember(channel!.id, user!.id)).toBe(true);
+-    // B holds A's REAL ids — and still cannot write or read through them.
+-    expect(await repoB.addMember(channel!.id, user!.id)).toBe(false);
++    expect(await repoA.addMember(channel!.id, user!.id)).toBe("added");
++    expect(await repoA.addMember(channel!.id, user!.id)).toBe("already_a_member");
++    // B holds A's REAL ids — and still cannot write or read through them. The
++    // answer is `not_found`, which is also what B gets for ids that exist
++    // nowhere: three refusals, one word, on purpose.
++    expect(await repoB.addMember(channel!.id, user!.id)).toBe("not_found");
+```
+
+The endpoint that needed the distinction is chapter 3.13's. The isolation half of
+it belongs here, because `not_found` covering both foreign cases is the property
+FR-TEN-05 asks for and it is now written down as a word rather than as a boolean
+somebody has to interpret.
+
+A defence trusted past its range is worse than none, and this is the difference
+between this suite and the eleven assertions it joins. The eleven are still there,
+still passing, counted before and after — the gauntlet adds to the isolation
+surface rather than relocating it off the code the coverage run measures.
+
+<Checkpoint>
+
+- `pnpm test:integration` — 407 tests, ten tasks, green
+- `gauntlet targets: 24 derived, 21 attacked, 3 exempt`
+- `tenant paths: 22 base tables — 12 direct, 2 hop, 8 spine`
+- the gauntlet: 21 tests, including three that prove the attacker works
+- the socket gauntlet: 19 tests, four verbs and ten frames
+- three reintroductions, two red on the first attempt, all three reverted
+
+</Checkpoint>
+
+<ForwardRef part="chapters 3.13 and 3.14">
+
+The two endpoints this chapter's suite found — `POST /v1/channels` and
+`POST /v1/channels/:channelId/members` — and the instruments that verify the
+verifiers are chapter 3.13. The error vocabulary, the sealed outsider and the
+Phase 2 exit criterion's verdict are chapter 3.14.
+
+</ForwardRef>
+
+<ChapterFooter id="3.12" />
