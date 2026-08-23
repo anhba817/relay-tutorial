@@ -510,7 +510,7 @@ export const series: Part[] = [
         id: "3.13",
         path: "/part-3/chapter-13/the-endpoints-and-the-instruments",
         title: "The endpoints and the instruments",
-        status: "forthcoming",
+        status: "published",
         // Split out of 3.12 on a measurement, not a feeling: the two chapters'
         // surface came to 61 files against an estimate of 37, and the
         // 2,000-4,000 prose-word bound cannot hold that. This half is the two
@@ -521,6 +521,8 @@ export const series: Part[] = [
         sourceDoc: "docs/04-srs.md",
         readerMinutes: 80,
         titleVi: "Các endpoint và các thiết bị đo",
+        readerProducesVi:
+          "Hai endpoint công khai mà Part 3 cần và chưa ai xây, tính đẳng xâm (idempotent) do unique index bảo đảm chứ không phải do bộ nhớ ứng dụng, mọi lỗi validation lần đầu tiên gọi tên field của nó, guard thao tác toàn cục canh chín bảng thay vì năm, và độ phủ nhánh của tầng repository được trả lời bằng một con số",
       },
       {
         id: "3.14",

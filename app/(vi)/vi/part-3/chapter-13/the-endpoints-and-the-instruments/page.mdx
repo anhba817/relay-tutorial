@@ -1,0 +1,1685 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figTwoEndpoints, figThreeOutcomes, figOneRuleName, figBaitMustNotBeClaimable } from "./figures";
+
+export const metadata = {
+  title: "Các endpoint và các thiết bị đo — Building Relay",
+  description:
+    "Cửa ải tìm ra hai endpoint mà Part 3 cần và chưa ai xây. Xây chúng làm lộ ba hàm vốn vẫn ổn khi chỉ là fixture, và việc đi kiểm chính các thiết bị dùng để kiểm cô lập phát hiện một trong số đó đã bị tắt cho mọi integration test trong workspace.",
+  alternates: {
+    canonical: "/vi/part-3/chapter-13/the-endpoints-and-the-instruments",
+    languages: {
+      en: "/part-3/chapter-13/the-endpoints-and-the-instruments",
+      vi: "/vi/part-3/chapter-13/the-endpoints-and-the-instruments",
+    },
+  },
+};
+
+<ChapterHeader id="3.13" locale="vi" />
+
+Chương 3.12 dựng một bộ test tấn công mọi endpoint mà platform phục vụ. Trong lúc
+suy ra danh sách mục tiêu, nó lộ ra một điều bản plan không có: **không có cách công
+khai nào để tạo một channel, hay để thêm một member vào channel.**
+
+`packages/e2e/src/harness.ts` đã nói điều đó từ chương 2.8, trong một comment mà
+chưa ai có lý do để đọc lại:
+```ts
+/** DECISION (chapter 2.8): the suite seeds through the api's own repository
+ * layer, imported from its build output. There is no admin API to create an
+ * environment, a user or a channel yet — that is Part 3's tenancy work — and
+ * inventing one for a test would be inventing product. */
+```
+
+Part 3 kết thúc ở 3.14. Vậy là "phần việc tenancy của Part 3" chỉ còn cách hai
+chương nữa là không bao giờ xảy ra, và tiêu chí ra khỏi Phase 2 của SRS — *một
+developer bên ngoài tích hợp chỉ bằng tài liệu công khai* — là bất khả thi vì một lý
+do chẳng liên quan gì đến tài liệu. Không có cách công khai nào để tạo ra một channel
+mà gửi tin nhắn vào.
+
+Chương này xây hai endpoint mở lối cho việc đó, rồi quay đúng câu hỏi ấy về phía các
+thiết bị đo: những thứ dùng để kiểm cô lập cũng là code, và chưa ai đi kiểm chúng.
+
+## Hai endpoint, và điều một endpoint cần mà một fixture thì không
+
+<Figure caption="Việc tạo là đẳng xâm (idempotent) trên chính identifier của khách hàng, và status nói rõ chuyện nào đã xảy ra. Đường thêm member đọc channel đã-scope TRƯỚC TIÊN, nên một id của người khác và một id không tồn tại trả lời y hệt nhau trước khi có bất kỳ việc gì được làm." chart={figTwoEndpoints} />
+
+Các body đều strict, và một field trong đó là nhát cắt sắc nhất của cặp chương này:
+```ts title="services/api/src/channels/channels.schema.ts"
+import { z } from "zod";
+
+// THE PUBLIC CHANNEL SURFACE'S BODIES (FR-016, FR-CHN-01, FR-CHN-06, NFR-SEC-04).
+//
+// Both strict: an unknown field is a rejection, not a silently ignored typo. An
+// integrating developer who writes `externalId` instead of `external_id` finds out
+// on the first call rather than after wondering why the name never appears.
+
+/** 8 KB, the same bound `channels.metadata` has had since chapter 2.1 — the
+ * column is jsonb with a `{}` default, so this is a limit on what a caller may
+ * send and not a new capability. Measured on the JSON text, because that is what
+ * the column stores and what the row costs. */
+const METADATA_BYTES = 8 * 1024;
+
+const metadataSchema = z
+  .record(z.string(), z.unknown())
+  .refine((value) => Buffer.byteLength(JSON.stringify(value), "utf8") <= METADATA_BYTES, {
+    message: `metadata must be at most ${METADATA_BYTES} bytes of JSON`,
+  });
+
+export const createChannelBodySchema = z.strictObject({
+  external_id: z.string().min(1).max(255),
+  // `public` AND NOTHING ELSE, and this is the chapter's sharpest edit (FR-047).
+  //
+  // `channels.type` has been a `"public" | "private"` column with a CHECK
+  // constraint since chapter 2.1, and NOTHING IN THE PLATFORM READS IT. History
+  // and send scope by `environment_id` alone; there is no membership check on any
+  // read path. So FR-CHN-05 — a P1 clause promising that a private channel is
+  // visible only to its members — is unimplemented.
+  //
+  // An endpoint accepting `private` would sell a guarantee the platform does not
+  // keep, and it would do it in the chapter whose exit criterion is that an
+  // outsider can integrate on the documentation alone. The enum is `public`
+  // today; FR-CHN-03's private half goes to chapter 3.15 with FR-CHN-05, where
+  // the read paths are made to honour it.
+  type: z.enum(["public"]),
+  name: z.string().min(1).max(255).optional(),
+  metadata: metadataSchema.optional(),
+});
+
+export type CreateChannelBody = z.infer<typeof createChannelBodySchema>;
+
+/** FR-CHN-06's page: at most 100 users in one call. The channel's own ceiling is
+ * 1,000 (FR-CHN-07) and is enforced in the service against a counted read — this
+ * only bounds the size of a single request. */
+export const addMembersBodySchema = z.strictObject({
+  user_ids: z.array(z.string().min(1).max(255)).min(1).max(100),
+});
+
+export type AddMembersBody = z.infer<typeof addMembersBodySchema>;
+
+/** FR-CHN-07. A structural limit on one channel, not a monthly quota — see
+ * `channel_member_limit_exceeded` in the registry for why it is not
+ * `quota_exceeded`. */
+export const CHANNEL_MEMBER_LIMIT = 1000;
+```
+
+<Trap title="`private` bị từ chối, và cột đó đã nhận nó từ chương 2.1" locale="vi">
+
+`channels.type` là `"public" | "private"` kèm một CHECK constraint từ migration đầu
+tiên. **Không có gì trong platform đọc nó.** History scope theo `environment_id`;
+send scope theo `environment_id`; không có phép kiểm membership nào trên bất kỳ
+đường read nào, ở bất cứ đâu.
+
+Nên FR-CHN-05 — một mệnh đề P1 hứa rằng một channel private chỉ hiện với các member
+của nó — là chưa được hiện thực, và đã như vậy mười một chương. Một endpoint nhận
+`private` sẽ bán một lời bảo đảm mà platform không giữ, và nó sẽ làm thế ngay trong
+phần mà tiêu chí ra là một người ngoài tích hợp được chỉ bằng tài liệu.
+
+Enum là `public` và không gì khác. Nửa private của FR-CHN-03 đi sang chương 3.15 cùng
+FR-CHN-05, nơi các đường read được sửa để tôn trọng nó.
+
+</Trap>
+
+Service thì mỏng, và thứ tự bên trong nó là tính chất cô lập chứ không phải một sự
+tiện tay:
+```ts title="services/api/src/channels/channels.service.ts"
+import { HttpStatus, Injectable, NotFoundException } from "@nestjs/common";
+
+import { protocolError } from "../protocol-error";
+
+import { Repository, type ChannelRow } from "../db/repository";
+import { CHANNEL_MEMBER_LIMIT, type AddMembersBody, type CreateChannelBody } from "./channels.schema";
+
+// THE TWO ENDPOINTS PART 3 NEEDED AND NOBODY HAD BUILT (FR-016 to FR-019).
+//
+// `packages/e2e/src/harness.ts` has said since chapter 2.8 that creating a channel
+// and adding a member is "Part 3's tenancy work". Part 3 ends at 3.12, and this
+// chapter's exit criterion is that an outsider integrates on public documentation
+// alone — which was unreachable for a reason that had nothing to do with
+// documentation: there was no public way to make a channel to send a message to.
+//
+// This is the minimum that unblocks it. The rest of FR-CHN and all of FR-USR go to
+// chapter 3.13.
+
+export interface CreatedChannel {
+  channel: ChannelRow;
+  /** 201 or 200 at the controller. FR-CHN-02 says return the existing channel; it
+   * does not say return the same status, and the difference is something an
+   * integrating developer can act on — chapter 2.3 drew the same line for a
+   * duplicate send. */
+  created: boolean;
+}
+
+export interface MemberResult {
+  user_id: string;
+  external_id: string;
+  status: "added" | "already_a_member";
+}
+
+@Injectable()
+export class ChannelsService {
+  constructor(private readonly repo: Repository) {}
+
+  async create(body: CreateChannelBody): Promise<CreatedChannel> {
+    const result = await this.repo.createChannel(
+      body.external_id,
+      body.type,
+      body.name,
+      body.metadata,
+    );
+    const { created, ...channel } = result;
+    return { channel, created };
+  }
+
+  /** Members by EXTERNAL id, and a user is created on first membership (FR-CHN-04).
+   *
+   * THE CHANNEL IS READ SCOPED FIRST, and that ordering is the isolation property
+   * rather than a convenience. A foreign channel id and one that exists nowhere both
+   * fail this read, so both answer with the same 404 and neither reveals that the
+   * other tenant's channel is there. If the ceiling or the user creation happened
+   * first, a foreign id would spend work — and could answer differently — before
+   * anyone checked whose channel it was. */
+  async addMembers(channelId: string, body: AddMembersBody): Promise<MemberResult[]> {
+    if (!(await this.repo.channelExists(channelId))) {
+      // A CONSTANT message. Echoing the id back would make the foreign-id answer
+      // differ from the absent-id answer, and different is itself a disclosure
+      // (FR-TEN-05).
+      throw new NotFoundException("channel not found");
+    }
+
+    // FR-CHN-07's ceiling, counted from storage rather than trusted from the
+    // request. Checked BEFORE any user is created: a refused call must not leave
+    // rows behind, and creating users for a request about to be refused would do
+    // exactly that.
+    const existing = await this.repo.countMembers(channelId);
+    if (existing + body.user_ids.length > CHANNEL_MEMBER_LIMIT) {
+      throw protocolError(
+        "channel_member_limit_exceeded",
+        `this channel holds ${existing} of ${CHANNEL_MEMBER_LIMIT} members; ` +
+          `adding ${body.user_ids.length} would exceed the limit`,
+        HttpStatus.UNPROCESSABLE_ENTITY,
+      );
+    }
+
+    const results: MemberResult[] = [];
+    for (const externalId of body.user_ids) {
+      const user = await this.repo.createUser(externalId);
+      const outcome = await this.repo.addMember(channelId, user.id);
+      if (outcome === "not_found") {
+        // The channel was read above and both ids are this environment's, so this
+        // is not reachable by a foreign request — it means the channel was deleted
+        // between the read and here. Answer as the read would have.
+        throw new NotFoundException("channel not found");
+      }
+      results.push({ user_id: user.id, external_id: externalId, status: outcome });
+    }
+    return results;
+  }
+}
+```
+
+<Why title="Vì sao lượt read đã-scope phải đi trước" locale="vi">
+
+`channelExists` đã được scope, nên một channel thuộc tenant khác và một channel chưa
+bao giờ tồn tại đều fail nó — và cả hai nhận đúng một cái 404 với đúng một body. Nếu
+phép kiểm ngưỡng hay việc tạo user chạy trước, một id lạ sẽ tiêu tốn công việc trước
+khi có ai hỏi channel đó của ai, và có thể trả lời khác đi vì đã tiêu tốn công đó.
+
+Ngưỡng được đếm từ storage, cùng lý do mà nó được kiểm trước khi tạo bất kỳ user nào:
+một lượt gọi bị từ chối không được để lại row nào, mà tạo user cho một request sắp bị
+từ chối thì để lại đúng điều đó.
+
+</Why>
+```ts title="services/api/src/channels/channels.controller.ts"
+import { Body, Controller, HttpCode, Param, Post, Res, UseGuards } from "@nestjs/common";
+
+import { Accepts, CredentialGuard } from "../auth/credential.guard";
+import { ZodValidationPipe } from "../messages/zod-validation.pipe";
+import { ChannelsService } from "./channels.service";
+import { addMembersBodySchema, createChannelBodySchema } from "./channels.schema";
+import type { AddMembersBody, CreateChannelBody } from "./channels.schema";
+
+// THE PUBLIC CHANNEL SURFACE (FR-016, FR-019, data-model.md §7).
+//
+// `@Accepts("application")` and not both classes: creating a channel and deciding
+// who is in it are server-side acts. An end-user token is minted for one person
+// (FR-AUT-10), and a person adding themselves to a channel is a product decision
+// this chapter is not making — chapter 3.15 owns the user-facing surface.
+/** The one thing this controller needs from the response object.
+ *
+ * Declared rather than imported, which is chapter 3.4's decision in
+ * `signup.controller.ts` and its reason still holds: `@Res()` normally means
+ * importing express's `Response` type, express 5 ships no types, and adding
+ * `@types/express` for one method signature would move the api's dependency list
+ * for nothing. */
+interface HttpResponse {
+  status(code: number): unknown;
+}
+
+@Controller("v1/channels")
+@UseGuards(CredentialGuard)
+@Accepts("application")
+export class ChannelsController {
+  constructor(private readonly channels: ChannelsService) {}
+
+  /** 201 on creation, 200 on the idempotent repeat (FR-017, FR-CHN-02).
+   *
+   * `@Res({ passthrough: true })` rather than a fixed `@HttpCode`, because the
+   * status is the answer here: FR-CHN-02 says return the existing channel, and an
+   * integrating developer who cannot tell "I made this" from "this was already
+   * here" has to go and read the body to find out. Chapter 2.3 drew the same line
+   * for a duplicate send. */
+  @Post()
+  async create(
+    @Body(new ZodValidationPipe(createChannelBodySchema)) body: CreateChannelBody,
+    @Res({ passthrough: true }) res: HttpResponse,
+  ) {
+    const { channel, created } = await this.channels.create(body);
+    res.status(created ? 201 : 200);
+    return {
+      id: channel.id,
+      external_id: channel.external_id,
+      type: channel.type,
+      name: channel.name,
+      metadata: channel.metadata,
+    };
+  }
+
+  /** Members by external id, users created on first membership (FR-CHN-04).
+   *
+   * 200 and not 201: this is idempotent in a way creation is not — a member list
+   * sent twice is the same list, and the per-user `status` says which ones were
+   * already there. */
+  @Post(":channelId/members")
+  @HttpCode(200)
+  async addMembers(
+    @Param("channelId") channelId: string,
+    @Body(new ZodValidationPipe(addMembersBodySchema)) body: AddMembersBody,
+  ) {
+    return { members: await this.channels.addMembers(channelId, body) };
+  }
+}
+```
+
+```ts title="services/api/src/channels/channels.module.ts"
+import { Module, Scope } from "@nestjs/common";
+import { REQUEST } from "@nestjs/core";
+
+import { AuthModule } from "../auth/auth.module";
+import { createDb, createPool, type Db } from "../db/client";
+import { Repository } from "../db/repository";
+import { ChannelsController } from "./channels.controller";
+import { ChannelsService } from "./channels.service";
+import type { RequestWithTenant } from "../messages/request-with-tenant";
+
+// The messages module's shape, for the messages module's reasons: the repository
+// is the plain 2.1 class, constructed per request with the tenant the middleware
+// already resolved from a verified credential (ADR-15).
+@Module({
+  imports: [AuthModule],
+  controllers: [ChannelsController],
+  providers: [
+    {
+      provide: "DB",
+      useFactory: (): Db => createDb(createPool()),
+      scope: Scope.DEFAULT,
+    },
+    {
+      provide: Repository,
+      scope: Scope.REQUEST,
+      inject: ["DB", REQUEST],
+      useFactory: (db: Db, req: RequestWithTenant) =>
+        new Repository(db, req.principal?.environmentId ?? ""),
+    },
+    ChannelsService,
+  ],
+})
+export class ChannelsModule {}
+```
+
+```diff title="services/api/src/app.module.ts"
+@@ -10,6 +10,7 @@ import { AuthenticateMiddleware } from "./auth/authenticate.middleware";
+ import { HealthController } from "./health.controller";
+ import { InternalModule } from "./internal/internal.module";
+ import { MessagesModule } from "./messages/messages.module";
++import { ChannelsModule } from "./channels/channels.module";
+ import { ConsumerModule } from "./consumer/consumer.module";
+ import { NotificationsModule } from "./notifications/notifications.module";
+ import { QuotasModule } from "./quotas/quotas.module";
+@@ -30,6 +31,7 @@ import { RequestContextMiddleware } from "./request-context.middleware";
+   imports: [
+     AuthModule,
+     MessagesModule,
++    ChannelsModule,
+     InternalModule,
+     TenancyModule,
+     OutboxModule,
+```
+
+## Ba hàm vốn vẫn ổn khi chỉ là fixture
+
+<Figure caption="Boolean cũ gộp ba câu trả lời làm một. Hai trong ba PHẢI được gộp — đó là FR-TEN-05 — còn cái thứ ba là một unique violation đi ra tới wire thành một cái 500." chart={figThreeOutcomes} />
+
+`addMember`, `createChannel` và `createUser` đã tồn tại từ chương 2.1 và cả ba đều là
+insert trơn. Điều đó đúng với một fixture, thứ tự kiểm soát input của chính nó. Nó
+không đỡ được một endpoint.
+
+`members` có primary key `(channel_id, user_id)`, nên hỏi hai lần thì ném unique
+violation, và `ProtocolErrorFilter` render một unique violation thành
+`internal_error`. Một client thêm một member vốn đã ở đó nhận một cái 500.
+```diff title="services/api/src/db/repository.ts"
+@@ -2190,20 +2190,32 @@ export interface UserRow {
+   id: string;
+   external_id: string;
+   display_name: string | null;
+ }
+ 
+ export interface ChannelRow {
+   id: string;
+   external_id: string;
++  /** The column has been `"public" | "private"` with a CHECK constraint since
++   * chapter 2.1. NOTHING READS IT: history and send scope by `environment_id`
++   * alone and there is no membership check anywhere, so FR-CHN-05's private
++   * guarantee is unimplemented. The public create endpoint accepts `public` only
++   * (chapter 3.12, FR-047) — this type stays as the column is, because rows
++   * seeded before that endpoint existed can still say `private`. */
+   type: "public" | "private";
+   name: string | null;
++  metadata: Record<string, unknown>;
+ }
+ 
++/** What `addMember` did. `not_found` deliberately covers "the channel is not
++ * yours", "the user is not yours" and "neither exists" — the caller must not be
++ * able to tell those apart (FR-018, FR-TEN-05). */
++export type AddMemberOutcome = "added" | "already_a_member" | "not_found";
++
+ export interface MessageRow {
+   id: string;
+   channel_id: string;
+   seq: number;
+   text: string | null;
+   created_at: string;
+   /** Chapter 2.3 (FR-MSG-04): true when a retry was recognised by the
+    * idempotency index and the ORIGINAL message was returned instead of
+@@ -2535,25 +2547,48 @@ export class Repository {
+       created_at: r.createdAt.toISOString(),
+       disabled_at: r.disabledAt?.toISOString() ?? null,
+       disabled_reason: r.disabledReason,
+       failure_run_started_at: r.failureRunStartedAt?.toISOString() ?? null,
+       failure_run_attempts: r.failureRunAttempts,
+     }));
+   }
+ 
++  /** IDEMPOTENT, for `createChannel`'s reason and found the same way (chapter
++   * 3.12). This was a plain insert too, and the members endpoint creates a user
++   * on first membership — so a second identical request would have raised against
++   * `users_environment_id_external_id_unique` and answered `internal_error`. R14a
++   * named `addMember` and `createChannel`; this is the third function on the same
++   * request path and it had the same fault.
++   *
++   * Not a read-then-insert in the service, for the same reason as there:
++   * concurrent first-membership adds of one user race, and Principle II requires
++   * the unique index to be what enforces this rather than application memory. */
+   async createUser(externalId: string, displayName?: string): Promise<UserRow> {
+     const id = randomUUID();
+-    await this.db.insert(users).values({
+-      id,
+-      environmentId: this.environmentId,
+-      externalId,
+-      displayName: displayName ?? null,
+-    });
+-    return { id, external_id: externalId, display_name: displayName ?? null };
++    const inserted = await this.db
++      .insert(users)
++      .values({
++        id,
++        environmentId: this.environmentId,
++        externalId,
++        displayName: displayName ?? null,
++      })
++      .onConflictDoNothing({ target: [users.environmentId, users.externalId] })
++      .returning({ id: users.id });
++
++    if (inserted.length > 0) {
++      return { id, external_id: externalId, display_name: displayName ?? null };
++    }
++    const existing = await this.getUserByExternalId(externalId);
++    if (existing === null) throw new Error(`user ${externalId} could not be created or read`);
++    // The DISPLAY NAME OF THE EXISTING ROW WINS. A second call is not an update:
++    // FR-CHN-04 asks for membership, and quietly renaming a user because someone
++    // re-sent a member list would be a write nobody asked for.
++    return existing;
+   }
+ 
+   async getUserByExternalId(externalId: string): Promise<UserRow | null> {
+     const rows = await this.db
+       .select({
+         id: users.id,
+         external_id: users.externalId,
+         display_name: users.displayName,
+@@ -2563,39 +2598,77 @@ export class Repository {
+         and(
+           eq(users.environmentId, this.environmentId),
+           eq(users.externalId, externalId),
+         ),
+       );
+     return rows[0] ?? null;
+   }
+ 
++  /** IDEMPOTENT ON THE CUSTOMER'S OWN IDENTIFIER (FR-017, FR-CHN-02).
++   *
++   * This was a plain insert until chapter 3.12, which is fine for a fixture and
++   * cannot back an endpoint: a repeated `external_id` raises against
++   * `channels_environment_id_external_id_unique`, and `ProtocolErrorFilter`
++   * renders a unique violation as `internal_error`. The second call in an
++   * integration guide would have been a 500.
++   *
++   * `ON CONFLICT DO NOTHING RETURNING` and not a read-then-insert in the
++   * service: that races, and Principle II requires idempotency enforced at the
++   * storage layer by a unique index rather than in application memory. The
++   * fallback read is not the check — it is how the loser of a race learns what
++   * the winner wrote. */
+   async createChannel(
+     externalId: string,
+     type: ChannelRow["type"],
+     name?: string,
+-  ): Promise<ChannelRow> {
++    metadata?: Record<string, unknown>,
++  ): Promise<ChannelRow & { created: boolean }> {
+     const id = randomUUID();
+-    await this.db.insert(channels).values({
+-      id,
+-      environmentId: this.environmentId,
+-      externalId,
+-      type,
+-      name: name ?? null,
+-    });
+-    return { id, external_id: externalId, type, name: name ?? null };
++    const inserted = await this.db
++      .insert(channels)
++      .values({
++        id,
++        environmentId: this.environmentId,
++        externalId,
++        type,
++        name: name ?? null,
++        ...(metadata !== undefined ? { metadata } : {}),
++      })
++      .onConflictDoNothing({ target: [channels.environmentId, channels.externalId] })
++      .returning({ id: channels.id });
++
++    if (inserted.length > 0) {
++      return {
++        id,
++        external_id: externalId,
++        type,
++        name: name ?? null,
++        metadata: metadata ?? {},
++        created: true,
++      };
++    }
++    const existing = await this.getChannelByExternalId(externalId);
++    if (existing === null) {
++      // Nothing inserted and nothing there: the row belongs to another
++      // environment, which this repository is scoped away from. Callers see the
++      // same answer they would see for a channel that does not exist.
++      throw new Error(`channel ${externalId} could not be created or read`);
++    }
++    return { ...existing, created: false };
+   }
+ 
+   async getChannelByExternalId(externalId: string): Promise<ChannelRow | null> {
+     const rows = await this.db
+       .select({
+         id: channels.id,
+         external_id: channels.externalId,
+         type: sql<ChannelRow["type"]>`${channels.type}`,
+         name: channels.name,
++        metadata: sql<Record<string, unknown>>`${channels.metadata}`,
+       })
+       .from(channels)
+       .where(
+         and(
+           eq(channels.environmentId, this.environmentId),
+           eq(channels.externalId, externalId),
+         ),
+       );
+@@ -2604,35 +2677,100 @@ export class Repository {
+ 
+   async listChannels(): Promise<ChannelRow[]> {
+     return this.db
+       .select({
+         id: channels.id,
+         external_id: channels.externalId,
+         type: sql<ChannelRow["type"]>`${channels.type}`,
+         name: channels.name,
++        metadata: sql<Record<string, unknown>>`${channels.metadata}`,
+       })
+       .from(channels)
+       .where(eq(channels.environmentId, this.environmentId))
+       .orderBy(asc(channels.externalId));
+   }
+ 
+   /** Membership joins live in channel-land, so the tenant scope rides the
+    * channel: the double-scoped SELECT below is what makes a foreign channel
+    * id useless. INSERT ... SELECT is where the builder falls short — this
+    * is the layer's one raw SQL island, permitted by ADR-16 and kept inside
+-   * the wall like everything else. */
+-  async addMember(channelId: string, userId: string): Promise<boolean> {
+-    const result = await this.db.execute(
++   * the wall like everything else.
++   *
++   * THREE OUTCOMES, NOT A BOOLEAN (chapter 3.12, R14a). Until then this returned
++   * `false` for all of: the channel is not yours, the user is not yours, and you
++   * asked twice. Conflating the first two is right and is the whole point — a
++   * foreign id must be indistinguishable from an absent one. Conflating the third
++   * with them is wrong, and it cannot back an endpoint: `members`' primary key is
++   * `(channel_id, user_id)`, so before the `ON CONFLICT` below a repeat raised a
++   * unique violation that reached the wire as `internal_error`.
++   *
++   * `not_found` keeps the conflation the isolation property needs. The follow-up
++   * read distinguishes it from `already_a_member` — and it is a read, not a
++   * check-then-write: the insert already happened. */
++  async addMember(channelId: string, userId: string): Promise<AddMemberOutcome> {
++    const inserted = await this.db.execute(
+       sql`INSERT INTO members (channel_id, user_id)
+           SELECT c.id, u.id FROM channels c, users u
+           WHERE c.id = ${channelId} AND c.environment_id = ${this.environmentId}
+-            AND u.id = ${userId} AND u.environment_id = ${this.environmentId}`,
++            AND u.id = ${userId} AND u.environment_id = ${this.environmentId}
++          ON CONFLICT (channel_id, user_id) DO NOTHING
++          RETURNING channel_id`,
+     );
+-    return (result.rowCount ?? 0) > 0;
++    // `RETURNING` and `.rows.length`, not `rowCount ?? 0`. `rowCount` is typed
++    // `number | null` by the driver and is never null for an INSERT, so the `??`
++    // was a branch nothing could take — one uncovered arm in the file
++    // constitution VI asks for 100% of, bought for nothing. A row that came back
++    // is a row that was inserted.
++    if (inserted.rows.length > 0) return "added";
++
++    const existing = await this.db
++      .select({ userId: members.userId })
++      .from(members)
++      .innerJoin(channels, eq(channels.id, members.channelId))
++      .where(
++        and(
++          eq(members.channelId, channelId),
++          eq(members.userId, userId),
++          eq(channels.environmentId, this.environmentId),
++        ),
++      );
++    return existing.length > 0 ? "already_a_member" : "not_found";
++  }
++
++  /** How many deliveries an endpoint holds, scoped. Added for chapter 3.12's
++   * `expand` attack, which has to read the victim's side to prove nothing moved —
++   * and it lives HERE rather than in the test because the restored lint ban
++   * (R23, FR-043) puts the query engine in this directory and nowhere else. The
++   * isolation suite is written to that constraint rather than exempted from it,
++   * which is the whole point of restoring it in the same chapter. */
++  async countDeliveriesForEndpoint(endpointId: string): Promise<number> {
++    const rows = await this.db
++      .select({ id: webhookDeliveries.id })
++      .from(webhookDeliveries)
++      .where(
++        and(
++          eq(webhookDeliveries.endpointId, endpointId),
++          eq(webhookDeliveries.environmentId, this.environmentId),
++        ),
++      );
++    return rows.length;
++  }
++
++  /** How many members a channel holds, scoped — FR-CHN-07's ceiling is checked
++   * against this rather than against a count the caller supplies. */
++  async countMembers(channelId: string): Promise<number> {
++    const rows = await this.db
++      .select({ userId: members.userId })
++      .from(members)
++      .innerJoin(channels, eq(channels.id, members.channelId))
++      .where(
++        and(eq(members.channelId, channelId), eq(channels.environmentId, this.environmentId)),
++      );
++    return rows.length;
+   }
+ 
+   async listMembers(channelId: string): Promise<string[]> {
+     const rows = await this.db
+       .select({ user_id: members.userId })
+       .from(members)
+       .innerJoin(channels, eq(channels.id, members.channelId))
+       .where(
+```
+
+<Why title="Vì sao là `ON CONFLICT` chứ không phải một lượt read trong service" locale="vi">
+
+Hình dạng hiển nhiên là đọc trước rồi insert nếu chưa có. Cái đó race: hai lượt thêm
+member-lần-đầu song song cho cùng một user đều thấy trống và đều insert.
+
+Nguyên tắc II nói rõ — tính đẳng xâm được "bảo đảm ở tầng storage (unique index),
+không phải trong bộ nhớ ứng dụng" — và unique index chính là thứ bảo đảm ở đây. Lượt
+read dự phòng không phải phép kiểm. Nó là cách kẻ thua trong một cuộc race biết được
+kẻ thắng đã ghi gì.
+
+</Why>
+
+<Trap title="R14a gọi tên hai trong ba" locale="vi">
+
+Ghi chú nghiên cứu tìm ra chuyện này gọi tên `addMember` và `createChannel`.
+`createUser` có cùng lỗi, nằm trên cùng đường request — endpoint members tạo một user
+ở lần thêm member đầu tiên — và sẽ trả `internal_error` cho một request thứ hai giống
+hệt.
+
+Ba hàm, một hình dạng lỗi, và một ghi chú bắt được hai. Cái thứ ba được tìm ra khi
+viết service gọi cả ba.
+
+</Trap>
+
+Thay đổi đó với tới một assertion đã có, và điều xảy ra với nó đáng giá hơn cả bản
+thay đổi:
+```diff title="packages/e2e/src/harness.ts"
+@@ -51,7 +51,33 @@ const forwarded = (...names: string[]): Record<string, string> =>
+  * layer, imported from its build output. There is no admin API to create an
+  * environment, a user or a channel yet — that is Part 3's tenancy work — and
+  * inventing one for a test would be inventing product. The import is a
+- * test-only seam with a named retirement, like 2.3's `listMessagesRaw`. */
++ * test-only seam with a named retirement, like 2.3's `listMessagesRaw`.
++ *
++ * REASSESSED IN CHAPTER 3.12 (T063a), and two of the three now have an API.
++ * `POST /v1/channels` and `POST /v1/channels/:channelId/members` are public, and
++ * the members route creates a user on first membership — so `createChannel`,
++ * `createUser` and `addMember` could all come off this seam today. The list it
++ * still NEEDS is shorter than the list it uses:
++ *
++ *   still needed   createEnvironment   no admin API, and none is planned before
++ *                                      the dashboard
++ *                  createApiKey        the same, and for the same chapter
++ *                  sendMessage         only to write an UNATTRIBUTED row, which
++ *                                      is what `journey 4` needs a foreign tenant
++ *                                      to hold; the public send writes exactly
++ *                                      that, so this one is convenience rather
++ *                                      than necessity
++ *   no longer       createChannel      POST /v1/channels
++ *                  createUser         created on first membership
++ *                  addMember          POST /v1/channels/:channelId/members
++ *
++ * NOT MIGRATED HERE, and the reason is the one this chapter keeps running into:
++ * `packages/e2e` is excluded from the coverage run by name, so moving its seeding
++ * to public HTTP would prove nothing the branch figures can see, and it would
++ * rewrite four journeys in a chapter about isolation. `services/gateway/src/
++ * public-surface.itest.ts` makes the same claim where the coverage run does look,
++ * and `packages/outsider` makes the stronger one in a package that cannot import
++ * this file at all. The migration is chapter 3.15's, with the rest of FR-CHN. */
+ interface Seeder {
+   createEnvironment: (
+     db: unknown,
+```
+
+Đường nối 2.8 ngắn đi ba hàm. `createChannel`, `createUser` và `addMember` giờ đều có
+thể rời khỏi nó; `createEnvironment`, `createApiKey` và `sendMessage` thì ở lại, vì
+vẫn chưa có cách công khai nào lấy hai cái đầu và cái thứ ba chỉ dùng để ghi một row
+không có người gửi. Nêu ra như một hiệu số chứ không phải một cuộc di trú:
+`packages/e2e` bị loại khỏi lượt đo coverage theo tên, nên chuyển phần seeding của nó
+sang HTTP công khai sẽ không chứng minh được điều gì mà các con số nhánh nhìn thấy.
+
+## Cái field chưa ai từng gán
+
+Một channel private bị từ chối với `invalid_request`, và test đòi một thứ platform
+chưa làm được:
+```ts title="services/api/src/channels/channels.itest.ts"
+import "reflect-metadata";
+
+import { Test } from "@nestjs/testing";
+import type { INestApplication } from "@nestjs/common";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+
+import { AppModule } from "../app.module";
+import { createDb, createPool, type Db } from "../db/client";
+import { createApiKey, createEnvironment, Repository } from "../db/repository";
+import { withoutRequestId } from "../isolation/compare";
+import { CHANNEL_MEMBER_LIMIT } from "./channels.schema";
+
+// THE TWO ENDPOINTS, END TO END (FR-016 to FR-019, FR-047, FR-048, SC-014).
+//
+// The gauntlet attacks these too, from the derived list. This suite is the other
+// half: that they WORK, with the shapes an integrating developer is told to
+// expect. A route that refuses every cross-tenant request and also refuses every
+// legitimate one passes the gauntlet perfectly.
+
+describe("the public channel surface", () => {
+  let app: INestApplication;
+  let url: string;
+  let db: Db;
+  let credential: string;
+  let repo: Repository;
+  let foreignChannelId: string;
+  let foreignRepo: Repository;
+
+  beforeAll(async () => {
+    db = createDb(createPool());
+    const env = await createEnvironment(db, { name: "channels-itest" });
+    repo = new Repository(db, env.id);
+    credential = (await createApiKey(db, { environmentId: env.id })).credential;
+    const other = await createEnvironment(db, { name: "channels-itest-other" });
+    foreignRepo = new Repository(db, other.id);
+    foreignChannelId = (await foreignRepo.createChannel("theirs", "public")).id;
+    app = (
+      await Test.createTestingModule({ imports: [AppModule] }).compile()
+    ).createNestApplication({ logger: false });
+    await app.listen(0);
+    url = await app.getUrl();
+  }, 60_000);
+
+  afterAll(async () => {
+    await app?.close();
+  });
+
+  const create = (body: unknown, key = credential) =>
+    fetch(`${url}/v1/channels`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
+      body: JSON.stringify(body),
+    });
+
+  const addMembers = (channelId: string, body: unknown, key = credential) =>
+    fetch(`${url}/v1/channels/${channelId}/members`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
+      body: JSON.stringify(body),
+    });
+
+  describe("POST /v1/channels", () => {
+    it("creates a channel and answers 201", async () => {
+      const res = await create({ external_id: "created-201", type: "public", name: "Support" });
+      expect(res.status).toBe(201);
+      const body = (await res.json()) as Record<string, unknown>;
+      expect(body).toMatchObject({
+        external_id: "created-201",
+        type: "public",
+        name: "Support",
+      });
+      expect(typeof body["id"]).toBe("string");
+    });
+
+    it("answers the idempotent repeat with 200 and the same channel", async () => {
+      const first = await create({ external_id: "repeat", type: "public" });
+      expect(first.status).toBe(201);
+      const second = await create({ external_id: "repeat", type: "public" });
+      // 200 rather than 201, and FR-CHN-02's existing channel rather than a new
+      // one. The status is the part a client can act on without reading the body.
+      expect(second.status).toBe(200);
+      expect(await second.json()).toEqual(await first.json());
+    });
+
+    it("refuses type private, naming the field (FR-047)", async () => {
+      const res = await create({ external_id: "private-attempt", type: "private" });
+      expect(res.status).toBe(400);
+      const body = (await res.json()) as { code: string; message: string; field?: string };
+      expect(body.code).toBe("invalid_request");
+      // THE FIELD IS NAMED, and until this chapter no validation error in the api
+      // named one — EIR-API-04 has carried `field` since chapter 1.3 and nothing
+      // ever set it. A developer who tries `private` is told which key was
+      // refused instead of reading `Invalid input: expected "public"` and
+      // guessing.
+      expect(body.field).toBe("type");
+    });
+
+    it("round-trips metadata and refuses it over 8 KB", async () => {
+      const ok = await create({
+        external_id: "with-metadata",
+        type: "public",
+        metadata: { team: "fleet", tier: 2 },
+      });
+      expect(ok.status).toBe(201);
+      expect((await ok.json()) as Record<string, unknown>).toMatchObject({
+        metadata: { team: "fleet", tier: 2 },
+      });
+
+      const tooBig = await create({
+        external_id: "metadata-too-big",
+        type: "public",
+        metadata: { blob: "x".repeat(9 * 1024) },
+      });
+      expect(tooBig.status).toBe(400);
+      expect(((await tooBig.json()) as { code: string }).code).toBe("invalid_request");
+    });
+
+    it("refuses an unknown field rather than ignoring it", async () => {
+      const res = await create({ external_id: "typo", type: "public", externalId: "typo" });
+      expect(res.status).toBe(400);
+    });
+
+    it("lets two tenants own the same external id, independently", async () => {
+      const mine = await create({ external_id: "theirs", type: "public" });
+      expect(mine.status).toBe(201);
+      // `theirs` is the other environment's channel's external id, seeded above.
+      expect(((await mine.json()) as { id: string }).id).not.toBe(foreignChannelId);
+    });
+  });
+
+  describe("POST /v1/channels/:channelId/members", () => {
+    let channelId: string;
+
+    beforeAll(async () => {
+      channelId = ((await (await create({ external_id: "members", type: "public" })).json()) as {
+        id: string;
+      }).id;
+    });
+
+    it("adds members and creates the users on first membership", async () => {
+      const res = await addMembers(channelId, { user_ids: ["tuan", "mai"] });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { members: { external_id: string; status: string }[] };
+      expect(body.members.map((m) => m.external_id)).toEqual(["tuan", "mai"]);
+      expect(body.members.every((m) => m.status === "added")).toBe(true);
+      // The users did not exist a moment ago. FR-CHN-04: membership creates them.
+      expect(await repo.getUserByExternalId("tuan")).not.toBeNull();
+      expect((await repo.listMembers(channelId)).length).toBe(2);
+    });
+
+    it("says already_a_member on a repeat, and is not a 500 (T052)", async () => {
+      const res = await addMembers(channelId, { user_ids: ["tuan"] });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { members: { status: string }[] };
+      expect(body.members[0]?.status).toBe("already_a_member");
+      // Before this chapter `members`' primary key raised a unique violation here
+      // and `ProtocolErrorFilter` rendered it as `internal_error` — a 500 for a
+      // client doing something entirely reasonable.
+      expect((await repo.listMembers(channelId)).length).toBe(2);
+    });
+
+    it("refuses more than 100 in one call (FR-CHN-06)", async () => {
+      const res = await addMembers(channelId, {
+        user_ids: Array.from({ length: 101 }, (_, i) => `bulk-${i}`),
+      });
+      expect(res.status).toBe(400);
+    });
+
+    it("answers a foreign channel id exactly as an absent one (FR-018)", async () => {
+      const absent = "00000000-0000-4000-8000-000000000000";
+      const foreign = await addMembers(foreignChannelId, { user_ids: ["intruder"] });
+      const nowhere = await addMembers(absent, { user_ids: ["intruder"] });
+      expect(foreign.status).toBe(nowhere.status);
+      expect(withoutRequestId(await foreign.json())).toEqual(
+        withoutRequestId(await nowhere.json()),
+      );
+      // And the other tenant's channel gained nobody. Read through ITS OWN
+      // repository — a repository scoped to the empty string is not a scope, it is
+      // a query that fails on an invalid uuid, which is how this line read first.
+      expect(await foreignRepo.listMembers(foreignChannelId)).toEqual([]);
+    });
+  });
+
+  // ── T058a: the ceiling, read back rather than inferred ──────────────────────
+  describe("the member ceiling (FR-CHN-07, FR-048)", () => {
+    let fullChannelId: string;
+
+    beforeAll(async () => {
+      fullChannelId = ((await (
+        await create({ external_id: "at-the-ceiling", type: "public" })
+      ).json()) as { id: string }).id;
+      // Seeded through the repository rather than through 10 calls to the
+      // endpoint: the endpoint caps a single call at 100, and this test is about
+      // the CHANNEL's limit, not about how many requests it took to reach it.
+      for (let i = 0; i < CHANNEL_MEMBER_LIMIT; i++) {
+        const user = await repo.createUser(`ceiling-${i}`);
+        await repo.addMember(fullChannelId, user.id);
+      }
+    }, 180_000);
+
+    it("refuses the one that would exceed it with 422 and the code", async () => {
+      expect(await repo.countMembers(fullChannelId)).toBe(CHANNEL_MEMBER_LIMIT);
+      const res = await addMembers(fullChannelId, { user_ids: ["one-too-many"] });
+      expect(res.status).toBe(422);
+      const body = (await res.json()) as { code: string; message: string };
+      expect(body.code).toBe("channel_member_limit_exceeded");
+      expect(body.message).toContain(String(CHANNEL_MEMBER_LIMIT));
+      // AND THE CHANNEL IS UNCHANGED. A refusal that added the member anyway
+      // would pass a status assertion and fail the requirement.
+      expect(await repo.countMembers(fullChannelId)).toBe(CHANNEL_MEMBER_LIMIT);
+    });
+  });
+});
+```
+
+`expect(body.field).toBe("type")` fail. Response là:
+```json
+{
+  "code": "invalid_request",
+  "message": "Invalid input: expected \"public\"",
+  "docs_url": "…",
+  "request_id": "…"
+}
+```
+
+Không có `field`. EIR-API-04 đã mang nó từ chương 1.3, `errorFrameSchema` khai báo nó
+— còn `ZodValidationPipe` thì ném `issues[0].message` và bỏ đi `issues[0].path`.
+**Mọi lỗi validation trong platform, suốt hai mươi hai chương, đều nói cho developer
+biết cái gì sai mà không nói ở đâu.**
+
+<ForwardRef part="chương 3.14" locale="vi">
+
+Phần vá thuộc về bộ từ vựng lỗi, nên nó nằm ở chương sau: pipe gọi tên field,
+`ProtocolErrorFilter` mang nó đi theo đúng cách nó đã mang `code`, và key bị bỏ đi
+thay vì gửi rỗng khi không có gì để gọi tên.
+
+Điều quan trọng ở đây là cách nó được tìm ra. Không phải bằng cách đọc
+`errorFrameSchema` rồi nhận ra một field không ai dùng — mà bằng cách viết một test
+đòi hành vi mà một requirement đã hứa, rồi xem nó fail.
+
+</ForwardRef>
+
+## Một member được thêm qua wire, và một tin nhắn không bao giờ tới
+
+FR-020 đòi rằng một member được thêm qua public API phải nhận được các tin nhắn của
+channel đó trên socket. Test cho điều đó fail, và cái fail ấy là phát hiện lớn nhất
+trong cả hai chương:
+```ts title="services/gateway/src/public-surface.itest.ts"
+import { spawn, type ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import type { Server } from "node:http";
+import type { AddressInfo } from "node:net";
+
+import { createLogger, serve, type Logger } from "@relay/service-kit";
+import { docsUrl } from "@relay/protocol";
+import { WebSocket } from "ws";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+
+import { createApiClient } from "./api-client.js";
+import { createFanout, type Fanout } from "./fanout.js";
+import { attachSessions } from "./session.js";
+
+// THE EXIT CRITERION, REHEARSED IN THE LANE (FR-020, SC-015).
+//
+// A channel created over the public API, a member added over the public API, a
+// message sent over the public API, and the socket delivering it to that member.
+// Chapter 3.12 built the first two endpoints for exactly this path, and this is
+// the test that the path joins up.
+//
+// NO REPOSITORY CALL FOR ANY OF IT, which is the whole point and is a narrower
+// claim than it sounds. The environment and the API key still come through the
+// build-output seam, because there is no public way to create either — that has
+// been true since chapter 2.8 and is still true. Everything downstream of the
+// credential is public HTTP: `POST /v1/channels`, `POST
+// /v1/channels/:id/members`, `POST /auth/dev-token`, `POST
+// /v1/channels/:id/messages`, and `ws://…/v1/ws`.
+//
+// `packages/outsider` will make the stronger version of this claim in Phase 10 —
+// a package mechanically forbidden from importing workspace code at all. This one
+// runs where the coverage lane can see it.
+
+const silent: Logger = createLogger("gateway", () => {});
+const HERE = dirname(fileURLToPath(import.meta.url));
+const REPO = join(HERE, "..", "..", "..");
+const require_ = createRequire(import.meta.url);
+
+interface Seeder {
+  createEnvironment: (db: unknown, input: { name: string }) => Promise<{ id: string }>;
+  createApiKey: (db: unknown, input: { environmentId: string }) => Promise<{ credential: string }>;
+}
+
+async function waitForHealth(url: string): Promise<void> {
+  const deadline = Date.now() + 30_000;
+  for (;;) {
+    try {
+      if ((await fetch(url)).ok) return;
+    } catch {
+      // not up yet
+    }
+    if (Date.now() > deadline) throw new Error("api never became healthy");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
+/** 5200-5400 — see the port map at the top of `limits.itest.ts`. A random high
+ * port per run, for the reason `session.itest.ts` records: a previous run's child
+ * still holding a fixed port answers the health check from a DIFFERENT
+ * environment, and every token this run minted is then refused by an api that has
+ * never heard of it. */
+async function startApi(): Promise<{ url: string; credential: string; stop: () => void }> {
+  const port = 5200 + Math.floor(Math.random() * 200);
+  const dist = join(REPO, "services", "api", "dist");
+  if (!existsSync(join(dist, "main.js"))) {
+    throw new Error("the api is not built — run `pnpm build` before this lane");
+  }
+  const client = require_(join(dist, "db", "client.js")) as {
+    createDb: (pool: unknown) => unknown;
+    createPool: () => unknown;
+  };
+  const seeder = require_(join(dist, "db", "repository.js")) as Seeder;
+  const db = client.createDb(client.createPool());
+  const environment = await seeder.createEnvironment(db, {
+    name: `public-surface-${randomUUID().slice(0, 8)}`,
+  });
+  const key = await seeder.createApiKey(db, { environmentId: environment.id });
+
+  const child: ChildProcess = spawn("node", [join(dist, "main.js")], {
+    env: {
+      ...process.env,
+      PORT: String(port),
+      RELAY_OUTBOX_RELAY: "off",
+      RELAY_NOTIFICATION_RELAY: "off",
+      RELAY_AUTH_KEY_PREFIX: `rlauth-public-${randomUUID().slice(0, 8)}`,
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const url = `http://127.0.0.1:${port}`;
+  await waitForHealth(`${url}/healthz`);
+  return { url, credential: key.credential, stop: () => child.kill() };
+}
+
+describe("a channel, a member and a message, all over the public API", () => {
+  let api: { url: string; credential: string; stop: () => void };
+  let server: Server;
+  let wsUrl: string;
+  let fanout: Fanout;
+
+  const post = (path: string, body: unknown, auth: string) =>
+    fetch(`${api.url}${path}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${auth}` },
+      body: JSON.stringify(body),
+    });
+
+  beforeAll(async () => {
+    api = await startApi();
+    server = serve({
+      service: "gateway",
+      health: () => ({}),
+      logger: silent,
+      notFoundDocsUrl: docsUrl("not_found"),
+    });
+    // THE FAN-OUT IS NOT OPTIONAL FOR DELIVERY, which is easy to miss because a
+    // gateway without one still connects, still authenticates and still acks a
+    // send. `attachSessions` takes `fanout` as an option, and without it a
+    // message reaches the api and stops: the sender gets `message.ack` and every
+    // other socket — on this instance or any other — hears nothing. That is how
+    // this file first read, and it looked like a membership bug.
+    fanout = createFanout({ logger: silent });
+    attachSessions({ server, api: createApiClient(api.url), logger: silent, fanout });
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+    wsUrl = `ws://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  }, 90_000);
+
+  afterAll(async () => {
+    await new Promise<void>((resolve) => server?.close(() => resolve()));
+    await fanout?.close();
+    api?.stop();
+  });
+
+  /** Collect from construction. `connection.ack` is sent the instant the upgrade
+   * completes, and awaiting `open` first loses it — twelve tests in
+   * `isolation.itest.ts` timed out learning that. */
+  function reader(url: string) {
+    const socket = new WebSocket(url);
+    const frames: { type: string; payload?: { text?: string } }[] = [];
+    socket.on("message", (raw) =>
+      frames.push(JSON.parse(raw.toString()) as { type: string; payload?: { text?: string } }),
+    );
+    socket.on("error", () => undefined);
+    const opened = new Promise<void>((resolve, reject) => {
+      socket.on("open", () => resolve());
+      socket.on("close", (code) => reject(new Error(`closed ${code}`)));
+      setTimeout(() => reject(new Error("socket never opened")), 10_000);
+    });
+    const waitForText = async (text: string, ms = 10_000) => {
+      const deadline = Date.now() + ms;
+      for (;;) {
+        if (frames.some((f) => f.type === "message.created" && f.payload?.text === text)) return;
+        if (Date.now() > deadline) {
+          throw new Error(`never saw "${text}"; frames were ${frames.map((f) => f.type).join(", ")}`);
+        }
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    };
+    return { socket, frames, opened, waitForText };
+  }
+
+  /** A channel and two members, all over public HTTP. Returns the channel id. */
+  async function seedOverTheWire(label: string, users: string[]): Promise<string> {
+    const created = await post(
+      "/v1/channels",
+      { external_id: `${label}-${randomUUID().slice(0, 8)}`, type: "public" },
+      api.credential,
+    );
+    expect(created.status).toBe(201);
+    const channelId = ((await created.json()) as { id: string }).id;
+    const members = await post(
+      `/v1/channels/${channelId}/members`,
+      { user_ids: users },
+      api.credential,
+    );
+    expect(members.status).toBe(200);
+    const body = (await members.json()) as { members: { status: string }[] };
+    expect(body.members.every((m) => m.status === "added")).toBe(true);
+    return channelId;
+  }
+
+  const mint = async (user: string): Promise<string> => {
+    // 200, not 201: minting a token creates nothing that has a URL.
+    const res = await post("/auth/dev-token", { user, ttl_seconds: 3600 }, api.credential);
+    expect(res.status).toBe(200);
+    return ((await res.json()) as { token: string }).token;
+  };
+
+  it("delivers a message between two members added over the wire", async () => {
+    const channelId = await seedOverTheWire("live", ["tuan", "mai"]);
+
+    const tuan = reader(`${wsUrl}/v1/ws?token=${await mint("tuan")}`);
+    const mai = reader(`${wsUrl}/v1/ws?token=${await mint("mai")}`);
+    await Promise.all([tuan.opened, mai.opened]);
+
+    const text = `over the wire ${randomUUID().slice(0, 8)}`;
+    tuan.socket.send(
+      JSON.stringify({
+        type: "message.send",
+        payload: { idem_key: randomUUID(), channel: channelId, text },
+      }),
+    );
+
+    // Mai hears it, and the ONLY reason she is in this channel is the
+    // `POST /v1/channels/:id/members` call above. No repository, no fixture.
+    await mai.waitForText(text);
+    tuan.socket.close();
+    mai.socket.close();
+  }, 60_000);
+
+  // A MESSAGE SENT OVER THE PUBLIC REST API CANNOT REACH A SOCKET AT ALL, and
+  // that is the platform's behaviour rather than this test's shortcoming. Pinned
+  // here because chapter 3.12's exit criterion is that an outsider integrates on
+  // the documentation alone, and this is the sentence that documentation has to
+  // contain.
+  //
+  // Two independent mechanisms stop it, and each one is enough on its own:
+  //
+  //   1. NOTHING IN THE API PUBLISHES TO THE FAN-OUT. `session.ts` publishes when
+  //      a SOCKET sends; the api's send path writes the row and the outbox and
+  //      stops. The event consumer's handler is `createRecorder` — it records, it
+  //      does not deliver. So there is no live push.
+  //   2. AN UNATTRIBUTED ROW IS NOT A FRAME. `POST /v1/channels/:id/messages`
+  //      never passes a user — the public controller calls
+  //      `messages.send(channelId, body)` with no `userId`, so every row it writes
+  //      has `user_id` NULL. `backfill.controller.ts`'s `toFrame` drops those on
+  //      purpose and says why: `messageSchema` requires `user`, and there is no
+  //      truthful value to invent. So resume does not carry it either.
+  //
+  // The route that works is the socket, and the test above proves it. An
+  // integrating developer who sends over REST and waits on a socket waits for
+  // ever — so the guide has to say "send over the socket", not "send a message".
+  //
+  // FIXING IT IS A PRODUCT DECISION AND NOT THIS CHAPTER'S. Attributing a public
+  // send to an end-user token would change what `user` means on the wire for every
+  // existing caller (FR-MSG-13's territory), and a live fan-out from the api is a
+  // new coupling between the api and Redis. Both are named in the chapter.
+  it("does NOT deliver a REST-sent message, live or on resume", async () => {
+    const channelId = await seedOverTheWire("rest", ["tuan"]);
+    const token = await mint("tuan");
+
+    const live = reader(`${wsUrl}/v1/ws?token=${token}`);
+    await live.opened;
+
+    const first = `first over rest ${randomUUID().slice(0, 8)}`;
+    const second = `second over rest ${randomUUID().slice(0, 8)}`;
+    for (const text of [first, second]) {
+      const sent = await post(`/v1/channels/${channelId}/messages`, { text }, api.credential);
+      expect(sent.status).toBe(201);
+    }
+
+    // Both rows exist and both are unattributed — this is the row shape the drop
+    // is about, asserted rather than assumed.
+    const history = (await (
+      await fetch(`${api.url}/v1/channels/${channelId}/messages?limit=10`, {
+        headers: { authorization: `Bearer ${api.credential}` },
+      })
+    ).json()) as { messages: { seq: number; user: string | null; text: string }[] };
+    expect(history.messages.map((m) => m.text)).toEqual([second, first]);
+    expect(history.messages.every((m) => m.user === null)).toBe(true);
+
+    // No live delivery.
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    expect(live.frames.filter((f) => f.type === "message.created")).toEqual([]);
+    live.socket.close();
+
+    // And none on resume either. The cursor IS accepted — `resume_ok` is true and
+    // the channel is in the echoed cursor — so this is not a rejected resume
+    // dressed as an empty one. The page came back and every row in it was
+    // dropped for having no sender.
+    const resumed = reader(`${wsUrl}/v1/ws?token=${token}&cursor=${channelId}:1`);
+    await resumed.opened;
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    const ack = resumed.frames.find((f) => f.type === "connection.ack") as
+      | { payload: { cursor: Record<string, number>; resume_ok: boolean } }
+      | undefined;
+    expect(ack?.payload.resume_ok).toBe(true);
+    expect(Object.keys(ack?.payload.cursor ?? {})).toContain(channelId);
+    expect(resumed.frames.filter((f) => f.type === "message.created")).toEqual([]);
+    resumed.socket.close();
+  }, 60_000);
+});
+```
+
+<Trap title="Một tin nhắn gửi qua REST không bao giờ tới được socket" locale="vi">
+
+Hai cơ chế độc lập, mỗi cái một mình đã đủ.
+
+**Không có gì trong api publish vào fan-out của gateway.** `session.ts` publish khi
+một SOCKET gửi; đường send của api ghi row và ghi outbox rồi dừng; handler của event
+consumer là `createRecorder`, thứ ghi lại chứ không giao đi.
+
+**Và một row không có người gửi thì không phải một frame.**
+`POST /v1/channels/:id/messages` không truyền user nào — controller công khai gọi
+`messages.send(channelId, body)` mà không có `userId` — nên mọi row nó ghi đều có
+`user_id` NULL, và `toFrame` của `backfill.controller.ts` bỏ các row không người gửi
+một cách có chủ ý, bởi `messageSchema` đòi `user` và không có giá trị nào trung thực
+để bịa ra.
+
+Đo được chứ không suy ra: history cho thấy cả hai row ở seq 1 và 2 với `user: null`;
+ack của lượt resume về với `resume_ok: true` và channel nằm trong cursor được vọng
+lại, nghĩa là trang đã được lấy và mọi row trong đó đều bị bỏ.
+
+Các journey của `packages/e2e` chưa bao giờ nhận ra vì mọi tin nhắn trong đó đều được
+gửi qua socket.
+
+</Trap>
+
+Vậy FR-020 vẫn đúng — cho một tin nhắn gửi qua socket. Bộ test assert cả hai nửa: một
+lượt gửi qua socket giữa hai member được thêm qua API thì được giao, và một lượt gửi
+qua REST thì không được giao, cả live lẫn resume. Vá nó là một quyết định sản phẩm ở
+cả hai hướng — gán một lượt send công khai cho một end-user token sẽ thay đổi ý nghĩa
+của `user` trên wire với mọi caller đang có, còn một fan-out live từ api là một liên
+kết mới mà ADR-05 và hiến pháp III đều sẽ muốn nghe lập luận — nên nó được gọi tên và
+xếp lịch chứ không bị vá lặng lẽ.
+
+## Các thiết bị đo dùng để kiểm cô lập. Ai kiểm chúng?
+
+<Figure caption="Một tên rule, và trong flat config thì block khớp cuối cùng thắng tuyệt đối. Block của feature 030 dành cho integration test đã THAY THẾ lệnh cấm driver chứ không cộng thêm vào nó, nên lệnh cấm đã tắt cho mọi *.itest.ts trong workspace." chart={figOneRuleName} />
+
+Hiến pháp I nói cô lập sống trong tầng truy cập dữ liệu, và chương 2.1 biến điều đó
+thành một lint rule: không `pg`, không `drizzle-orm`, không `ioredis` ngoài các thư
+mục sở hữu chúng. Đo ở thời điểm bắt đầu phần việc này:
+```
+$ npx eslint services/api/src/quotas/period.itest.ts
+$ echo $?
+0
+```
+
+Dòng đầu của file đó là `import { and, eq } from "drizzle-orm";` và nó không nằm trong
+danh sách miễn trừ nào. Mười integration test import driver, engine hoặc Redis. Cả
+mười đều qua lint.
+
+`no-restricted-imports` là một rule, và trong flat config thì một block sau **thay
+thế** thiết lập của block trước cho rule đó chứ không hợp nhất với nó. Feature 030
+thêm một block khoá theo `**/*.itest.ts` để hạn chế các hàm global-admin, và khi làm
+thế đã tắt lệnh cấm driver cho mọi integration test trong workspace.
+```diff title="eslint.config.mjs (excerpt)"
++const DRIVER_AND_ENGINE = {
++  paths: [
++    { name: "pg", message: "Raw database access is forbidden outside services/api/src/db (constitution I)." },
++    { name: "drizzle-orm", message: "The query engine lives inside the repository layer only (constitution I, ADR-16)." },
++    { name: "ioredis", message: "The counter store lives in services/api/src/limits and services/gateway/src/limits.ts only …" },
++  ],
++  patterns: [{ group: ["drizzle-orm/*"], message: "…" }],
++};
++
+   {
+     files: ["**/*.itest.ts"],
++    ignores: [...DRAIN_EXEMPT_TESTS, ...DRIVER_EXEMPT_TESTS],
+     rules: {
+-      "no-restricted-imports": ["error", { paths: [ /* the global drains only */ ] }],
++      "no-restricted-imports": [
++        "error",
++        {
++          paths: [...DRIVER_AND_ENGINE.paths, ...GLOBAL_DRAINS.paths],
++          patterns: DRIVER_AND_ENGINE.patterns,
++        },
++      ],
+     },
+   },
+```
+
+Một đoạn trích, và lý do là fence chain chứ không phải sự ngắn gọn. Chain của file
+này chạy qua `fences/post-series.md`, thứ được áp dụng **sau** mọi chương — feature
+030 không xuất bản chương nào, nên phần vá của nó nằm ở đó. Một chương không thể vá
+một trạng thái mà một file sau nó mới dựng lên, và checker nói điều đó rất chính xác:
+*hunk pre-image matched 0 times*. Bản vá đầy đủ nằm trong `post-series.md`, còn chương
+này là nơi nó được giải thích.
+
+<Why title="Vì sao ba block mà không phải một" locale="vi">
+
+Hai danh sách miễn trừ là hai tập file khác nhau và một block chỉ có một `ignores`.
+Một block hợp nhất sẽ phải miễn cả hai tập khỏi cả hai rule — một file được phép giữ
+raw client thì cũng sẽ được phép chạy một lượt drain toàn cục.
+
+Nên: một block mang phần hợp cho mọi integration test không cần miễn trừ nào, và mỗi
+danh sách miễn trừ một block mang tập rule còn lại. Kiểm ở cả ba hướng chứ không phỏng
+đoán, gồm cả việc một import drizzle trong một file được miễn drain thì vẫn bị từ
+chối, và một import `outboxDepth` trong một file được miễn driver thì vẫn bị từ chối.
+
+</Why>
+
+Tám integration test thực sự cần driver, liệt kê kèm lý do.
+**`services/api/src/isolation/**` cố tình không có trong đó**, và giành được điều ấy
+tốn hai lần sửa: cửa ải của chương 3.12 import `eq` để đếm delivery, việc đó chuyển
+xuống sau một method của repository, và phép kiểm cấu trúc của nó import `pg` cho một
+type, cái đó thành `ReturnType<typeof createPool>`. Một import chỉ-để-lấy-type thì
+vẫn là một import với rule này.
+
+## Chín bảng được canh, không phải năm
+
+<Figure caption="Nằm trong mảng trigger không có nghĩa là đang được canh: không có sentinel row trong một bảng thì mệnh đề WHEN không bao giờ khớp. Và bait mà một lượt drain toàn cục claim được sẽ biến một guard thành mười ba cái fail trong hai file chẳng liên quan." chart={figBaitMustNotBeClaimable} />
+
+Guard của feature 030 từ chối một lượt mutation cross-environment lên một sentinel
+row. Nó canh năm bảng. Chương 3.10 và 3.11 thêm bốn bảng nữa có `environment_id` —
+`usage_periods`, `usage_active_users`, `quota_notifications`, `usage_connections` — và
+không chương nào thêm chúng vào đây. Đọc lại từ database đang chạy chứ không từ file
+nguồn:
+```
+__sentinel_guard_channels                        on channels
+__sentinel_guard_users                           on users
+__sentinel_guard_webhook_deliveries              on webhook_deliveries
+__sentinel_guard_webhook_disable_notifications   on webhook_disable_notifications
+__sentinel_guard_webhook_endpoints               on webhook_endpoints
+```
+
+Mở rộng cái mảng đó không phải một dòng sửa, và lý do nằm trong thông báo từ chối:
+```sql title="packages/test-harness/src/sentinel.sql (excerpt)"
+  RAISE EXCEPTION
+    'global-operation guard: this statement modified sentinel row %.% (id %), which belongs to no test%',
+    TG_TABLE_SCHEMA, TG_TABLE_NAME,
+    coalesce(to_jsonb(OLD) ->> 'id', to_jsonb(OLD)::text),
+    COALESCE(' — the bait planted by ' || who, '');
+```
+
+Ba trong bốn bảng mới có primary key ghép và **không có cột `id`**: `usage_periods` là
+`(environment_id, period)`, `usage_active_users` thêm `user_id`, `usage_connections` là
+`(connection_id, period)`. `OLD.id` trên một record không có field đó sẽ ném
+`record "old" has no field "id"` ngay lúc chạy — một guard fail trên đúng những lượt
+ghi mà nó cho phép, trong đúng những test vốn đã đúng.
+
+<Why title="Vì sao phần dự phòng in cả row, và ở đâu thì không được" locale="vi">
+
+Bốn bảng này mang các bộ đếm, các mốc ngày của kỳ và các identifier: không có message
+text, không có tên hiển thị, không có credential. In cả row ở đây là an toàn.
+
+Cùng phần dự phòng ấy trên `messages` sẽ đưa nội dung tin nhắn của khách hàng vào log
+của test, mà đó là một vi phạm NFR-SEC-06. Nếu về sau nó canh một bảng chứa nội dung,
+biểu thức phải gọi tên key của bảng đó thay vì trút cả row ra.
+
+</Why>
+
+Và nằm trong mảng không có nghĩa là đang được canh. Không có sentinel row trong một
+bảng thì mệnh đề `WHEN (__is_sentinel(OLD.environment_id))` không bao giờ khớp và
+trigger chỉ là đồ trang trí. Nên `plant()` thêm một row bait vào mỗi bảng — một, không
+phải hai trăm như các bait khác, bởi trigger nổ ngay ở sentinel row đầu tiên mà một
+câu lệnh chạm tới, và chỉ `quota_notifications` là có một lượt drain toàn cục.
+```sql title="packages/test-harness/src/sentinel.ts (excerpt)"
+  await q(
+    `INSERT INTO quota_notifications
+       (id, environment_id, organisation_id, period, dimension, threshold, quota,
+        usage_at_crossing, delivered_at)
+     VALUES ($1, $2, $3, DATE '2020-01-01', 'messages', 80, 1000, 800,
+             now() - interval '2 hours')
+     ON CONFLICT (id) DO NOTHING`,
+    [s.usageNotificationId, s.environmentId, s.organisationId],
+  );
+```
+
+<Trap title="Bait đầu tiên tốn mười ba test trong hai file chẳng liên quan" locale="vi">
+
+Bản nháp đầu gieo `quota_notifications` với `delivered_at` NULL — một row **claim
+được** — và `createQuotaRelay` claim các notification chưa gửi trên mọi environment.
+
+`quotas.itest.ts` và `connections.itest.ts` fail mười ba test với một lời từ chối của
+guard gọi tên một uuid mà chính file test của guard đã viết cứng:
+```
+Error: Failed query: UPDATE quota_notifications SET last_error = $1 WHERE id = $2
+global-operation guard: … public.quota_notifications (id 33333333-…),
+which belongs to no test — the bait planted by guard.itest.ts#usage
+```
+
+Đó là lần đo thứ tư của cùng một luật: **bait chỉ được claim được ở nơi việc drain nó
+là việc của database.** `drainQuotaNotifications` làm I/O từng row, nên bait của nó
+được gieo ở trạng thái đã-gửi — đúng như các disablement notification, vì đúng cái lý
+do đã được ghi lại khi chúng được gieo.
+
+</Trap>
+
+Từng bảng trong bốn bảng đều bị lái vào một cách có chủ ý, bởi SC-008 của chương 3.10
+đã qua nhờ việc *không* được canh, và một test đọc chính cái nguồn nó phải đi kiểm là
+cùng một sai lầm, ở một tầng cao hơn:
+```ts title="packages/test-harness/src/guard.itest.ts (excerpt)"
+  for (const [table, statement, params] of cases) {
+    it(`refuses a cross-environment write to ${table}, naming the table`, async () => {
+      await expect(guarded.query(statement, params as never[])).rejects.toThrow(
+        new RegExp(`global-operation guard.*public\\.${table}`, "s"),
+      );
+    });
+  }
+```
+
+Chín trigger sau đó, đọc lại từ `pg_trigger`. **Không file nào được thêm vào danh sách
+miễn trừ** — sáu trước và sáu sau — bởi bait gieo ở trạng thái đã-gửi là bait không
+lượt drain nào với tới.
+
+## Cái port cố định cuối cùng của lane, và một cái mà lượt audit tìm ra
+
+CLAUDE.md gọi tên `?? 4124` của `limits.itest.ts` là một món nợ kế thừa. Hai file
+trùng basename đó và file của api thì không bind port nào; ghi chú nghiên cứu, bản
+plan và một task đều gọi tên file sai.
+```ts title="services/gateway/src/limits.itest.ts (excerpt)"
+  const port = Number(
+    process.env.RELAY_LIMITS_ITEST_API_PORT ??
+      4100 + Math.floor(Math.random() * 200),
+  );
+```
+
+Lượt audit vốn chỉ để xác nhận một phần vá lại tìm ra một trường hợp thứ hai — một
+4131 cố định trong `dispatcher.itest.ts` — và hai dải port của chính chương 3.12 chồng
+lên `meter.itest.ts`:
+```diff title="services/dispatcher/src/dispatcher.itest.ts"
+@@ -364,7 +364,17 @@ describe("the dispatcher", () => {
+     second = customerEndpoint();
+     secondUrl = await second.listen();
+ 
+-    apiPort = Number(process.env["RELAY_DISPATCHER_ITEST_API_PORT"] ?? 4131);
++    // A RANDOM HIGH PORT (chapter 3.12, T077). This bound a fixed 4131, which is
++    // the second instance of the fault CLAUDE.md names only for
++    // `limits.itest.ts` — the audit is what found it. The integration lane runs
++    // one package at a time, so nothing races this file WITHIN a run; what does
++    // bite is a back-to-back run whose previous child still holds the port, and
++    // then the health check answers from an api serving a different environment.
++    // See the port map at the top of `services/gateway/src/limits.itest.ts`.
++    apiPort = Number(
++      process.env["RELAY_DISPATCHER_ITEST_API_PORT"] ??
++        4310 + Math.floor(Math.random() * 60),
++    );
+     child = spawnApi(apiPort, CREDENTIAL);
+     apiUrl = `http://127.0.0.1:${apiPort}`;
+     await waitForHealth(`${apiUrl}/healthz`);
+```
+
+    4100-4300  gateway/limits.itest.ts          api    trước là 4124 cố định
+    4310-4370  dispatcher/dispatcher.itest.ts   api    trước là 4131 cố định
+    4400-4600  gateway/session.itest.ts         api
+    4610-4670  gateway/meter.itest.ts           gateway
+    4710-4770  gateway/meter.itest.ts           api
+    4900-5100  gateway/isolation.itest.ts       api    trước là 4600-4800
+    5200-5400  gateway/public-surface.itest.ts  api    trước là 4800-5000
+
+Bản đồ nằm ở đầu `limits.itest.ts` và mọi file đều trỏ về đó, bởi một dải chỉ nói nó
+tránh cái gì sẽ mục đi ngay lần tiếp theo có file được thêm vào.
+
+## Hiến pháp VI, trả lời bằng một con số
+```diff title="vitest.coverage.config.mts"
+@@ -63,7 +63,12 @@ export default defineConfig({
+     hookTimeout: 60_000,
+     coverage: {
+       provider: "v8",
+-      reporter: ["text", "json-summary"],
++      // `json` joins the other two for chapter 3.12's FR-040, which asks for every
++      // uncovered branch to be NAMED and not merely counted. `json-summary` carries
++      // totals and percentages; the per-branch locations are only in `coverage-final.json`.
++      // Found by trying to list the 25 uncovered arms in `repository.ts` and getting a
++      // file that does not contain them. `coverage/` is gitignored, so this commits nothing.
++      reporter: ["text", "json-summary", "json"],
+       include: ["packages/*/src/**/*.ts", "services/*/src/**/*.ts"],
+       exclude: [
+         "**/*.test.ts",
+@@ -124,6 +129,28 @@ export default defineConfig({
+         // tested none of them" in the only language it has. The tests were written;
+         // it now reads 97.29 / 90.56 / 100 / 99.14. These numbers are that
+         // measurement, not a target negotiated down to meet it.
++        // CHAPTER 3.12 DID NOT RAISE THIS, and the number says why. The chapter
++        // added six operations to this file — idempotent creation for channels and
++        // users, a three-outcome `addMember`, two scoped counts — and branches
++        // measured 90.43% mid-phase, DOWN from T007's 90.60% while still above the
++        // pinned 90. Three new uncovered arms, all of them the same kind:
++        //
++        //   - `addMember`'s `(inserted.rowCount ?? 0)` — REMOVED rather than named.
++        //     `rowCount` is typed `number | null` and is never null for an INSERT,
++        //     so the `??` was an arm nothing could take, bought for nothing in the
++        //     one file constitution VI asks 100% of. `RETURNING` and `.rows.length`
++        //     replaced it.
++        //   - `createChannel`'s and `createUser`'s "could not be created or read"
++        //     throws. Both are the loser of an `ON CONFLICT` race finding no row,
++        //     which means the winner's row was deleted between two statements in
++        //     the same call. Nothing in the api deletes from either table, so
++        //     reaching these means constructing a state the layer exists to make
++        //     unconstructable — the same class T007's list already named for lines
++        //     151 and 3139.
++        //
++        // It now reads 90.71%, above where the chapter found it and below 91, so
++        // the pin stays at 90 rather than moving to a number the next chapter
++        // would have to earn back.
+         "services/api/src/db/repository.ts": {
+           branches: 90,
+           functions: 100,
+@@ -189,6 +216,77 @@ export default defineConfig({
+         // (FR-004, SC-006), and its `catch` is what stops an analytics outage
+         // becoming a delivery outage (contract invariant 4). Both are branches, and
+         // an unmeasured branch here fails silently in the direction nobody checks.
++        // ── CHAPTER 3.12'S NEW FILES, PINNED DELIBERATELY ──────────────────
++        //
++        // T079 asked for an explicit decision either way, and the answer is: pin
++        // the ones that decide something, at what they measure. All of these sit
++        // inside the coverage `include` glob, so an unpinned file here is bounded
++        // by nothing but the aggregate 70 — chapter 3.11's T033c made the same
++        // call for the same reason, and its comment is the one to read: an
++        // unpinned file is a figure that can slide.
++        //
++        // `catalogue.ts` matters most of the four. It lands in
++        // `services/api/src/db/`, the one directory that already carries a
++        // per-file ratchet and the directory constitution VI's 100%-branch clause
++        // is about. It reaches 100 on every metric — but only after the
++        // classification was separated from the query, because the arm that
++        // returns `null` cannot execute against a database that has no
++        // unclassified table, which is the state the check exists to keep. The
++        // separation is the finding; the number is what it bought.
++        "services/api/src/db/catalogue.ts": {
++          branches: 100,
++          functions: 100,
++          lines: 100,
++          statements: 100,
++        },
++
++        // The gauntlet's own instruments. Test infrastructure that the include
++        // glob cannot tell from product code — and rather than adding an exclude
++        // entry to hide them, they are pinned, because Phase 7's whole argument
++        // applies one layer down: an instrument that has never produced output has
++        // never had its output checked. Both reached 100 only after the arms a
++        // PASSING suite cannot reach were driven with fakes: the router shapes the
++        // live adapter does not have, and the difference strings a healthy
++        // platform never produces.
++        "services/api/src/isolation/targets.ts": {
++          branches: 100,
++          functions: 100,
++          lines: 100,
++          statements: 100,
++        },
++        "services/api/src/isolation/compare.ts": {
++          branches: 100,
++          functions: 100,
++          lines: 100,
++          statements: 100,
++        },
++
++        // `attack.ts` is NOT at 100, and the remaining arms are named rather than
++        // chased. `send`'s empty-body arm and `credentialAttack`'s mint-failure arm
++        // both need an HTTP fake to reach, and faking the transport in a file whose
++        // subject is real HTTP would test the fake. `rowsOf` was extracted and
++        // closed because it holds a real decision — zero rows from an unrecognised
++        // shape reads exactly like zero rows from a correctly-scoped list, and only
++        // one of those is a pass.
++        "services/api/src/isolation/attack.ts": {
++          branches: 83,
++          functions: 100,
++          lines: 100,
++          statements: 96,
++        },
++
++        // The channel surface's decisions: the scoped read that comes FIRST so a
++        // foreign channel and an absent one answer alike, and the ceiling counted
++        // from storage before any user is created. The one uncovered branch is the
++        // `not_found` outcome after a successful scoped read — the channel deleted
++        // between two statements of one call — which nothing in the api can do.
++        "services/api/src/channels/channels.service.ts": {
++          branches: 75,
++          functions: 100,
++          lines: 94,
++          statements: 94,
++        },
++
+         "services/api/src/webhooks/disable.ts": {
+           branches: 100,
+           functions: 100,
+```
+
+`repository.ts` đọc ra **254/280 nhánh — 90.71%**, so với 241/266 (90.60%) lúc bắt
+đầu. Nó tụt xuống 90.43% trước đã: sáu operation mới, ba nhánh chưa phủ mới. Một cái
+bị **xoá bỏ** chứ không phải được gọi tên — `rowCount ?? 0` của `addMember`, nơi
+driver khai `rowCount` là `number | null` và không bao giờ trả null cho một INSERT,
+nên cái `??` là một nhánh không gì chạm tới được, trong đúng cái file mà hiến pháp VI
+đòi 100%. Hai cái còn lại được gọi tên: hai lời ném "could not be created or read" của
+kẻ thua trong `ON CONFLICT`, chỉ với tới được nếu row của kẻ thắng bị xoá giữa hai câu
+lệnh của cùng một lượt gọi.
+
+<Why title="Vì sao cái ghim vẫn ở 90" locale="vi">
+
+90.71% cao hơn chỗ chương này tìm thấy file và thấp hơn 91. Một cái ghim mà chương sau
+phải giành lại thì tệ hơn một cái ghim trung thực, và việc của cái ratchet là chặn con
+số tuột xuống trong lúc khoảng hở được lấp — chứ không phải làm cái ngưỡng. Mệnh đề
+100% của hiến pháp VI vẫn còn mở, và hai mươi sáu nhánh chưa phủ được liệt kê trong
+`baseline.txt` của feature kèm mỗi cái là gì.
+
+</Why>
+
+Năm file mới được ghim, và ba trong số đó chỉ đạt 100% sau khi các nhánh mà một bộ
+test ĐANG XANH không thể với tới được tách ra — đó chính là lập luận của chương 3.12
+về bộ test của chính nó, hạ xuống một tầng.
+
+<Checkpoint locale="vi">
+
+- `pnpm test:integration` — 407 test, hai mươi lượt chạy xanh liên tiếp, trung bình 193.25 s
+- `pnpm coverage` — 771 test, mọi ratchet đều đạt
+- chín bảng được canh, từng bảng đều bị lái vào; sáu miễn trừ, không đổi
+- `npx eslint` trên một integration test import `drizzle-orm` giờ đã fail
+- không bộ test nào trong lane bind một port api cố định
+- `POST /v1/channels` 201 rồi 200; member thứ 1.001 bị từ chối với `422`
+
+</Checkpoint>
+
+<ForwardRef part="chương 3.14" locale="vi">
+
+Bộ từ vựng lỗi mà các endpoint này liên tục đụng phải — mười ba code, một registry,
+một `docs_url` resolve được — và bản tích hợp niêm phong đứng thay cho một developer
+bên ngoài, là chương sau. Chương đó cũng mang phán quyết cho tiêu chí ra khỏi Phase 2
+của SRS, đúng cái mà hai endpoint ở trên được xây để làm cho khả thi.
+
+</ForwardRef>
+
+<ChapterFooter id="3.13" locale="vi" />
