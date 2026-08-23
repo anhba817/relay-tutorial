@@ -2383,3 +2383,81 @@ second time, in the same chapter.
  );
 ```
 
+---
+
+## Chapter 3.14's neighbours
+
+Chapter 3.14 explains all three of these; the amendments land here because these
+files' chains do. Each already carries an entry above, so a chapter cannot amend the
+state those entries build.
+
+`turbo.json` gains four variables. `RELAY_DOCS_BASE_URL` lets a preview deployment
+point `docs_url` at itself; the other three are what the sealed integration reads,
+and it has no workspace constant to fall back on by design. Under turbo's strict env
+mode an undeclared variable does not reach the task at all — the live proof is
+`RELAY_LIMITS_ITEST_API_PORT`, absent from that list and therefore unusable, which is
+why a fixed 4124 was the only port that ever ran.
+
+`package.json` splits the lane. `pnpm test:integration` excludes the sealed package
+and `pnpm test:outsider` is the way in: the default lane spawns what it talks to,
+while that suite needs the api and gateway already serving from built images with a
+tenant already seeded.
+
+`resume.itest.ts` gains one line, because `serve()`'s `notFoundDocsUrl` became
+required and the compiler named every call site.
+
+```diff title="turbo.json"
+@@ -15,7 +15,8 @@
+     },
+     "test": {
+       "dependsOn": ["^build"],
+-      "inputs": ["$TURBO_DEFAULT$", "$TURBO_ROOT$/compose.yaml"]
++      "inputs": ["$TURBO_DEFAULT$", "$TURBO_ROOT$/compose.yaml"],
++      "env": ["RELAY_DOCS_BASE_URL"]
+     },
+     "test:integration": {
+       "dependsOn": ["^build", "build"],
+@@ -41,7 +42,11 @@
+         "RELAY_SMTP_URL",
+         "RELAY_MAILPIT_URL",
+         "RELAY_NOTIFICATION_RELAY",
+-        "RELAY_QUOTA_RELAY"
++        "RELAY_QUOTA_RELAY",
++        "RELAY_DOCS_BASE_URL",
++        "RELAY_API_URL",
++        "RELAY_WS_URL",
++        "RELAY_DEMO_CREDENTIAL"
+       ]
+     },
+     "//#lint:root": {
+```
+
+```diff title="package.json"
+@@ -12,7 +12,8 @@
+     "lint:root": "eslint .",
+     "typecheck": "turbo run typecheck",
+     "test": "turbo run test",
+-    "test:integration": "turbo run test:integration --concurrency=1",
++    "test:integration": "turbo run test:integration --concurrency=1 --filter=!@relay/outsider",
++    "test:outsider": "turbo run test:integration --filter=@relay/outsider",
+     "coverage": "vitest run --config vitest.coverage.config.mts --coverage",
+     "build": "turbo run build"
+   },
+```
+
+```diff title="services/gateway/src/resume.itest.ts"
+@@ -1,3 +1,4 @@
++import { docsUrl } from "@relay/protocol";
+ import { randomUUID } from "node:crypto";
+ 
+ import { WebSocket } from "ws";
+@@ -66,6 +67,7 @@ async function boot(api: Omit<ApiClient, "reportUsage">): Promise<Harness> {
+     service: "gateway",
+     health: () => ({}),
+     logger: silent,
++    notFoundDocsUrl: docsUrl("not_found"),
+   });
+   const sessions = attachSessions({
+     server,
+```
+

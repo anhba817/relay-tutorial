@@ -1,0 +1,1543 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figThirteenCodes, figFourTypeGates, figThreeLevels, figVerdict } from "./figures";
+
+export const metadata = {
+  title: "Cột mốc: lỗi có trang để xem, và một người ngoài — Building Relay",
+  description:
+    "Envelope lỗi đã mang một docs_url từ chương 1.3 và nó chưa bao giờ resolve được. Năm trong mười ba code mà platform gửi ra thậm chí không có trong registry. Và tiêu chí ra khỏi Phase 2 nhận phán quyết: đạt một phần, với phần còn thiếu được gọi tên chứ không ngụ ý.",
+  alternates: {
+    canonical: "/vi/part-3/chapter-14/errors-that-resolve-and-an-outsider",
+    languages: {
+      en: "/part-3/chapter-14/errors-that-resolve-and-an-outsider",
+      vi: "/vi/part-3/chapter-14/errors-that-resolve-and-an-outsider",
+    },
+  },
+};
+
+<ChapterHeader id="3.14" locale="vi" />
+
+Mọi lỗi mà platform này gửi ra đều mang bốn field, và một trong bốn field đó đã là
+một lời nói dối từ chương 1.3.
+```json
+{
+  "code": "rate_limited",
+  "message": "too many requests; retry shortly",
+  "docs_url": "https://relay.example/docs/errors/rate_limited",
+  "request_id": "9c2f8a1e-4b7d-4f3a-9e51-6d8c2b0a7f14"
+}
+```
+
+`relay.example` không resolve. Nó chưa bao giờ resolve. Chương 1.4 viết rằng host đó
+"là chỗ giữ tạm cho đến khi có một trang tài liệu để biến lời hứa trang-có-thật của
+hiến pháp V thành sự thật"; chương 3.8 dành cho chỗ giữ tạm ấy một mục riêng —
+*"`docs_url` vẫn còn là chỗ giữ tạm, và giờ nó đã có giá"* — bởi `rate_limited` là
+lỗi đầu tiên mà một bản tích hợp đang hoạt động nhận được **thường xuyên**. Chương
+3.10 thêm `quota_exceeded` vào danh sách những code chẳng trỏ đi đâu. Chương 3.11 từ
+chối thêm cái thứ ba.
+
+Chương này là chương không thể ship cùng nó, bởi nửa còn lại của chương là tiêu chí
+ra khỏi Phase 2 của SRS: *một developer bên ngoài tích hợp chỉ bằng tài liệu công
+khai, không ai trợ giúp.* Một developer lần theo link từ một response lỗi và gặp 404
+thì đã không được cho tài liệu nào cả.
+
+## Đếm lại bộ từ vựng
+
+<Figure caption="Năm trong mười ba code mà platform có thể phát ra chưa bao giờ nằm trong registry. `ProtocolErrorFilter` ánh xạ status thành code khi bên ném không gọi tên code nào, và docs_url được suy ra từ code — nên mỗi cái trong năm cái đó đều gửi ra một link tới một trang không thể tồn tại, kể cả về nguyên tắc." chart={figThirteenCodes} />
+
+Cái registry tự gọi mình là bộ từ vựng đã-được-tài-liệu-hoá trong khi chỉ tài liệu
+hoá tám trong mười ba:
+```diff title="packages/protocol/src/codes.ts"
+@@ -34,11 +34,93 @@ export const ERROR_CODES = {
+   //
+   // REGISTERED HERE RATHER THAN WRITTEN INLINE. The frame schema types `code` as
+   // `z.string().min(1)`, so nothing forces this — but the registry is the
+   // documented vocabulary and `codes.test.ts` enforces its uniqueness, which is
+   // why chapter 3.2 put `wrong_credential_type` in it instead of inventing it at
+   // the call site.
+   quota_exceeded:
+     "a monthly quota is exhausted; the message names the dimension, the figures and the date it resumes",
++  // Chapter 3.12. The refusal beside `wrong_credential_type`, one dimension over:
++  // the class presented is RIGHT and the service is not. Two platform credentials
++  // exist — the dispatcher's and the gateway's — and until this chapter a route
++  // could say which class may call it and not which service, so the gateway's
++  // credential reached `POST /internal/dispatch/replay`.
++  //
++  // NOT `forbidden`. Chapter 3.2 made this argument when it added
++  // `wrong_credential_type` rather than answering a wrong-credential mistake with
++  // a generic 403: the response has to say what actually happened, and "you lack a
++  // permission" is a different fact from "that credential belongs to another
++  // service". The MESSAGE names the service and the permitted set and never the
++  // credential — a service name is a deployment label, a credential is a secret
++  // (NFR-SEC-06).
++  wrong_credential_service:
++    "the credential's service is not permitted on this route; the message names the service presented and the services allowed",
++  // Chapter 3.12. FR-CHN-07's ceiling: a channel holds at most 1,000 members and
++  // an add that would cross it is refused with 422 and this code.
++  //
++  // The SRS names this code in its own worked example for EIR-API-04, which is
++  // the reason it is spelled this way rather than `member_limit_exceeded` — the
++  // document got there first and an integrating developer will have read it.
++  //
++  // NOT `quota_exceeded`. That one is a monthly, billable, resets-on-a-date
++  // refusal and its message promises a resume date; this is a structural limit on
++  // one channel that no amount of waiting changes. Same status code, different
++  // fact, and a client that retries on the wrong one waits for ever.
++  channel_member_limit_exceeded:
++    "the channel already holds its maximum members; the message names the limit and the channel",
++
++  // ── THE FIVE THE PLATFORM HAS ALWAYS SENT AND NEVER REGISTERED (chapter 3.12,
++  // FR-024) ────────────────────────────────────────────────────────────────────
++  //
++  // `ProtocolErrorFilter` maps a status to a code when the thrower names none,
++  // and those codes went out on the wire for twenty-two chapters without being in
++  // this object. The registry called itself "the documented vocabulary" while
++  // documenting eight of thirteen — and `docs_url` is derived from the code, so
++  // every one of these five shipped a link to a page that could not exist.
++  //
++  // Registering them is what makes the filter's ladder typable: with it annotated
++  // `ErrorCode`, a code that is not here stops compiling instead of reaching a
++  // customer with a 404 for a docs link.
++  invalid_request:
++    "the request body, query or path failed validation; `field` names the first offending key",
++  forbidden: "the credential is valid and is not permitted to do this",
++  not_found:
++    "no such resource for this tenant — and DELIBERATELY the same answer as for a resource in another tenant (FR-TEN-05)",
++  internal_error:
++    "the platform failed in a way it did not anticipate; the request_id is what a support ticket needs",
++  // Chapter 3.11's. A connection belongs to one environment for its lifetime, and
++  // a second report naming a different one is a bug in the reporter rather than a
++  // state to reconcile — so it is refused rather than absorbed.
++  connection_environment_conflict:
++    "this connection was first reported for a different environment; a connection belongs to one environment for its whole life",
+ } as const;
+ 
+ export type ErrorCode = keyof typeof ERROR_CODES;
++
++/** The published reference, and the one place the URL is built (FR-027,
++ * `contracts/errors.md` §2).
++ *
++ * THE DEBT THIS CLOSES. `docs_url` has been in the error envelope since chapter
++ * 1.3 and constitution V calls it a reachable-page promise. Six construction sites
++ * built it with a template literal against `https://relay.example`, a host that
++ * does not resolve, and two codes — `rate_limited` (3.8) and `quota_exceeded`
++ * (3.10, 3.11) — shipped links to pages that did not exist even in principle.
++ * Chapter 3.11 declined to add a third instance and named the debt; a chapter whose
++ * exit criterion is "integrates on public documentation alone" cannot ship a
++ * fourth.
++ *
++ * THE CODE IS THE ANCHOR, VERBATIM. No slug transform, no case change, no
++ * separator swap — the reference's `h2` headings ARE the codes, and
++ * `slugifyHeading` in the tutorial site keeps `_` so `## quota_exceeded` anchors
++ * at `#quota_exceeded`. Any transform here would be the same transform maintained
++ * in two repositories with no test able to see both sides.
++ *
++ * The base is overridable so a preview deployment can point at itself. It is read
++ * per call rather than captured at module load: a test that sets the variable in
++ * `beforeAll` would otherwise get the value from whenever this module was first
++ * imported. */
++export const DEFAULT_DOCS_BASE_URL = "https://relay.dev/docs/error-reference";
++
++export function docsUrl(code: ErrorCode): string {
++  const base = process.env["RELAY_DOCS_BASE_URL"] ?? DEFAULT_DOCS_BASE_URL;
++  return `${base}#${code}`;
++}
+```
+
+<Why title="Vì sao code chính là cái anchor, nguyên văn" locale="vi">
+
+`docsUrl` trả về base cộng `#` cộng code, không phép biến đổi nào: không slug, không
+đổi hoa thường, không đổi dấu phân cách. Các heading `h2` của tài liệu **chính là**
+các code.
+
+Lựa chọn còn lại là một hàm slug trong `@relay/protocol` khớp với `slugifyHeading`
+của trang tutorial — cùng một phép biến đổi được bảo trì ở hai repository, và không
+test nào thấy được cả hai phía. Thay vào đó, hàm của trang giữ `_` trong lớp ký tự
+của nó, nên `## quota_exceeded` neo tại `#quota_exceeded`; và bán kính ảnh hưởng của
+thay đổi ấy được đo trước khi làm: không heading chương nào có dấu gạch dưới, đúng
+một heading tài liệu có, và không link nào ở bất cứ đâu trỏ tới một
+`/docs/<slug>#anchor`.
+
+</Why>
+
+Base được đọc ở mỗi lượt gọi chứ không chốt lại lúc load module, một chuyện nhỏ với
+một lý do rất cụ thể: một test đặt `RELAY_DOCS_BASE_URL` trong `beforeAll` sẽ nhận
+đúng giá trị lúc module được import lần đầu, chứ không phải giá trị nó vừa đặt.
+
+## Bốn chỗ mà một lỗi chính tả từng compile được
+
+<Figure caption="Response của `HttpException` là `unknown`, nên tám chỗ gọi tự gõ error code của mình thành một chuỗi trơn. Một lỗi chính tả compile được, ship được, rồi thành một URL." chart={figFourTypeGates} />
+
+Chương 3.2 đưa ra quy ước rằng bên ném được quyền gọi tên code của mình, bởi
+`wrong_credential_type` là một sự phân biệt mà status không chở nổi. Điều nó không
+đưa ra được là bất kỳ phép kiểm nào lên cái chuỗi ấy.
+```ts title="services/api/src/protocol-error.ts"
+import { HttpException } from "@nestjs/common";
+import type { ErrorCode } from "@relay/protocol";
+
+/** An HTTP failure that NAMES ITS OWN CODE, typed (chapter 3.12, FR-025, FR-026).
+ *
+ * Chapter 3.2 introduced the convention that a thrower may name its code, because
+ * `wrong_credential_type` is a distinction a status cannot carry. What it could not
+ * introduce was any check on the string: `HttpException`'s response is `unknown`,
+ * so `code: "wrong_credental_type"` compiles, ships, and becomes a `docs_url`
+ * pointing at a page that does not exist. Eight sites named their code by hand.
+ *
+ * This is one function so `ErrorCode` is the only thing that fits. The value is
+ * exactly what `ProtocolErrorFilter` already reads — `code`, `message` and the
+ * optional `field` — so nothing about the envelope changes; what changes is that a
+ * typo stops compiling. */
+export function protocolError(
+  code: ErrorCode,
+  message: string,
+  status: number,
+  field?: string,
+): HttpException {
+  return new HttpException(
+    { code, message, ...(field !== undefined ? { field } : {}) },
+    status,
+  );
+}
+```
+
+```diff title="services/api/src/protocol-error.filter.ts"
+@@ -1,10 +1,12 @@
+ import type { ServerResponse } from "node:http";
+ 
++import { docsUrl, ERROR_CODES, type ErrorCode } from "@relay/protocol";
++
+ import {
+   Catch,
+   HttpException,
+   type ArgumentsHost,
+   type ExceptionFilter,
+ } from "@nestjs/common";
+ 
+ // EIR-API-04: one error shape, one home. Whatever throws — the router's own
+@@ -32,31 +34,51 @@ export class ProtocolErrorFilter implements ExceptionFilter {
+     const response =
+       exception instanceof HttpException ? exception.getResponse() : null;
+     const named =
+       typeof response === "object" &&
+       response !== null &&
+       typeof (response as { code?: unknown }).code === "string"
+         ? (response as { code: string }).code
+         : null;
+-    const code =
+-      named ??
+-      (status === 400
++    // TYPED AS `ErrorCode` (chapter 3.12, FR-025). The ladder emitted five codes
++    // that were not in the registry for twenty-two chapters — `invalid_request`,
++    // `forbidden`, `not_found`, `internal_error` and the frame codes — and
++    // `docs_url` is derived from the code, so each one shipped a link to a page
++    // that could not exist. With the annotation, an unregistered code stops
++    // compiling here instead of reaching a customer.
++    //
++    // `named` is checked against the registry rather than trusted: a thrower can
++    // put any string in `code`, and `ProtocolErrorFilter` is the last place that
++    // can notice before it becomes a URL.
++    const ladder: ErrorCode =
++      status === 400
+         ? "invalid_request"
+         : status === 401
+           ? "unauthorized"
+           : status === 403
+             ? "forbidden"
+             : status === 404
+               ? "not_found"
+-              : "internal_error");
++              : "internal_error";
++    const code: ErrorCode =
++      named !== null && named in ERROR_CODES ? (named as ErrorCode) : ladder;
+     const message =
+       exception instanceof HttpException
+         ? exception.message
+         : "unexpected internal error";
++    // `field` travels the way `code` does — the thrower names it, because only the
++    // thrower knows it. Omitted rather than null when there is nothing to name: a
++    // key that is always present and usually empty teaches a client to ignore it.
++    const field =
++      typeof response === "object" &&
++      response !== null &&
++      typeof (response as { field?: unknown }).field === "string"
++        ? (response as { field: string }).field
++        : null;
+     res.statusCode = status;
+     res.setHeader("content-type", "application/json");
+     // FOUR FIELDS AS OF CHAPTER 3.8, and constitution V has asked for four since
+     // chapter 1.3. `request_id` was promised "in Part 2, when a gateway exists to
+     // mint one"; the gateway arrived and the field did not. It is read back off
+     // the response rather than threaded through, because `RequestContextMiddleware`
+     // has already set `X-Request-Id` by the time anything can throw — one id, in
+     // the header and the body, from one place.
+@@ -65,14 +87,15 @@ export class ProtocolErrorFilter implements ExceptionFilter {
+     // `error` key until this chapter checked what the platform actually sends;
+     // it never sent that shape. Wrapping every error response would be a breaking
+     // change and CON-05 makes breaking changes a URL-versioning event, so the
+     // document was brought to the code — SRS 1.3 (research R27).
+     res.end(
+       JSON.stringify({
+         code,
+         message,
+-        docs_url: `https://relay.example/docs/errors/${code}`,
++        docs_url: docsUrl(code),
+         request_id: String(res.getHeader("X-Request-Id") ?? ""),
++        ...(field !== null ? { field } : {}),
+       }),
+     );
+   }
+ }
+```
+
+Cái thang đã có type, và `named` được đối chiếu với registry chứ không được tin —
+bên ném có thể nhét bất cứ chuỗi nào vào `code`, và filter là chỗ cuối cùng có thể
+nhận ra trước khi nó thành một URL.
+```diff title="services/api/src/messages/messages.service.ts"
+@@ -1,16 +1,17 @@
+ import {
+   BadRequestException,
+-  HttpException,
+   HttpStatus,
+   Injectable,
+   NotFoundException,
+ } from "@nestjs/common";
+ 
++import { protocolError } from "../protocol-error";
++
+ import {
+   ChannelNotFoundError,
+   Repository,
+   type MessageRow,
+   type MessageWithSender,
+ } from "../db/repository";
+ import { QuotaExceededError } from "../quotas/quota.error";
+ import { decodeCursor, encodeCursor } from "./cursor";
+@@ -78,21 +79,19 @@ export class MessagesService {
+         // THE CODE IS NAMED HERE, and it has to be. `ProtocolErrorFilter` infers
+         // a code from the status for 400, 401, 403 and 404, and everything else
+         // becomes `internal_error` — so an unnamed `402` would emit a body
+         // calling itself an internal error while carrying a `402`. That is the
+         // lie chapter 2.2 fixed for 400 and chapter 3.2 for 403, and 3.2's
+         // mechanism — a thrower naming its own code — is what this uses. The
+         // filter builds the four-field envelope and derives `docs_url` from the
+         // code.
+-        throw new HttpException(
+-          {
+-            code: "quota_exceeded",
+-            message: error.publicMessage(),
+-          },
++        throw protocolError(
++          "quota_exceeded",
++          error.publicMessage(),
+           HttpStatus.PAYMENT_REQUIRED,
+         );
+       }
+       throw error;
+     }
+   }
+ 
+   /** A page of history (chapter 2.4). The cursor is opaque coming in and
+```
+
+```diff title="services/api/src/internal/session.controller.ts"
+@@ -1,20 +1,21 @@
+ import {
+   Controller,
+   HttpCode,
+-  HttpException,
+   HttpStatus,
+   Inject,
+   Post,
+   Req,
+   UnauthorizedException,
+   UseGuards,
+ } from "@nestjs/common";
+ 
++import { protocolError } from "../protocol-error";
++
+ import type { InternalSessionResponse } from "@relay/protocol";
+ 
+ import { AUTH_DB } from "../auth/authenticate.middleware";
+ import { Accepts, CredentialGuard } from "../auth/credential.guard";
+ import type { RequestWithPrincipal } from "../auth/principal";
+ import type { Db } from "../db/client";
+ import { connectPolicy, Repository } from "../db/repository";
+ import { periodOf } from "../quotas/period";
+@@ -84,18 +85,19 @@ export class SessionController {
+     try {
+       policy = await connectPolicy(
+         this.db,
+         principal.environmentId,
+         periodOf(new Date()),
+       );
+     } catch (error) {
+       if (error instanceof QuotaExceededError) {
+-        throw new HttpException(
+-          { code: "quota_exceeded", message: error.publicMessage() },
++        throw protocolError(
++          "quota_exceeded",
++          error.publicMessage(),
+           HttpStatus.PAYMENT_REQUIRED,
+         );
+       }
+       throw error;
+     }
+ 
+     return {
+       environment_id: principal.environmentId,
+```
+
+```diff title="services/api/src/limits/rate-limit.middleware.ts"
+@@ -1,8 +1,9 @@
++import { docsUrl } from "@relay/protocol";
+ import type { IncomingMessage, ServerResponse } from "node:http";
+ 
+ import { Inject, Injectable, type NestMiddleware } from "@nestjs/common";
+ import type { Logger } from "@relay/service-kit";
+ 
+ import type { Db } from "../db/client";
+ import { environmentLimits } from "../db/repository";
+ import type { RequestWithPrincipal } from "../auth/principal";
+@@ -114,17 +115,17 @@ export class RateLimitMiddleware implements NestMiddleware {
+       if (count !== null && count > authFailureThreshold()) {
+         res.statusCode = 429;
+         res.setHeader("Retry-After", "60");
+         res.setHeader("content-type", "application/json");
+         res.end(
+           JSON.stringify({
+             code: "rate_limited",
+             message: "too many sign-up attempts from this address; retry shortly",
+-            docs_url: "https://relay.example/docs/errors/rate_limited",
++            docs_url: docsUrl("rate_limited"),
+             request_id: String(res.getHeader("X-Request-Id") ?? ""),
+           }),
+         );
+         return;
+       }
+       next();
+       return;
+     }
+@@ -212,17 +213,17 @@ export class RateLimitMiddleware implements NestMiddleware {
+       const what =
+         refusal.operation === "send" ? "messages" : "requests";
+       res.statusCode = 429;
+       res.setHeader("content-type", "application/json");
+       res.end(
+         JSON.stringify({
+           code: "rate_limited",
+           message: `too many ${what} for this environment; retry after ${retryAfter} seconds`,
+-          docs_url: "https://relay.example/docs/errors/rate_limited",
++          docs_url: docsUrl("rate_limited"),
+           request_id: String(res.getHeader("X-Request-Id") ?? ""),
+         }),
+       );
+       return;
+     }
+ 
+     next();
+   }
+```
+
+```diff title="services/gateway/src/session.ts"
+@@ -1,15 +1,17 @@
+ import { randomUUID } from "node:crypto";
+ import type { IncomingMessage, Server } from "node:http";
+ import type { Duplex } from "node:stream";
+ 
+ import {
+   CLOSE_CODES,
++  docsUrl,
+   frameSchema,
++  type ErrorCode,
+   type Frame,
+   type Message,
+ } from "@relay/protocol";
+ import { newRequestId, type Logger } from "@relay/service-kit";
+ import { WebSocketServer, type WebSocket } from "ws";
+ 
+ import { ApiError, type ApiClient } from "./api-client.js";
+ import { authenticate, type Identity } from "./auth.js";
+@@ -64,17 +66,17 @@ function send(socket: WebSocket, frame: Frame): void {
+  * The same three headers the api sends on a 429, from the same numbers, plus
+  * `Retry-After` — a client should not have to learn a second dialect for the
+  * socket door. `Connection: close` because this socket is not becoming a
+  * WebSocket and is not being kept alive for a second request either. */
+ function refuseUpgrade(socket: Duplex, decision: Decision): void {
+   const body = JSON.stringify({
+     code: "rate_limited",
+     message: "too many connections; retry after the window resets",
+-    docs_url: "https://relay.example/docs/errors/rate_limited",
++    docs_url: docsUrl("rate_limited"),
+     request_id: newRequestId(),
+   });
+   socket.write(
+     [
+       "HTTP/1.1 429 Too Many Requests",
+       "Content-Type: application/json",
+       `Content-Length: ${Buffer.byteLength(body)}`,
+       `Retry-After: ${decision.retryAfterSeconds}`,
+@@ -84,28 +86,33 @@ function refuseUpgrade(socket: Duplex, decision: Decision): void {
+       "Connection: close",
+       "",
+       body,
+     ].join("\r\n"),
+   );
+   socket.destroy();
+ }
+ 
++/** `ErrorCode`, not `string` (chapter 3.12, FR-025). Every code this function is
++ * given becomes a `docs_url`, so a typo used to ship a link to a page that could
++ * not exist — and the gateway is the surface where nobody sees a 404 until a
++ * customer clicks it. Narrowing the parameter is what makes the registry the
++ * vocabulary rather than a suggestion. */
+ function sendError(
+   socket: WebSocket,
+-  code: string,
++  code: ErrorCode,
+   message: string,
+   requestId: string = newRequestId(),
+ ): void {
+   send(socket, {
+     type: "error",
+     payload: {
+       code,
+       message,
+-      docs_url: `https://relay.example/docs/errors/${code}`,
++      docs_url: docsUrl(code),
+       request_id: requestId,
+     },
+   });
+ }
+ 
+ export interface SessionServerOptions {
+   server: Server;
+   api: ApiClient;
+```
+
+Thu hẹp tham số của `sendError` từ `string` xuống `ErrorCode` là thay đổi duy nhất
+được dự đoán sẽ làm vỡ cái gì đó, và nó không làm vỡ gì: mọi chỗ gọi đang có đều đã
+dùng một code đã đăng ký. Cái cổng đó đứng đó cho lần sau.
+
+## Cái field mà chương 3.13 không gán được
+
+Test của chương 3.13 đòi một channel private bị từ chối phải gọi tên field sai, và
+không có gì trong platform từng gán một field nào:
+```diff title="services/api/src/messages/zod-validation.pipe.ts"
+@@ -1,21 +1,42 @@
+-import { BadRequestException, type PipeTransform } from "@nestjs/common";
++import type { PipeTransform } from "@nestjs/common";
++
++import { protocolError } from "../protocol-error";
+ import type { ZodType } from "zod";
+ 
+ // Boundary validation (chapter 2.2). safeParse, never parse: a throw
+ // from deep inside a library is not an error shape anyone can rely on.
+ // The BadRequestException carries the message; 1.4's ProtocolErrorFilter
+ // turns it into the EIR-API-04 envelope on the way out — one error shape,
+ // one home, unchanged since the skeleton.
+ export class ZodValidationPipe<T> implements PipeTransform<unknown, T> {
+   constructor(private readonly schema: ZodType<T>) {}
+ 
+   transform(value: unknown): T {
+     const result = this.schema.safeParse(value);
+     if (!result.success) {
+-      throw new BadRequestException(
+-        result.error.issues[0]?.message ?? "invalid body",
++      const issue = result.error.issues[0];
++      // WHICH FIELD, and chapter 3.12 is where that stopped being optional.
++      //
++      // EIR-API-04's error shape has carried a `field` since chapter 1.3 and
++      // `errorFrameSchema` declares it — and nothing in the api had ever set it.
++      // Every validation failure in twenty-two chapters said `Invalid input:
++      // expected "public"` and left the caller to work out which key that was
++      // about. This is the same habit as `request_id`, which was declared in 1.3
++      // and first sent in 3.8: a field in the contract that the code never filled.
++      //
++      // Named here rather than in the filter because only the pipe knows the
++      // path. Zod's `path` is an array — `["metadata", "blob"]` — and it joins
++      // with dots, which is what a developer reading their own request body sees.
++      // An empty path means the whole body failed (a non-object, say), and then
++      // there is no field to name and the key is omitted rather than sent empty.
++      const path = issue?.path.join(".");
++      throw protocolError(
++        "invalid_request",
++        issue?.message ?? "invalid body",
++        400,
++        path !== undefined && path.length > 0 ? path : undefined,
+       );
+     }
+     return result.data;
+   }
+ }
+```
+
+`issues[0].path` là một array — `["metadata", "blob"]` — và nó nối bằng dấu chấm,
+đúng cái mà một developer đọc chính request body của mình nhìn thấy. Một path rỗng
+nghĩa là cả body sai, và khi đó không có field nào để gọi tên nên key bị bỏ đi thay
+vì gửi rỗng.
+
+<Why title="Vì sao field được gọi tên trong pipe và được filter chở đi" locale="vi">
+
+Chỉ pipe biết cái path. Chỉ filter dựng cái envelope. Nên field đi theo đúng đường mà
+`code` đã đi — bên ném gọi tên nó, filter chở nó — và một key luôn có mặt mà thường
+rỗng sẽ dạy client bỏ qua nó, nên nó bị bỏ đi khi không có gì để nói.
+
+</Why>
+
+## Một package không có dependency nào, và một URL nó phải phát ra
+
+`packages/service-kit` khai báo **không dependency nào cả**, và đó chính là tính chất
+cho phép mọi thứ dùng nó. Envelope not-found của nó cần một `docs_url`, mà cái
+registry sở hữu URL thì nằm trong `@relay/protocol`.
+```diff title="packages/service-kit/src/index.ts"
+@@ -50,26 +50,44 @@ export function newRequestId(): string {
+   return randomUUID();
+ }
+ 
+ export interface ServeOptions {
+   service: string;
+   /** Extra fields merged into the /healthz payload. */
+   health: () => Record<string, unknown>;
+   logger?: Logger;
++  /** The `docs_url` for the not-found envelope this server answers unknown routes
++   * with (chapter 3.12, FR-027).
++   *
++   * REQUIRED, AND THE DEPENDENCY INVERTS RATHER THAN BEING ADDED. The obvious move
++   * is to import `docsUrl` from `@relay/protocol` here — and this package declares
++   * NO dependencies at all, which is the property that lets anything use it. So the
++   * caller supplies the URL instead, and because the field is required the compiler
++   * makes it do so: `serve()` has exactly one caller and cannot be given a stale
++   * placeholder by accident.
++   *
++   * Optional would have been the fourth instance of this chapter's own subject —
++   * `rate_limited`, close code 4008 and `request_id` were all declared and left
++   * unenforced, and an optional field with a default host is a placeholder with a
++   * longer life. */
++  notFoundDocsUrl: string;
+ }
+ 
+ /** Build (but do not start) a service's HTTP server: every response carries
+  * X-Request-Id (EIR-API-05), every request logs exactly one structured line
+  * carrying the same id (NFR-OBS-06's grep-ability starts here), GET /healthz
+  * answers with the service's health payload, and unknown routes get the
+- * EIR-API-04 error shape. The docs_url host is a placeholder until the docs
+- * site exists — constitution V's reachable-page promise lands with it. */
++ * EIR-API-04 error shape.
++ *
++ * The docs_url is no longer a placeholder — chapter 3.12 made it a required option
++ * and the caller derives it from `@relay/protocol`'s registry, which is how a
++ * package with no dependencies can still emit a URL the registry owns. */
+ export function serve(options: ServeOptions): Server {
+-  const { service, health } = options;
++  const { service, health, notFoundDocsUrl } = options;
+   const logger = options.logger ?? createLogger(service);
+   return createServer((req, res) => {
+     const requestId = newRequestId();
+     const path = req.url ?? "/";
+     res.setHeader("X-Request-Id", requestId);
+     res.setHeader("content-type", "application/json");
+ 
+     let status: number;
+@@ -77,17 +95,17 @@ export function serve(options: ServeOptions): Server {
+     if (req.method === "GET" && path === "/healthz") {
+       status = 200;
+       body = { status: "ok", service, ...health() };
+     } else {
+       status = 404;
+       body = {
+         code: "not_found",
+         message: `no route for ${req.method ?? "?"} ${path}`,
+-        docs_url: "https://relay.example/docs/errors/not_found",
++        docs_url: notFoundDocsUrl,
+         // Chapter 3.8: the fourth field constitution V has asked for since 1.3.
+         // Everywhere, not only on the rate-limit error — four fields on one
+         // status and three on the others is worse than either consistent answer.
+         request_id: requestId,
+       };
+     }
+     res.statusCode = status;
+     res.end(JSON.stringify(body));
+```
+
+```diff title="services/gateway/src/main.ts"
+@@ -1,9 +1,9 @@
+-import { CLOSE_CODES, frameSchema } from "@relay/protocol";
++import { CLOSE_CODES, frameSchema, docsUrl } from "@relay/protocol";
+ import { createLogger, serve, type Logger } from "@relay/service-kit";
+ 
+ import { createApiClient } from "./api-client.js";
+ import { createFanout } from "./fanout.js";
+ import { createGatewayLimits } from "./limits.js";
+ import { attachSessions } from "./session.js";
+ 
+ // The gateway — SAD §4.1: terminates WebSockets and never writes to the
+@@ -22,16 +22,19 @@ export function createServer(logger?: Logger) {
+   const log = logger ?? createLogger("gateway");
+   const server = serve({
+     service: "gateway",
+     health: () => ({
+       uptime_s: Math.round(process.uptime()),
+       protocol: { frames, close_codes: closeCodes },
+     }),
+     logger: log,
++    // The registry owns the URL; `service-kit` owns no dependencies. So the URL
++    // crosses the boundary as data (chapter 3.12, FR-027, R9).
++    notFoundDocsUrl: docsUrl("not_found"),
+   });
+   // The socket server rides the SAME listener as health — one port, two
+   // protocols, which is what an upgrade handshake is for.
+   // Every instance is both publisher and subscriber: there is no leader
+   // here, and no instance knows how many others exist (ADR-07). Scaling
+   // out is adding a process.
+   const fanout = createFanout({ logger: log });
+   // Chapter 3.8. A SECOND Redis client, not fanout's — one of fanout's two is a
+```
+
+<Why title="Vì sao là bắt buộc, và vì sao dependency bị đảo chiều" locale="vi">
+
+Import `@relay/protocol` ở đây sẽ kết thúc tính chất kia. Nên bên gọi truyền URL vào
+như dữ liệu, và vì field là **bắt buộc**, compiler bắt nó phải truyền: `serve()` có
+đúng một chỗ gọi trong production và không thể bị đưa một chỗ-giữ-tạm cũ do vô tình.
+
+Optional kèm một host mặc định sẽ là lần thứ tư của đúng cái chủ đề chương này nói
+về. `rate_limited`, close code 4008 và `request_id` đều đã được khai báo rồi để đó
+không ai thực thi, mà một chỗ giữ tạm có sẵn giá trị mặc định thì sống lâu hơn một
+chỗ giữ tạm không có.
+
+</Why>
+
+Compiler gọi tên từng chỗ gọi — một trong production và tám trong test:
+```diff title="services/gateway/src/session.test.ts"
+@@ -1,17 +1,19 @@
+ import { WebSocket } from "ws";
+ import { afterEach, describe, expect, it } from "vitest";
+ import { readFile } from "node:fs/promises";
+ import type { Server } from "node:http";
+ import type { AddressInfo } from "node:net";
+ 
+ import { createLogger, type Logger } from "@relay/service-kit";
+ import { serve } from "@relay/service-kit";
+-import { CLOSE_CODES, type Frame } from "@relay/protocol";
++import { CLOSE_CODES, type Frame,
++  docsUrl,
++} from "@relay/protocol";
+ 
+ import type { InternalSendResponse, Message } from "@relay/protocol";
+ 
+ import type { ApiClient } from "./api-client.js";
+ import type { Fanout } from "./fanout.js";
+ import { decide, type GatewayLimits } from "./limits.js";
+ import { attachSessions } from "./session.js";
+ 
+@@ -168,16 +170,17 @@ async function boot(
+   fanout?: Fanout,
+   resumeDeadlineMs?: number,
+   limits?: GatewayLimits,
+ ): Promise<Harness> {
+   const server: Server = serve({
+     service: "gateway",
+     health: () => ({}),
+     logger: silent,
++    notFoundDocsUrl: docsUrl("not_found"),
+   });
+   const sessions = attachSessions({
+     server,
+     api,
+     logger: silent,
+     ...(fanout !== undefined && { fanout }),
+     ...(pingIntervalMs !== undefined && { pingIntervalMs }),
+     ...(resumeDeadlineMs !== undefined && { resumeDeadlineMs }),
+```
+
+```diff title="services/gateway/src/resume.itest.ts (excerpt)"
++import { docsUrl } from "@relay/protocol";
+   const server: Server = serve({
+     service: "gateway",
+     health: () => ({}),
+     logger: silent,
++    notFoundDocsUrl: docsUrl("not_found"),
+   });
+```
+
+```ts title="services/gateway/src/session.itest.ts (excerpt)"
+    server = serve({
+      service: "gateway",
+      health: () => ({}),
+      logger: silent,
+      notFoundDocsUrl: docsUrl("not_found"),
+    });
+```
+
+## Một trang resolve được, kiểm theo cả hai chiều
+
+Tài liệu là `docs/08-error-reference.md`: một `h2` cho mỗi code, heading chính là
+code nguyên văn, mỗi mục kèm nghĩa của nó, nguyên nhân, và điều client nên làm. Mỗi
+mục đều nói rõ có nên retry hay không, bởi một client retry một lời từ chối nó không
+bao giờ thoả được sẽ chờ mãi mãi, còn một client bỏ cuộc trước một lỗi tạm thời sẽ
+mất tin nhắn.
+```
+check-error-codes: 13 codes, 13 sections, each with a cause and a client action
+```
+
+Nửa phía platform của phép kiểm ấy sống cùng registry, bởi nó có thể tự chứa — không
+file nào ngoài workspace, nên không có lỗ cache của turbo và không phụ thuộc vào
+repository cha:
+```ts title="packages/protocol/src/codes.test.ts"
+import { describe, expect, it } from "vitest";
+
+import { CLOSE_CODES, ERROR_CODES, docsUrl, DEFAULT_DOCS_BASE_URL } from "./codes.js";
+
+// The failure vocabulary stays coherent: EIR-WS-06's four classes are all
+// present, exactly once, with distinct meanings — and error codes never
+// collide or go blank as chapters add to the registry.
+
+describe("close codes cover EIR-WS-06's four classes", () => {
+  it("contains exactly 4001, 4002, 4008, 4009", () => {
+    expect(Object.keys(CLOSE_CODES).map(Number).sort()).toEqual([
+      4001, 4002, 4008, 4009,
+    ]);
+  });
+
+  it("gives every code a distinct, non-empty meaning", () => {
+    const meanings = Object.values(CLOSE_CODES);
+    expect(new Set(meanings).size).toBe(meanings.length);
+    for (const meaning of meanings) expect(meaning.length).toBeGreaterThan(0);
+  });
+});
+
+describe("error codes stay unique and described", () => {
+  it("has no duplicate or empty descriptions", () => {
+    const descriptions = Object.values(ERROR_CODES);
+    expect(new Set(descriptions).size).toBe(descriptions.length);
+    for (const d of descriptions) expect(d.length).toBeGreaterThan(0);
+  });
+
+  it("uses snake_case machine-readable keys (EIR-API-04)", () => {
+    for (const code of Object.keys(ERROR_CODES)) {
+      expect(code).toMatch(/^[a-z][a-z_]*$/);
+    }
+  });
+});
+
+// ── THE PLATFORM HALF OF THE CLOSURE CHECK (chapter 3.12, FR-025, SC-011) ─────
+//
+// Every code the platform can emit is in `ERROR_CODES`. The tutorial repository
+// holds the other half — that every code has a section in the published reference,
+// and that every section names a code that exists — and it lives there rather than
+// here for two measured reasons: `docs/` sits above `$TURBO_ROOT$` so it cannot be
+// a turbo input, and a gate whose input turbo cannot see passes from cache after
+// the reference changes; and `relay-platform` is independently clonable with a
+// README promising its checks pass from a clean checkout, where `../docs` does not
+// exist.
+//
+// What CAN be checked here is the registry's own closure: `docsUrl` accepts only
+// `ErrorCode`, `ProtocolErrorFilter`'s ladder is typed `ErrorCode`, and
+// `protocolError` and the gateway's `sendError` both take `ErrorCode` — so a code
+// that is not in this object cannot be constructed anywhere in the platform without
+// failing the build. This suite checks the shape of the object those types rest on.
+describe("the registry is the whole vocabulary (FR-024)", () => {
+  it("holds thirteen codes", () => {
+    // A number, so adding one is a visible edit rather than a silent widening. The
+    // count is here and not in a comment because a comment does not fail.
+    expect(Object.keys(ERROR_CODES)).toHaveLength(13);
+  });
+
+  it("contains the five the status ladder emits", () => {
+    // `ProtocolErrorFilter` maps a status to one of these when a thrower names no
+    // code. All five went out on the wire for twenty-two chapters while absent
+    // from this object — and `docs_url` is derived from the code, so each one
+    // shipped a link to a page that could not exist.
+    for (const code of [
+      "invalid_request",
+      "unauthorized",
+      "forbidden",
+      "not_found",
+      "internal_error",
+    ]) {
+      expect(ERROR_CODES, code).toHaveProperty(code);
+    }
+  });
+
+  it("contains every code the socket surface sends", () => {
+    for (const code of ["invalid_frame", "unknown_frame_type", "rate_limited", "quota_exceeded"]) {
+      expect(ERROR_CODES, code).toHaveProperty(code);
+    }
+  });
+
+  it("builds a docs_url whose fragment is the code verbatim", () => {
+    // No slug transform, in either direction. The reference's `h2` headings ARE
+    // the codes, and `slugifyHeading` in the tutorial site keeps `_` so that
+    // stays true — a transform here would be the same transform maintained in two
+    // repositories with no test able to see both sides.
+    for (const code of Object.keys(ERROR_CODES) as (keyof typeof ERROR_CODES)[]) {
+      expect(docsUrl(code).endsWith(`#${code}`), code).toBe(true);
+    }
+  });
+
+  it("reads the base URL per call, not at import", () => {
+    const before = process.env["RELAY_DOCS_BASE_URL"];
+    try {
+      process.env["RELAY_DOCS_BASE_URL"] = "https://preview.example/errors";
+      expect(docsUrl("not_found")).toBe("https://preview.example/errors#not_found");
+    } finally {
+      if (before === undefined) delete process.env["RELAY_DOCS_BASE_URL"];
+      else process.env["RELAY_DOCS_BASE_URL"] = before;
+    }
+    expect(docsUrl("not_found")).toBe(`${DEFAULT_DOCS_BASE_URL}#not_found`);
+  });
+});
+```
+
+Con số được assert chứ không để trong một comment, bởi một comment thì không fail. Và
+base URL được kiểm về việc có được đọc ở mỗi lượt gọi, đó là điều duy nhất về
+`docsUrl` mà người đọc sẽ không tự đoán ra.
+
+Phép kiểm so registry với các heading **theo cả hai chiều**. Một code không có mục
+thì fail, bởi `docs_url` của nó sẽ 404. **Và một mục không ứng với code nào cũng
+fail**, bởi một tài liệu tham chiếu mô tả một code đã bị bỏ chính là cách một bộ tài
+liệu bắt đầu nói dối. Cả hai đều được chứng minh rồi hoàn nguyên:
+```
+$ # a fourteenth code with no section
+check-error-codes: these codes have no section in the reference, so their
+docs_url 404s:  probe_code_with_no_page
+$ echo $?
+1
+
+$ # a section naming no code
+check-error-codes: these sections name no code in ERROR_CODES — remove them
+or the reference is lying:  retired_code
+$ echo $?
+1
+```
+
+<Trap title="Phép kiểm chạy như một bước CI, không phải một turbo task" locale="vi">
+
+Hai lý do đã đo, và cả hai đều về việc cái cổng này là thật.
+
+`docs/` nằm trên `$TURBO_ROOT$`, nên nó không thể là input của turbo — và một cái
+cổng mà turbo không thấy được input thì **qua nhờ cache** sau khi tài liệu thay đổi.
+Còn `relay-platform` thì clone độc lập được, với một README hứa rằng các phép kiểm
+của chính nó qua được từ một bản checkout sạch, nơi `../docs` không tồn tại.
+
+Nên nó là một bước trong CI job của platform, job vốn đã có bản build của protocol
+package mà script đọc. Bản thân script chỉ dùng builtin của node, nên nó không cần gì
+từ cây dependency của tutorial — chỉ cần đường dẫn tới nó.
+
+</Trap>
+
+Và cái URL được **fetch** chứ không phải khớp theo pattern. Một api thật với
+`RELAY_DOCS_BASE_URL` trỏ vào một trang đang được serve, ba response lỗi thật, và mỗi
+fragment được đối chiếu với các thuộc tính `id` trong HTML trả về:
+```
+unauthorized     → …/error-reference#unauthorized      RESOLVES
+not_found        → …/error-reference#not_found          RESOLVES
+invalid_request  → …/error-reference#invalid_request    RESOLVES
+```
+
+```json
+{
+  "code": "invalid_request",
+  "message": "Invalid input: expected \"public\"",
+  "docs_url": "http://localhost:3999/docs/error-reference#invalid_request",
+  "request_id": "3b3c88fc-cee6-4c72-9b21-5817d929e9c4",
+  "field": "type"
+}
+```
+
+Năm field, và field thứ năm là cái mà chương 3.13 đã đòi.
+
+## Người ngoài
+
+<Figure caption="Ba cấp, và cấp đầu không phải một rule: node_modules cô lập của pnpm không có thư mục @relay ở gốc workspace, nên import đó không resolve. Điều không cấp nào chặn được là đọc source bằng mắt, và đó là một kỷ luật chứ không phải một cơ chế." chart={figThreeLevels} />
+
+Tiêu chí ra đòi một bản tích hợp được dựng chỉ từ tài liệu công khai. Tuyên bố thì
+dễ; tuyên bố ấy vô giá trị trừ khi cái thứ đưa ra nó **không thể** đọc source của
+platform. Nên nó là một package không thể đọc được:
+```json title="packages/outsider/package.json"
+{
+  "name": "@relay/outsider",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test:integration": "vitest run --config vitest.integration.config.mts"
+  }
+}
+```
+
+```json title="packages/outsider/tsconfig.json"
+{
+  "extends": "../../tsconfig.base.json",
+  "include": ["src"]
+}
+```
+
+```ts title="packages/outsider/vitest.integration.config.mts"
+import { defineConfig } from "vitest/config";
+
+// THE SEALED INTEGRATION (chapter 3.12, FR-030, FR-031).
+//
+// This package holds one suite that behaves like a customer: it reads two URLs
+// and a credential from the environment, speaks HTTP and WebSocket, and knows
+// nothing else about Relay. It is the SRS Phase 2 exit criterion — "an external
+// developer integrates using only public documentation, with no assistance" —
+// made into something that either passes or fails.
+//
+// WRITTEN FROM SCRATCH, NOT COPIED FROM A SIBLING, and that was a deliberate
+// instruction rather than a preference. Every other integration config in this
+// workspace points `globalSetup` and `setupFiles` at
+// `../../packages/test-harness/src/…` — so copying one reaches into another
+// package on its second line, which is exactly the thing this package exists to
+// be unable to do. It needs neither: it touches no database, so there is nothing
+// to migrate, no guard to arm and no bait to plant.
+//
+// NO `test` SCRIPT in package.json either. The Docker-free unit lane must not
+// look here: with no platform running, every test in this suite fails, and it
+// should — "the platform is not up" is the correct answer to a request to
+// integrate against it, not a reason to soften the suite.
+//
+// AND THE DEFAULT INTEGRATION LANE SKIPS IT TOO. `pnpm test:integration` is
+// `turbo run test:integration --filter=!@relay/outsider`, with `pnpm test:outsider`
+// as the way in. That lane needs stores and spawns what it talks to; this suite
+// needs the api and gateway ALREADY SERVING, from images that were built, with a
+// tenant already seeded. Folding it in would make every developer's integration run
+// depend on a compose profile they did not ask for — and the honest failure this
+// suite gives when the platform is absent would become noise everyone learns to
+// scroll past.
+export default defineConfig({
+  test: {
+    include: ["src/**/*.itest.ts"],
+    // A socket handshake and a fan-out hop against a real stack, not a stub.
+    testTimeout: 30_000,
+    hookTimeout: 30_000,
+  },
+});
+```
+
+<Why title="Vì sao config được viết từ đầu chứ không copy từ package bên cạnh" locale="vi">
+
+Mọi integration config khác trong workspace này đều trỏ `globalSetup` và `setupFiles`
+tới `../../packages/test-harness/src/…`. Copy một cái là với vào package khác **ngay
+ở dòng thứ hai** — mà đó đúng là điều package này tồn tại để không làm được.
+
+Nó không cần cả hai: nó không chạm database, nên không có gì để migrate, không guard
+nào để nạp và không bait nào để gieo.
+
+</Why>
+```ts title="packages/outsider/src/integrate.itest.ts"
+import { beforeAll, describe, expect, it } from "vitest";
+
+// AN INTEGRATION BUILT FROM PUBLISHED DOCUMENTATION ALONE (FR-031, SC-009,
+// SC-030).
+//
+// This file is the SRS Phase 2 exit criterion as a test: "an external developer
+// integrates using only public documentation, with no assistance." It knows three
+// things about Relay — two URLs and a credential — and everything else it does is
+// HTTP and WebSocket against a running platform it did not start.
+//
+// IT STARTS NOTHING. No `spawn`, no compose invocation, no process launch of any
+// kind. Every other integration suite in this workspace boots what it talks to,
+// which is right for them and would destroy the claim here: a package that can
+// start the platform is a package that knows how the platform is built. If the
+// platform is absent this fails saying so, which is the correct answer.
+//
+// THREE MECHANICAL SEALS keep it honest, and none of them is this comment:
+//
+//   1. `package.json` declares no `@relay/*` dependency, and pnpm's isolated
+//      `node_modules` has no `@relay` directory at the workspace root — so
+//      `import { ERROR_CODES } from "@relay/protocol"` does not resolve. No rule
+//      is involved; the module simply is not there.
+//   2. `no-restricted-imports` in `eslint.config.mjs` refuses any specifier that
+//      climbs out of this package.
+//   3. `no-restricted-syntax` refuses the `".."` string literal and
+//      `createRequire`, because an import rule cannot see a path built from
+//      strings — `packages/e2e/src/harness.ts` builds one and spawns from it.
+//
+// WHAT NONE OF THE THREE CLOSES: reading the repository's source with human eyes.
+// The seals make it impossible to IMPORT workspace code; they cannot make it
+// impossible to look. That is a discipline, and the chapter says so rather than
+// letting three rules imply a fourth (FR-034).
+//
+// AND IT IMPORTS NOTHING AT ALL BEYOND VITEST. The socket uses Node's GLOBAL
+// `WebSocket`, not the `ws` package every suite in this workspace uses — which
+// was not the plan and is the better answer. `ws` resolves from the workspace root
+// by the ordinary parent walk, so the suite could have used it while declaring
+// nothing; its TYPES do not, and the choice was between borrowing `@types/ws`
+// through a parent walk, writing a local ambient declaration, or using the
+// platform's own client. Node 22 has had a standards-compliant `WebSocket` since
+// 22.4, so an outsider in 2026 needs no library — and the API is the browser's,
+// which is what the series' own examples show. A dependency list that is empty
+// because nothing is needed is a stronger claim than one that is empty because
+// three things were reached for sideways.
+
+const API = process.env["RELAY_API_URL"];
+const WS = process.env["RELAY_WS_URL"];
+const CREDENTIAL = process.env["RELAY_DEMO_CREDENTIAL"];
+
+/** Read from the environment and checked ONCE, with a message that says what to do.
+ *
+ * An outsider's first failure should not be `fetch failed` against `undefined`. It
+ * should be a sentence naming the three things this suite needs and where they come
+ * from — which is itself part of what the exit criterion measures. */
+function required(): { api: string; ws: string; credential: string } {
+  const missing = [
+    API ? null : "RELAY_API_URL",
+    WS ? null : "RELAY_WS_URL",
+    CREDENTIAL ? null : "RELAY_DEMO_CREDENTIAL",
+  ].filter(Boolean);
+  if (missing.length > 0) {
+    throw new Error(
+      `this suite integrates against a RUNNING platform and starts nothing. ` +
+        `Missing: ${missing.join(", ")}. Bring the platform up and seed a tenant:\n` +
+        `  RELAY_POSTGRES_PORT=15432 docker compose up -d --wait\n` +
+        `  DATABASE_URL=postgres://relay:relay@localhost:15432/relay node services/api/dist/db/migrate.js\n` +
+        `  RELAY_POSTGRES_PORT=15432 docker compose --profile services up -d --wait\n` +
+        `  export RELAY_DEMO_CREDENTIAL=$(node scripts/seed-demo-tenant.mjs)\n` +
+        `  export RELAY_API_URL=http://localhost:4000 RELAY_WS_URL=ws://localhost:4001`,
+    );
+  }
+  return { api: API!, ws: WS!, credential: CREDENTIAL! };
+}
+
+describe("integrating with Relay from the outside", () => {
+  let api: string;
+  let ws: string;
+  let credential: string;
+  let channelId: string;
+  let token: string;
+
+  const post = async (path: string, body: unknown, auth: string) => {
+    const res = await fetch(`${api}${path}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${auth}` },
+      body: JSON.stringify(body),
+    });
+    return { status: res.status, body: (await res.json()) as Record<string, unknown> };
+  };
+
+  beforeAll(() => {
+    ({ api, ws, credential } = required());
+  });
+
+  it("reaches the platform at all", async () => {
+    // Before anything else, and separately, so a platform that is not there says
+    // so once instead of failing eight times with eight different messages.
+    const res = await fetch(`${api}/healthz`);
+    expect(res.status, `no healthy api at ${api}`).toBe(200);
+  });
+
+  it("creates a channel, and creating it twice is not an error", async () => {
+    const external = `outsider-${Date.now()}`;
+    const first = await post("/v1/channels", { external_id: external, type: "public" }, credential);
+    expect(first.status).toBe(201);
+    expect(first.body["external_id"]).toBe(external);
+    channelId = first.body["id"] as string;
+
+    // The documentation says a repeat returns the existing channel. 200 rather
+    // than 201 is how a client tells which happened without reading the body.
+    const again = await post("/v1/channels", { external_id: external, type: "public" }, credential);
+    expect(again.status).toBe(200);
+    expect(again.body["id"]).toBe(channelId);
+  });
+
+  it("refuses a private channel, naming the field", async () => {
+    // Documented behaviour, not a guess: the reference says `type` accepts
+    // `public` and the error names the offending key. An integration that reads
+    // the reference should be able to rely on both.
+    const res = await post(
+      "/v1/channels",
+      { external_id: `outsider-private-${Date.now()}`, type: "private" },
+      credential,
+    );
+    expect(res.status).toBe(400);
+    expect(res.body["code"]).toBe("invalid_request");
+    expect(res.body["field"]).toBe("type");
+    // And the docs_url is a URL, with the code as its fragment.
+    expect(String(res.body["docs_url"])).toContain("#invalid_request");
+  });
+
+  it("adds two members, creating the users on first membership", async () => {
+    const res = await post(
+      `/v1/channels/${channelId}/members`,
+      { user_ids: ["ana", "ben"] },
+      credential,
+    );
+    expect(res.status).toBe(200);
+    const members = res.body["members"] as { external_id: string; status: string }[];
+    expect(members.map((m) => m.external_id)).toEqual(["ana", "ben"]);
+    expect(members.every((m) => m.status === "added")).toBe(true);
+  });
+
+  it("mints a token for one of those members", async () => {
+    const res = await post("/auth/dev-token", { user: "ana", ttl_seconds: 3600 }, credential);
+    expect(res.status).toBe(200);
+    token = res.body["token"] as string;
+    expect(typeof token).toBe("string");
+  });
+
+  it("sends a message over REST and reads it back from history", async () => {
+    const text = `from the outside ${Date.now()}`;
+    const sent = await post(`/v1/channels/${channelId}/messages`, { text }, credential);
+    expect(sent.status).toBe(201);
+
+    const history = await fetch(`${api}/v1/channels/${channelId}/messages?limit=10`, {
+      headers: { authorization: `Bearer ${credential}` },
+    });
+    expect(history.status).toBe(200);
+    const page = (await history.json()) as { messages: { text: string }[] };
+    expect(page.messages.map((m) => m.text)).toContain(text);
+  });
+
+  it("receives a message on a socket — SENT over the socket", async () => {
+    // THE SEND HAS TO BE ON THE SOCKET, and finding that out is one of the gaps
+    // this exercise recorded. A message sent over `POST /v1/channels/:id/messages`
+    // reaches no socket at all: the api publishes to no fan-out, and the public
+    // send attributes no user, so the row is dropped from resume for having no
+    // sender. Nothing in the published documentation said so.
+    const socket = new WebSocket(`${ws}/v1/ws?token=${token}`);
+    const frames: { type: string; payload?: { text?: string; seq?: number } }[] = [];
+    // Listeners attached BEFORE the open await. `connection.ack` arrives the
+    // instant the upgrade completes, and awaiting `open` first yields to the event
+    // loop — the frame lands with no listener and is gone.
+    socket.addEventListener("message", (event) => {
+      frames.push(JSON.parse(String(event.data)) as { type: string });
+    });
+    socket.addEventListener("error", () => undefined);
+
+    await new Promise<void>((resolve, reject) => {
+      socket.addEventListener("open", () => resolve());
+      socket.addEventListener("close", (event) =>
+        reject(new Error(`closed ${(event as CloseEvent).code}`)),
+      );
+      setTimeout(() => reject(new Error(`no socket at ${ws} within 10s`)), 10_000);
+    });
+
+    const waitFor = async (predicate: (f: { type: string }) => boolean, what: string) => {
+      const deadline = Date.now() + 10_000;
+      for (;;) {
+        const found = frames.find(predicate);
+        if (found) return found;
+        if (Date.now() > deadline) {
+          throw new Error(`no ${what}; saw ${frames.map((f) => f.type).join(", ") || "nothing"}`);
+        }
+        await new Promise((r) => setTimeout(r, 50));
+      }
+    };
+
+    await waitFor((f) => f.type === "connection.ack", "connection.ack");
+
+    const text = `over the socket ${Date.now()}`;
+    socket.send(
+      JSON.stringify({
+        type: "message.send",
+        payload: { idem_key: `outsider-${Date.now()}`, channel: channelId, text },
+      }),
+    );
+
+    // The sender's own acknowledgement, then the event. Both are documented and
+    // both matter: the ack says it was committed, the event says it was delivered.
+    await waitFor((f) => f.type === "message.ack", "message.ack");
+    await waitFor(
+      (f) => f.type === "message.created" && (f as { payload?: { text?: string } }).payload?.text === text,
+      "message.created for the text just sent",
+    );
+    socket.close();
+  });
+
+  it("cannot see another tenant's channel, and cannot tell it apart from an absent one", async () => {
+    // The documented isolation property, exercised the only way an outsider can:
+    // with an id that is well formed and is not theirs. The reference says both
+    // answer identically, so this checks that rather than taking it on faith.
+    const nowhere = "00000000-0000-4000-8000-000000000000";
+    const a = await fetch(`${api}/v1/channels/${nowhere}/messages`, {
+      headers: { authorization: `Bearer ${credential}` },
+    });
+    const b = await fetch(`${api}/v1/webhooks/${nowhere}`, {
+      headers: { authorization: `Bearer ${credential}` },
+    });
+    expect(a.status).toBe(404);
+    expect(b.status).toBe(404);
+    for (const res of [a, b]) {
+      const body = (await res.json()) as Record<string, unknown>;
+      expect(body["code"]).toBe("not_found");
+      expect(String(body["docs_url"])).toContain("#not_found");
+      // Every error carries one, and it is what a support request quotes.
+      expect(typeof body["request_id"]).toBe("string");
+    }
+  });
+});
+```
+
+<Trap title="Nó không import gì ngoài vitest, và đó không phải kế hoạch ban đầu" locale="vi">
+
+`ws` resolve được từ gốc workspace bằng phép đi lên cha thông thường, nên bộ test lẽ
+ra dùng được nó mà vẫn không khai báo gì. **Type** của nó thì không — và điều đó buộc
+phải chọn giữa việc mượn `@types/ws` theo đường ngang, viết một khai báo ambient cục
+bộ, hay dùng chính client của platform.
+
+Node đã ship một `WebSocket` toàn cục đúng chuẩn từ 22.4 và platform đòi Node 22, nên
+một bản tích hợp năm 2026 không cần thư viện nào, mà lời gọi constructor thì y hệt cái
+mà các ví dụ của chính series đưa ra.
+
+Một danh sách dependency rỗng vì không cần gì là một tuyên bố mạnh hơn một danh sách
+rỗng vì ba thứ đã được với lấy theo đường ngang.
+
+</Trap>
+
+Lớp niêm phong được chứng minh là chặn được, từng cấp một:
+```
+$ import { ERROR_CODES } from "@relay/protocol"
+Error: Cannot find package '@relay/protocol' imported from …/integrate.itest.ts
+  → level 1: no rule involved, the module is not there
+
+$ import { ERROR_CODES } from "../../protocol/src/codes.js"
+error  '../../protocol/src/codes.js' import is restricted from being used by a
+       pattern. packages/outsider may not reach outside itself   no-restricted-imports
+
+$ readFileSync(join(import.meta.dirname, "..", "..", "protocol", "src", "codes.ts"))
+error  packages/outsider may not build a path out of the package   no-restricted-syntax
+error  packages/outsider may not build a path out of the package   no-restricted-syntax
+
+$ createRequire(import.meta.url)
+error  node:module is only useful here for createRequire, which is banned above
+error  createRequire turns a computed path into a module           no-restricted-syntax
+```
+
+<Trap title="Và lớp niêm phong đã tắt ngay ở bản nháp đầu" locale="vi">
+
+Block được đặt **trước** các block `**/*.itest.ts`, mà file duy nhất của outsider là
+`integrate.itest.ts`. Trong flat config, một block sau thay thế thiết lập của block
+trước cho cùng một tên rule — nên một block sau đã đặt lại `no-restricted-imports` và
+thắng, và `npx eslint` trên một file import `@relay/protocol` báo **không có gì**.
+
+Đó là phát hiện của chương 3.13, lần thứ hai, trong code viết bởi đúng người vừa sửa
+xong lần thứ nhất. Giờ block đó nằm cuối file và mang phần hợp nó cần — gồm cả lệnh
+cấm driver, bởi `pg` **có** resolve được ở đây bằng phép đi lên cha, dù `@relay/*` thì
+không.
+
+`no-restricted-syntax` sống sót qua bản nháp đầu chỉ vì không block nào khác đặt nó.
+Cấp 3 hoạt động nhờ may mắn.
+
+Thêm một phát hiện nữa trong lúc viết các rule: một pattern `group: ["/*"]` định dành
+cho đường dẫn tuyệt đối lại khớp **`vitest/config`**, và một rule từ chối chính test
+runner là một rule sẽ bị ai đó tắt đi. Đường dẫn tuyệt đối được khớp bằng một selector
+trên chính specifier.
+
+</Trap>
+
+## Một thứ để tích hợp vào
+
+Bộ test không khởi động gì. Nên phải có thứ gì khởi động platform, và phải có thứ gì
+đưa cho bộ test một credential — mà không có cách công khai nào lấy được một cái, bởi
+sign-up kết thúc ở một màn hình đồng thuận OAuth mà không bản tích hợp tự động nào
+hoàn thành được, còn việc quản lý key thì đã được gác lại cho chương của dashboard.
+```js title="scripts/seed-demo-tenant.mjs"
+// A tenant an outsider can integrate against (chapter 3.12, FR-032).
+//
+// The constitution asks that `docker compose up` yield a working local platform
+// "including a seeded demo tenant". Nothing seeded one, and until this chapter
+// nothing needed to: every suite mints its own environment through the repository
+// layer. `packages/outsider` cannot — it is mechanically forbidden from importing
+// workspace code, which is the whole point of it — so it needs a credential that
+// already exists before it starts.
+//
+// A SCRIPT AND NOT AN ENDPOINT, and the reason is worth stating rather than
+// deferring. Creating an organisation is the sign-up flow's job (chapter 3.4), and
+// the sign-up flow ends at an OAuth consent screen that no automated integration
+// can complete. Minting a key is the dashboard's job, which chapter 3.2 deferred
+// by name. Inventing either as an API for a test would be inventing product — the
+// rule chapter 2.8 set for `listMessagesRaw` and every seam since.
+//
+//   RELAY_POSTGRES_PORT=15432 docker compose up -d --wait
+//   DATABASE_URL=postgres://relay:relay@localhost:15432/relay \
+//     node services/api/dist/db/migrate.js
+//   node scripts/seed-demo-tenant.mjs
+//
+// ORDER IS LOAD-BEARING: this writes rows the api's schema must already accept, so
+// the migration comes first. The suite then needs the credential this prints, so
+// the seed comes before the suite. Stores, migrations, services, seed, suite.
+//
+// IDEMPOTENT ON THE NAME. Re-running it is the ordinary case — a developer runs it
+// twice, CI runs it once per job — and a second organisation called `demo` with a
+// second key would leave two credentials where the printed one is whichever the
+// script happened to make last. So an existing demo environment is reused and its
+// key is reissued, because a key's plaintext exists only at the moment it is
+// minted: the row keeps a hash, by design (chapter 3.2), so there is nothing to
+// print for a key that already exists.
+import { createDb, createPool } from "../services/api/dist/db/client.js";
+import {
+  createApiKey,
+  createEnvironment,
+} from "../services/api/dist/db/repository.js";
+
+const NAME = process.env.RELAY_DEMO_TENANT_NAME ?? "demo";
+
+// The POOL for the lookup and the repository's helpers for the writes. Drizzle
+// is not importable from here — pnpm's isolated `node_modules` puts it under the
+// api's tree, not the workspace root — and the pool is what `createDb` was given
+// anyway, so this borrows no dependency the api does not already own.
+const pool = createPool();
+const db = createDb(pool);
+
+const existing = (
+  await pool.query(
+    `SELECT e.id FROM environments e
+       JOIN applications a ON a.id = e.application_id
+       JOIN organisations o ON o.id = a.organisation_id
+      WHERE o.name = $1
+      ORDER BY a.created_at
+      LIMIT 1`,
+    [NAME],
+  )
+).rows;
+
+const environmentId =
+  existing.length > 0
+    ? existing[0].id
+    : (await createEnvironment(db, { name: NAME })).id;
+
+const key = await createApiKey(db, { environmentId });
+
+// STDOUT IS THE INTERFACE. A caller in a shell wants the credential and nothing
+// else on the pipe, so everything a human wants to read goes to stderr and the
+// key goes to stdout on its own line:
+//
+//   RELAY_DEMO_CREDENTIAL=$(node scripts/seed-demo-tenant.mjs)
+console.error(
+  existing.length > 0
+    ? `reusing environment ${environmentId} (organisation "${NAME}")`
+    : `created organisation "${NAME}", one application, one development environment`,
+);
+console.error(`environment_id ${environmentId}`);
+console.log(key.credential);
+
+process.exit(0);
+```
+
+```diff title="turbo.json (excerpt)"
+     "test": {
+       "dependsOn": ["^build"],
+-      "inputs": ["$TURBO_DEFAULT$", "$TURBO_ROOT$/compose.yaml"]
++      "inputs": ["$TURBO_DEFAULT$", "$TURBO_ROOT$/compose.yaml"],
++      "env": ["RELAY_DOCS_BASE_URL"]
+     },
+         "RELAY_QUOTA_RELAY",
++        "RELAY_DOCS_BASE_URL",
++        "RELAY_API_URL",
++        "RELAY_WS_URL",
++        "RELAY_DEMO_CREDENTIAL"
+       ]
+```
+
+```diff title="package.json (excerpt)"
+-    "test:integration": "turbo run test:integration --concurrency=1",
++    "test:integration": "turbo run test:integration --concurrency=1 --filter=!@relay/outsider",
++    "test:outsider": "turbo run test:integration --filter=@relay/outsider",
+```
+
+Ba cái cuối là đoạn trích, và lý do là fence chain chứ không phải sự ngắn gọn.
+`resume.itest.ts`, `turbo.json` và `package.json` đều có bản vá trong
+`fences/post-series.md`, thứ mà checker áp dụng **sau** mọi chương — nên một chương
+không thể vá một trạng thái mà một file sau nó mới dựng lên, và nó nói rất chính xác:
+*hunk pre-image matched 0 times*. Các bản vá đầy đủ nằm trong `post-series.md`; chương
+này là nơi chúng được giải thích.
+
+<Why title="Vì sao hai lane mà không phải một" locale="vi">
+
+`pnpm test:integration` giờ là `turbo run test:integration --filter=!@relay/outsider`,
+với `pnpm test:outsider` là đường vào.
+
+Lane mặc định tự spawn thứ nó nói chuyện với. Bộ test này cần api và gateway **đã**
+đang phục vụ, từ những image **đã được build**, với một tenant đã được gieo. Gộp nó
+vào sẽ khiến mọi lượt chạy integration của mọi developer phụ thuộc vào một compose
+profile mà họ không yêu cầu — và cái fail trung thực mà bộ test này đưa ra khi platform
+không có mặt sẽ thành tiếng ồn mà ai cũng học cách cuộn qua.
+
+</Why>
+
+<Trap title="`docker compose --profile services up` phục vụ image được build lần cuối" locale="vi">
+
+Bộ test báo sáu cái fail trên một stack đang chạy và khoẻ mạnh:
+`POST /v1/channels` trả 404 cho một route đang tồn tại, và `docs_url` về với
+`https://relay.example/docs/errors/not_found` — cái host trước chương này.
+
+Không cái nào trong sáu cái fail gọi tên một image cũ. `--build` giờ là một dòng riêng
+trong README, trong quickstart và trong CI job, kèm con số đo bên cạnh.
+
+</Trap>
+
+## Phán quyết
+
+<Figure caption="Đạt một phần. Phần đạt được thì đã đo; phần không đạt là hai thứ khác loại nhau, và chỉ một trong hai là khiếm khuyết mà ai đó có thể vá." chart={figVerdict} />
+
+> **ĐẠT MỘT PHẦN**, và phần còn thiếu không phải phần mà chương này đặt ra để vá.
+
+**Phần đạt, và cách nó được kiểm.** Package niêm phong hoàn thành một lượt tích hợp
+đầy đủ vào một platform mà nó không khởi động: nó tạo một channel, gọi lại lần nữa và
+nhận về channel đã có, bị từ chối một channel private với field được gọi tên, thêm hai
+member chưa từng tồn tại, cấp một token cho một trong hai, gửi qua REST rồi đọc lại
+history, gửi qua socket rồi nhận được event, và xác nhận rằng một resource của người
+khác và một resource không tồn tại trả lời y hệt nhau. **Tám test, tất cả xanh**, chạy
+trong CI như một job riêng.
+
+**Phần không đạt.** Hai thứ, khác loại nhau.
+
+Thứ nhất là khoảng hở REST-tới-socket mà chương 3.13 ghi lại. Một bản tích hợp gửi qua
+REST rồi chờ trên socket thì không thể thành công, và không tài liệu nào nói thế. Bộ
+test xanh vì nó **được một test fail sửa lại** — mà đó đúng là sự trợ giúp mà tiêu chí
+cấm. Một người ngoài thật sẽ mở một bug hoặc bỏ cuộc.
+
+Thứ hai là nửa khó hơn của tiêu chí, và không test nào với tới được. **Đủ nội dung
+không phải là dễ hiểu.** Chương này đo xem tài liệu có *chứa* những gì một bản tích
+hợp cần. Việc một người đọc nó mà không ai giúp có dựng được một bản tích hợp hay
+không là một câu hỏi khác, và chỉ con người là thiết bị đo được nó.
+
+Sự phân biệt ấy cũng áp cho lớp niêm phong. Các rule về dependency là cơ chế: code
+trong workspace là không-thể-import, chứng minh được, theo ba đường. Việc không **đọc**
+source của repository là một kỷ luật, và không cấu hình nào thực thi được nó. Ba rule
+không được để ngụ ý cái thứ tư.
+
+<Why title="Sáu khoảng hở, kèm cách xử lý" locale="vi">
+
+Ghi lại trong lúc bộ test đang được viết chứ không dựng lại sau đó, bởi một danh sách
+rỗng chỉ là một kết quả khi có phương pháp được nêu ra. Phương pháp là: viết bộ test
+dựa vào tài liệu, chạy nó, và ghi lại mọi chỗ tài liệu hết hơi.
+
+  1. **Một tin nhắn gửi qua REST không tới được socket** — đã xếp lịch, được một test
+     ghim lại, chủ là FR-RTM-05
+  2. **compose phục vụ image build lần cuối** — đã vá
+  3. **`RELAY_POSTGRES_PORT=15432` trên mọi lượt gọi compose** — đã vá cho các lệnh
+     chương này sở hữu; việc series tự lệch port thì được gọi tên và nằm ngoài phạm vi
+  4. **Không có cách công khai nào lấy một credential** — đã vá bằng một script, kèm
+     việc nó đóng nửa nào của mệnh đề trong hiến pháp
+  5. **`POST /auth/dev-token` trả 200 và không tài liệu nào nói** — xếp lịch cùng
+     chương 3.15
+  6. **WebSocket của chính Node** — không phải khiếm khuyết, và nó làm bộ test tốt hơn
+
+</Why>
+
+<Checkpoint locale="vi">
+
+- 13 code, 13 mục tài liệu, kiểm theo cả hai chiều
+- `docs_url` được fetch vào một trang đang serve và resolve được, ba code
+- `pnpm test:outsider` — 8 test, vào compose với profile services
+- ba lớp niêm phong, mỗi lớp được chứng minh chặn được, từng lớp một
+- `pnpm test:integration` — 407 test, hai mươi lượt chạy xanh liên tiếp
+- tiêu chí ra khỏi Phase 2: **đạt một phần**, với phần còn thiếu được gọi tên
+
+</Checkpoint>
+
+<ForwardRef part="Part 3 đóng lại, Part 4 mở ra" locale="vi">
+
+Part 3 kết thúc ở đây. Những gì nó để lại đều được viết xuống chứ không ngụ ý: outbox
+giữ nội dung tin nhắn mãi mãi và chương của FR-MOD-06 sở hữu phần prune; một tin nhắn
+gửi qua REST không tới được socket và chương của FR-RTM-05 sở hữu quyết định ấy; còn
+bề mặt mà khách hàng điều khiển — liệt kê channel, số tin chưa đọc, profile người
+dùng, và loại channel private mà phần này từ chối ngay ở cửa vì chưa có gì đọc nó — là
+chương 3.15.
+
+</ForwardRef>
+
+<ChapterFooter id="3.14" locale="vi" />

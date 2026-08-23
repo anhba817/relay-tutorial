@@ -528,7 +528,7 @@ export const series: Part[] = [
         id: "3.14",
         path: "/part-3/chapter-14/errors-that-resolve-and-an-outsider",
         title: "Milestone: errors that resolve, and an outsider",
-        status: "forthcoming",
+        status: "published",
         // The milestone name lives here rather than on 3.12, because the Phase 2
         // exit criterion is what this chapter gives a verdict on.
         readerProduces:
@@ -536,6 +536,8 @@ export const series: Part[] = [
         sourceDoc: "docs/04-srs.md, docs/08-error-reference.md",
         readerMinutes: 80,
         titleVi: "Cột mốc: lỗi có trang để xem, và một người ngoài",
+        readerProducesVi:
+          "Mười ba error code với một registry và một luật URL duy nhất, một docs_url resolve được vào tài liệu đã xuất bản, một package tích hợp bị niêm phong về mặt cơ chế nên không thể import code trong workspace, và một phán quyết cho tiêu chí ra khỏi Phase 2 của SRS kèm những gì đã đo và những gì chỉ được giả định",
       },
       {
         id: "3.15",
