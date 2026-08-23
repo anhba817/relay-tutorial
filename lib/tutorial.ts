@@ -487,12 +487,68 @@ export const series: Part[] = [
         id: "3.12",
         path: "/part-3/chapter-12/milestone-the-isolation-gauntlet",
         title: "Milestone: the isolation gauntlet",
-        status: "forthcoming",
+        status: "published",
+        // The suite constitution I has required since it was written. What the
+        // repository had instead was eleven assertions in eight files and nothing
+        // that knew which endpoints had been attacked and which had merely never
+        // been thought about.
+        //
+        // `readerMinutes` came down from 100. That figure was set when this
+        // chapter was planned to carry two public endpoints, thirteen error codes
+        // and a sealed integration as well; the surface measured 61 files against
+        // an estimate of 37 and split three ways. 80 for 3,381 prose words and 19
+        // fenced files, measured against 3.11's 100 for 3,316 words and 21.
         readerProduces:
-          "The cross-tenant attack suite run against every endpoint",
-        sourceDoc: "docs/04-srs.md",
-        readerMinutes: 100,
+          "A cross-tenant suite whose target list derives itself from the running router, four attack shapes over 24 routes, a structural check that every table has a tenant path, the socket surface attacked from the protocol's own frame union, and three deliberate reintroductions — one of which stayed green and taught the suite's range",
+        sourceDoc: "docs/04-srs.md, docs/05-sad.md",
+        readerMinutes: 80,
         titleVi: "Cột mốc: cửa ải cô lập tenant",
+        readerProducesVi:
+          "Một bộ kiểm thử cross-tenant tự suy ra danh sách mục tiêu từ router đang chạy, bốn dạng tấn công trên 24 route, một kiểm tra cấu trúc rằng mọi bảng đều có đường về tenant, tầng socket bị tấn công từ chính frame union của protocol, và ba lần cố ý tái tạo lỗi — một lần vẫn xanh và dạy ta giới hạn của bộ kiểm thử",
+      },
+      {
+        id: "3.13",
+        path: "/part-3/chapter-13/the-endpoints-and-the-instruments",
+        title: "The endpoints and the instruments",
+        status: "forthcoming",
+        // Split out of 3.12 on a measurement, not a feeling: the two chapters'
+        // surface came to 61 files against an estimate of 37, and the
+        // 2,000-4,000 prose-word bound cannot hold that. This half is the two
+        // public endpoints the gauntlet found missing, and the instruments that
+        // verify the verifiers.
+        readerProduces:
+          "The two public endpoints Part 3 needed and nobody had built, idempotency enforced by a unique index rather than in memory, every validation error naming its field for the first time, the global-operation guard watching nine tables instead of five, and the api repository layer's branch coverage answered with a number",
+        sourceDoc: "docs/04-srs.md",
+        readerMinutes: 80,
+        titleVi: "Các endpoint và các thiết bị đo",
+      },
+      {
+        id: "3.14",
+        path: "/part-3/chapter-14/errors-that-resolve-and-an-outsider",
+        title: "Milestone: errors that resolve, and an outsider",
+        status: "forthcoming",
+        // The milestone name lives here rather than on 3.12, because the Phase 2
+        // exit criterion is what this chapter gives a verdict on.
+        readerProduces:
+          "Thirteen error codes with one registry and one URL rule, a docs_url that resolves against the published site, a sealed integration package mechanically unable to import workspace code, and a verdict on the SRS Phase 2 exit criterion with what was measured and what was assumed",
+        sourceDoc: "docs/04-srs.md, docs/08-error-reference.md",
+        readerMinutes: 80,
+        titleVi: "Cột mốc: lỗi có trang để xem, và một người ngoài",
+      },
+      {
+        id: "3.15",
+        path: "/part-3/chapter-15/the-surface-a-customer-drives",
+        title: "The surface a customer drives",
+        status: "forthcoming",
+        // Was going to be 3.13 until the split took that number. What mattered
+        // about the promise was that the deferred surface had a number, not which
+        // number — the rest of FR-CHN and all of FR-USR, including the private
+        // channel type chapter 3.12 refuses because nothing reads it.
+        readerProduces:
+          "Channel listing with cursor pagination, unread counts, user profiles, and the private channel type made real on every read path that has to honour it",
+        sourceDoc: "docs/04-srs.md",
+        readerMinutes: 90,
+        titleVi: "Bề mặt mà khách hàng điều khiển",
       },
     ],
   },
