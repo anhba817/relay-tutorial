@@ -59,6 +59,17 @@ export const docs: DocEntry[] = [
     title: "ADR deep dives",
     titleVi: "ADR — phân tích chuyên sâu",
   },
+  // The seventh, and the first one the PLATFORM links to rather than the series
+  // (chapter 3.12). Every error response's `docs_url` points at
+  // `/docs/error-reference#<code>`, so this page's URL and its anchors are part of
+  // the wire contract now — renaming the slug breaks links already in the field.
+  {
+    slug: "error-reference",
+    sourceDoc: "docs/08-error-reference.md",
+    file: "08-error-reference.md",
+    title: "Error reference",
+    titleVi: "Tham chiếu mã lỗi",
+  },
 ];
 
 export function getDoc(slug: string): DocEntry | null {
