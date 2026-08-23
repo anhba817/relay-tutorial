@@ -632,7 +632,7 @@ criteria for journey Stages 2–4.
 | NFR-USE-02 | Proportion of signups reaching a first delivered message | > 60% | A |
 | NFR-USE-03 | The quickstart shall run without modification, verified by automated execution in CI against the published documentation | 100% pass | T |
 | NFR-USE-04 | Complete API reference shall be publicly accessible without authentication | — | I |
-| NFR-USE-05 | Every error code shall have a documentation page reachable from the `docs_url` in the error response | 100% coverage | T |
+| NFR-USE-05 | Every error code shall have a documentation page reachable from the `docs_url` in the error response | 100% coverage | T — `docs/08-error-reference.md`, one `h2` per code; the test is `relay-tutorial/scripts/check-error-codes.mjs`, which compares `ERROR_CODES` against the reference's headings **in both directions** so an undocumented code and a documented non-code both fail. It runs as a CI step rather than a turbo task: `docs/` is above `$TURBO_ROOT$` and cannot be a turbo input, so a cached task would pass after the reference changed |
 | NFR-USE-06 | Documentation shall specify reconnection, ordering, idempotency, and rate limit behaviour explicitly | — | I |
 
 ---
