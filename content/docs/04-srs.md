@@ -297,6 +297,31 @@ and React Native 0.72+.
 | FR-USR-05 | Deleting a user shall remove profile data and memberships while preserving their messages as authored by a deleted user, unless message deletion is explicitly requested. | P2 | T |
 | FR-USR-06 | The system shall support banning a user at tenant scope, preventing connection and message send while preserving history. | P3 | T |
 
+> **Verification, FR-USR-02 to FR-USR-06 (chapters 3.15 and 3.16).** Five of these six
+> clauses were unimplemented until then, and two things are worth recording beyond "tested".
+>
+> **FR-USR-02** had a symptom rather than a gap: minting a token for an unknown identifier
+> and sending through the internal route answered `400 "unknown user"`, which names the
+> caller when the cause is that nobody created a row. Implicit creation now happens on the
+> mint path, and the response deliberately does **not** distinguish "created" from
+> "existed" — a status that did would let a caller enumerate a tenant's external ids.
+>
+> **FR-USR-03**'s two bounds are 4 KB for a user against FR-CHN-01's 8 KB for a channel.
+> The difference is row cardinality and is now stated where the constant is: users
+> outnumber channels 3.4:1 on the test lane and the ratio only grows, because a channel is
+> created deliberately and a user row appears for every end user who authenticates.
+>
+> **FR-USR-05** keeps the row. `ON DELETE SET NULL` on `messages.user_id` satisfies the
+> letter of "preserving their messages" and breaks delivery: the resume path drops a
+> senderless row, so every message a deleted user ever sent would vanish from every
+> reconnecting client with a sequence gap as the only trace. Verified on the socket, not
+> only in storage.
+>
+> **FR-USR-06** is enforced at connect and on the send path, and the ban check runs
+> *before* the channel is resolved — so a banned user gets one answer for every channel id
+> and cannot enumerate them. An already-open socket stops writing and keeps receiving,
+> which is the shape FR-AUT-11 already required for an expired token.
+
 ### 4.4 Channels and membership — `FR-CHN`
 
 | ID | Requirement | Pri | Ver |
@@ -311,6 +336,44 @@ and React Native 0.72+.
 | FR-CHN-08 | The system shall support listing a user's channels, ordered by most recent activity, with cursor pagination. | P1 | T |
 | FR-CHN-09 | Channel listings shall include the caller's unread count and the most recent message. | P2 | T |
 | FR-CHN-10 | Archiving a channel shall preserve history and prevent new messages. Archiving shall be reversible. | P2 | T |
+
+> **Verification, FR-CHN-03 to FR-CHN-10 (chapters 3.15 and 3.16).** `channels.type` had
+> carried `public | private` with a CHECK constraint since the first migration while **no
+> decision consulted it** — it was declared, selected and returned by the create route, so
+> "nothing reads it" was false and "nothing decides on it" was the true and sharper
+> statement. FR-CHN-03 and FR-CHN-05 are what made it decide.
+>
+> **FR-CHN-05 has four doors** — the send path, the read-by-id path, the history path and
+> the socket session — and the enum accepting `private` was widened **last**, after all
+> four held. Each refusal is byte-identical to a channel that does not exist, verified by
+> the same indistinguishability oracle NFR-SEC-09's suite uses for cross-tenant attacks,
+> extended with a same-tenant fixture. A `403` naming the membership would announce that
+> the channel exists.
+>
+> **FR-CHN-04's roles are not `FR-TEN-07`'s.** `owner`, `moderator`, `member` against an
+> organisation's `owner`, `admin`, `member` — one word apart, and a migration reusing the
+> organisation's constraint would accept `admin` on a channel member and look correct in
+> review. Both CHECK constraints now name the other. The listing returns a member's role
+> and **no operation is authorized by it**, which is the statement worth making rather
+> than "nothing reads it".
+>
+> **FR-CHN-09's count has no counter**: `greatest(last_sequence − read_position, 0)`,
+> because `last_sequence` is already the sequencing authority. Measured against 1,000,000
+> messages, counting rows past the position is 9.8–13.4 ms, a cached counter is 1.2–2.1 ms
+> and the subtraction is 1.1–4.5 ms — the counter is no faster and adds a value that can
+> go stale. The approximation this accepts is stated: **a deleted message still counts as
+> one unread**, because a tombstone keeps its sequence.
+>
+> **FR-CHN-08's ordering key is indexed and the index is earned.** Ordering by the last
+> message's timestamp costs 0.87 ms on the test lane and 159 ms at 1,000,000 messages with
+> a sequential scan over every message in the environment; an indexed
+> `channels.last_activity_at` is 1.1 ms. The listing's own plan was measured at four
+> scales, and the first page is the most expensive one — the reverse of an offset
+> paginator, because a keyset narrows the input set as it pages.
+>
+> **FR-CHN-10's refusal order is part of the requirement.** Ban, then membership and
+> visibility, then archive. Reverse the last two and a non-member of a private *archived*
+> channel learns it exists from `channel_archived`.
 
 ### 4.5 Messaging — `FR-MSG`
 

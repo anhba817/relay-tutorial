@@ -560,15 +560,17 @@ export const series: Part[] = [
         id: "3.16",
         path: "/part-3/chapter-16/what-a-user-sees",
         title: "What a user sees",
-        status: "forthcoming",
+        status: "published",
         // The other half of the deferred surface. Its centre is a measurement that
         // pointed the wrong way: ordering a user's channels by their last message
         // costs 0.87 ms on the test lane and 159 ms at a million messages.
         readerProduces:
-          "Channel listing with cursor pagination and activity ordering, unread counts from the sequence the write path already maintains, user profiles created implicitly on first authentication, and a deleted user whose messages survive",
+          "Channel listing with cursor pagination and activity ordering, unread counts from the sequence the write path already maintains, user profiles created implicitly on first authentication, a deleted user whose messages survive, and a ban enforced at the door and on the send path",
         sourceDoc: "docs/04-srs.md",
-        readerMinutes: 90,
+        readerMinutes: 95,
         titleVi: "Những gì một người dùng thấy",
+        readerProducesVi:
+          "Danh sách channel phân trang bằng cursor và xếp theo hoạt động, số tin chưa đọc suy ra từ chính sequence mà đường ghi vẫn duy trì, profile người dùng được tạo ngầm ở lần xác thực đầu tiên, một người dùng đã xoá mà tin nhắn vẫn còn, và một lệnh ban có hiệu lực cả ở cửa vào lẫn trên đường gửi",
       },
     ],
   },

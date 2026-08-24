@@ -1839,7 +1839,7 @@ a reader code the chapter never discusses.
  
      // Nothing in the row it left behind contains what was returned. Read with
      // a plain string rather than drizzle's `sql` helper: the query engine lives
-@@ -424,4 +440,65 @@ describe("credentials", () => {
+@@ -424,3 +440,64 @@ describe("credentials", () => {
        expect(JSON.stringify(body)).not.toContain(PLATFORM);
      });
    });
@@ -1904,7 +1904,6 @@ a reader code the chapter never discusses.
 +      ).toBeNull();
 +    });
 +  });
- });
 ```
 
 ```diff title="services/gateway/src/resume.itest.ts"
@@ -2249,7 +2248,7 @@ second time, in the same chapter.
 +    },
 +  },
 +  {
-+    // THE SEAL ON `packages/outsider` (chapter 3.12, FR-030, FR-034, R12).
++    // THE SEAL ON `packages/outsider` (chapter 3.14, FR-030, FR-034, R12).
 +    //
 +    // That package holds one suite that behaves like a customer, and the claim it
 +    // makes — an integration built from published documentation alone — is worth
