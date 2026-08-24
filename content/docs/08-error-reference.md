@@ -138,6 +138,52 @@ that no amount of waiting changes.
 
 **What to do:** use more channels, or remove members. Retrying is futile.
 
+## not_a_member
+
+**Status:** 403 · **Retryable:** no, until the user is a member
+
+The user is not a member of this channel, and the operation is one that only a member can
+perform. In practice there is **one** operation like that: recording a read position, which
+is per-member state keyed by channel and user.
+
+**Where you will NOT see this,** because both are more interesting than they look. A
+**private** channel the caller cannot see answers `404 not_found` — byte-identical to a
+channel that does not exist, body and status, because a `403` naming the membership would
+tell you the channel exists. And a **public** channel permits any authenticated user of the
+tenant to read, send and join without being a member at all, so nothing there refuses.
+
+**What to do:** add the user to the channel, or have them join it if it is public. The
+message never names the channel's contents or its other members.
+
+## channel_archived
+
+**Status:** 403 · **Retryable:** yes, once the channel is unarchived
+
+The channel is archived. Archiving stops new messages and keeps everything already written:
+history reads normally, the channel still appears in listings, and unarchiving restores
+sending with nothing lost.
+
+**Not the same as `not_found`,** and you will only ever see this for a channel you can
+already see. The refusal order is ban, then membership and visibility, then archive —
+reversed, a non-member of a private archived channel would learn it exists from this code.
+
+**What to do:** unarchive the channel, or write somewhere else. Retrying the same send
+against the same archived channel will keep failing.
+
+## user_banned
+
+**Status:** 403 · **Retryable:** no, until the ban is lifted
+
+The user is banned in this environment. A ban is tenant-scope rather than per channel: they
+cannot open a socket and cannot send anywhere. Their existing messages stay exactly where
+they are, readable by everyone else and still attributed to them.
+
+**You will see this for every channel id, including ones that do not exist,** and that is
+deliberate: the ban is checked before the channel is resolved, so this refusal cannot be
+used to find out which channels exist.
+
+**What to do:** lift the ban if it was a mistake. There is nothing a client can retry into.
+
 ## rate_limited
 
 **Status:** 429 · **Retryable:** YES, after the window

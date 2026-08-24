@@ -346,6 +346,7 @@ CREATE TABLE users (
     avatar_url      TEXT,
     metadata        JSONB NOT NULL DEFAULT '{}',
     banned_at       TIMESTAMPTZ,
+    deleted_at      TIMESTAMPTZ,                          -- FR-USR-05: the row survives
     UNIQUE (environment_id, external_id)                  -- DR-02
 );
 
@@ -358,7 +359,25 @@ CREATE TABLE channels (
     metadata        JSONB NOT NULL DEFAULT '{}',
     last_sequence   BIGINT NOT NULL DEFAULT 0,             -- ADR-03
     archived_at     TIMESTAMPTZ,
+    last_activity_at TIMESTAMPTZ NOT NULL DEFAULT now(),   -- FR-CHN-08's ordering
     UNIQUE (environment_id, external_id)                   -- DR-02
+);
+
+-- FR-CHN-09's unread count. Per user, per channel, the sequence up to which that
+-- user has read — and no counter column: unread is
+-- `greatest(channels.last_sequence - sequence, 0)`, because the write path already
+-- maintains `last_sequence` (ADR-03).
+--
+-- `environment_id` is denormalised — `channel_id` determines it — so feature 030's
+-- global-operation guard can watch the table. `members` carries none and is
+-- classified as a foreign-key hop instead.
+CREATE TABLE read_positions (
+    environment_id  UUID NOT NULL REFERENCES environments(id),
+    channel_id      UUID NOT NULL REFERENCES channels(id),
+    user_id         UUID NOT NULL REFERENCES users(id),
+    sequence        BIGINT NOT NULL,                       -- forwards only; <= last_sequence
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (channel_id, user_id)                      -- no `id` column
 );
 
 CREATE TABLE messages (
