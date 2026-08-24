@@ -1,0 +1,3723 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figRefusalOrder, figThreePlaces, figSameTenant } from "./figures";
+
+export const metadata = {
+  title: "The channel a customer controls — Building Relay",
+  description:
+    "channels.type has been a two-value column since chapter 2.1 and no decision consulted it. Making the second value mean something took a route that was never built, a check the only public send could not reach, and a refusal order that leaked what it refused.",
+  alternates: {
+    canonical: "/part-3/chapter-15/the-channel-a-customer-controls",
+    languages: {
+      en: "/part-3/chapter-15/the-channel-a-customer-controls",
+      vi: "/vi/part-3/chapter-15/the-channel-a-customer-controls",
+    },
+  },
+};
+
+<ChapterHeader id="3.15" />
+
+A channel has had two kinds since chapter 2.1.
+
+```sql
+CONSTRAINT channels_type_check CHECK (type IN ('public','private'))
+```
+
+Twenty-two chapters later the column still holds `'public'` in every row of every
+environment. Chapter 3.12 built `POST /v1/channels` and gave the field a
+one-value enum with the sharpest edit in that chapter — `z.enum(["public"])` — on
+the grounds that an endpoint accepting `private` would sell a guarantee the platform
+did not keep.
+
+That was the right call and its stated reason was slightly wrong, in a way worth
+opening with. The claim behind the refusal was that *nothing reads the column*. Count
+the references and there are eleven: `ChannelRow` declares it, two repository queries
+select it, and `channels.controller.ts` **returns it in the create response**.
+Returning a column is reading it. What was actually true is narrower and sharper —
+**no decision consulted it.** The only `.type ===` in non-test code was on a protocol
+frame, not on a channel.
+
+Fifteen analysis passes read the phrase "five dead columns" past that count without
+measuring it. The measurement took one `grep`. It is the second time in this feature
+that a column was called dead while a response body returned it, and both times the
+correction made the statement stronger rather than weaker: a value can be visible to
+every client and still authorize nothing.
+
+<Why source="docs/04-srs.md FR-CHN-05">
+
+FR-CHN-05 is one sentence: a private channel's messages are visible only to its
+members. The work is not the sentence. The work is that "visible" has four doors —
+the send path, the read-by-id path, the history path, and the socket session — and a
+guarantee is only as good as its weakest one. This chapter widens the enum **last**,
+after all four hold, which is the opposite of the order that feels natural.
+
+</Why>
+
+## The verb with no handler
+
+Before writing a line, one question: does every verb that has to honour the new rule
+have somewhere to honour it?
+
+`GET /v1/channels/:channelId` did not exist. `channels.controller.ts` carried a create
+and a member-add and no read at all, so a customer could create a channel and never
+read its four fields back. Three documents rested on the route being there — a success
+criterion naming "read by id" as one of four verbs, a requirement saying "every read",
+and a contract with a row for it.
+
+Nothing found that by comparing the spec to the plan to the tasks. It came from asking
+the repository a question with a yes-or-no answer: *does this verb have a handler?*
+Two of this feature's eight critical findings came from that kind of question, and the
+other one is the same shape — a module registration no task named, without which eight
+routes would not have mounted.
+
+<Trap>
+
+The four tables this feature's task list carries — routes by handler, credential,
+repository method and pin; columns by migration, writer, reader and removal test —
+close that class of defect and only that class. Neither table asks whether a route
+matches the scenario that motivated it. A separate pass found a requirement demanding
+bulk removal "up to 100 in one request" against a contract specifying
+`DELETE …/members/:userExternalId`, singular. Ten passes had read both and identifier
+coverage read 100% the whole time, because both documents said "removal".
+
+Shape only becomes visible when you put an **acceptance scenario** next to a **route**.
+
+</Trap>
+
+## The check the only public send could not reach
+
+The membership check belongs in data access — the constitution puts tenant isolation
+there, and the same argument carries authorization inside a tenant, because a check in
+one service can be bypassed by the next caller to reach the repository directly. The
+research note said six callers inherit it.
+
+Counted from the call graph, there are three. And the one that matters supplied
+nothing:
+
+```ts
+// services/api/src/messages/messages.controller.ts, before this chapter
+return this.messages.send(channelId, body);
+```
+
+`MessagesController` declared no `@Accepts`, so the guard fell back to accepting
+either credential class, and a user token got in. The handler then called a service
+that called a repository function whose `userId` parameter was optional — and the
+check was gated on that parameter being present. So a user could send to a private
+channel they were not a member of and nothing anywhere would look.
+
+**A parameter nobody fills in encodes nothing.** The argument was true of the
+signature and false of the caller, and writing out the graph is what found it. Six
+analysis passes had read the number six.
+
+<Figure caption="A check on the caller needs three places, and this feature had two routes with a gap" src={figThreePlaces} />
+
+The tasks file now carries a five-row table — one row per route whose behaviour
+depends on who is calling, with those three as columns. Two of the five had a gap. The
+second was found only because the first was: `messages.controller.ts` has exactly two
+routes, and after fixing send nobody asked whether the read path had the same shape.
+It did. `listMessages(channelId, {beforeSeq, afterSeq, limit})` had nowhere to put a
+`userId`, so the task saying "add the same check to the history path" was asking for a
+check with nothing to check against.
+
+```diff title="services/api/src/messages/messages.controller.ts"
+@@ -1,14 +1,17 @@
+ import {
++  BadRequestException,
+   Body,
+   Controller,
+   Get,
+   Param,
+   Post,
+   Query,
++  Req,
+   UseGuards,
+ } from "@nestjs/common";
+ 
+ import { CredentialGuard } from "../auth/credential.guard";
++import { Repository } from "../db/repository";
+ import { MessagesService } from "./messages.service";
+ import { historyQuerySchema, sendMessageBodySchema } from "./messages.schema";
+ // `import type` is required, not stylistic: with isolatedModules and
+@@ -16,8 +19,20 @@
+ // in a decorated signature must be imported as a type or TS1272 refuses
+ // to compile it.
+ import type { HistoryQuery, SendMessageBody } from "./messages.schema";
++import type { RequestWithPrincipal } from "../auth/principal";
+ import { ZodValidationPipe } from "./zod-validation.pipe";
+ 
++/** The end user this request acts for, or `undefined` when the tenant is acting.
++ *
++ * SOFT, unlike `internal.controller.ts`'s `principalUser`, which throws. These two
++ * routes accept BOTH credential classes — the class-level guard declares no
++ * `@Accepts`, so `credential.guard.ts` falls back to `EITHER` — and an application
++ * key legitimately carries no user. A tenant's own server sending on a customer's
++ * behalf is FR-MSG-13, not a mistake. */
++function actingUser(req: RequestWithPrincipal): string | undefined {
++  return req.principal?.kind === "user" ? req.principal.userExternalId : undefined;
++}
++
+ // The api's first product endpoint (chapter 2.2). Validation is zod at the
+ // boundary — the same schema family as @relay/protocol, so the REST body
+ // and the WebSocket frame payload cannot drift (1.3's payoff, again).
+@@ -30,14 +45,52 @@
+ @Controller("v1/channels/:channelId/messages")
+ @UseGuards(CredentialGuard)
+ export class MessagesController {
+-  constructor(private readonly messages: MessagesService) {}
++  constructor(
++    private readonly messages: MessagesService,
++    private readonly repo: Repository,
++  ) {}
+ 
+   @Post()
+   async send(
+     @Param("channelId") channelId: string,
+     @Body(new ZodValidationPipe(sendMessageBodySchema)) body: SendMessageBody,
++    @Req() req: RequestWithPrincipal,
+   ) {
+-    const message = await this.messages.send(channelId, body);
++    // WHO IS SENDING, resolved here (chapter 3.15, FR-001, T031a).
++    //
++    // This route called `this.messages.send(channelId, body)` with no user for
++    // twenty-three chapters, and the membership check in `sendMessage` is gated on
++    // `userId` being present — so the check could not fire on the only send path a
++    // customer's own client calls. `MessagesController` declares no `@Accepts`, so
++    // the guard falls back to `EITHER` and a user token is accepted here.
++    //
++    // A LOOKUP PER SEND, and it is the same one the internal route already pays.
++    // `sendMessage`'s own comment explains why the id is threaded rather than
++    // resolved inside the write transaction: a SELECT in there is a cost every
++    // message pays forever. Outside it, once, is what `internal.controller.ts`
++    // does at line 63.
++    //
++    // A USER TOKEN FOR AN IDENTIFIER WITH NO ROW IS REFUSED, and this is a
++    // behaviour change worth naming. `POST /auth/dev-token` mints tokens for
++    // identifiers that need not exist, so before this a token-authenticated send
++    // by a stranger succeeded UNATTRIBUTED — and an unattributed send is one the
++    // membership check waves through. A user with no row is a member of nothing;
++    // refusing is the honest answer, and it is the same one the internal route has
++    // given since chapter 2.6. FR-039a removes the case entirely by creating the
++    // row when the token is minted.
++    const actingExternalId = actingUser(req);
++    let userId: string | undefined;
++    if (actingExternalId !== undefined) {
++      const user = await this.repo.getUserByExternalId(actingExternalId);
++      if (!user) throw new BadRequestException("unknown user");
++      userId = user.id;
++    }
++    const message = await this.messages.send(
++      channelId,
++      body,
++      userId,
++      actingExternalId,
++    );
+     // FR-MSG-04's "201-equivalent semantics" lives HERE, on the public
+     // wire: the client sees the same body whether this was the original
+     // send or the retry that recovered it. Moved down from the service in
+@@ -58,7 +111,19 @@
+   async history(
+     @Param("channelId") channelId: string,
+     @Query(new ZodValidationPipe(historyQuerySchema)) query: HistoryQuery,
++    @Req() req: RequestWithPrincipal,
+   ) {
+-    return this.messages.history(channelId, query);
++    // The same resolution the send handler above does, on the other route of this
++    // controller (chapter 3.15, T041a). Both dropped the caller; the send path was
++    // found in one analysis pass and this one in the next, because finding the first
++    // did not prompt anyone to ask whether the sibling had the same shape.
++    const actingExternalId = actingUser(req);
++    let userId: string | undefined;
++    if (actingExternalId !== undefined) {
++      const user = await this.repo.getUserByExternalId(actingExternalId);
++      if (!user) throw new BadRequestException("unknown user");
++      userId = user.id;
++    }
++    return this.messages.history(channelId, query, userId);
+   }
+ }
+```
+
+Both routes now resolve their caller from the principal, and both refuse a user
+external id that names no row — a token minted for a user who has since been removed
+is a bad request, not an anonymous send.
+
+<Trap>
+
+**A repository test proves a check exists. Only a route test proves it fires.**
+
+The send path had a passing repository test for six analysis passes while its
+controller supplied no caller. The tasks file said that test existed "so a controller
+cannot mask it", which is precisely the opposite of what happened. One test drove the
+repository directly, one drove the internal route, and both supplied a `userId` the
+public route never sent.
+
+</Trap>
+
+```diff title="services/api/src/messages/messages.service.ts"
+@@ -8,6 +8,7 @@
+ import { protocolError } from "../protocol-error";
+ 
+ import {
++  ChannelArchivedError,
+   ChannelNotFoundError,
+   Repository,
+   type MessageRow,
+@@ -33,9 +34,15 @@
+   async send(
+     channelId: string,
+     body: SendMessageBody,
+-    /** Chapter 2.6: who wrote it. Optional because a key-authenticated public
+-     * send is unattributed (3.2's recorded bound); the internal route always
+-     * knows. */
++    /** Chapter 2.6: who wrote it. Optional because an APPLICATION-key send is
++     * unattributed — it acts for the tenant and there is no user to name.
++     *
++     * IT IS NO LONGER OPTIONAL FOR A USER TOKEN. Chapter 3.15 made the public
++     * route resolve its principal (T031a): the membership check in `sendMessage`
++     * is gated on this parameter, and until then the public route supplied none,
++     * so the check could not fire on the route a customer's client actually calls.
++     * "A key-authenticated public send is unattributed" was the old bound and it
++     * described the whole route; now it describes one of its two credentials. */
+     userId?: string,
+     /** Chapter 3.3: the same person as a CONSUMER will see them. The event
+      * envelope carries external ids, and the internal route already holds this
+@@ -54,6 +61,18 @@
+         }),
+       });
+     } catch (error) {
++      if (error instanceof ChannelArchivedError) {
++        // 403 AND ITS OWN CODE (FR-021). Distinct from not-found, because the
++        // channel is there and the caller can see it, and distinct from
++        // `user_banned`, because one lifts when somebody unarchives and the other
++        // when somebody unbans. A client that cannot tell them apart retries the
++        // wrong one for ever.
++        throw protocolError(
++          "channel_archived",
++          "this channel is archived and accepts no new messages; its history is unchanged",
++          HttpStatus.FORBIDDEN,
++        );
++      }
+       if (error instanceof ChannelNotFoundError) {
+         // A CONSTANT message: echoing the id back would make the foreign-id
+         // answer differ from the missing-id answer, and "different" is
+@@ -101,6 +120,12 @@
+   async history(
+     channelId: string,
+     { cursor, direction, limit }: HistoryQuery,
++    /** Who is reading (chapter 3.15, FR-002). Threaded for the same reason `send`
++     * threads it: the membership check lives in the repository, and a check gated
++     * on a parameter no caller fills in is a check that never fires. This route
++     * dropped the caller for twenty-three chapters — the same defect as the send
++     * path on the same controller, found one analysis pass later. */
++    userId?: string,
+   ): Promise<{
+     messages: MessageWithSender[];
+     next_cursor: string | null;
+@@ -112,7 +137,11 @@
+     // same — but it leaves a client unable to tell "no such conversation"
+     // from "no messages yet", and it made one resource answer two ways
+     // depending on the verb.
+-    if (!(await this.repo.channelExists(channelId))) {
++    // VISIBILITY, NOT EXISTENCE (chapter 3.15, FR-003). `channelExists` answered
++    // only the first half, and the difference was a leak: an absent channel gave
++    // 404 while a private channel a non-member read gave 200 with an empty page.
++    // One predicate now produces both refusals, so the two answers cannot diverge.
++    if (!(await this.repo.channelVisibleTo(channelId, userId))) {
+       throw new NotFoundException("channel not found");
+     }
+ 
+@@ -123,6 +152,7 @@
+       anchor = decoded;
+     }
+     const messages = await this.repo.listMessages(channelId, {
++      ...(userId !== undefined && { userId }),
+       limit,
+       ...(direction === "newer"
+         ? { afterSeq: anchor ?? 0 }
+```
+
+The history path is the one worth reading twice. The first fix returned an empty list
+for a private channel the caller could not see — which leaks, because an absent
+channel answers 404 and an empty page answers 200. One predicate produces both
+refusals instead: `channelVisibleTo` returns false for a channel that does not exist
+**and** for a private channel the caller is not in, and the handler above it turns one
+answer into one envelope.
+
+That choice pays off later in a way that was not the reason for making it. See the
+gauntlet, below.
+
+## A refusal that reveals what it is refusing
+
+Three tasks and a contract specified a private channel's send refusal as
+`403 not_a_member`. A success criterion required send's answer to be byte-identical to
+a channel that does not exist. Both could not hold: a 403 announces the channel
+exists.
+
+So a private channel's send answers the not-found envelope, and `not_a_member` turns
+out to have **exactly one emitter** in the whole feature — the read-position route on a
+public channel, where a read position is per-member state and refusing a non-member is
+the same rule the rest of the table keeps. The registry entry says so, because saying
+so saves the next reader a search.
+
+<Figure caption="Ban, then membership and visibility, then archive — and what the other order gives away" src={figRefusalOrder} />
+
+The order was the second half of the same defect. Ban, then archive, then membership
+means a non-member of a private **archived** channel gets `channel_archived` and learns
+the channel exists. The ban check runs before the channel is resolved at all, so a
+banned user gets one answer for every channel id, real or invented.
+
+<Why source="chapter 3.12, fifth analysis pass">
+
+Chapter 3.12's sharpest finding was that `POST /v1/channels` was about to accept
+`type: "private"` while nothing in the platform read the column. Both findings here are
+that one pointed forwards: a refusal that reveals what it is refusing. It took a
+precise artifact to find them. Five passes of reading artifacts against each other
+produced nothing but arithmetic errors; the pass that changed "all three verbs" to
+"all four verbs SC-001 names" put send's refusal in contact with the indistinguishability
+criterion, and the contradiction fell out. **Precision creates contradictions where
+vagueness hid them.**
+
+</Why>
+
+Here is the repository layer with all of it in place — the visibility predicate, the
+membership check on send, the archive check below it, bulk removal, roles, and the
+by-id read that had no handler.
+
+```diff title="services/api/src/db/repository.ts"
+@@ -23,6 +23,7 @@
+   environments,
+   humans,
+   members,
++  readPositions,
+   memberships,
+   messages,
+   organisations,
+@@ -2157,11 +2158,12 @@
+   id: string;
+   external_id: string;
+   /** The column has been `"public" | "private"` with a CHECK constraint since
+-   * chapter 2.1. NOTHING READS IT: history and send scope by `environment_id`
+-   * alone and there is no membership check anywhere, so FR-CHN-05's private
+-   * guarantee is unimplemented. The public create endpoint accepts `public` only
+-   * (chapter 3.12, FR-047) — this type stays as the column is, because rows
+-   * seeded before that endpoint existed can still say `private`. */
++   * chapter 2.1, and chapter 3.15 gave it its first DECISION. Before that it was
++   * selected and returned by the create route — read, but consulted by nothing:
++   * no conditional anywhere branched on it, so FR-CHN-05's private guarantee was
++   * unimplemented while the value round-tripped.
++   *
++   * Now `sendMessage`, the by-id read, history and join all branch on it. */
+   type: "public" | "private";
+   name: string | null;
+   metadata: Record<string, unknown>;
+@@ -2206,6 +2208,20 @@
+   }
+ }
+ 
++/** A write refused because the channel is archived (chapter 3.15, FR-020, FR-021).
++ *
++ * A TYPED DOMAIN ERROR, not a `protocolError` thrown from here. The repository has
++ * raised `ChannelNotFoundError` since chapter 2.2 and let the service map it to a
++ * status — the data layer knows the fact, the service knows the wire. Reaching for
++ * `protocolError` here would put an HTTP status in the layer whose whole job is to
++ * not know about HTTP. */
++export class ChannelArchivedError extends Error {
++  constructor(public readonly channelId: string) {
++    super(`channel archived: ${channelId}`);
++    this.name = "ChannelArchivedError";
++  }
++}
++
+ /** Timestamps cross the wire as RFC 3339 strings (constitution: UTC,
+  * millisecond precision) — the driver hands back a Date or a string
+  * depending on the column and the query shape. */
+@@ -2667,13 +2683,28 @@
+    * `not_found` keeps the conflation the isolation property needs. The follow-up
+    * read distinguishes it from `already_a_member` — and it is a read, not a
+    * check-then-write: the insert already happened. */
+-  async addMember(channelId: string, userId: string): Promise<AddMemberOutcome> {
++  async addMember(
++    channelId: string,
++    userId: string,
++    /** Chapter 3.15, FR-011b. Absent means the column's own default — `member` —
++     * which is what keeps every existing caller working unchanged. An entry that
++     * names a role is creating a member WITH one rather than changing them into one
++     * afterwards, which is what US6's first scenario asks for. */
++    role?: string,
++  ): Promise<AddMemberOutcome> {
+     const inserted = await this.db.execute(
+-      sql`INSERT INTO members (channel_id, user_id)
++      role === undefined
++        ? sql`INSERT INTO members (channel_id, user_id)
+           SELECT c.id, u.id FROM channels c, users u
+           WHERE c.id = ${channelId} AND c.environment_id = ${this.environmentId}
+             AND u.id = ${userId} AND u.environment_id = ${this.environmentId}
+           ON CONFLICT (channel_id, user_id) DO NOTHING
++          RETURNING channel_id`
++        : sql`INSERT INTO members (channel_id, user_id, role)
++          SELECT c.id, u.id, ${role} FROM channels c, users u
++          WHERE c.id = ${channelId} AND c.environment_id = ${this.environmentId}
++            AND u.id = ${userId} AND u.environment_id = ${this.environmentId}
++          ON CONFLICT (channel_id, user_id) DO NOTHING
+           RETURNING channel_id`,
+     );
+     // `RETURNING` and `.rows.length`, not `rowCount ?? 0`. `rowCount` is typed
+@@ -2697,6 +2728,170 @@
+     return existing.length > 0 ? "already_a_member" : "not_found";
+   }
+ 
++  /** Archive and unarchive, both idempotent (chapter 3.15, FR-020, FR-020a).
++   *
++   * IDEMPOTENT BY THE WRITE, not by a read-then-write: setting `archived_at` on an
++   * already-archived channel writes the same state, and a caller who asks twice
++   * meant it once. The returned boolean says whether the channel was FOUND, not
++   * whether anything changed — "already archived" and "archived just now" are the
++   * same answer to the customer, which is what idempotent means here.
++   *
++   * `now()` FROM THE DATABASE rather than the app clock, because nothing compares
++   * this timestamp against another statement's value. `sendMessage` takes its period
++   * from the app clock for the opposite reason: two statements there need the same
++   * value and only one of them can be `now()`.
++   */
++  async archiveChannel(channelId: string): Promise<boolean> {
++    const updated = await this.db
++      .update(channels)
++      .set({ archivedAt: sql`now()` })
++      .where(
++        and(
++          eq(channels.id, channelId),
++          eq(channels.environmentId, this.environmentId),
++        ),
++      )
++      .returning({ id: channels.id });
++    return updated.length > 0;
++  }
++
++  async unarchiveChannel(channelId: string): Promise<boolean> {
++    const updated = await this.db
++      .update(channels)
++      .set({ archivedAt: null })
++      .where(
++        and(
++          eq(channels.id, channelId),
++          eq(channels.environmentId, this.environmentId),
++        ),
++      )
++      .returning({ id: channels.id });
++    return updated.length > 0;
++  }
++
++  /** Set a member's role (chapter 3.15, FR-011).
++   *
++   * SCOPED THROUGH THE CHANNEL, like every other write to `members`: that table
++   * carries no `environment_id`, so the `EXISTS` is what keeps another tenant's rows
++   * out of reach.
++   *
++   * The CHECK constraint is the second line of defence and the one that matters:
++   * `members_role_check` names FR-CHN-04's three, so a value that got past the
++   * schema at the edge still cannot land. R8's trap was a constraint that reused
++   * `memberships`' vocabulary — it would accept `admin`, refuse `moderator`, and
++   * read as correct in review. */
++  async setMemberRole(
++    channelId: string,
++    userId: string,
++    role: string,
++  ): Promise<"set" | "not_a_member"> {
++    const updated = await this.db
++      .update(members)
++      .set({ role })
++      .where(
++        and(
++          eq(members.channelId, channelId),
++          eq(members.userId, userId),
++          sql`EXISTS (SELECT 1 FROM channels c WHERE c.id = ${channelId}
++                       AND c.environment_id = ${this.environmentId})`,
++        ),
++      )
++      .returning({ userId: members.userId });
++    return updated.length > 0 ? "set" : "not_a_member";
++  }
++
++  /** One member's role, or null when there is no membership. Used by the tests that
++   * assert the default rather than reading it out of the DDL. */
++  async memberRole(channelId: string, userId: string): Promise<string | null> {
++    const rows = await this.db
++      .select({ role: members.role })
++      .from(members)
++      .innerJoin(channels, eq(channels.id, members.channelId))
++      .where(
++        and(
++          eq(members.channelId, channelId),
++          eq(members.userId, userId),
++          eq(channels.environmentId, this.environmentId),
++        ),
++      );
++    return rows[0]?.role ?? null;
++  }
++
++  /** Remove members by user id, up to a hundred in one call, reporting each
++   * (chapter 3.15, FR-006, FR-007, FR-008).
++   *
++   * BULK, BECAUSE THE REQUIREMENT ALWAYS WAS. FR-006 says "up to 100 in one
++   * request" and FR-007 says the result is reported per user — which is chapter
++   * 3.13's `addMembers` shape in both halves. `contracts/membership.md` specified a
++   * single-user `DELETE …/members/:userExternalId` for ten analysis passes, having
++   * read "the shape chapter 3.13 chose" as *named outcomes* and dropped *bulk*.
++   * Every pass compared requirements to tasks, both said "removal", and identifier
++   * coverage read 100% the whole time.
++   *
++   * NO MESSAGES ARE TOUCHED (FR-008). The removed user's messages stay in history
++   * attributed to them: `messages.user_id` still points at a row that still exists,
++   * and their socket stops receiving the channel on its next resume because the
++   * session is built from `members`.
++   *
++   * THE READ POSITION GOES WITH THE MEMBERSHIP. `read_positions` is per-member
++   * state keyed by `(channel_id, user_id)`, so leaving the row would leave a
++   * non-member's position in a per-member table. Adding the user back therefore
++   * starts their unread count at the channel's whole history, which is the same
++   * thing "no row means position zero" says for a new member.
++   *
++   * SCOPED THROUGH THE CHANNEL, and the caller has already read it scoped. `members`
++   * carries no `environment_id` — the catalogue calls it a `hop` — so the join is
++   * what keeps a foreign channel's rows out of reach.
++   */
++  async removeMembers(
++    channelId: string,
++    userIds: string[],
++  ): Promise<Map<string, "removed" | "not_a_member">> {
++    const outcome = new Map<string, "removed" | "not_a_member">();
++    if (userIds.length === 0) return outcome;
++
++    // ONE STATEMENT FOR THE BATCH, and `inArray` rather than a built string.
++    //
++    // The first draft of this method interpolated the ids into raw SQL with
++    // `sql.raw(\`ARRAY['${'${'}userIds.join("','")}']::uuid[]\`)`. It typechecked and it
++    // would have worked, and it is an injection hole in the one layer that must not
++    // have one: these ids arrive in a request body. `inArray` parameterises, which
++    // is the only reason to reach for the query builder over a template here.
++    //
++    // A hundred round trips to answer one request is the cost chapter 2.4 measured
++    // away on the read path; there is no reason to reintroduce it on this one.
++    const deleted = await this.db
++      .delete(members)
++      .where(
++        and(
++          eq(members.channelId, channelId),
++          inArray(members.userId, userIds),
++          // The channel scoped, in the same statement. `members` carries no
++          // `environment_id` — the catalogue calls it a `hop` — so this EXISTS is
++          // what keeps another tenant's rows out of reach.
++          sql`EXISTS (SELECT 1 FROM channels c WHERE c.id = ${channelId}
++                       AND c.environment_id = ${this.environmentId})`,
++        ),
++      )
++      .returning({ userId: members.userId });
++    const removed = new Set(deleted.map((r) => r.userId));
++
++    await this.db
++      .delete(readPositions)
++      .where(
++        and(
++          eq(readPositions.channelId, channelId),
++          eq(readPositions.environmentId, this.environmentId),
++          inArray(readPositions.userId, userIds),
++        ),
++      );
++
++    for (const id of userIds) {
++      outcome.set(id, removed.has(id) ? "removed" : "not_a_member");
++    }
++    return outcome;
++  }
++
+   /** How many deliveries an endpoint holds, scoped. Added for chapter 3.12's
+    * `expand` attack, which has to read the victim's side to prove nothing moved —
+    * and it lives HERE rather than in the test because the restored lint ban
+@@ -2800,7 +2995,17 @@
+       const period = periodOf(new Date());
+ 
+       const [channel] = await tx
+-        .select({ id: channels.id, lastSequence: channels.lastSequence })
++        .select({
++          id: channels.id,
++          lastSequence: channels.lastSequence,
++          // Chapter 3.15. `channels.type` has been a `"public" | "private"` column
++          // with a CHECK since chapter 2.1 and nothing decided on it until now — it
++          // was returned by the create route and consulted by nothing.
++          type: channels.type,
++          // Chapter 3.15. Declared in chapter 2.1 and read by NOTHING until here:
++          // zero non-test references, measured rather than assumed (T007).
++          archivedAt: channels.archivedAt,
++        })
+         .from(channels)
+         .where(
+           and(
+@@ -2811,6 +3016,69 @@
+         .for("update");
+       if (!channel) throw new ChannelNotFoundError(channelId);
+ 
++      // MEMBERSHIP, FOR A PRIVATE CHANNEL, WHEN A USER IS SENDING (chapter 3.15,
++      // FR-001, FR-CHN-05).
++      //
++      // HERE AND NOT IN A HANDLER, because constitution I says isolation is
++      // enforced in data access. Two controllers reach this function and neither
++      // can be trusted to remember a rule the other also needs.
++      //
++      // GATED ON `userId`, and the parameter is the whole distinction:
++      //
++      //     userId present    a USER is sending. Membership applies.
++      //     userId absent     the TENANT is sending through an application key.
++      //                       It acts for the customer, carries no user, and sees
++      //                       private channels (FR-005).
++      //
++      // And that gate is only honest because chapter 3.15 made the public route
++      // supply a user. It called `messages.send(channelId, body)` with none, and
++      // `MessagesController` declares no `@Accepts` — so the guard falls back to
++      // `EITHER` and a user token was accepted there. A check gated on a parameter
++      // no caller fills in is a check that never fires, and this one did not, on
++      // the only send path a customer's own client uses.
++      //
++      // `ChannelNotFoundError` AND NOT A 403. SC-002 requires the answer for a
++      // private channel the caller cannot see to be byte-identical to a channel
++      // that does not exist — same status, same body but for `request_id` — and
++      // send is one of the verbs it covers. A `403 not_a_member` here would
++      // announce that the channel exists, which is the leak FR-003 forbids and
++      // exactly what chapter 3.12's indistinguishability oracle was built to
++      // catch. The refusal above throws the same error for the same reason.
++      //
++      // FR-021a's ORDER is ban, then membership and visibility, then archive. The
++      // ban goes ahead of the channel read entirely, so a banned user gets one
++      // answer for every channel id; the archive check goes below this one, so a
++      // non-member of a private archived channel never learns it exists from
++      // `channel_archived`. Both arrive with their own columns' chapters; this is
++      // the middle of the three.
++      if (channel.type === "private" && userId !== undefined) {
++        const [membership] = await tx
++          .select({ userId: members.userId })
++          .from(members)
++          .where(and(eq(members.channelId, channelId), eq(members.userId, userId)))
++          .limit(1);
++        if (!membership) throw new ChannelNotFoundError(channelId);
++      }
++
++      // ARCHIVE, AFTER VISIBILITY AND NOT BEFORE (chapter 3.15, FR-020, FR-021,
++      // FR-021a).
++      //
++      // The order is the requirement, not an implementation detail. Put this check
++      // above the membership one and a non-member of a private ARCHIVED channel
++      // learns it exists from `channel_archived` — a refusal that reveals what it is
++      // refusing, which is the defect chapter 3.12's fifth analysis pass caught one
++      // phase before shipping.
++      //
++      // So: ban, then membership and visibility, then archive. The ban's slot is
++      // ahead of the channel read entirely — a banned user gets one answer for every
++      // channel id, including ids that do not exist — and it is EMPTY here on
++      // purpose: `users.banned_at` has no reader until chapter 3.16 gives it one at
++      // T155a. Leaving the slot visible is the point; a reader who finds two checks
++      // where the requirement names three should be able to see which is missing.
++      //
++      // History stays readable while archived (FR-020). Only the write refuses.
++      if (channel.archivedAt !== null) throw new ChannelArchivedError(channelId);
++
+       // THE CAP, CHECKED BEFORE THE MESSAGE IS WRITTEN (chapter 3.10, FR-RTL-08).
+       //
+       // Here rather than in middleware, because chapter 3.8's limiter never sees
+@@ -3250,6 +3518,85 @@
+    * tenant-scoped query over a foreign channel simply returns no rows, and
+    * the endpoint dressed that as an empty page. The milestone suite caught
+    * the two doors disagreeing about the same resource. */
++  /** One channel by its id, scoped, with the two fields the by-id route reports
++   * beyond FR-CHN-01's four (chapter 3.15, FR-003a).
++   *
++   * SCOPED IN THE WHERE CLAUSE and not filtered afterwards, for the reason
++   * `addMembers` states: a foreign id and an absent one must both miss this read,
++   * so both answer alike and neither reveals the other tenant's row.
++   *
++   * THIS ROUTE DID NOT EXIST. `channels.controller.ts` carried a create and a
++   * member-add and no read, so a customer could create a channel and never read
++   * its four fields back — while SC-001 named "read by id" as one of four verbs,
++   * FR-003 said "every read", and `contracts/membership.md` had a row for it.
++   * Three artifacts resting on a handler nobody wrote (analysis pass three). */
++  async getChannelById(
++    channelId: string,
++  ): Promise<(ChannelRow & { archived_at: Date | null }) | null> {
++    const rows = await this.db
++      .select({
++        id: channels.id,
++        external_id: channels.externalId,
++        type: sql<ChannelRow["type"]>`${channels.type}`,
++        name: channels.name,
++        metadata: sql<Record<string, unknown>>`${channels.metadata}`,
++        archived_at: channels.archivedAt,
++      })
++      .from(channels)
++      .where(
++        and(
++          eq(channels.id, channelId),
++          eq(channels.environmentId, this.environmentId),
++        ),
++      );
++    return rows[0] ?? null;
++  }
++
++  /** Whether this user is a member of this channel (chapter 3.15).
++   *
++   * No environment predicate, and that is safe rather than sloppy: `members` has
++   * no `environment_id` — it is reached through `channels` and `users`, which is
++   * why the catalogue calls it a `hop` — and every caller has already read the
++   * channel scoped. A membership row for a channel this environment cannot see is
++   * unreachable because the channel id came from a scoped read. */
++  async isMember(channelId: string, userId: string): Promise<boolean> {
++    const rows = await this.db
++      .select({ userId: members.userId })
++      .from(members)
++      .where(and(eq(members.channelId, channelId), eq(members.userId, userId)))
++      .limit(1);
++    return rows.length > 0;
++  }
++
++  /** Whether this channel exists AND this caller may see it (chapter 3.15, FR-003).
++   *
++   * `channelExists` answers the first half and every read route used it. That was
++   * enough while `channels.type` decided nothing; it is not enough now, and the gap
++   * showed up as a leak rather than as a failure:
++   *
++   *     a channel that does not exist   → channelExists false → 404
++   *     a private channel, non-member   → channelExists TRUE  → 200, empty page
++   *
++   * Two different answers, so the empty page announced that the channel was there.
++   * FR-003 says every read answers identically to a channel that does not exist, and
++   * the only way to keep that is for one predicate to produce both refusals.
++   *
++   * `userId` absent means the tenant is reading, which sees everything it owns. */
++  async channelVisibleTo(channelId: string, userId?: string): Promise<boolean> {
++    const [channel] = await this.db
++      .select({ type: sql<ChannelRow["type"]>`${channels.type}` })
++      .from(channels)
++      .where(
++        and(
++          eq(channels.id, channelId),
++          eq(channels.environmentId, this.environmentId),
++        ),
++      );
++    if (!channel) return false;
++    if (channel.type !== "private" || userId === undefined) return true;
++    return this.isMember(channelId, userId);
++  }
++
+   async channelExists(channelId: string): Promise<boolean> {
+     const rows = await this.db
+       .select({ id: channels.id })
+@@ -3278,8 +3625,50 @@
+       beforeSeq,
+       afterSeq,
+       limit,
+-    }: { beforeSeq?: number; afterSeq?: number; limit: number },
++      /** Who is reading (chapter 3.15, FR-002, FR-003).
++       *
++       * THIS PARAMETER DID NOT EXIST, and its absence is why the history path had
++       * nothing to check. The task said "add the same check to the history path" and
++       * there was nowhere to put a caller: this function took a channel and a page,
++       * `messages.service.history` passed neither, and the controller resolved no
++       * principal. Three places, and a gap in any one makes a check unreachable.
++       *
++       * Absent means the TENANT is reading, the same convention `sendMessage` uses
++       * — an application credential sees private channels (FR-005). */
++      userId,
++    }: {
++      beforeSeq?: number;
++      afterSeq?: number;
++      limit: number;
++      userId?: string;
++    },
+   ): Promise<MessageWithSender[]> {
++    // MEMBERSHIP FIRST, WHEN A USER IS READING (chapter 3.15, FR-002, FR-003).
++    //
++    // A scoped read below would already exclude another tenant's channel; this is
++    // the case inside one tenant, where the channel exists and the reader is not a
++    // member of it. An EMPTY PAGE is the answer, and it is the same answer a channel
++    // that does not exist gives — `listMessages` has always returned `[]` for an
++    // unknown id rather than raising, so indistinguishability here is a matter of
++    // not diverging from that.
++    //
++    // ORDERED BEFORE THE PAGE QUERY so a non-member's read costs one small lookup
++    // rather than a page of rows this function then discards.
++    if (userId !== undefined) {
++      const [channel] = await this.db
++        .select({ type: sql<ChannelRow["type"]>`${channels.type}` })
++        .from(channels)
++        .where(
++          and(
++            eq(channels.id, channelId),
++            eq(channels.environmentId, this.environmentId),
++          ),
++        );
++      if (channel?.type === "private" && !(await this.isMember(channelId, userId))) {
++        return [];
++      }
++    }
++
+     const columns = {
+       id: messages.id,
+       channel_id: messages.channelId,
+```
+
+<Trap>
+
+The first `removeMembers` I wrote built its `IN` list with `sql.raw`:
+
+```ts
+sql.raw(`ARRAY['${userIds.join("','")}']::uuid[]`)
+```
+
+Those ids come from a request body. That is a SQL injection hole in the one layer of
+this platform that is allowed to speak SQL, written while implementing a chapter about
+authorization. `inArray(members.userId, userIds)` parameterises it and reads better.
+Nothing in the lane would have caught it: every test passes ids that are already
+uuids.
+
+</Trap>
+
+## Two role vocabularies, one word apart
+
+`memberships.role` has been `('owner','admin','member')` since chapter 3.1 — a human's
+role in an organisation. A channel member's roles are `('owner','moderator','member')`.
+One word apart, and a migration that reused the organisation's constraint would accept
+`admin` on a channel member, refuse `moderator`, and look correct in review.
+
+```diff title="services/api/src/db/schema.ts"
+@@ -88,6 +88,15 @@
+   },
+   (t) => [
+     primaryKey({ columns: [t.organisationId, t.humanId] }),
++    // A HUMAN'S ROLE IN AN ORGANISATION (FR-TEN-07), and NOT a channel role.
++    //
++    // `members.role` below is the other one: `('owner','moderator','member')`, a user's
++    // role in a channel (FR-CHN-04). Different tables, different subjects, and ONE WORD
++    // different — `admin` here, `moderator` there. A migration that reused this constraint
++    // for channel members would accept `admin` on a channel member, refuse `moderator`,
++    // and look correct in review. Chapter 3.15's research found that before writing it;
++    // the comment sits on both sides because a warning on one side is a warning the next
++    // person does not find.
+     check(
+       "memberships_role_check",
+       sql`${t.role} IN ('owner','admin','member')`,
+@@ -231,6 +240,24 @@
+     avatarUrl: text("avatar_url"),
+     metadata: jsonb("metadata").notNull().default({}),
+     bannedAt: timestamp("banned_at", { withTimezone: true }),
++    // A DELETED USER KEEPS THIS ROW (chapter 3.15, FR-USR-05, research R7).
++    //
++    // This column is in no SRS clause. It arrived from designing the deletion path:
++    // `messages.user_id`, `members.user_id` and `usage_active_users.user_id` all
++    // reference `users.id`, and FR-USR-05 asks that a deleted user's messages be
++    // preserved "as authored by a deleted user".
++    //
++    // `ON DELETE SET NULL` would satisfy the letter of that and break delivery.
++    // `backfill.controller`'s `toFrame` drops senderless rows because `messageSchema`
++    // requires `user`, so "authored by a deleted user" and "authored by nobody" are
++    // different states and only the first is deliverable. `ON DELETE CASCADE` deletes
++    // the messages the clause says to keep.
++    //
++    // So the row survives with its profile fields cleared, and this marker is what says
++    // the row is deleted. `(environment_id, external_id)` stays unique, which is why
++    // presenting the same external id again reuses this row and clears the marker
++    // (FR-030) rather than creating a second identity.
++    deletedAt: timestamp("deleted_at", { withTimezone: true }),
+   },
+   (t) => [
+     unique("users_environment_id_external_id_unique").on(
+@@ -255,6 +282,27 @@
+       .notNull()
+       .default(0), // ADR-03
+     archivedAt: timestamp("archived_at", { withTimezone: true }),
++    // WHEN THIS CHANNEL LAST TOOK A MESSAGE (chapter 3.15, FR-014).
++    //
++    // A denormalised value, and the 145× is why. FR-CHN-08 wants a user's channels
++    // ordered by most recent activity. `last_sequence` above cannot do it — it is a
++    // per-channel counter, so two channels both at 50 say nothing about which was
++    // active more recently. The alternative is `max(messages.created_at)` per channel,
++    // measured at 2,000 channels and 1,000,000 messages:
++    //
++    //     aggregate over messages    159 ms   → Seq Scan, every message, every listing
++    //     this column, indexed         1.1 ms
++    //
++    // The test lane answered the aggregate in 0.87 ms because its busiest environment
++    // holds 579 messages, which is the number that would have settled the question the
++    // wrong way (research R4).
++    //
++    // The write path already advances `last_sequence` in one statement; this moves with
++    // it, in the same transaction. Nothing else writes it: a member joining, a rename or
++    // an archive is not activity.
++    lastActivityAt: timestamp("last_activity_at", { withTimezone: true })
++      .notNull()
++      .defaultNow(),
+   },
+   (t) => [
+     unique("channels_environment_id_external_id_unique").on(
+@@ -262,6 +310,12 @@
+       t.externalId,
+     ), // DR-02
+     check("channels_type_check", sql`${t.type} IN ('public','private')`),
++    // The listing's ordering, scoped first (FR-013). Environment leads because every
++    // listing is inside one and the planner can then walk the timestamp backward.
++    index("channels_environment_last_activity").on(
++      t.environmentId,
++      t.lastActivityAt.desc(),
++    ),
+   ],
+ );
+ 
+@@ -315,14 +369,83 @@
+     joinedAt: timestamp("joined_at", { withTimezone: true })
+       .notNull()
+       .defaultNow(),
++    // A USER'S ROLE IN A CHANNEL (chapter 3.15, FR-CHN-04), default `member`.
++    //
++    // The default is what lets chapter 3.13's `addMember` keep working unchanged and
++    // gives every existing row a value the CHECK accepts.
++    role: text("role").notNull().default("member"),
+   },
+   (t) => [
+     primaryKey({ columns: [t.channelId, t.userId] }),
++    // ITS OWN CONSTRAINT, and NOT `memberships_role_check` above.
++    //
++    // `memberships.role` is `('owner','admin','member')` — a human's role in an
++    // organisation, FR-TEN-07. This one is `('owner','moderator','member')` — FR-CHN-04's
++    // three. One word apart, and reusing the other constraint here would accept `admin`
++    // on a channel member, refuse `moderator`, and read as correct in review.
++    check("members_role_check", sql`${t.role} IN ('owner','moderator','member')`),
+     // Hot-path index (SAD §6.3): the resume path's "which channels am I in".
+     index("members_user_channel").on(t.userId, t.channelId),
+   ],
+ );
+ 
++// HOW FAR EACH USER HAS READ IN EACH CHANNEL (chapter 3.15, FR-017, research R6).
++//
++// The only entity in this feature with no storage before it. Verified absent: no
++// `last_read`, `read_at` or equivalent column anywhere in this file.
++//
++// THE UNREAD COUNT NEEDS NO COUNTER. It is
++// `greatest(channels.last_sequence - sequence, 0)`, because the write path already
++// maintains `last_sequence` and chapter 2.2 made it the sequencing authority. Three
++// shapes measured on one page of 50 channels against 1,000,000 messages:
++//
++//     count rows past the position     9.8–13.4 ms
++//     a cached counter on the position  1.2– 2.1 ms
++//     last_sequence - this column       1.1– 4.5 ms
++//
++// The cached counter is no faster and adds a value that can go stale. The approximation
++// this accepts, and FR-016 asks for it to be stated: a tombstoned message still occupies
++// a sequence, so a deleted message counts as one unread. Counting rows instead is 10x the
++// cost on the query a client runs to render its first screen.
++//
++// `environment_id` IS DENORMALISED HERE, DELIBERATELY. `channel_id` already determines
++// it. The column exists because feature 030's guard watches tables that carry one, and a
++// table without it is a table the guard cannot refuse a cross-environment delete on.
++// `members` above is the counter-example and the reason this is worth saying: it has no
++// `environment_id`, so `tenant-scope.itest.ts` classifies it as `hop` — reached through a
++// foreign key — and no trigger protects it. A read position is per-user state that a
++// tenant's own operations mutate, so it takes the stronger classification.
++//
++// NO `id` COLUMN, and the guard's refusal message is why that matters: it interpolates a
++// key, and chapter 3.13 installed
++// `coalesce(to_jsonb(OLD) ->> 'id', to_jsonb(OLD)::text)` for exactly this case.
++export const readPositions = pgTable(
++  "read_positions",
++  {
++    environmentId: uuid("environment_id")
++      .notNull()
++      .references(() => environments.id),
++    channelId: uuid("channel_id")
++      .notNull()
++      .references(() => channels.id),
++    userId: uuid("user_id")
++      .notNull()
++      .references(() => users.id),
++    // The last sequence this user has read. Advances forwards only: a write naming a
++    // lower value is accepted and changes nothing, so a client replaying an old
++    // acknowledgement cannot move the count backwards. A value past
++    // `channels.last_sequence` is refused (FR-018) — a position nothing can reach makes
++    // every later count wrong.
++    sequence: bigint("sequence", { mode: "number" }).notNull(),
++    updatedAt: timestamp("updated_at", { withTimezone: true })
++      .notNull()
++      .defaultNow(),
++  },
++  (t) => [
++    primaryKey({ columns: [t.channelId, t.userId] }),
++  ],
++);
++
+ // The outbox (chapter 3.3, ADR-06). For the first time in Part 3 this table is
+ // QUOTED rather than derived: SAD §6.1 defines it column-for-column, so nothing
+ // about its shape is a chapter invention.
+```
+
+Both CHECK constraints now carry a comment naming the other one, in both directions.
+The migration is new, so it appears whole:
+
+```sql title="services/api/migrations/0012_member_roles_and_user_deletion.sql"
+-- Chapter 3.15 — a member's role, and a deleted user who is still an author.
+--
+-- FR-CHN-04 has asked for channel member roles since the SRS was written and
+-- `members` has been `(channel_id, user_id, joined_at)` the whole time. Chapter
+-- 3.12's traceability map recorded the clause as delivered, described it with a
+-- paraphrase belonging to FR-CHN-06, and was corrected while chapter 3.15 was
+-- being specified.
+--
+-- ITS OWN CHECK CONSTRAINT, AND NOT THE ONE THAT ALREADY EXISTS. `memberships`
+-- has carried `CHECK (role IN ('owner','admin','member'))` since chapter 3.1 —
+-- that is FR-TEN-07, a human's role in an ORGANISATION. FR-CHN-04's channel
+-- roles are 'owner', 'moderator', 'member'.
+--
+-- Different tables, different subjects, ONE WORD DIFFERENT. A migration that
+-- reused the organisation constraint here would accept `admin` on a channel
+-- member, refuse `moderator`, and look correct in review. Both constraints now
+-- carry a comment naming the other, because a warning on one side of a trap is
+-- a warning the next person does not find (research R8).
+--
+-- DEFAULT 'member', which is what lets chapter 3.13's `addMember` keep working
+-- unchanged and gives every existing row a value the CHECK accepts. The
+-- member-add endpoint takes an optional role per entry (FR-011b) so a member
+-- can be created with one rather than only changed into one.
+ALTER TABLE members
+    ADD COLUMN role TEXT NOT NULL DEFAULT 'member';
+--> statement-breakpoint
+
+ALTER TABLE members
+    ADD CONSTRAINT members_role_check CHECK (role IN ('owner','moderator','member'));
+--> statement-breakpoint
+
+-- A DELETED USER KEEPS THEIR ROW, and this column is what says so.
+--
+-- This is in no SRS clause. It arrived from designing FR-USR-05's deletion path
+-- and finding nowhere to record the state. Three tables reference users(id) —
+-- messages, members, usage_active_users — and the clause asks that a deleted
+-- user's messages be preserved "as authored by a deleted user".
+--
+-- ON DELETE SET NULL WOULD SATISFY THE LETTER OF THAT AND BREAK DELIVERY.
+-- `backfill.controller`'s `toFrame` drops senderless rows because
+-- `messageSchema` requires `user`, so a NULL author makes a message invisible
+-- to every socket. "Authored by a deleted user" and "authored by nobody" are
+-- different states and only the first is deliverable. ON DELETE CASCADE deletes
+-- the messages the clause says to keep. A separate `deleted_users` table is a
+-- second identity space for one flag (research R7).
+--
+-- So deletion clears the profile fields, removes the memberships and read
+-- positions, sets this, and touches no messages and no usage_active_users rows —
+-- that table is billing history and does not vanish with a profile (FR-029).
+--
+-- (environment_id, external_id) STAYS UNIQUE, which is why presenting the same
+-- external id again reuses this row and clears this column (FR-030) rather than
+-- creating a second identity for one person.
+ALTER TABLE users
+    ADD COLUMN deleted_at TIMESTAMPTZ;
+```
+
+That migration carries a column this chapter does not use. `users.deleted_at` belongs
+to the next chapter's subject, and it shares a migration with `members.role` because
+both were designed in the same phase. Regrouping the migrations by chapter was the
+alternative and it costs a phase ordering that runs both before either chapter is
+written; the straddle costs one diff instead.
+
+**What reads a member's role.** The listing returns it. **No operation is authorized by
+it** — no permission decision anywhere in the platform consults the column. That
+distinction is the statement worth making, and for thirteen analysis passes the
+documents said "nothing reads it" while a contract's own field table returned the
+field. Found by putting the two side by side, which no earlier pass had done.
+
+```diff title="services/api/src/channels/channels.schema.ts"
+@@ -20,23 +20,30 @@
+ 
+ export const createChannelBodySchema = z.strictObject({
+   external_id: z.string().min(1).max(255),
+-  // `public` AND NOTHING ELSE, and this is the chapter's sharpest edit (FR-047).
++  // BOTH, AND ONLY NOW (chapter 3.15, FR-009).
+   //
+-  // `channels.type` has been a `"public" | "private"` column with a CHECK
+-  // constraint since chapter 2.1, and NOTHING IN THE PLATFORM DECIDES ON IT. It is
+-  // selected and returned by this endpoint, so it is read — and no conditional
+-  // anywhere branches on it. The PUBLIC history and send routes check nothing, and
+-  // `POST /internal/messages` resolves a user and checks nothing; `repository.backfill`
+-  // and `session.controller` DO check membership, so "no membership check on any read
+-  // path" would be wrong. So FR-CHN-05 — a P1 clause promising that a private channel
+-  // is visible only to its members — is unimplemented.
++  // Chapter 3.12 pinned this enum to `public` alone with the sharpest edit in that
++  // chapter, and the reason it gave was true then: `channels.type` had been a
++  // `"public" | "private"` column with a CHECK since chapter 2.1 and NOTHING
++  // DECIDED ON IT. An endpoint accepting `private` would have sold a guarantee the
++  // platform did not keep.
+   //
+-  // An endpoint accepting `private` would sell a guarantee the platform does not
+-  // keep, and it would do it in the chapter whose exit criterion is that an
+-  // outsider can integrate on the documentation alone. The enum is `public`
+-  // today; FR-CHN-03's private half goes to chapter 3.15 with FR-CHN-05, where
+-  // the read paths are made to honour it.
+-  type: z.enum(["public"]),
++  // ONE SENTENCE IN THAT COMMENT WAS WRONG, and it shipped for three chapters:
++  // "there is no membership check on any read path". `repository.backfill` joins
++  // `members` on the caller's user id, and `session.controller` builds its channel
++  // list from `channelsForUser` — both are read paths and both check membership.
++  // What was true is narrower: the PUBLIC history and send routes checked nothing,
++  // and `POST /internal/messages` resolved a user and checked nothing. Corrected
++  // here under FR-037, in the same edit that widens the enum, because a false
++  // sentence inside a titled fence cannot wait for a later phase.
++  //
++  // WIDENED LAST, DELIBERATELY. FR-009 gates this on FR-001 to FR-003 holding
++  // first: the send path refuses a non-member, the by-id read and history answer
++  // as if the channel were absent, and the socket's session never carries it. All
++  // four are in place before this line changed. Reversed, the platform would sell
++  // the guarantee before keeping it — which is the mistake chapter 3.12's fifth
++  // analysis pass caught one phase before it shipped.
++  type: z.enum(["public", "private"]),
+   name: z.string().min(1).max(255).optional(),
+   metadata: metadataSchema.optional(),
+ });
+@@ -46,7 +53,59 @@
+ /** FR-CHN-06's page: at most 100 users in one call. The channel's own ceiling is
+  * 1,000 (FR-CHN-07) and is enforced in the service against a counted read — this
+  * only bounds the size of a single request. */
++/** FR-CHN-04's three, and NOT `memberships`' three (chapter 3.15, FR-011).
++ *
++ * `memberships.role` is `('owner','admin','member')` — a human's role in an
++ * organisation, FR-TEN-07. This is a user's role in a CHANNEL. One word apart, and
++ * the database CHECK names these three so a request that gets past this enum still
++ * cannot write `admin`. */
++export const CHANNEL_ROLES = ["owner", "moderator", "member"] as const;
++export const channelRoleSchema = z.enum(CHANNEL_ROLES);
++export type ChannelRole = z.infer<typeof channelRoleSchema>;
++
++/** An entry in the add body: a bare external id, or an id with a role.
++ *
++ * A UNION RATHER THAN A NEW SHAPE, because chapter 3.13 shipped
++ * `{"user_ids": ["a", "b"]}` and a customer's server is sending that today. FR-011b
++ * asks that a member be creatable WITH a role — US6's first scenario — and the
++ * cheapest honest way is for an entry to be either form:
++ *
++ *     {"user_ids": ["a", {"user": "b", "role": "owner"}]}
++ *
++ * `contracts/membership.md` proposed renaming the field to `users`, which would
++ * have been a breaking change to a shipped route decided in an analysis pass. The
++ * shipped name wins and the contract is corrected. */
++export const addMemberEntrySchema = z.union([
++  z.string().min(1).max(255),
++  z.strictObject({
++    user: z.string().min(1).max(255),
++    role: channelRoleSchema.optional(),
++  }),
++]);
++
+ export const addMembersBodySchema = z.strictObject({
++  user_ids: z.array(addMemberEntrySchema).min(1).max(100),
++});
++
++/** One entry, normalised. The union above is for the wire; nothing downstream should
++ * have to ask which form arrived. */
++export function normaliseEntry(
++  entry: z.infer<typeof addMemberEntrySchema>,
++): { user: string; role?: ChannelRole | undefined } {
++  // `| undefined` explicitly, because `exactOptionalPropertyTypes` is on (ADR-15's
++  // strictness, chapter 1.4): an optional property and a property that may hold
++  // `undefined` are different types here, and the union's object arm produces the
++  // second.
++  return typeof entry === "string" ? { user: entry } : entry;
++}
++
++/** FR-006's page: at most 100 users in one removal, the same bound as the add.
++ *
++ * THE SAME NUMBER FOR THE SAME REASON, not by symmetry. Both routes take a list a
++ * customer's server assembled, and a bound that differed between them would be two
++ * numbers to remember for one concept. `strictObject`, so a misspelled key is a
++ * refusal rather than a silently ignored typo. */
++export const removeMembersBodySchema = z.strictObject({
+   user_ids: z.array(z.string().min(1).max(255)).min(1).max(100),
+ });
+ 
+@@ -56,3 +115,16 @@
+  * `channel_member_limit_exceeded` in the registry for why it is not
+  * `quota_exceeded`. */
+ export const CHANNEL_MEMBER_LIMIT = 1000;
++
++export type RemoveMembersBody = z.infer<typeof removeMembersBodySchema>;
++
++/** The `PATCH` body for one member's role (chapter 3.15, FR-011).
++ *
++ * `strictObject` and a required `role`: a PATCH with an empty body would be a
++ * request that asks for nothing, and answering it 200 would be a lie about having
++ * changed something. */
++export const setMemberRoleBodySchema = z.strictObject({
++  role: channelRoleSchema,
++});
++
++export type SetMemberRoleBody = z.infer<typeof setMemberRoleBodySchema>;
+```
+```diff title="services/api/src/channels/channels.service.ts"
+@@ -3,7 +3,14 @@
+ import { protocolError } from "../protocol-error";
+ 
+ import { Repository, type ChannelRow } from "../db/repository";
+-import { CHANNEL_MEMBER_LIMIT, type AddMembersBody, type CreateChannelBody } from "./channels.schema";
++import {
++  CHANNEL_MEMBER_LIMIT,
++  normaliseEntry,
++  type AddMembersBody,
++  type ChannelRole,
++  type CreateChannelBody,
++  type RemoveMembersBody,
++} from "./channels.schema";
+ 
+ // THE TWO ENDPOINTS PART 3 NEEDED AND NOBODY HAD BUILT (FR-016 to FR-019).
+ //
+@@ -25,10 +32,21 @@
+   created: boolean;
+ }
+ 
++export interface MemberRemoval {
++  external_id: string;
++  /** `removed` if a membership row went away, `not_a_member` otherwise — including
++   * when the external id belongs to no user this tenant knows. */
++  result: "removed" | "not_a_member";
++}
++
+ export interface MemberResult {
+   user_id: string;
+   external_id: string;
+   status: "added" | "already_a_member";
++  /** Chapter 3.15. What role the member holds AFTER the call — read back, not
++   * echoed, so an `already_a_member` reports the role they already had rather than
++   * the one the request asked for. Adding is not changing. */
++  role: string;
+ }
+ 
+ @Injectable()
+@@ -46,6 +64,165 @@
+     return { channel, created };
+   }
+ 
++  /** One channel by id, with the caller's membership (chapter 3.15, FR-003a, FR-003).
++   *
++   * THE ANSWER FOR A PRIVATE CHANNEL THE CALLER CANNOT SEE IS THE NOT-FOUND
++   * ENVELOPE, and it has to be byte-identical to the answer for a channel that does
++   * not exist — SC-002, over the same oracle chapter 3.12 built for cross-tenant
++   * pairs. A `403` naming the membership would announce that the channel exists,
++   * which is what FR-003 forbids. So both paths raise the same exception with the
++   * same constant message, and the message names no id: echoing it back would make
++   * the two answers differ, and different is itself a disclosure.
++   *
++   * `userId` ABSENT MEANS THE TENANT IS ASKING. An application credential acts for
++   * the customer, carries no user, and sees private channels (FR-005) — so it gets
++   * the row and a membership of `null`, because the tenant is not a member of
++   * anything. A user token gets `true` or `false`.
++   *
++   * FR-004's answer for the other type: a `public` channel is readable by any
++   * authenticated user of the tenant, member or not. The column decides something
++   * only because the two types differ. */
++  async read(
++    channelId: string,
++    userId?: string,
++  ): Promise<{
++    channel: ChannelRow & { archived_at: Date | null };
++    isMember: boolean | null;
++  }> {
++    const channel = await this.repo.getChannelById(channelId);
++    if (!channel) throw this.notFound();
++
++    const isMember =
++      userId === undefined ? null : await this.repo.isMember(channelId, userId);
++
++    if (channel.type === "private" && isMember === false) throw this.notFound();
++
++    return { channel, isMember };
++  }
++
++  /** Remove members by EXTERNAL id, reporting each (chapter 3.15, FR-006, FR-007).
++   *
++   * THE CHANNEL IS READ SCOPED FIRST, the same ordering `addMembers` states below
++   * and for the same reason: a foreign channel id and one that exists nowhere both
++   * fail that read, so both answer alike and neither reveals the other tenant's
++   * channel. A private channel the caller cannot see answers the same way — this is
++   * a tenant credential's route, and the tenant sees its own private channels
++   * (FR-005), so in practice only absence and foreignness refuse here.
++   *
++   * A USER THAT DOES NOT EXIST REPORTS `not_a_member`, per entry, rather than
++   * failing the request. It is not a member — that is simply true — and answering
++   * anything else would make this route a membership oracle for user ids: a caller
++   * could sweep external ids and learn which ones this tenant knows. One bad entry
++   * must not refuse the other ninety-nine.
++   */
++  async removeMembers(
++    channelId: string,
++    body: RemoveMembersBody,
++  ): Promise<MemberRemoval[]> {
++    if (!(await this.repo.channelExists(channelId))) throw this.notFound();
++
++    // External ids to row ids, and the ones with no row are already answered: no
++    // user, no membership. `getUserByExternalId` is scoped, so an id belonging to
++    // another tenant resolves to nothing here — which is the same answer as an id
++    // belonging to nobody, and deliberately so.
++    const resolved = new Map<string, string | null>();
++    for (const externalId of body.user_ids) {
++      const user = await this.repo.getUserByExternalId(externalId);
++      resolved.set(externalId, user?.id ?? null);
++    }
++
++    const ids = [...resolved.values()].filter((id): id is string => id !== null);
++    const outcomes = await this.repo.removeMembers(channelId, ids);
++
++    return body.user_ids.map((externalId) => {
++      const id = resolved.get(externalId) ?? null;
++      return {
++        external_id: externalId,
++        result: id === null ? "not_a_member" : (outcomes.get(id) ?? "not_a_member"),
++      };
++    });
++  }
++
++  /** Archive and unarchive (chapter 3.15, FR-020, FR-020a).
++   *
++   * Both answer 200 whether or not the state changed. "Already archived" is not an
++   * error: the customer asked for the channel to be archived and it is. What DOES
++   * refuse is a channel that is not there — the same not-found every other route
++   * here gives, so absence and foreignness stay one answer.
++   */
++  async setArchived(channelId: string, archived: boolean): Promise<{ archived: boolean }> {
++    const found = archived
++      ? await this.repo.archiveChannel(channelId)
++      : await this.repo.unarchiveChannel(channelId);
++    if (!found) throw this.notFound();
++    return { archived };
++  }
++
++  /** Set one member's role by external id (chapter 3.15, FR-011).
++   *
++   * THE CHANNEL FIRST, then the user, then the membership — each refusing with the
++   * same not-found so the three cases are one answer from outside. A caller who can
++   * tell "no such channel" from "no such user" from "not a member" has a probe.
++   */
++  async setMemberRole(
++    channelId: string,
++    userExternalId: string,
++    role: ChannelRole,
++  ): Promise<{ external_id: string; role: ChannelRole }> {
++    if (!(await this.repo.channelExists(channelId))) throw this.notFound();
++    const user = await this.repo.getUserByExternalId(userExternalId);
++    if (!user) throw this.notFound();
++    const outcome = await this.repo.setMemberRole(channelId, user.id, role);
++    if (outcome === "not_a_member") throw this.notFound();
++    return { external_id: userExternalId, role };
++  }
++
++  /** A user joining a channel themselves (chapter 3.15, FR-CHN-03).
++   *
++   * FR-CHN-03's exact words are that any authenticated user of the tenant "may read
++   * and join" a public channel, and JOIN is the hard half: reading needs no new
++   * operation, joining is a user acting on their own behalf rather than the tenant
++   * adding somebody. `POST …/members` is the tenant's route; this is the user's.
++   *
++   * A PRIVATE CHANNEL ANSWERS AS IF ABSENT. Not "you may not join" — that would
++   * announce it exists, and joining is one of the verbs SC-001 covers.
++   *
++   * THE CEILING IS READ, NOT REIMPLEMENTED. Chapter 3.13 counts members from
++   * storage and refuses at 1,000 with `channel_member_limit_exceeded`; a second
++   * count with its own limit here would be a second answer to one question. */
++  async join(channelId: string, userId: string): Promise<"joined" | "already_a_member"> {
++    const channel = await this.repo.getChannelById(channelId);
++    if (!channel) throw this.notFound();
++    if (channel.type === "private") throw this.notFound();
++
++    if (await this.repo.isMember(channelId, userId)) return "already_a_member";
++
++    const existing = await this.repo.countMembers(channelId);
++    if (existing + 1 > CHANNEL_MEMBER_LIMIT) {
++      throw protocolError(
++        "channel_member_limit_exceeded",
++        `this channel holds ${existing} of ${CHANNEL_MEMBER_LIMIT} members; ` +
++          `joining would exceed the limit`,
++        HttpStatus.UNPROCESSABLE_ENTITY,
++      );
++    }
++
++    const outcome = await this.repo.addMember(channelId, userId);
++    // `not_found` here means the channel went away between two statements of one
++    // call, which nothing in the api can do — it is the same unconstructable state
++    // `createChannel` and `createUser` throw for.
++    if (outcome === "not_found") throw this.notFound();
++    return outcome === "added" ? "joined" : "already_a_member";
++  }
++
++  /** The one refusal shape for "you cannot see this", used by every read here.
++   *
++   * A CONSTANT MESSAGE, for the reason `addMembers` gives below: a message carrying
++   * the id makes the foreign-id answer differ from the absent-id answer. */
++  private notFound(): Error {
++    return new NotFoundException("channel not found");
++  }
++
+   /** Members by EXTERNAL id, and a user is created on first membership (FR-CHN-04).
+    *
+    * THE CHANNEL IS READ SCOPED FIRST, and that ordering is the isolation property
+@@ -77,16 +254,31 @@
+     }
+ 
+     const results: MemberResult[] = [];
+-    for (const externalId of body.user_ids) {
++    for (const entry of body.user_ids) {
++      // An entry is a bare external id or an id with a role (FR-011b). Normalised
++      // once here so nothing below has to ask which form arrived.
++      const { user: externalId, role } = normaliseEntry(entry);
+       const user = await this.repo.createUser(externalId);
+-      const outcome = await this.repo.addMember(channelId, user.id);
++      const outcome = await this.repo.addMember(
++        channelId,
++        user.id,
++        ...(role === undefined ? [] : ([role] as const)),
++      );
+       if (outcome === "not_found") {
+         // The channel was read above and both ids are this environment's, so this
+         // is not reachable by a foreign request — it means the channel was deleted
+         // between the read and here. Answer as the read would have.
+         throw new NotFoundException("channel not found");
+       }
+-      results.push({ user_id: user.id, external_id: externalId, status: outcome });
++      results.push({
++        user_id: user.id,
++        external_id: externalId,
++        status: outcome,
++        // The role the member ends up with, read back rather than echoed: on an
++        // `already_a_member` the request's role is NOT applied, because adding is
++        // not changing. `PATCH` is the route that changes one.
++        role: (await this.repo.memberRole(channelId, user.id)) ?? "member",
++      });
+     }
+     return results;
+   }
+```
+```diff title="services/api/src/channels/channels.controller.ts"
+@@ -1,10 +1,36 @@
+-import { Body, Controller, HttpCode, Param, Post, Res, UseGuards } from "@nestjs/common";
++import {
++  BadRequestException,
++  Body,
++  Controller,
++  Delete,
++  Get,
++  HttpCode,
++  HttpStatus,
++  Param,
++  Patch,
++  Post,
++  Req,
++  Res,
++  UseGuards,
++} from "@nestjs/common";
+ 
+ import { Accepts, CredentialGuard } from "../auth/credential.guard";
++import type { RequestWithPrincipal } from "../auth/principal";
++import { Repository } from "../db/repository";
+ import { ZodValidationPipe } from "../messages/zod-validation.pipe";
+ import { ChannelsService } from "./channels.service";
+-import { addMembersBodySchema, createChannelBodySchema } from "./channels.schema";
+-import type { AddMembersBody, CreateChannelBody } from "./channels.schema";
++import {
++  addMembersBodySchema,
++  createChannelBodySchema,
++  removeMembersBodySchema,
++  setMemberRoleBodySchema,
++} from "./channels.schema";
++import type {
++  AddMembersBody,
++  CreateChannelBody,
++  RemoveMembersBody,
++  SetMemberRoleBody,
++} from "./channels.schema";
+ 
+ // THE PUBLIC CHANNEL SURFACE (FR-016, FR-019, data-model.md §7).
+ //
+@@ -27,7 +53,12 @@
+ @UseGuards(CredentialGuard)
+ @Accepts("application")
+ export class ChannelsController {
+-  constructor(private readonly channels: ChannelsService) {}
++  constructor(
++    private readonly channels: ChannelsService,
++    // For resolving a user token's subject to a row id. The service takes an id
++    // because the repository's membership lookup is keyed on it.
++    private readonly repo: Repository,
++  ) {}
+ 
+   /** 201 on creation, 200 on the idempotent repeat (FR-017, FR-CHN-02).
+    *
+@@ -52,6 +83,134 @@
+     };
+   }
+ 
++  /** One channel by id (chapter 3.15, FR-003a).
++   *
++   * THIS ROUTE DID NOT EXIST, and three artifacts assumed it did: SC-001 named
++   * "read by id" as one of four verbs a non-member must not reach, FR-003 said
++   * "every read", and `contracts/membership.md` had a row for it. A customer could
++   * create a channel and never read its four fields back.
++   *
++   * `@Accepts("application", "user")` AT THE METHOD, overriding the class's
++   * `"application"`. `credential.guard.ts` resolves
++   * `getAllAndOverride([handler, class])`, so a method-level decorator wins — the
++   * pattern `dev-token.controller.ts` already uses. Both classes belong here: the
++   * tenant reads any of its channels (FR-005), and a user reads the ones they may
++   * see, which is what makes `channels.type` decide something.
++   */
++  @Get(":channelId")
++  @Accepts("application", "user")
++  async read(
++    @Param("channelId") channelId: string,
++    @Req() req: RequestWithPrincipal,
++  ) {
++    const actingExternalId =
++      req.principal?.kind === "user" ? req.principal.userExternalId : undefined;
++    let userId: string | undefined;
++    if (actingExternalId !== undefined) {
++      const user = await this.repo.getUserByExternalId(actingExternalId);
++      // A user token for an identifier with no row is a member of nothing. Refusing
++      // rather than reading as the tenant is the same choice the send path makes,
++      // and FR-039a removes the case by creating the row when the token is minted.
++      if (!user) throw new BadRequestException("unknown user");
++      userId = user.id;
++    }
++    const { channel, isMember } = await this.channels.read(channelId, userId);
++    return {
++      id: channel.id,
++      external_id: channel.external_id,
++      type: channel.type,
++      name: channel.name,
++      metadata: channel.metadata,
++      archived_at: channel.archived_at?.toISOString() ?? null,
++      // `null` when the tenant is asking: an application credential is not a member
++      // of anything, and reporting `false` would imply it could become one.
++      is_member: isMember,
++    };
++  }
++
++  /** Archive and unarchive (chapter 3.15, FR-020, FR-020a).
++   *
++   * ACTION-STYLE, and a pair rather than a `PATCH` with a boolean: "archive this"
++   * and "unarchive this" are two things a customer does, and a body carrying
++   * `{"archived": false}` makes the client assemble a state instead of naming an
++   * action. `POST …/ban` and `POST …/members/remove` take the same shape.
++   *
++   * The tenant's routes. A member does not archive the channel they are in.
++   */
++  @Post(":channelId/archive")
++  @HttpCode(HttpStatus.OK)
++  async archive(@Param("channelId") channelId: string) {
++    return this.channels.setArchived(channelId, true);
++  }
++
++  @Delete(":channelId/archive")
++  @HttpCode(HttpStatus.OK)
++  async unarchive(@Param("channelId") channelId: string) {
++    return this.channels.setArchived(channelId, false);
++  }
++
++  /** One member's role (chapter 3.15, FR-011, FR-011a).
++   *
++   * The tenant's route: an application credential decides who moderates. A member
++   * cannot promote themselves, which is why this is not `@Accepts("user")` like
++   * join.
++   */
++  @Patch(":channelId/members/:userExternalId")
++  async setMemberRole(
++    @Param("channelId") channelId: string,
++    @Param("userExternalId") userExternalId: string,
++    @Body(new ZodValidationPipe(setMemberRoleBodySchema)) body: SetMemberRoleBody,
++  ) {
++    return this.channels.setMemberRole(channelId, userExternalId, body.role);
++  }
++
++  /** Remove members, up to a hundred, reporting each (chapter 3.15, FR-006, FR-007).
++   *
++   * AN ACTION-STYLE `POST`, NOT `DELETE` WITH A BODY. A body on `DELETE` is legal
++   * and unreliable — proxies and some clients drop it — and this feature already
++   * sets the action-style precedent with `POST …/archive` and `POST …/ban`. The
++   * singular `DELETE …/members/:userExternalId` the contract carried for ten
++   * analysis passes is gone rather than kept beside this: "up to 100" covers one,
++   * and two routes for one job is two classification entries, two tests and two
++   * chances to disagree.
++   */
++  @Post(":channelId/members/remove")
++  @HttpCode(HttpStatus.OK)
++  async removeMembers(
++    @Param("channelId") channelId: string,
++    @Body(new ZodValidationPipe(removeMembersBodySchema)) body: RemoveMembersBody,
++  ) {
++    return { results: await this.channels.removeMembers(channelId, body) };
++  }
++
++  /** The user-initiated half of FR-CHN-03 (chapter 3.15).
++   *
++   * `@Accepts("user")` AT THE METHOD, overriding the class's `"application"`. This
++   * is the caller joining, not the tenant adding someone, so an application key has
++   * no business here — it carries no user to join. `credential.guard.ts` resolves
++   * `getAllAndOverride([handler, class])`, so the method wins.
++   *
++   * Without this decorator every user's join would be a 403, which is chapter
++   * 3.12's FR-044 hole exactly: a credential mismatch that passed for a whole
++   * chapter and then turned nine of fifteen tests red.
++   */
++  @Post(":channelId/join")
++  @HttpCode(HttpStatus.OK)
++  @Accepts("user")
++  async join(
++    @Param("channelId") channelId: string,
++    @Req() req: RequestWithPrincipal,
++  ) {
++    // The guard has already refused anything that is not a user principal, so this
++    // is narrowing for the type system rather than for trust.
++    if (req.principal?.kind !== "user") {
++      throw new BadRequestException("joining is an end user's action");
++    }
++    const user = await this.repo.getUserByExternalId(req.principal.userExternalId);
++    if (!user) throw new BadRequestException("unknown user");
++    return { result: await this.channels.join(channelId, user.id) };
++  }
++
+   /** Members by external id, users created on first membership (FR-CHN-04).
+    *
+    * 200 and not 201: this is idempotent in a way creation is not — a member list
+```
+
+The add body is a union rather than a new shape. Chapter 3.13 shipped
+`{"user_ids": ["a", "b"]}` and a customer's server is sending that today, so an entry
+is either a bare external id or an id with a role:
+
+```json
+{"user_ids": ["ana", {"user": "bo", "role": "owner"}]}
+```
+
+A contract written in an analysis pass proposed renaming the field to `users`, which
+would have been a breaking change to a shipped route decided in a review. The shipped
+name wins and the contract was corrected.
+
+**Removal is a POST to `.../members/remove`, not a DELETE with an id in the path.** The
+requirement says up to 100 users in one request and reports per user, which is the same
+shape chapter 3.13 chose for the add. A path segment holds one id.
+
+## The enum, last
+
+Now the widening, in the same edit that fixes a sentence:
+
+```ts
+type: z.enum(["public", "private"]),
+```
+
+Chapter 3.13's comment on that field said "there is no membership check on any read
+path". That was false when it was written and it shipped for three chapters.
+`repository.backfill` joins `members` on the caller's user id, and the socket session
+builds its channel list from `channelsForUser` — both are read paths and both check
+membership. What was true is narrower: the **public** history and send routes checked
+nothing, and the internal send resolved a user and checked nothing.
+
+The correction lives inside the fence above, beside the edit that widens the enum,
+because a false sentence inside a titled fence cannot wait for a later phase — the
+chapter that publishes the file publishes the sentence.
+
+<Why source="docs/04-srs.md traceability">
+
+A second correction is a row in chapter 3.12's own traceability table, which recorded
+FR-CHN-04 — channel member roles — as delivered. It was not; `members` had no role
+column until this chapter's migration. Both corrections are stated here rather than
+only made, because both subjects are this chapter's, and a fix nobody announces is
+indistinguishable from a document that was always right.
+
+</Why>
+
+## The attack the gauntlet had no fixture for
+
+Chapter 3.12 built four attack shapes over one oracle. All four take **another
+tenant's** identifiers. Every one of them is useless here: the attacker this chapter
+needs is a user of your own tenant who is not a member.
+
+<Figure caption="Four cross-tenant shapes, one same-tenant shape, and the control without which none of them mean anything" src={figSameTenant} />
+
+```diff title="services/api/src/isolation/fixtures.ts"
+@@ -96,3 +96,125 @@
+ export function nowhereId(): string {
+   return "00000000-0000-4000-8000-" + Math.random().toString(16).slice(2, 14).padEnd(12, "0");
+ }
++
++/** ONE TENANT, TWO USERS, AND A PRIVATE CHANNEL ONE OF THEM IS NOT IN.
++ *
++ * Chapter 3.15, FR-034. `seedTwoTenants` above gives every attack a victim in
++ * ANOTHER environment, and all four attack shapes take an identifier that does not
++ * exist in the attacker's own tenant. A non-member of your OWN tenant is a
++ * different case entirely: the channel is right there, the environment predicate
++ * passes, and the only thing standing between the caller and the rows is a
++ * membership check this chapter wrote.
++ *
++ * So this is new work rather than a reuse, and the suite had no fixture for it —
++ * measured before building it, which is why FR-034 says so.
++ */
++export interface SameTenant {
++  environmentId: string;
++  credential: string;
++  /** A member of the private channel. The control's subject. */
++  member: { id: string; externalId: string; token: string };
++  /** A user of the same tenant who is NOT a member of it. The attacker. */
++  stranger: { id: string; externalId: string; token: string };
++  privateChannelId: string;
++  publicChannelId: string;
++  /** A message the member wrote, so a read attack has something to fail to find. */
++  messageId: string;
++  repo: Repository;
++}
++
++export async function seedSameTenant(db: Db, mintToken: MintToken): Promise<SameTenant> {
++  const stamp = Math.random().toString(36).slice(2, 8);
++  const environment = await createEnvironment(db, { name: `iso-same-${stamp}` });
++  const key = await createApiKey(db, { environmentId: environment.id });
++  const repo = new Repository(db, environment.id);
++
++  const member = await repo.createUser(`same-${stamp}-member`, "A Member");
++  const stranger = await repo.createUser(`same-${stamp}-stranger`, "A Stranger");
++  const privateChannel = await repo.createChannel(`same-${stamp}-private`, "private");
++  const publicChannel = await repo.createChannel(`same-${stamp}-public`, "public");
++  await repo.addMember(privateChannel.id, member.id);
++  const message = await repo.sendMessage(privateChannel.id, {
++    text: "written by a member",
++    userId: member.id,
++    userExternalId: member.external_id,
++  });
++
++  return {
++    environmentId: environment.id,
++    credential: key.credential,
++    member: {
++      id: member.id,
++      externalId: member.external_id,
++      token: await mintToken(environment.id, member.external_id),
++    },
++    stranger: {
++      id: stranger.id,
++      externalId: stranger.external_id,
++      token: await mintToken(environment.id, stranger.external_id),
++    },
++    privateChannelId: privateChannel.id,
++    publicChannelId: publicChannel.id,
++    messageId: message.id,
++    repo,
++  };
++}
++
++/** THE SAME `external_id` IN TWO ENVIRONMENTS, ONE PUBLIC AND ONE PRIVATE.
++ *
++ * Chapter 3.15, FR-034a. `seedTenant` above label-prefixes every identifier —
++ * `${label}-channel` — so the two tenants it mints never share one, and all four
++ * attack shapes take an id that does NOT exist in the attacker's tenant. The case
++ * where the same STRING resolves in both, to channels of different types, has no
++ * fixture at all.
++ *
++ * AND THIS FEATURE IS WHAT MAKES IT WORTH TESTING. Before it, both channels would
++ * have been `public` and the two answers matched trivially. Now one tenant's user
++ * gets 200 for a string that another tenant's non-member gets 404 for — and the
++ * reason must be the TYPE, not the tenant. A route that resolved an external id
++ * without scoping would cross the boundary and look correct doing it.
++ */
++export interface CollidingTenants {
++  /** The tenant whose channel of this name is public. */
++  open: { environmentId: string; credential: string; token: string; channelId: string };
++  /** The tenant whose channel of the SAME name is private, with a non-member. */
++  closed: { environmentId: string; credential: string; token: string; channelId: string };
++  /** The one external id both channels carry. */
++  sharedExternalId: string;
++}
++
++export async function seedCollidingTenants(
++  db: Db,
++  mintToken: MintToken,
++): Promise<CollidingTenants> {
++  const stamp = Math.random().toString(36).slice(2, 8);
++  const sharedExternalId = `collide-${stamp}`;
++
++  const seed = async (label: string, type: "public" | "private") => {
++    const environment = await createEnvironment(db, { name: `iso-collide-${label}-${stamp}` });
++    const key = await createApiKey(db, { environmentId: environment.id });
++    const repo = new Repository(db, environment.id);
++    const userExternalId = `collide-${label}-${stamp}-user`;
++    const user = await repo.createUser(userExternalId);
++    // THE SAME external id in both environments. `DR-02` makes it unique per
++    // environment, which is exactly the property under test.
++    const channel = await repo.createChannel(sharedExternalId, type);
++    // The `public` tenant's user is deliberately NOT a member either: this fixture
++    // is about type deciding the answer, and membership would confound it.
++    return {
++      environmentId: environment.id,
++      credential: key.credential,
++      token: await mintToken(environment.id, userExternalId),
++      channelId: channel.id,
++      userId: user.id,
++    };
++  };
++
++  const [open, closed] = await Promise.all([seed("open", "public"), seed("closed", "private")]);
++  return { open, closed, sharedExternalId };
++}
++
++/** How a fixture mints an end-user token. Injected rather than imported so
++ * `fixtures.ts` stays free of the auth module — the gauntlet's api-side fixtures
++ * have never needed it, and the two suites that do want tokens already know how. */
++export type MintToken = (environmentId: string, userExternalId: string) => Promise<string>;
+```
+```diff title="services/api/src/isolation/gauntlet.itest.ts"
+@@ -9,7 +9,16 @@
+ import { mintUserToken } from "../auth/user-token";
+ import { environmentSigningSecret } from "../db/repository";
+ import { credentialAttack, listAttack, readAttack, writeAttack } from "./attack";
+-import { nowhereId, seedTwoTenants, type TwoTenants } from "./fixtures";
++import { withoutRequestId } from "./compare";
++import {
++  nowhereId,
++  seedCollidingTenants,
++  seedSameTenant,
++  seedTwoTenants,
++  type CollidingTenants,
++  type SameTenant,
++  type TwoTenants,
++} from "./fixtures";
+ 
+ import type { Db } from "../db/client";
+ 
+@@ -58,10 +67,27 @@
+   let url: string;
+   let db: Db;
+   let tenants: TwoTenants;
++  let same: SameTenant;
++  let colliding: CollidingTenants;
+ 
+   beforeAll(async () => {
+     db = createDb(createPool());
++    // A token minter the fixtures can call without `fixtures.ts` importing the auth
++    // module: it has never needed to, and the two shapes chapter 3.15 adds are the
++    // only ones that want tokens.
++    const mint = async (environmentId: string, userExternalId: string) => {
++      const secret = (await environmentSigningSecret(db, environmentId))!.signingSecret;
++      return (
++        await mintUserToken(secret, {
++          user: userExternalId,
++          environmentId,
++          ttlSeconds: 3600,
++        })
++      ).token;
++    };
+     tenants = await seedTwoTenants(db);
++    same = await seedSameTenant(db, mint);
++    colliding = await seedCollidingTenants(db, mint);
+     app = (
+       await Test.createTestingModule({ imports: [AppModule] }).compile()
+     ).createNestApplication({ logger: false });
+@@ -297,6 +323,160 @@
+     });
+   });
+ 
++  // ── THE SAME-TENANT NON-MEMBER (chapter 3.15, FR-034, SC-015) ──────────────
++  //
++  // Every attack above crosses a tenant boundary. This block does not, and that is
++  // the case constitution I's suite never had: the channel is in the caller's own
++  // environment, the environment predicate passes, and the only thing between the
++  // caller and the rows is a membership check this chapter wrote.
++  //
++  // THE PAIR IS THE SAME SHAPE AS EVERY OTHER ONE HERE — the private channel the
++  // caller cannot see against an id that exists nowhere — because SC-002 asks for
++  // the same property inside a tenant that FR-TEN-05 asks for across tenants.
++  describe("same tenant, not a member", () => {
++    const asUser = (token: string, method: string, path: string, body?: unknown) =>
++      fetch(`${url}${path}`, {
++        method,
++        headers: {
++          authorization: `Bearer ${token}`,
++          ...(body === undefined ? {} : { "content-type": "application/json" }),
++        },
++        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
++      });
++
++    // ── the control, for the reason the cross-tenant block needed one ─────────
++    //
++    // Three of the four assertions below say NOTHING HAPPENED. A token the guard
++    // rejects outright makes nothing happen too, and would pass all of them while
++    // testing no membership at all. So the MEMBER is shown to work first.
++    describe("the control: the member's token works on the same channel", () => {
++      it("reads it by id", async () => {
++        const res = await asUser(same.member.token, "GET", `/v1/channels/${same.privateChannelId}`);
++        expect(res.status).toBe(200);
++        expect(await res.json()).toMatchObject({ is_member: true });
++      });
++
++      it("reads its history", async () => {
++        const res = await asUser(
++          same.member.token,
++          "GET",
++          `/v1/channels/${same.privateChannelId}/messages?limit=10`,
++        );
++        expect(res.status).toBe(200);
++        expect(((await res.json()) as { messages: unknown[] }).messages.length).toBeGreaterThan(0);
++      });
++
++      it("sends into it", async () => {
++        const res = await asUser(
++          same.member.token,
++          "POST",
++          `/v1/channels/${same.privateChannelId}/messages`,
++          { text: "the control speaks" },
++        );
++        expect(res.status).toBe(201);
++      });
++    });
++
++    const verbs: ReadonlyArray<
++      readonly [string, string, (channel: string) => string, unknown?]
++    > = [
++      ["read by id", "GET", (c) => `/v1/channels/${c}`],
++      ["read history", "GET", (c) => `/v1/channels/${c}/messages?limit=10`],
++      ["send", "POST", (c) => `/v1/channels/${c}/messages`, { text: "not mine" }],
++      ["join", "POST", (c) => `/v1/channels/${c}/join`],
++    ];
++
++    for (const [name, method, path, body] of verbs) {
++      it(`${name}: the private channel answers as an id that exists nowhere`, async () => {
++        const refused = await asUser(same.stranger.token, method, path(same.privateChannelId), body);
++        const absent = await asUser(same.stranger.token, method, path(nowhereId()), body);
++        expect(refused.status).toBe(absent.status);
++        // The bodies too, `request_id` excepted. Matching statuses is the easy half
++        // and says nothing on its own — chapter 3.12's oracle exists because of it.
++        const a = withoutRequestId(await refused.json());
++        const b = withoutRequestId(await absent.json());
++        expect(a).toEqual(b);
++      });
++    }
++
++    it("the private channel gained nothing from the refused send", async () => {
++      // Read the state rather than infer it from the refusal. A refusal that wrote
++      // the row anyway is the failure this assertion exists for.
++      const history = await asUser(
++        same.member.token,
++        "GET",
++        `/v1/channels/${same.privateChannelId}/messages?limit=100`,
++      );
++      const body = (await history.json()) as { messages: { text: string | null }[] };
++      expect(body.messages.some((m) => m.text === "not mine")).toBe(false);
++    });
++
++    it("a PUBLIC channel of the same tenant is open to the same non-member (FR-004)", async () => {
++      // The other half of what makes `channels.type` decide something. If both types
++      // refused, the column would still be deciding nothing.
++      const res = await asUser(same.stranger.token, "GET", `/v1/channels/${same.publicChannelId}`);
++      expect(res.status).toBe(200);
++      expect(await res.json()).toMatchObject({ is_member: false });
++    });
++  });
++
++  // ── THE IDENTIFIER COLLISION (chapter 3.15, FR-034a) ───────────────────────
++  //
++  // The same `external_id` in two environments, `public` in one and `private` in the
++  // other. `seedTenant` label-prefixes every id, so the pair it mints can never
++  // collide — and all four attack shapes take an id that does NOT exist in the
++  // attacker's tenant. The case where the same STRING resolves in both had no
++  // fixture at all (analysis pass twelve).
++  describe("the same external id in two tenants, one public and one private", () => {
++    it("resolves to each tenant's own channel and never the other's", async () => {
++      const open = await fetch(`${url}/v1/channels`, {
++        method: "POST",
++        headers: {
++          "content-type": "application/json",
++          authorization: `Bearer ${colliding.open.credential}`,
++        },
++        body: JSON.stringify({ external_id: colliding.sharedExternalId, type: "public" }),
++      });
++      // The idempotent repeat returns the tenant's OWN channel, not the other's.
++      expect(open.status).toBe(200);
++      expect(await open.json()).toMatchObject({ id: colliding.open.channelId });
++
++      const closed = await fetch(`${url}/v1/channels`, {
++        method: "POST",
++        headers: {
++          "content-type": "application/json",
++          authorization: `Bearer ${colliding.closed.credential}`,
++        },
++        body: JSON.stringify({ external_id: colliding.sharedExternalId, type: "private" }),
++      });
++      expect(closed.status).toBe(200);
++      expect(await closed.json()).toMatchObject({ id: colliding.closed.channelId });
++    });
++
++    it("answers the two tenants' users differently, and the TYPE is why", async () => {
++      // The public tenant's non-member reads their channel; the private tenant's
++      // non-member cannot read theirs. Same external id, different answer — and the
++      // difference has to be the type rather than the tenant, which is what the
++      // third assertion pins down.
++      const openRead = await fetch(`${url}/v1/channels/${colliding.open.channelId}`, {
++        headers: { authorization: `Bearer ${colliding.open.token}` },
++      });
++      expect(openRead.status).toBe(200);
++
++      const closedRead = await fetch(`${url}/v1/channels/${colliding.closed.channelId}`, {
++        headers: { authorization: `Bearer ${colliding.closed.token}` },
++      });
++      expect(closedRead.status).toBe(404);
++
++      // And neither can reach the other's row with their own credential, which is
++      // the cross-tenant property holding while the ids are identical.
++      const across = await fetch(`${url}/v1/channels/${colliding.closed.channelId}`, {
++        headers: { authorization: `Bearer ${colliding.open.token}` },
++      });
++      expect(across.status).toBe(404);
++    });
++  });
++
+   describe("internal, end-user token: a token minted in one environment is refused in another", () => {
+     let attackerToken: string;
+ 
+```
+
+Six control tests, and they are the count that matters more than the attack count.
+Chapter 3.12 shipped fourteen passing tests that compared two refusals — and two
+refusals for an unrelated reason are also byte-identical. Three of these prove the
+member's own token works on the same channel before anything asserts that a
+non-member's does not.
+
+The second block is a case **this feature creates**. Two tenants using the same
+`external_id`, one channel public and one private: before this chapter every channel
+was public, so "resolves to your own tenant's channel" and "answers you the same way"
+matched trivially. Now the types differ, and the two answers differ *because the types
+differ, not because the tenants do* — which is the property worth a test. The existing
+fixture made it impossible to write, because it labels every id with its own tenant's
+name and the two tenants never share one.
+
+```diff title="services/api/src/isolation/targets.ts"
+@@ -106,6 +106,22 @@
+   // to it — never the derivation.
+   { method: "POST", path: "/v1/channels", accepts: "application", shape: "write" },
+   { method: "POST", path: "/v1/channels/:channelId/members", accepts: "application", shape: "write" },
++  // Chapter 3.15's two, and the derivation found them the same way it found the
++  // pair above: the lane went red naming both as unclassified on the build that
++  // added them, before this file mentioned either. Written with the ROUTER'S
++  // parameter names — `:channelId`, not the contracts' `:externalId` — because the
++  // derivation compares literal path strings and an entry copied from a contract
++  // matches no target.
++  //
++  // `accepts: "user"` on the join: it is the caller joining, not the tenant adding
++  // somebody, and the route carries a method-level `@Accepts("user")` that overrides
++  // the controller's class-level `"application"`.
++  { method: "GET", path: "/v1/channels/:channelId", accepts: "application", shape: "read" },
++  { method: "POST", path: "/v1/channels/:channelId/join", accepts: "user", shape: "write" },
++  { method: "POST", path: "/v1/channels/:channelId/members/remove", accepts: "application", shape: "write" },
++  { method: "PATCH", path: "/v1/channels/:channelId/members/:userExternalId", accepts: "application", shape: "write" },
++  { method: "POST", path: "/v1/channels/:channelId/archive", accepts: "application", shape: "write" },
++  { method: "DELETE", path: "/v1/channels/:channelId/archive", accepts: "application", shape: "write" },
+   { method: "POST", path: "/v1/webhooks", accepts: "application", shape: "write" },
+   { method: "POST", path: "/v1/webhooks/:id/rotate-secret", accepts: "application", shape: "write" },
+   { method: "POST", path: "/v1/webhooks/:id/enable", accepts: "application", shape: "write" },
+```
+```diff title="services/api/src/isolation/targets.itest.ts"
+@@ -104,4 +104,31 @@
+     );
+     expect(attacked + exempt).toBe(derived.length);
+   });
++
++  // ── SC-014: THE COUNT MOVED BY EXACTLY WHAT THIS FEATURE ADDS ──────────────
++  //
++  // Chapter 3.12 closed at **24** derived targets, recorded in
++  // `specs/033-chapter-3-12/baseline.txt` and re-measured at the start of this
++  // feature (T008). Chapters 3.15 and 3.16 add fourteen routes, so the closing
++  // number is 38.
++  //
++  // A NUMBER RATHER THAN A DELTA, because a delta cannot fail: `after - before`
++  // computed from the same run is an identity. This is the figure a reader can
++  // check against the route table, and the route table lists which fourteen.
++  it("has grown from chapter 3.12's 24 by exactly the routes this feature adds", () => {
++    // The routes built so far. This assertion moves ONE line per phase, which is
++    // the point: a phase that adds a route and forgets to classify it fails the
++    // test above, and a phase that adds a route nobody planned fails this one.
++    const BUILT_SO_FAR = 6;
++    expect(derived.length).toBe(24 + BUILT_SO_FAR);
++  });
++
++  it("leaves nothing exempt by omission (FR-033a)", () => {
++    // Every exempt entry carries a reason — asserted above — and every DERIVED
++    // target matches an entry. What this adds is the direction that catches a route
++    // quietly dropped from the classification list: the entry count and the derived
++    // count are the same number, so a deletion here fails rather than reducing
++    // coverage silently.
++    expect(CLASSIFICATIONS.length).toBe(derived.length);
++  });
+ });
+```
+
+The target list is derived from the running router, so a route that gets built and not
+classified fails the suite on the build that adds it. The count is asserted as a
+**total** and not as a delta: `after − before` computed inside one run is an identity
+and cannot fail.
+
+    gauntlet targets: 30 derived, 27 attacked, 3 exempt
+
+Twenty-four before this feature, six routes added so far, three exemptions unchanged
+and each still carrying a written reason. Nothing this chapter adds is exempt.
+
+## Removing each check to see whether the suite notices
+
+A suite of refusals cannot demonstrate that it is testing anything. So each new check
+came out in turn, with a rebuild and the full gauntlet:
+
+    send check disabled                2 failed | 30 passed
+    by-id read check disabled          2 failed | 30 passed
+    history visibility disabled        1 failed | 31 passed
+
+Each failed its own attack and no other, and **in all three the controls stayed
+green** — that is what separates a working attacker from a broken one.
+
+The collision test failing alongside the by-id read is correct rather than sloppy: it
+asserts the two tenants are answered differently *because the types differ*, so a
+removal that stops the type deciding should take it down.
+
+<Trap>
+
+**Nothing was masked, and the reason is a fix made for another purpose.**
+
+Chapter 3.12 found that `channelExists` runs first and is scoped, so an unscoped read
+beneath it is never reached — a suite is sensitive to the outermost check on a path and
+blind to an inner one a live outer check hides. That is why this chapter's task list
+says to *record* which attacks are masked rather than to reshape them.
+
+None were. The history path's outermost check **is** the visibility check now, because
+`channelVisibleTo` replaced `channelExists` instead of being added below it. One
+predicate produces both refusals, so there is no outer check left to do the masking.
+Added underneath — the obvious way to add a check — that removal would have come back
+green and the suite would have reported success.
+
+</Trap>
+
+```diff title="services/api/src/db/repository.itest.ts"
+@@ -126,3 +126,157 @@
+     expect(rows).toHaveLength(1);
+   });
+ });
++
++// ── A PRIVATE CHANNEL IS PRIVATE (chapter 3.15, FR-001, FR-CHN-05) ────────────
++//
++// `channels.type` has been a `"public" | "private"` column with a CHECK since
++// chapter 2.1, and until this chapter nothing DECIDED on it. It was selected and
++// returned by the create route, so it was read; no conditional anywhere branched
++// on it. Chapter 3.12's fifth analysis pass caught `POST /v1/channels` about to
++// accept `private` while that was still true.
++//
++// THESE CHANNELS ARE CREATED THROUGH THE REPOSITORY, not the API, and the reason
++// is FR-009's ordering: `POST /v1/channels` accepts `private` only once the read
++// paths and the send path enforce it, which is the end of the next phase.
++// `createChannel(externalId, type, …)` has always taken a type.
++//
++// AND THE REFUSAL IS THE NOT-FOUND ERROR, not a 403. SC-002 requires send's
++// answer for a private channel the caller cannot see to be byte-identical to a
++// channel that does not exist, and `ChannelNotFoundError` is what the absent
++// channel throws. A `403 not_a_member` would announce that the channel exists.
++describe("a private channel refuses a non-member's send (FR-001)", () => {
++  it("refuses a user of the tenant who is not a member, as if the channel were absent", async () => {
++    const channel = await repoA.createChannel("private-send", "private");
++    const stranger = await repoA.createUser("stranger", "A Stranger");
++
++    // The same error an absent channel raises, which is the whole property.
++    const absent = "00000000-0000-4000-8000-000000000000";
++    const forAbsent = await repoA
++      .sendMessage(absent, { userId: stranger.id, text: "nowhere" })
++      .catch((error: unknown) => error);
++    const forPrivate = await repoA
++      .sendMessage(channel.id, { userId: stranger.id, text: "not mine" })
++      .catch((error: unknown) => error);
++
++    expect(forPrivate).toBeInstanceOf(Error);
++    expect((forPrivate as Error).constructor).toBe(
++      (forAbsent as Error).constructor,
++    );
++  });
++
++  it("leaves the channel's message count unchanged after the refusal (SC-003)", async () => {
++    // A refusal that still writes a row is not a refusal, and the status code
++    // cannot tell you which one you have — only the rows can.
++    const channel = await repoA.createChannel("private-count", "private");
++    const stranger = await repoA.createUser("count-stranger", "Counter");
++    const before = await repoA.listMessagesRaw(channel.id);
++
++    await expect(
++      repoA.sendMessage(channel.id, { userId: stranger.id, text: "should not land" }),
++    ).rejects.toThrow();
++
++    const after = await repoA.listMessagesRaw(channel.id);
++    expect(after).toHaveLength(before.length);
++  });
++
++  it("accepts a member's send to the same channel", async () => {
++    // The control. Two refusals for unrelated reasons are also indistinguishable,
++    // which is what chapter 3.12's fourteen passing tests turned out to be
++    // measuring — so the attacker has to be shown working before its failure
++    // means anything.
++    const channel = await repoA.createChannel("private-member", "private");
++    const member = await repoA.createUser("member", "A Member");
++    expect(await repoA.addMember(channel.id, member.id)).toBe("added");
++
++    const sent = await repoA.sendMessage(channel.id, {
++      userId: member.id,
++      text: "mine to send",
++    });
++    expect(sent.seq).toBe(1);
++  });
++
++  it("accepts an application credential with no user (FR-005)", async () => {
++    // `userId` absent means the TENANT is sending: it acts for the customer,
++    // carries no user, and is the customer's own server. FR-005 asked for this to
++    // be stated rather than assumed, and the assumption is that a private channel
++    // is not private FROM ITS OWNER.
++    const channel = await repoA.createChannel("private-app", "private");
++    const sent = await repoA.sendMessage(channel.id, { text: "from the tenant" });
++    expect(sent.seq).toBe(1);
++  });
++
++  it("does not check membership on a public channel", async () => {
++    // FR-004's answer for the other type: any authenticated user of the tenant may
++    // send to a public channel without being a member. The column becomes live
++    // only because the two types differ — require membership for both and
++    // `channels.type` still decides nothing.
++    const channel = await repoA.createChannel("public-send", "public");
++    const outsider = await repoA.createUser("public-outsider", "Outsider");
++    const sent = await repoA.sendMessage(channel.id, {
++      userId: outsider.id,
++      text: "public is open",
++    });
++    expect(sent.seq).toBe(1);
++  });
++});
++
++// ── THE ROLE CHECK IS IN THE DATABASE, NOT ONLY AT THE EDGE ───────────────────
++//
++// Chapter 3.15, T068. `channels.itest.ts` proves the zod enum refuses `admin` at
++// the boundary. That is the wrong layer to trust: R8's trap is a CONSTRAINT that
++// reused the organisation's vocabulary — `memberships.role` is
++// `('owner','admin','member')`, one word apart from FR-CHN-04's three — and such a
++// constraint would accept `admin`, refuse `moderator`, and read as correct in
++// review.
++//
++// So this drives the repository, past the schema, and asserts the database says no.
++describe("members_role_check names the channel's three (FR-011, R8)", () => {
++  it("refuses `admin` — the organisation's word — at the database", async () => {
++    const channel = await repoA.createChannel("role-check", "public");
++    const user = await repoA.createUser("role-check-user");
++    expect(await repoA.addMember(channel.id, user.id)).toBe("added");
++
++    // The constraint name is in the CAUSE, not the message: drizzle's top-level
++    // text is "Failed query: update …" and the driver's error underneath it carries
++    // `constraint`. Asserting on the wrapper's message would have passed for any
++    // failed update at all — including one that failed for the wrong reason.
++    const error = await repoA
++      .setMemberRole(channel.id, user.id, "admin")
++      .then(() => null)
++      .catch((e: unknown) => e);
++    expect(error).toBeInstanceOf(Error);
++    const chain = JSON.stringify({
++      message: (error as Error).message,
++      cause: String((error as { cause?: unknown }).cause ?? ""),
++      constraint: ((error as { cause?: { constraint?: string } }).cause ?? {})
++        .constraint,
++    });
++    expect(chain).toContain("members_role_check");
++  });
++
++  it("accepts `moderator`, which the organisation's constraint would refuse", async () => {
++    // The other half of the same trap, and the one that makes the test above mean
++    // something: a constraint that refused BOTH words would pass the assertion
++    // above while being just as wrong.
++    const channel = await repoA.createChannel("role-check-ok", "public");
++    const user = await repoA.createUser("role-check-ok-user");
++    await repoA.addMember(channel.id, user.id);
++
++    expect(await repoA.setMemberRole(channel.id, user.id, "moderator")).toBe("set");
++    expect(await repoA.memberRole(channel.id, user.id)).toBe("moderator");
++  });
++
++  it("gives a member created without a role the column's default", async () => {
++    const channel = await repoA.createChannel("role-default", "public");
++    const user = await repoA.createUser("role-default-user");
++    await repoA.addMember(channel.id, user.id);
++    expect(await repoA.memberRole(channel.id, user.id)).toBe("member");
++  });
++
++  it("gives a member created WITH a role that role (FR-011b)", async () => {
++    const channel = await repoA.createChannel("role-at-insert", "public");
++    const user = await repoA.createUser("role-at-insert-user");
++    await repoA.addMember(channel.id, user.id, "owner");
++    expect(await repoA.memberRole(channel.id, user.id)).toBe("owner");
++  });
++});
+```
+```diff title="services/api/src/messages/messages.itest.ts"
+@@ -5,6 +5,8 @@
+ import { afterAll, beforeAll, describe, expect, it } from "vitest";
+ 
+ import { AppModule } from "../app.module";
++import { mintUserToken } from "../auth/user-token";
++import { environmentSigningSecret } from "../db/repository";
+ import { createDb, createPool } from "../db/client";
+ import { createApiKey, createEnvironment, Repository } from "../db/repository";
+ // The comparison this suite invented, now shared. Chapter 3.12 moved it into
+@@ -28,6 +30,14 @@
+   let credential: string;
+   let channelId: string;
+   let foreignChannelId: string;
++  let privateChannelId: string;
++  let tokenFor: (user: string) => Promise<string>;
++  /** Suite-scoped so a test can build its OWN fixture rather than lean on shared
++   * state an earlier test may have changed. T072b's first draft used
++   * `privateChannelId` and failed on its control: T057 above removes `insider` from
++   * that channel, so by then the "member" was not one. A test that depends on the
++   * order it runs in is a test that will fail for a reason it does not name. */
++  let repo: Repository;
+ 
+   beforeAll(async () => {
+     const db = createDb(createPool());
+@@ -40,6 +50,26 @@
+     foreignChannelId = (
+       await new Repository(db, other.id).createChannel("theirs", "public")
+     ).id;
++
++    // Chapter 3.15's fixtures: a private channel, one member, one stranger of the
++    // SAME tenant, and a way to mint their tokens. The private channel is created
++    // through the repository because `POST /v1/channels` does not accept `private`
++    // until the read paths enforce it (FR-009's ordering).
++    repo = new Repository(db, env.id);
++    privateChannelId = (await repo.createChannel("members-only", "private")).id;
++    const member = await repo.createUser("insider", "An Insider");
++    await repo.addMember(privateChannelId, member.id);
++    await repo.createUser("outsider", "An Outsider");
++    const signingSecret = (await environmentSigningSecret(db, env.id))!
++      .signingSecret;
++    tokenFor = async (subject: string) =>
++      (
++        await mintUserToken(signingSecret, {
++          user: subject,
++          environmentId: env.id,
++          ttlSeconds: 3600,
++        })
++      ).token;
+     app = (
+       await Test.createTestingModule({ imports: [AppModule] }).compile()
+     ).createNestApplication({ logger: false });
+@@ -108,4 +138,186 @@
+       withoutRequestId(await missing.json()),
+     );
+   });
++
++  // ── THE ROUTE A CUSTOMER'S CLIENT ACTUALLY CALLS (chapter 3.15, FR-001) ───────
++  //
++  // The membership check lives in `repository.sendMessage` and is gated on `userId`
++  // being present. `repository.itest.ts` proves the check EXISTS by driving that
++  // function directly with a user id. Only these tests prove it FIRES, because for
++  // twenty-three chapters this controller called `messages.send(channelId, body)`
++  // with no user at all — and `MessagesController` declares no `@Accepts`, so the
++  // guard falls back to `EITHER` and a user token is accepted here.
++  //
++  // So the repository test passed while the route it protects was open. A repository
++  // test proves a check exists; only a route test proves it fires.
++  describe("a private channel over the public route (FR-001, SC-002)", () => {
++    const sendAs = async (token: string, channel: string, text = "hello") =>
++      fetch(`${url}/v1/channels/${channel}/messages`, {
++        method: "POST",
++        headers: {
++          "content-type": "application/json",
++          authorization: `Bearer ${token}`,
++        },
++        body: JSON.stringify({ text }),
++      });
++
++    it("refuses a non-member's send with the not-found envelope, body and all", async () => {
++      const token = await tokenFor("outsider");
++      const refused = await sendAs(token, privateChannelId);
++      const absent = await sendAs(token, "00000000-0000-4000-8000-000000000000");
++
++      expect(refused.status).toBe(absent.status);
++      // Byte-identical but for `request_id`, which is SC-002's actual requirement —
++      // matching status codes is the easy half and says nothing on its own.
++      // Deleting rather than destructuring: an unused binding is a lint error and
++      // the intent is a removal either way. `request_id` is the one field that
++      // differs by construction — it names the request, not the resource — which is
++      // why chapter 3.12's oracle drops exactly this one and nothing else.
++      const strip = (b: Record<string, unknown>) => {
++        delete b.request_id;
++        return b;
++      };
++      expect(strip((await refused.json()) as Record<string, unknown>)).toEqual(
++        strip((await absent.json()) as Record<string, unknown>),
++      );
++    });
++
++    it("accepts a member's send to the same channel", async () => {
++      // The control, and it is not optional. Two refusals for unrelated reasons are
++      // also indistinguishable — a token the guard rejects outright would pass the
++      // test above while proving nothing about membership.
++      const token = await tokenFor("insider");
++      const accepted = await sendAs(token, privateChannelId, "mine to send");
++      expect(accepted.status).toBe(201);
++    });
++
++    it("accepts an application key's send to the same private channel (FR-005)", async () => {
++      const accepted = await send({ text: "from the tenant" }, privateChannelId);
++      expect(accepted.status).toBe(201);
++    });
++
++    it("answers a non-member's history read exactly as an absent channel does", async () => {
++    // T041b. The history route dropped its caller the same way the send route did,
++    // and `listMessages` had no `userId` parameter to drop it INTO — so the task
++    // that said "add the same check to the history path" was asking for a check
++    // with nothing to check against. Three places, and a gap in any one makes a
++    // check unreachable: the handler resolves, the service threads, the repository
++    // accepts.
++    //
++    // AND THE FIRST ATTEMPT AT THIS TEST WAS WRONG IN AN INSTRUCTIVE WAY. It
++    // expected an empty page, because `listMessages` answers an unknown channel id
++    // with `[]` at the repository level. The ROUTE answers 404 — `messages.service`
++    // checks `channelExists` first — so an empty page for a private channel would
++    // have differed from an absent one and announced that the channel was there.
++    // Only comparing the two answers caught it, which is the whole point of pairing
++    // them rather than asserting a status.
++    const outsider = await tokenFor("outsider");
++    const insider = await tokenFor("insider");
++    await sendAs(insider, privateChannelId, "members can read this");
++
++    const hidden = await fetch(
++      `${url}/v1/channels/${privateChannelId}/messages?limit=10`,
++      { headers: { authorization: `Bearer ${outsider}` } },
++    );
++    const absent = await fetch(
++      `${url}/v1/channels/00000000-0000-4000-8000-000000000000/messages?limit=10`,
++      { headers: { authorization: `Bearer ${outsider}` } },
++    );
++    expect(hidden.status).toBe(absent.status);
++    // The whole body, `request_id` excepted — a private channel the caller cannot
++    // see and a channel that does not exist give one answer.
++    expect(withoutRequestId(await hidden.json())).toEqual(
++      withoutRequestId(await absent.json()),
++    );
++  });
++
++  it("returns the page to a member of the same channel", async () => {
++    // The control: the page exists and the reader is the variable.
++    const insider = await tokenFor("insider");
++    const res = await fetch(
++      `${url}/v1/channels/${privateChannelId}/messages?limit=10`,
++      { headers: { authorization: `Bearer ${insider}` } },
++    );
++    const body = (await res.json()) as { messages: unknown[] };
++    expect(body.messages.length).toBeGreaterThan(0);
++  });
++
++  it("returns the page to an application credential (FR-005)", async () => {
++    const res = await fetch(
++      `${url}/v1/channels/${privateChannelId}/messages?limit=10`,
++      { headers: { authorization: `Bearer ${credential}` } },
++    );
++    const body = (await res.json()) as { messages: unknown[] };
++    expect(body.messages.length).toBeGreaterThan(0);
++  });
++
++  it("refuses a removed member's send, and their messages stay (SC-004, SC-005)", async () => {
++    // T057. This is phase 3's check reading a row that is now gone — no new code
++    // path, which is the point: removal takes the membership away and the check
++    // that was already there does the rest.
++    const token = await tokenFor("insider");
++    const sent = await sendAs(token, privateChannelId, "written while a member");
++    expect(sent.status).toBe(201);
++
++    await fetch(`${url}/v1/channels/${privateChannelId}/members/remove`, {
++      method: "POST",
++      headers: { "content-type": "application/json", authorization: `Bearer ${credential}` },
++      body: JSON.stringify({ user_ids: ["insider"] }),
++    });
++
++    const refused = await sendAs(token, privateChannelId, "after removal");
++    const absent = await sendAs(token, "00000000-0000-4000-8000-000000000000");
++    expect(refused.status).toBe(absent.status);
++
++    // And what they wrote is still there, read with the tenant's key.
++    const history = await fetch(
++      `${url}/v1/channels/${privateChannelId}/messages?limit=100`,
++      { headers: { authorization: `Bearer ${credential}` } },
++    );
++    const body = (await history.json()) as { messages: { user: string | null }[] };
++    expect(body.messages.some((m) => m.user === "insider")).toBe(true);
++  });
++
++  it("an archived PRIVATE channel answers a non-member as an absent one does", async () => {
++    // T072b, and the point of FR-021a's order. Reverse the last two checks — archive
++    // before membership — and this test goes red: the non-member would get
++    // `channel_archived` and learn the channel exists. Asserted with the oracle
++    // rather than by reading the code, because the order is only observable from
++    // outside as a pair of answers.
++    // Its own channel and its own member, for the reason `repo` is suite-scoped.
++    const channel = (await repo.createChannel("archived-private", "private")).id;
++    const member = await repo.getUserByExternalId("insider");
++    await repo.addMember(channel, member!.id);
++    await fetch(`${url}/v1/channels/${channel}/archive`, {
++      method: "POST",
++      headers: { authorization: `Bearer ${credential}` },
++    });
++
++    const outsider = await tokenFor("outsider");
++    const refused = await sendAs(outsider, channel);
++    const absent = await sendAs(outsider, "00000000-0000-4000-8000-000000000000");
++    expect(refused.status).toBe(absent.status);
++    expect(withoutRequestId(await refused.json())).toEqual(
++      withoutRequestId(await absent.json()),
++    );
++
++    // The control that makes it mean something: a MEMBER of the same archived
++    // channel gets `channel_archived`, so the archive check is live and it is the
++    // ORDER that hides it from the non-member.
++    const insider = await tokenFor("insider");
++    const asMember = await sendAs(insider, channel);
++    expect(asMember.status).toBe(403);
++    expect(((await asMember.json()) as { code: string }).code).toBe("channel_archived");
++  });
++
++  it("refuses a token minted for an identifier with no user row", async () => {
++      // `POST /auth/dev-token` mints tokens for identifiers that need not exist, so
++      // before chapter 3.15 this send SUCCEEDED, unattributed — and an unattributed
++      // send is one the membership check waves through. A user with no row is a
++      // member of nothing. FR-039a removes the case by creating the row at mint time.
++      const token = await tokenFor("never-seen-before");
++      const refused = await sendAs(token, privateChannelId);
++      expect(refused.status).toBe(400);
++    });
++  });
+ });
+```
+```diff title="services/api/src/channels/channels.itest.ts"
+@@ -5,8 +5,10 @@
+ import { afterAll, beforeAll, describe, expect, it } from "vitest";
+ 
+ import { AppModule } from "../app.module";
++import { mintUserToken } from "../auth/user-token";
+ import { createDb, createPool, type Db } from "../db/client";
+ import { createApiKey, createEnvironment, Repository } from "../db/repository";
++import { environmentSigningSecret } from "../db/repository";
+ import { withoutRequestId } from "../isolation/compare";
+ import { CHANNEL_MEMBER_LIMIT } from "./channels.schema";
+ 
+@@ -25,6 +27,9 @@
+   let repo: Repository;
+   let foreignChannelId: string;
+   let foreignRepo: Repository;
++  let privateChannelId: string;
++  let publicChannelId: string;
++  let tokenFor: (user: string) => Promise<string>;
+ 
+   beforeAll(async () => {
+     db = createDb(createPool());
+@@ -34,6 +39,23 @@
+     const other = await createEnvironment(db, { name: "channels-itest-other" });
+     foreignRepo = new Repository(db, other.id);
+     foreignChannelId = (await foreignRepo.createChannel("theirs", "public")).id;
++    // Chapter 3.15: a private channel, a member, a non-member of the SAME tenant,
++    // and a way to mint their tokens. Created through the repository because
++    // `POST /v1/channels` accepts `private` only from this phase's last task.
++    privateChannelId = (await repo.createChannel("members-only", "private")).id;
++    const member = await repo.createUser("insider", "An Insider");
++    await repo.addMember(privateChannelId, member.id);
++    await repo.createUser("outsider", "An Outsider");
++    publicChannelId = (await repo.createChannel("town-square", "public")).id;
++    const signingSecret = (await environmentSigningSecret(db, env.id))!.signingSecret;
++    tokenFor = async (subject: string) =>
++      (
++        await mintUserToken(signingSecret, {
++          user: subject,
++          environmentId: env.id,
++          ttlSeconds: 3600,
++        })
++      ).token;
+     app = (
+       await Test.createTestingModule({ imports: [AppModule] }).compile()
+     ).createNestApplication({ logger: false });
+@@ -82,16 +104,22 @@
+       expect(await second.json()).toEqual(await first.json());
+     });
+ 
+-    it("refuses type private, naming the field (FR-047)", async () => {
+-      const res = await create({ external_id: "private-attempt", type: "private" });
++    // CHAPTER 3.12 ASSERTED THE OPPOSITE HERE, and it was right at the time.
++    //
++    // FR-047 pinned the enum to `public` alone because `channels.type` decided
++    // nothing: an endpoint accepting `private` would have sold a guarantee the
++    // platform did not keep. FR-009 supersedes it now that the send path, the by-id
++    // read, history and the session all honour the type — the guarantee exists, so
++    // the enum may offer it.
++    //
++    // The `field` half of that test survives intact and is worth keeping: EIR-API-04
++    // has carried `field` since chapter 1.3 and nothing set it until chapter 3.14.
++    // A third type still names the key it refused.
++    it("refuses a type outside the two, naming the field (FR-009)", async () => {
++      const res = await create({ external_id: "secret-attempt", type: "secret" });
+       expect(res.status).toBe(400);
+       const body = (await res.json()) as { code: string; message: string; field?: string };
+       expect(body.code).toBe("invalid_request");
+-      // THE FIELD IS NAMED, and until this chapter no validation error in the api
+-      // named one — EIR-API-04 has carried `field` since chapter 1.3 and nothing
+-      // ever set it. A developer who tries `private` is told which key was
+-      // refused instead of reading `Invalid input: expected "public"` and
+-      // guessing.
+       expect(body.field).toBe("type");
+     });
+ 
+@@ -198,6 +226,25 @@
+       }
+     }, 180_000);
+ 
++    it("refuses a JOIN that would exceed it, with the same code (chapter 3.15)", async () => {
++      // T047. The ceiling is chapter 3.13's and it is READ here, not reimplemented:
++      // `join` counts members from storage and refuses with the same
++      // `channel_member_limit_exceeded` the member-add route uses. A second limit
++      // with its own number would be a second answer to one question.
++      expect(await repo.countMembers(fullChannelId)).toBe(CHANNEL_MEMBER_LIMIT);
++      const token = await tokenFor("outsider");
++      const res = await fetch(`${url}/v1/channels/${fullChannelId}/join`, {
++        method: "POST",
++        headers: { authorization: `Bearer ${token}` },
++      });
++      expect(res.status).toBe(422);
++      const body = (await res.json()) as { code: string; message: string };
++      expect(body.code).toBe("channel_member_limit_exceeded");
++      // And nobody joined: a refusal that added the member anyway would pass a
++      // status assertion and fail the requirement.
++      expect(await repo.countMembers(fullChannelId)).toBe(CHANNEL_MEMBER_LIMIT);
++    });
++
+     it("refuses the one that would exceed it with 422 and the code", async () => {
+       expect(await repo.countMembers(fullChannelId)).toBe(CHANNEL_MEMBER_LIMIT);
+       const res = await addMembers(fullChannelId, { user_ids: ["one-too-many"] });
+@@ -210,4 +257,461 @@
+       expect(await repo.countMembers(fullChannelId)).toBe(CHANNEL_MEMBER_LIMIT);
+     });
+   });
++
++  // ── THE PRIVATE TYPE, MADE TO MEAN SOMETHING (chapter 3.15) ────────────────
++  //
++  // `channels.type` has been a column with a CHECK since chapter 2.1 and until this
++  // chapter no conditional anywhere branched on it. It was selected and returned by
++  // the create route — read, and decided upon by nothing.
++  describe("GET /v1/channels/:channelId (FR-003a)", () => {
++    const readAs = (channel: string, token: string) =>
++      fetch(`${url}/v1/channels/${channel}`, {
++        headers: { authorization: `Bearer ${token}` },
++      });
++    const readAsTenant = (channel: string) =>
++      fetch(`${url}/v1/channels/${channel}`, {
++        headers: { authorization: `Bearer ${credential}` },
++      });
++
++    it("reads back the four fields a create wrote (FR-CHN-01)", async () => {
++      const made = await create({
++        external_id: "readable",
++        name: "Readable",
++        type: "public",
++        metadata: { team: "platform" },
++      });
++      const { id } = (await made.json()) as { id: string };
++      const res = await readAsTenant(id);
++      expect(res.status).toBe(200);
++      expect(await res.json()).toMatchObject({
++        id,
++        external_id: "readable",
++        type: "public",
++        name: "Readable",
++        metadata: { team: "platform" },
++        archived_at: null,
++        // `null` and not `false`: an application credential is not a member of
++        // anything, and `false` would imply it could become one.
++        is_member: null,
++      });
++    });
++
++    it("lets a member read a private channel", async () => {
++      const res = await readAs(privateChannelId, await tokenFor("insider"));
++      expect(res.status).toBe(200);
++      expect(await res.json()).toMatchObject({ type: "private", is_member: true });
++    });
++
++    it("lets a non-member read a PUBLIC channel (FR-004)", async () => {
++      // The subscription set is not the read set. A public channel is readable on
++      // demand by anyone in the tenant; membership decides what the socket carries.
++      const res = await readAs(publicChannelId, await tokenFor("outsider"));
++      expect(res.status).toBe(200);
++      expect(await res.json()).toMatchObject({ type: "public", is_member: false });
++    });
++
++    it("answers a non-member's read of a private channel as if it were absent", async () => {
++      const token = await tokenFor("outsider");
++      const refused = await readAs(privateChannelId, token);
++      const absent = await readAs("00000000-0000-4000-8000-000000000000", token);
++      expect(refused.status).toBe(absent.status);
++      expect(withoutRequestId(await refused.json())).toEqual(
++        withoutRequestId(await absent.json()),
++      );
++    });
++
++    it("answers the same for another tenant's channel", async () => {
++      // The cross-tenant half, unchanged by this chapter and worth keeping beside
++      // the same-tenant one: three ids, one answer.
++      const token = await tokenFor("outsider");
++      const foreign = await readAs(foreignChannelId, token);
++      const absent = await readAs("00000000-0000-4000-8000-000000000000", token);
++      expect(withoutRequestId(await foreign.json())).toEqual(
++        withoutRequestId(await absent.json()),
++      );
++    });
++  });
++
++  describe("POST /v1/channels/:channelId/join (FR-CHN-03)", () => {
++    const join = (channel: string, token: string) =>
++      fetch(`${url}/v1/channels/${channel}/join`, {
++        method: "POST",
++        headers: { authorization: `Bearer ${token}` },
++      });
++
++    it("joins a public channel, and says so again on the repeat", async () => {
++      const token = await tokenFor("outsider");
++      const first = await join(publicChannelId, token);
++      expect(first.status).toBe(200);
++      expect(await first.json()).toEqual({ result: "joined" });
++      const second = await join(publicChannelId, token);
++      expect(second.status).toBe(200);
++      expect(await second.json()).toEqual({ result: "already_a_member" });
++    });
++
++    it("answers a private channel as if it were absent", async () => {
++      const token = await tokenFor("outsider");
++      const refused = await join(privateChannelId, token);
++      const absent = await join("00000000-0000-4000-8000-000000000000", token);
++      expect(refused.status).toBe(absent.status);
++      expect(withoutRequestId(await refused.json())).toEqual(
++        withoutRequestId(await absent.json()),
++      );
++    });
++
++    it("refuses an application credential, which has no user to join", async () => {
++      // The method-level `@Accepts("user")` overriding the class's "application".
++      // Without it this would be a 403 for every USER instead — chapter 3.12's
++      // FR-044 hole in the other direction.
++      const res = await join(publicChannelId, credential);
++      expect(res.status).toBe(403);
++    });
++  });
++
++  describe("the enum widens last (FR-009, FR-010)", () => {
++    it("accepts `private` and reads the row back as private (SC-006)", async () => {
++      const made = await create({ external_id: "now-private", type: "private" });
++      expect(made.status).toBe(201);
++      const { id } = (await made.json()) as { id: string };
++      const back = await fetch(`${url}/v1/channels/${id}`, {
++        headers: { authorization: `Bearer ${credential}` },
++      });
++      expect(await back.json()).toMatchObject({ type: "private" });
++    });
++
++    it("a repeat naming a different type returns the existing channel unchanged", async () => {
++      // FR-010. Idempotency means the second call returns the FIRST call's channel,
++      // and a type change is not a creation — so this is a read, not an update.
++      const first = await create({ external_id: "type-stays", type: "private" });
++      expect(first.status).toBe(201);
++      const second = await create({ external_id: "type-stays", type: "public" });
++      expect(second.status).toBe(200);
++      expect(await second.json()).toMatchObject({ type: "private" });
++    });
++  });
++
++  // ── REMOVAL, BULK, BECAUSE THE REQUIREMENT ALWAYS WAS (chapter 3.15) ────────
++  //
++  // FR-006 says "up to 100 in one request" and FR-007 says the result is reported
++  // per user — chapter 3.13's add shape in both halves. The contract specified a
++  // single-user `DELETE` for ten analysis passes, having read "the shape chapter
++  // 3.13 chose" as *named outcomes* and dropped *bulk*. Every pass compared
++  // requirements to tasks, both said "removal", and identifier coverage read 100%.
++  // Comparing US2's scenario 4 — which names a hundred users — to the route's path,
++  // which named one, is what found it.
++  describe("POST /v1/channels/:channelId/members/remove (FR-006, FR-007)", () => {
++    let target: string;
++
++    const remove = (channel: string, users: string[], key = credential) =>
++      fetch(`${url}/v1/channels/${channel}/members/remove`, {
++        method: "POST",
++        headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
++        body: JSON.stringify({ user_ids: users }),
++      });
++
++    beforeAll(async () => {
++      target = (await repo.createChannel("removals", "public")).id;
++      await addMembers(target, { user_ids: ["stays", "goes", "also-goes"] });
++    });
++
++    it("reports one result per user, in request order, mixing outcomes", async () => {
++      const res = await remove(target, ["goes", "never-a-member", "also-goes"]);
++      expect(res.status).toBe(200);
++      expect(await res.json()).toEqual({
++        results: [
++          { external_id: "goes", result: "removed" },
++          // A user that does not exist is NOT a member — simply true — and answering
++          // anything else would make this a membership oracle for user ids.
++          { external_id: "never-a-member", result: "not_a_member" },
++          { external_id: "also-goes", result: "removed" },
++        ],
++      });
++      // One bad entry did not refuse the other two.
++      expect(await repo.countMembers(target)).toBe(1);
++    });
++
++    it("is idempotent: removing a non-member says so rather than failing", async () => {
++      const res = await remove(target, ["goes"]);
++      expect(res.status).toBe(200);
++      expect(await res.json()).toEqual({
++        results: [{ external_id: "goes", result: "not_a_member" }],
++      });
++    });
++
++    it("takes 100 in one request and refuses 101, naming the field", async () => {
++      const hundred = Array.from({ length: 100 }, (_, i) => `bulk-${i}`);
++      const ok = await remove(target, hundred);
++      expect(ok.status).toBe(200);
++      expect(((await ok.json()) as { results: unknown[] }).results).toHaveLength(100);
++
++      const tooMany = await remove(target, [...hundred, "one-too-many"]);
++      expect(tooMany.status).toBe(400);
++      const body = (await tooMany.json()) as { code: string; field?: string };
++      expect(body.code).toBe("invalid_request");
++      expect(body.field).toBe("user_ids");
++    });
++
++    it("answers a channel that does not exist as it answers a foreign one", async () => {
++      const absent = await remove("00000000-0000-4000-8000-000000000000", ["goes"]);
++      const foreign = await remove(foreignChannelId, ["goes"]);
++      expect(absent.status).toBe(foreign.status);
++      expect(withoutRequestId(await absent.json())).toEqual(
++        withoutRequestId(await foreign.json()),
++      );
++    });
++
++    // THE READ POSITION GOES WITH THE MEMBERSHIP, and that assertion lives in
++    // phase 12 rather than here — deliberately, twice over.
++    //
++    // Writing it here needed a read position to exist, and `setReadPosition` does
++    // not until phase 12. The first attempt planted one with raw SQL and the lint
++    // rule refused it: "the query engine lives inside the repository layer only
++    // (constitution I, ADR-16)". That rule is right and the test was wrong — a suite
++    // that reaches past the repository to set up state is testing something other
++    // than what the platform does.
++    //
++    // So `removeMembers` deletes the row (see the repository), and phase 12 asserts
++    // the consequence a customer can see: a re-added member's unread count starts at
++    // the channel's whole history. A test placed before the thing it tests is the
++    // fourth instance of that class in this feature.
++    it("keeps the removed member's messages, attributed to them (FR-008, SC-005)", async () => {
++      const author = await repo.createUser("author", "An Author");
++      await repo.addMember(target, author.id);
++      const sent = await repo.sendMessage(target, {
++        userId: author.id,
++        userExternalId: "author",
++        text: "written while a member",
++      });
++
++      await remove(target, ["author"]);
++
++      const history = await repo.listMessages(target, { limit: 100 });
++      const kept = history.find((m) => m.seq === sent.seq);
++      expect(kept).toBeDefined();
++      // Still theirs. `messages.user_id` points at a row that still exists, which is
++      // the whole reason deletion keeps the user row rather than nulling the author.
++      expect(kept?.user).toBe("author");
++    });
++
++    it("does not stop a removed member reading or sending to a PUBLIC channel", async () => {
++      // T060, and it is the case that makes FR-004's table load-bearing rather than
++      // decorative: membership was never what permitted this. A removal from a
++      // public channel takes away the subscription and nothing else.
++      const token = await tokenFor("outsider");
++      await addMembers(publicChannelId, { user_ids: ["outsider"] });
++      await remove(publicChannelId, ["outsider"]);
++
++      const read = await fetch(`${url}/v1/channels/${publicChannelId}`, {
++        headers: { authorization: `Bearer ${token}` },
++      });
++      expect(read.status).toBe(200);
++      expect(await read.json()).toMatchObject({ is_member: false });
++
++      const sent = await fetch(`${url}/v1/channels/${publicChannelId}/messages`, {
++        method: "POST",
++        headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
++        body: JSON.stringify({ text: "still open to me" }),
++      });
++      expect(sent.status).toBe(201);
++    });
++  });
++
++  // ── MEMBER ROLES (chapter 3.15, FR-CHN-04, FR-011) ─────────────────────────
++  //
++  // The clause has asked for these since the SRS was written, and `members` was
++  // `(channel_id, user_id, joined_at)` the whole time. Chapter 3.12's traceability
++  // map recorded it as delivered and described it with a paraphrase belonging to
++  // FR-CHN-06; that was corrected while this chapter was specified.
++  describe("roles on members", () => {
++    let roleChannel: string;
++
++    const patchRole = (channel: string, user: string, role: unknown) =>
++      fetch(`${url}/v1/channels/${channel}/members/${user}`, {
++        method: "PATCH",
++        headers: { "content-type": "application/json", authorization: `Bearer ${credential}` },
++        body: JSON.stringify({ role }),
++      });
++
++    beforeAll(async () => {
++      roleChannel = (await repo.createChannel("roles", "public")).id;
++    });
++
++    it("defaults a new member to `member`, read through the API", async () => {
++      // T067. The default is declared in the migration; this exercises it rather
++      // than reading it out of the DDL — a comment about a default is not a default.
++      const res = await addMembers(roleChannel, { user_ids: ["plain"] });
++      expect(res.status).toBe(200);
++      const body = (await res.json()) as { members: { external_id: string; role: string }[] };
++      expect(body.members[0]).toMatchObject({ external_id: "plain", role: "member" });
++    });
++
++    it("accepts a role on the add body, per entry (FR-011b)", async () => {
++      // US6's first scenario: a member ADDED WITH a role. The plan had add assign the
++      // default and `PATCH` change it — two calls for one intention, and a window
++      // where the member holds a role nobody chose. Analysis pass eleven found that
++      // by comparing the scenario to the routes.
++      //
++      // Mixed forms in one request, because the entry is a union: chapter 3.13
++      // shipped `{"user_ids": ["a", "b"]}` and a customer's server sends that today.
++      const res = await addMembers(roleChannel, {
++        user_ids: ["bare-string", { user: "with-role", role: "owner" }],
++      });
++      expect(res.status).toBe(200);
++      const body = (await res.json()) as { members: { external_id: string; role: string }[] };
++      expect(body.members).toEqual([
++        expect.objectContaining({ external_id: "bare-string", role: "member" }),
++        expect.objectContaining({ external_id: "with-role", role: "owner" }),
++      ]);
++    });
++
++    it("round-trips all three roles through PATCH (FR-011)", async () => {
++      await addMembers(roleChannel, { user_ids: ["promotable"] });
++      for (const role of ["owner", "moderator", "member"]) {
++        const res = await patchRole(roleChannel, "promotable", role);
++        expect(res.status).toBe(200);
++        expect(await res.json()).toEqual({ external_id: "promotable", role });
++      }
++    });
++
++    it("refuses a fourth role, naming the field (FR-011a, SC-009)", async () => {
++      await addMembers(roleChannel, { user_ids: ["hopeful"] });
++      const res = await patchRole(roleChannel, "hopeful", "superuser");
++      expect(res.status).toBe(400);
++      const body = (await res.json()) as { code: string; field?: string };
++      expect(body.code).toBe("invalid_request");
++      // The field name is in the envelope only because chapter 3.14 stopped
++      // `ZodValidationPipe` discarding `issues[0].path`.
++      expect(body.field).toBe("role");
++    });
++
++    it("refuses `admin` — the organisation's word, not a channel's", async () => {
++      // R8's trap from the edge: `memberships.role` is
++      // `('owner','admin','member')`, one word apart from these three. A migration
++      // that reused that constraint would take `admin` and refuse `moderator`.
++      await addMembers(roleChannel, { user_ids: ["would-be-admin"] });
++      const res = await patchRole(roleChannel, "would-be-admin", "admin");
++      expect(res.status).toBe(400);
++      expect(((await res.json()) as { field?: string }).field).toBe("role");
++    });
++
++    it("answers a non-member, an unknown user and an absent channel alike", async () => {
++      // Three cases, one answer. A caller who can tell them apart has a probe for
++      // which users this tenant knows and which channels exist.
++      const notAMember = await patchRole(roleChannel, "outsider", "owner");
++      const noSuchUser = await patchRole(roleChannel, "never-heard-of", "owner");
++      const noSuchChannel = await patchRole(
++        "00000000-0000-4000-8000-000000000000",
++        "plain",
++        "owner",
++      );
++      expect(notAMember.status).toBe(404);
++      expect(noSuchUser.status).toBe(404);
++      expect(noSuchChannel.status).toBe(404);
++      // Each body read ONCE and held: a `Response` is a stream, and reading it
++      // twice throws "Body has already been read" — which is what the first draft
++      // of this test did.
++      const a = withoutRequestId(await notAMember.json());
++      const b = withoutRequestId(await noSuchUser.json());
++      const c = withoutRequestId(await noSuchChannel.json());
++      expect(a).toEqual(b);
++      expect(a).toEqual(c);
++    });
++  });
++
++  // ── ARCHIVING (chapter 3.15, FR-020, FR-021, FR-021a) ──────────────────────
++  //
++  // `channels.archived_at` was declared in chapter 2.1 and had ZERO non-test
++  // references until this chapter — measured, not assumed (T007). Archiving stops
++  // new messages and keeps everything already written.
++  describe("archiving a channel", () => {
++    let archived: string;
++
++    const archive = (channel: string) =>
++      fetch(`${url}/v1/channels/${channel}/archive`, {
++        method: "POST",
++        headers: { authorization: `Bearer ${credential}` },
++      });
++    const unarchive = (channel: string) =>
++      fetch(`${url}/v1/channels/${channel}/archive`, {
++        method: "DELETE",
++        headers: { authorization: `Bearer ${credential}` },
++      });
++    const sendTo = (channel: string) =>
++      fetch(`${url}/v1/channels/${channel}/messages`, {
++        method: "POST",
++        headers: { "content-type": "application/json", authorization: `Bearer ${credential}` },
++        body: JSON.stringify({ text: "attempted after archiving" }),
++      });
++
++    beforeAll(async () => {
++      archived = (await repo.createChannel("archivable", "public")).id;
++      await repo.sendMessage(archived, { text: "written before archiving" });
++    });
++
++    it("refuses a send with its own code, distinct from not-found and banned", async () => {
++      // T074, and FR-021's actual requirement: three refusals a client acts on
++      // differently. The comparison used to be against `not_a_member`, which cannot
++      // appear on this path at all — private channels answer not-found and public
++      // ones permit the send.
++      expect((await archive(archived)).status).toBe(200);
++      const refused = await sendTo(archived);
++      expect(refused.status).toBe(403);
++      const body = (await refused.json()) as { code: string; message: string };
++      expect(body.code).toBe("channel_archived");
++      expect(body.code).not.toBe("not_found");
++      expect(body.code).not.toBe("user_banned");
++      // The message says history is unchanged, which is the thing a client needs to
++      // know next: this is not data loss.
++      expect(body.message).toContain("history");
++    });
++
++    it("still serves history while archived (FR-020)", async () => {
++      const res = await fetch(`${url}/v1/channels/${archived}/messages?limit=10`, {
++        headers: { authorization: `Bearer ${credential}` },
++      });
++      expect(res.status).toBe(200);
++      const body = (await res.json()) as { messages: { text: string | null }[] };
++      expect(body.messages.some((m) => m.text === "written before archiving")).toBe(true);
++    });
++
++    it("is idempotent in both directions (FR-020a)", async () => {
++      // Archiving an archived channel and unarchiving an active one both answer 200.
++      // "Already archived" is not an error: the customer asked for the channel to be
++      // archived and it is.
++      expect((await archive(archived)).status).toBe(200);
++      expect((await unarchive(archived)).status).toBe(200);
++      expect((await unarchive(archived)).status).toBe(200);
++      // And sending works again, with nothing lost.
++      expect((await sendTo(archived)).status).toBe(201);
++    });
++
++    it("answers an absent channel as it answers a foreign one", async () => {
++      const absent = await archive("00000000-0000-4000-8000-000000000000");
++      const foreign = await archive(foreignChannelId);
++      expect(absent.status).toBe(foreign.status);
++      const a = withoutRequestId(await absent.json());
++      const b = withoutRequestId(await foreign.json());
++      expect(a).toEqual(b);
++    });
++
++    it("does not change what a user has left unread (FR-022, T078)", async () => {
++      // The edge case the spec names, and this is where "the count is still true"
++      // gets a definition: archiving writes ONE column on `channels` and touches no
++      // message and no read position. So `last_sequence` is what it was, every read
++      // position is what it was, and the arithmetic between them is unchanged.
++      //
++      // Asserted on the sequence rather than on a count, because the count is phase
++      // 12's route — this is the invariant that makes the count safe, tested where it
++      // can be tested.
++      const target = (await repo.createChannel("archive-unread", "public")).id;
++      const before = (await repo.sendMessage(target, { text: "unread by somebody" })).seq;
++      await archive(target);
++      const after = await repo.listMessages(target, { limit: 10 });
++      expect(after.map((m) => m.seq)).toContain(before);
++      // And the channel's sequence did not move: archiving is not a write to the log.
++      const reread = await repo.getChannelById(target);
++      expect(reread).not.toBeNull();
++      expect((await repo.listMessages(target, { limit: 10 })).length).toBe(1);
++    });
++  });
+ });
+```
+```diff title="services/api/src/internal/internal.itest.ts"
+@@ -33,6 +33,7 @@
+   let url: string;
+   let env: { id: string };
+   let channelId: string;
++  let privateChannelId: string;
+   /** Chapter 3.2: the gateway forwards the END USER'S token instead of
+    * asserting two identity headers, so this suite mints tokens the same way the
+    * dev-token endpoint does — with the environment's own signing secret. */
+@@ -45,6 +46,12 @@
+     const user = await repo.createUser("tuan", "Tuan");
+     channelId = (await repo.createChannel("fleet", "public")).id;
+     await repo.addMember(channelId, user.id);
++    // Chapter 3.15: the socket's route reaches the same `sendMessage`, so the
++    // membership check has to hold here too — this is the caller R1 counted and
++    // the one that always supplied a user.
++    privateChannelId = (await repo.createChannel("fleet-private", "private")).id;
++    await repo.addMember(privateChannelId, user.id);
++    await repo.createUser("stranger", "A Stranger");
+     const signingSecret = (await environmentSigningSecret(db, env.id))!
+       .signingSecret;
+     tokenFor = async (subject: string) =>
+@@ -162,4 +169,67 @@
+     });
+     expect(res.status).toBe(401);
+   });
++
++  // ── THE SOCKET'S ROUTE INHERITS THE CHECK (chapter 3.15, FR-001) ────────────
++  //
++  // `POST /internal/messages` resolves the user from the forwarded token and then
++  // calls the same `messages.send` the public route does, so one check in
++  // `repository.sendMessage` covers both doors. Chapter 3.12 recorded this route
++  // as checking nothing; what it was missing was a check, not a caller — it has
++  // always supplied `user.id` (`internal.controller.ts:65`).
++  it("refuses a non-member's send to a private channel, as if it were absent", async () => {
++    const refused = await send(
++      { channel_id: privateChannelId, text: "not mine" },
++      "stranger",
++    );
++    const absent = await send(
++      { channel_id: "00000000-0000-4000-8000-000000000000", text: "nowhere" },
++      "stranger",
++    );
++    expect(refused.status).toBe(absent.status);
++  });
++
++  it("accepts a member's send to the same private channel", async () => {
++    const accepted = await send(
++      { channel_id: privateChannelId, text: "mine to send" },
++      "tuan",
++    );
++    expect(accepted.status).toBe(201);
++  });
++
++  // ── THE SESSION CARRIES MEMBERSHIPS, WHICH IS WHY IT NEEDED NO CHANGE ───────
++  //
++  // T042. `session.controller` builds its channel list from
++  // `repository.channelsForUser`, which selects from `members` joined to `users`
++  // and filters on both the user and the environment. So a private channel a user
++  // is not a member of cannot enter a session — and neither can a PUBLIC one,
++  // which is FR-004's other half: the subscription set is not the read set.
++  //
++  // A CONFIRMATION RATHER THAN A CHECK, and the test says so. R2 measured this by
++  // reading the query; this asserts it against a running one, which is the
++  // difference between believing a comment and knowing.
++  it("names neither a private nor a public channel the user is not a member of", async () => {
++    const res = await fetch(`${url}/internal/session`, {
++      method: "POST",
++      headers: await headers("stranger"),
++    });
++    expect(res.status).toBe(200);
++    const body = (await res.json()) as { channel_ids: string[] };
++    expect(body.channel_ids).not.toContain(privateChannelId);
++    // `channelId` is the PUBLIC channel this suite's other user belongs to. The
++    // stranger can read it by id and send to it, and it is still not in their
++    // session: membership decides subscription, visibility decides reads.
++    expect(body.channel_ids).not.toContain(channelId);
++  });
++
++  it("names a channel the user IS a member of", async () => {
++    // The control. An empty list would satisfy the assertions above while proving
++    // that the session is broken rather than that it is scoped.
++    const res = await fetch(`${url}/internal/session`, {
++      method: "POST",
++      headers: await headers("tuan"),
++    });
++    const body = (await res.json()) as { channel_ids: string[] };
++    expect(body.channel_ids).toContain(privateChannelId);
++  });
+ });
+```
+```diff title="services/gateway/src/isolation-fixtures.ts"
+@@ -48,6 +48,18 @@
+   credential: string;
+   userExternalId: string;
+   channelId: string;
++  /** A private channel in the same environment that this tenant's user is NOT a
++   * member of (chapter 3.15). */
++  privateChannelId: string;
++  /** That private channel's history, read with the APPLICATION key — which sees
++   * private channels (FR-005) — so a refused send can be checked against the
++   * rows rather than against its own error frame. */
++  privateHistory: () => Promise<string>;
++  /** Removes this tenant's user from its own channel via the public route. */
++  removeSelf: () => Promise<void>;
++  rejoinSelf: () => Promise<void>;
++  archiveOwnChannel: () => Promise<void>;
++  unarchiveOwnChannel: () => Promise<void>;
+   /** A token for `userExternalId`, minted through the api's own dev-token route so
+    * the signing secret never leaves the api — research R1's rule, and the reason
+    * the gateway asks rather than verifies. */
+@@ -94,6 +106,11 @@
+     const user = await repo.createUser(userExternalId, `${label} user`);
+     const channel = await repo.createChannel(`${label}-channel`, "public");
+     await repo.addMember(channel.id, user.id);
++    // Chapter 3.15: a PRIVATE channel in the same tenant, and this user is NOT a
++    // member of it. The four cross-tenant shapes all attack with another tenant's
++    // identifiers; a non-member of your own tenant is a different fixture, and the
++    // socket needs one too because `message.send` reaches the same check.
++    const privateChannel = await repo.createChannel(`${label}-private`, "private");
+     const key = await seeder.createApiKey(db, { environmentId: environment.id });
+     const token = await mintToken(apiUrl, key.credential, userExternalId);
+     return {
+@@ -101,9 +118,71 @@
+       credential: key.credential,
+       userExternalId,
+       channelId: channel.id,
++      privateChannelId: privateChannel.id,
+       token,
+       say: (text: string) =>
+         repo.sendMessage(channel.id, { text, userId: user.id, userExternalId }),
++      /** Remove this tenant's own user from its own public channel, through the
++       * public route — so the test asserts the consequence of the API rather than of
++       * a direct write. */
++      removeSelf: async () => {
++        const res = await fetch(
++          `${apiUrl}/v1/channels/${channel.id}/members/remove`,
++          {
++            method: "POST",
++            headers: {
++              "content-type": "application/json",
++              authorization: `Bearer ${key.credential}`,
++            },
++            body: JSON.stringify({ user_ids: [userExternalId] }),
++          },
++        );
++        if (!res.ok) throw new Error(`removeSelf for ${label}: ${res.status}`);
++      },
++      /** Archive and unarchive this tenant's own channel through the public routes,
++       * so the socket test observes the API's effect rather than a direct write. */
++      /** Put the membership back. A test that mutates shared fixture state has to
++       * restore it: T058 removed the attacker from their own channel and did not,
++       * and T078a two tests later failed on its control because the "member" was no
++       * longer one. The fixture's invariant — this tenant's user is a member of this
++       * tenant's channel — belongs to every test in the file, not to the first one
++       * that gets there. */
++      rejoinSelf: async () => {
++        const res = await fetch(
++          `${apiUrl}/v1/channels/${channel.id}/members`,
++          {
++            method: "POST",
++            headers: {
++              "content-type": "application/json",
++              authorization: `Bearer ${key.credential}`,
++            },
++            body: JSON.stringify({ user_ids: [userExternalId] }),
++          },
++        );
++        if (!res.ok) throw new Error(`rejoinSelf for ${label}: ${res.status}`);
++      },
++      archiveOwnChannel: async () => {
++        const res = await fetch(`${apiUrl}/v1/channels/${channel.id}/archive`, {
++          method: "POST",
++          headers: { authorization: `Bearer ${key.credential}` },
++        });
++        if (!res.ok) throw new Error(`archive for ${label}: ${res.status}`);
++      },
++      unarchiveOwnChannel: async () => {
++        const res = await fetch(`${apiUrl}/v1/channels/${channel.id}/archive`, {
++          method: "DELETE",
++          headers: { authorization: `Bearer ${key.credential}` },
++        });
++        if (!res.ok) throw new Error(`unarchive for ${label}: ${res.status}`);
++      },
++      privateHistory: async () => {
++        const res = await fetch(
++          `${apiUrl}/v1/channels/${privateChannel.id}/messages?limit=100`,
++          { headers: { authorization: `Bearer ${key.credential}` } },
++        );
++        if (!res.ok) throw new Error(`private history for ${label}: ${res.status}`);
++        return res.text();
++      },
+       history: async () => {
+         const res = await fetch(`${apiUrl}/v1/channels/${channel.id}/messages?limit=100`, {
+           headers: { authorization: `Bearer ${key.credential}` },
+```
+```diff title="services/gateway/src/isolation.itest.ts"
+@@ -35,8 +35,24 @@
+ const HERE = dirname(fileURLToPath(import.meta.url));
+ const REPO = join(HERE, "..", "..", "..");
+ 
++/** 120 SECONDS, NOT 30, and the number is measured (chapter 3.15's Phase 1).
++ *
++ * This suite spawns an api child and waits for its health endpoint. Thirty seconds is
++ * ample in the integration lane, where the whole suite finishes in **6 s**. Under
++ * `pnpm coverage` the same suite takes **90.9 s** — v8 instrumentation on a NestJS boot
++ * is most of that — and the child blew the 30 s deadline every run: one failed suite,
++ * six tests skipped, and an `afterAll` that then timed out at 60 s waiting on a
++ * half-started server.
++ *
++ * A generous deadline costs nothing when the api is healthy: the loop polls every 100 ms
++ * and returns on the first success. It only changes how long a genuinely dead api takes
++ * to say so.
++ *
++ * Chapter 3.12's battery blew this same 30 s at run 11 for an unrelated reason — two
++ * Next.js dev servers compiling an MDX page while the child had 30 s to boot. Both
++ * failures were the deadline being tight rather than the api being broken. */
+ async function waitForHealth(url: string): Promise<void> {
+-  const deadline = Date.now() + 30_000;
++  const deadline = Date.now() + 120_000;
+   for (;;) {
+     try {
+       if ((await fetch(url)).ok) return;
+@@ -258,6 +274,138 @@
+     expect(after).toBe(before);
+   });
+ 
++  // ── THE SOCKET'S SEND INTO A PRIVATE CHANNEL OF ITS OWN TENANT ─────────────
++  //
++  // Chapter 3.15, FR-001. Every attack above crosses a tenant boundary; this one
++  // does not. The attacker's own tenant holds a private channel they are not a
++  // member of, and the socket reaches the same `repository.sendMessage` the REST
++  // route does — through `api-client` to `POST /internal/messages`, which has
++  // always supplied the user id.
++  //
++  // THE SAME ANSWER AS A CHANNEL THAT DOES NOT EXIST, on this surface too. A
++  // socket error frame carries a code rather than a status, so the comparison is
++  // between two frames: the refusal for a private channel the caller cannot see
++  // and the refusal for an id that exists nowhere.
++  it("a send into its own tenant's private channel is refused as if absent, and that channel gains nothing", async () => {
++    const client = connect(tenants.attacker.token);
++    await client.waitFor("connection.ack");
++
++    const text = `not a member ${randomUUID()}`;
++    client.socket.send(
++      JSON.stringify({
++        type: "message.send",
++        payload: {
++          idem_key: randomUUID(),
++          channel: tenants.attacker.privateChannelId,
++          text,
++        },
++      }),
++    );
++    const refused = await client.waitFor<{ payload: { code: string } }>("error");
++
++    client.socket.send(
++      JSON.stringify({
++        type: "message.send",
++        payload: {
++          idem_key: randomUUID(),
++          channel: "00000000-0000-4000-8000-000000000000",
++          text: `nowhere ${randomUUID()}`,
++        },
++      }),
++    );
++    const absent = await client.waitFor<{ payload: { code: string } }>("error");
++
++    expect(refused.payload.code).toBe(absent.payload.code);
++
++    // And read the channel's state rather than inferring it from the refusal.
++    const after = await tenants.attacker.privateHistory();
++    expect(after).not.toContain(text);
++  });
++
++  // ── A REMOVED MEMBER'S RECONNECTION (chapter 3.15, SC-004) ──────────────────
++  //
++  // T058. The session is built from `members` — `channelsForUser` selects from that
++  // table, and `repository.backfill` joins it per cursor — so removal takes the
++  // channel out of the next session without the gateway knowing anything about
++  // removal.
++  //
++  // ASSERTED ON THE ACCEPTED CURSOR, and the two attempts before this one are worth
++  // recording because both were unfalsifiable:
++  //
++  //   1. Looking for the channel id in `connection.ack`'s payload. That frame carries
++  //      `user`, `cursor`, `resume_ok`, `truncated` and no channel list.
++  //   2. Sending a message and waiting for `message.created`. **This suite attaches
++  //      no fan-out** — `attachSessions({server, api, logger})` passes none, so
++  //      `fanout?.publish` is a no-op and nothing is ever delivered here. The control
++  //      hung for five seconds and timed out.
++  //
++  // The ack's `cursor` is what the server ACCEPTED, so it is the one place the
++  // session's membership decision is visible from outside. The control below shows a
++  // member's cursor being accepted, which is what makes the removal assertion mean
++  // something.
++  it("a removed member's resume cursor is no longer accepted", async () => {
++    await tenants.attacker.say(`before removal ${randomUUID()}`);
++
++    const asMember = connect(
++      tenants.attacker.token,
++      `&cursor=${tenants.attacker.channelId}:0`,
++    );
++    const first = await asMember.waitFor<{
++      payload: { cursor: Record<string, number> };
++    }>("connection.ack");
++    // The control: while they are a member, the server takes the cursor.
++    expect(Object.keys(first.payload.cursor)).toContain(tenants.attacker.channelId);
++
++    await tenants.attacker.removeSelf();
++
++    const afterRemoval = connect(
++      tenants.attacker.token,
++      `&cursor=${tenants.attacker.channelId}:0`,
++    );
++    const second = await afterRemoval.waitFor<{
++      payload: { cursor: Record<string, number> };
++    }>("connection.ack");
++    expect(Object.keys(second.payload.cursor)).not.toContain(
++      tenants.attacker.channelId,
++    );
++    await quiet(1_000);
++    expect(afterRemoval.frames().filter((f) => f.type === "message.created")).toEqual([]);
++
++    // PUT IT BACK. This test mutates state every later test in the file leans on,
++    // and the next one to need it failed on its control rather than on its subject.
++    await tenants.attacker.rejoinSelf();
++  });
++
++  // ── AN ARCHIVED CHANNEL AND THE SOCKET (chapter 3.16, FR-022a) ──────────────
++  //
++  // T078a. FR-022 asks two things and only one of them had a task for eleven
++  // analysis passes: whether an archived channel appears in a listing (it does, with
++  // a flag) and **whether the socket delivers anything for it**. This is the second.
++  //
++  // THE ANSWER IS THAT NOTHING CHANGES, AND THE GATEWAY NEEDS NO EDIT. Archiving
++  // stops writes and touches no membership, so the channel stays in the session and
++  // the resume cursor is still accepted. Nothing new arrives because nothing new can
++  // be sent — the refusal is at the write, not at the subscription.
++  //
++  // A NO-OP PROVED RATHER THAN ASSUMED. "We changed nothing so nothing broke" is the
++  // sentence this test exists to replace: archiving could plausibly have been
++  // implemented by removing memberships, and then a member would silently lose the
++  // channel from their session.
++  it("keeps an archived channel in the session and its cursor accepted", async () => {
++    await tenants.attacker.archiveOwnChannel();
++
++    const client = connect(
++      tenants.attacker.token,
++      `&cursor=${tenants.attacker.channelId}:0`,
++    );
++    const ack = await client.waitFor<{
++      payload: { cursor: Record<string, number> };
++    }>("connection.ack");
++    expect(Object.keys(ack.payload.cursor)).toContain(tenants.attacker.channelId);
++
++    await tenants.attacker.unarchiveOwnChannel();
++  });
++
+   // ── T047: the resume ───────────────────────────────────────────────────────
+   it("a cursor naming the other tenant's channel backfills nothing", async () => {
+     await tenants.victim.say(`before the resume ${randomUUID()}`);
+@@ -271,6 +419,36 @@
+     await quiet(1_000);
+     expect(client.frames().filter((f) => f.type === "message.created")).toEqual([]);
+   });
++
++  // ── THE SAME-TENANT NON-MEMBER, ON THE SOCKET (chapter 3.15, T087) ─────────
++  //
++  // The protocol's frame union has exactly one inbound member — `message.send` —
++  // so there is no "subscribe" frame to attack: what a socket may see is decided at
++  // connect, from the session's channel list, and a cursor is the only thing a
++  // client gets to assert about it. So the socket's version of "a non-member
++  // reaches a private channel" is a cursor naming one.
++  //
++  // The tenant's own user is not a member of the tenant's own private channel —
++  // `seedSocketTenants` creates it and adds nobody — which makes this the
++  // same-tenant case rather than the cross-tenant one every other attack here uses.
++  it("a same-tenant non-member's cursor for a private channel is not accepted", async () => {
++    const client = connect(
++      tenants.attacker.token,
++      `&cursor=${tenants.attacker.privateChannelId}:0`,
++    );
++    const ack = await client.waitFor<{
++      payload: { cursor: Record<string, number> };
++    }>("connection.ack");
++    expect(Object.keys(ack.payload.cursor)).not.toContain(
++      tenants.attacker.privateChannelId,
++    );
++
++    // The control is two tests up: the SAME token's cursor for a channel it IS a
++    // member of gets accepted. Without that, an empty cursor set here would pass
++    // whether the session was scoped or simply broken.
++    await quiet(1_000);
++    expect(client.frames().filter((f) => f.type === "message.created")).toEqual([]);
++  });
+ 
+   // ── T048: the subscribe ────────────────────────────────────────────────────
+   it("nothing from the other tenant's channel is delivered", async () => {
+```
+```diff title="packages/protocol/src/codes.ts"
+@@ -68,6 +68,43 @@
+   channel_member_limit_exceeded:
+     "the channel already holds its maximum members; the message names the limit and the channel",
+ 
++  // ── CHAPTERS 3.15 AND 3.16 (FR-021, FR-031, research R11) ────────────────────
++  //
++  // Three refusals a client acts on differently, which is the test this registry
++  // sets: `channel_member_limit_exceeded` above is separate from `quota_exceeded`
++  // because one resets on a date and the other never does. Reusing `forbidden` for
++  // all three would leave a client unable to tell "join the channel" from "wait for
++  // the archive to lift" from "contact support".
++  //
++  // `not_a_member` HAS EXACTLY ONE EMITTER, and saying so here saves the next
++  // reader a search. A PRIVATE channel the caller cannot see answers the not-found
++  // envelope, byte-identical to a channel that does not exist — SC-002 covers send
++  // along with the three reads, and a 403 naming the membership would announce that
++  // the channel exists. A PUBLIC channel permits a tenant user to read, send and
++  // join without membership (FR-004). What is left is the read-position route on a
++  // public channel: a read position is per-member state, keyed by channel and user,
++  // and removal deletes the row — so refusing a non-member there is the same rule
++  // the rest of the table keeps.
++  not_a_member:
++    "the user is not a member of this channel; the message names neither the channel's contents nor its members",
++  // Chapter 3.15. Archiving prevents new messages and preserves history, and this
++  // is the refusal a send gets.
++  //
++  // ONLY ONCE THE CALLER CAN SEE THE CHANNEL. FR-021a fixes the order at ban, then
++  // membership and visibility, then archive — reverse the last two and a non-member
++  // of a private archived channel learns it exists from this code, which is the leak
++  // FR-003 forbids.
++  channel_archived:
++    "the channel is archived and accepts no new messages; history is still readable",
++  // Chapter 3.16. A ban is tenant-scope: no connecting and no sending anywhere in
++  // the environment, while the banned user's history stays readable by others.
++  //
++  // CHECKED BEFORE THE CHANNEL IS RESOLVED, so a banned user gets the same answer
++  // for every channel id. Resolve first and this becomes the existence oracle the
++  // membership refusal is not allowed to be.
++  user_banned:
++    "the user is banned in this environment and can neither connect nor send; their existing messages remain",
++
+   // ── THE FIVE THE PLATFORM HAS ALWAYS SENT AND NEVER REGISTERED (chapter 3.12,
+   // FR-024) ────────────────────────────────────────────────────────────────────
+   //
+```
+```diff title="packages/protocol/src/codes.test.ts"
+@@ -51,10 +51,14 @@
+ // that is not in this object cannot be constructed anywhere in the platform without
+ // failing the build. This suite checks the shape of the object those types rest on.
+ describe("the registry is the whole vocabulary (FR-024)", () => {
+-  it("holds thirteen codes", () => {
++  it("holds sixteen codes", () => {
+     // A number, so adding one is a visible edit rather than a silent widening. The
+     // count is here and not in a comment because a comment does not fail.
+-    expect(Object.keys(ERROR_CODES)).toHaveLength(13);
++    //
++    // Thirteen until chapters 3.15 and 3.16 added `not_a_member`,
++    // `channel_archived` and `user_banned` — three refusals a client acts on
++    // differently, which is the test this registry sets.
++    expect(Object.keys(ERROR_CODES)).toHaveLength(16);
+   });
+ 
+   it("contains the five the status ladder emits", () => {
+@@ -74,7 +78,26 @@
+   });
+ 
+   it("contains every code the socket surface sends", () => {
+-    for (const code of ["invalid_frame", "unknown_frame_type", "rate_limited", "quota_exceeded"]) {
++    for (const code of [
++      "invalid_frame",
++      "unknown_frame_type",
++      "rate_limited",
++      "quota_exceeded",
++      // Chapter 3.16. A banned user is refused at connect, so the socket says this
++      // one too — and a non-member's send over a socket answers the same way REST
++      // does, which for a private channel is the not-found envelope and not a code
++      // of its own.
++      "user_banned",
++    ]) {
++      expect(ERROR_CODES, code).toHaveProperty(code);
++    }
++  });
++
++  it("contains the three the channel surface adds", () => {
++    // `not_a_member` has one emitter — the read-position route on a public channel —
++    // and it is here rather than at that call site for the reason chapter 3.2 gave
++    // when it registered `wrong_credential_type` instead of inventing it inline.
++    for (const code of ["not_a_member", "channel_archived", "user_banned"]) {
+       expect(ERROR_CODES, code).toHaveProperty(code);
+     }
+   });
+```
+
+## The socket had no frame to attack
+
+The task said to add "a same-tenant non-member's subscribe frame, from the protocol's
+own frame union". Reading the union settles it: there is exactly one inbound member,
+`message.send`. **There is no subscribe frame.** What a socket may see is decided at
+connect, from the session's channel list, and a cursor is the only thing a client gets
+to assert about it.
+
+So the attack is a cursor naming the private channel, and the assertion is that the
+ack's cursor set does not contain it. A task that had simply said "add a subscribe
+test" would have produced a test of something that does not exist; the instruction to
+derive it from the union is what turned it into a test that could be written.
+
+<Trap>
+
+A declared frame with no sender, in a feature about declared columns with no reader:
+`presenceChangedSchema` is in the frame union and **nothing emits it**. The research
+note deferred presence "in scope only as far as: a non-member's socket is not
+subscribed, so it receives no presence for it" — a claim that was vacuously true. It is
+recorded as such rather than left to read as though presence flowed.
+
+</Trap>
+
+## One number that moved without a file changing
+
+The catalogue that proves every table has a path to exactly one tenant now reports 23
+base tables where chapter 3.12 recorded 22, and **`tenant-scope.itest.ts` did not
+change by one character.** The classification is derived from the live database, so a
+new table appears in it without anybody maintaining a list.
+
+That makes the file this chapter's *subject* without being one of its *fences* — a
+distinction the file assignment did not have, and the reason the assignment moved from
+21 files to 20. The same count taken from the repository rather than from the task list
+found two files that were in no chapter's bucket at all. It was the sixth revision of
+that number, from the sixth different question, and it has never once been too high.
+
+<SkipAhead>
+
+The new table is `read_positions`, and it classifies **direct** rather than hop because
+it carries its own `environment_id`. Reached through its parents it would have been a
+hop through a hop — a two-link path this catalogue derives and no table had used. The
+unread counts that table exists for are the next chapter.
+
+</SkipAhead>
+
+<Checkpoint>
+
+- `pnpm test:integration` — 474 tests, 192 s, green
+- `pnpm check:fences` — 20 problems before this chapter, 0 after
+- `gauntlet targets: 30 derived, 27 attacked, 3 exempt`; 46 isolation tests, six controls
+- three checks removed in turn: 2, 2 and 1 failures, controls green in all three
+- `tenant paths: 23 base tables — 13 direct, 2 hop, 8 spine`
+- `POST /v1/channels` accepts `private`, and every one of the four doors refuses a
+  non-member with the envelope a missing channel gets
+
+</Checkpoint>
+
+<ForwardRef part="chapter 3.16">
+
+What a user sees: their channels ordered by activity, with unread counts and a cursor;
+their profile, created implicitly on first authentication; and the measurement that
+pointed the wrong way — ordering by the last message costs 0.87 ms on the test lane and
+159 ms at a million messages, with a sequential scan over every message in the
+environment on every listing.
+
+</ForwardRef>
+
+<ChapterFooter id="3.15" />

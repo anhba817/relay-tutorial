@@ -541,18 +541,34 @@ export const series: Part[] = [
       },
       {
         id: "3.15",
-        path: "/part-3/chapter-15/the-surface-a-customer-drives",
-        title: "The surface a customer drives",
-        status: "forthcoming",
-        // Was going to be 3.13 until the split took that number. What mattered
-        // about the promise was that the deferred surface had a number, not which
-        // number — the rest of FR-CHN and all of FR-USR, including the private
-        // channel type chapter 3.12 refuses because nothing reads it.
+        path: "/part-3/chapter-15/the-channel-a-customer-controls",
+        title: "The channel a customer controls",
+        status: "published",
+        // Was going to be 3.13 until the split took that number, and the deferred
+        // surface then split again on a file count taken before any prose existed:
+        // 40 files across two chapters, 20 taught here. What mattered about the
+        // promise was that the surface had a number, not which number.
         readerProduces:
-          "Channel listing with cursor pagination, unread counts, user profiles, and the private channel type made real on every read path that has to honour it",
+          "A private channel type that decides something on all four of its doors, member removal and roles, archiving that refuses a send without announcing the channel exists, and a gauntlet that attacks your own tenant",
+        sourceDoc: "docs/04-srs.md",
+        readerMinutes: 85,
+        titleVi: "Kênh mà khách hàng kiểm soát",
+        readerProducesVi:
+          "Một loại kênh private thực sự quyết định điều gì đó ở cả bốn cửa vào, xoá thành viên và phân quyền, lưu trữ kênh để từ chối gửi tin mà không tiết lộ kênh có tồn tại, và một gauntlet tấn công chính tenant của bạn",
+      },
+      {
+        id: "3.16",
+        path: "/part-3/chapter-16/what-a-user-sees",
+        title: "What a user sees",
+        status: "forthcoming",
+        // The other half of the deferred surface. Its centre is a measurement that
+        // pointed the wrong way: ordering a user's channels by their last message
+        // costs 0.87 ms on the test lane and 159 ms at a million messages.
+        readerProduces:
+          "Channel listing with cursor pagination and activity ordering, unread counts from the sequence the write path already maintains, user profiles created implicitly on first authentication, and a deleted user whose messages survive",
         sourceDoc: "docs/04-srs.md",
         readerMinutes: 90,
-        titleVi: "Bề mặt mà khách hàng điều khiển",
+        titleVi: "Những gì một người dùng thấy",
       },
     ],
   },
