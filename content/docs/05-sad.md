@@ -347,7 +347,11 @@ CREATE TABLE users (
     metadata        JSONB NOT NULL DEFAULT '{}',
     banned_at       TIMESTAMPTZ,
     deleted_at      TIMESTAMPTZ,                          -- FR-USR-05: the row survives
-    UNIQUE (environment_id, external_id)                  -- DR-02
+    kind            TEXT NOT NULL DEFAULT 'person'
+                    CHECK (kind IN ('person','bot')),     -- FR-USR-07 (chapter 3.17)
+    description     TEXT,                                 -- what the software is, and why
+    UNIQUE (environment_id, external_id),                 -- DR-02
+    CHECK (kind <> 'bot' OR description IS NOT NULL)      -- a bot without one is not a bot
 );
 
 CREATE TABLE channels (

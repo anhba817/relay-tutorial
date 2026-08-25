@@ -296,6 +296,49 @@ and React Native 0.72+.
 | FR-USR-04 | The system shall support upserting up to 100 users in a single request. | P2 | T |
 | FR-USR-05 | Deleting a user shall remove profile data and memberships while preserving their messages as authored by a deleted user, unless message deletion is explicitly requested. | P2 | T |
 | FR-USR-06 | The system shall support banning a user at tenant scope, preventing connection and message send while preserving history. | P3 | T |
+| FR-USR-07 | Customers shall be able to create bot users representing their own software, each carrying a description of what it is and why it posts. A bot user shall not authenticate. | P2 | T |
+
+> **AMENDMENT, chapter 3.17 — FR-USR-07 and FR-MSG-15 added, FR-MSG-13 and FR-RTL-05
+> narrowed.** Until this chapter a message sent with an application key named nobody, and the
+> SRS had no word for the thing a customer's software is. Three chapters since have made the
+> sender decide what is rendered, what is delivered and what may be seen, so a message with no
+> sender became a row those three chapters cannot describe.
+>
+> **FR-USR-07** is new: a bot user, carrying a description, that cannot authenticate. It is not
+> a new kind of row — it is a `users` row with a stored property — because every reader built
+> since chapter 3.15 already reads that table.
+>
+> **FR-MSG-13 was already here, and it is being MET rather than introduced.** It has said since
+> v1 that a key may send *on behalf of a user*, and chapter 3.3 satisfied it by sending
+> unattributed — a decision that was right when nothing read the sender, and that
+> `messages.controller.ts` has recorded ever since as *"A tenant's own server sending on a
+> customer's behalf is FR-MSG-13, not a mistake."* This chapter is the first implementation that
+> names the user. The clause is narrowed from *any user* to *a bot user of that tenant*, in
+> place: adding a clause beside it would have left this document asserting both that a key may
+> send as anyone and that it may send only as a bot.
+>
+> **FR-MSG-15** carries only what FR-MSG-13 does not — that every message has a sender at all.
+>
+> **FR-RTL-05 is narrowed from "unique active users" to "unique active persons", and FR-ANL-05
+> is deliberately unchanged.** A bot is metered like any user and is exempt from the enforced
+> ceiling: the ceiling bounds a customer's human population, and a customer's own software
+> should not be able to lock their people out of sending. Metering and enforcement were already
+> two clauses in two families before this chapter needed them to be.
+>
+> **FR-RTL-08's exception, stated rather than discovered.** *"Quota exhaustion shall degrade
+> predictably: sends rejected with a specific error code."* A bot's send is not rejected at
+> exhaustion. Uncited that is a defect report; here it is a decision.
+>
+> **FR-MSG-01 is unchanged** — it describes what a message contains and does not mention a
+> sender. A later reader must not look for the sender rule there. **FR-MSG-08 is unchanged**
+> too, and worth naming: its tombstone already retains the *author*, which agrees with FR-MSG-15
+> and has never been built.
+>
+> **FR-USR-01 still holds for bots.** *"Relay shall not generate end-user identifiers"* — a
+> bot's identifier is customer-supplied like any other, and the platform invents nothing. The
+> alternative this chapter rejected was a synthetic sender the platform mints for a key, which
+> is what chapter 3.10 argued against and still argues against; a bot is a *declared* identity
+> the customer creates, names and describes.
 
 > **Verification, FR-USR-02 to FR-USR-06 (chapters 3.15 and 3.16).** Five of these six
 > clauses were unimplemented until then, and two things are worth recording beyond "tested".
@@ -391,8 +434,9 @@ and React Native 0.72+.
 | FR-MSG-10 | History responses shall include tombstones so that clients can render deletions without gaps in ordering. | P2 | T |
 | FR-MSG-11 | The system shall support up to 10 attachments per message. An attachment is either a reference to a Relay-hosted media object (`media_id`, see §4.14) or an external URL with a declared kind (`image`, `audio`, `video`). | P2 | T |
 | FR-MSG-12 | The system shall record and expose per-user read state as the highest sequence number read in a channel. | P2 | T |
-| FR-MSG-13 | The system shall support sending a message on behalf of any user via API key, for backend-originated messages. | P2 | T |
+| FR-MSG-13 | The system shall support sending a message on behalf of a bot user of that tenant via API key, for backend-originated messages. | P2 | T |
 | FR-MSG-14 | Threads, reactions, and full-text search shall not be implemented in v1. Emoji *reactions* remain excluded; emoji within message content is specified in §4.13. | P5 | I |
+| FR-MSG-15 | Every message shall carry a sender. A message accepted with no sender shall not be created. | P1 | T |
 
 **Message state machine (client-observable)**
 
@@ -446,7 +490,7 @@ customer interfaces can represent delivery honestly rather than optimistically.
 | FR-RTL-02 | Every rate-limited response shall include `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `X-RateLimit-Reset` headers. Headers shall be present on successful responses, not only on `429`. | P2 | T |
 | FR-RTL-03 | Rate-limited requests shall return `429` with a `Retry-After` header. | P2 | T |
 | FR-RTL-04 | Development and production environments shall have entirely independent limits and counters. | P2 | T |
-| FR-RTL-05 | The system shall enforce configurable monthly quotas on messages sent, unique active users, and connection-minutes. | P3 | T |
+| FR-RTL-05 | The system shall enforce configurable monthly quotas on messages sent, unique active persons, and connection-minutes. | P3 | T |
 | FR-RTL-06 | Organisations shall be able to configure a hard spending cap that suspends the environment on breach, and a soft threshold that only alerts. | P3 | T |
 | FR-RTL-07 | The system shall email organisation admins at 50%, 80%, and 100% of configured quota. | P3 | T |
 | FR-RTL-08 | Quota exhaustion shall degrade predictably: sends rejected with a specific error code; existing connections and history reads unaffected. | P3 | T |
