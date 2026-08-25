@@ -94,6 +94,27 @@ from the code — an undocumented code would ship a link to nothing.
 **What to do:** internal callers should present the credential for the service that owns
 the route. The message names the service presented and the services permitted.
 
+## sender_not_permitted
+
+**Status:** 403 · **Retryable:** no
+
+An application credential named a person in `user` when sending a message. A key may speak
+as software and not as any person: it acts for the tenant, not for one of the tenant's
+users, so the only sender it may name is a bot user of that same tenant.
+
+The third refusal in a family. `wrong_credential_type` is the wrong credential *class*,
+`wrong_credential_service` the wrong *service*, and this one is the right class naming the
+wrong *kind of user*.
+
+The message names neither the person asked for nor the bots that would have been accepted.
+Which identifiers exist in a tenant is not something a refusal reveals — a message listing
+the acceptable senders would be an enumeration endpoint behind a 403.
+
+**What to do:** create a bot user — a `users` upsert entry with `kind: "bot"` and a
+`description` saying what the software is — and name it in `user`. A user token needs none
+of this: its send is attributed to the token's subject, and naming `user` in the body is
+refused.
+
 ## forbidden
 
 **Status:** 403 · **Retryable:** no
