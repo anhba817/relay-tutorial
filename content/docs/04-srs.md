@@ -334,6 +334,14 @@ and React Native 0.72+.
 > too, and worth naming: its tombstone already retains the *author*, which agrees with FR-MSG-15
 > and has never been built.
 >
+> **How the two new clauses are verified (T073).** `FR-USR-07` by test: the bot round
+> trip, the description rules at the boundary and at the database, and the promotion in all
+> three of its states. `FR-MSG-15` by **compilation** as well as by test —
+> `repository.sendMessage` takes `userId: string`, so a senderless write does not build,
+> and the evidence is a `typecheck` transcript rather than a failing test. A compile-time
+> guarantee has no red test to watch, which is why the amendment says so here rather than
+> leaving a reader to look for one.
+>
 > **FR-USR-01 still holds for bots.** *"Relay shall not generate end-user identifiers"* — a
 > bot's identifier is customer-supplied like any other, and the platform invents nothing. The
 > alternative this chapter rejected was a synthetic sender the platform mints for a key, which
