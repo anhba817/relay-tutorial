@@ -572,6 +572,23 @@ export const series: Part[] = [
         readerProducesVi:
           "Danh sách channel phân trang bằng cursor và xếp theo hoạt động, số tin chưa đọc suy ra từ chính sequence mà đường ghi vẫn duy trì, profile người dùng được tạo ngầm ở lần xác thực đầu tiên, một người dùng đã xoá mà tin nhắn vẫn còn, và một lệnh ban có hiệu lực cả ở cửa vào lẫn trên đường gửi",
       },
+      {
+        id: "3.17",
+        path: "/part-3/chapter-17/the-sender-a-message-never-had",
+        title: "The sender a message never had",
+        status: "published",
+        // The requirement was already in the SRS — FR-MSG-13, P2, since v1 — and
+        // chapter 3.3 satisfied it by naming nobody, which was right when nothing
+        // read the sender. Three chapters later a senderless row is one the platform
+        // cannot describe, and 121,250 of them exist in the test lane.
+        readerProduces:
+          "Bot users carrying a description the database requires, a sender required on every message and enforced by the compiler rather than a test, an application credential that may speak as software and not as any person, refusals that reveal nothing about who exists, and a bot that is billed as an active user while being exempt from the ceiling that refuses sends",
+        sourceDoc: "docs/04-srs.md",
+        readerMinutes: 80,
+        titleVi: "Người gửi mà một tin nhắn chưa từng có",
+        readerProducesVi:
+          "Bot user mang theo một description mà cơ sở dữ liệu bắt buộc phải có, một người gửi bắt buộc trên mọi tin nhắn và được chính trình biên dịch bảo đảm thay vì một bài test, một application credential chỉ được nói với danh nghĩa phần mềm chứ không phải bất kỳ con người nào, những lời từ chối không hé ra ai đang tồn tại, và một bot vẫn được tính tiền như active user nhưng được miễn khỏi cái ngưỡng vốn từ chối tin gửi",
+      },
     ],
   },
   {
