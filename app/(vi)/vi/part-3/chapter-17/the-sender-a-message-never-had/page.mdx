@@ -1,0 +1,3067 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figBlastRadius, figRefusalOrder, figAbsence, figTwoCounters } from "./figures";
+
+export const metadata = {
+  title: "Người gửi mà một tin nhắn chưa từng có — Building Relay",
+  description:
+    "Một tin nhắn do server của khách hàng gửi không nêu tên ai. Yêu cầu phải nêu tên một ai đó đã nằm trong SRS từ v1, và chương 3.3 thoả mãn nó bằng cách làm điều ngược lại — một quyết định đúng khi chưa có gì đọc người gửi.",
+  alternates: {
+    canonical: "/vi/part-3/chapter-17/the-sender-a-message-never-had",
+    languages: {
+      en: "/part-3/chapter-17/the-sender-a-message-never-had",
+      vi: "/vi/part-3/chapter-17/the-sender-a-message-never-had",
+    },
+  },
+};
+
+<ChapterHeader id="3.17" />
+
+Server của một khách hàng đăng kết quả build vào một channel. Nó xác thực bằng API key, vì nó là
+một server và không có con người nào đứng sau, và tin nhắn hạ cánh với `user_id` null.
+
+Suốt mười bốn chương, thế là ổn. Chưa có gì đọc người gửi.
+
+Rồi chương 3.15 khiến người gửi quyết định một private channel có hiển thị hay không, chương 3.16
+khiến nó quyết định danh sách channel render ra gì, và đường resume khiến nó quyết định một tin
+nhắn có được giao đi hay không. Một row không có người gửi trở thành một row mà ba chương đó
+không thể diễn tả — và có 121.250 row như vậy trong test lane, trên tổng số 394.808.
+
+Chương này cho tin nhắn đó một người gửi. Phần lớn công việc không phải là người gửi.
+
+## Yêu cầu đã ở đó từ trước, và nó đã được thoả mãn ngược
+
+Bản plan của chương này nói SRS không có khái niệm nào về người gửi của một tin nhắn và sẽ cần một
+lần tu chính. Mười ba lượt phân tích đọc câu đó. Rồi một lượt mở §4.5 và đọc các điều khoản thay
+vì đọc các mã định danh:
+```text title="docs/04-srs.md (excerpt)"
+| FR-MSG-13 | The system shall support sending a message on behalf of any user via
+              API key, for backend-originated messages. | P2 | T |
+```
+
+*P2, kiểm chứng bằng test, có trên giấy từ v1.*
+
+Năng lực đó đã được yêu cầu từ khi tài liệu tồn tại. Chương 3.3 thoả mãn nó bằng cách gửi vô danh
+— và `messages.controller.ts` đã ghi lại cách đọc ấy từ đó tới nay, trong một comment mà người đọc
+sẽ tin ngay: *"Việc server của chính tenant gửi thay cho khách hàng là FR-MSG-13, không phải một
+lỗi."*
+
+<Why title="Một yêu cầu được thoả mãn bằng cách làm điều ngược lại thì khó thấy hơn một yêu cầu không ai viết">
+
+Một yêu cầu thiếu sẽ hiện ra ở lượt kiểm tra coverage: không có gì trace tới nó. Một yêu cầu được
+thoả mãn ngược thì trace tới code, có comment dẫn nó, và vượt qua mọi cửa. Dụng cụ duy nhất tìm ra
+nó là một người đọc điều khoản ngay bên cạnh đoạn code viện dẫn nó.
+
+Điều khoản nói *thay cho bất kỳ user nào*. Code không nêu tên ai. Cả hai câu đều chứa cụm "thay
+cho", và suốt mười một chương thế là đủ.
+
+</Why>
+
+Nên lần tu chính này gồm hai điều khoản mới và **hai lần sửa các điều khoản đã tồn tại** — điều đó
+quan trọng, vì một lần tu chính chỉ-thêm sẽ để tài liệu này đồng thời khẳng định rằng một key có
+thể gửi với danh nghĩa bất kỳ ai và rằng nó chỉ được gửi với danh nghĩa một bot:
+```text title="docs/04-srs.md (excerpt)"
++ FR-USR-07   NEW      Customers shall be able to create bot users representing their
+                       own software, each carrying a description of what it is and why
+                       it posts. A bot user shall not authenticate.          P2  T
+~ FR-MSG-13   AMENDED  "on behalf of any user" -> "on behalf of a bot user of that
+                       tenant"                                              P2  T
++ FR-MSG-15   NEW      Every message shall carry a sender. A message accepted with no
+                       sender shall not be created.                         P1  T
+~ FR-RTL-05   AMENDED  quota on "unique active users" -> "unique active persons"  P3 T
+```
+
+## Một danh tính từng là một sự vắng mặt
+
+Cái người gửi mà một key nêu tên phải là một cái gì đó. Ba phương án, và phương án thứ ba là phương
+án được chọn:
+
+<Figure caption="Ba cách nêu tên phần mềm, và cái giá của từng cách" code={figAbsence} />
+
+**Người gửi nullable** giữ lại sự vắng mặt và bắt mọi bên đọc phải xử lý nó — đó chính là cái đang
+tồn tại và là cái ba chương vừa rồi phải trả giá. **User tổng hợp** do nền tảng bịa ra chính là cái
+mà chương 3.10 phản đối, trong một `<Trap>` mà chương này đã phải sửa: bịa ra một user sẽ làm phồng
+lên cái dimension mà khách hàng bị tính tiền. **Bot user** do khách hàng tạo, đặt tên và mô tả là
+một danh tính được khai báo, và khác biệt so với một user tổng hợp là ở chỗ ai đã quyết định nó tồn
+tại.
+
+Phần description không phải đồ trang trí. Nó là cái làm cho người gửi trở nên có thể trả lời được:
+bộ công cụ hỗ trợ của khách hàng có thể nói cái gì đã đăng và vì sao. Một bot không có nó chính là
+người gửi vô danh mà chương này tồn tại để loại bỏ, nên cơ sở dữ liệu từ chối nó:
+```diff title="services/api/src/db/schema.ts"
+@@ -258,13 +258,56 @@ export const users = pgTable(
+     // presenting the same external id again reuses this row and clears the marker
+     // (FR-030) rather than creating a second identity.
+     deletedAt: timestamp("deleted_at", { withTimezone: true }),
++    // WHAT KIND OF THING THIS USER IS (chapter 3.17, FR-USR-07).
++    //
++    // A stored property on the row a customer already knows about, not a second table.
++    // Every reader built since chapter 3.15 reads `users`; a `bots` table would have
++    // needed each of them taught a second place to look, and a message's `user_id`
++    // would have had to reference one of two tables.
++    //
++    // `NOT NULL DEFAULT 'person'` is metadata-only on Postgres 11+, so the existing
++    // rows are not rewritten — chapter 3.16 measured that for `last_activity_at`.
++    // The default belongs HERE, at creation, and NOT in the request schema: a schema
++    // default would make "absent" indistinguishable from "person" before anything can
++    // compare it to the stored row, and telling those two apart is what makes a
++    // promotion reportable (FR-002b).
++    kind: text("kind").notNull().default("person"),
++    // WHAT THE SOFTWARE IS, AND WHY IT POSTS (chapter 3.17, FR-USR-07).
++    //
++    // NOT PROFILE DATA, and `deleteUser` must not clear it (FR-004a). FR-027 clears
++    // `display_name`, `avatar_url` and `metadata` on deletion; clearing this one would
++    // violate `users_bot_description_check` below and make a bot the one kind of user
++    // that cannot be deleted.
++    description: text("description"),
+   },
+   (t) => [
+     unique("users_environment_id_external_id_unique").on(
+       t.environmentId,
+       t.externalId,
++    ), // DR-02
++    // THE CONSTRAINED TEXT COLUMNS IN THIS SCHEMA NAME EACH OTHER (chapter 3.15's
++    // practice, applied here): `channels_type_check` on `channels.type`,
++    // `members_role_check` on `members.role`, `memberships_role_check` on an
++    // organisation membership's role, and this pair. One word apart is how `admin`
++    // nearly reached a channel member, so each of these says where its siblings are.
++    //
++    // AND `environments.kind` IS THE ONE THAT IS NOT CONSTRAINED. It has held
++    // `development` or `production` since chapter 2.1 (FR-TEN-04) with no CHECK, so
++    // this schema now has two columns called `kind` and only one of them cannot hold
++    // a typo. Named here rather than fixed: adding a constraint to a column
++    // seventeen chapters old is not this chapter's change, and leaving the asymmetry
++    // unmentioned is how the next reader assumes both are guarded.
++    check("users_kind_check", sql`${t.kind} IN ('person','bot')`),
++    // THE SECOND CHECK IS THE REQUIREMENT, not a nicety. It makes a bot without a
++    // description **unrepresentable** rather than merely refused: zod refuses one at
++    // the boundary (FR-002, FR-004b) and this refuses one from any writer, including
++    // a migration, a backfill, or a psql session. A description is what turns an
++    // opaque sender into an answerable one, so a bot without one is not a bot.
++    check(
++      "users_bot_description_check",
++      sql`${t.kind} <> 'bot' OR ${t.description} IS NOT NULL`,
+     ),
+-  ], // DR-02
++  ],
+ );
+ 
+ export const channels = pgTable(
+```
+
+<Why title="Hai cột trên `users`, không phải một bảng `bots`">
+
+Mọi bên đọc được xây từ chương 3.15 trở đi đều đọc `users`. Một bảng riêng sẽ có nghĩa là dạy cho
+từng bên đọc đó một nơi thứ hai để tìm, và `messages.user_id` sẽ phải tham chiếu tới một trong hai
+bảng. Một bot là một user với một thuộc tính được lưu (FR-003 yêu cầu đúng điều đó), và điều duy
+nhất nó không làm được là xác thực.
+
+`environments.kind` là cột duy nhất tên `kind` trong schema này không có CHECK. Nó đã giữ
+`development` hoặc `production` từ chương 2.1 và không thể từ chối một lỗi đánh máy. Được nêu tên
+trong migration chứ không được sửa: thêm một constraint vào một cột mười bảy chương tuổi không phải
+việc của chương này, và một sự bất đối xứng không được nêu ra là một sự bất đối xứng mà người đọc
+sau sẽ mặc định là không có.
+
+</Why>
+```sql title="services/api/migrations/0013_bot_users.sql"
+-- Chapter 3.17 — the sender a message never had.
+--
+-- FR-MSG-13 has said since v1 that the system "shall support sending a message on
+-- behalf of a bot user of that tenant via API key" — and until this chapter it read
+-- "on behalf of any user", satisfied by naming nobody. Chapter 3.3 decided that when
+-- nothing read the sender. Three chapters since have made the sender decide what is
+-- rendered, what is delivered and what may be seen, so a message with no sender became
+-- a row those three chapters cannot describe.
+--
+-- TWO COLUMNS, NOT A SECOND TABLE. `users` is what every reader built since chapter
+-- 3.15 already reads. A `bots` table would have meant teaching each of them a second
+-- place to look, and `messages.user_id` would have had to reference one of two tables.
+--
+-- NO BACKFILL, and that is measured rather than assumed. `ADD COLUMN ... NOT NULL
+-- DEFAULT` is metadata-only on Postgres 11+ — the existing rows are not rewritten —
+-- which chapter 3.16 measured for `last_activity_at` on the same table.
+ALTER TABLE users
+  ADD COLUMN kind        TEXT NOT NULL DEFAULT 'person',
+  ADD COLUMN description TEXT;
+
+-- THE FIRST CHECK IS THE VOCABULARY. `channels_type_check` guards `channels.type`,
+-- `members_role_check` guards a channel member's role and `memberships_role_check` an
+-- organisation member's — one word apart is how `admin` nearly reached a channel
+-- member (chapter 3.15), so each of these constraints names its siblings.
+--
+-- `environments.kind` is the one column called `kind` that has no CHECK: it has held
+-- 'development' or 'production' since chapter 2.1 (FR-TEN-04) and cannot refuse a typo.
+-- Not fixed here, because a constraint on a column seventeen chapters old is not this
+-- chapter's change, and an unmentioned asymmetry is one the next reader assumes away.
+ALTER TABLE users
+  ADD CONSTRAINT users_kind_check CHECK (kind IN ('person','bot'));
+
+-- THE SECOND CHECK IS THE REQUIREMENT, not a nicety.
+--
+-- It makes a bot without a description UNREPRESENTABLE rather than merely refused. Zod
+-- refuses one at the boundary (FR-002, FR-004b) and this refuses one from any writer —
+-- a migration, a backfill, a psql session. A description is what turns an opaque sender
+-- into an answerable one: a customer's support tooling can say what posted and why, and
+-- a bot without that is the anonymous sender this chapter exists to remove.
+--
+-- IT ALSO DECIDES WHAT DELETION MAY DO. FR-027 clears `display_name`, `avatar_url` and
+-- `metadata` when a user is deleted; clearing `description` too would violate this
+-- constraint and make a bot the one kind of user that cannot be deleted. So a bot's
+-- description is not profile data (FR-004a), and this line is why.
+ALTER TABLE users
+  ADD CONSTRAINT users_bot_description_check
+  CHECK (kind <> 'bot' OR description IS NOT NULL);
+```
+
+Migration được đo chứ không được phỏng đoán, và câu trả lời tách làm hai theo cách bản plan không
+lường trước:
+```text
+users rows on this machine                                          134,067
+ADD COLUMN kind NOT NULL DEFAULT 'person', ADD COLUMN description     4.721 ms
+ADD CONSTRAINT users_kind_check                                      14.427 ms
+ADD CONSTRAINT users_bot_description_check                           13.972 ms
+```
+
+"Không cần backfill" là đúng với các cột — 4,7 ms trên 134.067 row là thao tác chỉ trên metadata,
+đúng như Postgres 11 đã hứa và chương 3.16 đã đo cho `last_activity_at`. Nó **không** đúng với các
+CHECK: mỗi cái đều kiểm chứng từng row đang tồn tại. Ở cỡ này thì không đáng gì; hình dạng là O(n),
+và "migration này không cần backfill" là câu mà ai đó sẽ đem đi trích dẫn.
+
+## Một lỗi biên dịch, không phải một bài test
+
+Quy tắc là mọi tin nhắn đều có người gửi. Cơ chế là một ký tự:
+```diff title="services/api/src/db/repository.ts"
+@@ -2213,6 +2213,15 @@ export interface UserRow {
+    * apart: a repository that hid deleted rows would make the marker unobservable and
+    * the deletion untestable. */
+   deleted_at: string | null;
++  /** Chapter 3.17, FR-USR-07. What kind of thing this user is — `'person'` or `'bot'`.
++   *
++   * ON EVERY USER, not only bots. A reader that had to infer personhood from a null
++   * description would be inferring it from the absence of something, and FR-003 asks
++   * for a stored property rather than an inference. */
++  kind: "person" | "bot";
++  /** What the software is, and why it posts. Null for a person, and
++   * `users_bot_description_check` makes it non-null for a bot at the database. */
++  description: string | null;
+ }
+ 
+ export interface ChannelRow {
+@@ -2289,6 +2298,19 @@ export class ChannelArchivedError extends Error {
+  * so a banned user gets one answer for every channel id, whether it exists, belongs to
+  * somebody else, or was invented. Any other position leaks: check the channel first and
+  * a banned user learns which channel ids are real. */
++/** An application credential named a person (chapter 3.17, FR-007, FR-007a).
++ *
++ * ITS OWN CLASS, NOT A `ChannelNotFoundError`, because the two say different things and
++ * the service maps them to different codes. Carries the sender's INTERNAL id and never
++ * the customer's identifier: the message on the wire names neither the person asked for
++ * nor the bots that would have been accepted (SC-005). */
++export class SenderNotPermittedError extends Error {
++  constructor(readonly userId: string) {
++    super("an application credential may send only as a bot user");
++    this.name = "SenderNotPermittedError";
++  }
++}
++
+ export class UserBannedError extends Error {
+   constructor(public readonly userId: string) {
+     super(`user banned: ${userId}`);
+@@ -2638,6 +2660,13 @@ export class Repository {
+         metadata: {},
+         banned_at: null,
+         deleted_at: null,
++        // `createUser` CANNOT MAKE A BOT, and that is deliberate (chapter 3.17). Its
++        // callers are the member-add and the token mint, where an unknown identifier
++        // arrives with nothing but a name; a bot needs a description, so it is created
++        // through the upsert where one can be supplied. This is also why `person -> bot`
++        // has an escape at all — see `upsertUser`.
++        kind: "person",
++        description: null,
+       };
+     }
+     const existing = await this.getUserByExternalId(externalId);
+@@ -2658,6 +2687,8 @@ export class Repository {
+         metadata: users.metadata,
+         bannedAt: users.bannedAt,
+         deletedAt: users.deletedAt,
++        kind: users.kind,
++        description: users.description,
+       })
+       .from(users)
+       .where(
+@@ -2681,6 +2712,11 @@ export class Repository {
+           metadata: row.metadata as Record<string, unknown>,
+           banned_at: row.bannedAt === null ? null : toIso(row.bannedAt),
+           deleted_at: row.deletedAt === null ? null : toIso(row.deletedAt),
++          // `as` for the same reason as `metadata` above: the column is
++          // `notNull().default('person')` and `users_kind_check` bounds it to two
++          // values, so a `?? "person"` here would be an arm the database cannot produce.
++          kind: row.kind as "person" | "bot",
++          description: row.description,
+         };
+   }
+ 
+@@ -3085,8 +3121,19 @@ export class Repository {
+       display_name?: string | null | undefined;
+       avatar_url?: string | null | undefined;
+       metadata?: Record<string, unknown> | undefined;
++      /** Chapter 3.17 (FR-002b). ABSENT MEANS "NO CHANGE", NOT "PERSON" — the column
++       * default handles a new row and this method must not apply it to an existing
++       * one, or an entry updating a bot's description would silently demote it. */
++      kind?: "person" | "bot" | undefined;
++      description?: string | undefined;
+     },
+-  ): Promise<{ user: UserRow; status: "created" | "updated" | "revived" }> {
++  ): Promise<{
++    user: UserRow;
++    /** `kind_conflict` REPORTS A CHANGE RATHER THAN PERFORMING ONE (FR-002a). Zod
++     * cannot reach this decision: it depends on the stored row's kind and, for a
++     * promotion, on whether that row has ever sent a message. */
++    status: "created" | "updated" | "revived" | "kind_conflict";
++  }> {
+     const id = randomUUID();
+     const inserted = await this.db
+       .insert(users)
+@@ -3097,6 +3144,13 @@ export class Repository {
+         displayName: profile.display_name ?? null,
+         avatarUrl: profile.avatar_url ?? null,
+         ...(profile.metadata === undefined ? {} : { metadata: profile.metadata }),
++        // THE DEFAULT APPLIES HERE AND NOWHERE ELSE (chapter 3.17, FR-002b, T019a).
++        // A new row with no `kind` is a person; an existing row with no `kind` is
++        // asking for no change, which the update block below is careful about.
++        ...(profile.kind === undefined ? {} : { kind: profile.kind }),
++        ...(profile.description === undefined
++          ? {}
++          : { description: profile.description }),
+       })
+       .onConflictDoNothing({ target: [users.environmentId, users.externalId] })
+       .returning({ id: users.id });
+@@ -3111,6 +3165,8 @@ export class Repository {
+           metadata: profile.metadata ?? {},
+           banned_at: null,
+           deleted_at: null,
++          kind: profile.kind ?? "person",
++          description: profile.description ?? null,
+         },
+         status: "created",
+       };
+@@ -3130,7 +3186,7 @@ export class Repository {
+     // `revived`. `UPDATE ... RETURNING` gives post-update values, so there is no way to
+     // learn it from the write itself.
+     const [before] = await this.db
+-      .select({ id: users.id, deletedAt: users.deletedAt })
++      .select({ id: users.id, deletedAt: users.deletedAt, kind: users.kind })
+       .from(users)
+       .where(
+         and(
+@@ -3140,7 +3196,49 @@ export class Repository {
+       )
+       .limit(1);
+ 
+-    if (before !== undefined) {
++    // A KIND CHANGE IS REPORTED, NOT PERFORMED (chapter 3.17, FR-002a, FR-002d).
++    //
++    // `person -> bot` is allowed when the row has NEVER SENT A MESSAGE. Without that
++    // escape the natural ordering traps a customer: `POST /v1/channels/:id/members`
++    // creates any unknown identifier as a person, because `createUser` cannot set
++    // `kind` — so "add support-bot to #support" followed by "register support-bot as a
++    // bot" would make that bot permanently impossible. The escape closes at the first
++    // message, because a message already attributed to a person must not turn into one
++    // attributed to software.
++    //
++    // `bot -> person` is refused unconditionally. A bot's messages are attributed to it
++    // and demoting it would rewrite what those messages mean, retroactively.
++    //
++    // THE COST IS A FILTERED SCAN. `messages.user_id` carries no index and this asks
++    // whether one row exists, so `LIMIT 1` is doing the work: the planner stops at the
++    // first hit rather than counting. Measured in `baseline.txt` (T018b) rather than
++    // assumed, and no index was added for a question asked once per promotion.
++    // A THIRD THROW OF THE SAME CLASS IS WHAT THE RATCHET CAUGHT, AND DELETING IT IS THE
++    // FIX (chapter 3.17). The first version of this branch read the row back and threw if
++    // it was absent, then returned `kind_conflict` — which is the second statement for one
++    // impossible state that the comment forty lines below already argues against. Lines
++    // fell to **98.95%** against a pin of 99 and the gate went red, exactly as that
++    // comment predicts. Third time this project has answered the ratchet by removing code
++    // rather than covering it (3.12's `addMember`, 3.16's `upsertUser`).
++    //
++    // The flag defers to the read the method already does at the end, so the conflict
++    // costs no extra query and no extra throw.
++    let kindConflict = false;
++    if (before !== undefined && profile.kind !== undefined && profile.kind !== before.kind) {
++      const promotable =
++        before.kind === "person" &&
++        profile.kind === "bot" &&
++        (
++          await this.db
++            .select({ id: messages.id })
++            .from(messages)
++            .where(eq(messages.userId, before.id))
++            .limit(1)
++        ).length === 0;
++      kindConflict = !promotable;
++    }
++
++    if (before !== undefined && !kindConflict) {
+       await this.db
+         .update(users)
+         .set({
+@@ -3151,6 +3249,12 @@ export class Repository {
+             : { displayName: profile.display_name }),
+           ...(profile.avatar_url === undefined ? {} : { avatarUrl: profile.avatar_url }),
+           ...(profile.metadata === undefined ? {} : { metadata: profile.metadata }),
++          // ABSENT STAYS ABSENT FOR `kind` TOO (T019a). An entry that omits it is not
++          // asking for `'person'`; the column default is for new rows only.
++          ...(profile.kind === undefined ? {} : { kind: profile.kind }),
++          ...(profile.description === undefined
++            ? {}
++            : { description: profile.description }),
+           deletedAt: null,
+         })
+         .where(and(eq(users.id, before.id), eq(users.environmentId, this.environmentId)));
+@@ -3158,7 +3262,14 @@ export class Repository {
+ 
+     const after = await this.getUserByExternalId(externalId);
+     if (after === null) throw new Error(`user ${externalId} could not be created or read`);
+-    return { user: after, status: before?.deletedAt != null ? "revived" : "updated" };
++    return {
++      user: after,
++      status: kindConflict
++        ? "kind_conflict"
++        : before?.deletedAt != null
++          ? "revived"
++          : "updated",
++    };
+   }
+ 
+   /** Ban and unban a user, tenant-wide (chapter 3.15, FR-031, FR-032).
+@@ -3234,6 +3345,24 @@ export class Repository {
+ 
+       await tx.delete(readPositions).where(eq(readPositions.userId, userId));
+       await tx.delete(members).where(eq(members.userId, userId));
++      // `description` IS NOT IN THIS `set`, AND ITS ABSENCE IS THE REQUIREMENT
++      // (chapter 3.17, FR-004a, T043b).
++      //
++      // FR-027 clears profile data on deletion, and a bot's description is not profile
++      // data — it says what the software is, which is what makes the messages it already
++      // sent answerable after it is gone. Clearing it would violate
++      // `users_bot_description_check` and make a bot **the one kind of user that cannot
++      // be deleted**: the constraint would reject the deletion itself.
++      //
++      // The rejected alternative was clearing `kind` back to `'person'` first. That
++      // makes the deletion two writes and leaves a person nobody created, holding
++      // messages a bot sent.
++      //
++      // THE OTHER DELETION METHOD IS `markUserDeleted`, and it clears nothing — it only
++      // stamps the marker. It has **no production caller**: chapter 3.16 added it so the
++      // listing's 404 branch was reachable before the deletion route existed. This rule
++      // is `deleteUser`'s, and a reader looking for it in the other one will find a
++      // method nothing calls.
+       await tx
+         .update(users)
+         .set({
+@@ -3273,12 +3402,18 @@ export class Repository {
+       display_name?: string | null | undefined;
+       avatar_url?: string | null | undefined;
+       metadata?: Record<string, unknown> | undefined;
++      /** Chapter 3.17, FR-004. `string | undefined` and NOT `| null`, unlike its three
++       * neighbours: the boundary refuses a null (FR-004b) because
++       * `users_bot_description_check` would raise on a bot, so a null can never arrive
++       * here and widening the type would invite one. */
++      description?: string | undefined;
+     },
+   ): Promise<UserRow | null> {
+     const set: Record<string, unknown> = {};
+     if (patch.display_name !== undefined) set["displayName"] = patch.display_name;
+     if (patch.avatar_url !== undefined) set["avatarUrl"] = patch.avatar_url;
+     if (patch.metadata !== undefined) set["metadata"] = patch.metadata;
++    if (patch.description !== undefined) set["description"] = patch.description;
+ 
+     if (Object.keys(set).length > 0) {
+       const updated = await this.db
+@@ -3576,13 +3711,42 @@ export class Repository {
+       text,
+       metadata,
+       idempotencyKey,
++      senderMustBeBot = false,
+     }: {
+-      userId?: string;
++      /** THE SENDER MUST BE A BOT (chapter 3.17, FR-007, T030, T032).
++       *
++       * A CONSTRAINT, NOT A CREDENTIAL CLASS. Research R5 says the repository must not
++       * learn what a credential is, and it does not: it is told that this send's sender
++       * has to be software, and the controller is the only thing that knows an
++       * application key is why.
++       *
++       * IT LIVES HERE BECAUSE OF THE ORDER, and the order was the finding. The
++       * documented sequence (`contracts/sending.md`) puts "may this credential send as
++       * that sender?" last, after the channel checks, so that a refusal naming a fact
++       * about a user cannot be provoked for a channel the caller could not otherwise
++       * reach. Enforcing it in the service would put it FIRST — before the ban, the
++       * visibility and the archive — and leak exactly what the ordering protects.
++       * There is no way to be both last and outside this transaction. */
++      senderMustBeBot?: boolean;
++      /** REQUIRED SINCE CHAPTER 3.17 (FR-MSG-15, FR-006), and required is the whole
++       * mechanism. SC-003 asks that no write path be able to produce a senderless
++       * message; a runtime check would be a test somebody has to remember, and this
++       * is a compile error. `exactOptionalPropertyTypes` means a caller cannot pass
++       * `undefined` here either — passing a `string | undefined` is named by the
++       * compiler, not silently accepted.
++       *
++       * There is no red test for this. Reverting the `?` is what makes the guarantee
++       * visible, and the transcript of that revert is SC-003a's evidence (T013a). */
++      userId: string;
+       /** Chapter 3.3: the sender as a CONSUMER will see them. Threaded from the
+        * caller rather than looked up here — the internal route already holds it
+        * (it is the token's subject), and an extra SELECT inside the write
+-       * transaction is a cost every message would pay forever. Absent on the
+-       * public REST route, where a key-authenticated send is unattributed. */
++       * transaction is a cost every message would pay forever.
++       *
++       * STILL OPTIONAL, and that is not an oversight. `userId` is what the platform
++       * stores and `userExternalId` is what a consumer sees; the public route now
++       * resolves a bot and holds both, but the internal route has always supplied
++       * both and nothing requires a caller to know the external id to write a row. */
+       userExternalId?: string;
+       text: string;
+       metadata?: unknown;
+@@ -3607,19 +3771,33 @@ export class Repository {
+       // channel that exists differs from the refusal for one that does not, and a
+       // banned user can enumerate channel ids.
+       //
+-      // ONLY FOR AN ATTRIBUTED SEND. A key-authenticated REST send carries no user, so
+-      // there is nobody to be banned; the tenant acting for itself is not a banned
+-      // user's send by proxy, because the tenant is who bans.
+-      if (userId !== undefined) {
+-        const [sender] = await tx
+-          .select({ bannedAt: users.bannedAt })
+-          .from(users)
+-          .where(
+-            and(eq(users.id, userId), eq(users.environmentId, this.environmentId)),
+-          )
+-          .limit(1);
+-        if (sender?.bannedAt != null) throw new UserBannedError(userId);
+-      }
++      // EVERY SEND IS ATTRIBUTED NOW (chapter 3.17, FR-MSG-15). The gate that used to
++      // stand here — `if (userId !== undefined)` — guarded against a key-authenticated
++      // send that carried no user, and `userId` is required as of this chapter, so the
++      // condition could no longer be false. **Fourth time this project has met a guard
++      // that stopped meaning anything**: `addMember`'s `rowCount ?? 0` (3.12), and
++      // `upsertUser`'s second throw and `(row.metadata ?? {})` (3.16). Tightening a
++      // type makes its runtime guards dead; three of the seven `userId` comparisons in
++      // this file were dead the moment T012 landed, and two others are in methods where
++      // the parameter is optional by design and must not be touched.
++      //
++      // A BOT CAN BE BANNED, AND THAT IS THE POINT (FR-005c). `banned_at` has been on
++      // every `users` row since chapter 3.15 and this check has never run for a bot
++      // because no send named one. A ban is how an operator stops a runaway integration
++      // without deleting the identity its messages are attributed to.
++      //
++      // ONE LOOKUP, TWO ANSWERS. `kind` is read here and used again at the private
++      // channel check below (FR-019a). The alternative is a second SELECT on the write
++      // path for every message forever, to learn something this query already touched.
++      const [sender] = await tx
++        .select({ bannedAt: users.bannedAt, kind: users.kind })
++        .from(users)
++        .where(
++          and(eq(users.id, userId), eq(users.environmentId, this.environmentId)),
++        )
++        .limit(1);
++      if (sender?.bannedAt != null) throw new UserBannedError(userId);
++      const senderIsPerson = sender?.kind !== "bot";
+ 
+       const [channel] = await tx
+         .select({
+@@ -3678,7 +3856,26 @@ export class Repository {
+       // non-member of a private archived channel never learns it exists from
+       // `channel_archived`. Both arrive with their own columns' chapters; this is
+       // the middle of the three.
+-      if (channel.type === "private" && userId !== undefined) {
++      // THE SENDER ATTRIBUTES; IT DOES NOT AUTHORISE (chapter 3.17, FR-019).
++      //
++      // This gate used to read `channel.type === "private" && userId !== undefined`,
++      // and the second half was doing real work: a key-authenticated send carried no
++      // user, so it skipped the membership check entirely. That is chapter 3.15's
++      // FR-005 — an application credential "acts for the customer, carries no user,
++      // and sees private channels" — and `messages.itest.ts` asserts it by name.
++      //
++      // Requiring `userId` would have made the condition always true, fired the check,
++      // and refused a bot that is not a member with `ChannelNotFoundError`: a 404 that
++      // by design cannot say why. A capability chapter 3.15 delivered would have
++      // vanished, and the analysis passes that read FR-005 never noticed because the
++      // word "private" appeared nowhere in this chapter's plan.
++      //
++      // So the gate turns on WHAT THE SENDER IS, not on whether there is one. A key
++      // naming a bot has exactly the authority the key has today; the bot's name is
++      // what appears on the message and nothing more. A person's token still both
++      // authorises and attributes, which is why `senderIsPerson` is the condition and
++      // a person who is not a member is still refused, indistinguishably (FR-019b).
++      if (channel.type === "private" && senderIsPerson) {
+         const [membership] = await tx
+           .select({ userId: members.userId })
+           .from(members)
+@@ -3687,6 +3884,19 @@ export class Repository {
+         if (!membership) throw new ChannelNotFoundError(channelId);
+       }
+ 
++      // THE SENDER'S KIND, LAST OF THE FIVE (chapter 3.17, FR-007, T032).
++      //
++      // After the ban, the visibility and the archive, because this refusal names a
++      // fact about a USER — "that identifier is a person" — and a caller who could not
++      // otherwise reach this channel must not be able to ask it. Same reasoning as
++      // archive-after-visibility three checks below, one subject over.
++      //
++      // `senderIsPerson` was computed at the ban check from the same row, so this costs
++      // nothing beyond the comparison.
++      if (senderMustBeBot && senderIsPerson) {
++        throw new SenderNotPermittedError(userId);
++      }
++
+       // ARCHIVE, AFTER VISIBILITY AND NOT BEFORE (chapter 3.15, FR-020, FR-021,
+       // FR-021a).
+       //
+@@ -3735,7 +3945,7 @@ export class Repository {
+       // The joined read is about 1.2ms of that and US1 needs it whether or not a
+       // cap exists. An earlier uncontrolled benchmark reported 273% and sent three
+       // separate hypotheses chasing what turned out to be warm-up (T033).
+-      const quota = await this.assertWithinQuota(tx, period, userId);
++      const quota = await this.assertWithinQuota(tx, period, userId, senderIsPerson);
+ 
+       const seq = channel.lastSequence + 1;
+       const id = randomUUID();
+@@ -3866,15 +4076,20 @@ export class Repository {
+       // sent this period, which is a read. The row IS the answer, and
+       // `ON CONFLICT DO NOTHING` makes the second send of the month free.
+       //
+-      // ONLY WHEN THE SEND IS ATTRIBUTED. A key-authenticated REST send carries
+-      // no `userId` — unattributed by design since chapter 3.3 — and counts
+-      // toward the message quota and toward no user.
+-      if (userId !== undefined) {
+-        await tx
+-          .insert(usageActiveUsers)
+-          .values({ environmentId: this.environmentId, period, userId })
+-          .onConflictDoNothing();
+-      }
++      // EVERY SEND IS ATTRIBUTED, SO EVERY SEND COUNTS (chapter 3.17). The gate here
++      // was the twin of the ban check's: it existed because a key-authenticated send
++      // carried no `userId`, which chapter 3.3 decided and FR-MSG-15 reverses.
++      //
++      // A BOT IS BILLED (FR-018, FR-ANL-05, *"shall meter, per tenant per day:
++      // messages sent, unique active users, ..."*). The row is the bill, and a bot's
++      // send writes one like anyone's. What a bot is exempt from is the ENFORCED
++      // ceiling in `assertWithinQuota` — FR-RTL-05, narrowed to "unique active
++      // persons" by this chapter's amendment. Metering and enforcement were already
++      // two clauses in two families; this insert is the first one.
++      await tx
++        .insert(usageActiveUsers)
++        .values({ environmentId: this.environmentId, period, userId })
++        .onConflictDoNothing();
+ 
+       // What this send crossed, if anything. Almost always nothing, which is why
+       // the caps are read first and the whole block skipped when none is set.
+@@ -3899,7 +4114,10 @@ export class Repository {
+         // send could have added someone.
+         const userRef =
+           quota.caps.active_users.hard ?? quota.caps.active_users.soft;
+-        const mayHaveAddedUser = userId !== undefined && userRef !== null;
++        // ONLY THE `userId` HALF WAS DEAD. `userRef !== null` still decides whether a
++        // user cap exists at all, and asking the database for a count when no cap is
++        // configured is a query nobody reads.
++        const mayHaveAddedUser = userRef !== null;
+ 
+         if (crossedMessages.length > 0 || mayHaveAddedUser) {
+           const organisationId = await this.organisationOf(tx);
+@@ -3968,7 +4186,15 @@ export class Repository {
+   private async assertWithinQuota(
+     tx: Db,
+     period: string,
+-    userId: string | undefined,
++    /** REQUIRED, following `sendMessage`'s parameter (chapter 3.17, T012). Its only
++     * caller is the send, and the `userId === undefined` disjunct in the ceiling check
++     * below became unreachable when that parameter did. */
++    userId: string,
++    /** Whether the sender is a person (chapter 3.17, FR-018a, T047b). Threaded from the
++     * ban check's row rather than read again: this method is inside the write
++     * transaction, and a second SELECT on `users` here is a query every send would pay
++     * to learn something the caller already knows. */
++    senderIsPerson: boolean,
+   ): Promise<{
+     caps: { messages: Caps; active_users: Caps };
+     sent: number;
+@@ -4039,7 +4265,27 @@ export class Repository {
+       });
+     }
+ 
+-    if (users_.hard === null || userId === undefined) {
++    // THE `userId === undefined` DISJUNCT IS GONE, and only that half. `hard === null`
++    // still means no ceiling is configured, which is the common case and the reason the
++    // count below is not taken on every send.
++    //
++    // THE BOT EXEMPTION IS NOT HERE YET. FR-018a exempts a bot from this ceiling and
++    // FR-018b requires the count to exclude bots as well — Phase 5's T047b, because
++    // doing only the first leaves a bot's row displacing a person and the bot's own
++    // send passing makes it look fixed.
++    // A BOT IS EXEMPT FROM THE CEILING, AND THAT IS HALF OF IT (chapter 3.17, FR-018a,
++    // FR-RTL-05 as amended). The clause now caps "unique active PERSONS"; FR-ANL-05
++    // still meters "unique active users" and the insert above still counts a bot, which
++    // is what makes a bot billed and exempt at the same time.
++    //
++    // The ceiling bounds a customer's human population. A customer's own software should
++    // not be able to lock their people out of sending — and it would: the block below
++    // refuses the FIRST send of a period by anyone once the count is reached, so the
++    // person refused is not whoever caused it.
++    if (!senderIsPerson) {
++      return { caps: { messages: messages_, active_users: users_ }, sent };
++    }
++    if (users_.hard === null) {
+       return { caps: { messages: messages_, active_users: users_ }, sent };
+     }
+ 
+@@ -4057,13 +4303,27 @@ export class Repository {
+       return { caps: { messages: messages_, active_users: users_ }, sent };
+     }
+ 
++    // THE COUNT EXCLUDES BOTS, AND THIS IS THE HALF THAT DECIDES WHETHER THE EXEMPTION
++    // WORKS (FR-018b). Returning early above stops a bot being refused; it does nothing
++    // about a bot's row sitting in this count and displacing a person. A test that
++    // watches the bot's send succeed passes with only the first half applied.
++    //
++    // **THE JOIN FILTERS `kind` AND NOT `deleted_at`.** Three `users` joins in this file
++    // pair with `isNull(users.deletedAt)` and it is the house idiom, so the wrong version
++    // is the one a careful reader writes. `deleteUser` is a SOFT delete and leaves
++    // `usage_active_users` alone, so adding that filter would make a deleted person's row
++    // stop counting — and deleting users would become a way to free ceiling slots, which
++    // it is not today. `users.itest.ts` pins the BILLED figure across a deletion and
++    // nothing pins the enforced one, so no ratchet would have caught it.
+     const [count] = await tx
+       .select({ n: sql<number>`count(*)::int` })
+       .from(usageActiveUsers)
++      .innerJoin(users, eq(users.id, usageActiveUsers.userId))
+       .where(
+         and(
+           eq(usageActiveUsers.environmentId, this.environmentId),
+           eq(usageActiveUsers.period, period),
++          eq(users.kind, "person"),
+         ),
+       );
+     const active = count?.n ?? 0;
+```
+
+`userId?: string` trở thành `userId: string`. Với `exactOptionalPropertyTypes`, một caller cũng
+không thể truyền `undefined` — truyền một `string | undefined` sẽ bị trình biên dịch nêu tên, chứ
+không được lặng lẽ chấp nhận. Một lần ghi không có người gửi sẽ không build được.
+
+<Why title="Không có bài test nào fail cho điều này, và không thể có">
+
+Mọi bảo đảm khác trong chương này đều có một bài test kiểu tháo-ra: bỏ phần kiểm tra đi, xem cái gì
+đỏ lên, rồi đặt lại. Một bảo đảm ở thời điểm biên dịch không có bài test đỏ nào — tháo constraint ra
+thì mọi thứ vẫn biên dịch được, và đó là sự vắng mặt của bằng chứng chứ không phải bằng chứng.
+
+Nên bằng chứng chính là bản ghi của việc tháo nó ra. Đưa dấu `?` trở lại sẽ nêu tên mọi call site
+lúc đó bỏ trống người gửi, và bản kiểm kê ấy là hình dạng của bảo đảm này nhìn từ bên ngoài.
+
+</Why>
+
+Bản kiểm kê dự đoán 27 call site. Trình biên dịch nêu tên **28**.
+
+Cái thứ 28 là `messages.service.ts` — caller production duy nhất. Dự đoán đã đếm những chỗ *bỏ
+trống* `userId`; service không bỏ trống nó, nó truyền `string | undefined`, và cái đó bị từ chối
+cũng dứt khoát y như vậy. Ba con số cùng mô tả các lần gọi send của tệp này — 100 nếu grep thô, 46
+HTTP send site trong phần nghiên cứu bán kính ảnh hưởng, 27 nếu đếm chỗ bỏ trống thuộc tính — và câu
+trả lời thật cho "cái gì vỡ" là con số thứ tư.
+
+<Figure caption="Hai bán kính ảnh hưởng, và không cái nào là cái đã vỡ" code={figBlastRadius} />
+
+## Những cái chốt hết còn ý nghĩa, và cái chốt vẫn còn
+
+Bắt buộc một tham số sẽ khiến các chốt kiểm tra lúc chạy của nó chết. `sendMessage` có một cổng bao
+quanh phần kiểm tra ban chỉ tồn tại vì một lần gửi bằng key không mang user, và một cổng nữa quanh
+phần ghi usage vì cùng lý do. Cả hai không thể tới được ngay khi kiểu dữ liệu đổi. Đây là lần thứ tư
+dự án này gặp một cái chốt hết còn ý nghĩa — `rowCount ?? 0` của `addMember` ở 3.12, hai cái trong
+`upsertUser` ở 3.16.
+
+Bản plan nói hãy grep cả lớp thay vì sửa hai chỗ đã biết. Bản năng tốt. Lệnh grep trả về **bảy**:
+```text
+3626  the ban check                       DEAD — remove the gate, keep the check
+3694  private-channel membership          NOT DEAD IN EFFECT
+3885  the usage_active_users insert       DEAD — remove the gate, keep the insert
+3902  mayHaveAddedUser (compound)         DEAD conjunct; the other half stays
+4055  the active-user ceiling's return    DEAD disjunct; the other half stays
+4254  channelVisibleTo(id, userId?)       LEGITIMATELY OPTIONAL — do not touch
+4315  listMessages                        LEGITIMATELY OPTIONAL — do not touch
+```
+
+<Trap title="Quét cả lớp sẽ xoá mất một năng lực mà chương 3.15 đã ship">
+
+Dòng 3694 đọc là `if (channel.type === "private" && userId !== undefined)`. Một lần gửi bằng key bỏ
+qua phần kiểm tra thành viên vì không có user — và đó chính là FR-005 của chương 3.15, được giao có
+chủ đích: *"Một application credential hành động thay cho khách hàng, không mang user, và thấy được
+các private channel."*
+
+Bắt buộc `userId` thì nửa sau luôn đúng, phần kiểm tra sẽ chạy, và một bot không phải thành viên sẽ
+bị từ chối bằng một 404 mà theo thiết kế không thể nói lý do. `messages.itest.ts` có một bài test
+khẳng định điều ngược lại, nêu rõ tên. Mọi tích hợp đang tồn tại mà đăng vào một private channel sẽ
+bắt đầu fail.
+
+Quy tắc không phải là *cả lớp đã chết*. Nó là *`userId` là bắt buộc trong `sendMessage` và chưa ở
+đâu khác* — và một sự tổng quát hoá cần bước kiểm chứng riêng của nó. Lệnh grep đã được viết vào bản
+plan và không được chạy cho tới ba lượt phân tích sau đó.
+
+</Trap>
+
+Cái mà lần suýt-sai này sinh ra là sự phân biệt mà phần còn lại của chương dựa lên:
+
+**Người gửi quy thuộc; nó không cấp quyền.** Token của một con người làm cả hai việc cùng lúc, và đó
+là vì sao chưa có gì từng cần gọi tên hai việc ấy riêng ra. Một key nêu tên một bot có đúng cái quyền
+mà key đó đang có; tên của bot là cái xuất hiện trên tin nhắn, không hơn. Nên cổng kiểm tra thành
+viên bật theo *người gửi là cái gì*, không phải theo việc có người gửi hay không — và một con người
+không phải thành viên thì vẫn bị từ chối, không thể phân biệt được.
+
+## Phân giải người gửi, và thứ tự các lời từ chối
+```diff title="services/api/src/messages/messages.controller.ts"
+@@ -10,7 +10,7 @@ import {
+   UseGuards,
+ } from "@nestjs/common";
+ 
+-import { CredentialGuard } from "../auth/credential.guard";
++import { Accepts, CredentialGuard } from "../auth/credential.guard";
+ import { Repository } from "../db/repository";
+ import { MessagesService } from "./messages.service";
+ import { historyQuerySchema, sendMessageBodySchema } from "./messages.schema";
+@@ -25,10 +25,16 @@ import { ZodValidationPipe } from "./zod-validation.pipe";
+ /** The end user this request acts for, or `undefined` when the tenant is acting.
+  *
+  * SOFT, unlike `internal.controller.ts`'s `principalUser`, which throws. These two
+- * routes accept BOTH credential classes — the class-level guard declares no
+- * `@Accepts`, so `credential.guard.ts` falls back to `EITHER` — and an application
+- * key legitimately carries no user. A tenant's own server sending on a customer's
+- * behalf is FR-MSG-13, not a mistake. */
++ * routes accept both credential classes — declared as `@Accepts("application", "user")`
++ * since chapter 3.17, rather than inherited from `credential.guard.ts`'s `EITHER`
++ * fallback — and an application key carries no user OF ITS OWN.
++ *
++ * THIS COMMENT SAID SOMETHING ELSE UNTIL CHAPTER 3.17, and what it said was the reading
++ * that made the gap invisible: *"A tenant's own server sending on a customer's behalf is
++ * FR-MSG-13, not a mistake."* FR-MSG-13 said the system shall support sending **on behalf
++ * of a user**, and this route named nobody — so the clause was cited for eleven chapters
++ * by the code that did the opposite of it. The clause is now narrowed to a bot user of
++ * that tenant, and the sender comes from the body (`user`), resolved below. */
+ function actingUser(req: RequestWithPrincipal): string | undefined {
+   return req.principal?.kind === "user" ? req.principal.userExternalId : undefined;
+ }
+@@ -40,9 +46,17 @@ function actingUser(req: RequestWithPrincipal): string | undefined {
+ // Chapter 3.2 swapped the guard. `EnvironmentContextGuard` resolved a tenant
+ // from a header the caller asserted; `CredentialGuard` only asks whether the
+ // principal the middleware already resolved is allowed here. Both classes are
+-// (FR-MSG-13 lets a server send on a user's behalf, and FR-AUT-10 does not
+-// reserve these routes), so this one declares nothing narrower.
++// accepted (FR-MSG-13 lets a server send on behalf of a bot user of its tenant, and
++// FR-AUT-10 does not reserve these routes) — and chapter 3.17 made that a DECLARATION
++// rather than a fallback, because a fallback is what let the gateway's credential reach
++// `POST /internal/dispatch/replay` in chapter 3.12.
++// DECLARED, NOT INHERITED FROM A FALLBACK (chapter 3.17, T027a). Until now this class
++// declared no `@Accepts` and `credential.guard.ts` fell back to `EITHER` — the fallback
++// its own comment names as the thing that let the gateway's credential reach
++// `POST /internal/dispatch/replay` in chapter 3.12. Both classes are genuinely accepted
++// here, so the declaration says the same thing the fallback did and says it on purpose.
+ @Controller("v1/channels/:channelId/messages")
++@Accepts("application", "user")
+ @UseGuards(CredentialGuard)
+ export class MessagesController {
+   constructor(
+@@ -78,18 +92,64 @@ export class MessagesController {
+     // refusing is the honest answer, and it is the same one the internal route has
+     // given since chapter 2.6. FR-039a removes the case entirely by creating the
+     // row when the token is minted.
+-    const actingExternalId = actingUser(req);
+-    let userId: string | undefined;
+-    if (actingExternalId !== undefined) {
+-      const user = await this.repo.getUserByExternalId(actingExternalId);
+-      if (!user) throw new BadRequestException("unknown user");
+-      userId = user.id;
++    // THE SENDER, RESOLVED PER CREDENTIAL CLASS (chapter 3.17, FR-010, FR-008).
++    //
++    // A user token attributes to its subject and MAY NOT name anybody else: a token is
++    // both an authorisation and an attribution, so a body `user` beside one is either a
++    // mistake or an attempt to post as someone else, and both deserve the same refusal.
++    //
++    // An application credential carries no user of its own, so the body's `user` is the
++    // only thing that can name one — and naming nothing is refused, because FR-MSG-15
++    // says every message has a sender.
++    //
++    // THE SENDER ATTRIBUTES; IT DOES NOT AUTHORISE (FR-019). What a key may reach is
++    // decided by the key. Naming a bot does not widen that, and the repository's
++    // private-channel check turns on the sender's `kind` for exactly this reason.
++    const tokenSubject = actingUser(req);
++    if (tokenSubject !== undefined && body.user !== undefined) {
++      throw new BadRequestException({
++        code: "invalid_request",
++        message:
++          "a user token is already attributed to its subject; remove `user` from the body",
++        field: "user",
++      });
++    }
++    const actingExternalId = tokenSubject ?? body.user;
++    if (actingExternalId === undefined) {
++      throw new BadRequestException({
++        code: "invalid_request",
++        message: "name the sender in `user` — an application credential has no user of its own",
++        field: "user",
++      });
++    }
++    // ONE THROW FOR BOTH FAILURES, WHICH IS THE INDISTINGUISHABILITY (T031, SC-005).
++    //
++    // An identifier belonging to another tenant and an identifier belonging to nobody
++    // are the same answer here, because there is only one place that answers. Resolving
++    // the id per tenant is what `getUserByExternalId` already does — a foreign bot is
++    // simply absent from this environment — so the two cannot diverge by construction
++    // rather than by two branches that happen to agree today.
++    //
++    // The message names no identifier. A bot's external id is often its purpose spelled
++    // out, so echoing it back would say "this exists somewhere" about the one string the
++    // caller most wants confirmed.
++    const user = await this.repo.getUserByExternalId(actingExternalId);
++    if (!user) {
++      throw new BadRequestException({
++        code: "invalid_request",
++        message: "the sender named in `user` is not a user of this environment",
++        field: "user",
++      });
+     }
+     const message = await this.messages.send(
+       channelId,
+       body,
+-      userId,
++      user.id,
+       actingExternalId,
++      // The class the credential presented, so the service can apply the bot rule
++      // without learning what a credential is (R5). A boolean rather than the
++      // principal: the service needs one fact, not the request.
++      tokenSubject === undefined,
+     );
+     // FR-MSG-04's "201-equivalent semantics" lives HERE, on the public
+     // wire: the client sees the same body whether this was the original
+@@ -104,6 +164,11 @@ export class MessagesController {
+       seq: message.seq,
+       text: message.text,
+       created_at: message.created_at,
++      // THE SENDER IT USED (chapter 3.17, FR-009a). A caller now required to name one
++      // gets told which was recorded — and for a user token, which it inferred. The
++      // internal send has carried this since chapter 2.6; the public one answered five
++      // fields and left the caller to assume.
++      user: actingExternalId,
+     };
+   }
+ 
+```
+
+Token của người dùng quy thuộc về chính subject của nó và không được nêu tên ai khác — một token vừa
+là một sự cấp quyền vừa là một sự quy thuộc, nên một `user` trong body đi kèm nó thì hoặc là một lỗi
+hoặc là một ý định đăng với danh nghĩa người khác. Một application credential không mang user của
+riêng nó, nên `user` trong body là thứ duy nhất có thể nêu tên một ai đó, và việc không nêu tên ai
+sẽ bị từ chối kèm theo tên của field.
+
+Rồi tới lời từ chối cần có mã riêng:
+```diff title="packages/protocol/src/codes.ts"
+@@ -66,6 +66,24 @@ export const ERROR_CODES = {
+   // (NFR-SEC-06).
+   wrong_credential_service:
+     "the credential's service is not permitted on this route; the message names the service presented and the services allowed",
++  // Chapter 3.17. THE THIRD IN THE SAME FAMILY, one dimension further over. Its two
++  // siblings are directly above: `wrong_credential_type` is the wrong CLASS,
++  // `wrong_credential_service` the wrong SERVICE, and this one is the right class
++  // holding the right service naming the wrong KIND OF USER — an application key
++  // asking to post as a person.
++  //
++  // NOT `forbidden`, for the reason this file has now given twice. `ProtocolErrorFilter`
++  // maps a bare 403 to `forbidden`, so this is the one code in the chapter that collides
++  // with the filter's ladder, and the ladder is what has to lose: "you lack a
++  // permission" is a different fact from "a key may speak as software and not as any
++  // person", and only the second tells an integrator what to change.
++  //
++  // The MESSAGE names neither the person asked for nor the bots available. Which
++  // identifiers exist in a tenant is exactly what the isolation oracle exists to keep
++  // out of a refusal (FR-009, SC-005), and a message listing the acceptable senders
++  // would be an enumeration endpoint with a 403 in front of it.
++  sender_not_permitted:
++    "an application credential may send only as a bot user; name one in `user`",
+   // Chapter 3.12. FR-CHN-07's ceiling: a channel holds at most 1,000 members and
+   // an add that would cross it is refused with 422 and this code.
+   //
+```
+
+<Why title="Không phải `forbidden`, và đây là lần thứ ba trong tệp này">
+
+`ProtocolErrorFilter` map một 403 trơ thành `forbidden`, và đây là mã duy nhất trong chương xung đột
+với cái thang đó. `codes.ts` đã lập luận điều này hai lần rồi — `wrong_credential_type` là sai *lớp*
+credential, `wrong_credential_service` là sai *service*, và cái này là đúng lớp nhưng nêu tên sai
+*loại user*.
+
+"Bạn thiếu một quyền" và "một key chỉ được nói với danh nghĩa phần mềm chứ không phải bất kỳ con
+người nào" là hai sự thật khác nhau, và chỉ cái thứ hai nói cho người tích hợp biết phải đổi gì. Theo
+đúng lời của chính registry: *một client không phân biệt được chúng sẽ thử lại sai cái mãi mãi.*
+
+Thông điệp không nêu tên con người được yêu cầu, cũng không nêu tên những bot lẽ ra sẽ hợp lệ. Những
+mã định danh nào tồn tại trong một tenant chính là thứ mà isolation oracle tồn tại để giữ ra ngoài
+một lời từ chối.
+
+</Why>
+
+Bản hợp đồng của route này ghi năm lời từ chối theo thứ tự: ban, khả kiến, lưu trữ, rồi
+người-gửi-có-phân-giải-được, rồi credential-này-có-được-gửi-với-danh-nghĩa-đó. **Thứ tự đó không
+thực hiện được như đã viết**, và việc tìm ra vì sao đã thay đổi chỗ đặt phần kiểm tra cuối.
+
+<Figure caption="Năm lời từ chối, mỗi cái hé ra điều gì, và vì sao việc phân giải người gửi không thể là thứ tư" code={figRefusalOrder} />
+
+Phần kiểm tra ban đọc row của người gửi — một lệnh ban áp lên *người gửi được nêu tên*, không phải
+lên caller, và đó là điều làm cho việc ban một bot có ý nghĩa. Nên người gửi phải được phân giải
+xong trước khi phần kiểm tra đầu tiên chạy được. Phân giải là bước số không, không phải bước thứ tư.
+
+Cái còn sống sót là phần mà bản hợp đồng thật sự lập luận cho: **phân giải trước khi kiểm tra loại**,
+để một lời từ chối nêu ra một sự thật về một user không thể bị kích ra cho một channel mà caller lẽ
+ra không thể tới được. Hai bước đó giờ không còn liền nhau — một cái đứng đầu và một cái đứng cuối:
+```diff title="services/api/src/messages/messages.service.ts"
+@@ -14,6 +14,7 @@ import {
+   Repository,
+   type MessageRow,
+   type MessageWithSender,
++  SenderNotPermittedError,
+ } from "../db/repository";
+ import { QuotaExceededError } from "../quotas/quota.error";
+ import { decodeCursor, encodeCursor } from "./cursor";
+@@ -36,7 +37,10 @@ export class MessagesService {
+     channelId: string,
+     body: SendMessageBody,
+     /** Chapter 2.6: who wrote it. Optional because an APPLICATION-key send is
+-     * unattributed — it acts for the tenant and there is no user to name.
++     * unattributed — it acted for the tenant and there was no user to name. **That is no
++     * longer true**: chapter 3.17 made every message carry a sender (FR-MSG-15), and a key
++     * names a bot user of its tenant. The parameter below is required at the repository and
++     * resolved by the controller before this method is called.
+      *
+      * IT IS NO LONGER OPTIONAL FOR A USER TOKEN. Chapter 3.15 made the public
+      * route resolve its principal (T031a): the membership check in `sendMessage`
+@@ -50,12 +54,27 @@ export class MessagesService {
+      * one — it is the token's subject — so threading it costs nothing where a
+      * lookup inside the write transaction would cost a query per message. */
+     userExternalId?: string,
++    /** Whether the caller is an application credential (chapter 3.17, FR-007, T030).
++     *
++     * A BOOLEAN, NOT THE PRINCIPAL. The service needs one fact to apply the bot rule and
++     * has no business holding the request; the controller is what knows about credential
++     * classes. Passed through to the repository as `senderMustBeBot`, which knows even
++     * less — only that this send's sender has to be software (R5). */
++    senderMustBeBot = false,
+   ): Promise<MessageRow> {
+     try {
++      // THE SENDER IS RESOLVED BEFORE HERE (chapter 3.17, FR-008). The controller does
++      // it per credential class and refuses an absent or unresolvable one with a 400
++      // naming `user`, so by this line there is a sender and it exists in this tenant.
++      // What remains is the narrowing the compiler needs.
++      if (userId === undefined) {
++        throw new Error("a message must name its sender (FR-MSG-15, FR-008)");
++      }
+       return await this.repo.sendMessage(channelId, {
+         text: body.text,
+         metadata: body.metadata,
+-        ...(userId !== undefined && { userId }),
++        userId,
++        senderMustBeBot,
+         ...(userExternalId !== undefined && { userExternalId }),
+         ...(body.idempotency_key != null && {
+           idempotencyKey: body.idempotency_key,
+@@ -72,6 +91,25 @@ export class MessagesService {
+       // about the CALLER, not about the channel, so saying so reveals nothing about what
+       // channels exist — and a client that cannot tell "you are banned" from "no such
+       // channel" retries for ever against a wall.
++      // 403 `sender_not_permitted`, AND NOT `forbidden` (chapter 3.17, FR-007a, T032a).
++      //
++      // `ProtocolErrorFilter` maps a bare 403 to `forbidden`, and this is the only code
++      // in the chapter that collides with the ladder — so it is named here, the way
++      // chapter 3.12 named `wrong_credential_service` for the same reason. The filter
++      // prefers an explicit code when one is given; leaving it to the ladder would put
++      // "you lack a permission" on the wire in place of the one fact an integrator can
++      // act on.
++      //
++      // THE MESSAGE NAMES NOBODY. Not the person asked for, not the bots that would
++      // have worked. Which identifiers exist in a tenant is what the oracle exists to
++      // keep out of a refusal (SC-005).
++      if (error instanceof SenderNotPermittedError) {
++        throw protocolError(
++          "sender_not_permitted",
++          "an application credential may send only as a bot user; name one in `user`",
++          HttpStatus.FORBIDDEN,
++        );
++      }
+       if (error instanceof UserBannedError) {
+         throw protocolError(
+           "user_banned",
+```
+
+Điều đó quyết định chỗ đặt phần kiểm tra loại. Bản plan nói là ở service chứ không ở repository, vì
+repository không được biết credential là cái gì. Nhưng service chạy *trước* repository, nên áp nó ở
+đó sẽ đặt nó lên trước ban, khả kiến và lưu trữ — và làm lộ đúng cái mà thứ tự kia bảo vệ. Nó nằm
+trong repository, được cho biết `senderMustBeBot`: một điều kiện ràng buộc, không phải một lớp
+credential. Repository vẫn không biết credential là cái gì.
+
+## Một bot ở khắp nơi, trừ ở cửa vào
+
+Một bot là một user, nên nó thừa hưởng mọi thứ khoá theo user: thành viên kèm role, một danh sách
+channel, số tin chưa đọc, một lệnh ban, một lần xoá vẫn giữ nguyên sự quy thuộc của các tin nhắn nó
+đã gửi. Điều nó không làm được là xác thực:
+```diff title="services/api/src/auth/dev-token.controller.ts"
+@@ -100,7 +100,31 @@ export class DevTokenController {
+     // an existing row — its own comment is about refusing to rename anybody — so
+     // `banned_at` and `deleted_at` survive a mint. `upsertUser` is the route that
+     // clears state, and it clears only `deleted_at`, because FR-030 asks it to.
+-    await new Repository(this.db, principal.environmentId).createUser(body.user);
++    // A BOT CANNOT OBTAIN A TOKEN (chapter 3.17, FR-005, T040, T041).
++    //
++    // `createUser` still creates a PERSON for an unknown identifier — FR-005a, and the
++    // paragraph above is why that matters — so this refusal is only ever about a row
++    // that already exists and is already software. A bot is an identity messages are
++    // sent AS, not an account that logs in, and a token is the one thing that would make
++    // it the second.
++    //
++    // 404 `not_found`, AND THERE IS NO INDISTINGUISHABLE ANSWER AVAILABLE. Everywhere
++    // else in this chapter a refusal is made byte-identical to the refusal for an
++    // identifier that exists nowhere — but on this route an unknown identifier answers
++    // **200 with a token**, because chapter 3.16 made the mint create the row. So there
++    // is nothing for a refusal to be identical to: any refusal at all says "this
++    // identifier exists and is not a person". That is a leak this route cannot close,
++    // and 404 is chosen because it is the answer this route already gives for an
++    // environment it cannot resolve — one shape rather than a new one (FR-005).
++    const repo = new Repository(this.db, principal.environmentId);
++    const existing = await repo.getUserByExternalId(body.user);
++    if (existing?.kind === "bot") {
++      throw new NotFoundException({
++        code: "not_found",
++        message: "no such user",
++      });
++    }
++    await repo.createUser(body.user);
+ 
+     const { token, expiresAt } = await mintUserToken(environment.signingSecret, {
+       user: body.user,
+```
+
+<Trap title="Chỉ từ chối ở chỗ cấp token thì còn lại một cửa sổ 24 giờ">
+
+Một token sống tối đa 24 giờ. Một user được nâng thành bot lúc 09:00 vẫn giữ một token hợp lệ tới
+09:00 ngày mai, và route session đọc `banned_at` mà không đọc `kind`. Đóng chỗ cấp token mà không
+đóng session thì cùng hình dạng với một lệnh ban chỉ có hiệu lực ở lần kết nối sau.
+
+</Trap>
+```diff title="services/api/src/internal/session.controller.ts"
+@@ -60,6 +60,21 @@ export class SessionController {
+     }
+ 
+     const user = await this.repo.getUserByExternalId(principal.userExternalId);
++    // A BOT MAY NOT OPEN A SOCKET EITHER (chapter 3.17, FR-005b, T040a).
++    //
++    // REFUSING AT THE MINT IS NOT ENOUGH, and the window is the reason. A token lives
++    // up to 24 hours (FR-AUT-07), so a user promoted to a bot at 09:00 holds a valid
++    // token until 09:00 tomorrow — and this route reads `banned_at` and, until now, not
++    // `kind`. Closing the mint alone would leave a bot able to connect for a day after
++    // it became one, which is the same shape as a ban that only takes effect on the
++    // next connect.
++    //
++    // The socket sees a closed connection rather than a 404: the gateway calls this
++    // route and has nothing to say to a client whose session was refused, which is why
++    // the test for this lives in the gateway's suite and not here.
++    if (user?.kind === "bot") {
++      throw new UnauthorizedException("a bot user cannot open a session");
++    }
+     // A verified token for a user this environment has never seen is not an
+     // error: it is a user with no channels. The gateway's job is delivery, not
+     // identity forensics — 2.5's rule, and the reason a first connect from a
+```
+
+Đây cũng là lời từ chối duy nhất trong chương không thể làm cho không-phân-biệt-được. Ở mọi nơi
+khác, một lời từ chối cho một mã định danh của tenant khác là giống từng byte với lời từ chối cho một
+mã định danh không tồn tại ở đâu cả. Ở chỗ cấp token, một mã định danh chưa biết sẽ nhận **200 kèm
+một token** — chương 3.16 khiến nó tạo row — nên không có gì để một lời từ chối giống với. Bất kỳ
+lời từ chối nào cũng nói rằng "mã định danh này tồn tại và nó không phải một con người". Chỗ rò rỉ
+đó không đóng được trên route này, và nói ra thì tốt hơn là một assertion giả vờ điều ngược lại.
+
+## Bị tính tiền, và được miễn
+
+`usage_active_users` trông như một câu hỏi về tiền. Nó là hai câu hỏi, và câu thứ hai từ chối tin
+gửi.
+
+<Figure caption="Một bảng, hai bên đọc, và chỉ một bên nói không" code={figTwoCounters} />
+
+Lệnh insert ghi lại mức dùng. Một khối riêng so một con đếm với cái ngưỡng được cấu hình rồi throw.
+Một bot mặc định thừa hưởng cả hai — nên phần mềm của chính khách hàng sẽ chiếm chỗ cuối cùng, và
+**con người kế tiếp của họ đăng bài trong kỳ đó sẽ bị từ chối**. Thiệt hại rơi vào người không gây
+ra nó.
+
+Câu trả lời là bị tính tiền và được miễn: cái ngưỡng giới hạn dân số con người của một khách hàng, và
+hạ tầng của chính họ không nên khoá được người của họ khỏi việc gửi. Và SRS đã tách hai việc đó từ
+trước — FR-ANL-05 *đo* số active user duy nhất, FR-RTL-05 *áp* một quota lên chúng, hai điều khoản ở
+hai họ khác nhau. Chỉ một trong hai bị thu hẹp.
+
+<Trap title="Việc miễn có hai nửa, và nửa thứ hai mới quyết định nó có hoạt động">
+
+Trả về sớm để một bot không bị từ chối là nửa nhìn thấy được. Con đếm mà cái ngưỡng đem ra so
+**cũng** phải loại bot ra — nếu không thì row của bot vẫn chiếm một chỗ và một con người vẫn bị từ
+chối, mà việc lần gửi của chính bot đi qua được lại làm nó trông như đã sửa xong.
+
+Bài test cho việc này là một *con người* gửi sau một bot, không bao giờ là chính con bot. Bản đầu
+tiên của nó đặt ngưỡng bằng số người đã gửi rồi, nghĩa là người kế tiếp vượt ngưỡng theo cả hai
+đường: nó pass với chỉ một nửa bản sửa được áp, đã kiểm chứng bằng cách bỏ nửa còn lại ra và xem cả
+26 bài test quota vẫn xanh. Số học phải tách được hai phiên bản — riêng con người thì dưới ngưỡng,
+con người cộng con bot thì đúng bằng ngưỡng.
+
+Đây là mục thứ sáu trong họ những bài test của dự án này vốn xanh mà chẳng chứng minh điều gì, và là
+mục đầu tiên do một người đã đọc năm mục kia viết ra.
+
+</Trap>
+
+Một hệ quả, nêu ra vì nếu không thì nó là một cuộc gọi hỗ trợ: con số bị tính tiền và con số được áp
+ngưỡng giờ lệch nhau đúng bằng số bot. Một tenant có thể thấy "5 trên 5 active user" trên trang mức
+dùng trong khi người của họ vẫn gửi được.
+
+## Những row có từ trước
+
+121.250 tin nhắn trong lane này không có người gửi, rải trên 10.077 environment. Quy tắc của chương
+này nói về các lần ghi mới; những row đó vẫn ở lại, và FR-012 yêu cầu cả bốn đường đọc vẫn phải chạy
+được với chúng. Yêu cầu đó đòi thêm một điều nữa: rằng câu trả lời phải *giống nhau* trên cả bốn.
+
+Nó không thể giống nhau, và lý do nằm ở các bản hợp đồng chứ không ở code:
+```text
+history      listMessages          user: null      readable
+listing      last_message          user: null      readable
+webhook      MessageCreatedData    user: null      readable
+resume       toFrame               row DROPPED     not renderable
+```
+
+`messageSchema.user` là `z.string().min(1)` — một frame không thể mang một null, và đổi điều đó sẽ
+làm vỡ mọi client đã công bố. Nên cái giống nhau trên cả bốn là *quyết định*: **không bao giờ bịa ra
+một người gửi.** Ở đâu một bản hợp đồng diễn tả được "không có ai" thì nó nói null; ở đâu không diễn
+tả được thì row không được giao. Đó là một câu yếu hơn câu mà yêu cầu đòi hỏi, và nó là câu đúng.
+
+`MessageCreatedData.user` vẫn là `string | null` vì cùng lý do đó. Không gì tạo được một null mới —
+trình biên dịch cấm — nhưng một lần thử lại webhook chạy tới hai giờ, và hàng đợi đã đầy sẵn khi quy
+tắc thay đổi. Thu hẹp kiểu dữ liệu sẽ là khẳng định rằng một điều đang bay giữa đường không thể xảy
+ra.
+
+<Why title="Một nửa của một khoảng trống hai-cơ-chế được đóng ngoài dự tính">
+
+Chương 3.12 ghi lại rằng một tin nhắn gửi qua REST không tới được socket nào, và liệt kê hai nguyên
+nhân độc lập: không có gì publish, và lần gửi không truyền user. Cho mọi lần gửi một người gửi thì
+nguyên nhân thứ hai mất đi. Đã đo: giao trực tiếp vẫn không tới đâu cả, vì chỉ gateway publish vào
+fan-out — nhưng **lần resume giờ giao được nó**, vì `toFrame` không còn lý do bỏ row đó đi.
+
+Bài test vốn ghim cả hai nguyên nhân cùng lúc giờ fail ở đúng cái nửa đã đổi, và đó là cách khoảng
+trống này hoá ra chỉ được đóng một nửa. Chương 3.18 là nửa còn lại.
+
+</Why>
+
+## Một caller đang tồn tại phải đổi những gì
+
+Đây là một thay đổi phá vỡ tương thích trên một route đã ship ở chương 2.2, và gọi nó bằng cái tên
+nào khác cũng là không trung thực. Một application key đăng lên `POST
+/v1/channels/:channelId/messages` mà không nêu tên một `user` sẽ nhận **400** ở chỗ trước đây nhận
+201. Cách sửa là hai request: tạo một bot một lần, rồi nêu tên nó ở mọi lần gửi.
+
+Lần gửi bằng token của người dùng không bị ảnh hưởng — nó không nêu tên ai và được quy thuộc về
+subject của nó, đúng như trước. Chỗ vỡ rơi hoàn toàn vào những bên gửi xác thực bằng key, và đó
+chính là lớp mà yêu cầu này luôn nói về.
+
+Ba mươi lăm tệp trong repository nền tảng đã đổi để điều này thành thật. Hai mươi bảy trong số đó
+được rào ở trên. Tám tệp còn lại không được chương nào rào cả — kể cả README, là chính cái tệp mà
+một người ngoài được chỉ tới để đọc.
+
+<Trap title="Không có checker nào trong repository này đọc văn xuôi">
+
+`check:fences` replay code đã rào lên nền tảng. `check:figures` khẳng định một figure có nguồn.
+`check:docs` so từng tài liệu được nhân bản với bản gốc của nó. `check:srs` đọc các mã định danh.
+**Một câu đã công bố khẳng định một điều sai sẽ vượt qua cả bốn.**
+
+Chương 3.10 mang một `<Trap>` tiêu đề *"Một lần gửi vô danh tính vào tin nhắn và không tính vào
+ai"*, và phần thân của nó lập luận chống lại quyết định của chương này, dựa trên đúng cái nền mà
+chương này quyết định theo hướng khác. Nó sống qua mười lăm lượt phân tích của feature này. Giờ nó
+đã được sửa, cùng với lý do mà chương 3.13 đã nêu cho một đường nối không còn đứng vững — cả hai đều
+do một con người đọc ra, vì không có dụng cụ nào cho việc đó.
+
+</Trap>
+
+## 19 tệp chương này đổi mà không dạy
+
+Mọi send site trong workspace đều phải nêu tên một người gửi, và phần lớn chúng là test. Một fixture
+có thêm một bot thì không phải một bài học, nên không có gì trong đây đáng viết thành văn xuôi —
+nhưng chuỗi fence không quan tâm vì sao một tệp đổi. Trạng thái của một đường dẫn đã được tuyên bố
+phải bằng đúng trạng thái trong repository, nên chúng nằm đây ở một chỗ chứ không rải rác qua những
+mục chẳng có gì để nói về chúng.
+
+Chương 3.16 gặp đúng hình dạng này từ phía bên kia: mười một tệp nó đổi đúng một từ, cho nó mười một
+**fence không có chủ đề**. Đây là mặt ngược lại — những chủ đề mà người đọc không cần, trên những
+đường dẫn mà chuỗi vẫn phải tính đến.
+```diff title="packages/outsider/src/integrate.itest.ts"
+@@ -113,20 +113,25 @@ describe("integrating with Relay from the outside", () => {
+     expect(again.body["id"]).toBe(channelId);
+   });
+ 
+-  it("refuses a private channel, naming the field", async () => {
+-    // Documented behaviour, not a guess: the reference says `type` accepts
+-    // `public` and the error names the offending key. An integration that reads
+-    // the reference should be able to rely on both.
++  it("creates a PRIVATE channel, which the route began accepting in chapter 3.15", async () => {
++    // THIS TEST WAS RED FOR TWO CHAPTERS AND NOBODY SAW IT (chapter 3.17, T065).
++    //
++    // It asserted `400` with `field: "type"`, which was true when it was written: the
++    // create route took `public` only. Chapter 3.15 (`43899e3`, "the private type decides
++    // something, on every read") widened the enum to `["public","private"]` and this
++    // suite was not run at that chapter's close — `pnpm test:outsider` is its own lane,
++    // outside `pnpm test:integration`, so nothing in the twenty-run battery touches it.
++    //
++    // The one suite that stands for an external developer was wrong about the API for two
++    // chapters. That is chapter 3.14's unmet half showing itself: a sealed suite proves
++    // nothing about the documentation if nobody runs it.
+     const res = await post(
+       "/v1/channels",
+       { external_id: `outsider-private-${Date.now()}`, type: "private" },
+       credential,
+     );
+-    expect(res.status).toBe(400);
+-    expect(res.body["code"]).toBe("invalid_request");
+-    expect(res.body["field"]).toBe("type");
+-    // And the docs_url is a URL, with the code as its fragment.
+-    expect(String(res.body["docs_url"])).toContain("#invalid_request");
++    expect(res.status).toBe(201);
++    expect(res.body["type"]).toBe("private");
+   });
+ 
+   it("adds two members, creating the users on first membership", async () => {
+@@ -148,10 +153,74 @@ describe("integrating with Relay from the outside", () => {
+     expect(typeof token).toBe("string");
+   });
+ 
++  it("creates a bot, because a key send must name one", async () => {
++    // FOLLOWED FROM THE README, which says an application key carries no user of its own
++    // and may name only a bot — and that `kind` and `description` travel together. This
++    // suite is sealed from workspace code, so what it knows is what the documentation
++    // says.
++    const res = await post(
++      "/v1/users",
++      {
++        users: [
++          {
++            external_id: "outside-bot",
++            display_name: "Outside Bot",
++            kind: "bot",
++            description: "the outsider's own software, posting from a script",
++          },
++        ],
++      },
++      credential,
++    );
++    expect(res.status).toBe(200);
++    const data = res.body["data"] as {
++      external_id: string;
++      kind: string;
++      description: string;
++    }[];
++    expect(data[0]).toMatchObject({
++      external_id: "outside-bot",
++      kind: "bot",
++      description: "the outsider's own software, posting from a script",
++    });
++  });
++
++  it("refuses a send that names nobody, and says which field", async () => {
++    // The refusal an integrator meets first if they skip the step above. Worth asserting
++    // from out here: a 400 that did not name the field would leave a developer guessing,
++    // and the README promises this one.
++    const res = await post(
++      `/v1/channels/${channelId}/messages`,
++      { text: "who is this from?" },
++      credential,
++    );
++    expect(res.status).toBe(400);
++    expect(res.body["field"]).toBe("user");
++  });
++
++  it("refuses a send that names a person, with its own code", async () => {
++    // "ana" was created by the member-add above, so she is a PERSON. A key may not post
++    // as her — and the code is specific rather than a generic 403, which is what tells an
++    // integrator to create a bot instead of to go looking for a permission.
++    const res = await post(
++      `/v1/channels/${channelId}/messages`,
++      { text: "posting as a human", user: "ana" },
++      credential,
++    );
++    expect(res.status).toBe(403);
++    expect(res.body["code"]).toBe("sender_not_permitted");
++  });
++
+   it("sends a message over REST and reads it back from history", async () => {
+     const text = `from the outside ${Date.now()}`;
+-    const sent = await post(`/v1/channels/${channelId}/messages`, { text }, credential);
++    const sent = await post(
++      `/v1/channels/${channelId}/messages`,
++      { text, user: "outside-bot" },
++      credential,
++    );
+     expect(sent.status).toBe(201);
++    // The response echoes the sender it recorded, which the README promises.
++    expect(sent.body["user"]).toBe("outside-bot");
+ 
+     const history = await fetch(`${api}/v1/channels/${channelId}/messages?limit=10`, {
+       headers: { authorization: `Bearer ${credential}` },
+@@ -162,11 +231,11 @@ describe("integrating with Relay from the outside", () => {
+   });
+ 
+   it("receives a message on a socket — SENT over the socket", async () => {
+-    // THE SEND HAS TO BE ON THE SOCKET, and finding that out is one of the gaps
+-    // this exercise recorded. A message sent over `POST /v1/channels/:id/messages`
+-    // reaches no socket at all: the api publishes to no fan-out, and the public
+-    // send attributes no user, so the row is dropped from resume for having no
+-    // sender. Nothing in the published documentation said so.
++    // THE SEND HAS TO BE ON THE SOCKET, and finding that out is one of the gaps this
++    // exercise recorded. It had TWO causes and chapter 3.17 removed one: the api still
++    // publishes to no fan-out, so nothing arrives LIVE — but the public send now
++    // attributes a sender, so the row is no longer dropped from a resume. Half the gap,
++    // and the half that remains is the fan-out.
+     const socket = new WebSocket(`${ws}/v1/ws?token=${token}`);
+     const frames: { type: string; payload?: { text?: string; seq?: number } }[] = [];
+     // Listeners attached BEFORE the open await. `connection.ack` arrives the
+```
+
+```diff title="packages/protocol/src/codes.test.ts"
+@@ -59,14 +59,19 @@ describe("error codes stay unique and described", () => {
+ // that is not in this object cannot be constructed anywhere in the platform without
+ // failing the build. This suite checks the shape of the object those types rest on.
+ describe("the registry is the whole vocabulary (FR-024)", () => {
+-  it("holds sixteen codes", () => {
++  it("holds seventeen codes", () => {
+     // A number, so adding one is a visible edit rather than a silent widening. The
+     // count is here and not in a comment because a comment does not fail.
+     //
+     // Thirteen until chapters 3.15 and 3.16 added `not_a_member`,
+     // `channel_archived` and `user_banned` — three refusals a client acts on
+     // differently, which is the test this registry sets.
+-    expect(Object.keys(ERROR_CODES)).toHaveLength(16);
++    //
++    // Sixteen until chapter 3.17 added `sender_not_permitted`, and **this assertion
++    // failed on the build that added it** — "expected 16 but got 17", which is the
++    // third time this line has turned a new code into a decision instead of an
++    // accident. Chapter 3.11's close-code set did the same for 4003.
++    expect(Object.keys(ERROR_CODES)).toHaveLength(17);
+   });
+ 
+   it("contains the five the status ladder emits", () => {
+```
+
+```diff title="services/api/src/auth/credentials.itest.ts"
+@@ -4,6 +4,7 @@ import { Test } from "@nestjs/testing";
+ import type { INestApplication } from "@nestjs/common";
+ import { SignJWT } from "jose";
+ import { afterAll, beforeAll, describe, expect, it } from "vitest";
++import { randomUUID } from "node:crypto";
+ 
+ import { AppModule } from "../app.module";
+ import { createDb, createPool, type Db } from "../db/client";
+@@ -137,7 +138,19 @@ describe("credentials", () => {
+     channelId = (await repo.createChannel("general", "public")).id;
+     await repo.createUser("tuan", "Tuan");
+ 
++    // A BOT IN EACH ENVIRONMENT (chapter 3.17). A key send names one, and the FOREIGN
++    // key must name a bot of ITS OWN tenant — otherwise the attack below would be
++    // refused for naming an unresolvable sender (400) rather than for reaching a channel
++    // it cannot see (404), and the test would stop attacking what it attacked.
++    await repo.upsertUser("cred-bot", {
++      kind: "bot",
++      description: "sends so a credential test has something to send",
++    });
+     foreign = await createEnvironment(db, { name: "credentials-itest-other" });
++    await new Repository(db, foreign.id).upsertUser("cred-bot", {
++      kind: "bot",
++      description: "the other tenant's own software",
++    });
+     foreignKey = await createApiKey(db, { environmentId: foreign.id });
+     foreignChannelId = (
+       await new Repository(db, foreign.id).createChannel("theirs", "public")
+@@ -198,7 +211,7 @@ describe("credentials", () => {
+     expect(stored).not.toContain(minted.credential);
+ 
+     // And it still works — unrecoverable is not the same as unusable.
+-    expect((await post({ text: "with the new key" }, minted.credential)).status).toBe(
++    expect((await post({ text: "with the new key", user: "cred-bot" }, minted.credential)).status).toBe(
+       201,
+     );
+   });
+@@ -228,9 +241,14 @@ describe("credentials", () => {
+   });
+ 
+   it("invariant 4: a foreign key sees nothing, and it looks exactly like absent", async () => {
+-    const foreignAnswer = await post({ text: "trespass" }, foreignKey.credential);
++    // The foreign key names a bot of ITS OWN tenant, so the only thing wrong with this
++    // request is the channel — which is what the test is about.
++    const foreignAnswer = await post(
++      { text: "trespass", user: "cred-bot" },
++      foreignKey.credential,
++    );
+     const absentAnswer = await post(
+-      { text: "nowhere" },
++      { text: "nowhere", user: "cred-bot" },
+       key.credential,
+       "00000000-0000-0000-0000-000000000000",
+     );
+@@ -242,7 +260,7 @@ describe("credentials", () => {
+ 
+     // And the reverse direction, so the test cannot pass by both being broken.
+     expect(
+-      (await post({ text: "mine" }, foreignKey.credential, foreignChannelId))
++      (await post({ text: "mine", user: "cred-bot" }, foreignKey.credential, foreignChannelId))
+         .status,
+     ).toBe(201);
+   });
+@@ -252,10 +270,10 @@ describe("credentials", () => {
+       environmentId: env.id,
+       name: "doomed",
+     });
+-    expect((await post({ text: "before" }, doomed.credential)).status).toBe(201);
++    expect((await post({ text: "before", user: "cred-bot" }, doomed.credential)).status).toBe(201);
+     await revokeApiKey(db, doomed.id);
+     // No wait, no cache to expire: verification is a live query (research R7).
+-    expect((await post({ text: "after" }, doomed.credential)).status).toBe(401);
++    expect((await post({ text: "after", user: "cred-bot" }, doomed.credential)).status).toBe(401);
+   });
+ 
+   it("invariant 6: several active keys work at once, which is what rotation needs", async () => {
+@@ -263,8 +281,8 @@ describe("credentials", () => {
+       environmentId: env.id,
+       name: "rotation",
+     });
+-    expect((await post({ text: "old key" }, key.credential)).status).toBe(201);
+-    expect((await post({ text: "new key" }, second.credential)).status).toBe(201);
++    expect((await post({ text: "old key", user: "cred-bot" }, key.credential)).status).toBe(201);
++    expect((await post({ text: "new key", user: "cred-bot" }, second.credential)).status).toBe(201);
+   });
+ 
+   it("invariant 7: a token is refused when expired, malformed, mis-signed, foreign, or over-long", async () => {
+@@ -296,6 +314,42 @@ describe("credentials", () => {
+     ).toBe(401);
+   });
+ 
++  // ── T042: the mint's three cases (chapter 3.17, FR-005, FR-005a, SC-006) ──
++  //
++  // DO NOT ASSERT BYTE-IDENTITY WITH THE UNKNOWN CASE. Everywhere else in this chapter a
++  // refusal is made indistinguishable from the refusal for an identifier that exists
++  // nowhere — here the unknown case SUCCEEDS, because chapter 3.16 made the mint create
++  // the row. There is nothing to be identical to, and any refusal at all says "this
++  // identifier exists and is not a person". That is a leak this route cannot close, and
++  // saying so is better than an assertion that pretends otherwise.
++  it("mints for an unknown identifier and creates it as a PERSON", async () => {
++    const fresh = `never-seen-${randomUUID().slice(0, 8)}`;
++    const res = await devToken(key.credential, { user: fresh });
++    expect(res.status).toBe(200);
++    // FR-005a: implicit creation must not produce a bot, or a customer could make one
++    // by accident and then find it cannot authenticate.
++    const created = await new Repository(db, env.id).getUserByExternalId(fresh);
++    expect(created?.kind).toBe("person");
++  });
++
++  it("mints for a person who already exists", async () => {
++    const repo = new Repository(db, env.id);
++    const who = `person-${randomUUID().slice(0, 8)}`;
++    await repo.createUser(who, "A Person");
++    expect((await devToken(key.credential, { user: who })).status).toBe(200);
++  });
++
++  it("refuses a bot with 404 — a bot is not an account", async () => {
++    const repo = new Repository(db, env.id);
++    const who = `bot-${randomUUID().slice(0, 8)}`;
++    await repo.upsertUser(who, { kind: "bot", description: "cannot log in" });
++    const res = await devToken(key.credential, { user: who });
++    expect(res.status).toBe(404);
++    expect((await res.json()).code).toBe("not_found");
++    // FR-005a's other half: the refusal must not have converted anything.
++    expect((await repo.getUserByExternalId(who))?.kind).toBe("bot");
++  });
++
+   it("invariant 9: the dev-token endpoint mints in development and does not exist in production", async () => {
+     const minted = await devToken(key.credential);
+     expect(minted.status).toBe(200);
+@@ -408,8 +462,14 @@ describe("credentials", () => {
+     // And the key it did hand over works on the environment it belongs to.
+     const repo = new Repository(db, first.environment.id);
+     const channel = await repo.createChannel("signup-key", "public");
++    // A THIRD ENVIRONMENT, seeded by signup rather than by this file's `beforeAll` — so
++    // it needs its own bot (chapter 3.17).
++    await repo.upsertUser("cred-bot", {
++      kind: "bot",
++      description: "the freshly signed-up tenant's own software",
++    });
+     expect(
+-      (await post({ text: "bootstrapped" }, first.apiKey!.secret, channel.id))
++      (await post({ text: "bootstrapped", user: "cred-bot" }, first.apiKey!.secret, channel.id))
+         .status,
+     ).toBe(201);
+   });
+```
+
+```diff title="services/api/src/channels/channels.itest.ts"
+@@ -3,6 +3,7 @@ import "reflect-metadata";
+ import { Test } from "@nestjs/testing";
+ import type { INestApplication } from "@nestjs/common";
+ import { afterAll, beforeAll, describe, expect, it } from "vitest";
++import { randomUUID } from "node:crypto";
+ 
+ import { AppModule } from "../app.module";
+ import { mintUserToken } from "../auth/user-token";
+@@ -510,6 +511,8 @@ describe("the public channel surface", () => {
+       const sent = await fetch(`${url}/v1/channels/${publicChannelId}/messages`, {
+         method: "POST",
+         headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
++        // NO `user` — this is a USER TOKEN, and naming one beside a token is refused
++        // (FR-010). Adding it here was a reflex during T061 and the test caught it.
+         body: JSON.stringify({ text: "still open to me" }),
+       });
+       expect(sent.status).toBe(201);
+@@ -640,12 +643,25 @@ describe("the public channel surface", () => {
+       fetch(`${url}/v1/channels/${channel}/messages`, {
+         method: "POST",
+         headers: { "content-type": "application/json", authorization: `Bearer ${credential}` },
+-        body: JSON.stringify({ text: "attempted after archiving" }),
++        body: JSON.stringify({
++          text: "attempted after archiving",
++          user: "archive-bot",
++        }),
+       });
+ 
+     beforeAll(async () => {
+       archived = (await repo.createChannel("archivable", "public")).id;
+-      await repo.sendMessage(archived, { text: "written before archiving" });
++      // A key send names a bot (chapter 3.17). The refusal under test is the ARCHIVE's,
++      // so the sender must resolve or the test would be measuring a 400 about `user`.
++      await repo.upsertUser("archive-bot", {
++        kind: "bot",
++        description: "sends at an archived channel so the refusal can be checked",
++      });
++      const scribe = (await repo.createUser(`ch-${randomUUID().slice(0, 8)}`)).id;
++      await repo.sendMessage(archived, {
++        text: "written before archiving",
++        userId: scribe,
++      });
+     });
+ 
+     it("refuses a send with its own code, distinct from not-found and banned", async () => {
+@@ -704,7 +720,13 @@ describe("the public channel surface", () => {
+       // 12's route — this is the invariant that makes the count safe, tested where it
+       // can be tested.
+       const target = (await repo.createChannel("archive-unread", "public")).id;
+-      const before = (await repo.sendMessage(target, { text: "unread by somebody" })).seq;
++      const teller = (await repo.createUser(`ch-${randomUUID().slice(0, 8)}`)).id;
++      const before = (
++        await repo.sendMessage(target, {
++          text: "unread by somebody",
++          userId: teller,
++        })
++      ).seq;
+       await archive(target);
+       const after = await repo.listMessages(target, { limit: 10 });
+       expect(after.map((m) => m.seq)).toContain(before);
+```
+
+```diff title="services/api/src/db/history-drift.itest.ts"
+@@ -1,4 +1,5 @@
+ import { beforeAll, describe, expect, it } from "vitest";
++import { randomUUID } from "node:crypto";
+ import { desc, eq, sql } from "drizzle-orm";
+ 
+ import { createDb, createPool, DEFAULT_DATABASE_URL, type Db } from "./client";
+@@ -52,14 +53,15 @@ beforeAll(async () => {
+ 
+ describe("offset pagination drifts under live inserts (chapter 2.4)", () => {
+   it("serves rows the reader has already seen", async () => {
++    const sender = (await repo.createUser(`drift-${randomUUID().slice(0, 8)}`)).id;
+     const channel = await repo.createChannel("drift-repeat", "public");
+     for (let i = 1; i <= 60; i += 1) {
+-      await repo.sendMessage(channel.id, { text: `m-${i}` });
++      await repo.sendMessage(channel.id, { text: `m-${i}`, userId: sender });
+     }
+     const page1 = await readByOffset(channel.id, { offset: 0, limit: 50 });
+     // The feed moves mid-scroll: three drivers type while page two loads.
+     for (let i = 1; i <= 3; i += 1) {
+-      await repo.sendMessage(channel.id, { text: `live-${i}` });
++      await repo.sendMessage(channel.id, { text: `live-${i}`, userId: sender });
+     }
+     const page2 = await readByOffset(channel.id, { offset: 50, limit: 50 });
+ 
+@@ -70,9 +72,10 @@ describe("offset pagination drifts under live inserts (chapter 2.4)", () => {
+   });
+ 
+   it("hides rows the reader will never see, when the feed shrinks", async () => {
++    const sender = (await repo.createUser(`drift-${randomUUID().slice(0, 8)}`)).id;
+     const channel = await repo.createChannel("drift-gap", "public");
+     for (let i = 1; i <= 60; i += 1) {
+-      await repo.sendMessage(channel.id, { text: `m-${i}` });
++      await repo.sendMessage(channel.id, { text: `m-${i}`, userId: sender });
+     }
+     const page1 = await readByOffset(channel.id, { offset: 0, limit: 50 });
+     // A moderator deletes a message the reader has ALREADY passed — one
+```
+
+```diff title="services/api/src/db/repository.itest.ts"
+@@ -95,12 +95,49 @@ describe("tenant isolation is structural (FR-TEN-05)", () => {
+   });
+ });
+ 
++describe("the database refuses a bot with no description (chapter 3.17, FR-003)", () => {
++  // TWO GUARANTEES, NOT ONE, AND THIS IS THE SECOND (T023). Zod refuses a bot with no
++  // description at the boundary and that covers every request; this covers every
++  // WRITER — a migration, a backfill, a psql session, a future route nobody has
++  // written. Research R5 puts the two checks in two layers deliberately, and a test
++  // that only exercised the boundary would leave the constraint unproven.
++  it("refuses the insert directly, not only through the route", async () => {
++    const user = await repoA.createUser("db-refuses-me", "Person For Now");
++    // THE CONSTRAINT NAME IS ON THE CAUSE, NOT THE MESSAGE. Drizzle wraps the driver
++    // error as "Failed query: ...", so asserting on `toThrow(/users_bot.../)` passes
++    // for any failure of that statement — including a typo in the SQL. The name is
++    // what makes this test about the constraint rather than about the query.
++    await expect(
++      db.execute(sql`UPDATE users SET kind = 'bot' WHERE id = ${user.id}`),
++    ).rejects.toMatchObject({
++      cause: { constraint: "users_bot_description_check" },
++    });
++  });
++
++  it("accepts the same promotion when a description comes with it", async () => {
++    const user = await repoA.createUser("db-allows-me", "Person For Now");
++    await db.execute(
++      sql`UPDATE users SET kind = 'bot', description = 'it says what it does'
++          WHERE id = ${user.id}`,
++    );
++    expect((await repoA.getUserByExternalId("db-allows-me"))!.kind).toBe("bot");
++  });
++
++  it("refuses a kind outside the two the vocabulary allows", async () => {
++    const user = await repoA.createUser("db-refuses-kind", "Person");
++    await expect(
++      db.execute(sql`UPDATE users SET kind = 'daemon' WHERE id = ${user.id}`),
++    ).rejects.toMatchObject({ cause: { constraint: "users_kind_check" } });
++  });
++});
++
+ describe("sequence assignment is serialised per channel (ADR-03)", () => {
+   it("two concurrent sends never interleave", async () => {
+     const channel = await repoA.createChannel("ordering", "public");
++    const writer = (await repoA.createUser("ordering-writer", "Writer")).id;
+     const [a, b] = await Promise.all([
+-      repoA.sendMessage(channel.id, { text: "first writer" }),
+-      repoA.sendMessage(channel.id, { text: "second writer" }),
++      repoA.sendMessage(channel.id, { text: "first writer", userId: writer }),
++      repoA.sendMessage(channel.id, { text: "second writer", userId: writer }),
+     ]);
+     // Two sends, two DISTINCT consecutive sequence numbers — always.
+     expect(new Set([a.seq, b.seq]).size).toBe(2);
+@@ -111,7 +148,8 @@ describe("sequence assignment is serialised per channel (ADR-03)", () => {
+ describe("idempotency must not disarm DR-01 (chapter 2.3)", () => {
+   it("a keyless send still fails loudly on a sequence collision", async () => {
+     const channel = await repoA.createChannel("dr01-guard", "public");
+-    await repoA.sendMessage(channel.id, { text: "first" });
++    const guard = (await repoA.createUser("dr01-guard-sender", "Sender")).id;
++    await repoA.sendMessage(channel.id, { text: "first", userId: guard });
+     // Rewind the counter so the next keyless send reuses seq 1. The
+     // conflict clause must NOT swallow this: DR-01's unique constraint is
+     // 2.2's safety net, and idempotency has no business disarming it.
+@@ -119,7 +157,7 @@ describe("idempotency must not disarm DR-01 (chapter 2.3)", () => {
+       sql`UPDATE channels SET last_sequence = 0 WHERE id = ${channel.id}`,
+     );
+     await expect(
+-      repoA.sendMessage(channel.id, { text: "collides" }),
++      repoA.sendMessage(channel.id, { text: "collides", userId: guard }),
+     ).rejects.toThrow();
+     // And nothing landed: the failed insert wrote no row.
+     const rows = await repoA.listMessagesRaw(channel.id);
+@@ -201,7 +239,25 @@ describe("a private channel refuses a non-member's send (FR-001)", () => {
+     // be stated rather than assumed, and the assumption is that a private channel
+     // is not private FROM ITS OWNER.
+     const channel = await repoA.createChannel("private-app", "private");
+-    const sent = await repoA.sendMessage(channel.id, { text: "from the tenant" });
++    // A BOT, AND THAT IS THE WHOLE POINT NOW (chapter 3.17, FR-019a). This test is the
++    // repository-level twin of `messages.itest.ts`'s "accepts an application key's send
++    // to the same private channel". Before this chapter the send carried no user at all
++    // and skipped the membership check for that reason; now the check is gated on the
++    // sender being a PERSON, so a bot still gets through and a non-member person still
++    // does not. Give it a person here and the test inverts into its own opposite.
++    //
++    // `createUser` cannot set `kind` — that is `upsertUser`'s job from Phase 3 — so the
++    // promotion is a raw UPDATE, which is also the only writer that can satisfy
++    // `users_bot_description_check` in one statement.
++    const bot = (await repoA.createUser("private-app-bot", "Tenant Bot")).id;
++    await db.execute(
++      sql`UPDATE users SET kind = 'bot', description = 'posts on the tenant''s behalf'
++          WHERE id = ${bot}`,
++    );
++    const sent = await repoA.sendMessage(channel.id, {
++      text: "from the tenant",
++      userId: bot,
++    });
+     expect(sent.seq).toBe(1);
+   });
+ 
+@@ -491,7 +547,33 @@ describe("the repository's own refusals (chapter 3.15)", () => {
+     const reader = await repoA.createUser("arm-no-author", "Reader");
+     const channel = await repoA.createChannel("arm-unattributed", "public");
+     await repoA.addMember(channel.id, reader.id);
+-    await repoA.sendMessage(channel.id, { text: "from the tenant, not a user" });
++    // PLANTED, BECAUSE NOTHING CAN WRITE ONE ANY MORE (chapter 3.17, T014a, FR-014).
++    //
++    // The subject of this test IS a senderless row, so the repository can no longer
++    // produce its own fixture: `sendMessage` requires a sender as of FR-MSG-15, which
++    // is exactly the guarantee this arm exists to describe the other side of. The row
++    // is inserted directly, the way chapter 3.12's read-position clamp is planted a few
++    // hundred lines above — the only way a branch that no writer can reach is covered.
++    //
++    // THE ARM IS NOT DEAD, AND ITS SUBJECT HAS CHANGED (chapter 3.17, T055, FR-014).
++    //
++    // Chapter 3.16 wrote this arm for a state the public route produced on every
++    // key-authenticated send. It now covers LEGACY ROWS ONLY: 121,250 of the 394,808
++    // messages in this lane have no sender (T050), and any deployment older than this
++    // chapter has them, but nothing can make another. R8 said re-examine rather than
++    // delete, and re-examining is what changes here — the assertion is the same and the
++    // reason for it is not.
++    //
++    // A test whose subject changed and whose comment did not is how a reader concludes
++    // the behaviour is still reachable from the outside.
++    await db.execute(
++      sql`INSERT INTO messages (id, channel_id, sequence, text, created_at)
++          VALUES (gen_random_uuid(), ${channel.id}, 1, 'from the tenant, not a user', now())`,
++    );
++    await db.execute(
++      sql`UPDATE channels SET last_sequence = 1, last_activity_at = now()
++          WHERE id = ${channel.id}`,
++    );
+ 
+     const { rows } = await repoA.listChannelsForUser(reader.id, { limit: 10 });
+     const row = rows.find((r) => r.external_id === "arm-unattributed")!;
+```
+
+```diff title="services/api/src/internal/backfill.itest.ts"
+@@ -11,6 +11,8 @@ import {
+ } from "@relay/protocol";
+ 
+ import { AppModule } from "../app.module";
++import { sql } from "drizzle-orm";
++
+ import { createDb, createPool } from "../db/client";
+ import {
+   createEnvironment,
+@@ -169,9 +171,27 @@ describe("POST /internal/backfill", () => {
+   it("skips a message no frame can be built from, rather than inventing one", async () => {
+     const orphans = (await repo.createChannel("orphans", "public")).id;
+     await repo.addMember(orphans, tuan.id);
+-    // No userId: the shape of every row written through the socket before
+-    // 2.6's fix. There is no truthful sender to put on the wire.
+-    const anonymous = await repo.sendMessage(orphans, { text: "who said it?" });
++    // PLANTED, BECAUSE NOTHING CAN WRITE ONE ANY MORE (chapter 3.17, T014a, FR-014).
++    //
++    // This is the SECOND test whose subject is a senderless row, and T014a named only
++    // the first — `repository.itest.ts`'s `last_message.user` arm. Both had to stop
++    // using `sendMessage` for the same reason: FR-MSG-15 makes the sender required, so
++    // the repository can no longer produce the fixture that proves what happens without
++    // one. Found by the compiler rather than by reading, which is what Phase 2 is for.
++    //
++    // The shape is still real: every row written through the socket before 2.6's fix
++    // looks like this, and `toFrame` skipping them is the behaviour under test.
++    const anonymousSeq = 1;
++    const raw = createDb(createPool());
++    await raw.execute(
++      sql`INSERT INTO messages (id, channel_id, sequence, text, created_at)
++          VALUES (gen_random_uuid(), ${orphans}, ${anonymousSeq}, 'who said it?', now())`,
++    );
++    await raw.execute(
++      sql`UPDATE channels SET last_sequence = ${anonymousSeq}, last_activity_at = now()
++          WHERE id = ${orphans}`,
++    );
++    const anonymous = { seq: anonymousSeq };
+     const withAuthor = await say(orphans, "this one is attributable");
+     const page = (await parsed(await ask({ [orphans]: 0 }))).channels[orphans]!;
+     expect(page.messages.map((m) => m.seq)).toEqual([withAuthor.seq]);
+```
+
+```diff title="services/api/src/isolation/fixtures.ts"
+@@ -23,6 +23,8 @@ import type { Db } from "../db/client";
+  * webhook routes. */
+ export interface Tenant {
+   environmentId: string;
++  /** This tenant's own bot (chapter 3.17). A key send must name one. */
++  botExternalId: string;
+   /** An `rk_dev_…` credential for this environment, minted the way signup does. */
+   credential: string;
+   userId: string;
+@@ -50,6 +52,15 @@ async function seedTenant(db: Db, label: string): Promise<Tenant> {
+ 
+   const userExternalId = `${label}-user`;
+   const user = await repo.createUser(userExternalId, `${label} user`);
++  // A BOT PER TENANT (chapter 3.17). Every attack in the gauntlet presents a KEY, and a
++  // key send names a bot — so each tenant needs one of its own, or an attack would be
++  // refused for naming an unresolvable sender rather than for the thing it attacks.
++  const bot = (
++    await repo.upsertUser(`${label}-bot`, {
++      kind: "bot",
++      description: `${label}'s own software`,
++    })
++  ).user;
+   const channel = await repo.createChannel(`${label}-channel`, "public", `${label}`);
+   await repo.addMember(channel.id, user.id);
+   const message = await repo.sendMessage(channel.id, {
+@@ -66,6 +77,7 @@ async function seedTenant(db: Db, label: string): Promise<Tenant> {
+   return {
+     environmentId: environment.id,
+     credential: key.credential,
++    botExternalId: bot.external_id,
+     userId: user.id,
+     userExternalId,
+     channelId: channel.id,
+@@ -120,6 +132,9 @@ export interface SameTenant {
+   publicChannelId: string;
+   /** A message the member wrote, so a read attack has something to fail to find. */
+   messageId: string;
++  /** A bot of this tenant (chapter 3.17). The control's sender: an application
++   * credential may name this one and no other tenant's. */
++  bot: { id: string; externalId: string };
+   repo: Repository;
+ }
+ 
+@@ -139,6 +154,15 @@ export async function seedSameTenant(db: Db, mintToken: MintToken): Promise<Same
+     userId: member.id,
+     userExternalId: member.external_id,
+   });
++  // A BOT, VIA THE UPSERT, because `createUser` cannot set `kind` — a bot needs a
++  // description and the member-add path has nowhere to put one (chapter 3.17).
++  const bot = (
++    await repo.upsertUser(`same-${stamp}-bot`, {
++      display_name: "A Bot",
++      kind: "bot",
++      description: "the tenant's own software, for the sender attacks",
++    })
++  ).user;
+ 
+   return {
+     environmentId: environment.id,
+@@ -156,6 +180,7 @@ export async function seedSameTenant(db: Db, mintToken: MintToken): Promise<Same
+     privateChannelId: privateChannel.id,
+     publicChannelId: publicChannel.id,
+     messageId: message.id,
++    bot: { id: bot.id, externalId: bot.external_id },
+     repo,
+   };
+ }
+```
+
+```diff title="services/api/src/isolation/gauntlet.itest.ts"
+@@ -7,7 +7,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
+ import { AppModule } from "../app.module";
+ import { createDb, createPool } from "../db/client";
+ import { mintUserToken } from "../auth/user-token";
+-import { environmentSigningSecret } from "../db/repository";
++import { environmentSigningSecret, Repository } from "../db/repository";
+ import { credentialAttack, listAttack, readAttack, writeAttack } from "./attack";
+ import { withoutRequestId } from "./compare";
+ import {
+@@ -130,7 +130,12 @@ describe("the isolation gauntlet", () => {
+           authorization: `Bearer ${tenants.attacker.credential}`,
+           "content-type": "application/json",
+         },
+-        body: JSON.stringify({ text: "the control writes" }),
++        body: JSON.stringify({
++          text: "the control writes",
++          // The attacking credential is a KEY, so it names a bot of its own tenant
++          // (chapter 3.17). The control must keep proving the credential works.
++          user: tenants.attacker.botExternalId,
++        }),
+       });
+       expect(res.status).toBe(201);
+     });
+@@ -474,6 +479,71 @@ describe("the isolation gauntlet", () => {
+       });
+     });
+ 
++    // ══ THE SENDER (chapter 3.17, T035, T036, SC-005) ════════════════════════
++    //
++    // HAND-WRITTEN, AND `attack.ts` NEEDS NO FIFTH SHAPE. The sender is a new DIMENSION
++    // on a route already classified `write` and already attacked with a foreign channel
++    // id — not a new kind of target. A generated shape would have to know that this
++    // body field names a user in the caller's own tenant, which is one route's
++    // knowledge and not the gauntlet's.
++    describe("a foreign bot and a bot that exists nowhere (chapter 3.17)", () => {
++      // ── T036: THE CONTROL FIRST ───────────────────────────────────────────
++      //
++      // Chapter 3.12's fourteen green tests compared two refusals and meant nothing,
++      // because the thing they attacked was refused for an unrelated reason. If this
++      // control does not pass, the pair below proves only that both sends failed.
++      it("the control: the same credential, the same channel, its OWN bot — 201", async () => {
++        const res = await fetch(
++          `${url}/v1/channels/${same.publicChannelId}/messages`,
++          {
++            method: "POST",
++            headers: {
++              "content-type": "application/json",
++              authorization: `Bearer ${same.credential}`,
++            },
++            body: JSON.stringify({ text: "the control", user: same.bot.externalId }),
++          },
++        );
++        expect(res.status).toBe(201);
++      });
++
++      it("refuses a foreign bot and an invented identifier identically", async () => {
++        const post = (user: string) =>
++          fetch(`${url}/v1/channels/${same.publicChannelId}/messages`, {
++            method: "POST",
++            headers: {
++              "content-type": "application/json",
++              authorization: `Bearer ${same.credential}`,
++            },
++            body: JSON.stringify({ text: "not mine to send as", user }),
++          });
++
++        // A BOT IN ANOTHER TENANT, planted here rather than in the fixture: the point
++        // is a real, resolvable identifier that belongs to somebody else, and only this
++        // test needs one. `tenants.victim` is the tenant whose identifiers every attack
++        // in this file borrows.
++        const theirs = (
++          await new Repository(db, tenants.victim.environmentId).upsertUser(
++            "victim-bot",
++            { kind: "bot", description: "the victim tenant's own software" },
++          )
++        ).user;
++
++        const foreign = await post(theirs.external_id);
++        const invented = await post("a-bot-that-exists-in-no-tenant");
++
++        expect(foreign.status).toBe(400);
++        expect(invented.status).toBe(400);
++        const a = withoutRequestId(await foreign.json());
++        const b = withoutRequestId(await invented.json());
++        // If these differ by one byte, naming an identifier is a way to ask whether
++        // another tenant has one — and a bot's identifier is often its purpose spelled
++        // out, so the answer would leak what the neighbour's software does.
++        expect(a).toEqual(b);
++        expect((a as { field: string }).field).toBe("user");
++      });
++    });
++
+     it("a PUBLIC channel of the same tenant is open to the same non-member (FR-004)", async () => {
+       // The other half of what makes `channels.type` decide something. If both types
+       // refused, the column would still be deciding nothing.
+```
+
+```diff title="services/api/src/messages/messages.itest.ts"
+@@ -3,6 +3,7 @@ import "reflect-metadata";
+ import { Test } from "@nestjs/testing";
+ import type { INestApplication } from "@nestjs/common";
+ import { afterAll, beforeAll, describe, expect, it } from "vitest";
++import { randomUUID } from "node:crypto";
+ 
+ import { AppModule } from "../app.module";
+ import { mintUserToken } from "../auth/user-token";
+@@ -60,6 +61,15 @@ describe("POST /v1/channels/:channelId/messages", () => {
+     const member = await repo.createUser("insider", "An Insider");
+     await repo.addMember(privateChannelId, member.id);
+     await repo.createUser("outsider", "An Outsider");
++    // A BOT OF THIS TENANT, and a person, for chapter 3.17's four outcomes. Added
++    // beside the existing fixtures and NOT added to `privateChannelId` — that
++    // membership is load-bearing for the tests above, and a bot needs none of it
++    // (FR-019a) which is the point T012c makes.
++    await repo.upsertUser("courier", {
++      display_name: "Courier",
++      kind: "bot",
++      description: "delivers build results into the channel",
++    });
+     const signingSecret = (await environmentSigningSecret(db, env.id))!
+       .signingSecret;
+     tokenFor = async (subject: string) =>
+@@ -81,6 +91,9 @@ describe("POST /v1/channels/:channelId/messages", () => {
+     await app.close();
+   });
+ 
++  // KEY SENDS NAME `courier`, THE TENANT'S BOT (chapter 3.17, T059). Each caller passes
++  // its own body, so the sender is added per call rather than defaulted here — a default
++  // would hide which tests are about the sender and which merely need one.
+   const send = (body: unknown, channel = channelId, key = credential) =>
+     fetch(`${url}/v1/channels/${channel}/messages`, {
+       method: "POST",
+@@ -92,15 +105,15 @@ describe("POST /v1/channels/:channelId/messages", () => {
+     });
+ 
+   it("returns 201 with an ascending sequence", async () => {
+-    const first = await send({ text: "hello" });
++    const first = await send({ text: "hello", user: "courier" });
+     expect(first.status).toBe(201);
+     const a = (await first.json()) as { seq: number };
+-    const b = (await (await send({ text: "again" })).json()) as { seq: number };
++    const b = (await (await send({ text: "again", user: "courier" })).json()) as { seq: number };
+     expect(b.seq).toBe(a.seq + 1);
+   });
+ 
+   it("rejects a malformed body through the protocol envelope", async () => {
+-    const res = await send({ text: "" });
++    const res = await send({ text: "", user: "courier" });
+     expect(res.status).toBe(400);
+     const body = (await res.json()) as Record<string, unknown>;
+     expect(body).toMatchObject({ code: "invalid_request" });
+@@ -129,8 +142,8 @@ describe("POST /v1/channels/:channelId/messages", () => {
+   });
+ 
+   it("answers a FOREIGN channel id with the same 404 as a missing one", async () => {
+-    const foreign = await send({ text: "not for you" }, foreignChannelId);
+-    const missing = await send({ text: "nobody home" }, crypto.randomUUID());
++    const foreign = await send({ text: "not for you", user: "courier" }, foreignChannelId);
++    const missing = await send({ text: "nobody home", user: "courier" }, crypto.randomUUID());
+     expect(foreign.status).toBe(404);
+     expect(missing.status).toBe(404);
+     // Indistinguishable — no data, and no reveal that the id exists.
+@@ -151,7 +164,118 @@ describe("POST /v1/channels/:channelId/messages", () => {
+   // So the repository test passed while the route it protects was open. A repository
+   // test proves a check exists; only a route test proves it fires.
+   describe("a private channel over the public route (FR-001, SC-002)", () => {
+-    const sendAs = async (token: string, channel: string, text = "hello") =>
++  
++  // ══ THE SENDER (chapter 3.17, US2) ══════════════════════════════════════════
++
++  // ── T033: the four outcomes for an application credential ──────────────────
++  it("accepts a key's send naming a bot, and echoes the sender it used", async () => {
++    const res = await send({ text: "build 412 is green", user: "courier" });
++    expect(res.status).toBe(201);
++    // FR-009a: a caller now required to name a sender is told which was recorded.
++    expect((await res.json()).user).toBe("courier");
++  });
++
++  it("refuses a key's send naming a person with 403 sender_not_permitted", async () => {
++    const res = await send({ text: "posting as a human", user: "outsider" });
++    expect(res.status).toBe(403);
++    const body = (await res.json()) as { code: string; message: string };
++    // T032a: `ProtocolErrorFilter` maps a bare 403 to `forbidden`, and this is the one
++    // code in the chapter that collides with that ladder. The wire must carry the
++    // specific fact, not the generic one.
++    expect(body.code).toBe("sender_not_permitted");
++    expect(body.code).not.toBe("forbidden");
++    // And it names neither the person asked for nor the bots that would have worked.
++    expect(body.message).not.toContain("outsider");
++    expect(body.message).not.toContain("courier");
++  });
++
++  it("refuses a key's send naming nobody with 400 and the field", async () => {
++    const res = await send({ text: "who is this from?" });
++    expect(res.status).toBe(400);
++    expect((await res.json()).field).toBe("user");
++  });
++
++  it("refuses a foreign sender and a nonexistent one identically", async () => {
++    const foreign = await createEnvironment(createDb(createPool()), {
++      name: `messages-itest-foreign-${randomUUID().slice(0, 8)}`,
++    });
++    await new Repository(createDb(createPool()), foreign.id).upsertUser("theirs", {
++      kind: "bot",
++      description: "a bot of another tenant",
++    });
++
++    const a = await send({ text: "x", user: "theirs" });
++    const b = await send({ text: "x", user: "no-such-identifier-anywhere" });
++    expect(a.status).toBe(400);
++    expect(b.status).toBe(400);
++    // SC-005: the two answers must be indistinguishable, or naming an identifier is a
++    // way to ask whether another tenant has one.
++    expect(withoutRequestId(await a.json())).toEqual(
++      withoutRequestId(await b.json()),
++    );
++  });
++
++  // ── T034: a user token attributes to its subject and may name nobody ───────
++  it("attributes a user token's send to its subject", async () => {
++    const token = await tokenFor("insider");
++    const res = await fetch(`${url}/v1/channels/${channelId}/messages`, {
++      method: "POST",
++      headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
++      body: JSON.stringify({ text: "from a person" }),
++    });
++    expect(res.status).toBe(201);
++    expect((await res.json()).user).toBe("insider");
++  });
++
++  it("refuses a body `user` beside a user token", async () => {
++    const token = await tokenFor("insider");
++    const res = await fetch(`${url}/v1/channels/${channelId}/messages`, {
++      method: "POST",
++      headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
++      body: JSON.stringify({ text: "posting as someone else", user: "courier" }),
++    });
++    expect(res.status).toBe(400);
++    expect((await res.json()).field).toBe("user");
++  });
++
++  // ── T012c: the private channel, BOTH halves (SC-012) ───────────────────────
++  //
++  // A test that checked only the bot would pass if the membership gate had been deleted
++  // outright — which is the change that breaks chapter 3.15's refusal. The pair is the
++  // oracle.
++  it("lets a key's bot send to a private channel it is not a member of", async () => {
++    const res = await send(
++      { text: "from the tenant's software", user: "courier" },
++      privateChannelId,
++    );
++    expect(res.status).toBe(201);
++  });
++
++  it("still refuses a person who is not a member of that private channel", async () => {
++    const token = await tokenFor("outsider");
++    const res = await sendAs(token, privateChannelId);
++    // 404, not 403: a private channel a caller cannot see answers as if absent
++    // (chapter 3.15, FR-019b).
++    expect(res.status).toBe(404);
++  });
++
++  // ── T012d: a bot may be banned (FR-005c, SC-013) ───────────────────────────
++  it("refuses a banned bot's send, indistinguishably from a foreign sender", async () => {
++    await repo.upsertUser("runaway", {
++      kind: "bot",
++      description: "posts far too often",
++    });
++    const banned = await repo.getUserByExternalId("runaway");
++    await repo.banUser(banned!.id);
++
++    const res = await send({ text: "still going", user: "runaway" });
++    // A ban stops a runaway integration without deleting the identity its messages are
++    // attributed to. The refusal is the ban's, which arrives before the channel is read.
++    expect(res.status).toBe(403);
++    expect((await res.json()).code).toBe("user_banned");
++  });
++
++  const sendAs = async (token: string, channel: string, text = "hello") =>
+       fetch(`${url}/v1/channels/${channel}/messages`, {
+         method: "POST",
+         headers: {
+@@ -192,7 +316,7 @@ describe("POST /v1/channels/:channelId/messages", () => {
+     });
+ 
+     it("accepts an application key's send to the same private channel (FR-005)", async () => {
+-      const accepted = await send({ text: "from the tenant" }, privateChannelId);
++      const accepted = await send({ text: "from the tenant", user: "courier" }, privateChannelId);
+       expect(accepted.status).toBe(201);
+     });
+ 
+```
+
+```diff title="services/api/src/messages/messages.schema.ts"
+@@ -11,6 +11,18 @@ export const sendMessageBodySchema = z.strictObject({
+   // time (FR-SDK-06), optional because server-originated messages may not
+   // carry one. The partial unique index (DR-03) ignores NULLs.
+   idempotency_key: z.string().uuid().optional(),
++  /** WHO IS SENDING (chapter 3.17, FR-MSG-15, FR-008).
++   *
++   * OPTIONAL HERE AND REQUIRED FOR ONE CREDENTIAL CLASS, which zod cannot express
++   * because it cannot see who is calling. A user token's send is attributed to the
++   * token's subject and naming a `user` in the body is refused; an application
++   * credential must name one, because it carries no user of its own. The controller
++   * resolves that per class (T029) and the service refuses what cannot be resolved.
++   *
++   * A CUSTOMER-SUPPLIED IDENTIFIER, not a platform id. Every other user-facing field in
++   * this API names a user the way FR-USR-01 says the customer does, and a route that
++   * took an internal uuid here would be the only one that did not. */
++  user: z.string().min(1).max(255).optional(),
+ });
+ 
+ export type SendMessageBody = z.infer<typeof sendMessageBodySchema>;
+```
+
+```diff title="services/api/src/outbox/outbox.itest.ts"
+@@ -156,7 +156,7 @@ describe("the outbox", () => {
+     });
+     // The key-authenticated public send is unattributed (3.2's recorded bound),
+     // which is a CONTENT difference, not a shape one.
+-    await repo.sendMessage(channelId, { text: "through REST" });
++    await repo.sendMessage(channelId, { text: "through REST", userId: tuan.id });
+     const rows = (await unpublishedFor(db, env.id)).slice(before.length);
+     expect(rows.length).toBe(2);
+     const shapes = rows.map((r) => Object.keys(r.payload).sort().join(","));
+```
+
+```diff title="services/api/src/users/users.itest.ts"
+@@ -3,6 +3,7 @@ import "reflect-metadata";
+ import { Test } from "@nestjs/testing";
+ import type { INestApplication } from "@nestjs/common";
+ import { afterAll, beforeAll, describe, expect, it } from "vitest";
++import { randomUUID } from "node:crypto";
+ 
+ import { AppModule } from "../app.module";
+ import { createDb, createPool, type Db } from "../db/client";
+@@ -500,7 +501,14 @@ describe("a user's channel listing", () => {
+       avatar_url: string | null;
+       metadata: Record<string, unknown>;
+     };
++    // THE PROFILE GREW TWO FIELDS AND THIS ASSERTION BROKE, WHICH IS WHY IT IS EXACT
++    // (chapter 3.17, T021a). `toEqual` on a whole body is the only assertion that
++    // notices a field arriving — a `toMatchObject` would have said nothing, and a
++    // reader would have learned about `kind` from the code rather than from a test.
++    // Chapter 3.16 made the same trade for `last_message`.
+     expect(body).toEqual({
++      kind: "person",
++      description: null,
+       external_id: "profiled",
+       display_name: "After",
+       avatar_url: "https://cdn.example.com/a/b.png",
+@@ -578,6 +586,112 @@ describe("a user's channel listing", () => {
+     expect((await profile("nobody-at-all")).status).toBe(404);
+   });
+ 
++  // ══ A BOT IS A USER (chapter 3.17, US3, FR-004) ═════════════════════════════
++
++  // ── T043: a bot inherits everything keyed on a user ───────────────────────
++  it("a bot can be a channel member with a role, and appears in the member list", async () => {
++    const channel = await repo.createChannel(`botmember-${randomUUID().slice(0, 8)}`, "public");
++    const bot = (
++      await repo.upsertUser("member-bot", {
++        kind: "bot",
++        description: "sits in the channel and posts",
++      })
++    ).user;
++    await repo.addMember(channel.id, bot.id);
++
++    // `listMembers` returns user ids; the ROLE is on the add's own response, which is
++    // where chapter 3.15 put it (read back rather than echoed).
++    expect(await repo.listMembers(channel.id)).toContain(bot.id);
++    // A ROLE LIKE ANYBODY ELSE. FR-004 asks that a bot support the operations a person
++    // supports, and membership with a role is one of them — nothing about `kind` reaches
++    // the members table, so re-adding reports the role it already holds.
++    // `addMember` reports an OUTCOME, not a role — the role lives on the HTTP response
++    // (chapter 3.15). What matters here is that a second add of a bot behaves exactly
++    // as a second add of a person: nothing about `kind` reaches the members table.
++    expect(await repo.addMember(channel.id, bot.id)).toBe("already_a_member");
++  });
++
++  // ── T043a: a bot's own channel listing, and its unread count ──────────────
++  it("answers a bot's channel listing, with the whole history unread", async () => {
++    const channel = await repo.createChannel(`botlist-${randomUUID().slice(0, 8)}`, "public");
++    const bot = (
++      await repo.upsertUser("listing-bot", {
++        kind: "bot",
++        description: "has a listing like any user",
++      })
++    ).user;
++    await repo.addMember(channel.id, bot.id);
++    const person = await repo.createUser(`p-${randomUUID().slice(0, 8)}`);
++    await repo.addMember(channel.id, person.id);
++    await repo.sendMessage(channel.id, { text: "one", userId: person.id });
++    await repo.sendMessage(channel.id, { text: "two", userId: person.id });
++
++    const listed = await repo.listChannelsForUser(bot.id, { limit: 10 });
++    const row = listed.rows.find((r) => r.id === channel.id);
++    expect(row).toBeDefined();
++    // THE WHOLE HISTORY IS UNREAD, AND IT ALWAYS WILL BE. Nothing acknowledges on a
++    // bot's behalf — there is no client holding its token, because it has none. Worth
++    // asserting rather than assuming: a reader who saw `unread: 2` might go looking for
++    // the acknowledgement path a bot does not have.
++    expect(row!.unread).toBe(2);
++  });
++
++  // ── T044: banned, then deleted, with the messages surviving ───────────────
++  it("bans a bot, refuses its sends, then deletes it with its messages intact", async () => {
++    const channel = await repo.createChannel(`botlife-${randomUUID().slice(0, 8)}`, "public");
++    const bot = (
++      await repo.upsertUser("mortal-bot", {
++        kind: "bot",
++        description: "will be banned and then deleted",
++      })
++    ).user;
++    await repo.addMember(channel.id, bot.id);
++    const sent = await repo.sendMessage(channel.id, {
++      text: "I was here",
++      userId: bot.id,
++    });
++
++    await repo.banUser(bot.id);
++    await expect(
++      repo.sendMessage(channel.id, { text: "after the ban", userId: bot.id }),
++    ).rejects.toThrow();
++
++    expect((await removeUser("mortal-bot")).status).toBe(200);
++    // SC-007: the messages survive and still name it. A bot's history is the record of
++    // what the customer's software did, and deleting the identity must not rewrite it.
++    const history = await repo.listMessages(channel.id, { limit: 10 });
++    const still = history.find((m) => m.id === sent.id);
++    expect(still).toBeDefined();
++    expect(still!.user).toBe("mortal-bot");
++  });
++
++  // ── T044a: the description survives deletion, and the revival ─────────────
++  //
++  // THIS IS THE ASSERTION THAT WOULD HAVE CAUGHT THE COLLISION. `deleteUser` clears
++  // `display_name`, `avatar_url` and `metadata`; adding `description` to that list by
++  // symmetry would violate `users_bot_description_check` and make a bot the one kind of
++  // user that cannot be deleted at all.
++  it("keeps a deleted bot's description, and revives it with the description intact", async () => {
++    await upsert([
++      { external_id: "revivable-bot", kind: "bot", description: "says what it does" },
++    ]);
++    expect((await removeUser("revivable-bot")).status).toBe(200);
++
++    const deleted = await repo.getUserByExternalId("revivable-bot");
++    expect(deleted?.deleted_at).not.toBeNull();
++    expect(deleted?.description).toBe("says what it does");
++    expect(deleted?.display_name).toBeNull();
++
++    const revived = await upsert([
++      { external_id: "revivable-bot", kind: "bot", description: "says what it does" },
++    ]);
++    expect((await revived.json()).data[0]).toMatchObject({
++      status: "revived",
++      kind: "bot",
++      description: "says what it does",
++    });
++  });
++
+   // ══ THE BULK UPSERT AND THE DELETION (FR-025 to FR-030, SC-012) ═════════════
+ 
+   const upsert = (users: unknown, key = credential) =>
+@@ -593,6 +707,201 @@ describe("a user's channel listing", () => {
+       headers: { authorization: `Bearer ${key}` },
+     });
+ 
++  // ══ THE BOT USER (chapter 3.17, FR-USR-07) ══════════════════════════════════
++
++  // ── T022: the round trip ────────────────────────────────────────────────────
++  it("creates a bot with a description, reads it back, and edits the description", async () => {
++    const created = await upsert([
++      {
++        external_id: "deploy-bot",
++        display_name: "Deploy Bot",
++        kind: "bot",
++        description: "posts a line when a deploy finishes",
++      },
++    ]);
++    expect(created.status).toBe(200);
++    expect((await created.json()).data[0]).toMatchObject({
++      external_id: "deploy-bot",
++      status: "created",
++      kind: "bot",
++      description: "posts a line when a deploy finishes",
++    });
++
++    const read = await (await profile("deploy-bot")).json();
++    expect(read.kind).toBe("bot");
++    expect(read.description).toBe("posts a line when a deploy finishes");
++
++    const edited = await patchProfile("deploy-bot", {
++      description: "posts a line when a deploy finishes, and when one fails",
++    });
++    expect(edited.status).toBe(200);
++    expect((await (await profile("deploy-bot")).json()).description).toBe(
++      "posts a line when a deploy finishes, and when one fails",
++    );
++  });
++
++  // ── T023: refused at the boundary, and by the database ──────────────────────
++  it("refuses a bot with no description, naming the field", async () => {
++    const res = await upsert([{ external_id: "no-why", kind: "bot" }]);
++    expect(res.status).toBe(400);
++    const body = await res.json();
++    expect(body.field).toContain("description");
++  });
++
++  it("refuses a description on a person", async () => {
++    const res = await upsert([
++      { external_id: "a-person", description: "people do not have these" },
++    ]);
++    expect(res.status).toBe(400);
++    expect((await res.json()).field).toContain("description");
++  });
++
++  // ── T025: `description: null` is refused on BOTH kinds (SC-014) ─────────────
++  //
++  // THE ASSERTION IS THE STATUS, NOT THE DATABASE. A test that checked the row was
++  // unchanged would pass when the request 500s and the transaction rolls back, which is
++  // the failure this test exists to tell apart from success.
++  it("refuses `description: null` on a bot — the CHECK must never be reached", async () => {
++    await upsert([
++      { external_id: "null-bot", kind: "bot", description: "here for now" },
++    ]);
++    const res = await patchProfile("null-bot", { description: null });
++    expect(res.status).toBe(400);
++    expect((await (await profile("null-bot")).json()).description).toBe("here for now");
++  });
++
++  it("refuses `description: null` on a person too, where it would mean nothing", async () => {
++    await upsert([{ external_id: "null-person" }]);
++    expect((await patchProfile("null-person", { description: null })).status).toBe(400);
++  });
++
++  // ── T018c: the promotion, in all three states ──────────────────────────────
++  it("promotes a person to a bot when the row has never sent a message", async () => {
++    await upsert([{ external_id: "grew-up" }]);
++    const res = await upsert([
++      { external_id: "grew-up", kind: "bot", description: "it was a person first" },
++    ]);
++    expect(res.status).toBe(200);
++    expect((await res.json()).data[0]).toMatchObject({
++      status: "updated",
++      kind: "bot",
++      description: "it was a person first",
++    });
++  });
++
++  it("refuses the promotion once the row has sent a message", async () => {
++    await upsert([{ external_id: "has-spoken" }]);
++    const speaker = (await (await profile("has-spoken")).json()) as {
++      external_id: string;
++    };
++    const channel = await repo.createChannel(`spoken-${randomUUID().slice(0, 8)}`, "public");
++    const row = await repo.getUserByExternalId(speaker.external_id);
++    await repo.sendMessage(channel.id, { text: "I said something", userId: row!.id });
++
++    const res = await upsert([
++      { external_id: "has-spoken", kind: "bot", description: "too late" },
++    ]);
++    expect(res.status).toBe(200);
++    expect((await res.json()).data[0]).toMatchObject({
++      status: "kind_conflict",
++      kind: "person",
++    });
++  });
++
++  it("refuses bot -> person unconditionally, even with no messages", async () => {
++    await upsert([
++      { external_id: "stays-a-bot", kind: "bot", description: "cannot be demoted" },
++    ]);
++    const res = await upsert([{ external_id: "stays-a-bot", kind: "person" }]);
++    expect(res.status).toBe(200);
++    expect((await res.json()).data[0]).toMatchObject({
++      status: "kind_conflict",
++      kind: "bot",
++    });
++  });
++
++  // ── T018d: the trap, in the order a customer hits it ───────────────────────
++  //
++  // This is the assertion the escape exists for. `POST /v1/channels/:id/members` creates
++  // an unknown identifier as a PERSON, because `createUser` cannot set `kind`. A customer
++  // who adds their bot to a channel before registering it would, without FR-002d, have
++  // made that bot permanently impossible.
++  it("survives adding the bot to a channel BEFORE registering it as a bot", async () => {
++    const channel = await repo.createChannel(`trap-${randomUUID().slice(0, 8)}`, "public");
++    const stranger = await repo.createUser("support-bot", "support-bot");
++    await repo.addMember(channel.id, stranger.id);
++    expect((await repo.getUserByExternalId("support-bot"))!.kind).toBe("person");
++
++    const res = await upsert([
++      { external_id: "support-bot", kind: "bot", description: "answers tickets" },
++    ]);
++    expect((await res.json()).data[0]).toMatchObject({
++      status: "updated",
++      kind: "bot",
++    });
++  });
++
++  // ── T024a: omitting `kind` while editing a bot must not demote it ──────────
++  //
++  // The case FR-002b exists for, and the one a `.default("person")` in the request
++  // schema silently breaks: absent would become 'person', the entry would read as a
++  // demotion, and editing a bot's description through the upsert would be impossible.
++  it("leaves a bot a bot when the entry omits `kind`", async () => {
++    await upsert([
++      { external_id: "quiet-bot", kind: "bot", description: "first description" },
++    ]);
++    const res = await upsert([
++      { external_id: "quiet-bot", display_name: "Quiet Bot" },
++    ]);
++    expect((await res.json()).data[0]).toMatchObject({
++      status: "updated",
++      kind: "bot",
++      description: "first description",
++    });
++  });
++
++  // ── T024: a conflict in one entry does not fail the other ninety-nine ──────
++  it("reports kind_conflict per entry, in a 200, with the other entries written", async () => {
++    await upsert([
++      { external_id: "conflict-bot", kind: "bot", description: "a bot already" },
++    ]);
++    const res = await upsert([
++      { external_id: "batch-a" },
++      { external_id: "conflict-bot", kind: "person" },
++      { external_id: "batch-b" },
++    ]);
++    expect(res.status).toBe(200);
++    const data = (await res.json()).data as Array<{ status: string }>;
++    expect(data.map((d) => d.status)).toEqual([
++      "created",
++      "kind_conflict",
++      "created",
++    ]);
++    expect((await profile("batch-a")).status).toBe(200);
++    expect((await profile("batch-b")).status).toBe(200);
++  });
++
++  // ── T023a: the status set, pinned ──────────────────────────────────────────
++  //
++  // `codes.ts` pins error codes and close codes the same way, and close code 4003 is the
++  // precedent for why: an exact set makes a fifth value a decision rather than an
++  // accident. This assertion is what will fail on the build that adds one.
++  it("the upsert's status set is exactly these four", async () => {
++    await upsert([
++      { external_id: "pinned-bot", kind: "bot", description: "for the pin" },
++    ]);
++    const res = await upsert([
++      { external_id: "pinned-new" },
++      { external_id: "pinned-bot", kind: "person" },
++    ]);
++    const seen = new Set(
++      ((await res.json()).data as Array<{ status: string }>).map((d) => d.status),
++    );
++    for (const status of seen) {
++      expect(["created", "updated", "revived", "kind_conflict"]).toContain(status);
++    }
++  });
++
+   // ── T138: 100 accepted, 101 refused (SC-012) ────────────────────────────────
+   it("upserts 100 users in one request", async () => {
+     const entries = Array.from({ length: 100 }, (_, i) => ({
+@@ -757,7 +1066,11 @@ describe("a user's channel listing", () => {
+     // THE SAME ROW, EMPTY. `(environment_id, external_id)` is unique and the row never
+     // left, so there is no other honest answer than reusing it — and a revived row does
+     // not inherit the profile the deletion wiped.
++    // The revival's shape, exact for T021a's reason above. A revived user is a person
++    // with no description unless something said otherwise.
+     expect(back).toEqual({
++      kind: "person",
++      description: null,
+       external_id: "revivable",
+       display_name: null,
+       avatar_url: null,
+```
+
+```diff title="services/api/src/users/users.schema.ts"
+@@ -53,6 +53,25 @@ export const userProfileBodySchema = z.strictObject({
+   display_name: z.string().min(1).max(255).nullable().optional(),
+   avatar_url: z.string().url().max(2048).nullable().optional(),
+   metadata: userMetadataSchema.optional(),
++  /** A bot's description, editable here (chapter 3.17, FR-004).
++   *
++   * **NOT `.nullable()`, AND THIS COMMENT IS WHY IT STAYS THAT WAY.** Every field above
++   * is nullable on purpose and the paragraph above says what that means: `null` clears.
++   * Extending the idiom one more line would have been the natural thing to write, and
++   * `PATCH {"description": null}` would then set null on a bot,
++   * `users_bot_description_check` would raise, and the customer would get a **500** for
++   * a request the boundary should have refused (FR-004b).
++   *
++   * Nullability buys nothing for either kind. A bot must never clear its description —
++   * the constraint forbids it, and a bot whose description is gone is the anonymous
++   * sender this chapter exists to remove. A person may never be given one
++   * (`upsertUserEntrySchema` refuses that). So the field is settable and not clearable,
++   * and the next person to reach for symmetry has to read this first.
++   *
++   * `kind` IS ABSENT FROM THIS SCHEMA, and `strictObject` is what refuses it: a
++   * promotion is a decision about a stored row, so it goes through the upsert where the
++   * per-entry status can report a conflict. A PATCH has one row and one status code. */
++  description: z.string().min(1).max(2000).optional(),
+ });
+ 
+ export type UserProfileBody = z.infer<typeof userProfileBodySchema>;
+@@ -66,12 +85,72 @@ export type UserProfileBody = z.infer<typeof userProfileBodySchema>;
+  * `strictObject`, and the same 4 KB metadata bound and URL validation the single PATCH
+  * uses — one schema fragment, so the two routes cannot drift into accepting different
+  * things for the same column. */
+-export const upsertUserEntrySchema = z.strictObject({
+-  external_id: z.string().min(1).max(255),
+-  display_name: z.string().min(1).max(255).nullable().optional(),
+-  avatar_url: z.string().url().max(2048).nullable().optional(),
+-  metadata: userMetadataSchema.optional(),
+-});
++export const upsertUserEntrySchema = z
++  .strictObject({
++    external_id: z.string().min(1).max(255),
++    display_name: z.string().min(1).max(255).nullable().optional(),
++    avatar_url: z.string().url().max(2048).nullable().optional(),
++    metadata: userMetadataSchema.optional(),
++    /** What kind of thing this user is (chapter 3.17, FR-USR-07).
++     *
++     * NO `.default("person")`, AND THAT IS THE REQUIREMENT (FR-002b). A schema default
++     * would make "absent" indistinguishable from "person" before anything can compare
++     * the entry to the stored row — and an entry that omits `kind` for an existing bot
++     * is asking for no change, not asking to demote it. The default belongs at
++     * creation, in the column (`schema.ts`), where only a new row gets it. */
++    kind: z.enum(["person", "bot"]).optional(),
++    /** What the software is, and why it posts.
++     *
++     * NOT `.nullable()`, unlike every sibling above, and `userProfileBodySchema`'s
++     * comment explains the idiom this deliberately breaks: there, `null` clears. Here
++     * a null description on a bot violates `users_bot_description_check` and would
++     * reach the customer as a 500 (FR-004b). The field is settable and not clearable. */
++    description: z.string().min(1).max(2000).optional(),
++  })
++  /** THE TWO RULES ZOD CAN CHECK WITHOUT THE STORED ROW (FR-002, FR-004b).
++   *
++   * A bot needs a description and a person may not have one — both decidable from the
++   * request alone, which is why they live here and not in the service. What zod
++   * CANNOT decide is whether a change of `kind` is permitted, because that depends on
++   * the row already in the database and on whether it has ever sent a message; that is
++   * `kind_conflict`, a per-entry status in a 200 (FR-002a).
++   *
++   * The line between the two: a refusal a customer can fix by re-reading their own
++   * request belongs at the boundary and fails the whole batch, the way a bad
++   * `avatar_url` or an unknown key already does. A refusal that depends on state they
++   * cannot see is reported per entry, so one bad row out of a hundred does not fail
++   * the other ninety-nine. */
++  .superRefine((entry, ctx) => {
++    if (entry.kind === "bot" && entry.description === undefined) {
++      ctx.addIssue({
++        code: "custom",
++        path: ["description"],
++        message: "a bot requires a description",
++      });
++    }
++    // A DESCRIPTION REQUIRES `kind: "bot"` IN THE SAME ENTRY, and the condition is
++    // `!== "bot"` rather than `=== "person"` for a reason found by a test.
++    //
++    // The first version read `entry.kind === "person"`, which let
++    // `{external_id, description}` through — `kind` absent is the common shape, not
++    // `kind: "person"`, so the rule never fired on the case it was written for and a
++    // person could be given a description.
++    //
++    // So the two rules together make description and `kind: "bot"` imply each other
++    // WITHIN AN ENTRY. Editing a bot's description through this route means restating
++    // `kind: "bot"`, which is not a change and raises no conflict; the single PATCH is
++    // where a description is edited on its own (FR-004). The alternative — inferring
++    // permission from the stored row — is exactly the decision zod cannot make, and
++    // moving it here would put a state-dependent refusal at the boundary where it
++    // fails a whole batch of a hundred.
++    if (entry.description !== undefined && entry.kind !== "bot") {
++      ctx.addIssue({
++        code: "custom",
++        path: ["description"],
++        message: "a description belongs to a bot; name `kind: \"bot\"` with it",
++      });
++    }
++  });
+ 
+ /** FR-025's bound: 100 in one request, and `field: "users"` on 101.
+  *
+```
+
+```diff title="services/api/src/users/users.service.ts"
+@@ -45,12 +45,21 @@ export class UsersService {
+     display_name: string | null;
+     avatar_url: string | null;
+     metadata: Record<string, unknown>;
++    kind: "person" | "bot";
++    description: string | null;
+   } {
+     return {
+       external_id: user.external_id,
+       display_name: user.display_name,
+       avatar_url: user.avatar_url,
+       metadata: user.metadata,
++      // `kind` ON EVERY USER, AND THAT IS FR-003 BEING SATISFIED RATHER THAN
++      // DOCUMENTED (chapter 3.17). A client that had to infer personhood from a null
++      // description would be inferring it from an absence, and the clause asks for a
++      // stored property. `description` is null for a person because the schema refuses
++      // to give one, not because nobody has set it yet.
++      kind: user.kind,
++      description: user.description,
+     };
+   }
+ 
+@@ -174,10 +183,22 @@ export class UsersService {
+   async upsertUsers(body: UpsertUsersBody): Promise<{
+     data: Array<{
+       external_id: string;
+-      status: "created" | "updated" | "revived";
++      /** A FOURTH STATUS, IN A 200 (chapter 3.17, FR-002a). `kind_conflict` says the
++       * entry asked to change what kind of thing a user is and the change was refused
++       * — a promotion whose row has already sent a message, or any demotion.
++       *
++       * NOT A 400, and the reason is the shape of this route rather than politeness.
++       * Zod cannot see the stored row, so this refusal is only knowable mid-batch; a
++       * status code would fail all hundred entries because of entry 7, which is what
++       * this per-entry array exists to prevent. The boundary keeps the refusals a
++       * customer can fix by re-reading their own request — a bot with no description,
++       * a person with one — and those still fail the whole body. */
++      status: "created" | "updated" | "revived" | "kind_conflict";
+       display_name: string | null;
+       avatar_url: string | null;
+       metadata: Record<string, unknown>;
++      kind: "person" | "bot";
++      description: string | null;
+     }>;
+   }> {
+     const data = [];
+@@ -190,6 +211,8 @@ export class UsersService {
+         display_name: user.display_name,
+         avatar_url: user.avatar_url,
+         metadata: user.metadata,
++        kind: user.kind,
++        description: user.description,
+       });
+     }
+     return { data };
+```
+
+```diff title="services/gateway/src/isolation-fixtures.ts"
+@@ -40,6 +40,13 @@ interface Seeder {
+       channelId: string,
+       input: { text: string; userId?: string; userExternalId?: string },
+     ) => Promise<{ id: string; seq: number }>;
++    /** Chapter 3.17. The gateway declares its own narrow view of the repository —
++     * it has no database and must not gain one (research R12) — so a new fixture
++     * capability means one more line here. */
++    upsertUser: (
++      externalId: string,
++      profile: { kind?: "person" | "bot"; description?: string },
++    ) => Promise<{ status: string }>;
+   };
+ }
+ 
+@@ -55,6 +62,14 @@ export interface SocketTenant {
+    * private channels (FR-005) — so a refused send can be checked against the
+    * rows rather than against its own error frame. */
+   privateHistory: () => Promise<string>;
++  /** A DISPOSABLE user of this tenant, with its own token, that a test may destroy
++   * (chapter 3.17, T040b).
++   *
++   * NOT the tenant's own user. Promoting that one to a bot makes it unable to connect
++   * for the rest of the file, and every test after it — including the control — fails.
++   * That is the fifth time in two features a shared fixture has been the hazard, and
++   * the fix is a fixture nobody else depends on rather than a rule nobody remembers. */
++  disposable: () => Promise<{ token: string; promoteToBot: () => Promise<unknown> }>;
+   /** Removes this tenant's user from its own channel via the public route. */
+   removeSelf: () => Promise<void>;
+   rejoinSelf: () => Promise<void>;
+@@ -140,6 +155,22 @@ export async function seedSocketTenants(apiUrl: string): Promise<SocketTenants>
+       token,
+       say: (text: string) =>
+         repo.sendMessage(channel.id, { text, userId: user.id, userExternalId }),
++      /** Turn this tenant's own user into a bot (chapter 3.17, T040b). Exposed rather
++       * than done in the test, because the fixture owns the repository handle and the
++       * test has no database of its own. */
++      disposable: async () => {
++        const who = `${label}-disposable-${Math.random().toString(36).slice(2, 8)}`;
++        const row = await repo.createUser(who, "Disposable");
++        await repo.addMember(channel.id, row.id);
++        return {
++          token: await mintToken(apiUrl, key.credential, who),
++          promoteToBot: () =>
++            repo.upsertUser(who, {
++              kind: "bot",
++              description: "promoted while holding a live token",
++            }),
++        };
++      },
+       /** Remove this tenant's own user from its own public channel, through the
+        * public route — so the test asserts the consequence of the API rather than of
+        * a direct write. */
+```
+
+```diff title="services/gateway/src/isolation.itest.ts"
+@@ -218,6 +218,36 @@ describe("the socket gauntlet", () => {
+     api?.stop();
+   });
+ 
++  // ── T040b: a promoted bot's live token cannot open a socket (FR-005b) ──────
++  //
++  // REFUSING AT THE MINT IS NOT ENOUGH, and this is the test that says so. A token lives
++  // up to 24 hours (FR-AUT-07), so a user promoted to a bot at 09:00 holds a valid token
++  // until 09:00 tomorrow. The session route reads `banned_at` and, until chapter 3.17,
++  // not `kind` — so closing the mint alone would leave a bot able to connect for a day
++  // after it became one.
++  //
++  // THE SOCKET SEES A CLOSE, NOT A 404. The refusal is the api's, at
++  // `POST /internal/session`, and the gateway has nothing to tell a client whose session
++  // was refused — which is why this test lives here and not in the api's suite.
++  describe("a bot cannot open a socket, even holding a token minted before it was one", () => {
++    it("closes the connection instead of acknowledging it", async () => {
++      // A DISPOSABLE USER, not the tenant's own. Promoting the attacker's user makes it
++      // unable to connect for the rest of the file, and the first version of this test
++      // took the control down with it — the fifth shared-fixture casualty in two
++      // features.
++      const doomed = await tenants.attacker.disposable();
++      // The token is minted while the identifier is still a person, which is the whole
++      // scenario: the promotion happens afterwards and the token stays valid.
++      await connect(doomed.token).waitFor("connection.ack");
++
++      await doomed.promoteToBot();
++
++      await expect(
++        connect(doomed.token).waitFor("connection.ack"),
++      ).rejects.toThrow();
++    });
++  });
++
+   // ── THE CONTROL, for the reason the HTTP gauntlet needed one ────────────────
+   //
+   // Three of the four attacks below assert that NOTHING happened. A socket that
+```
+
+```diff title="services/gateway/src/public-surface.itest.ts"
+@@ -238,9 +238,35 @@ describe("a channel, a member and a message, all over the public API", () => {
+   // send to an end-user token would change what `user` means on the wire for every
+   // existing caller (FR-MSG-13's territory), and a live fan-out from the api is a
+   // new coupling between the api and Redis. Both are named in the chapter.
++  //
++  // CHAPTER 3.17 DID HALF OF THAT, and this comment is left standing rather than
++  // rewritten because the half it did is not the half that fixes this. FR-MSG-13 was
++  // amended — "on behalf of any user" became "on behalf of a bot user of that tenant" —
++  // so a REST send now names a sender, and the send below names one. What did NOT change
++  // is the fan-out: the api still publishes nothing, so the message still reaches no
++  // socket, live or on resume. Chapter 3.18 is the fan-out.
++  //
++  // THE SENDER IS A BOT, because the caller is a key. A key may not name "tuan" — that
++  // is a person and `sender_not_permitted` is the refusal — so the send that this test
++  // needs to succeed must name software.
+   it("does NOT deliver a REST-sent message, live or on resume", async () => {
+     const channelId = await seedOverTheWire("rest", ["tuan"]);
+     const token = await mint("tuan");
++    // Created over the public route, because this suite has no database handle by
++    // design — it is the one that tests what a customer can reach.
++    await post(
++      "/v1/users",
++      {
++        users: [
++          {
++            external_id: "rest-courier",
++            kind: "bot",
++            description: "sends over REST so this test can watch nothing arrive",
++          },
++        ],
++      },
++      api.credential,
++    );
+ 
+     const live = reader(`${wsUrl}/v1/ws?token=${token}`);
+     await live.opened;
+@@ -248,7 +274,11 @@ describe("a channel, a member and a message, all over the public API", () => {
+     const first = `first over rest ${randomUUID().slice(0, 8)}`;
+     const second = `second over rest ${randomUUID().slice(0, 8)}`;
+     for (const text of [first, second]) {
+-      const sent = await post(`/v1/channels/${channelId}/messages`, { text }, api.credential);
++      const sent = await post(
++        `/v1/channels/${channelId}/messages`,
++        { text, user: "rest-courier" },
++        api.credential,
++      );
+       expect(sent.status).toBe(201);
+     }
+ 
+@@ -260,17 +290,33 @@ describe("a channel, a member and a message, all over the public API", () => {
+       })
+     ).json()) as { messages: { seq: number; user: string | null; text: string }[] };
+     expect(history.messages.map((m) => m.text)).toEqual([second, first]);
+-    expect(history.messages.every((m) => m.user === null)).toBe(true);
++    // WAS `every((m) => m.user === null)`, AND THAT IS THE CHAPTER (chapter 3.17,
++    // T055's class). This assertion existed to prove the rows were senderless, which was
++    // why `toFrame` dropped them. Every REST send now names a sender, so the premise it
++    // rested on is gone.
++    expect(history.messages.every((m) => m.user === "rest-courier")).toBe(true);
+ 
+     // No live delivery.
+     await new Promise((resolve) => setTimeout(resolve, 1_500));
+     expect(live.frames.filter((f) => f.type === "message.created")).toEqual([]);
+     live.socket.close();
+ 
+-    // And none on resume either. The cursor IS accepted — `resume_ok` is true and
+-    // the channel is in the echoed cursor — so this is not a rejected resume
+-    // dressed as an empty one. The page came back and every row in it was
+-    // dropped for having no sender.
++    // AND ON RESUME IT NOW ARRIVES — WHICH IS HALF OF THE GAP CLOSING (chapter 3.17).
++    //
++    // This block asserted `[]`, and the comment said why: "the page came back and every
++    // row in it was dropped for having no sender." That was true, and it is the reason
++    // chapter 3.12's `gaps.md` G1 listed TWO independent mechanisms for "a REST-sent
++    // message reaches no socket" — nothing publishes, and the public send passes no user.
++    //
++    // FR-MSG-15 removes the second. Every REST send now names a sender, `toFrame` has no
++    // reason to drop the row, and the backfill delivers it. So the resume half of G1 is
++    // closed by this chapter and the LIVE half is not: `live.frames` above is still
++    // empty, because only the gateway publishes to the fan-out (`session.ts`) and the api
++    // still publishes nothing. Chapter 3.18 is that half.
++    //
++    // The test's name is now half wrong and is left alone deliberately: T096a amends the
++    // gap record, and renaming a test is not how a reader learns that a two-mechanism
++    // gap became a one-mechanism gap.
+     const resumed = reader(`${wsUrl}/v1/ws?token=${token}&cursor=${channelId}:1`);
+     await resumed.opened;
+     await new Promise((resolve) => setTimeout(resolve, 1_500));
+@@ -279,7 +325,17 @@ describe("a channel, a member and a message, all over the public API", () => {
+       | undefined;
+     expect(ack?.payload.resume_ok).toBe(true);
+     expect(Object.keys(ack?.payload.cursor ?? {})).toContain(channelId);
+-    expect(resumed.frames.filter((f) => f.type === "message.created")).toEqual([]);
++    // ONE FRAME, NOT TWO, AND THE CURSOR IS WHY. `cursor=${channelId}:1` says "I have
++    // seen through sequence 1", so the backfill replays what came after it — the second
++    // message only. Asserting two was an assumption about the fixture rather than a
++    // reading of the cursor.
++    const onResume = resumed.frames.filter((f) => f.type === "message.created");
++    expect(onResume).toHaveLength(1);
++    const frame = onResume[0] as unknown as {
++      payload: { user: string; text: string };
++    };
++    expect(frame.payload.text).toBe(second);
++    expect(frame.payload.user).toBe("rest-courier");
+     resumed.socket.close();
+   }, 60_000);
+ });
+```
+
+```diff title="vitest.coverage.config.mts"
+@@ -191,7 +191,11 @@ export default defineConfig({
+         // the gate went red against its pin of 99; the instrument was right, because the
+         // second throw said nothing the first had not. One throw, and lines read 99.13%.
+         "services/api/src/db/repository.ts": {
+-          branches: 91,
++          // 91 -> 92 (chapter 3.17). Measured 92.59 after this feature, which is 0.59 of
++          // headroom — the same margin chapter 3.16 left when it raised 90 -> 91 at 92.11.
++          // The arms that moved it: the sender's `kind` read feeding two checks, the
++          // promotion's has-ever-sent scan, and the ceiling's person-only count.
++          branches: 92,
+           functions: 100,
+           lines: 99,
+           statements: 97,
+```
+
+## Nó đã tốn những gì
+```text
+files changed in relay-platform                                    35
+of those, fenced by some chapter                                   27
+changed and fenced by nobody                                        8
+
+integration lane        589 tests, 25 of 26 full-lane runs green
+                        mean 193.55 s, stdev 0.99, budget 240 s
+the sealed outsider     11 tests, green, following the README
+repository.ts           branches 92.59% (pin raised 91 -> 92), functions 100%
+```
+
+Chi phí lane trên mỗi test không nhích. 589 test ở mức trung bình 193,55 s so với 550 test của chương
+trước ở mức trung bình 193,55 s — cùng một con số tới hai chữ số thập phân, vì lane tốn theo *suite*
+và chương này không thêm tệp suite nào. Lần đầu tiên một mô hình chi phí lane ở đây đưa ra một dự báo
+đứng vững.
+
+Một lượt trong hai mươi sáu lượt đã fail, ở một bài test về mail relay mà chương này không chạm tới,
+và cơ chế thì chưa xác định được. Nó được ghi lại như một khoảng trống có người phụ trách chứ không
+được sửa, vì sửa một bài test chập chờn mà chưa biết cơ chế nghĩa là cứ đổi code cho tới khi triệu
+chứng biến mất.
+
+<Checkpoint>
+
+Server của một khách hàng nêu tên phần mềm đang đăng bài. Cái tên đó là một row `users` có
+description, description là bắt buộc theo cơ sở dữ liệu, và một tin nhắn không có người gửi thì
+không biên dịch được.
+
+</Checkpoint>
+
+<ForwardRef>
+
+Tin nhắn vẫn không tới được socket trực tiếp nào. Api không publish vào fan-out nào cả — đó là nửa
+của khoảng trống ở chương 3.12 mà chương này không đóng, và chương 3.18 là lần publish đó.
+
+Presence là động từ thứ ba của FR-CHN-05 và nó chưa từng được xây. Điều khoản đó có ba động từ: đọc,
+gửi, quan sát presence. Hai trong ba đã đứng vững trước chương này và vẫn đứng vững sau nó. Chương
+3.19 là động từ thứ ba.
+
+</ForwardRef>
+
+<ChapterFooter id="3.17" />
