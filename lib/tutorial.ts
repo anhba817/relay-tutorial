@@ -589,6 +589,25 @@ export const series: Part[] = [
         readerProducesVi:
           "Bot user mang theo một description mà cơ sở dữ liệu bắt buộc phải có, một người gửi bắt buộc trên mọi tin nhắn và được chính trình biên dịch bảo đảm thay vì một bài test, một application credential chỉ được nói với danh nghĩa phần mềm chứ không phải bất kỳ con người nào, những lời từ chối không hé ra ai đang tồn tại, và một bot vẫn được tính tiền như active user nhưng được miễn khỏi cái ngưỡng vốn từ chối tin gửi",
       },
+      {
+        id: "3.18",
+        path: "/part-3/chapter-18/the-message-that-never-arrived",
+        title: "The message that never arrived",
+        status: "published",
+        // The architecture drew this edge before the api existed — `05-sad.md`'s
+        // component diagram has `api -- "publish fan-out" --> redis` — and its own
+        // sequence diagram ten lines lower gives the publish to the gateway. Three
+        // planning documents cited the first line as proof the design intended it and
+        // none read as far as the second. `sourceDoc` is the SAD rather than the SRS
+        // because no SRS clause changed: FR-RTM-01 already required this.
+        readerProduces:
+          "A message sent over REST that reaches a live socket, an ordering that splits by transport because a request handler's response IS its acknowledgement, a publisher that survives a dead broker in 2 ms where the gateway's client hangs for ever, and a P1 clause measured as unmet and recorded rather than narrowed",
+        sourceDoc: "docs/05-sad.md",
+        readerMinutes: 70,
+        titleVi: "Tin nhắn chưa từng tới",
+        readerProducesVi:
+          "Một tin nhắn gửi qua REST tới được socket đang mở, một thứ tự phải tách theo transport vì response của một request handler CHÍNH LÀ acknowledgement của nó, một publisher sống sót qua broker đã chết trong 2 ms ở nơi client của gateway treo vô hạn, và một điều khoản P1 được đo là chưa thoả mãn rồi ghi lại thay vì bị thu hẹp",
+      },
     ],
   },
   {

@@ -1,0 +1,1149 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figTwoDoors, figOrdering, figFailureShape, figMembershipSnapshot } from "./figures";
+
+export const metadata = {
+  title: "The message that never arrived — Building Relay",
+  description:
+    "A message sent over REST commits, returns 201, and reaches nobody. The architecture drew that edge before the api existed; nothing built it. One publisher closes it, and the ordering it inherits cannot be copied.",
+  alternates: {
+    canonical: "/part-3/chapter-18/the-message-that-never-arrived",
+    languages: {
+      en: "/part-3/chapter-18/the-message-that-never-arrived",
+      vi: "/vi/part-3/chapter-18/the-message-that-never-arrived",
+    },
+  },
+};
+
+<ChapterHeader id="3.18" />
+
+A customer's build server posts a message. It gets a `201` with a sequence number. A teammate
+has the app open, is a member of that channel, and is looking at it.
+
+Nothing happens.
+
+Not slowly — never. The row is committed, the sequence is assigned, the outbox has its event,
+and the socket sitting four feet away receives its own handshake and then silence. Chapter 3.14
+found this by running the sealed exercise and recorded it as a verdict. Chapter 3.12 listed it
+as a gap with two independent causes. Chapter 3.17 removed one of them. This chapter removes
+the other, and the call site that does it is sixteen lines of code. The publisher behind it is
+fifty-seven.
+
+The interesting part is neither number.
+
+<Figure caption="One publisher, and the door it does not stand at" code={figTwoDoors} />
+
+## The edge was drawn before the api existed
+
+`docs/05-sad.md`, the component diagram:
+
+```text title="docs/05-sad.md (excerpt)"
+    api -- "publish fan-out" --> redis
+```
+
+That line is older than the code that would have satisfied it. Three of this chapter's own
+planning documents cited it as proof the design had always intended this — *the edge was drawn
+all along* — and every one of them stopped reading there.
+
+Ten lines below the sequence diagram in the same file:
+
+```text title="docs/05-sad.md (excerpt)"
+    G->>G: publish to Redis chan:{channel_id}
+```
+
+`G` is the gateway. The component view gives the publish to the api; the sequence view gives it
+to the gateway; and a third document, ADR-07's deep dive, argues for Redis over core NATS on the
+grounds of *"a clean mapping — gateway to Redis, api and workers to NATS"*.
+
+The gateway's own file says the same thing in a comment, and that comment is now wrong:
+
+```diff title="services/gateway/src/fanout.ts"
+@@ -1,4 +1,8 @@
+-import { messageCreatedSchema, type Message } from "@relay/protocol";
++import {
++  messageCreatedSchema,
++  subjectForChannel,
++  type Message,
++} from "@relay/protocol";
+ import type { Logger } from "@relay/service-kit";
+ // A NAMED import, not a default: ioredis is CommonJS, the gateway is ESM,
+ // and without esModuleInterop a default import of a CJS module hands you
+@@ -8,9 +12,16 @@ import type { Logger } from "@relay/service-kit";
+ import { Redis } from "ioredis";
+ 
+ // The fan-out fabric (chapter 2.6, ADR-07): Redis pub/sub, one subject per
+-// channel — `chan:{channel_id}`. The instance that handled a send publishes
+-// the committed message AFTER the api's response; every instance hosting a
+-// member of that channel is subscribed and delivers to its local sockets.
++// channel — `chan:{channel_id}`. Every instance hosting a member of that
++// channel is subscribed and delivers to its local sockets.
++//
++// WHO PUBLISHES CHANGED IN CHAPTER 3.18. This comment used to say "the
++// instance that handled a send publishes the committed message AFTER the api's
++// response", which was true while a socket was the only way in. There are two
++// publishers now: this one, for a socket send, and the api, for a REST send.
++// The ordering also splits by transport — a socket can ack and then publish
++// because it has two channels, and a request handler cannot, because its
++// response IS the ack.
+ //
+ // This fabric is AT-MOST-ONCE by design. No acks, no replay, no consumer
+ // groups. A frame that misses a subscriber is simply gone — and that is
+@@ -26,13 +37,6 @@ import { Redis } from "ioredis";
+ 
+ export const DEFAULT_REDIS_URL = "redis://localhost:6379";
+ 
+-/** One subject per channel: an instance receives only frames it can
+- * actually deliver, and a pathological channel saturates its own subject
+- * rather than every gateway's inbox. */
+-export function subjectFor(channelId: string): string {
+-  return `chan:${channelId}`;
+-}
+-
+ export interface Fanout {
+   /** Register the delivery callback. Set by the session layer at wiring
+    * time — the fabric knows how to receive, the sessions know who to
+@@ -88,7 +92,7 @@ export function createFanout({
+     async publish(message) {
+       try {
+         await publisher.publish(
+-          subjectFor(message.channel),
++          subjectForChannel(message.channel),
+           JSON.stringify(message),
+         );
+       } catch (error) {
+@@ -103,13 +107,13 @@ export function createFanout({
+     async subscribe(channelId) {
+       const next = (counts.get(channelId) ?? 0) + 1;
+       counts.set(channelId, next);
+-      if (next === 1) await subscriber.subscribe(subjectFor(channelId));
++      if (next === 1) await subscriber.subscribe(subjectForChannel(channelId));
+     },
+     async unsubscribe(channelId) {
+       const next = (counts.get(channelId) ?? 1) - 1;
+       if (next <= 0) {
+         counts.delete(channelId);
+-        await subscriber.unsubscribe(subjectFor(channelId));
++        await subscriber.unsubscribe(subjectForChannel(channelId));
+       } else {
+         counts.set(channelId, next);
+       }
+```
+
+The grammar left with it. `subjectForChannel` lives in the shared package now, and the gateway
+imports what it used to define:
+
+```diff title="packages/protocol/src/index.ts"
+@@ -1,9 +1,12 @@
+ // @relay/protocol — the shared wire contract (ADR-01's payoff, chapter 1.3).
+ // One home for frame schemas, their inferred types, the failure
+-// vocabulary, and — from chapter 2.5 — the internal service contract the
+-// gateway and API service share. Consumed by the gateway and API service
+-// from 1.4, and by the SDK in a later part.
++// vocabulary, the internal service contract the gateway and API service share
++// (chapter 2.5), and — from chapter 3.18 — the live fan-out's subject grammar,
++// which needed a shared home the moment a second service published to it.
++// Consumed by the gateway and API service from 1.4, and by the SDK in a later
++// part.
+ 
+ export * from "./frames.js";
+ export * from "./codes.js";
+ export * from "./internal.js";
++export * from "./fanout.js";
+```
+
+<Why>
+
+None of the three is a lie. They were written about a system with one way in, at a time when the
+gateway was the only thing that spoke to a client. A component diagram records intent, a sequence
+diagram records a trace, and an ADR records an argument — and the three drift apart the moment
+something has two entrances instead of one.
+
+The instrument that would have caught it is not a checker. `check:docs` compares each mirrored
+document against its source and finds **drift**, and it says so in its own comment; two copies
+that agree are both wrong together. Reading the line number answered *is the edge drawn*. It
+never answered *does the document agree with itself*.
+
+</Why>
+
+## The ordering cannot be copied
+
+Here is the sentence the SAD attaches to that diagram:
+
+```text title="docs/05-sad.md (excerpt)"
+- **Ack after commit, never before** (FR-MSG-05). The Redis fan-out happens after the ack;
+  a recipient may see the message milliseconds after the sender's ack, never before durability.
+```
+
+A socket can perform that literally, and `session.ts` does:
+
+```text title="services/gateway/src/session.ts (excerpt)"
+      send(connection.socket, { type: "message.ack", payload: { seq } });
+      // ...and only THEN does anyone else hear about it. Durability, then the
+      // sender's confirmation, then everybody's copy: no step overtakes the
+      // one before it.
+```
+
+It writes an ack frame, then publishes. It can, because it holds two channels: a socket it can
+write to whenever it likes, and a broker it can publish to afterwards.
+
+**A request handler holds one.** The response *is* the ack. Anything the handler awaits happens
+before the response is written, so "publish after the ack" is not a sequence this transport can
+produce. The only way to get it literally is to detach the publish from the request — and a
+detached publish takes its failure with it, somewhere no test and no operator can see it
+synchronously.
+
+<Figure caption="The same guarantee, two orderings, one of them not available" code={figOrdering} />
+
+So the clause splits by transport, and what it protects survives both readings: **the commit
+precedes both**. A recipient may see a REST-sent message a fraction before the sender's `201`,
+and can never see any message before it is durable.
+
+<Trap title="The clause you amend is not always the one you are reading">
+
+This chapter's own specification said *"the publish MUST happen after the acknowledgement, not
+before"* — copied from the SAD in good faith, before anyone had established where the publish
+site actually is. The site is one line above the `return` that assembles the response. The
+requirement forbade the only thing the transport can do.
+
+Amending a requirement to match a measurement is not the same as weakening it. The test is
+whether the amended clause still forbids something: this one forbids publishing before the
+commit, on both paths, which is the whole of what FR-MSG-05 was ever protecting.
+
+</Trap>
+
+There is a cost, and it is recorded rather than absorbed. **NFR-PRF-01 measures "send
+acknowledged to recipient receipt"** — an interval that can be negative on the REST path, and
+therefore is not measurable there. It stays measurable on the socket path. The publish instead
+falls inside NFR-PRF-02's budget for the write, where it was measured:
+
+```text title="specs/036-chapter-3-18/baseline.txt (excerpt)"
+    242-byte payload, 2000 samples after 200 warm-up
+
+    p50   0.142 ms
+    p95   0.226 ms
+    p99   0.472 ms
+    max   0.965 ms
+```
+
+0.226 ms against 150 ms. That number is why the publish is awaited rather than detached: making
+the failure observable costs 0.15% of the budget.
+
+## Where the publish goes, and the two callers that decide it
+
+```text title="services/api/src/messages/messages.controller.ts (excerpt)"
+    const message = await this.messages.send(
+      channelId,
+      body,
+      user.id,
+      actingExternalId,
+      tokenSubject === undefined,
+    );
+```
+
+The obvious home for a publish is `MessagesService.send` — one place, both routes, no
+duplication. It is also wrong, and the reason is two lines of `grep`:
+
+```text title="the question that decides the publish site (excerpt)"
+$ grep -rl "this.messages.send(" services/api/src
+services/api/src/internal/internal.controller.ts
+services/api/src/messages/messages.controller.ts
+```
+
+Two callers. The second is the public route; **the first is the gateway's**, and the gateway
+already publishes for its own path. A publish in the service would put every socket-sent message
+on every member's screen twice.
+
+<Why>
+
+The controller turns out to be the better site for a reason that has nothing to do with
+avoiding the bug. The six fields the fan-out frame needs — `id`, `channel`, `seq`, `user`,
+`text`, `created_at` — are *already assembled there*, in the `return` that builds the public
+response. `MessageRow` carries five of them and `actingExternalId` is the sixth. Nothing needs
+threading, and `message.duplicate` is in scope for the guard.
+
+Put the publish in the service and you must thread the sender down, thread a flag to say which
+caller you are, and hold `duplicate` past the point the service deliberately stopped exposing
+it. The site that avoids the bug is the site that needed no new plumbing.
+
+</Why>
+
+And the module keeps it that way structurally:
+
+```text title="services/api/src/messages/messages.module.ts (excerpt)"
+  // MESSAGE_PUBLISHER is deliberately absent. See the note above it.
+  exports: [Repository, MessagesService],
+```
+
+`internal.module.ts` imports this module and, in its own words, *"reuse[s] MessagesModule's
+providers wholesale"*. Provided and not exported, the publisher is not injectable from the
+internal route at all. FR-006 holds by module boundary rather than by where a call sits — the
+same trick this module already plays with `"DB"`.
+
+```diff title="services/api/src/messages/messages.module.ts"
+@@ -1,13 +1,58 @@
+-import { Module, Scope } from "@nestjs/common";
++import {
++  Inject,
++  Injectable,
++  Module,
++  Scope,
++  type OnModuleDestroy,
++} from "@nestjs/common";
+ import { REQUEST } from "@nestjs/core";
++import type { Logger } from "@relay/service-kit";
+ 
+ import { AuthModule } from "../auth/auth.module";
++import {
++  createMessagePublisher,
++  MESSAGE_PUBLISHER,
++  type MessagePublisher,
++} from "../fanout/publisher";
++import { apiLogger, LOGGER } from "../logger";
+ import { createDb, createPool, type Db } from "../db/client";
+ import type { RequestWithTenant } from "./request-with-tenant";
+ import { Repository } from "../db/repository";
+ import { MessagesController } from "./messages.controller";
+ import { MessagesService } from "./messages.service";
+ 
++/** Chapter 3.18. The api publishes to the live fan-out from the send path, so
++ * the module that owns that path owns the client.
++ *
++ * PROVIDED AND NOT EXPORTED, and that is the point. `internal.module.ts` imports
++ * this module and, in its own words, "reuse[s] MessagesModule's providers
++ * wholesale" — so an exported publisher would be injectable from the internal
++ * route, which is the one path that must never publish. The gateway already
++ * publishes for a socket send, and a second publisher there would put the same
++ * message on every member's screen twice (FR-006).
++ *
++ * Withholding it makes that structural rather than a matter of where a call
++ * sits. This module already does the same with `"DB"`.
++ *
++ * The TOKEN lives in `../fanout/publisher` — this module imports the controller,
++ * so a controller importing the token from here would be a cycle. */
++
++/** `limits/limits.module.ts:10` states the convention: "resource in this api
++ * closes through `OnModuleDestroy`". Six modules implement it; this is
++ * `CounterStoreLifecycle` for the analogous Redis client. A `close()` nothing
++ * calls is a leaked handle in a service that boots once per integration
++ * suite. */
++@Injectable()
++export class MessagePublisherLifecycle implements OnModuleDestroy {
++  constructor(
++    @Inject(MESSAGE_PUBLISHER) private readonly publisher: MessagePublisher,
++  ) {}
++
++  async onModuleDestroy(): Promise<void> {
++    await this.publisher.close();
++  }
++}
++
+ // The repository stays the plain 2.1 class — the framework's job is only
+ // to construct it per request with the authenticated tenant (ADR-15's
+ // scope note: guards authenticate, the data layer isolates).
+@@ -41,7 +86,16 @@ import { MessagesService } from "./messages.service";
+         new Repository(db, req.principal?.environmentId ?? ""),
+     },
+     MessagesService,
++    { provide: LOGGER, useFactory: apiLogger },
++    {
++      provide: MESSAGE_PUBLISHER,
++      inject: [LOGGER],
++      useFactory: (logger: Logger): MessagePublisher =>
++        createMessagePublisher({ logger }),
++    },
++    MessagePublisherLifecycle,
+   ],
++  // MESSAGE_PUBLISHER is deliberately absent. See the note above it.
+   exports: [Repository, MessagesService],
+ })
+ export class MessagesModule {}
+```
+
+And the publish itself, at the site the two callers chose for it:
+
+```diff title="services/api/src/messages/messages.controller.ts"
+@@ -3,6 +3,7 @@ import {
+   Body,
+   Controller,
+   Get,
++  Inject,
+   Param,
+   Post,
+   Query,
+@@ -13,6 +14,10 @@ import {
+ import { Accepts, CredentialGuard } from "../auth/credential.guard";
+ import { Repository } from "../db/repository";
+ import { MessagesService } from "./messages.service";
++import {
++  MESSAGE_PUBLISHER,
++  type MessagePublisher,
++} from "../fanout/publisher";
+ import { historyQuerySchema, sendMessageBodySchema } from "./messages.schema";
+ // `import type` is required, not stylistic: with isolatedModules and
+ // emitDecoratorMetadata on (ADR-15's trade-off, chapter 1.4), a type used
+@@ -62,6 +67,12 @@ export class MessagesController {
+   constructor(
+     private readonly messages: MessagesService,
+     private readonly repo: Repository,
++    // Chapter 3.18. INJECTED HERE AND NOT INTO THE SERVICE, because two callers
++    // reach `MessagesService.send` — this route and `internal.controller.ts`,
++    // which is the gateway's — and the gateway publishes for its own path
++    // already. A publish in the service would put every socket-sent message on
++    // every member's screen twice (FR-006).
++    @Inject(MESSAGE_PUBLISHER) private readonly fanout: MessagePublisher,
+   ) {}
+ 
+   @Post()
+@@ -158,6 +169,52 @@ export class MessagesController {
+     // The field list is spelled out rather than spread-minus-`duplicate`,
+     // so a new column joins the public response only when someone decides
+     // it should.
++    // ── the live fan-out (chapter 3.18, FR-004) ────────────────────────────
++    //
++    // AFTER THE COMMIT, BEFORE THE RESPONSE. `docs/05-sad.md` says the fan-out
++    // happens "after the ack", and a socket can do that literally — it writes an
++    // ack frame and then publishes, because it has two channels. A request
++    // handler has one: the response IS the ack, so anything awaited here
++    // precedes it. FR-005 was amended to split by transport rather than pretend
++    // otherwise. What the sentence protects survives either way: the row is
++    // durable before anyone hears about it.
++    //
++    // Not in a `finally`, and not in the service's `try`. A refused send throws
++    // out of `this.messages.send` above and never reaches this line, which is
++    // FR-008 by construction rather than by a flag.
++    //
++    // TWO GUARDS, both mirrored from `session.ts:651`, both load-bearing:
++    //
++    //   !duplicate    A RECOGNISED RETRY WROTE NO ROW. 2.3 made the retry safe
++    //                 for storage; that did not make it safe for delivery, and a
++    //                 client retrying on a flaky link would otherwise put the
++    //                 same message on every member's screen twice.
++    //   text !== null A tombstone recovered by an old idempotency key is not a
++    //                 creation. It has a second, independent reason here:
++    //                 `messageSchema.text` is `z.string()`, not nullable, so a
++    //                 tombstone could not be published anyway — the far end
++    //                 would drop it as an invalid payload while this route
++    //                 answered 201.
++    if (!message.duplicate && message.text !== null) {
++      await this.fanout.publish(
++        {
++          id: message.id,
++          // `channel`, not `channel_id`. The frame's field is `channel`, and
++          // `messageSchema` is a `z.strictObject` — publishing `channel_id`
++          // would deliver NOTHING while this route still answered 201.
++          channel: message.channel_id,
++          seq: message.seq,
++          user: actingExternalId,
++          text: message.text,
++          created_at: message.created_at,
++        },
++        {
++          requestId: req.requestId ?? "unknown",
++          environmentId: req.principal?.environmentId ?? "unknown",
++        },
++      );
++    }
++
+     return {
+       id: message.id,
+       channel_id: message.channel_id,
+```
+
+## Two guards, one of which has a reason nobody wrote down
+
+```text title="services/api/src/messages/messages.controller.ts (excerpt)"
+    if (!message.duplicate && message.text !== null) {
+      await this.fanout.publish(
+```
+
+Both are copied from the gateway, and the gateway explains the first:
+
+```text title="services/gateway/src/session.ts (excerpt)"
+      // A RECOGNISED RETRY IS NOT REPUBLISHED. 2.3 made the retry safe for
+      // storage; that did not make it safe for delivery, and a client that
+      // retries on a flaky link would otherwise put the same message on
+      // every member's screen twice. `text === null` is the same argument:
+      // a tombstone recovered by an old key is not a creation.
+```
+
+The second guard has a second reason, and it is stronger than the semantic one:
+
+```text title="packages/protocol/src/frames.ts (excerpt)"
+export const messageSchema = z.strictObject({
+  id: z.string().min(1),
+  channel: z.string().min(1),
+  seq: z.number().int().positive(),
+  user: z.string().min(1),
+  text: z.string(),
+  created_at: z.iso.datetime(),
+});
+```
+
+`text: z.string()` — **not nullable.** A tombstone could not be published even if the semantic
+argument were waived: the delivery side parses with this schema, and what does not match is
+dropped with a log line while the send still answers `201`.
+
+<Trap title="A strict object turns a wrong field name into silence">
+
+`z.strictObject` means the frame is exactly six fields. The row calls its channel `channel_id`
+and the frame calls it `channel`, and the publish site has both names in scope. Publish
+`channel_id` and the far end drops the whole message — no error to the sender, no frame to the
+recipient, a `201` on the wire and nothing else.
+
+Which is why the test asserts against **the schema** rather than against a list of mistakes one
+can think of:
+
+```text title="services/api/src/fanout/fanout.itest.ts (excerpt)"
+    const parsed = messageSchema.safeParse(JSON.parse(raw!));
+    expect(parsed.success, JSON.stringify(parsed.error?.issues)).toBe(true);
+```
+
+One `safeParse` covers a seventh key, a renamed field, a missing sender, a non-positive
+sequence and a timestamp that is not RFC 3339. The class definition is a better checker than any
+enumeration of its members.
+
+</Trap>
+
+## The grammar had to move, and the compiler said why
+
+The api cannot import from the gateway, so `subjectFor` moved into `@relay/protocol` — the same
+move chapter 3.4 made for the event spine's subject grammar, for the same reason. Then:
+
+```text title="tsc, four seconds after the export was added (excerpt)"
+src/index.ts(12,1): error TS2308: Module "./internal.js" has already exported a
+member named 'subjectFor'.
+```
+
+The package already had one. `internal.ts` exports `subjectFor(type, environmentId)` for the
+event spine, and this one is `subjectFor(channelId)` for the fan-out. Nineteen analysis passes
+read both files; the compiler found the collision immediately.
+
+The new one is now `subjectForChannel`, because the spine's name is chapter 3.4's and is
+published. And putting the two side by side makes a difference visible that neither signature
+states:
+
+```text title="the two subject grammars, together for the first time (excerpt)"
+events.msg.created.{environment_id}     the spine   — carries the tenant
+chan:{channel_id}                       the fan-out — carries a channel
+```
+
+The spine's subject is tenant-scoped; the fan-out's is not. It is defensible — a channel id is
+a UUID, and an instance subscribes only to channels a tenant-scoped session named at connect —
+and it is the kind of asymmetry that should be noticed on purpose rather than discovered later.
+
+## Failing is the interesting half
+
+```text title="services/api/src/fanout/publisher.ts (excerpt)"
+      if (now() < downUntil) return;
+      try {
+        await redis.publish(
+          subjectForChannel(message.channel),
+          JSON.stringify(message),
+        );
+        downUntil = 0;
+      } catch (error) {
+        downUntil = now() + DOWN_WINDOW_MS;
+        logger.log("error", "fanout.publish_failed", {
+```
+
+`publish` never rejects. Delivery is allowed to fail because the row is durable and the resume
+path will find it — ADR-07's decision, and constitution IV's *"any new delivery mechanism MUST
+preserve this recovery property"*.
+
+<Figure caption="Every path through publish() resolves, which is the problem" code={figFailureShape} />
+
+Which means the obvious test proves nothing.
+
+<Trap title="The send returned 201 while Redis was down">
+
+That sentence is true of a working publisher whose publish failed. It is also true of a
+publisher that does nothing at all — and of the fifteen lines never having been written. A test
+asserting it passes in all three worlds.
+
+So the suite contains a second application, booted with a publisher whose `publish` is an empty
+function:
+
+```text title="services/api/src/fanout/fanout.itest.ts (excerpt)"
+      // The weak assertions — both PASS, which is the finding.
+      expect((await send(base, text)).status).toBe(201);
+      expect(await history(base)).toContain(text);
+
+      // The one that carries FR-010 and FR-011 — absent, correctly.
+      expect(lines.find((l) => l["msg"] === "fanout.publish_failed")).toBeUndefined();
+```
+
+The `201` and the recoverability are identical in both worlds. Only the log line separates them,
+which is why FR-011 exists and why it names the fields it names.
+
+</Trap>
+
+## What the measurements said about the client
+
+The api's own rate limiter already holds a Redis client, and its comment is the reason this
+publisher does not copy the gateway's:
+
+```text title="services/api/src/limits/store.ts (excerpt)"
+  // FAILING OPEN IS NOT FREE IF IT FAILS SLOWLY, and the first version of this
+  // file was slow. With the store gone, every command waits out its connect
+  // timeout before giving up — so each request paid a second or more, twice,
+```
+
+That is the warning. Measured, it understates the case:
+
+```text title="specs/036-chapter-3-18/baseline.txt (excerpt)"
+    the shipped publisher, 12 sends at a dead port    total 2 ms
+                                                      (2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    createFanout's options, 12 sends                  HUNG past 420 s
+```
+
+Default ioredis retries forever, so a queued `PUBLISH` never rejects. Copying the gateway's
+client into a request handler does not make sends slow; it makes them never return. The eleven
+zeros are the down-window — after one failure, the next five seconds of publishes do not touch
+the client at all.
+
+And one hazard the options do not cover, found because a task existed to look for it:
+
+```text title="specs/036-chapter-3-18/baseline.txt (excerpt)"
+    as first shipped (no commandTimeout)   publish HUNG past a 3,000 ms bound, twice
+    with commandTimeout: 100               rejected in 100 ms, then 4 ms, then 100 ms
+```
+
+`maxRetriesPerRequest: 0` and `connectTimeout` bound a **dead** server. A server that accepts
+the connection and never answers is a different failure, and neither option touches it.
+`commandTimeout: 100` does — about 440 times the measured p95, and inside the budget a timeout
+above the budget could not protect.
+
+## The clause this chapter did not fix
+
+FR-RTM-10 is P1 and says events shall not reach a client whose membership no longer grants
+access, *"effective within 5 seconds of the membership change"*.
+
+<Figure caption="A snapshot taken at connect, and nothing that re-reads it" code={figMembershipSnapshot} />
+
+```text title="services/gateway/src/session.ts (excerpt)"
+    registry.add(connection);
+    // Subscriptions follow membership: the first local member of a channel
+    // makes this instance a subscriber, and the last one to leave releases
+    // it (reference-counted in the fabric).
+```
+
+`connection.channelIds` is built once, from the session response, at connect. Subscriptions are
+taken once over that set. `registry.subscribersOf` reads the same set on every delivery.
+Unsubscribing happens once, when the socket closes. **Nothing in between re-reads membership,
+and no code path could** — the gateway has no database, by ADR-05, and learns memberships only
+in the session response.
+
+Measured: a member removed over the public route still receives, five and a half seconds later.
+The test asserts the violation.
+
+<Why>
+
+This chapter did not break FR-RTM-10 and does not fix it. The gap has existed for
+socket-originated messages since chapter 2.6; what this chapter adds is a second door onto a
+room whose lock was already missing, and a measurement nobody had taken.
+
+Narrowing the requirement was available and is worth naming as the thing not done. Read
+FR-RTM-10 as *"within five seconds of a reconnect"* and every test goes green, because a
+reconnect rebuilds the snapshot. That reading is not what the clause says, and a specification
+edited until it matches the code has stopped being a specification.
+
+It belongs to chapter 3.19. Presence needs the same missing mechanism — something that tells a
+gateway a membership changed — and FR-RTM-06's grace period is the same shape of problem.
+
+</Why>
+
+## What a client can conclude from silence
+
+Nothing.
+
+A missing frame is not evidence that a message does not exist. The fan-out is at-most-once by
+design: no acks, no replay, no consumer groups, and a frame that misses a subscriber is simply
+gone. What makes that acceptable is that it is **recoverable** — sequences live in PostgreSQL,
+cursors live with the client, and chapter 2.7's resume turns any gap into a backfill.
+
+So the guarantee a client holds is the sequence number, not the delivery. Receiving `seq` 41 and
+then `seq` 43 is how a client learns it missed one, and refetching is how it recovers. The
+publish is an optimisation on top of a guarantee that was already there — which is exactly why
+it is allowed to fail, and why this chapter's publisher swallows its own errors and logs them
+instead of retrying.
+
+## The clause, and the amendment that was not needed
+
+FR-RTM-01: *"A connected client shall receive messages for every channel of which it is a
+member, without per-channel subscription."* P1, in the SRS since v1, and unmet for any REST send
+until this chapter.
+
+<Trap title="A reader arriving from 3.17 is looking for an amendment">
+
+Chapter 3.17's gate was an SRS amendment: the SRS had no concept of a bot user, so one had to be
+written. **This chapter changes no SRS clause at all.** Principle VI is satisfied by citation —
+FR-RTM-01 already required this and was already P1.
+
+The tutorial plan's own row for this chapter names FR-RTM-05, which is about *which event kinds
+exist*. FR-RTM-05 names six; this chapter delivers one, because one is all that has a producer:
+`message.updated` and `membership.changed` have none outside tests, and nothing writes
+`messages.edited_at` or `messages.deleted_at`. The unmet clause was always the delivery one.
+
+Two governing documents did change, and neither is the SRS: `docs/05-sad.md` gained a REST
+sequence and split its ordering bullet, and ADR-07's clean-mapping argument gained an exception
+dated to chapter 3.8 — where the rate limiter gave the api its first Redis client, long before
+this chapter gave it a second.
+
+</Trap>
+
+## The eight files this chapter changes and does not teach
+
+Two of them exist because a log line needed a request id, and the id turned out to live nowhere
+a handler could read it — generated in a middleware, set as a response header, and never put on
+the request. That is a one-line fix and no lesson at all.
+
+The other four are tests whose comments or assertions said the old thing. `isolation.itest.ts`
+keeps its "this suite attaches no fan-out" note, because that is still true of it; what changed
+is the sentence claiming the api publishes to none. `public-surface.itest.ts` had a test written
+two chapters ago to pin this gap, and it broke when the gap closed.
+
+Two of the eight are files the appendix also amends — the coverage config and
+`resume.itest.ts` — and their hunks land in regions the appendix's own do not touch.
+
+**`eslint.config.mjs` is not here, and the chain is why.** This chapter changed it: the new
+publisher imports `ioredis`, which a rule restricts on constitution I's authority, so two
+entries had to join an exemption list. A chapter fence for it produced
+`hunk pre-image matched 0 times` — the list is appendix territory, the appendix's hunk owns
+that region, and a chapter cannot do the appendix's work. The change is in
+`fences/post-series.md` instead. That was found by running the chain, not by reading it.
+
+```diff title="services/api/src/auth/principal.ts"
+@@ -75,6 +75,10 @@ export const OVER_AUTH_THRESHOLD = Symbol.for("relay:over-auth-threshold");
+ export interface RequestWithPrincipal {
+   headers: Record<string, string | string[] | undefined>;
+   principal?: Principal;
++  /** Chapter 3.18: the id `RequestContextMiddleware` generated for this request.
++   * A handler that logs on its own — the fan-out publish does — needs it, and
++   * NFR-OBS-01 requires it in every structured line. */
++  requestId?: string;
+   /** Chapter 3.8: set when this source address has spent its
+    * failed-authentication allowance. See `OVER_AUTH_THRESHOLD` above. */
+   [OVER_AUTH_THRESHOLD]?: boolean;
+```
+
+```diff title="services/api/src/request-context.middleware.ts"
+@@ -17,6 +17,13 @@ export class RequestContextMiddleware implements NestMiddleware {
+   use(req: IncomingMessage, res: ServerResponse, next: () => void): void {
+     const requestId = newRequestId();
+     res.setHeader("X-Request-Id", requestId);
++    // ...and on the request, so a handler can put it in a line of its own.
++    // Chapter 3.18 needed this: the fan-out publish logs its failure from inside
++    // the send handler, and NFR-OBS-01 wants a request id in every structured
++    // line while NFR-OBS-06 wants five-minute traceability from one. Until now
++    // the id existed only here and on the response header, which a handler
++    // cannot read without taking over the response.
++    (req as { requestId?: string }).requestId = requestId;
+     // `originalUrl` first, and this line was WRONG from chapter 2.2 until 3.8.
+     // Express rewrites `req.url` relative to the mount point, and this middleware
+     // is applied through `forRoutes("{*path}")`, so `req.url` is `/` — every
+```
+
+```diff title="services/gateway/src/fanout.itest.ts"
+@@ -5,7 +5,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
+ import { createLogger } from "@relay/service-kit";
+ import type { Message } from "@relay/protocol";
+ 
+-import { createFanout, subjectFor, type Fanout } from "./fanout.js";
++import { createFanout, type Fanout } from "./fanout.js";
+ 
+ // Chapter 2.6's real test: the one behaviour a single-process test CANNOT
+ // show. Two fabric clients stand in for two gateway instances — same code,
+@@ -146,7 +146,9 @@ describe("fan-out across instances", () => {
+     await raw.fanout.close();
+   });
+ 
+-  it("names subjects per channel, so an instance hears only what it can deliver", () => {
+-    expect(subjectFor(CHANNEL)).toBe(`chan:${CHANNEL}`);
+-  });
++  // THE SUBJECT GRAMMAR'S TEST MOVED IN CHAPTER 3.18, to
++  // `packages/protocol/src/fanout.test.ts`, along with `subjectFor` itself. It
++  // was a pure string assertion sitting in a suite that needs a running Redis;
++  // it needed neither. What stays here is everything that genuinely needs the
++  // fabric — two clients, a real subject, and a delivery.
+ });
+```
+
+```diff title="services/gateway/src/isolation.itest.ts"
+@@ -382,6 +382,12 @@ describe("the socket gauntlet", () => {
+   //      `fanout?.publish` is a no-op and nothing is ever delivered here. The control
+   //      hung for five seconds and timed out.
+   //
++  //      STILL TRUE OF THIS SUITE after chapter 3.18. That chapter gave the api a
++  //      publisher and added a THIRD describe to `session.itest.ts` with a fan-out
++  //      attached — deliberately a new block rather than a fourth argument to the
++  //      existing ones, so blocks like this that want no broker keep none. If a
++  //      delivery assertion belongs anywhere, it belongs there.
++  //
+   // The ack's `cursor` is what the server ACCEPTED, so it is the one place the
+   // session's membership decision is visible from outside. The control below shows a
+   // member's cursor being accepted, which is what makes the removal assertion mean
+@@ -593,10 +599,18 @@ describe("the socket gauntlet", () => {
+   //
+   // THE MESSAGE HALF IS CHECKED AGAINST THE SCHEMA AND NOT AGAINST A LIVE FRAME, because
+   // no `message.created` ever arrives in this suite: `say()` writes through the
+-  // repository, the api publishes to no fan-out, and nothing here drains the outbox.
+-  // Chapter 3.12 recorded that as its own finding — a REST-sent message reaches no socket,
+-  // ever — and `public-surface.itest.ts` is what pins it. Waiting for a frame here is a
+-  // 5-second timeout, which is how this test was written the first time.
++  // repository, THIS SUITE attaches no fan-out, and nothing here drains the outbox.
++  //
++  // THE REASON CHANGED IN CHAPTER 3.18 AND THE FACT DID NOT. This comment used to say
++  // "the api publishes to no fan-out", which was the platform-wide truth chapter 3.12
++  // recorded as a finding — a REST-sent message reached no socket, by two independent
++  // mechanisms. Chapter 3.17 removed one and chapter 3.18 the other, so the api does
++  // publish now; nothing arrives HERE because this suite subscribes to nothing, which is
++  // a property of the fixture rather than of the platform. `public-surface.itest.ts` used
++  // to pin the absence and now pins the arrival.
++  //
++  // Waiting for a frame here is still a 5-second timeout, which is how this test was
++  // written the first time.
+   it("keeps the socket's identity a bare external id, whatever the profile holds", async () => {
+     // A full profile written through the public route.
+     const patched = await fetch(`${api.url}/v1/users/${tenants.victim.userExternalId}`, {
+```
+
+```diff title="services/gateway/src/public-surface.itest.ts"
+@@ -239,17 +239,17 @@ describe("a channel, a member and a message, all over the public API", () => {
+   // existing caller (FR-MSG-13's territory), and a live fan-out from the api is a
+   // new coupling between the api and Redis. Both are named in the chapter.
+   //
+-  // CHAPTER 3.17 DID HALF OF THAT, and this comment is left standing rather than
+-  // rewritten because the half it did is not the half that fixes this. FR-MSG-13 was
+-  // amended — "on behalf of any user" became "on behalf of a bot user of that tenant" —
+-  // so a REST send now names a sender, and the send below names one. What did NOT change
+-  // is the fan-out: the api still publishes nothing, so the message still reaches no
+-  // socket, live or on resume. Chapter 3.18 is the fan-out.
++  // BOTH HALVES ARE CLOSED NOW, and the two chapters that closed them are worth naming
++  // separately because the gap needed both. Chapter 3.17 amended FR-MSG-13 — "on behalf
++  // of any user" became "on behalf of a bot user of that tenant" — so a REST send names a
++  // sender and `toFrame` stopped dropping the row from a resume. Chapter 3.18 gave the api
++  // a publisher, so the same row now reaches a LIVE socket too. Chapter 3.12's `gaps.md`
++  // G1 listed exactly those two mechanisms; neither remains.
+   //
+   // THE SENDER IS A BOT, because the caller is a key. A key may not name "tuan" — that
+   // is a person and `sender_not_permitted` is the refusal — so the send that this test
+   // needs to succeed must name software.
+-  it("does NOT deliver a REST-sent message, live or on resume", async () => {
++  it("delivers a REST-sent message, live and on resume", async () => {
+     const channelId = await seedOverTheWire("rest", ["tuan"]);
+     const token = await mint("tuan");
+     // Created over the public route, because this suite has no database handle by
+@@ -261,7 +261,7 @@ describe("a channel, a member and a message, all over the public API", () => {
+           {
+             external_id: "rest-courier",
+             kind: "bot",
+-            description: "sends over REST so this test can watch nothing arrive",
++            description: "sends over REST so this test can watch it arrive",
+           },
+         ],
+       },
+@@ -296,9 +296,32 @@ describe("a channel, a member and a message, all over the public API", () => {
+     // rested on is gone.
+     expect(history.messages.every((m) => m.user === "rest-courier")).toBe(true);
+ 
+-    // No live delivery.
+-    await new Promise((resolve) => setTimeout(resolve, 1_500));
+-    expect(live.frames.filter((f) => f.type === "message.created")).toEqual([]);
++    // LIVE DELIVERY, WHICH THIS BLOCK ASSERTED WAS ABSENT UNTIL CHAPTER 3.18.
++    //
++    // It read `toEqual([])`, and the reason was true when it was written: the only
++    // publisher to the fan-out was the gateway's own send handler, so a message a
++    // customer's backend posted committed, returned 201, and reached nobody. The api
++    // publishes now — `messages.controller.ts`, guarded the way `session.ts:651` is —
++    // and the two sends above arrive here in order.
++    //
++    // Waiting for BOTH rather than for the first: one frame arriving would be satisfied
++    // by a publisher that fired once and by one that fired correctly twice.
++    const deadline = Date.now() + 4_000;
++    for (;;) {
++      const created = live.frames.filter((f) => f.type === "message.created");
++      if (created.length >= 2) break;
++      if (Date.now() > deadline) {
++        throw new Error(
++          `expected 2 live frames, saw ${created.length}: ` +
++            live.frames.map((f) => f.type).join(", "),
++        );
++      }
++      await new Promise((resolve) => setTimeout(resolve, 25));
++    }
++    const liveTexts = live.frames
++      .filter((f) => f.type === "message.created")
++      .map((f) => (f as { payload: { text: string } }).payload.text);
++    expect(liveTexts).toEqual([first, second]);
+     live.socket.close();
+ 
+     // AND ON RESUME IT NOW ARRIVES — WHICH IS HALF OF THE GAP CLOSING (chapter 3.17).
+@@ -308,15 +331,15 @@ describe("a channel, a member and a message, all over the public API", () => {
+     // chapter 3.12's `gaps.md` G1 listed TWO independent mechanisms for "a REST-sent
+     // message reaches no socket" — nothing publishes, and the public send passes no user.
+     //
+-    // FR-MSG-15 removes the second. Every REST send now names a sender, `toFrame` has no
+-    // reason to drop the row, and the backfill delivers it. So the resume half of G1 is
+-    // closed by this chapter and the LIVE half is not: `live.frames` above is still
+-    // empty, because only the gateway publishes to the fan-out (`session.ts`) and the api
+-    // still publishes nothing. Chapter 3.18 is that half.
++    // FR-MSG-15 removed the second and chapter 3.18's publisher removed the first, so
++    // both legs of this test now assert arrival: live above, and on resume below. The
++    // resume leg is the one that proves the two paths do not double up — a client that
++    // was connected and then reconnects with a cursor gets the backfill, not a replay of
++    // what the fan-out already delivered, because the cursor is what decides.
+     //
+-    // The test's name is now half wrong and is left alone deliberately: T096a amends the
+-    // gap record, and renaming a test is not how a reader learns that a two-mechanism
+-    // gap became a one-mechanism gap.
++    // THE TEST'S NAME CHANGED WITH IT. It said "does NOT deliver" and was left half wrong
++    // on purpose while only half the gap was closed; leaving it now would make it wholly
++    // wrong, which is a different thing.
+     const resumed = reader(`${wsUrl}/v1/ws?token=${token}&cursor=${channelId}:1`);
+     await resumed.opened;
+     await new Promise((resolve) => setTimeout(resolve, 1_500));
+```
+
+```diff title="packages/outsider/src/integrate.itest.ts"
+@@ -1,3 +1,4 @@
++import { randomUUID } from "node:crypto";
+ import { beforeAll, describe, expect, it } from "vitest";
+ 
+ // AN INTEGRATION BUILT FROM PUBLISHED DOCUMENTATION ALONE (FR-031, SC-009,
+@@ -230,12 +231,23 @@ describe("integrating with Relay from the outside", () => {
+     expect(page.messages.map((m) => m.text)).toContain(text);
+   });
+ 
+-  it("receives a message on a socket — SENT over the socket", async () => {
+-    // THE SEND HAS TO BE ON THE SOCKET, and finding that out is one of the gaps this
+-    // exercise recorded. It had TWO causes and chapter 3.17 removed one: the api still
+-    // publishes to no fan-out, so nothing arrives LIVE — but the public send now
+-    // attributes a sender, so the row is no longer dropped from a resume. Half the gap,
+-    // and the half that remains is the fan-out.
++  // WAS `it.fails` FOR THE LENGTH OF THIS CHAPTER'S PHASE 1 AND 2.
++  //
++  // A red lane is not the same as a recorded failure, so the gap was asserted
++  // rather than left broken: 10,114 ms to the deadline having seen only
++  // `connection.ack`, with a 201 in hand. The publish landed in Phase 3 and this
++  // became a plain `it` — the body now succeeds in about 150 ms.
++  it("receives a message on a socket — sent over REST", async () => {
++    // THE SEND NO LONGER HAS TO BE ON THE SOCKET, and that is this chapter.
++    //
++    // The gap this exercise recorded had TWO causes. Chapter 3.17 removed the first:
++    // a public send attributes a sender, so the row is no longer dropped from a
++    // resume. Chapter 3.18 removes the second, which was the whole of what remained
++    // — the api published to no fan-out, so a REST-sent message reached no live
++    // socket. The title of this test used to say "SENT over the socket" in capitals,
++    // because a REST send could not work; it now sends over REST on purpose.
++    //
++    // The send is the one an integrating developer's backend actually makes.
+     const socket = new WebSocket(`${ws}/v1/ws?token=${token}`);
+     const frames: { type: string; payload?: { text?: string; seq?: number } }[] = [];
+     // Listeners attached BEFORE the open await. `connection.ack` arrives the
+@@ -268,17 +280,27 @@ describe("integrating with Relay from the outside", () => {
+ 
+     await waitFor((f) => f.type === "connection.ack", "connection.ack");
+ 
+-    const text = `over the socket ${Date.now()}`;
+-    socket.send(
+-      JSON.stringify({
+-        type: "message.send",
+-        payload: { idem_key: `outsider-${Date.now()}`, channel: channelId, text },
+-      }),
++    const text = `over REST ${Date.now()}`;
++    // NOT `socket.send`. A POST, with the credential a customer's server holds, to
++    // the route their backend calls — and then the socket is watched for the frame.
++    // `user: "outside-bot"` is not optional and not decoration. Chapter 3.17 made an
++    // application credential speak only as a bot user of its tenant, so a POST without
++    // it is a 400 naming `user` — which is how the first run of this inverted test
++    // failed, for a reason that had nothing to do with delivery.
++    const posted = await post(
++      `/v1/channels/${channelId}/messages`,
++      // A UUID, because the REST body demands one: `idempotency_key: z.string().uuid()`
++      // on this route, where the socket frame's `idem_key` is any string up to 255.
++      // Two entrances, two idempotency contracts — the second run of this inverted
++      // test failed on it, with `invalid_request` naming the field.
++      { text, user: "outside-bot", idempotency_key: randomUUID() },
++      credential,
+     );
++    expect(posted.status).toBe(201);
+ 
+-    // The sender's own acknowledgement, then the event. Both are documented and
+-    // both matter: the ack says it was committed, the event says it was delivered.
+-    await waitFor((f) => f.type === "message.ack", "message.ack");
++    // The REST response is the acknowledgement — there is no `message.ack` frame on
++    // this path, because the sender is not holding a socket. What has to arrive is
++    // the delivery, on a socket that was already open before the send.
+     await waitFor(
+       (f) => f.type === "message.created" && (f as { payload?: { text?: string } }).payload?.text === text,
+       "message.created for the text just sent",
+```
+
+```diff title="vitest.coverage.config.mts"
+@@ -381,6 +381,22 @@ export default defineConfig({
+         // 3.11's T033c) and this feature changed the file. A ratchet at 61 does not bless
+         // 61; it forbids 60. Raising it is the next chapter's work, and the arms are named
+         // here so that chapter knows what it is buying.
++        // CHOSEN BEFORE THE FIRST COVERAGE REPORT, not read off it (chapter 3.18,
++        // T011). The requirement is that the failure path be covered: this file's
++        // whole job is to swallow a publish error, log it, and open a window, and
++        // a test that only checks `publish` resolved cannot tell that apart from a
++        // publisher with no body. So every branch, and every function — the last
++        // of which forced `close()` and the ioredis `error` listener to be tested
++        // rather than assumed, which is R10 and the OnModuleDestroy convention.
++        //
++        // Without a pin this file falls to the global floor of 70, which a
++        // ten-line publisher clears with its `catch` untested.
++        "services/api/src/fanout/publisher.ts": {
++          branches: 100,
++          functions: 100,
++          lines: 100,
++          statements: 100,
++        },
+         "services/api/src/messages/messages.service.ts": {
+           branches: 61,
+           functions: 100,
+```
+
+```diff title="services/gateway/src/resume.itest.ts"
+@@ -356,3 +356,107 @@ describe("resume across a real fabric", () => {
+     socket.close();
+   });
+ });
++
++// ── chapter 3.18: two instances, one fabric (US2) ───────────────────────────
++//
++// `boot()` IS UNTOUCHED. It is called six times above and each call builds its
++// own `createFanout` and its own server, so two calls already give two gateway
++// instances sharing one Redis — which is precisely what SC-002 needs. Changing
++// the fixture to "support" that would have changed six passing tests to prove
++// nothing new (3.17's T040b, the fifth such incident in two features).
++//
++// WHAT THIS PROVES AND WHAT IT DOES NOT. The api here is a stub, as everywhere
++// in this file: the gateway has no database (ADR-05) and these suites are about
++// the fabric. So this is the DELIVERY half of SC-002 — a frame published by
++// somebody else reaches the instance holding a member and only that one. The
++// half where a REAL api publishes lives in `session.itest.ts`, which spawns one.
++// Neither fixture does both, and `chapter-notes.md` says so rather than letting
++// the pair imply it.
++describe("two instances on one fabric (chapter 3.18)", () => {
++  const OTHER_CHANNEL = randomUUID();
++  let member: Harness | undefined;
++  let bystander: Harness | undefined;
++  /** Closed BEFORE the harnesses. `Harness.close()` calls `server.close()`,
++   * which waits for open connections to drain — so a test that leaves a socket
++   * open hangs the teardown, and vitest reports it as "Hook timed out in
++   * 10000ms" pointing at `afterEach`. The first version of these tests looked
++   * like a delivery failure and was a housekeeping one. */
++  const sockets: WebSocket[] = [];
++  const open = async (harness: Harness) => {
++    const socket = new WebSocket(`${harness.url}?token=${await token()}`);
++    sockets.push(socket);
++    return record(socket);
++  };
++
++  const stub = (channels: string[]) => ({
++    session: async () => ({
++      environment_id: "env-1",
++      user: "tuan",
++      banned: false,
++      channel_ids: channels,
++      limits: { connect: 3_000, send: 600 },
++    }),
++    backfill: async () => ({}),
++    sendMessage: async () => {
++      throw new Error("not used");
++    },
++  });
++
++  afterEach(async () => {
++    for (const socket of sockets.splice(0)) socket.close();
++    await member?.close();
++    await bystander?.close();
++    member = undefined;
++    bystander = undefined;
++  });
++
++  it("delivers to the instance holding a member (SC-002)", async () => {
++    member = await boot(stub([CHANNEL]));
++    const frames = await open(member);
++    await settle(200);
++
++    // Published by a THIRD client — neither instance's own — which is what the
++    // api is once it publishes. The instance under test is a subscriber only.
++    await publishFromElsewhere(frame(3_001));
++    await settle(400);
++
++    expect(created(frames)).toEqual([3_001]);
++  });
++
++  it("delivers to NEITHER instance for a channel neither holds (SC-002's negative)", async () => {
++    // The subject is the filter and it is the only one. An instance subscribes
++    // to `chan:{id}` because a session named that channel at connect; a frame on
++    // any other subject is not something it declines to deliver, it is something
++    // it never hears.
++    member = await boot(stub([CHANNEL]));
++    bystander = await boot(stub([OTHER_CHANNEL]));
++    const a = await open(member);
++    const b = await open(bystander);
++    await settle(200);
++
++    // A third channel, which neither session named.
++    await publishFromElsewhere({ ...frame(3_002), channel: randomUUID() });
++    await settle(400);
++
++    expect(created(a)).toEqual([]);
++    expect(created(b)).toEqual([]);
++  });
++
++  it("delivers to the member's instance and not to the bystander's", async () => {
++    // The pair that matters for SC-002: two live instances, one frame, and the
++    // silence on the second is as much of the assertion as the arrival on the
++    // first. Asserted by COUNT on both sides — "the member got it" alone would
++    // be satisfied by a fabric that broadcast to everybody.
++    member = await boot(stub([CHANNEL]));
++    bystander = await boot(stub([OTHER_CHANNEL]));
++    const a = await open(member);
++    const b = await open(bystander);
++    await settle(200);
++
++    await publishFromElsewhere(frame(3_003));
++    await settle(400);
++
++    expect(created(a)).toEqual([3_003]);
++    expect(created(b)).toEqual([]);
++  });
++});
+```
+
+<Checkpoint>
+
+A message posted over REST reaches an open socket. The sealed exercise sends it with an API key
+and receives it on a socket it opened before the send — the same exercise that timed out at
+10,114 milliseconds one phase earlier.
+
+    41 files · 606 integration tests · 200 s · green
+    the sealed outsider: 11/11 in 420 ms
+
+Chapter 3.12's `gaps.md` G1 listed two independent mechanisms for "a REST-sent message reaches
+no socket". Chapter 3.17 removed one, this chapter removed the other, and a test written two
+chapters ago in anticipation — titled *"does NOT deliver a REST-sent message, live or on
+resume"* — broke the moment the publish landed. It is inverted now, and it waits for both
+frames rather than the first, because one arriving would be satisfied by a publisher that fired
+once.
+
+</Checkpoint>
+
+<ForwardRef>
+
+FR-RTM-10's five-second window is not met on either path, and the mechanism is a membership
+snapshot with no re-read. Chapter 3.19 needs the same thing built for presence.
+
+FR-RTM-05's other five event kinds still have no producers. `message.updated` needs something
+that writes `messages.edited_at`; `membership.changed` needs a producer connected to a writer
+that already exists. Both are recorded rather than delivered.
+
+</ForwardRef>
+
+<ChapterFooter id="3.18" />
