@@ -250,9 +250,38 @@ sequenceDiagram
     P->>J: outbox relay drains event (after commit)
 ```
 
+A message a customer's **backend** sends takes the same write path and a different ordering
+(chapter 3.18):
+
+```mermaid
+sequenceDiagram
+    participant B as Customer backend
+    participant A as API service
+    participant P as PostgreSQL
+    participant R as Redis
+    B->>A: POST /v1/channels/:id/messages
+    A->>P: INSERT message (seq under row lock)
+    A->>P: INSERT outbox event
+    A->>P: COMMIT
+    A->>R: publish to chan:{channel_id}
+    A-->>B: 201 {message, seq, user}
+    Note over R: every gateway instance holding a member delivers
+```
+
 Decisions visible here:
-- **Ack after commit, never before** (FR-MSG-05). The Redis fan-out happens after the ack;
-  a recipient may see the message milliseconds after the sender's ack, never before durability.
+- **Ack after commit, never before** (FR-MSG-05). **The ordering of the fan-out relative to
+  the ack depends on the transport, and only durability is invariant.** On the socket path
+  the gateway writes the ack frame and then publishes, because it holds two channels. On the
+  REST path the response *is* the ack, so a handler cannot publish after it without
+  detaching the failure from anywhere a test or an operator can see it — the api publishes
+  before responding. A recipient may therefore see a REST-sent message slightly before the
+  sender's `201`, and can never see any message before it is durable, which is what this
+  clause protects.
+
+  One measurement follows and is worth stating: **NFR-PRF-01's interval — "send acknowledged
+  to recipient receipt" — is not measurable on the REST path**, because it can be negative
+  there. It remains measurable on the socket path. The publish instead falls inside
+  NFR-PRF-02's budget, where it was measured at p95 0.226 ms against 150 ms.
 - **Idempotency at the storage layer** via partial unique index (DR-03), not application
   memory — it survives restarts and works across instances (FR-MSG-04).
 - **Sequence assignment under row lock** on the channel (DR-04, → ADR-03). Contention scope

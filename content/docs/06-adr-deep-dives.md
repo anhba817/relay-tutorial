@@ -439,7 +439,21 @@ presence as Redis keys with TTLs, and rate-limit buckets follow. So fan-out on N
 the gateway two broker clients where it had one, deletes nothing from the deployment, and
 splits the ephemeral concerns of a single service across two systems. Choosing Redis keeps
 a clean mapping — gateway to Redis, api and workers to NATS — where each broker's guarantee
-matches its cargo. The genuinely interesting alternative is the one nobody proposed: move
+matches its cargo.
+
+**That mapping has an exception, and it is older than the chapter that made it obvious.**
+Chapter 3.8 gave the api its own Redis client for rate-limit counters, so "api and workers to
+NATS" stopped being exactly true then; chapter 3.18 gave the api a second one, for the
+fan-out, on the hottest path there is. The api now holds two broker clients — which is the
+cost this analysis rejected core NATS for imposing on the gateway, relocated rather than
+avoided.
+
+The **Decision** below is untouched by that. "Publish once per message to `chan:{channel_id}`"
+still holds: a message enters through exactly one door, and whichever service accepted it
+publishes once. The **Revisit when** clauses are untouched too — they are about gap-refetch
+rate and subscription scale, and neither is what changed. What changed is that the selection
+argument's tidiest line is no longer literally true, and a reader comparing it against
+`05-sad.md`'s component diagram deserves to be told so rather than left to reconcile them. The genuinely interesting alternative is the one nobody proposed: move
 presence to NATS KV and remove Redis entirely. That is a coherent architecture and a much
 larger decision; it belongs to a deployment review, not to the fan-out fabric's ADR.
 
