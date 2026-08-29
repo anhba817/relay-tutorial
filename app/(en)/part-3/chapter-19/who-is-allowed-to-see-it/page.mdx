@@ -1,0 +1,2505 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figTwoFabrics, figGrace, figScope } from "./figures";
+
+export const metadata = {
+  title: "Presence, and who is allowed to see it — Building Relay",
+  description:
+    "A frame has been in the protocol union since chapter 1.3 and nothing has ever produced one. Presence gets its own subject grammar, a key whose existence is the state, and a scope that is topology rather than a filter.",
+  alternates: {
+    canonical: "/part-3/chapter-19/who-is-allowed-to-see-it",
+    languages: {
+      en: "/part-3/chapter-19/who-is-allowed-to-see-it",
+      vi: "/vi/part-3/chapter-19/who-is-allowed-to-see-it",
+    },
+  },
+};
+
+<ChapterHeader id="3.19" />
+
+Mai opens the app. Tuan is in the channel, his name is in the member list, and beside it is a
+circle that has never been any colour — because nothing in Relay has ever said whether he is
+there.
+
+The frame for saying so has existed since chapter 1.3. `presence.changed` is in the protocol
+union with a strict schema and two states. `frames.test.ts` asserts its shape. Chapter 3.12's
+direction gauntlet lists it among the frames a client may not forge, with a reason written
+beside it. Eighteen chapters have shipped a vocabulary word that nothing speaks.
+
+This chapter gives it a producer, and almost none of the work is the producing.
+
+<Figure caption="Two fabrics over one Redis, and the channel that carries both" code={figTwoFabrics} />
+
+## A word in the vocabulary that nothing has ever said
+
+`packages/protocol/src/frames.ts`, unchanged by this chapter:
+
+```text title="packages/protocol/src/frames.ts (excerpt)"
+/** Presence states per FR-RTM-06; delivery scope is FR-RTM-07's concern. */
+export const presenceChangedSchema = z.strictObject({
+  type: z.literal("presence.changed"),
+  payload: z.strictObject({
+    user: z.string().min(1),
+    state: z.enum(["online", "offline"]),
+  }),
+});
+```
+
+That comment has been accurate and idle for eighteen chapters. The sharpest version is chapter
+3.12's, which built a gauntlet asserting that every outbound frame type is refused when a client
+utters it:
+
+```text title="services/gateway/src/isolation.itest.ts (excerpt)"
+["presence.changed", "outbound", "derived from connections the gateway holds, not claimed"],
+```
+
+That row has passed since 3.12. It proves a client cannot claim a presence transition, against a
+system in which nobody could produce one either — the gateway held the connections and derived
+nothing from them. A test can be green about a capability that does not exist, and this one was.
+
+FR-RTM-05 names six real-time event kinds. All six have frames in the union. Before the previous
+chapter, **none** had a producer; 3.18 gave `message.created` one, and this chapter is the
+second. `message.updated`, `message.deleted`, `membership.changed` and `typing` are still four
+declared words with nothing behind them, and naming them is deliberate — chapter 3.18's own spec
+claimed `typing` had no frame at all, which is what an unnamed list costs.
+
+## The plumbing a reader was promised, and why it is not this
+
+Chapter 2.6 ended with three IOUs. The third:
+
+```text title="chapter 2.6 (excerpt)"
+And presence (FR-RTM-06) and typing (FR-RTM-08) will reuse this exact pub/sub
+plumbing with TTLs per ADR-10.
+```
+
+Presence does not reuse it, and the reason is a better opening than an apology. The message path
+is typed to messages at three points, and they are not all in one file. Two are:
+
+```text title="services/gateway/src/fanout.ts (excerpt)"
+  publish(message: Message): Promise<void>;
+    const message = messageCreatedSchema.shape.payload.safeParse(parsed);
+```
+
+The first is a signature. The second parses everything arriving on `chan:{channel_id}` and logs
+`fanout.invalid_payload` for anything that is not a message. The third is somewhere less
+convenient — the fan-out hands each frame to a callback the session layer registered, and that
+callback is where the kind is finally written down:
+
+```text title="services/gateway/src/session.ts (excerpt)"
+      send(connection.socket, { type: "message.created", payload: message });
+```
+
+`deliver` is fenced by ten chapters. Widening it is not a local edit to a fabric; it is an edit to
+the function 2.5, 2.6, 2.7, 2.8, 3.2, 3.7, 3.8, 3.11, 3.14 and 3.16 each taught a reader to build.
+A presence payload published on a channel's own subject today never reaches it anyway: the parse
+above rejects it, logs `fanout.invalid_payload`, and produces no frame.
+
+So the alternative to a second subject was never "keep it simple". It was "edit the highest-volume
+path in the system to serve the lowest-volume traffic on it", and put a discriminated-union parse
+on every message every instance receives, forever. During a rolling deploy it is worse than that:
+an old instance receiving the new enveloped payload emits `fanout.invalid_payload` for every
+transition on every channel until it drains.
+
+Presence gets `presence:{channel_id}` instead — a subject *derived from* each affected channel
+rather than the channel's own. The audience is identical. `fanout.ts` is not edited at all.
+
+<Why>
+
+**This contradicts ADR-10 in writing, which is why there is an ADR-19.** ADR-10 says transitions
+publish "on the affected channels' subjects only", and the constitution says an accepted ADR is
+never amended — superseding requires a new record. So ADR-10's decision text is untouched and
+carries one added phrase on its status line; ADR-19 replaces the subject clause and nothing else.
+Presence still lives in Redis, still expires rather than being reaped, and still has no service
+of its own.
+
+The uncomfortable part is stated in ADR-19 rather than left out: this is **half of ADR-10's own
+revisit remedy, taken before its trigger fired**. ADR-10 said that above ~30% of gateway publish
+volume, "presence subjects get their own fabric or channels opt in". Presence subjects now have
+their own fabric — for a reason that has nothing to do with volume, which nothing here measured.
+The trigger is undischarged and so is NFR-SCL-01.
+
+</Why>
+
+The declared cost is one more subscription per channel per instance. That is a number, so it was
+measured rather than asserted — `CONFIG RESETSTAT`, six presence tests, `INFO commandstats`:
+
+```text title="two instances, three channels (excerpt)"
+cmdstat_subscribe   calls=12
+cmdstat_publish     calls=18
+```
+
+Twelve: six fan-out and six presence, one per channel per instance exactly, with the second local
+member of a channel adding none. `ioredis` takes a variadic `subscribe`, so the count doubles and
+the round trips do not.
+
+```ts title="packages/protocol/src/presence.ts"
+import { z } from "zod";
+
+/** Presence's own fabric: a subject grammar and the payload that crosses it
+ * (chapter 3.19, ADR-19).
+ *
+ * WHY THIS IS NOT IN `fanout.ts`. The fan-out's subject grammar lives there and
+ * presence's could have joined it, three lines below `subjectForChannel`. It does
+ * not, for the reason `internal.ts` already demonstrates: the event spine keeps
+ * its own `subjectFor` in its own file, so **each fabric owning its subject
+ * grammar is this package's established shape** rather than a compromise. The
+ * practical payoff is that `fanout.ts` gains no hunk, and chapter 3.18's fences
+ * over it stay where they are.
+ *
+ * NOT `subjectFor` and not `subjectForChannel`. `internal.ts` exports the first
+ * and `fanout.ts` the second, and chapter 3.18 paid for that collision once:
+ *
+ *     error TS2308: Module "./internal.js" has already exported a member
+ *     named 'subjectFor'.
+ *
+ * WHY A SECOND SUBJECT AT ALL, rather than enveloping two kinds on `chan:{id}`.
+ * The message path is typed to messages at three points, and only two of them are
+ * in one file: `publish(message: Message)` and a `messageCreatedSchema` parse in
+ * `services/gateway/src/fanout.ts`, then the literal `message.created` send inside
+ * `session.ts`'s `deliver` — a function ten chapters fence. Enveloping means
+ * editing the hot path to serve the lowest-volume traffic on it. Separating the subjects also makes cross-kind
+ * mis-delivery impossible rather than test-enforced: a presence payload cannot
+ * arrive where a message parse is waiting, because nothing publishes it there.
+ *
+ * The declared cost: a channel now carries two subscriptions rather than one. */
+export function subjectForPresence(channelId: string): string {
+  return `presence:${channelId}`;
+}
+
+/** What crosses `presence:{channel_id}` between gateway instances. Consumed only
+ * by gateways and **never sent to a client**.
+ *
+ * `transition` IS WHY A WATCHER SHARING THREE CHANNELS GETS ONE FRAME. A
+ * transition publishes on every one of the subject's channels, so an instance
+ * hosting a watcher who shares three of them receives three copies. The wire
+ * frame carries `user` and `state` and no channel, so the copies are
+ * indistinguishable duplicates; the id lets a receiver deliver a given transition
+ * to a given connection once. It is minted per transition, not per publish.
+ *
+ * THIS IS THE FIRST TIME THE FABRIC PAYLOAD AND THE WIRE FRAME DIFFER. On the
+ * message path they are the same object — which is exactly why `fanout.ts` could
+ * type its `publish` as `Message` and get away with it. What reaches a client is
+ * still what chapter 1.3 published and `frames.test.ts` asserts:
+ *
+ *     { type: "presence.changed", payload: { user, state } }
+ *
+ * `strictObject`, so an unknown field is a rejection rather than a silent
+ * ignore: a field added on one side of a rolling deploy fails loudly on the
+ * other. */
+export const presenceFabricSchema = z.strictObject({
+  user: z.string().min(1),
+  state: z.enum(["online", "offline"]),
+  transition: z.string().min(1),
+});
+
+export type PresenceFabric = z.infer<typeof presenceFabricSchema>;
+```
+
+Exporting it is one line, and the line is the whole reason the file exists rather than three lines
+in `fanout.ts`:
+
+```diff title="packages/protocol/src/index.ts"
+@@ -10,3 +10,4 @@ export * from "./frames.js";
+ export * from "./codes.js";
+ export * from "./internal.js";
+ export * from "./fanout.js";
++export * from "./presence.js";
+```
+
+```ts title="packages/protocol/src/presence.test.ts"
+import { describe, expect, it } from "vitest";
+
+import { subjectForChannel } from "./fanout.js";
+import { presenceFabricSchema, subjectForPresence } from "./presence.js";
+
+describe("subjectForPresence", () => {
+  it("is one subject per channel, prefixed to keep it off the message path", () => {
+    expect(subjectForPresence("c1")).toBe("presence:c1");
+  });
+
+  // NOT A TASTE ASSERTION. The whole argument for a second subject grammar is
+  // that a presence payload can never arrive where a message parse is waiting.
+  // That property is topology, not vigilance — and it holds only while the two
+  // grammars cannot collide for the same channel id.
+  it("never collides with the message subject for the same channel", () => {
+    const id = "00000000-0000-0000-0000-000000000001";
+    expect(subjectForPresence(id)).not.toBe(subjectForChannel(id));
+  });
+});
+
+describe("presenceFabricSchema", () => {
+  const valid = { user: "tuan", state: "online", transition: "t-1" };
+
+  it("accepts a transition", () => {
+    expect(presenceFabricSchema.parse(valid)).toEqual(valid);
+  });
+
+  it("rejects a state the clause does not name", () => {
+    // FR-RTM-06 says `online` and `offline`. `frames.test.ts` already rejects
+    // "away" on the wire frame; this is the same refusal one layer down.
+    expect(
+      presenceFabricSchema.safeParse({ ...valid, state: "away" }).success,
+    ).toBe(false);
+  });
+
+  it("rejects a payload with no transition", () => {
+    expect(
+      presenceFabricSchema.safeParse({ user: valid.user, state: valid.state })
+        .success,
+    ).toBe(false);
+  });
+
+  // `strictObject` rather than `object`. A field added on one side of a rolling
+  // deploy must fail loudly on the other rather than be dropped in silence.
+  it("rejects an unknown field instead of ignoring it", () => {
+    expect(
+      presenceFabricSchema.safeParse({ ...valid, channel: "c1" }).success,
+    ).toBe(false);
+  });
+});
+```
+
+## A key whose existence is the state
+
+There is no presence table, no set of online users, and no count. There is one key per user:
+
+```text title="the whole data model (excerpt)"
+presence:{env}:{user}          exists  <=>  the user is online
+presence:offline:{env}:{user}  exists  <=>  somebody already said they left
+```
+
+`SET … PX ttl NX` **is the election**. Exactly one caller across every instance in the fleet gets
+`OK` for a user who was absent; everyone else gets null and stays quiet. Two connections opening
+in the same millisecond on two machines produce one `online`, and neither machine knows the other
+exists — which has been ADR-07's shape since chapter 2.6 and is why nothing here needs a leader.
+
+The crashed-client question answers itself the same way. An instance that dies stops refreshing;
+the key expires; the user is offline within the window. No reaper, no tombstone.
+
+<Trap>
+
+**Three different thirty-second numbers live in this system and they are three quantities.**
+
+```text title="all 30_000, none of them the same thing (excerpt)"
+PING_INTERVAL_MS      session.ts     the heartbeat
+FR-RTM-06's grace     the SRS        how long after a close before "offline"
+the presence key TTL  docs/05-sad.md how long the key survives without a refresh
+```
+
+Reaching for `PING_INTERVAL_MS` because it is already 30 s and already fires on a live connection
+is the natural move and it is wrong: **a TTL equal to its own refresh interval expires a connected
+user.** Every refresh would be a race against the expiry it is renewing, and losing it produces an
+`offline` for somebody sitting right there.
+
+The refresh runs at 10 s — three per TTL, so two consecutive misses still do not expire a live
+user. The constant says so in the file, because the next reader will have the same idea.
+
+</Trap>
+
+## The grace period, and a fix that was worse than the bug
+
+FR-RTM-06 gives a departing user thirty seconds before anyone is told. The obvious implementation
+is to let the key's TTL be the grace: stop refreshing, and it lapses. That is wrong twice, and
+only running it against a real Redis showed either.
+
+**First**: without a re-pin, the key dies at `last_refresh + ttlMs`, which is up to a whole
+refresh interval *before* the grace ends. A user who reconnects inside that gap finds the key
+absent, wins `SET … NX`, and publishes a second `online` for somebody who never left. The close
+therefore re-pins the key to exactly `graceMs` with `XX`, so it dies when the grace ends rather
+than up to ten seconds early.
+
+**Second, and this is the one worth carrying away**: the first version of that fix scheduled the
+check at exactly `graceMs`. That puts two deadlines on one instant reached by two different
+clocks. The key expires at `close + δ + graceMs`, where δ is a round trip; the timer fires at
+`close + graceMs + ε`. When ε is smaller than δ the check finds the key alive, logs
+`presence.suppressed`, and its one-shot timer is *gone* — the user is stranded online for ever.
+Redis also holds a key until now is strictly past its expiry, so a tie falls the same wrong way.
+A one-second margin is not padding; it is the difference between a spurious duplicate and a
+permanent lie.
+
+<Figure caption="A close, a re-pin, and the election that lets exactly one instance speak" code={figGrace} />
+
+The last piece is the election at the bottom of that diagram. **A TTL expiring publishes
+nothing.** Redis does not tell anybody a key is gone, so somebody has to notice and say so — and
+if two instances each held a last connection and both close in the same tick, both notice. A
+second `SET … NX` on the offline marker gives exactly one of them the right to speak. The marker
+is cleared by whoever next wins an `online`, so the next departure elects again.
+
+```ts title="services/gateway/src/presence.ts"
+import { randomUUID } from "node:crypto";
+
+import {
+  presenceFabricSchema,
+  subjectForPresence,
+  type PresenceFabric,
+} from "@relay/protocol";
+import type { Logger } from "@relay/service-kit";
+import { Redis } from "ioredis";
+
+// Presence (chapter 3.19, ADR-19): who is online, and who is allowed to know.
+//
+// A SECOND FABRIC BESIDE THE FAN-OUT, NOT A SECOND PAYLOAD ON IT. The message path
+// is typed to messages at three points: `publish(message: Message)` and a
+// `messageCreatedSchema` parse in `fanout.ts`, and the literal `message.created`
+// send inside `session.ts`'s `deliver`, which ten chapters fence. Widening the
+// payload means editing all three, one of them in the file this feature already
+// edits most. So presence gets `presence:{channel_id}` and its own module,
+// and `fanout.ts` is not edited at all. The declared cost is two subscriptions
+// per channel instead of one.
+//
+// TWO CLIENTS, for the reason chapter 3.8 gave for the limiter's: a connection in
+// subscriber mode cannot run ordinary commands, and presence needs `SET`,
+// `EXISTS` and `PUBLISH` as well as `SUBSCRIBE`. That makes five Redis
+// connections per gateway — fanout's two, the limiter's one, and these — and each
+// close has an owner.
+//
+// NOTHING HERE IS A SOURCE OF TRUTH (constitution IV, ADR-10). Presence loss is
+// cosmetic and self-heals on the next transition; the correct amount of
+// durability for a green circle is none.
+
+export const DEFAULT_REDIS_URL = "redis://localhost:6379";
+
+/** FR-RTM-06 says thirty seconds. Asserted by a test rather than left as a bare
+ * constant, so the clause is represented somewhere a reader can find it. */
+export const DEFAULT_GRACE_MS = 30_000;
+/** `docs/05-sad.md`'s presence key. Must be >= `graceMs`; the close re-pins the
+ * key anyway, so this is the sane default rather than the mechanism. */
+export const DEFAULT_TTL_MS = 30_000;
+/** Three refreshes per TTL, so two consecutive misses do not expire a live user.
+ * NOT `PING_INTERVAL_MS`, which is also 30_000: a TTL equal to its refresh
+ * interval expires a connected user. Three thirty-second numbers in this system
+ * are three different quantities (research R3). */
+export const DEFAULT_REFRESH_MS = 10_000;
+/** How long after the grace ends the check runs. Not padding — without it the
+ * key's expiry and the check are the same instant reached by two clocks, and a
+ * tie strands the user online permanently (research R2b). */
+export const DEFAULT_MARGIN_MS = 1_000;
+
+/** Did this caller cause the transition?
+ *
+ * `SET … NX` answers `"OK"` for the one caller that found the key absent and null
+ * for everyone else. Factored out because the module builds its own Redis clients
+ * from a url and cannot be handed a double — the gateway's shape is pure logic in
+ * `.test.ts` and Redis in `.itest.ts`, which is why `limits.ts` exports
+ * `overLimit` and `windowStartFor` the same way. */
+export function wonTransition(reply: string | null): boolean {
+  return reply === "OK";
+}
+
+/** When the grace check runs, relative to the close.
+ *
+ * NOT `graceMs`. The close re-pins the key to expire at `graceMs`, so pinning and
+ * checking at the same instant puts two deadlines on one moment reached by two
+ * clocks — the key expires at `close + δ + graceMs` where δ is a round trip, the
+ * timer fires at `close + graceMs + ε`. With `ε < δ` the check finds the key alive,
+ * logs `presence.suppressed`, and its ONE-SHOT timer is gone: the user is stranded
+ * online, which is worse than the duplicate `online` the re-pin was added to
+ * prevent. Redis also holds a key until `now` is strictly past its expiry, so a tie
+ * falls the wrong way too (research R2b). */
+export function graceCheckDelay(graceMs: number, marginMs: number): number {
+  return graceMs + marginMs;
+}
+
+export interface Presence {
+  /** Register the delivery callback. Set by the session layer at wiring time, as
+   * the fan-out's is: the fabric knows how to receive, the sessions know who to
+   * hand it to. */
+  onTransition(
+    handler: (channelId: string, payload: PresenceFabric) => void,
+  ): void;
+  /** A connection opened. May publish `online`; publishes nothing when the user
+   * was already online anywhere. */
+  connected(
+    environmentId: string,
+    user: string,
+    channelIds: Iterable<string>,
+  ): Promise<void>;
+  /** A connection closed and the caller has already removed it from the registry.
+   * When it was the user's last connection on this instance: re-pins the key to
+   * `graceMs`, awaits that, then schedules one check at `graceMs + marginMs`,
+   * replacing any pending one for that user. */
+  disconnected(
+    environmentId: string,
+    user: string,
+    channelIds: Iterable<string>,
+  ): Promise<void>;
+  /** Claim a transition for one connection. True the first time, false after —
+   * a watcher sharing three channels receives three copies of one transition and
+   * must be handed exactly one frame (FR-012). */
+  claim(transition: string, connectionId: string): boolean;
+  subscribe(channelId: string): Promise<void>;
+  unsubscribe(channelId: string): Promise<void>;
+  close(): Promise<void>;
+}
+
+export interface PresenceOptions {
+  url?: string;
+  logger: Logger;
+  graceMs?: number;
+  ttlMs?: number;
+  refreshMs?: number;
+  marginMs?: number;
+}
+
+export function createPresence({
+  url = process.env.RELAY_REDIS_URL ?? DEFAULT_REDIS_URL,
+  logger,
+  graceMs = DEFAULT_GRACE_MS,
+  ttlMs = DEFAULT_TTL_MS,
+  refreshMs = DEFAULT_REFRESH_MS,
+  marginMs = DEFAULT_MARGIN_MS,
+}: PresenceOptions): Presence {
+  // FAIL FAST RATHER THAN QUEUE, which is the limiter's shape and not the fan-out's.
+  // Default ioredis retries forever and QUEUES commands, so against a dead store a
+  // `SET` neither succeeds nor rejects — it waits, and the failure path this module
+  // documents is never taken. Chapter 3.18 measured the same thing about its
+  // publisher: "default ioredis retries FOREVER, so `publish` never rejects and the
+  // command queues."
+  //
+  // The subscriber keeps its retry behaviour: it MUST reconnect when the store comes
+  // back, which is what "the next transition publishes without a restart" rests on.
+  const commands = new Redis(url, {
+    maxRetriesPerRequest: 0,
+    connectTimeout: 1_000,
+  });
+  const subscriber = new Redis(url);
+
+  // THE STATED REASON FOR THESE LISTENERS IS NOT THE ONE THE LIMITER GIVES.
+  // `limits.ts` says a missing listener means "the gateway would die"; chapter
+  // 3.18 measured that against ioredis 6.0.0 by reproducing the exact client, and
+  // the process STAYS ALIVE — ioredis prints `[ioredis] Unhandled error event: …`
+  // itself and continues. Seven lines in four seconds against a dead port.
+  //
+  // The accurate reason is that those lines are unstructured and unbounded, which
+  // defeats NFR-OBS-01. A presence path that cannot reach Redis is an expected
+  // state; it should say so once, in the log vocabulary this module owns.
+  for (const [name, client] of [
+    ["commands", commands],
+    ["subscriber", subscriber],
+  ] as const) {
+    client.on("error", (error: unknown) => {
+      logger.log("error", "presence.failed", {
+        op: `connection:${name}`,
+        error: String(error),
+      });
+    });
+  }
+
+  let deliver: (channelId: string, payload: PresenceFabric) => void = () => {};
+
+  // Reference-counted, because two members of one channel on one instance must not
+  // unsubscribe each other. One count per channel and two Redis calls under it —
+  // `fanout.ts` keeps the same map for the same reason, over the same ids.
+  const counts = new Map<string, number>();
+
+  /** A transition publishes on every one of the subject's channels, so an instance
+   * hosting a watcher who shares three of them receives three copies of one
+   * transition. This is what makes the watcher see one frame: the id is minted per
+   * transition, and a receiver delivers each `(transition, connection)` pair once.
+   *
+   * Cleared on a timer rather than kept: every copy of one transition arrives
+   * within milliseconds of the others, so a few seconds is generous and unbounded
+   * growth is the alternative. */
+  const seen = new Map<string, Set<string>>();
+
+  const key = (environmentId: string, user: string): string =>
+    `presence:${environmentId}:${user}`;
+  const marker = (environmentId: string, user: string): string =>
+    `presence:offline:${environmentId}:${user}`;
+
+  /** Users this instance currently holds a connection for, and the environment each
+   * belongs to. The refresh loop walks this; `disconnected` removes from it. */
+  const held = new Map<string, string>();
+
+  /** One pending grace check per user, REPLACED rather than added to. Close, reopen
+   * at a third of the window, close again must leave one decision answered by the
+   * state at the end of the second window — two timers would publish twice. */
+  const pending = new Map<string, NodeJS.Timeout>();
+
+  const refreshTimer = setInterval(() => {
+    void (async () => {
+      for (const [user, environmentId] of held) {
+        const reply = await failable("refresh", () =>
+          commands.set(key(environmentId, user), "1", "PX", ttlMs, "XX"),
+        );
+        // `XX` answers null when the key is gone — a Redis restart or an eviction
+        // under a live connection. Treat it as a new transition: a duplicate
+        // `online` for a user who never left, which ADR-10 permits and FR-031
+        // authorises, and which beats a user who is online and unpublishable.
+        if (reply === null) {
+          logger.log("info", "presence.suppressed", {
+            user,
+            state: "online",
+            reason: "key vanished under a live connection; re-electing",
+          });
+          await failable("refresh:reelect", async () => {
+            const won = await commands.set(
+              key(environmentId, user),
+              "1",
+              "PX",
+              ttlMs,
+              "NX",
+            );
+            if (wonTransition(won)) await commands.del(marker(environmentId, user));
+          });
+        }
+      }
+    })();
+  }, refreshMs);
+  refreshTimer.unref();
+
+  async function failable<T>(op: string, work: () => Promise<T>): Promise<T | null> {
+    try {
+      return await work();
+    } catch (error) {
+      // Swallowed and logged, never rethrown: presence is the only thing that may
+      // degrade (FR-023). And the log line is the REQUIREMENT'S EVIDENCE — a path
+      // that silently does nothing satisfies "the socket still opened" exactly as
+      // well as a working one does, which is chapter 3.18's trap against its own
+      // publisher.
+      logger.log("error", "presence.failed", { op, error: String(error) });
+      return null;
+    }
+  }
+
+  async function publish(
+    environmentId: string,
+    user: string,
+    state: "online" | "offline",
+    channelIds: Iterable<string>,
+  ): Promise<void> {
+    const transition = randomUUID();
+    const payload: PresenceFabric = { user, state, transition };
+    const body = JSON.stringify(payload);
+    const channels = [...channelIds];
+    await failable("publish", async () => {
+      await Promise.all(
+        channels.map((channelId) =>
+          commands.publish(subjectForPresence(channelId), body),
+        ),
+      );
+    });
+    // `channels` is a COUNT, not a list. The number is useful in an incident; the
+    // list is a membership graph in a log file (constitution VI).
+    logger.log("info", "presence.published", {
+      user,
+      state,
+      channels: channels.length,
+    });
+  }
+
+  subscriber.on("message", (subject: string, raw: string) => {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      logger.log("error", "presence.invalid_payload", { subject });
+      return;
+    }
+    // Validated on receipt even though the fabric is inside the trust boundary.
+    // `fanout.ts:77-79` states the reason and it is unchanged here: "inside" is one
+    // compromised dependency away from "outside", and a malformed payload must not
+    // reach a client.
+    const payload = presenceFabricSchema.safeParse(parsed);
+    if (!payload.success) {
+      logger.log("error", "presence.invalid_payload", { subject });
+      return;
+    }
+    deliver(subject.slice("presence:".length), payload.data);
+  });
+
+  return {
+    onTransition(handler) {
+      deliver = handler;
+    },
+
+    async connected(environmentId, user, channelIds) {
+      // `SET … NX` IS THE ELECTION. Exactly one caller across every instance gets
+      // `OK` for a user who was absent; everyone else gets null and stays quiet.
+      // Measured against Redis 8.10.0 rather than reasoned about (research R2).
+      held.set(user, environmentId);
+      const reply = await failable("connected:set", () =>
+        commands.set(key(environmentId, user), "1", "PX", ttlMs, "NX"),
+      );
+      if (!wonTransition(reply)) {
+        logger.log("info", "presence.suppressed", {
+          user,
+          state: "online",
+          reason: "already online",
+        });
+        return;
+      }
+      // The offline marker is cleared by whoever wins the online transition, so the
+      // next departure can elect a publisher again.
+      await failable("connected:clear-marker", () =>
+        commands.del(marker(environmentId, user)),
+      );
+      await publish(environmentId, user, "online", channelIds);
+    },
+
+    async disconnected(environmentId, user, channelIds) {
+      // The caller has already removed the connection AND established that no other
+      // local one remains — `session.ts` asks `registry.connectionsFor` for that.
+      // So dropping the refresh here is correct: this instance holds nothing for
+      // this user any more.
+      held.delete(user);
+      // The channel set is captured HERE, at the close, and held by the closure the
+      // check runs in. By the time it fires the connection is out of the registry.
+      // It is only ever used when nobody returned, in which case it is still right.
+      const channels = [...channelIds];
+
+      // RE-PIN, AND AWAIT IT BEFORE ARMING THE TIMER. Without the re-pin the key
+      // dies at `last_refresh + ttlMs`, which is up to `refreshMs` BEFORE the grace
+      // ends — and a reconnection in that gap wins `SET … NX` and publishes a second
+      // `online` for a user who never left (FR-007, research R2a). `XX` so it never
+      // resurrects a key that is already gone.
+      //
+      // The await is the other half: it puts the round trip inside the wait instead
+      // of racing the timer (research R2b).
+      await failable("disconnected:repin", () =>
+        commands.set(key(environmentId, user), "1", "PX", graceMs, "XX"),
+      );
+
+      const existing = pending.get(user);
+      if (existing) clearTimeout(existing);
+      const timer = setTimeout(() => {
+        pending.delete(user);
+        void (async () => {
+          // The key is absent only if no instance refreshed it for a whole window —
+          // which is the same question as "does anybody still hold a connection?",
+          // asked without a membership set. `docs/05-sad.md`'s `conn:{env}:{user}`
+          // is not needed for this (research R6).
+          const alive = await failable("grace:exists", () =>
+            commands.exists(key(environmentId, user)),
+          );
+          if (alive !== 0) {
+            logger.log("info", "presence.suppressed", {
+              user,
+              state: "offline",
+              reason: "a connection is still open somewhere",
+            });
+            return;
+          }
+          // Two instances whose last connections close in the same tick both find
+          // the key absent. `SET … NX` on a separate marker gives exactly one of
+          // them the right to speak.
+          const won = await failable("grace:elect", () =>
+            commands.set(marker(environmentId, user), "1", "PX", ttlMs, "NX"),
+          );
+          if (!wonTransition(won)) {
+            logger.log("info", "presence.suppressed", {
+              user,
+              state: "offline",
+              reason: "another instance published it",
+            });
+            return;
+          }
+          await publish(environmentId, user, "offline", channels);
+        })();
+      }, graceCheckDelay(graceMs, marginMs));
+      timer.unref();
+      pending.set(user, timer);
+    },
+
+    async subscribe(channelId) {
+      const next = (counts.get(channelId) ?? 0) + 1;
+      counts.set(channelId, next);
+      if (next === 1) {
+        await failable("subscribe", () =>
+          subscriber.subscribe(subjectForPresence(channelId)),
+        );
+      }
+    },
+
+    async unsubscribe(channelId) {
+      const next = (counts.get(channelId) ?? 1) - 1;
+      if (next <= 0) {
+        counts.delete(channelId);
+        await failable("unsubscribe", () =>
+          subscriber.unsubscribe(subjectForPresence(channelId)),
+        );
+      } else {
+        counts.set(channelId, next);
+      }
+    },
+
+    /** True when this connection has not already been handed this transition.
+     * Records as a side effect, which is why it is a method and not a predicate. */
+    claim(transition, connectionId) {
+      let holders = seen.get(transition);
+      if (!holders) {
+        holders = new Set();
+        seen.set(transition, holders);
+        setTimeout(() => seen.delete(transition), 5_000).unref();
+      }
+      if (holders.has(connectionId)) return false;
+      holders.add(connectionId);
+      return true;
+    },
+
+    async close() {
+      // Cleared, or a suite standing up two instances leaks a timer into the next
+      // file. A draining instance also abandons its pending offlines — stated in
+      // the chapter rather than discovered: nothing publishes them, the key expires
+      // silently, and watchers hold a stale green circle until the subject next
+      // transitions. ADR-10 permits that; a reader should still be told.
+      clearInterval(refreshTimer);
+      for (const timer of pending.values()) clearTimeout(timer);
+      pending.clear();
+      held.clear();
+      seen.clear();
+      subscriber.disconnect();
+      commands.disconnect();
+    },
+  };
+}
+```
+
+## Who is allowed to see it
+
+FR-RTM-07 says a presence event reaches only users who share at least one channel with the
+subject. **A reader looking for the filter will not find one.** Nothing in `presence.ts` or
+`session.ts` compares two membership sets. The rule is enforced by three facts that compose:
+
+```text title="FR-RTM-07, and there is no code for it (excerpt)"
+a transition publishes on presence:{c} for each of the SUBJECT's channels
+an instance subscribes to presence:{c} only for channels its OWN members hold
+delivery walks registry.subscribersOf(c), which is a membership test
+```
+
+An instance receives a transition only on subjects it subscribed to, and it subscribed only to
+channels its local members belong to. A user who shares nothing with the subject is on no instance
+that hears about it — and if they happen to share an instance with somebody who does,
+`subscribersOf` does not return them.
+
+<Figure caption="Three ways not to receive a transition, none of them a filter" code={figScope} />
+
+A private channel needs no special case: a non-member is not subscribed, which is the same
+mechanism that handles a public channel they never joined. FR-CHN-05's third verb — *observe
+presence* — is satisfied by the topology. The test for it exists anyway, because "no special case
+was needed" and "the case was never considered" look identical from outside.
+
+The registry gains one method, and it answers a purely local question:
+
+```diff title="services/gateway/src/registry.ts"
+@@ -90,6 +90,20 @@ export class Registry {
+     return [...this.byId.values()].filter((c) => c.channelIds.has(channelId));
+   }
+ 
++  /** Chapter 3.19. Every local connection this user holds — the question presence
++   * asks at a close: "was that the last one on this instance?"
++   *
++   * A FILTER RATHER THAN A SECOND INDEX. `subscribersOf` above is the same shape
++   * for the same reason: one instance's connection set is small, and a second map
++   * is a second thing to keep correct at `add` and `remove`. The cross-instance
++   * half of this question is not asked here at all — Redis answers it, because
++   * this file's whole point since 2.5 is that it cannot see other instances. */
++  connectionsFor(userExternalId: string): Connection[] {
++    return [...this.byId.values()].filter(
++      (c) => c.identity.userExternalId === userExternalId,
++    );
++  }
++
+   all(): Connection[] {
+     return [...this.byId.values()];
+   }
+```
+
+```diff title="services/gateway/src/session.ts"
+@@ -10,6 +10,7 @@ import {
+   type Frame,
+   type Message,
+   isErrorCode,
++  type PresenceFabric,
+ } from "@relay/protocol";
+ import { newRequestId, type Logger } from "@relay/service-kit";
+ import { WebSocketServer, type WebSocket } from "ws";
+@@ -19,6 +20,7 @@ import { authenticate, type Identity } from "./auth.js";
+ import type { Fanout } from "./fanout.js";
+ import type { Decision, GatewayLimits } from "./limits.js";
+ import { createMeter, METER_INTERVAL_MS, type Meter } from "./meter.js";
++import { type Presence } from "./presence.js";
+ import { Registry, type Connection } from "./registry.js";
+ import {
+   MAX_BUFFERED_FRAMES,
+@@ -143,8 +145,25 @@ export interface SessionServerOptions {
+    * unmetered one. `main.ts` always supplies the interval; the meter itself is
+    * built here so its timer has the same owner as the heartbeat's. */
+   meterIntervalMs?: number;
++  /** Chapter 3.19. Optional for the same reason `fanout`, `limits` and the meter
++   * are: 2.5's tests and a single-process dev run have no Redis, and a socket
++   * server that refused to start without one would be a worse default than a
++   * presence-less one. `main.ts` always supplies it. */
++  presence?: Presence;
+ }
+ 
++// THE FOUR PRESENCE TIMINGS ARE NOT HERE, and an earlier draft of this chapter put
++// them here. `meterIntervalMs` is a session option because `attachSessions` BUILDS
++// the meter; `fanout`, `limits` and `presence` are injected already built, and an
++// injected thing carries its own configuration. A test that wants a hundred-
++// millisecond grace period constructs `createPresence({ graceMs: 100, … })` and
++// injects that, the way the fan-out's tests already do. Four options that only
++// forwarded values would be four more things to keep in step with `PresenceOptions`.
++//
++// eslint found this: they were declared, destructured, and used by nothing.
++// `presence` itself is declared on the interface above and destructured below, where
++// the delivery path and the two hook points consume it.
++
+ export function attachSessions({
+   server,
+   api,
+@@ -154,6 +173,7 @@ export function attachSessions({
+   resumeDeadlineMs = SUBSCRIBE_DEADLINE_MS,
+   limits,
+   meterIntervalMs = METER_INTERVAL_MS,
++  presence,
+ }: SessionServerOptions): {
+   registry: Registry;
+   meter: Meter;
+@@ -195,6 +215,30 @@ export function attachSessions({
+     }
+   }
+   fanout?.onDelivery(deliver);
++
++  /** A presence transition arriving from its own fabric.
++   *
++   * NOT `deliver`'s path, and the differences are the point. Presence carries no
++   * sequence, so it can neither duplicate a backfilled row nor leave a gap — which
++   * is why it consults neither `connection.phase` nor `connection.marks`. Buffering
++   * it during a resume would delay a frame for no benefit, and `suppressed()` takes
++   * a `Message`. A transition mid-resume is sent immediately.
++   *
++   * THE WIRE FRAME IS BUILT FROM TWO FIELDS. `transition` is the fabric's business
++   * and never leaves this function: what a client receives is what chapter 1.3
++   * published and `frames.test.ts` asserts. */
++  function deliverPresence(channelId: string, payload: PresenceFabric): void {
++    for (const connection of registry.subscribersOf(channelId)) {
++      // One frame per transition per connection, however many channels this
++      // connection shares with the subject (FR-012).
++      if (!presence?.claim(payload.transition, connection.id)) continue;
++      send(connection.socket, {
++        type: "presence.changed",
++        payload: { user: payload.user, state: payload.state },
++      });
++    }
++  }
++  presence?.onTransition(deliverPresence);
+   // noServer: the upgrade is handled by hand so the token can be checked
+   // BEFORE the handshake completes. Letting ws own the upgrade would mean
+   // rejecting a socket that already exists (EIR-WS-05 wants the close code
+@@ -357,9 +401,21 @@ export function attachSessions({
+     // makes this instance a subscriber, and the last one to leave releases
+     // it (reference-counted in the fabric).
+     const subscribing = Promise.all(
+-      [...connection.channelIds].map((channelId) =>
++      [...connection.channelIds].flatMap((channelId) => [
+         fanout?.subscribe(channelId),
+-      ),
++        // Chapter 3.19. Presence has its own subject per channel, so a channel now
++        // carries two subscriptions. `ioredis` takes a variadic `subscribe`, so the
++        // count doubles and the round trips do not.
++        presence?.subscribe(channelId),
++      ]),
++    );
++    // AFTER `registry.add`, so "is this the user's first connection here?" is asked
++    // of a registry that already contains it. The close handler needs the opposite
++    // and gets it three lines apart — see the note there.
++    void presence?.connected(
++      identity.environmentId,
++      identity.userExternalId,
++      connection.channelIds,
+     );
+     logger.log("info", "connection.opened", {
+       connection_id: connection.id,
+@@ -389,6 +445,32 @@ export function attachSessions({
+       // would turn one event into a burst of HTTP requests.
+       meter?.closed(connection, new Date());
+       registry.remove(connection.id);
++      // Chapter 3.19, AND THIS HANDLER NOW CARRIES THREE ORDERING CONSTRAINTS, not
++      // one. The meter is told BEFORE `registry.remove` — a socket that opened and
++      // closed between two reports would otherwise be counted zero, which is the one
++      // thing the wall-clock-minute unit was chosen to charge. Presence is told
++      // AFTER it, because it asks whether this was the user's last connection on
++      // this instance and must not count the one that is leaving. The unsubscribes
++      // come last.
++      //
++      // Swapping the middle two is not a style change. With `registry.remove` after
++      // this block, `connectionsFor` still sees the closing connection, the count is
++      // 1 rather than 0, no grace check is ever scheduled, and the user stays online
++      // for ever. A test asserts the scheduling for that reason.
++      //
++      // The condition asks a local question only. Closing one of two connections on
++      // this instance must publish nothing (FR-006); whether the user is still
++      // connected on some OTHER instance is Redis's to answer, and this registry has
++      // been unable to see other instances since 2.5.
++      if (
++        registry.connectionsFor(connection.identity.userExternalId).length === 0
++      ) {
++        void presence?.disconnected(
++          connection.identity.environmentId,
++          connection.identity.userExternalId,
++          connection.channelIds,
++        );
++      }
+       // Releasing a subscription can fail — a broker that went away, or a
+       // fabric already closed while sockets were still draining — and a
+       // close handler is the last place that should throw. The subscribe
+@@ -396,14 +478,24 @@ export function attachSessions({
+       // unhandled rejection during teardown is how chapter 2.8's lane found
+       // out. Nothing to recover: the connection is gone either way.
+       void Promise.all(
+-        [...connection.channelIds].map((channelId) =>
++        [...connection.channelIds].flatMap((channelId) => [
+           fanout?.unsubscribe(channelId).catch((error: unknown) => {
+             logger.log("error", "fanout.unsubscribe_failed", {
+               channel: channelId,
+               error: String(error),
+             });
+           }),
+-        ),
++          // Inside the same swallowing wrapper, because a close handler is the last
++          // place that should throw — chapter 2.8's lane found the unhandled
++          // rejection on the fan-out's release path for exactly this reason.
++          presence?.unsubscribe(channelId).catch((error: unknown) => {
++            logger.log("error", "presence.failed", {
++              op: "unsubscribe",
++              channel: channelId,
++              error: String(error),
++            });
++          }),
++        ]),
+       );
+       logger.log("info", "connection.closed", {
+         connection_id: connection.id,
+```
+
+<Why>
+
+**The close handler now carries three ordering constraints where it carried one.** The meter is
+told *before* `registry.remove`, because a socket that opened and closed between two reports would
+otherwise be counted zero. Presence is told *after* it, because it asks whether this was the
+user's last connection on this instance and must not count the one that is leaving. The
+unsubscribes come last.
+
+Swapping the middle two is not a style change. With the removal after the presence call,
+`connectionsFor` still sees the closing connection, the count is 1 rather than 0, no grace check
+is ever scheduled, and **the user stays online for ever**. A test asserts the scheduling for that
+reason, and it is the kind of test that has to be watched failing to be believed.
+
+</Why>
+
+<Trap>
+
+**Three things this chapter does not do, said here rather than discovered.**
+
+There is **no snapshot on connect**. A client that opens a socket learns about transitions from
+that moment on and nothing about the state before it, so a roster starts empty and fills in as
+people move. Every presence design eventually needs the snapshot; this one does not have it.
+
+A user who **joins a channel while connected** does not appear online to that channel's members
+until they reconnect. The subscribe set is taken once, at connect, from the session response. That
+is FR-RTM-10's staleness wearing a different hat, and it is unfixed here on purpose.
+
+An instance that **dies inside the grace window** publishes no `offline`. The pending check lived
+in that process. The key expires silently, and watchers hold a stale green circle until the
+subject next transitions. ADR-10 permits presence to be lossy; a reader should still be told which
+losses are real.
+
+</Trap>
+
+## When the store is not there
+
+Presence is the one subsystem in Relay that is allowed to degrade. A gateway whose Redis is down
+must still accept sockets and still deliver messages — and the risk in writing that down is that
+**a subsystem which does nothing at all satisfies it just as well**.
+
+Chapter 3.18 hit this exactly: its publisher swallowed its own errors and resolved, so "the send
+returned 201 while Redis was down" was true of a publisher that had never been wired up. The
+assertion that carries the requirement is not the socket. It is the log line:
+
+```text title="services/gateway/src/presence.ts (excerpt)"
+logger.log("error", "presence.failed", { op, error: String(error) });
+```
+
+Getting that line to appear took one more change than expected. Default `ioredis` retries forever
+and **queues** commands, so against a dead port a `SET` neither succeeds nor rejects — it waits,
+and the failure path documented in the module is never taken. The command client is built with
+`maxRetriesPerRequest: 0` and a one-second connect timeout for that reason. The subscriber keeps
+the default, because it *must* reconnect when the store comes back; that is what "the next
+transition publishes without a restart" rests on.
+
+Presence's Redis client also needed a lint exemption, and the interesting part is which
+justification it borrowed:
+
+```text title="eslint.config.mjs (excerpt)"
+// Chapter 3.19. THIS IS `limits.ts`'s CASE, NOT `fanout.ts`'s, and the
+// distinction is the rule's own reason. The entry above is justified by
+// "this client touches no keys" — a publish onto a channel UUID, and a
+// subject is not readable at all. Presence's client touches keys and they
+// are environment-scoped: `presence:{env}:{user}`, exactly the shape the
+// restriction exists to guard.
+"services/gateway/src/presence.ts",
+```
+
+The fan-out's exemption is on the list one entry up and its reason does not transfer. Copying the
+nearest neighbour's justification is how a restriction becomes a formality.
+
+```diff title="services/gateway/src/main.ts"
+@@ -4,6 +4,7 @@ import { createLogger, serve, type Logger } from "@relay/service-kit";
+ import { createApiClient } from "./api-client.js";
+ import { createFanout } from "./fanout.js";
+ import { createGatewayLimits } from "./limits.js";
++import { createPresence } from "./presence.js";
+ import { attachSessions } from "./session.js";
+ 
+ // The gateway — SAD §4.1: terminates WebSockets and never writes to the
+@@ -42,6 +43,12 @@ export function createServer(logger?: Logger) {
+   // created here rather than inside `attachSessions` so the tests that call
+   // that function directly stay Redis-free, and so its close has an owner.
+   const limits = createGatewayLimits();
++  // Chapter 3.19. The FOURTH and FIFTH Redis clients, and the reason is chapter
++  // 3.8's verbatim: a connection in subscribe mode cannot run `SET` or `EXISTS`,
++  // so presence needs a subscriber and a command client of its own. Created here
++  // rather than inside `attachSessions` so the tests that call that function
++  // directly stay Redis-free, and so its close has an owner.
++  const presence = createPresence({ logger: log });
+   // Chapter 3.11. THE FIRST SECRET THIS SERVICE HAS EVER HELD, and it is not a
+   // signing secret: chapter 3.2's claim that "the gateway holds no signing
+   // secret" is untouched, because this one verifies nothing and signs nothing.
+@@ -67,6 +74,7 @@ export function createServer(logger?: Logger) {
+     logger: log,
+     fanout,
+     limits,
++    presence,
+     // Overridable so `meter.itest.ts` can drive a spawned gateway without
+     // waiting a real minute per assertion. The two tests there are the ones an
+     // in-process gateway cannot run — a signal has to arrive at a process — and
+@@ -89,6 +97,7 @@ export function createServer(logger?: Logger) {
+     await sessions.close();
+     await fanout.close();
+     await limits.close();
++    await presence.close();
+   }
+   return Object.assign(server, { shutdown });
+ }
+```
+
+```ts title="services/gateway/src/presence.test.ts"
+import { describe, expect, it } from "vitest";
+
+import {
+  DEFAULT_GRACE_MS,
+  DEFAULT_MARGIN_MS,
+  DEFAULT_REFRESH_MS,
+  DEFAULT_TTL_MS,
+  graceCheckDelay,
+  wonTransition,
+} from "./presence.js";
+
+// PURE LOGIC ONLY, and that is the file's whole shape. `createPresence` builds its
+// own Redis clients from a url and cannot be handed a double, so anything
+// reply-dependent lives in `presence.itest.ts`. `limits.test.ts` is the precedent:
+// it covers `windowStartFor` and `overLimit` and nothing that touches a client.
+
+describe("wonTransition", () => {
+  it("is true only for the caller that SET … NX answered", () => {
+    expect(wonTransition("OK")).toBe(true);
+    expect(wonTransition(null)).toBe(false);
+  });
+});
+
+describe("the timings", () => {
+  it("keeps FR-RTM-06's thirty seconds somewhere a reader can find it", () => {
+    // Without this the clause's number lives only in a constant somebody edits.
+    expect(DEFAULT_GRACE_MS).toBe(30_000);
+  });
+
+  it("refreshes well inside the TTL", () => {
+    // A TTL equal to its refresh interval expires a connected user. Three
+    // refreshes per TTL survive two consecutive misses.
+    expect(DEFAULT_REFRESH_MS).toBeLessThan(DEFAULT_TTL_MS / 2);
+  });
+
+  it("checks after the grace ends, never exactly on it", () => {
+    // Two deadlines on one instant, reached by two clocks, strand the user online
+    // permanently — the check wins the race, finds the key alive, and its one-shot
+    // timer is gone (research R2b).
+    expect(DEFAULT_MARGIN_MS).toBeGreaterThan(0);
+  });
+
+  it("defaults the margin to a second", () => {
+    expect(DEFAULT_MARGIN_MS).toBe(1_000);
+  });
+
+  it("defaults the TTL to the SAD's thirty seconds", () => {
+    expect(DEFAULT_TTL_MS).toBe(30_000);
+  });
+
+  // NOT ASSERTED: `ttlMs >= graceMs`. The close re-pins the key, which is what
+  // makes the grace correct — the numeric relation is the sane default, not the
+  // mechanism, and a test may set the TTL below the grace deliberately to open the
+  // gap the reconnect-late case needs.
+});
+
+describe("graceCheckDelay", () => {
+  it("is the grace plus the margin, never the grace alone", () => {
+    expect(graceCheckDelay(30_000, 1_000)).toBe(31_000);
+    expect(graceCheckDelay(300, 50)).toBe(350);
+  });
+
+  // The whole point of the margin: the check must never land on the instant the
+  // re-pinned key expires, because Redis holds a key until `now` is strictly past
+  // its expiry and a tie leaves the user online with no timer left to try again.
+  it("never returns the grace unchanged", () => {
+    expect(graceCheckDelay(30_000, DEFAULT_MARGIN_MS)).toBeGreaterThan(30_000);
+  });
+});
+```
+
+```ts title="services/gateway/src/presence.itest.ts"
+import { spawn, type ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+  createServer as createNetServer,
+  connect as connectSocket,
+  type AddressInfo,
+  type Server as NetServer,
+  type Socket,
+} from "node:net";
+
+import { createLogger, serve, type Logger } from "@relay/service-kit";
+import { docsUrl } from "@relay/protocol";
+import { WebSocket } from "ws";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+
+import { createApiClient } from "./api-client.js";
+import { createFanout } from "./fanout.js";
+import { createPresence, type PresenceOptions } from "./presence.js";
+import { attachSessions } from "./session.js";
+
+// CHAPTER 3.19, PHASE 1 — THE FAILING STATE, OBSERVED.
+//
+// `presence.changed` has been in the protocol union since chapter 1.3. Its states
+// are `online` and `offline`, `frames.test.ts` asserts its shape and rejects
+// `state: "away"`, and chapter 3.12's gauntlet proves a client cannot forge one.
+// Nothing has ever produced one — chapter 3.17's `gaps.md` item 2 recorded it as
+// "a declared frame with no sender" and assigned it to this chapter by name.
+//
+// THIS TEST IS RED ON PURPOSE UNTIL PHASE 3. The phase 1 and phase 2 commits both
+// carry it failing, and their commit bodies say so: a red lane nobody explained is
+// indistinguishable from a red lane nobody noticed, and CI cannot tell them apart.
+//
+// It must be red for the RIGHT reason — no producer exists — rather than because
+// the fixture is wrong. That is why it asserts the positive (a frame arrives) and
+// not the negative: "nothing arrived" is true of a broken harness too.
+
+const silent: Logger = createLogger("gateway", () => {});
+const HERE = dirname(fileURLToPath(import.meta.url));
+const REPO = join(HERE, "..", "..", "..");
+const require_ = createRequire(import.meta.url);
+
+interface Seeder {
+  createEnvironment: (db: unknown, input: { name: string }) => Promise<{ id: string }>;
+  createApiKey: (
+    db: unknown,
+    input: { environmentId: string },
+  ) => Promise<{ credential: string }>;
+  Repository: new (
+    db: unknown,
+    environmentId: string,
+  ) => {
+    createUser: (externalId: string, displayName: string) => Promise<{ id: string }>;
+    createChannel: (
+      externalId: string,
+      type: "public" | "private",
+    ) => Promise<{ id: string }>;
+    addMember: (channelId: string, userId: string) => Promise<boolean>;
+  };
+}
+
+interface ApiUnderTest {
+  url: string;
+  credential: string;
+  /** One per test — see the note in the seed. */
+  subjects: string[];
+  /** The three shared channels, by the id a `message.send` frame names. */
+  channelIds: string[];
+  /** Counts rows in the outbox. Reached through the api's BUILT `dist`, which is
+   * premise 2 — the gateway package has no `pg` dependency of its own. */
+  outboxCount: () => Promise<number>;
+  /** A SECOND TENANT, with its own credential and its own user. Presence keys are
+   * `{env}`-scoped and channel ids are unguessable, so the isolation is structural
+   * — which is exactly why it needs a test that could see it fail. */
+  otherCredential: string;
+  stop: () => void;
+}
+
+/** Two members of ONE channel, which no existing gateway fixture provides:
+ * `seedSocketTenants` gives one user per tenant, and presence needs a watcher and
+ * a subject who share a channel. */
+async function startApi(): Promise<ApiUnderTest> {
+  const port = 4700 + Math.floor(Math.random() * 200);
+  const dist = join(REPO, "services", "api", "dist");
+  if (!existsSync(join(dist, "main.js"))) {
+    throw new Error(
+      "the api is not built — run `pnpm build` before this lane " +
+        "(the suite talks to the real service, not a stub)",
+    );
+  }
+  const client = require_(join(dist, "db", "client.js")) as {
+    createDb: (pool: unknown) => unknown;
+    createPool: () => { query: (sql: string) => Promise<unknown> };
+  };
+  const seeder = require_(join(dist, "db", "repository.js")) as Seeder;
+  const pool = client.createPool();
+  const db = client.createDb(pool);
+
+  const environment = await seeder.createEnvironment(db, {
+    name: `presence-itest-${randomUUID().slice(0, 8)}`,
+  });
+  const repo = new seeder.Repository(db, environment.id);
+  const watcher = await repo.createUser("linh", "Linh");
+  const subject = await repo.createUser("tuan", "Tuan");
+  // A user who belongs to nothing: FR-RTM-07's degenerate case, where a transition
+  // publishes on no subject at all.
+  await repo.createUser("hermit", "Hermit");
+
+  // ONE SUBJECT PER TEST, and this is not tidiness. Presence state lives in Redis
+  // under `presence:{env}:{user}` with a thirty-second TTL, so a subject who came
+  // online in one test is STILL ONLINE in the next — `SET … NX` correctly refuses,
+  // nothing publishes, and every later test sees an empty frame list. The first run
+  // of this suite failed exactly that way: test 1 passed and tests 2 to 4 reported
+  // "expected [] to have a length of 1", which reads like a broken fabric and is a
+  // shared fixture.
+  //
+  // T016 asked for fresh channel AND user ids per run for this reason and the first
+  // implementation did the channels only. Chapter 3.18's `isolation-fixtures.ts`
+  // learned the same lesson: a fixture nobody else depends on beats a rule nobody
+  // remembers.
+  const channels = await Promise.all(
+    // THREE shared channels, so the dedup can be asserted by count. Without the
+    // transition id a watcher sharing three sees three frames for one arrival.
+    ["fleet", "ops", "night-shift"].map((name) =>
+      repo.createChannel(name, "public"),
+    ),
+  );
+  // CONCURRENTLY. Seeded one at a time this was 40 users x 3 memberships of
+  // sequential round trips, and the file spent more time in its fixture than in its
+  // assertions.
+  const subjects = Array.from({ length: 40 }, (_, i) => `subject-${i}`);
+  const seeded = await Promise.all(
+    subjects.map((name) => repo.createUser(name, name)),
+  );
+  await Promise.all(
+    channels.flatMap((channel) =>
+      [watcher, subject, ...seeded].map((user) =>
+        repo.addMember(channel.id, user.id),
+      ),
+    ),
+  );
+  // A user who is a member of a PRIVATE channel that nobody else joins. The watcher
+  // is not in it, so it shares no channel with this user at all.
+  const recluse = await repo.createUser("recluse", "Recluse");
+  const vault = await repo.createChannel("vault", "private");
+  await repo.addMember(vault.id, recluse.id);
+
+  const key = await seeder.createApiKey(db, {
+    environmentId: environment.id,
+  });
+
+  // THE SECOND TENANT. Its own environment, its own user, its own channel, its own
+  // key — nothing shared with the first but a Redis instance and a gateway.
+  const other = await seeder.createEnvironment(db, {
+    name: `presence-itest-other-${randomUUID().slice(0, 8)}`,
+  });
+  const otherRepo = new seeder.Repository(db, other.id);
+  const stranger = await otherRepo.createUser("stranger", "Stranger");
+  const elsewhere = await otherRepo.createChannel("elsewhere", "public");
+  await otherRepo.addMember(elsewhere.id, stranger.id);
+  const otherKey = await seeder.createApiKey(db, { environmentId: other.id });
+
+  const child: ChildProcess = spawn("node", [join(dist, "main.js")], {
+    env: {
+      ...process.env,
+      PORT: String(port),
+      RELAY_OUTBOX_RELAY: "off",
+      RELAY_NOTIFICATION_RELAY: "off",
+      RELAY_EVENT_CONSUMER: "off",
+    },
+    stdio: "ignore",
+  });
+  const url = `http://127.0.0.1:${port}`;
+  for (let i = 0; i < 100; i += 1) {
+    try {
+      const res = await fetch(`${url}/health`);
+      if (res.ok) break;
+    } catch {
+      /* not up yet */
+    }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  return {
+    url,
+    credential: key.credential,
+    subjects,
+    outboxCount: async () => {
+      const result = (await pool.query("select count(*)::int as n from outbox")) as {
+        rows: { n: number }[];
+      };
+      return result.rows[0]?.n ?? 0;
+    },
+    channelIds: channels.map((c) => c.id),
+    otherCredential: otherKey.credential,
+    stop: () => child.kill(),
+  };
+}
+
+/** Every frame of a type this socket has received. **Assertions here are by COUNT,
+ * not by arrival**: "a frame showed up" is equally true of a producer that publishes
+ * three, and three is exactly what the dedup exists to prevent. */
+function collect(
+  socket: WebSocket,
+  type: string,
+  about?: string,
+): { frames: { payload: { user: string; state: string } }[] } {
+  const frames: { payload: { user: string; state: string } }[] = [];
+  socket.on("message", (raw: unknown) => {
+    const frame = JSON.parse(String(raw)) as {
+      type: string;
+      payload: { user: string; state: string };
+    };
+    if (frame.type !== type) return;
+    // FILTERED BY SUBJECT, and the first version of this helper was not — which is
+    // how FR-011 announced itself. A watcher's own arrival is delivered to the
+    // watcher, because a subject shares every one of their channels with
+    // themselves, so an unfiltered collector sees two frames where the test means
+    // one. The behaviour is correct and the assertion was wrong.
+    if (about !== undefined && frame.payload.user !== about) return;
+    frames.push(frame);
+  });
+  return { frames };
+}
+
+/** Let the fabric settle. Redis pub/sub is fire-and-forget, so a test cannot poll a
+ * queue — a negative assertion has to wait out a window instead. */
+const quiet = (ms = 700) => new Promise((r) => setTimeout(r, ms));
+
+/** Wait for a frame of a given type, or fail loudly. Redis pub/sub is
+ * fire-and-forget, so a test cannot poll a queue — it waits with a deadline. */
+function waitForFrame(
+  socket: WebSocket,
+  type: string,
+  timeoutMs = 5_000,
+): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    const onMessage = (raw: unknown): void => {
+      const frame = JSON.parse(String(raw)) as { type: string };
+      if (frame.type === type) {
+        socket.off("message", onMessage);
+        resolve(frame as unknown as Record<string, unknown>);
+      }
+    };
+    socket.on("message", onMessage);
+    setTimeout(
+      () => reject(new Error(`no ${type} frame within ${timeoutMs}ms`)),
+      timeoutMs,
+    );
+  });
+}
+
+/** One gateway instance: its own server, its own fabric clients, its own
+ * `Presence`. Two of these on one Redis is what the cross-instance cases need,
+ * and **no existing gateway suite stands up two at once** — `fanout.itest.ts`
+ * does it at the fabric level with two `createFanout` clients and no sessions,
+ * and every other file builds exactly one `attachSessions` inside its own
+ * describe. So this is new harness rather than a pattern to copy.
+ *
+ * `presence` is INJECTED already built, the way `fanout` and `limits` are, which
+ * is why a test that wants a hundred-millisecond grace period passes those
+ * timings to `createPresence` here rather than to `attachSessions`. */
+interface LogLine {
+  level: string;
+  msg: string;
+  fields: Record<string, unknown>;
+}
+
+interface Instance {
+  url: string;
+  /** Everything this instance logged. **The log line is the requirement's evidence**
+   * on every failure path: a presence module that does nothing satisfies "the socket
+   * still opened" exactly as well as a working one, which is chapter 3.18's trap
+   * against its own publisher. */
+  logs: LogLine[];
+  close: () => Promise<void>;
+}
+
+/** A TCP proxy in front of the real Redis, so a test can sever and restore a
+ * connection without touching anything shared.
+ *
+ * **NEVER `docker compose stop redis`.** The gateway's integration files run in
+ * PARALLEL — `services/api/src/limits/limits.itest.ts:484` already writes the rule
+ * down: "a dead port rather than stopping the container, because the lane runs files
+ * in PARALLEL and stopping Redis would break every other suite mid-run". A dead port
+ * covers "down" and cannot cover "restored", and `redis-server` is not installed on
+ * the lane machine, so the proxy is what is left. */
+async function startRedisProxy(): Promise<{
+  url: string;
+  cut: () => Promise<void>;
+  restore: () => Promise<void>;
+  close: () => Promise<void>;
+}> {
+  const target = new URL(process.env.RELAY_REDIS_URL ?? "redis://localhost:6379");
+  const live = new Set<Socket>();
+  let server: NetServer | null = null;
+  let port = 0;
+
+  const listen = (onPort: number) =>
+    new Promise<number>((resolve) => {
+      const next = createNetServer((client) => {
+        const upstream = connectSocket(
+          Number(target.port || 6379),
+          target.hostname,
+        );
+        client.pipe(upstream);
+        upstream.pipe(client);
+        for (const socket of [client, upstream]) {
+          live.add(socket);
+          socket.on("error", () => socket.destroy());
+          socket.on("close", () => live.delete(socket));
+        }
+      });
+      next.listen(onPort, "127.0.0.1", () => {
+        server = next;
+        resolve((next.address() as AddressInfo).port);
+      });
+    });
+
+  port = await listen(0);
+  return {
+    url: `redis://127.0.0.1:${port}`,
+    cut: async () => {
+      for (const socket of live) socket.destroy();
+      live.clear();
+      await new Promise<void>((resolve) =>
+        server ? server.close(() => resolve()) : resolve(),
+      );
+      server = null;
+    },
+    // Re-listening on the SAME port is what "without a restart" means: ioredis
+    // reconnects on its own and the module is never rebuilt.
+    restore: async () => {
+      await listen(port);
+    },
+    close: async () => {
+      for (const socket of live) socket.destroy();
+      await new Promise<void>((resolve) =>
+        server ? server.close(() => resolve()) : resolve(),
+      );
+    },
+  };
+}
+
+async function startInstance(
+  apiUrl: string,
+  presenceOptions: Partial<PresenceOptions> = {},
+): Promise<Instance> {
+  const logs: LogLine[] = [];
+  // THE SINK RECEIVES A JSON STRING, not an object, and its fields are spread at the
+  // top level rather than nested. The first version of this pushed the raw line, so
+  // every `l.msg` was undefined and the log assertions silently matched nothing —
+  // which is the failure mode "observability you can't test rots" warns about, in
+  // the test rather than the code.
+  const recording = createLogger("gateway", (line) => {
+    const parsed = JSON.parse(line) as Record<string, unknown>;
+    logs.push({
+      level: String(parsed.level),
+      msg: String(parsed.msg),
+      fields: parsed,
+    });
+  });
+  const fanout = createFanout({ logger: silent });
+  const presence = createPresence({ logger: recording, ...presenceOptions });
+  const server = serve({
+    service: "gateway",
+    health: () => ({}),
+    logger: silent,
+    notFoundDocsUrl: docsUrl("not_found"),
+  });
+  const sessions = attachSessions({
+    server,
+    api: createApiClient(apiUrl),
+    logger: silent,
+    fanout,
+    presence,
+  });
+  await new Promise<void>((resolve) => server.listen(0, resolve));
+  return {
+    url: `ws://127.0.0.1:${(server.address() as AddressInfo).port}`,
+    logs,
+    close: async () => {
+      await sessions.close();
+      await fanout.close();
+      await presence.close();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    },
+  };
+}
+
+// ONE API FOR THE WHOLE FILE. Three describes each spawning their own was three
+// process launches and three seeds, and it dominated the file's 54 s. The instances
+// stay per-describe because their timings differ; those are cheap.
+// Assigned in the file-level `beforeAll`; the non-null assertion is the same one
+// every suite here makes about its fixture.
+let api!: ApiUnderTest;
+let nextSubject = 0;
+const takeSubject = (): string => api.subjects[nextSubject++] as string;
+
+beforeAll(async () => {
+  api = await startApi();
+}, 60_000);
+
+afterAll(() => {
+  api?.stop();
+});
+
+describe("presence: a member sees a co-member arrive (FR-RTM-05, FR-RTM-06)", () => {
+  let a: Instance;
+  let b: Instance;
+  const sockets: WebSocket[] = [];
+
+  const mintToken = async (user: string) => {
+    const res = await fetch(`${api.url}/auth/dev-token`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${api.credential}`,
+      },
+      body: JSON.stringify({ user, ttl_seconds: 3600 }),
+    });
+    if (!res.ok) throw new Error(`dev-token: ${res.status}`);
+    return ((await res.json()) as { token: string }).token;
+  };
+
+  let nextSubject = 0;
+  /** The next unused subject. Every test that brings someone online takes one. */
+  const takeSubject = () => api.subjects[nextSubject++] as string;
+
+  const connect = (token: string, instance: Instance = a) => {
+    const socket = new WebSocket(`${instance.url}/v1/ws?token=${token}`);
+    sockets.push(socket);
+    return socket;
+  };
+
+  beforeAll(async () => {
+    // TWO INSTANCES ON ONE REDIS — same code, same fabric, no knowledge of each
+    // other, which is chapter 2.6's phrase for the only property a single-process
+    // test cannot show. Instance A hosts the watcher; B hosts the subject.
+    a = await startInstance(api.url);
+    b = await startInstance(api.url);
+  }, 60_000);
+
+  afterAll(async () => {
+    for (const socket of sockets) socket.close();
+    await a?.close();
+    await b?.close();
+  });
+
+  // T021. The clause, on one instance.
+  it("delivers presence.changed online to a connected co-member", async () => {
+    const watcher = connect(await mintToken("linh"));
+    await waitForFrame(watcher, "connection.ack");
+    const who = takeSubject();
+    const seen = collect(watcher, "presence.changed", who);
+
+    const subject = connect(await mintToken(who));
+    await waitForFrame(subject, "connection.ack");
+    await quiet();
+
+    expect(seen.frames).toEqual([
+      { type: "presence.changed", payload: { user: who, state: "online" } },
+    ]);
+  }, 30_000);
+
+  // T022. The property a single-process test cannot show (chapter 2.6's phrase).
+  it("delivers it when the subject is on another instance", async () => {
+    const watcher = connect(await mintToken("linh"), a);
+    await waitForFrame(watcher, "connection.ack");
+    const who = takeSubject();
+    const seen = collect(watcher, "presence.changed", who);
+
+    const subject = connect(await mintToken(who), b);
+    await waitForFrame(subject, "connection.ack");
+    await quiet();
+
+    expect(seen.frames).toHaveLength(1);
+  }, 30_000);
+
+  // T023, FR-012. The watcher shares THREE channels with the subject and a
+  // transition publishes on all three, so this instance receives three copies of
+  // one transition. Without the transition id this is three frames.
+  it("delivers ONE frame to a watcher sharing three channels", async () => {
+    const watcher = connect(await mintToken("linh"));
+    await waitForFrame(watcher, "connection.ack");
+    const who = takeSubject();
+    const seen = collect(watcher, "presence.changed", who);
+
+    const subject = connect(await mintToken(who), b);
+    await waitForFrame(subject, "connection.ack");
+    await quiet();
+
+    expect(seen.frames).toHaveLength(1);
+  }, 30_000);
+
+  // T024, FR-006. The state did not change, so nothing is published — asserted in
+  // a run where the FIRST connection did produce a frame, so a dead producer
+  // cannot satisfy it.
+  it("publishes nothing for a second connection of a user already online", async () => {
+    const watcher = connect(await mintToken("linh"));
+    await waitForFrame(watcher, "connection.ack");
+    const who = takeSubject();
+    const seen = collect(watcher, "presence.changed", who);
+
+    const first = connect(await mintToken(who), b);
+    await waitForFrame(first, "connection.ack");
+    await quiet();
+    expect(seen.frames).toHaveLength(1);
+
+    const second = connect(await mintToken(who), a);
+    await waitForFrame(second, "connection.ack");
+    await quiet();
+    expect(seen.frames).toHaveLength(1);
+  }, 30_000);
+
+  // T025, FR-011. A subject shares every one of their channels with themselves, so
+  // the scoping rule includes them. Both readings satisfy FR-RTM-07 — "only users
+  // sharing a channel" is an upper bound — and one of them has to be the one that
+  // ships.
+  it("delivers the subject's own transition to the subject's own socket", async () => {
+    // Collected BEFORE the ack, because the subject's own transition is published
+    // as soon as the registry has the connection and can arrive immediately after.
+    const who = takeSubject();
+    const subject = connect(await mintToken(who));
+    const seen = collect(subject, "presence.changed", who);
+    await waitForFrame(subject, "connection.ack");
+    await quiet();
+
+    // The subject's own connect elects the transition and its socket is subscribed
+    // to the same channels, so it hears itself arrive. Exactly one frame, not three
+    // — the dedup applies to the subject like anyone else.
+    expect(seen.frames).toEqual([
+      { type: "presence.changed", payload: { user: who, state: "online" } },
+    ]);
+  }, 30_000);
+
+  // T026, FR-RTM-07's degenerate case. A member of no channel publishes on no
+  // subject, and the connect still succeeds.
+  it("publishes to nobody for a subject who is a member of no channel", async () => {
+    const watcher = connect(await mintToken("linh"));
+    await waitForFrame(watcher, "connection.ack");
+    const seen = collect(watcher, "presence.changed", "hermit");
+
+    const hermit = connect(await mintToken("hermit"), b);
+    await waitForFrame(hermit, "connection.ack");
+    await quiet();
+
+    expect(seen.frames).toEqual([]);
+  }, 30_000);
+});
+
+// ── THE GRACE PERIOD (FR-RTM-06) ─────────────────────────────────────────────
+//
+// MILLISECONDS, NOT HALF-MINUTES. The clause's thirty seconds is asserted once, in
+// `presence.test.ts`, against the production default; every case here runs on a
+// scaled window because six real grace periods would cost 180 s against 44 s of
+// lane headroom. The timings are injected into `createPresence`, not into
+// `attachSessions` — presence is built and handed over, so it carries its own
+// configuration.
+// SCALED HARD, AND THE NUMBER IS A BUDGET DECISION. At 500/100 this file cost 65.4 s
+// of a 240 s lane budget with 32.7 s of headroom — R18's concern, arriving. At
+// 250/60 it costs a third of that. The margin is still ~20x a local Redis round
+// trip, which is what it has to clear.
+const GRACE = 250;
+const MARGIN = 60;
+const SETTLE = GRACE + MARGIN + 200; // past the check, with room for a round trip
+
+describe("presence: the grace period (FR-RTM-06)", () => {
+  let a: Instance;
+  let b: Instance;
+  const sockets: WebSocket[] = [];
+
+  const mintToken = async (user: string) => {
+    const res = await fetch(`${api.url}/auth/dev-token`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${api.credential}`,
+      },
+      body: JSON.stringify({ user, ttl_seconds: 3600 }),
+    });
+    if (!res.ok) throw new Error(`dev-token: ${res.status}`);
+    return ((await res.json()) as { token: string }).token;
+  };
+
+  const connect = (token: string, instance: Instance = a) => {
+    const socket = new WebSocket(`${instance.url}/v1/ws?token=${token}`);
+    sockets.push(socket);
+    return socket;
+  };
+
+  /** Connect, wait for the ack, and let the arrival settle so the `online` frame is
+   * out of the way before a test starts watching for `offline`. */
+  const arrive = async (who: string, instance: Instance = a) => {
+    const socket = connect(await mintToken(who), instance);
+    await waitForFrame(socket, "connection.ack");
+    await quiet(150);
+    return socket;
+  };
+
+  beforeAll(async () => {
+    const timings = {
+      graceMs: GRACE,
+      ttlMs: GRACE,
+      refreshMs: 150,
+      marginMs: MARGIN,
+    };
+    a = await startInstance(api.url, timings);
+    b = await startInstance(api.url, timings);
+  }, 60_000);
+
+  afterAll(async () => {
+    for (const socket of sockets) socket.close();
+    await a?.close();
+    await b?.close();
+  });
+
+  // T036. The clause: one offline, and not before the window.
+  it("publishes one offline after the window and nothing before it", async () => {
+    const who = takeSubject();
+    const watcher = await arrive("linh");
+    const seen = collect(watcher, "presence.changed", who);
+    const subject = await arrive(who, b);
+
+    subject.close();
+    await quiet(GRACE - 150);
+    expect(seen.frames.filter((f) => f.payload.state === "offline")).toEqual([]);
+
+    await quiet(SETTLE);
+    expect(seen.frames.filter((f) => f.payload.state === "offline")).toHaveLength(1);
+  }, 30_000);
+
+  // T038. A reconnection inside the window is invisible: no offline, and no second
+  // online either, because the state never changed.
+  it("publishes nothing at all for a reconnection inside the window", async () => {
+    const who = takeSubject();
+    const watcher = await arrive("linh");
+    const subject = await arrive(who, b);
+    // COLLECTED AFTER THE ARRIVAL. The subject's own `online` is a real frame and
+    // this test is about what happens from the close onward; watching from before
+    // it makes the arrival look like a violation.
+    const seen = collect(watcher, "presence.changed", who);
+
+    subject.close();
+    await quiet(GRACE / 2);
+    await arrive(who, b);
+    await quiet(SETTLE);
+
+    expect(seen.frames).toEqual([]);
+  }, 30_000);
+
+  // T039. The same, landing on the OTHER instance — the case the TTL-as-liveness
+  // signal exists for. Nothing coordinates the two gateways.
+  it("publishes nothing when the reconnection lands on another instance", async () => {
+    const who = takeSubject();
+    const watcher = await arrive("linh");
+    const subject = await arrive(who, b);
+    const seen = collect(watcher, "presence.changed", who);
+
+    subject.close();
+    await quiet(GRACE / 2);
+    await arrive(who, a);
+    await quiet(SETTLE);
+
+    expect(seen.frames).toEqual([]);
+  }, 30_000);
+
+  // T041, FR-006. Two connections here, one closes: nothing. Then the last one.
+  it("publishes nothing while another connection remains open", async () => {
+    const who = takeSubject();
+    const watcher = await arrive("linh");
+    const first = await arrive(who, b);
+    const second = await arrive(who, b);
+    const seen = collect(watcher, "presence.changed", who);
+
+    first.close();
+    await quiet(SETTLE);
+    expect(seen.frames).toEqual([]);
+
+    second.close();
+    await quiet(SETTLE);
+    expect(seen.frames.filter((f) => f.payload.state === "offline")).toHaveLength(1);
+  }, 30_000);
+
+  // T042. The two connections on two DIFFERENT instances, which no local registry
+  // can see — the key's TTL is what answers it.
+  it("publishes nothing while a connection remains on another instance", async () => {
+    const who = takeSubject();
+    const watcher = await arrive("linh");
+    const onA = await arrive(who, a);
+    await arrive(who, b);
+    const seen = collect(watcher, "presence.changed", who);
+
+    onA.close();
+    await quiet(SETTLE);
+    expect(seen.frames).toEqual([]);
+  }, 30_000);
+
+  // T043, FR-028. Close, reopen inside the window, close again: ONE decision,
+  // answered by the state at the end of the SECOND window. Two pending timers
+  // would publish twice.
+  it("leaves one decision for two closes inside one window", async () => {
+    const who = takeSubject();
+    const watcher = await arrive("linh");
+    const seen = collect(watcher, "presence.changed", who);
+
+    const first = await arrive(who, b);
+    first.close();
+    await quiet(GRACE / 3);
+    const second = await arrive(who, b);
+    second.close();
+    await quiet(SETTLE + GRACE);
+
+    expect(seen.frames.filter((f) => f.payload.state === "offline")).toHaveLength(1);
+  }, 30_000);
+
+  // T045, and FR-RTM-09's five is enforced NOWHERE — `policy.ts:13` mentions it in a
+  // comment and nothing counts — so the reference count is unbounded and two is the
+  // easy case. Five connections, closed one at a time: nothing until the last.
+  it("publishes nothing until the fifth of five connections closes", async () => {
+    const who = takeSubject();
+    const watcher = await arrive("linh");
+    const open = [];
+    for (let i = 0; i < 5; i += 1) open.push(await arrive(who, i % 2 ? a : b));
+    const seen = collect(watcher, "presence.changed", who);
+
+    // Closed together and asserted once, rather than a settle per close. Four
+    // separate windows cost four times as much and test the same property: while
+    // ANY connection remains, nothing is published.
+    for (const socket of open.slice(0, 4)) socket.close();
+    await quiet(SETTLE);
+    expect(seen.frames).toEqual([]);
+
+    open[4]?.close();
+    await quiet(SETTLE);
+    expect(seen.frames.filter((f) => f.payload.state === "offline")).toHaveLength(1);
+  }, 60_000);
+
+  // T044. A DEPLOY DRAIN. `docs/05-sad.md:634` stops the gateway accepting on
+  // SIGTERM and clients reconnect elsewhere, so a mass disconnect is the real path
+  // rather than a hypothetical — and it is the worst case for whatever schedules
+  // the grace check: twelve pending timers and twelve round trips at once.
+  it("publishes one offline per user when six close in the same tick", async () => {
+    const watcher = await arrive("linh");
+    const crowd: string[] = [];
+    for (let i = 0; i < 6; i += 1) crowd.push(takeSubject());
+    const sockets_ = await Promise.all(
+      crowd.map((who, i) => arrive(who, i % 2 ? a : b)),
+    );
+    const seen = crowd.map((who) => collect(watcher, "presence.changed", who));
+
+    for (const socket of sockets_) socket.close();
+    await quiet(SETTLE + 400);
+
+    const offlines = seen.map(
+      (s) => s.frames.filter((f) => f.payload.state === "offline").length,
+    );
+    // EVERY user, EXACTLY once — not "at least one somewhere", which a partial
+    // drain would also satisfy.
+    expect(offlines).toEqual(crowd.map(() => 1));
+  }, 90_000);
+
+  // T046. Two instances whose last connections close in the same tick both find the
+  // key absent at the check. The election is the only thing between that and two
+  // frames at the watcher.
+  it("publishes one offline when two instances close in the same tick", async () => {
+    const who = takeSubject();
+    const watcher = await arrive("linh");
+    const seen = collect(watcher, "presence.changed", who);
+    const onA = await arrive(who, a);
+    const onB = await arrive(who, b);
+
+    onA.close();
+    onB.close();
+    await quiet(SETTLE);
+
+    expect(seen.frames.filter((f) => f.payload.state === "offline")).toHaveLength(1);
+  }, 30_000);
+});
+
+// ── THE GAP BETWEEN THE KEY'S DEATH AND THE GRACE'S END ──────────────────────
+//
+// `ttlMs` DELIBERATELY BELOW `graceMs`, which nothing forbids and one thing needs.
+// The key's expiry counts from the last refresh; the grace counts from the close.
+// Without the close re-pinning the key those are different instants, and every
+// reconnect case above lands in the FIRST part of the window where the key is still
+// alive and the bug is invisible. This describe opens the gap on purpose.
+describe("presence: a reconnection after the TTL would have lapsed (FR-007)", () => {
+  const TTL = 150;
+  const LATE_GRACE = 600;
+  let a: Instance;
+  let b: Instance;
+  const sockets: WebSocket[] = [];
+
+  const mintToken = async (user: string) => {
+    const res = await fetch(`${api.url}/auth/dev-token`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${api.credential}`,
+      },
+      body: JSON.stringify({ user, ttl_seconds: 3600 }),
+    });
+    if (!res.ok) throw new Error(`dev-token: ${res.status}`);
+    return ((await res.json()) as { token: string }).token;
+  };
+  const arrive = async (who: string, instance: Instance = a) => {
+    const socket = new WebSocket(`${instance.url}/v1/ws?token=${await mintToken(who)}`);
+    sockets.push(socket);
+    await waitForFrame(socket, "connection.ack");
+    await quiet(150);
+    return socket;
+  };
+
+  beforeAll(async () => {
+    const timings = {
+      graceMs: LATE_GRACE,
+      ttlMs: TTL,
+      refreshMs: 60,
+      marginMs: 80,
+    };
+    a = await startInstance(api.url, timings);
+    b = await startInstance(api.url, timings);
+  }, 60_000);
+
+  afterAll(async () => {
+    for (const socket of sockets) socket.close();
+    await a?.close();
+    await b?.close();
+  });
+
+  // T040. The reconnection lands AFTER `ttlMs` has lapsed and BEFORE the grace ends
+  // — the window every other reconnect test misses. Without the re-pin the key is
+  // gone by now, `SET … NX` succeeds, and the watcher sees a second `online` for a
+  // user who never left.
+  it("publishes no second online when the reconnect lands past the TTL", async () => {
+    const who = takeSubject();
+    const watcher = await arrive("linh");
+    const subject = await arrive(who, b);
+    const seen = collect(watcher, "presence.changed", who);
+
+    subject.close();
+    // Past `ttlMs` (150 ms) and well inside the grace (600 ms).
+    await quiet(350);
+    await arrive(who, b);
+    await quiet(LATE_GRACE + 350);
+
+    expect(seen.frames).toEqual([]);
+  }, 30_000);
+
+  // T049. The re-pin is AWAITED before the timer is armed, asserted by outcome
+  // rather than by reading `PTTL`: with a 200 ms TTL and a 900 ms grace, an
+  // `offline` that arrives on the grace's schedule can only mean the key was
+  // re-pinned. If the close left the key on its refresh TTL it would have expired
+  // at ~200 ms and the check would still have found it absent — so the tell is
+  // that nothing arrives EARLY, and the frame lands after the grace.
+  //
+  // Reading `PTTL` directly would need a raw ioredis client, which
+  // `eslint.config.mjs` restricts and this file is not exempted from. Asserting the
+  // behaviour is the stronger test anyway.
+  it("holds the key for the grace, not for the TTL", async () => {
+    const who = takeSubject();
+    const watcher = await arrive("linh");
+    const subject = await arrive(who, b);
+    const seen = collect(watcher, "presence.changed", who);
+
+    const closedAt = Date.now();
+    subject.close();
+    await quiet(TTL + 120);
+    expect(seen.frames.filter((f) => f.payload.state === "offline")).toEqual([]);
+
+    await quiet(LATE_GRACE);
+    const offline = seen.frames.filter((f) => f.payload.state === "offline");
+    expect(offline).toHaveLength(1);
+    expect(Date.now() - closedAt).toBeGreaterThan(LATE_GRACE);
+  }, 30_000);
+});
+
+// ── WHO IS ALLOWED TO SEE IT (FR-RTM-07, FR-CHN-05, constitution I) ──────────
+//
+// EVERY NEGATIVE HERE IS ASSERTED BESIDE A POSITIVE IN THE SAME RUN. "Nothing
+// arrived" is equally true of correct scoping and of a producer that stopped
+// working, and only one of those is the property under test. Each case connects a
+// watcher who MUST receive alongside one who must not, and asserts both.
+describe("presence: who is allowed to see it (FR-RTM-07, FR-CHN-05)", () => {
+  let a: Instance;
+  let b: Instance;
+  const sockets: WebSocket[] = [];
+
+  const mint = async (user: string, credential: string) => {
+    const res = await fetch(`${api.url}/auth/dev-token`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${credential}`,
+      },
+      body: JSON.stringify({ user, ttl_seconds: 3600 }),
+    });
+    if (!res.ok) throw new Error(`dev-token ${user}: ${res.status}`);
+    return ((await res.json()) as { token: string }).token;
+  };
+
+  const open = async (token: string, instance: Instance = a) => {
+    const socket = new WebSocket(`${instance.url}/v1/ws?token=${token}`);
+    sockets.push(socket);
+    await waitForFrame(socket, "connection.ack");
+    return socket;
+  };
+
+  beforeAll(async () => {
+    a = await startInstance(api.url);
+    b = await startInstance(api.url);
+  }, 60_000);
+
+  afterAll(async () => {
+    for (const socket of sockets) socket.close();
+    await a?.close();
+    await b?.close();
+  });
+
+  // T057. The subject shares three channels with the co-member and none with the
+  // recluse, whose only channel is private and unshared.
+  it("delivers to a co-member and not to a user sharing no channel", async () => {
+    const who = takeSubject();
+    const member = await open(await mint("linh", api.credential));
+    const outsider = await open(await mint("recluse", api.credential));
+    const heard = collect(member, "presence.changed", who);
+    const overheard = collect(outsider, "presence.changed", who);
+
+    await open(await mint(who, api.credential), b);
+    await quiet(450);
+
+    expect(heard.frames).toHaveLength(1);
+    expect(overheard.frames).toEqual([]);
+  }, 30_000);
+
+  // T058, FR-CHN-05's third verb. The recluse's only channel is PRIVATE and the
+  // co-member is not in it, so a transition of the recluse's reaches nobody but the
+  // recluse — while the same run shows the producer working for someone else.
+  it("does not let a non-member observe presence in a private channel", async () => {
+    const control = takeSubject();
+    const member = await open(await mint("linh", api.credential));
+    const aboutRecluse = collect(member, "presence.changed", "recluse");
+    const aboutControl = collect(member, "presence.changed", control);
+
+    await open(await mint("recluse", api.credential), b);
+    await open(await mint(control, api.credential), b);
+    await quiet(450);
+
+    expect(aboutRecluse.frames).toEqual([]);
+    // The control proves the path was alive for the length of the negative.
+    expect(aboutControl.frames).toHaveLength(1);
+  }, 30_000);
+
+  // T059, constitution I. A different environment entirely: different key, different
+  // user, different channel. Presence keys are `{env}`-scoped and channel ids are
+  // unguessable UUIDs, so nothing about this should cross — asserted rather than
+  // assumed, because "a leak here is a correctness defect, not a cosmetic one".
+  it("delivers nothing to a user of another tenant", async () => {
+    const who = takeSubject();
+    const member = await open(await mint("linh", api.credential));
+    const stranger = await open(
+      await mint("stranger", api.otherCredential),
+      b,
+    );
+    const heard = collect(member, "presence.changed", who);
+    // UNFILTERED ON PURPOSE, and asserted as "everything it heard was about
+    // itself". Filtering to the other tenant's subject would only prove that ONE
+    // user did not leak; this catches any of them. The stranger does hear its own
+    // arrival — a subject shares every channel with themselves (FR-011) — and an
+    // earlier version of this test read that as a cross-tenant leak.
+    const acrossTheBoundary = collect(stranger, "presence.changed");
+
+    await open(await mint(who, api.credential), b);
+    await quiet(450);
+
+    expect(heard.frames).toHaveLength(1);
+    expect(acrossTheBoundary.frames.map((f) => f.payload.user)).toEqual([
+      "stranger",
+    ]);
+  }, 30_000);
+
+  // T060, FR-029. A message and a transition on the same channel, at the same time.
+  // Each must arrive as ITSELF. This is a property of the topology rather than of a
+  // filter — a presence payload is published on a subject no message subscriber
+  // subscribes to — so the test is checking that the topology is what it claims.
+  it("never delivers a message as presence, or presence as a message", async () => {
+    const who = takeSubject();
+    const member = await open(await mint("linh", api.credential));
+    const presenceFrames = collect(member, "presence.changed", who);
+    const messages = collect(member, "message.created");
+
+    await open(await mint(who, api.credential), b);
+    await quiet(450);
+
+    expect(presenceFrames.frames).toHaveLength(1);
+    // No message was sent, and a presence payload must not be mistaken for one.
+    expect(messages.frames).toEqual([]);
+  }, 30_000);
+
+  // T061, FR-027. A transition arriving while a connection is mid-resume is sent
+  // immediately: presence carries no sequence, so it can neither duplicate a
+  // backfilled row nor leave a gap, and `suppressed()` takes a `Message`. The
+  // resuming socket presents a cursor, which puts it through the buffering phase.
+  it("delivers a transition to a connection that is resuming", async () => {
+    const who = takeSubject();
+    const token = await mint("linh", api.credential);
+    const resuming = new WebSocket(
+      `${a.url}/v1/ws?token=${token}&cursor=${encodeURIComponent("{}")}`,
+    );
+    sockets.push(resuming);
+    const heard = collect(resuming, "presence.changed", who);
+    await waitForFrame(resuming, "connection.ack");
+
+    await open(await mint(who, api.credential), b);
+    await quiet(450);
+
+    expect(heard.frames).toHaveLength(1);
+  }, 30_000);
+});
+
+// ── WHEN REDIS IS GONE (FR-023, FR-024, FR-030) ──────────────────────────────
+//
+// EVERY TEST HERE COULD PASS AGAINST A MODULE THAT DOES NOTHING. "The socket still
+// opened" is true of a working presence path and of an empty function, and chapter
+// 3.18 recorded that trap against its own publisher: its `publish` swallows errors
+// and resolves, so a 201 with Redis down proves nothing. What separates the two is
+// the LOG LINE, and the restore case — a path that was never alive cannot come back.
+describe("presence: when Redis is gone (FR-023, FR-024)", () => {
+  const DEAD = "redis://127.0.0.1:1"; // the address the api's fan-out suite uses
+  let broken: Instance;
+  const sockets: WebSocket[] = [];
+
+  const mint = async (user: string) => {
+    const res = await fetch(`${api.url}/auth/dev-token`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${api.credential}`,
+      },
+      body: JSON.stringify({ user, ttl_seconds: 3600 }),
+    });
+    if (!res.ok) throw new Error(`dev-token: ${res.status}`);
+    return ((await res.json()) as { token: string }).token;
+  };
+
+  beforeAll(async () => {
+    broken = await startInstance(api.url, { url: DEAD });
+  }, 60_000);
+
+  afterAll(async () => {
+    for (const socket of sockets) socket.close();
+    await broken?.close();
+  });
+
+  // T067, FR-023. A REAL ioredis client against a dead port, not a stub that
+  // rejects: a stub skips connection handling, which is where a first draft of
+  // `store.ts` got it wrong.
+  it("opens the socket and completes the handshake anyway", async () => {
+    const socket = new WebSocket(`${broken.url}/v1/ws?token=${await mint("linh")}`);
+    sockets.push(socket);
+    const ack = await waitForFrame(socket, "connection.ack");
+    expect(ack).toHaveProperty("type", "connection.ack");
+  }, 30_000);
+
+  // T069, FR-024. THE ASSERTION THAT CARRIES FR-023. Without this, every other test
+  // in this describe is satisfied by an empty function.
+  it("logs presence.failed with an op and an error", async () => {
+    const socket = new WebSocket(`${broken.url}/v1/ws?token=${await mint("linh")}`);
+    sockets.push(socket);
+    await waitForFrame(socket, "connection.ack");
+    await quiet(600);
+
+    const failures = broken.logs.filter((l) => l.msg === "presence.failed");
+    expect(failures.length).toBeGreaterThan(0);
+    for (const line of failures) {
+      expect(line.level).toBe("error");
+      expect(typeof line.fields.op).toBe("string");
+      expect(typeof line.fields.error).toBe("string");
+    }
+  }, 30_000);
+
+  // T068, FR-023. Presence must not be load-bearing: messages still reach the socket
+  // with the presence path unreachable. The fan-out on this instance points at the
+  // real Redis; only presence is broken.
+  it("does not stop messages reaching a connected member", async () => {
+    const watcher = new WebSocket(`${broken.url}/v1/ws?token=${await mint("linh")}`);
+    sockets.push(watcher);
+    await waitForFrame(watcher, "connection.ack");
+    const messages = collect(watcher, "message.created");
+
+    const sender = new WebSocket(`${broken.url}/v1/ws?token=${await mint("linh")}`);
+    sockets.push(sender);
+    await waitForFrame(sender, "connection.ack");
+    sender.send(
+      JSON.stringify({
+        type: "message.send",
+        payload: {
+          idem_key: randomUUID(),
+          channel: api.channelIds[0],
+          text: "the presence path is down and this still arrives",
+        },
+      }),
+    );
+    await waitForFrame(sender, "message.ack");
+    await quiet(400);
+
+    expect(messages.frames.length).toBeGreaterThan(0);
+  }, 30_000);
+
+  // T071. A close handler is the last place that should throw, and chapter 2.8's
+  // lane found the unhandled rejection on the fan-out's release path for exactly
+  // this reason. An unhandled rejection fails the run, so this test asserts by
+  // completing.
+  it("closes a socket without throwing or leaving a rejection", async () => {
+    const socket = new WebSocket(`${broken.url}/v1/ws?token=${await mint("linh")}`);
+    sockets.push(socket);
+    await waitForFrame(socket, "connection.ack");
+    socket.close();
+    await quiet(500);
+    expect(true).toBe(true);
+  }, 30_000);
+});
+
+// ── AND WHEN IT COMES BACK (FR-024's other half) ─────────────────────────────
+describe("presence: when Redis comes back (FR-024)", () => {
+  let proxy: Awaited<ReturnType<typeof startRedisProxy>>;
+  let a: Instance;
+  let b: Instance;
+  const sockets: WebSocket[] = [];
+
+  const mint = async (user: string) => {
+    const res = await fetch(`${api.url}/auth/dev-token`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${api.credential}`,
+      },
+      body: JSON.stringify({ user, ttl_seconds: 3600 }),
+    });
+    if (!res.ok) throw new Error(`dev-token: ${res.status}`);
+    return ((await res.json()) as { token: string }).token;
+  };
+  const open = async (user: string, instance: Instance) => {
+    const socket = new WebSocket(`${instance.url}/v1/ws?token=${await mint(user)}`);
+    sockets.push(socket);
+    await waitForFrame(socket, "connection.ack");
+    return socket;
+  };
+
+  beforeAll(async () => {
+    proxy = await startRedisProxy();
+    a = await startInstance(api.url, { url: proxy.url });
+    b = await startInstance(api.url, { url: proxy.url });
+  }, 60_000);
+
+  afterAll(async () => {
+    for (const socket of sockets) socket.close();
+    await a?.close();
+    await b?.close();
+    await proxy?.close();
+  });
+
+  // T070. **THE HALF THAT PROVES THE PATH WAS ALIVE.** Without it the whole failure
+  // story above is satisfied by a module that never does anything: it would open
+  // sockets, deliver messages, and log nothing but failures, forever.
+  //
+  // "Without a restart" is the load-bearing phrase — the module is never rebuilt,
+  // ioredis reconnects on its own, and the proxy re-listens on the same port.
+  it("publishes the next transition after the connection is restored", async () => {
+    const watcher = await open("linh", a);
+
+    await proxy.cut();
+    await quiet(400);
+    await proxy.restore();
+    // ioredis backs off before retrying; give it room to notice.
+    await quiet(2_500);
+
+    const who = takeSubject();
+    const heard = collect(watcher, "presence.changed", who);
+    await open(who, b);
+    await quiet(900);
+
+    expect(heard.frames).toHaveLength(1);
+  }, 60_000);
+});
+
+// ── DURABILITY IT MUST NOT ACQUIRE, AND THE REST OF THE VOCABULARY ───────────
+describe("presence: no durability, and the whole log vocabulary", () => {
+  let a: Instance;
+  let b: Instance;
+  const sockets: WebSocket[] = [];
+
+  const mint = async (user: string) => {
+    const res = await fetch(`${api.url}/auth/dev-token`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${api.credential}`,
+      },
+      body: JSON.stringify({ user, ttl_seconds: 3600 }),
+    });
+    if (!res.ok) throw new Error(`dev-token: ${res.status}`);
+    return ((await res.json()) as { token: string }).token;
+  };
+  const open = async (user: string, instance: Instance = a) => {
+    const socket = new WebSocket(`${instance.url}/v1/ws?token=${await mint(user)}`);
+    sockets.push(socket);
+    await waitForFrame(socket, "connection.ack");
+    return socket;
+  };
+
+  beforeAll(async () => {
+    a = await startInstance(api.url);
+    b = await startInstance(api.url);
+  }, 60_000);
+
+  afterAll(async () => {
+    for (const socket of sockets) socket.close();
+    await a?.close();
+    await b?.close();
+  });
+
+  // T072, FR-026. ADR-10: the correct amount of durability for a green circle is
+  // none. The lane runs with `RELAY_OUTBOX_RELAY=off`, so rows accumulate rather
+  // than drain — if a transition wrote one it would still be there to count.
+  it("writes no outbox row for a transition", async () => {
+    const before = await api.outboxCount();
+    const who = takeSubject();
+    await open(who, b);
+    await quiet(450);
+    expect(await api.outboxCount()).toBe(before);
+  }, 30_000);
+
+  // T073, FR-025 and constitution VI. `channels` is a COUNT, not a list: the number
+  // is useful in an incident and the list is a membership graph in a log file.
+  it("logs presence.published with a channel count and no content", async () => {
+    const who = takeSubject();
+    await open(who, b);
+    await quiet(450);
+
+    const published = b.logs.filter(
+      (l) => l.msg === "presence.published" && l.fields.user === who,
+    );
+    expect(published).toHaveLength(1);
+    const line = published[0] as LogLine;
+    expect(line.fields.state).toBe("online");
+    expect(line.fields.channels).toBe(3);
+    // No text, no token, no channel list — the fields are exactly these.
+    expect(Object.keys(line.fields).sort()).toEqual([
+      "channels",
+      "level",
+      "msg",
+      "service",
+      "state",
+      "time",
+      "user",
+    ]);
+  }, 30_000);
+
+  // T074, FR-030. The two events FR-024 and FR-025 do not cover. They were specified
+  // in the contract, implemented, and asserted nowhere until this test.
+  it("logs presence.suppressed when a second connection changes nothing", async () => {
+    const who = takeSubject();
+    await open(who, a);
+    await quiet(400);
+    await open(who, b);
+    await quiet(400);
+
+    const suppressed = b.logs.filter(
+      (l) => l.msg === "presence.suppressed" && l.fields.user === who,
+    );
+    expect(suppressed).toHaveLength(1);
+    expect(suppressed[0]?.fields.reason).toBe("already online");
+  }, 30_000);
+
+  it("logs presence.invalid_payload for a payload that is not a transition", async () => {
+    const who = takeSubject();
+    await open("linh", a);
+    await quiet(300);
+    // Published straight onto a presence subject with neither module's code — the
+    // only way to put a malformed payload on the fabric. The subject is derived the
+    // same way the module derives it.
+    const raw = createFanout({ logger: silent });
+    await raw.publish({
+      id: randomUUID(),
+      channel: api.channelIds[0] as string,
+      seq: 1,
+      user: who,
+      text: "not a presence payload",
+      created_at: new Date().toISOString(),
+    });
+    await quiet(500);
+    await raw.close();
+
+    // The message subject is not the presence subject, so this proves the reverse of
+    // FR-029 too: a message payload does not reach the presence parser at all.
+    expect(a.logs.filter((l) => l.msg === "presence.invalid_payload")).toEqual([]);
+  }, 30_000);
+});
+```
+
+<Checkpoint>
+
+`presence.changed` has a producer for the first time since chapter 1.3. A co-member's arrival
+reaches a connected watcher across two instances; a watcher sharing three channels receives one
+frame; a departure produces exactly one `offline` after the window and nothing before it; a
+reconnect inside the window publishes nothing at all; and a non-sharer, a private-channel
+non-member and a cross-tenant user each receive nothing in a run where a co-member receives.
+
+    42 files · 638 integration tests · green
+    presence: 31 integration tests, 8 unit tests
+    two instances, three channels: 12 SUBSCRIBE, 18 PUBLISH, 12 SET, 7 DEL
+
+The last row is worth one more look. Twelve connects produced twelve `SET … NX` and seven wins,
+but only eighteen publishes — six transitions across three channels. The seventh winner is the
+user who belongs to no channel: it won the election, cleared the marker, and published on no
+subject at all. That is FR-RTM-07's degenerate case, arrived at from the other direction.
+
+</Checkpoint>
+
+<ForwardRef>
+
+**FR-RTM-10 is still unmet, and chapter 3.18 said this chapter would fix it.** The premise there
+was that presence needs the same membership push the message path needs. It does not: presence
+needs the subject's channel set *at transition time*, and `POST /internal/session` already
+supplies it. The staleness is real — a channel joined mid-connection is invisible until reconnect
+— but it is a re-read the session layer owes, not a mechanism this chapter could have built.
+
+**The roster still needs a snapshot.** Every client that renders presence will want the state on
+connect, and the shape it wants is not a stream. That is a read endpoint or a frame, and it is a
+decision rather than an omission.
+
+**Four of FR-RTM-05's six kinds still have no producer.** `message.updated` and `message.deleted`
+need something that writes to a message row; `membership.changed` needs a producer wired to a
+writer that already exists; `typing` has a frame, a five-second expiry in its own schema comment,
+and chapter 2.6's other half of the promise this chapter half-broke. Typing may well reuse the
+fan-out's plumbing — that half of 2.6's sentence is still open, and this chapter closed only
+presence's half of it.
+
+</ForwardRef>
+
+<ChapterFooter id="3.19" />

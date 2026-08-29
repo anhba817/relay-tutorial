@@ -2534,3 +2534,47 @@ sentence and got it a feature late.
      // not design for — 3.3's outbox suite learned that the hard way.
      fileParallelism: false,
 ```
+
+---
+
+## `eslint.config.mjs` — presence's ioredis exemption (chapter 3.19)
+
+**A chapter teaches this one and cannot fence it**, which no entry here has had to say
+before. Chapter 3.19 quotes these lines and argues about them: presence opens a Redis
+client, `ioredis` is a restricted import under constitution I, and the exemption's
+justification is the interesting part — the fan-out's entry one line up is justified by
+*"this client touches no keys"*, and presence's client touches keys. It borrows the
+limiter's justification instead.
+
+So why is the hunk here. The state `eslint.config.mjs` reaches after every chapter has run
+is **73 lines**; the repository's is 386. The two restriction sets and all three ignore
+lists were added by the entries above, which apply *after* the last chapter. The line this
+amendment adds goes into an ignore list that does not exist yet at the moment a chapter
+could fence it — a hunk anchored on `"services/api/src/fanout/**",` matches **zero** times
+in the pre-3.19 chapter state, because an entry above is what puts that line there.
+
+The chapter shows the same lines as an excerpt and says where they really live. When Part 6
+folds these amendments into a CI chapter, this one folds with them.
+
+```diff title="eslint.config.mjs"
+@@ -206,6 +206,19 @@ export default tseslint.config(
+       // already subscribed. The gateway's `fanout.ts` is on this list one line
+       // up for the same reason; the api needs it too now that it publishes.
+       "services/api/src/fanout/**",
++      // Chapter 3.19. THIS IS `limits.ts`'s CASE, NOT `fanout.ts`'s, and the
++      // distinction is the rule's own reason. The entry above is justified by
++      // "this client touches no keys" — a publish onto a channel UUID, and a
++      // subject is not readable at all. Presence's client touches keys and they
++      // are environment-scoped: `presence:{env}:{user}`, exactly the shape the
++      // restriction exists to guard.
++      //
++      // So the justification is the limiter's instead: it composes every key from
++      // the environment id on the authenticated connection's own identity, and it
++      // reads no key it did not compose. There is no path here that takes an
++      // environment id from a client, and no scan, `KEYS` or pattern read that
++      // could reach a key belonging to another tenant.
++      "services/gateway/src/presence.ts",
+       // The test harness IS data access — its whole job is to plant rows the
+       // repository layer must never plant and to hold a connection carrying an
+       // exemption no product code may carry (feature 030). Restricting it from
+```

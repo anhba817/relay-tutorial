@@ -1085,10 +1085,10 @@ the gateway half lives in its own module beside `fanout.ts`, and **`fanout.ts` i
 edited**. The event spine already keeps its `subjectFor` in its own file, so each fabric
 owning its subject grammar is the precedent here rather than a concession.
 
-**Why not the channel's own subject.** The fan-out is typed to messages at three points:
-`publish(message: Message)`, a `messageCreatedSchema` parse of every arriving payload, and
-a literal `message.created` send. The third sits inside a function fenced by ten
-chapters. Carrying two kinds on `chan:{channel_id}` means editing the highest-volume path in
+**Why not the channel's own subject.** The message path is typed to messages at three
+points, and they are not all in one file: `publish(message: Message)` and a
+`messageCreatedSchema` parse in `services/gateway/src/fanout.ts`, and the literal
+`message.created` send inside `session.ts`'s `deliver`, a function ten chapters fence. Carrying two kinds on `chan:{channel_id}` means editing the highest-volume path in
 the system to serve the lowest-volume traffic on it, and it makes cross-kind mis-delivery
 a property tests must defend rather than one the topology guarantees.
 

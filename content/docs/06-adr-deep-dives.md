@@ -1167,11 +1167,12 @@ change.
 ADR-10 decided *where presence lives* and, in the same sentence, *which subject carries it*:
 "transitions published on the member channels' subjects". Nine chapters later the first
 implementation of presence went to write that sentence into code, and the fabric it names
-cannot carry a transition. `chan:{channel_id}` is typed to messages at three points — a
-`publish(message: Message)` signature, a `messageCreatedSchema` parse of every arriving
-payload, and a literal `message.created` send — and the third sits inside a delivery
-function fenced by ten chapters of tutorial. A presence payload published there today
-produces `fanout.invalid_payload` and no frame at all.
+cannot carry a transition. The `chan:{channel_id}` path is typed to messages at three
+points, spread across two files: a `publish(message: Message)` signature and a
+`messageCreatedSchema` parse in `services/gateway/src/fanout.ts`, and the literal
+`message.created` send inside `session.ts`'s `deliver`, a function fenced by ten chapters
+of tutorial. A presence payload published there today produces `fanout.invalid_payload`
+and no frame at all.
 
 So the question is not the one ADR-10 answered. It is: what does presence publish on, given
 that the answer ADR-10 assumed is unavailable without editing the highest-volume path in the

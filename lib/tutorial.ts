@@ -608,6 +608,29 @@ export const series: Part[] = [
         readerProducesVi:
           "Một tin nhắn gửi qua REST tới được socket đang mở, một thứ tự phải tách theo transport vì response của một request handler CHÍNH LÀ acknowledgement của nó, một publisher sống sót qua broker đã chết trong 2 ms ở nơi client của gateway treo vô hạn, và một điều khoản P1 được đo là chưa thoả mãn rồi ghi lại thay vì bị thu hẹp",
       },
+      {
+        id: "3.19",
+        path: "/part-3/chapter-19/who-is-allowed-to-see-it",
+        title: "Presence, and who is allowed to see it",
+        status: "published",
+        // `sourceDoc` is the SAD rather than the SRS for chapter 3.18's reason: no
+        // clause changed. FR-RTM-05, FR-RTM-06, FR-RTM-07 and FR-CHN-05's third verb
+        // already required all of this. What changed is ADR-19, which supersedes
+        // ADR-10's subject clause — the first supersession in the series — and
+        // Appendix C's open question 3, closed as not opt-in.
+        readerProduces:
+          "A frame that has been in the protocol union since chapter 1.3 and had no producer, a second subject grammar that leaves the message hot path byte-identical, a key whose existence is the state and whose SET … NX is the election, a grace period whose first fix stranded users online for ever, and a delivery scope with no filtering code in it at all",
+        sourceDoc: "docs/05-sad.md",
+        readerMinutes: 70,
+        titleVi: "Presence, và ai được phép nhìn thấy",
+        readerProducesVi:
+          "Một frame đã nằm trong protocol union từ chương 1.3 mà chưa từng có producer, một subject grammar thứ hai giữ nguyên từng byte của đường đi message, một key mà sự tồn tại của nó chính là trạng thái và SET … NX của nó chính là cuộc bầu chọn, một grace period mà bản vá đầu tiên khiến người dùng mắc kẹt online vĩnh viễn, và một phạm vi chuyển giao không có lấy một dòng code lọc nào",
+        // The ONLY signal that gates the Vietnamese URL in the sitemap. Chapters 3.10
+        // to 3.18 each shipped a translated body without it, so nine Vietnamese pages
+        // route and are absent from the sitemap — carried into `gaps.md` rather than
+        // fixed here, because nine manifest entries are not this chapter's to change.
+        translatedIn: ["vi"],
+      },
     ],
   },
   {
