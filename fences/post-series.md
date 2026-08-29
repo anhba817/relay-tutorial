@@ -2557,7 +2557,23 @@ The chapter shows the same lines as an excerpt and says where they really live. 
 folds these amendments into a CI chapter, this one folds with them.
 
 ```diff title="eslint.config.mjs"
-@@ -206,6 +206,19 @@ export default tseslint.config(
+@@ -88,6 +88,15 @@ const DRIVER_EXEMPT_TESTS = [
+   // compares response bodies and a publish is a second output channel.
+   "services/api/src/fanout/fanout.itest.ts",
+   "services/api/src/messages/history.itest.ts",
++  // Chapter 3.19, and it is 3.18's argument in the other direction. The presence
++  // fabric's receive half has two rejection paths — a body that is not JSON, and a
++  // body that is JSON and not a transition — and neither can be reached through
++  // `createPresence`, which only ever publishes payloads its own schema produced.
++  // Putting arbitrary bytes on `presence:{channel_id}` needs a client that belongs to
++  // neither module, exactly as checking what reaches `chan:{id}` did.
++  //
++  // A `publish` and nothing else: this file reads no key and composes none.
++  "services/gateway/src/presence.itest.ts",
+ ];
+ 
+ 
+@@ -206,6 +215,19 @@ export default tseslint.config(
        // already subscribed. The gateway's `fanout.ts` is on this list one line
        // up for the same reason; the api needs it too now that it publishes.
        "services/api/src/fanout/**",
@@ -2577,4 +2593,76 @@ folds these amendments into a CI chapter, this one folds with them.
        // The test harness IS data access — its whole job is to plant rows the
        // repository layer must never plant and to hold a connection carrying an
        // exemption no product code may carry (feature 030). Restricting it from
+```
+
+---
+
+## `vitest.coverage.config.mts` — chapter 3.19's two presence pins
+
+The same reason as the entry above, one file over: chapter 3.19 argues about these
+numbers and cannot fence the file. `vitest.coverage.config.mts` is fenced by chapter
+3.18 and amended three times here, so a chapter's hunk would have to be written against
+a state the chapters never reach.
+
+The pins are 100 on every metric for both `presence.ts` files, and NFR-MNT-02's MUST is
+why — presence keys are `presence:{env}:{user}`, which makes them tenant-isolation code.
+The comment records what it cost: six arms had never executed, one of them behind a test
+whose title claimed it, and one branch was deleted rather than covered.
+
+```diff title="vitest.coverage.config.mts"
+@@ -551,6 +551,54 @@ export default defineConfig({
+           lines: 100,
+           statements: 100,
+         },
++
++        // CHAPTER 3.19's two, both at 100 on every metric, and the pin is
++        // NFR-MNT-02's MUST rather than a preference: presence keys are
++        // `presence:{env}:{user}`, so this is tenant-isolation code and the clause
++        // asks 100% of its branches.
++        //
++        // `packages/protocol/src/presence.ts` reached it on the first run — two
++        // exports, no clock, no client, and `presence.test.ts` covers both.
++        //
++        // `services/gateway/src/presence.ts` measured **91.52 / 81.81 / 93.93 /
++        // 92.92** with all 31 integration tests and 8 unit tests green, and closing
++        // it is the whole argument for a ratchet. Six arms had never executed:
++        //
++        //   the JSON.parse catch            a body that is not JSON
++        //   the safeParse rejection         JSON that is not a transition
++        //   the refresh re-election         the key lost under a live connection
++        //   `counts.get(c) ?? 1`            unsubscribe for a channel never subscribed
++        //   the no-op `deliver`             a transition with no handler registered
++        //   the pending-timer clear         close() while a grace check is armed
++        //
++        // ONE OF THEM HAD A TEST WHOSE TITLE CLAIMED IT. "logs
++        // presence.invalid_payload for a payload that is not a transition" asserted
++        // `toEqual([])` — it publishes a MESSAGE on a MESSAGE subject and checks
++        // presence never sees it, which is FR-029 from the other side and a good
++        // test under the wrong name. Both rejection arms read zero while it was
++        // green. It is renamed; the real ones publish onto `presence:{channel_id}`
++        // with a client belonging to neither module.
++        //
++        // AND ONE BRANCH WAS DELETED RATHER THAN COVERED, which is the fourth time
++        // this ratchet has done that. The re-election's `if (wonTransition(won))`
++        // guard around clearing the offline marker is reachable only when two
++        // instances race the same re-election — a test that could only flake. The
++        // marker is now cleared unconditionally, which is also more correct: unlike
++        // `connected`, nothing publishes here, so a loser that skipped the delete
++        // left a stale "somebody already said they left" standing against a user who
++        // is demonstrably connected.
++        "packages/protocol/src/presence.ts": {
++          branches: 100,
++          functions: 100,
++          lines: 100,
++          statements: 100,
++        },
++        "services/gateway/src/presence.ts": {
++          branches: 100,
++          functions: 100,
++          lines: 100,
++          statements: 100,
++        },
+       },
+     },
+   },
 ```
