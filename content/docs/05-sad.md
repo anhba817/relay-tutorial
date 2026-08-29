@@ -207,7 +207,7 @@ endpoints. Server-side sessions via OAuth (FR-TEN-01).
 |---|---|---|
 | "User service", "Channel service" | Same datastore, same transactions, same team. Splitting would turn local transactions into distributed ones for zero scaling benefit — users and channels do not scale independently of messages. | Never, realistically |
 | "Auth service" | JWT verification is a library concern (a middleware verifying HS256 with the env secret). A network hop per request to verify a token is pure latency. | If asymmetric multi-issuer auth arrives |
-| "Presence service" | Presence is connection state, which lives in the gateway + Redis already. | If presence fan-out dominates gateway CPU (see Open Q3, SRS) |
+| "Presence service" | Presence is connection state, which lives in the gateway + Redis already (ADR-10, ADR-19). | If presence fan-out dominates gateway CPU — ADR-19's revisit trigger, which is undischarged |
 | Rate limiter | Redis token buckets called in-process from API and gateway. | If limits need to be enforced at edge before TLS termination |
 
 This table is the answer to "why only six services?" — each merge is a decision with a
@@ -571,8 +571,10 @@ aggregate that cannot identify a person needs no erasing.
 
 | Key pattern | Purpose | TTL |
 |---|---|---|
-| `conn:{env}:{user}` → set of instance IDs | Connection registry (FR-RTM-09) | 60 s, heartbeat-refreshed |
-| `presence:{env}:{user}` | Presence with 30 s grace (FR-RTM-06) | 30 s |
+| `conn:{env}:{user}` → set of instance IDs | Connection registry (FR-RTM-09). **Not built, and this shape does not work:** a Redis TTL is per key, not per set member, so one instance refreshing the key keeps a dead instance's entry alive for ever. A sorted set scored by heartbeat time, pruned with `ZREMRANGEBYSCORE` on read, is the correct version. Presence (ADR-19) needs none of it — it asks a yes-or-no question of the key below rather than counting members | 60 s, heartbeat-refreshed |
+| `presence:{env}:{user}` | Presence with 30 s grace (FR-RTM-06). Its existence IS the state. **The TTL and the grace are two different quantities** and both are 30 s by coincidence: the TTL is refreshed every 10 s while a connection is open, and the closing instance re-pins it to the grace so the key dies when the grace ends rather than up to a refresh interval earlier | 30 s, refreshed every 10 s |
+| `presence:offline:{env}:{user}` | Elects one publisher when two instances' last connections close together (ADR-19). Cleared by the next `online` | 30 s |
+| pub/sub `presence:{channel_id}` | Presence fan-out, one subject per channel (ADR-19) | — |
 | `rl:{env}:{bucket}` | Token buckets (FR-RTL-01) | window |
 | `emoji:{env}:{version}` → shortcode→URL map | Resolution-map cache (→ ADR-12) | 24 h, version-keyed |
 | pub/sub `chan:{channel_id}` | Fan-out fabric (D2) | — |
@@ -896,7 +898,7 @@ gateway (couples dashboard load to end-user delivery paths — the one thing tha
 degrade); polling (2 s latency bound of FR-DSH-02 makes it ugly).
 
 ### ADR-10 — Presence in Redis with TTL, no dedicated service
-**Status:** accepted · resolves SRS Open Question 3 (provisionally) · **Drivers:** D8
+**Status:** accepted · resolves SRS Open Question 3 (provisionally) · **Drivers:** D8 · **superseded in part by ADR-19** (chapter 3.19), which replaces the subject-grammar clause below
 
 Presence = connection-registry keys with a 30 s grace TTL (FR-RTM-06); transitions publish
 on the affected channels' subjects only (FR-RTM-07). Presence loss (Redis incident) is
@@ -1070,6 +1072,42 @@ chapter. **Rejected:** one `users` table with a nullable tenant (breaks FR-TEN-0
 Principle I); a `platform_users` view over the same table (same nullable column, now
 hidden); storing organisation membership as an array on the organisation (not queryable, no
 room for roles, no foreign key).
+
+### ADR-19 — Presence on its own subject grammar, superseding ADR-10's
+**Status:** accepted (chapter 3.19) · supersedes ADR-10's subject clause · closes SRS Open
+Question 3 · **Drivers:** D8
+
+ADR-10 said presence "transitions publish on the affected channels' subjects only". They
+publish on `presence:{channel_id}` instead — a subject **derived from** each affected
+channel rather than the channel's own — and the audience is unchanged: the same members,
+reached the same way. The grammar and the payload schema live in their own protocol module,
+the gateway half lives in its own module beside `fanout.ts`, and **`fanout.ts` itself is not
+edited**. The event spine already keeps its `subjectFor` in its own file, so each fabric
+owning its subject grammar is the precedent here rather than a concession.
+
+**Why not the channel's own subject.** The fan-out is typed to messages at three points:
+`publish(message: Message)`, a `messageCreatedSchema` parse of every arriving payload, and
+a literal `message.created` send. The third sits inside a function fenced by ten
+chapters. Carrying two kinds on `chan:{channel_id}` means editing the highest-volume path in
+the system to serve the lowest-volume traffic on it, and it makes cross-kind mis-delivery
+a property tests must defend rather than one the topology guarantees.
+
+**Rejected: an enveloped payload on `chan:{channel_id}`.** Halves the subscription count
+and reads closer to ADR-10's letter. It also puts a discriminated-union parse on every
+message every instance receives, and during a rolling deploy an old instance emits
+`fanout.invalid_payload` for every transition on every channel until it drains.
+
+**The declared cost, measured.** A channel now carries two subscriptions instead of one —
+one `SUBSCRIBE` per channel per instance, confirmed at 6 and 6 for two instances over three
+channels. `ioredis` takes a variadic `subscribe`, so the round trips do not double.
+
+**This is half of ADR-10's own revisit remedy, taken before its trigger fired.** ADR-10 says
+that above ~30% of gateway publish volume "presence subjects get their own fabric or
+channels opt in". Nothing here measured publish volume at scale; the reason is the typed
+fan-out above, not the trigger. **The trigger remains undischarged** and so does NFR-SCL-01.
+
+**Revisit when:** presence fan-out exceeds ~30% of gateway publish volume in load tests, or
+the doubled subscription count becomes the constraint on connections per instance.
 
 ## 10. Risks and technical debt register
 
