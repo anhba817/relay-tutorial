@@ -1,0 +1,2986 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figGrammars, figRemoval, figBackstop } from "./figures";
+
+export const metadata = {
+  title: "The membership that changed under a live socket — Building Relay",
+  description:
+    "A clause has been unmet since chapter 2.6 and a test has asserted the violation since 3.18. Membership gets a third subject grammar, the first event addressed to a principal rather than a channel, and a periodic re-read standing in for a cursor that does not exist.",
+  alternates: {
+    canonical: "/part-3/chapter-20/the-membership-that-changed",
+    languages: {
+      en: "/part-3/chapter-20/the-membership-that-changed",
+      vi: "/vi/part-3/chapter-20/the-membership-that-changed",
+    },
+  },
+};
+
+<ChapterHeader id="3.20" />
+
+Priya removes Tuan from #incidents. The route answers 200, the row is gone, and the next
+message posted to that channel arrives on Tuan's phone.
+
+Not because anything failed. Because nothing was ever built to stop it.
+
+The gateway learns a connection's memberships once, at the door, from
+`POST /internal/session`. It builds a `Set`, subscribes to what is in it, and reads that same
+`Set` on every delivery until the socket closes. **Nothing between connect and close re-reads
+anything.** A removal is a row in Postgres; the socket holding the removed user has never heard
+of it.
+
+<Figure caption="Three subject grammars over one Redis, and the two shapes membership needs" code={figGrammars} />
+
+## A test that has asserted the violation on purpose
+
+Chapter 3.18 wrote this and left it green:
+
+```text title="services/gateway/src/session.itest.ts (excerpt)"
+it("keeps delivering to a member who was REMOVED while connected (FR-RTM-10)", async () => {
+  // T032/T033. THIS TEST ASSERTS THE VIOLATION, and that is deliberate.
+  //
+  // FR-RTM-10 is P1: events "shall not be delivered to a client whose
+  // membership no longer grants access, effective within 5 seconds of the
+  // membership change". Measured here: they are, indefinitely.
+```
+
+It removes a member, waits out the clause's own 5,500 milliseconds, posts a message, and asserts
+the frame **arrives**. Its closing comment carries the instruction for whoever fixes it:
+
+```text title="services/gateway/src/session.itest.ts (excerpt)"
+  // Reads as a pass and documents a failure. The assertion is the violation:
+  // change this to `.rejects` on the day a re-read exists.
+```
+
+This chapter is that day. The wait stays at 5,500 ms — inverting the assertion while shortening
+the window would prove the assertion moved, not that the clause is met.
+
+<Why title="Why the clause sat open for fourteen chapters">
+Not neglect. FR-RTM-10 needs a mechanism that did not exist: something that reaches a live
+socket on another instance and changes what it is allowed to hear. Chapter 2.6 built the fan-out
+that could carry such a message and had no reason to send one. Chapter 3.15 built the removal
+route and had no way to tell anybody. Chapter 3.18 gave the gap a second entrance — a REST send
+now reaches a socket too — and pinned it with the test above rather than narrowing the clause
+until it passed.
+</Why>
+
+## Three grammars, and why the third needs two shapes
+
+`chan:{channel_id}` carries messages. Chapter 3.19 added `presence:{channel_id}`. Both assume
+the receiving instance is **already subscribed to the channel**, which is true for everything
+they carry.
+
+For a removal it stays true, and the reason is worth slowing down for: at the instant the
+removal publishes, the removed user is *still a member*. One publish on `member:{channel_id}`
+reaches the channel's remaining members and the person being removed, because the person being
+removed has not been removed from the topology yet.
+
+**An addition cannot do this.** The instance holding the new member is subscribed to nothing of
+that channel — that is precisely what is changing. There is no subject both parties are already
+listening to. So membership needs a second shape, addressed not to a channel but to a person:
+
+
+```ts title="packages/protocol/src/membership.ts"
+import { z } from "zod";
+
+/** Membership's own fabric: two subject shapes and the payload that crosses them
+ * (chapter 3.20, FR-RTM-05, FR-RTM-10).
+ *
+ * WHY THIS IS NOT IN `fanout.ts` AND NOT IN `presence.ts`. Each fabric owns its
+ * subject grammar in its own file — `internal.ts` established that for the event
+ * spine and chapter 3.19 followed it for presence. A new file is a whole-file fence
+ * and leaves two chapters' hunks over `fanout.ts` alone.
+ *
+ * NOT `subjectFor`, WHICH `internal.ts` ALREADY EXPORTS. Chapter 3.18 paid for that
+ * collision once:
+ *
+ *     error TS2308: Module "./internal.js" has already exported a member
+ *     named 'subjectFor'.
+ *
+ * WHY TWO SHAPES AND NOT ONE. A membership change is addressed to a **user**, and
+ * every fabric before this one was addressed to a channel. A removal can ride
+ * `member:{channel_id}` and reach both audiences at once, because the removed user is
+ * still a member at the moment it goes out. **An addition cannot**: the instance
+ * holding the new member is not subscribed to that channel yet, so nothing derived
+ * from the channel can reach it. That asymmetry is topology rather than taste, and it
+ * is why this is the first event in the system whose recipient is a principal.
+ *
+ * The rejected alternative was publishing to every remaining member's user subject,
+ * which replaces one publish with one per member — a thousand of them at FR-CHN-07's
+ * ceiling, for one removal. */
+export function subjectForChannelMembership(channelId: string): string {
+  return `member:${channelId}`;
+}
+
+/** The principal-addressed half. `presence:{env}:{user}` is a Redis KEY and this is a
+ * pub/sub CHANNEL — different namespaces, no collision — but the two read alike in a
+ * log line, which is worth knowing before grepping for one and finding the other. */
+export function subjectForUserMembership(
+  environmentId: string,
+  user: string,
+): string {
+  return `member:${environmentId}:${user}`;
+}
+
+/** What crosses `member:{…}` between gateway instances. Consumed only by gateways and
+ * **never sent to a client**.
+ *
+ * `environment` IS ON THE FABRIC AND NOT ON THE WIRE. A receiving gateway checks it
+ * against the connection it is about to act on and refuses a mismatch (FR-007); a
+ * client already knows its own environment, and putting it on a socket frame would be
+ * the first time this platform sent a tenant identifier to a client for no purpose.
+ *
+ * `strictObject`, so an unknown field is a rejection rather than a silent ignore: a
+ * field added on one side of a rolling deploy fails loudly on the other instead of
+ * being dropped. Chapter 3.19 chose the same strictness for the same reason.
+ *
+ * THE WIRE FRAME IS `frames.ts`'s AND IS NOT EDITED. What reaches a client is what
+ * chapter 1.3 published and `frames.test.ts` asserts:
+ *
+ *     { type: "membership.changed", payload: { channel, user, change } }
+ *
+ * A BAN CARRIES `channel: "*"`. The alternative was a second payload shape, and one
+ * schema with one parse won: the receiving instance drops every channel for that user
+ * rather than one, and the sentinel is documented here rather than inferred from a
+ * log line. `channel` stays `z.string().min(1)`, so `"*"` is a value the schema admits
+ * and this comment is what makes it mean something. */
+export const membershipFabricSchema = z.strictObject({
+  environment: z.string().min(1),
+  channel: z.string().min(1),
+  user: z.string().min(1),
+  change: z.enum(["added", "removed"]),
+});
+
+export type MembershipFabric = z.infer<typeof membershipFabricSchema>;
+
+/** The `channel` value a ban publishes. A ban is a removal from every channel, so
+ * `change` is `"removed"` and the channel is all of them. */
+export const ALL_CHANNELS = "*";
+```
+
+`member:{env}:{user}` is the first subject in this system that names **someone to tell** rather
+than something to hear about. Every other subject is a topic; this one is an address.
+
+<Trap title="`subjectFor` was already taken, and the collision has a cost on record">
+`packages/protocol/src/internal.ts` exports a `subjectFor` for the event spine's NATS subjects.
+Chapter 3.18 paid for that collision once — two functions, one name, one import list — so this
+module's builders are `subjectForChannelMembership` and `subjectForUserMembership`. Longer, and
+unambiguous at every call site.
+</Trap>
+
+## The durable record comes first, and the constitution says so
+
+Constitution II forbids publishing after a commit without an outbox row. Chapter 3.18's Redis
+publish is legal because the same transaction wrote the durable event. A membership write
+recorded nothing — so the same publish here would be exactly the case the principle names.
+
+FR-WHK-02 already spells the two event types, so this is a requirement being met rather than a
+principle being appeased:
+
+
+```diff title="services/api/src/outbox/event.ts"
+@@ -22,16 +22,54 @@ export interface MessageCreatedData {
+   created_at: string;
+ }
+ 
++/** A membership change as a CONSUMER receives it (chapter 3.20, FR-WHK-02).
++ *
++ * `user` IS THE EXTERNAL ID and the type says so, because the repository methods
++ * that build this event hold only `users.id`. `MessageCreatedData` above fixes the
++ * boundary — "Consumers are customers: they get external ids and the field names the
++ * REST surface uses. `user_id` does not cross this boundary" — and the message path
++ * honours it by having its caller pass `userExternalId` down. The membership paths
++ * do the same, for the same reason: building the event outside the transaction to
++ * get at an external id is the constitution II violation this chapter's phase order
++ * exists to prevent. */
++export interface MembershipChangedData {
++  channel_id: string;
++  /** The EXTERNAL id. Never `users.id`. */
++  user: string;
++}
++
++/** FR-WHK-02 names eight event types and one existed before this chapter. These are
++ * the second and third, spelled as that clause spells them — a customer's webhook
++ * subscription filters on these strings, so the spelling is the requirement's and not
++ * this chapter's.
++ *
++ * WIDENED FROM A LITERAL. `type` was `"message.created"` alone, which is the shape a
++ * consumer narrows on: every `switch` and every `===` against it sees this change,
++ * which is what a typecheck catches and an integration lane does not. */
++/** THE ARRAY IS THE SOURCE AND THE TYPE IS DERIVED, so the set has a size a test can
++ * read. A bare union has no runtime form: "the union has exactly three members" is
++ * unassertable, and chapter 3.19's `codes.test.ts` earned its keep precisely by
++ * asserting an exact set and an exact count — which is what makes a new member a
++ * decision rather than an accident. `as const` plus `(typeof …)[number]` costs one
++ * line and buys that. */
++export const OUTBOX_EVENT_TYPES = [
++  "message.created",
++  "channel.member_added",
++  "channel.member_removed",
++] as const;
++
++export type OutboxEventType = (typeof OUTBOX_EVENT_TYPES)[number];
++
+ export interface OutboxEvent {
+   /** UUID, generated in the transaction. The consumer's deduplication key. */
+   id: string;
+   /** FR-WHK-02's name for this event, spelled as that requirement spells it. */
+-  type: "message.created";
++  type: OutboxEventType;
+   environment_id: string;
+   /** When the state change happened — the message's own timestamp, not the
+    * moment this object was constructed. */
+   occurred_at: string;
+-  data: MessageCreatedData;
++  data: MessageCreatedData | MembershipChangedData;
+ }
+ 
+ export interface PendingEvent {
+@@ -70,6 +108,54 @@ export function messageCreatedEvent({
+   };
+ }
+ 
++/** A membership change, built inside the transaction that wrote the row.
++ *
++ * `occurred_at` ARRIVES FROM THE CALLER, like `messageCreatedEvent`'s, and for the
++ * same reason: a republished event must be byte-identical to its first attempt, so
++ * nothing here reads the clock.
++ *
++ * THE CHANGE'S DIRECTION IS THE TYPE, not a field. FR-WHK-02 spells two separate
++ * event names rather than one with an `added`/`removed` discriminator, because that
++ * is what a customer subscribes to — an endpoint wanting only removals selects
++ * `channel.member_removed` and receives nothing else. The wire frame this chapter
++ * also produces does carry a `change` field, and the two shapes differ for that
++ * reason rather than by accident (see `specs/038-chapter-3-20/data-model.md` §2). */
++export function membershipEvent({
++  eventId,
++  environmentId,
++  change,
++  occurredAt,
++  membership,
++}: {
++  eventId: string;
++  environmentId: string;
++  change: "added" | "removed";
++  occurredAt: string;
++  membership: MembershipChangedData;
++}): PendingEvent {
++  // Refused rather than defaulted, exactly as above.
++  if (!eventId) throw new Error("an event id is required");
++  if (!environmentId) throw new Error("an environment id is required");
++  // AND THE EXTERNAL ID IS REFUSED WHEN ABSENT. The two ids above are refused
++  // because a defaulted one is undetectable; this one because an internal uuid
++  // reaching a customer's webhook is undetectable too, and the type alone cannot
++  // stop `String(user.id)` being passed.
++  if (!membership.user) throw new Error("a user external id is required");
++
++  const type =
++    change === "added" ? "channel.member_added" : "channel.member_removed";
++  return {
++    subject: subjectFor(type, environmentId),
++    payload: {
++      id: eventId,
++      type,
++      environment_id: environmentId,
++      occurred_at: occurredAt,
++      data: membership,
++    },
++  };
++}
++
+ /** The envelope as a CONSUMER receives it (chapter 3.4).
+  *
+  * The producing side builds this object and knows it is well formed; the
+@@ -78,17 +164,60 @@ export function messageCreatedEvent({
+  * more right to assume a payload's shape than an external one does — and a
+  * message that has been sitting in a stream for six days has had even longer to
+  * stop matching what the code expects. */
+-export const outboxEventSchema = z.strictObject({
++const envelope = {
+   id: z.string().uuid(),
+-  type: z.literal("message.created"),
+   environment_id: z.string().min(1),
+   occurred_at: z.iso.datetime(),
+-  data: z.strictObject({
+-    id: z.string().min(1),
+-    channel_id: z.string().min(1),
+-    seq: z.number().int().positive(),
+-    user: z.string().nullable(),
+-    text: z.string().nullable(),
+-    created_at: z.iso.datetime(),
++};
++
++/** A DISCRIMINATED UNION, AND IT WAS A LITERAL UNTIL CHAPTER 3.20 RAN IT.
++ *
++ * This schema was `type: z.literal("message.created")` inside a `strictObject`, and
++ * the consumer that uses it — `services/api/src/consumer/runtime.ts:163` — answers a
++ * failed parse with `message.term()`, which stops redelivery for good. So the first
++ * `channel.member_added` row to reach the event spine would have been **destroyed at
++ * the consumer**, logged as `consumer.unparseable`, with that chapter's own comment
++ * saying "nothing catches what lands here".
++ *
++ * **The lane could not have found this.** It runs `RELAY_EVENT_CONSUMER=off`, so
++ * nothing exercises the consumer; the api suite stayed green through 505 tests with
++ * the defect in place. And analysis cleared it by reading the wrong file — there is a
++ * second, permissive envelope in `packages/protocol/src/internal.ts:276` whose `type`
++ * is `z.string().min(1)`, which is what a grep for "outboxEventSchema" finds first.
++ *
++ * Adding a type to `OUTBOX_EVENT_TYPES` now forces a branch here: the union is
++ * exhaustive over the same three names, and a fourth added above without one below is
++ * a typecheck failure rather than a terminated message in production. */
++export const outboxEventSchema = z.discriminatedUnion("type", [
++  z.strictObject({
++    ...envelope,
++    type: z.literal("message.created"),
++    data: z.strictObject({
++      id: z.string().min(1),
++      channel_id: z.string().min(1),
++      seq: z.number().int().positive(),
++      user: z.string().nullable(),
++      text: z.string().nullable(),
++      created_at: z.iso.datetime(),
++    }),
++  }),
++  z.strictObject({
++    ...envelope,
++    type: z.literal("channel.member_added"),
++    data: z.strictObject({
++      channel_id: z.string().min(1),
++      // NOT nullable, unlike the message's `user`. A message can have no sender
++      // (chapter 3.17's senderless rows predate FR-MSG-15); a membership change
++      // always has a member.
++      user: z.string().min(1),
++    }),
++  }),
++  z.strictObject({
++    ...envelope,
++    type: z.literal("channel.member_removed"),
++    data: z.strictObject({
++      channel_id: z.string().min(1),
++      user: z.string().min(1),
++    }),
+   }),
+-});
++]);
+```
+
+<Trap title="The consumer would have destroyed every one of these, and three things hid it">
+`outboxEventSchema` was `type: z.literal("message.created")` inside a `strictObject`. The
+consumer answers a failed parse with `message.term()` — redelivery stopped for good. The first
+`channel.member_added` to reach the event spine would have been **destroyed at the consumer**,
+logged as `consumer.unparseable`, under a comment reading "nothing catches what lands here".
+
+Three things hid it. The integration lane runs `RELAY_EVENT_CONSUMER=off`, so nothing exercises
+the consumer — 505 api tests stayed green with the defect in place. A typecheck cannot see it:
+the producer and the consumer never meet in one type. And an analysis pass cleared it by reading
+the wrong file, because there is a *second*, permissive envelope in `internal.ts` whose `type` is
+`z.string().min(1)`, and that is what a grep for the schema name finds first.
+
+It was found by a task that said to run the consumer rather than reason about it.
+</Trap>
+
+The repository writes the row inside the transaction that writes the membership, and the
+external id comes out of `RETURNING` rather than from a parameter:
+
+
+```diff title="services/api/src/db/repository.ts"
+@@ -38,7 +38,7 @@ import {
+   webhookDisableNotifications,
+   webhookEndpoints,
+ } from "./schema";
+-import { messageCreatedEvent } from "../outbox/event";
++import { membershipEvent, messageCreatedEvent } from "../outbox/event";
+ import { capsFor, type Caps } from "../quotas/config";
+ import { thresholdsCrossed } from "../quotas/policy";
+ import { creditFor, highWaterMark } from "../quotas/credit";
+@@ -2823,6 +2823,28 @@ export class Repository {
+    * `not_found` keeps the conflation the isolation property needs. The follow-up
+    * read distinguishes it from `already_a_member` — and it is a read, not a
+    * check-then-write: the insert already happened. */
++  /** Chapter 3.20. THIS METHOD HAD NO TRANSACTION AND NOW HAS ONE, which is a
++   * different change from adding a statement to an existing one.
++   *
++   * Constitution II: "State changes and their events MUST commit atomically via the
++   * transactional outbox. Publish-after-commit without the outbox is forbidden."
++   * Chapter 3.18's Redis publish is legal because `sendMessage` already wrote the
++   * durable row inside the transaction that wrote the message; a membership write
++   * recorded nothing, so the same publish here would be exactly the case the
++   * principle names. The row has to come first, and it has to be atomic with the
++   * insert, and there was nothing to put it inside.
++   *
++   * THE EXTERNAL ID COMES OUT OF `RETURNING`, and the first draft of this chapter
++   * took it as a parameter instead. The event a customer receives carries external
++   * ids — `MessageCreatedData` fixes that boundary in its own words — and this
++   * method holds `users.id`. Adding a parameter was the obvious answer and it broke
++   * **68 call sites across 15 files**, twelve of them test fixtures and several
++   * inside files other chapters fence: a signature change to a method this old is a
++   * fence-chain cost paid by chapters that never mention membership.
++   *
++   * A subquery in the `RETURNING` clause costs one expression on the inserted branch
++   * and nothing anywhere else. The typecheck found the blast radius in four seconds;
++   * the alternative would have been found in phase 10. */
+   async addMember(
+     channelId: string,
+     userId: string,
+@@ -2832,40 +2854,71 @@ export class Repository {
+      * afterwards, which is what US6's first scenario asks for. */
+     role?: string,
+   ): Promise<AddMemberOutcome> {
+-    const inserted = await this.db.execute(
+-      role === undefined
+-        ? sql`INSERT INTO members (channel_id, user_id)
+-          SELECT c.id, u.id FROM channels c, users u
+-          WHERE c.id = ${channelId} AND c.environment_id = ${this.environmentId}
+-            AND u.id = ${userId} AND u.environment_id = ${this.environmentId}
+-          ON CONFLICT (channel_id, user_id) DO NOTHING
+-          RETURNING channel_id`
+-        : sql`INSERT INTO members (channel_id, user_id, role)
+-          SELECT c.id, u.id, ${role} FROM channels c, users u
+-          WHERE c.id = ${channelId} AND c.environment_id = ${this.environmentId}
+-            AND u.id = ${userId} AND u.environment_id = ${this.environmentId}
+-          ON CONFLICT (channel_id, user_id) DO NOTHING
+-          RETURNING channel_id`,
+-    );
+-    // `RETURNING` and `.rows.length`, not `rowCount ?? 0`. `rowCount` is typed
+-    // `number | null` by the driver and is never null for an INSERT, so the `??`
+-    // was a branch nothing could take — one uncovered arm in the file
+-    // constitution VI asks for 100% of, bought for nothing. A row that came back
+-    // is a row that was inserted.
+-    if (inserted.rows.length > 0) return "added";
+-
+-    const existing = await this.db
+-      .select({ userId: members.userId })
+-      .from(members)
+-      .innerJoin(channels, eq(channels.id, members.channelId))
+-      .where(
+-        and(
+-          eq(members.channelId, channelId),
+-          eq(members.userId, userId),
+-          eq(channels.environmentId, this.environmentId),
+-        ),
++    return this.db.transaction(async (tx) => {
++      const inserted = await tx.execute(
++        role === undefined
++          ? sql`INSERT INTO members (channel_id, user_id)
++            SELECT c.id, u.id FROM channels c, users u
++            WHERE c.id = ${channelId} AND c.environment_id = ${this.environmentId}
++              AND u.id = ${userId} AND u.environment_id = ${this.environmentId}
++            ON CONFLICT (channel_id, user_id) DO NOTHING
++            RETURNING channel_id,
++              (SELECT external_id FROM users WHERE users.id = members.user_id)
++                AS user_external_id`
++          : sql`INSERT INTO members (channel_id, user_id, role)
++            SELECT c.id, u.id, ${role} FROM channels c, users u
++            WHERE c.id = ${channelId} AND c.environment_id = ${this.environmentId}
++              AND u.id = ${userId} AND u.environment_id = ${this.environmentId}
++            ON CONFLICT (channel_id, user_id) DO NOTHING
++            RETURNING channel_id,
++              (SELECT external_id FROM users WHERE users.id = members.user_id)
++                AS user_external_id`,
+       );
+-    return existing.length > 0 ? "already_a_member" : "not_found";
++      // `RETURNING` and `.rows.length`, not `rowCount ?? 0`. `rowCount` is typed
++      // `number | null` by the driver and is never null for an INSERT, so the `??`
++      // was a branch nothing could take — one uncovered arm in the file
++      // constitution VI asks for 100% of, bought for nothing. A row that came back
++      // is a row that was inserted.
++      if (inserted.rows.length > 0) {
++        // ON THE INSERTED BRANCH ONLY, which is `sendMessage`'s rule verbatim: "a
++        // recognised idempotent retry returned above without writing anything and
++        // must consume no event either." An add that changed nothing publishes
++        // nothing and records nothing (FR-005).
++        const row = inserted.rows[0] as { user_external_id: string | null };
++        // Refused rather than defaulted. The subquery cannot miss — the INSERT's own
++        // SELECT already joined `users` — but `membershipEvent` throws on an empty
++        // external id and a silent `""` here is the uuid-in-a-webhook defect wearing
++        // a different hat.
++        if (!row.user_external_id) {
++          throw new Error(`no external id for added member ${userId}`);
++        }
++        const event = membershipEvent({
++          eventId: randomUUID(),
++          environmentId: this.environmentId,
++          change: "added",
++          occurredAt: new Date().toISOString(),
++          membership: { channel_id: channelId, user: row.user_external_id },
++        });
++        await tx.insert(outbox).values({
++          subject: event.subject,
++          payload: event.payload,
++        });
++        return "added";
++      }
++
++      const existing = await tx
++        .select({ userId: members.userId })
++        .from(members)
++        .innerJoin(channels, eq(channels.id, members.channelId))
++        .where(
++          and(
++            eq(members.channelId, channelId),
++            eq(members.userId, userId),
++            eq(channels.environmentId, this.environmentId),
++          ),
++        );
++      return existing.length > 0 ? "already_a_member" : "not_found";
++    });
+   }
+ 
+   /** Archive and unarchive, both idempotent (chapter 3.15, FR-020, FR-020a).
+@@ -2920,6 +2973,15 @@ export class Repository {
+    * schema at the edge still cannot land. R8's trap was a constraint that reused
+    * `memberships`' vocabulary — it would accept `admin`, refuse `moderator`, and
+    * read as correct in review. */
++  /** Chapter 3.20. **NO OUTBOX ROW, AND NO FABRIC PUBLISH.** `membership.changed`'s
++   * `change` is an enum of `added` and `removed` — chapter 1.3 published it that way
++   * and neither member means "role" — and FR-WHK-02's event names are
++   * `channel.member_added` and `channel.member_removed`. A role change is a
++   * membership write that this chapter's vocabulary cannot express, in either shape.
++   *
++   * That is a fact about the frame rather than an omission here, and it is stated
++   * where somebody will look for it: a reader who sees add and remove producing
++   * events will otherwise assume a `PATCH` does too, and find silence. */
+   async setMemberRole(
+     channelId: string,
+     userId: string,
+@@ -2983,6 +3045,16 @@ export class Repository {
+    * carries no `environment_id` — the catalogue calls it a `hop` — so the join is
+    * what keeps a foreign channel's rows out of reach.
+    */
++  /** Chapter 3.20. THIS ONE HAD NO TRANSACTION EITHER, and it was already two
++   * statements — the member delete and the read-position delete, with nothing
++   * between them. **A crash there left a removed member holding a read position**,
++   * which this transaction closes as a side effect of carrying the outbox rows.
++   * Saying so rather than letting it look incidental: the defect predates this
++   * chapter and is fixed here because the fix was free.
++   *
++   * THE EXTERNAL IDS COME OUT OF `RETURNING`, as `addMember`'s does and for the same
++   * reason: a third parameter here was two more call sites, and the pair of them was
++   * 68 across 15 files. */
+   async removeMembers(
+     channelId: string,
+     userIds: string[],
+@@ -3000,7 +3072,8 @@ export class Repository {
+     //
+     // A hundred round trips to answer one request is the cost chapter 2.4 measured
+     // away on the read path; there is no reason to reintroduce it on this one.
+-    const deleted = await this.db
++    return this.db.transaction(async (tx) => {
++    const deleted = await tx
+       .delete(members)
+       .where(
+         and(
+@@ -3013,10 +3086,41 @@ export class Repository {
+                        AND c.environment_id = ${this.environmentId})`,
+         ),
+       )
+-      .returning({ userId: members.userId });
++      .returning({
++        userId: members.userId,
++        // The event's `user` is what a customer reads, and this table holds only a
++        // uuid. One subquery per returned row, on the rows that were actually
++        // deleted — never on the ids that were merely asked for.
++        userExternalId: sql<string>`(SELECT external_id FROM users
++                                      WHERE users.id = ${members.userId})`,
++      });
+     const removed = new Set(deleted.map((r) => r.userId));
+ 
+-    await this.db
++    // ONE ROW PER ID THE `RETURNING` CLAUSE GAVE BACK, not one per id asked for.
++    // A bulk call naming five of which two were not members writes three (FR-005).
++    // The returning clause already existed; no second query is needed to find out
++    // who was actually removed.
++    for (const row of deleted) {
++      // Refused rather than defaulted, as on the add path: `membershipEvent` throws
++      // on an empty external id, and a silent `""` is the uuid-in-a-webhook defect
++      // wearing a different hat.
++      if (!row.userExternalId) {
++        throw new Error(`no external id for removed member ${row.userId}`);
++      }
++      const event = membershipEvent({
++        eventId: randomUUID(),
++        environmentId: this.environmentId,
++        change: "removed",
++        occurredAt: new Date().toISOString(),
++        membership: { channel_id: channelId, user: row.userExternalId },
++      });
++      await tx.insert(outbox).values({
++        subject: event.subject,
++        payload: event.payload,
++      });
++    }
++
++    await tx
+       .delete(readPositions)
+       .where(
+         and(
+@@ -3030,6 +3134,7 @@ export class Repository {
+       outcome.set(id, removed.has(id) ? "removed" : "not_a_member");
+     }
+     return outcome;
++    });
+   }
+ 
+   /** How many deliveries an endpoint holds, scoped. Added for chapter 3.12's
+@@ -3288,17 +3393,71 @@ export class Repository {
+    *
+    * `banned_at` HAD NO WRITER, the same omission `channels.archived_at` had. The column
+    * has been in the schema since chapter 2.1 with zero references outside tests. */
+-  async banUser(userId: string): Promise<void> {
+-    await this.db
+-      .update(users)
+-      .set({ bannedAt: new Date() })
+-      .where(
+-        and(
+-          eq(users.id, userId),
+-          eq(users.environmentId, this.environmentId),
+-          isNull(users.bannedAt),
+-        ),
+-      );
++  /** Chapter 3.20. A BAN WRITES ONE `channel.member_removed` PER CHANNEL, and the
++   * task list said "one event for the user, not one per channel" until this method
++   * was written and the question turned out to have no such answer.
++   *
++   * **FR-WHK-02 names no event type for a ban.** Its eight are `message.created`,
++   * `message.updated`, `message.deleted`, `channel.created`, `channel.member_added`,
++   * `channel.member_removed`, `user.connected` and `user.disconnected`, and inventing
++   * a ninth is scope this chapter does not have — the spelling belongs to the clause
++   * and a customer's subscription filters on it.
++   *
++   * So the choice was: no durable record at all, or the removals a ban actually is.
++   * No record makes the Redis publish beside it publish-after-commit with nothing in
++   * the outbox, which is the case constitution II names by name. **A ban IS a removal
++   * from every channel** — a consumer subscribed to `channel.member_removed` wants to
++   * know, and would be wrong to learn about it only for administrative removals.
++   *
++   * THE FABRIC PUBLISH IS STILL ONE, and `specs/038-chapter-3-20/data-model.md` §5's
++   * "once per user, not once per channel" is about that publish rather than about
++   * these rows. The two were the same sentence in that document and are not the same
++   * thing; the row count is bounded by FR-CHN-07's thousand members per channel.
++   *
++   * The returned list is the channels the ban revoked — the caller needs it for the
++   * fabric publish, and reading it inside the transaction is what makes the rows and
++   * the flag agree. */
++  async banUser(userId: string): Promise<string[]> {
++    return this.db.transaction(async (tx) => {
++      const banned = await tx
++        .update(users)
++        .set({ bannedAt: new Date() })
++        .where(
++          and(
++            eq(users.id, userId),
++            eq(users.environmentId, this.environmentId),
++            isNull(users.bannedAt),
++          ),
++        )
++        .returning({ externalId: users.externalId });
++
++      // ONLY WHEN A ROW WAS UPDATED. `isNull(users.bannedAt)` already makes a re-ban
++      // touch nothing, so without this guard every repeated ban would emit a full set
++      // of events for a state that did not change (FR-005).
++      if (banned.length === 0) return [];
++      const externalId = banned[0]!.externalId;
++
++      const channelRows = await tx
++        .select({ channelId: members.channelId })
++        .from(members)
++        .where(eq(members.userId, userId));
++
++      const occurredAt = new Date().toISOString();
++      for (const { channelId } of channelRows) {
++        const event = membershipEvent({
++          eventId: randomUUID(),
++          environmentId: this.environmentId,
++          change: "removed",
++          occurredAt,
++          membership: { channel_id: channelId, user: externalId },
++        });
++        await tx.insert(outbox).values({
++          subject: event.subject,
++          payload: event.payload,
++        });
++      }
++      return channelRows.map((r) => r.channelId);
++    });
+   }
+ 
+   async unbanUser(userId: string): Promise<void> {
+```
+
+<Why title="Why the external id comes from a subquery and not from the caller">
+The first version added a `userExternalId` parameter to `addMember`. That produced **68
+TypeScript errors across 15 files**, twelve of them test fixtures, several in files other
+chapters fence — for one string the database already holds two joins away. The subquery in
+`RETURNING` costs one index lookup per write and changes zero call sites.
+
+A signature is a contract with everyone who ever called it. This one had been called for
+eighteen chapters.
+</Why>
+
+## The publisher, and the down-window that is not inherited
+
+
+```ts title="services/api/src/membership/publisher.ts"
+import {
+  ALL_CHANNELS,
+  subjectForChannelMembership,
+  subjectForUserMembership,
+  type MembershipFabric,
+} from "@relay/protocol";
+import type { Logger } from "@relay/service-kit";
+// A NAMED import, not a default: ioredis is CommonJS, the api is ESM, and without
+// esModuleInterop a default import of a CJS module hands you the namespace object.
+import { Redis } from "ioredis";
+
+// The membership fabric's api half (chapter 3.20, FR-004).
+//
+// SHAPED ON `fanout/publisher.ts` AND NOT ON `createFanout`. Chapter 3.18 built that
+// publisher against the same problems this one has — a store that may be down on a
+// request path, a failure that must not fail the write, and a log line that is the
+// only evidence the path was taken — and its choices are inherited with their reasons
+// rather than rediscovered.
+//
+// WHAT IS NOT INHERITED: the down-window. `fanout/publisher.ts` opens one on failure
+// so a known-dead store is not retried per message, because that path runs once per
+// send at message volume. A membership change runs once per administrative action, so
+// the window would be a state machine with two more arms to cover and nothing to buy
+// with them. Named here because "shaped like" is otherwise a claim nobody can check.
+
+export const DEFAULT_MEMBERSHIP_REDIS_URL = "redis://localhost:6379";
+
+/** Nest's injection token. A string rather than the interface, because the interface
+ * is a type and types do not survive to runtime. */
+export const MEMBERSHIP_PUBLISHER = "MEMBERSHIP_PUBLISHER";
+
+export interface MembershipPublisher {
+  /** Publish one change. Resolves whatever happens: a membership write that
+   * committed must not be undone by a fabric that is down (FR-016). */
+  publish(change: MembershipFabric): Promise<void>;
+  close(): Promise<void>;
+}
+
+export interface MembershipPublisherOptions {
+  url?: string;
+  logger: Logger;
+}
+
+export function createMembershipPublisher({
+  url = process.env["RELAY_REDIS_URL"] ?? DEFAULT_MEMBERSHIP_REDIS_URL,
+  logger,
+}: MembershipPublisherOptions): MembershipPublisher {
+  const redis = new Redis(url, {
+    // Chapter 3.18's three, for its reasons: a queued command rejects as soon as the
+    // connection attempt fails rather than waiting out a retry schedule; a connected
+    // server that never answers is a different failure and only `commandTimeout`
+    // catches it.
+    lazyConnect: true,
+    maxRetriesPerRequest: 0,
+    connectTimeout: 1_000,
+    commandTimeout: 100,
+  });
+  // THE STATED REASON IS NFR-OBS-01, NOT PROCESS DEATH. `limits/store.ts:137` says a
+  // missing listener kills the api; chapter 3.18 measured that against ioredis 6.0.0
+  // and the process STAYS ALIVE — ioredis prints `[ioredis] Unhandled error event: …`
+  // itself and continues. The accurate reason is that those lines are unstructured
+  // and unbounded, which defeats NFR-OBS-01. A membership path that cannot reach
+  // Redis is an expected state and should say so once, in this module's vocabulary.
+  redis.on("error", (error: unknown) => {
+    logger.log("error", "membership.failed", {
+      op: "connection",
+      error: String(error),
+    });
+  });
+
+  return {
+    async publish(change) {
+      // TWO SUBJECTS FOR AN ADDITION, ONE FOR A REMOVAL, and the asymmetry is the
+      // topology rather than an optimisation. A removal reaches both audiences on the
+      // channel's subject because the removed user is still a member when it goes
+      // out; an addition's new member is on an instance subscribed to nothing of that
+      // channel, so the principal-addressed subject is the only way to reach them.
+      //
+      // A BAN IS THE THIRD CASE: `channel` is the all-channels sentinel, so there is
+      // no channel subject to publish on and the user's is the whole of it.
+      const subjects =
+        change.channel === ALL_CHANNELS
+          ? [subjectForUserMembership(change.environment, change.user)]
+          : change.change === "added"
+            ? [
+                subjectForChannelMembership(change.channel),
+                subjectForUserMembership(change.environment, change.user),
+              ]
+            : [subjectForChannelMembership(change.channel)];
+
+      const body = JSON.stringify(change);
+      try {
+        await Promise.all(subjects.map((subject) => redis.publish(subject, body)));
+      } catch (error) {
+        // SWALLOWED AND LOGGED, NEVER RETHROWN. The write has committed and the
+        // outbox row with it; a publish that throws here would undo a route's success
+        // for a delivery the backstop exists to repair (FR-016).
+        //
+        // AND THE LOG LINE IS THE REQUIREMENT'S EVIDENCE (FR-015). Chapter 3.18's
+        // trap against its own publisher: "the send returned 201 while Redis was
+        // down" is true of a publisher that does nothing at all, so the assertion
+        // that carries the requirement is this line and not the route's status.
+        logger.log("error", "membership.failed", {
+          op: "publish",
+          channel: change.channel,
+          user: change.user,
+          change: change.change,
+          error: String(error),
+        });
+        return;
+      }
+      // THE WORKING PATH SAYS SOMETHING TOO (FR-031). Every log requirement this
+      // chapter inherited was about failure, and an operator who can only see the
+      // mechanism breaking cannot tell a quiet system from a dead one.
+      //
+      // No message content and no token (constitution VI). A channel id and an
+      // external id are what an incident needs and are what the customer's own API
+      // already returns them.
+      logger.log("info", "membership.published", {
+        channel: change.channel,
+        user: change.user,
+        change: change.change,
+        subjects: subjects.length,
+      });
+    },
+    async close() {
+      redis.disconnect();
+    },
+  };
+}
+```
+
+Chapter 3.18's fan-out publisher opens a down-window: after a failure it stops trying for five
+seconds, so a dead Redis does not make every send pay a connect timeout. That path runs once per
+message. **This one runs once per administrative action**, so the window would be a state
+machine with two more arms to cover and nothing to buy with them. "Shaped like `fanout/publisher.ts`"
+is a claim somebody has to be able to check, so the three properties it does inherit are named
+and the one it does not is named too.
+
+The module exists because a factory alone is not injectable:
+
+
+```ts title="services/api/src/membership/membership.module.ts"
+import { Inject, Injectable, Module, type OnModuleDestroy } from "@nestjs/common";
+
+import { createLogger } from "@relay/service-kit";
+
+import {
+  createMembershipPublisher,
+  MEMBERSHIP_PUBLISHER,
+  type MembershipPublisher,
+} from "./publisher";
+
+// ONE MODULE, TWO IMPORTERS (chapter 3.20).
+//
+// `ChannelsModule` and `UsersModule` both publish membership changes, and registering
+// the factory in each would open two Redis connections for one job. A module they
+// both import is one connection, one lifecycle, one place to look.
+//
+// EXPORTED, WHERE `MESSAGE_PUBLISHER` IS NOT — and the difference is worth stating
+// because the precedent looks like it says otherwise. `messages.module.ts` withholds
+// its publisher deliberately: `internal.module.ts` imports that module and "reuse[s]
+// MessagesModule's providers wholesale", so an exported publisher would be injectable
+// from the one route that must never publish. Checked rather than assumed for this
+// one: `ChannelsModule` and `UsersModule` are imported only by `app.module.ts`, and
+// this module is imported only by them. There is no wholesale reuse to leak through.
+//
+// Anyone adding a third importer should re-read that paragraph first.
+
+/** `limits/limits.module.ts:10` states the convention: "resource in this api closes
+ * through `OnModuleDestroy`". Six modules implement it; this is the seventh. A
+ * `close()` nothing calls is a leaked handle in a service that boots once per
+ * integration suite, and the symptom is a suite that hangs rather than one that
+ * fails. */
+@Injectable()
+export class MembershipPublisherLifecycle implements OnModuleDestroy {
+  constructor(
+    @Inject(MEMBERSHIP_PUBLISHER)
+    private readonly publisher: MembershipPublisher,
+  ) {}
+
+  async onModuleDestroy(): Promise<void> {
+    await this.publisher.close();
+  }
+}
+
+@Module({
+  providers: [
+    {
+      provide: MEMBERSHIP_PUBLISHER,
+      useFactory: (): MembershipPublisher =>
+        createMembershipPublisher({ logger: createLogger("api") }),
+    },
+    MembershipPublisherLifecycle,
+  ],
+  exports: [MEMBERSHIP_PUBLISHER],
+})
+export class MembershipModule {}
+```
+
+Both `ChannelsModule` and `UsersModule` import it — one module, not the factory registered
+twice, which would open two Redis connections for one job:
+
+
+```diff title="services/api/src/channels/channels.module.ts"
+@@ -2,6 +2,7 @@ import { Module, Scope } from "@nestjs/common";
+ import { REQUEST } from "@nestjs/core";
+ 
+ import { AuthModule } from "../auth/auth.module";
++import { MembershipModule } from "../membership/membership.module";
+ import { createDb, createPool, type Db } from "../db/client";
+ import { Repository } from "../db/repository";
+ import { ChannelsController } from "./channels.controller";
+@@ -12,7 +13,7 @@ import type { RequestWithTenant } from "../messages/request-with-tenant";
+ // is the plain 2.1 class, constructed per request with the tenant the middleware
+ // already resolved from a verified credential (ADR-15).
+ @Module({
+-  imports: [AuthModule],
++  imports: [AuthModule, MembershipModule],
+   controllers: [ChannelsController],
+   providers: [
+     {
+```
+
+```diff title="services/api/src/users/users.module.ts"
+@@ -2,6 +2,7 @@ import { Module, Scope } from "@nestjs/common";
+ import { REQUEST } from "@nestjs/core";
+ 
+ import { AuthModule } from "../auth/auth.module";
++import { MembershipModule } from "../membership/membership.module";
+ import { createDb, createPool, type Db } from "../db/client";
+ import { Repository } from "../db/repository";
+ import { UsersController } from "./users.controller";
+@@ -16,7 +17,7 @@ import type { RequestWithTenant } from "../messages/request-with-tenant";
+ // lifecycle behind a channel path. `POST /v1/channels/users` is a sentence about
+ // nothing.
+ @Module({
+-  imports: [AuthModule],
++  imports: [AuthModule, MembershipModule],
+   controllers: [UsersController],
+   providers: [
+     {
+```
+
+## Four routes publish, and one of them gets forgotten
+
+FR-004 names four paths: the bulk add, `join`, the bulk remove, and the ban. Written per route,
+`join` is the one that goes silent — it is a separate service method calling `repo.addMember`
+directly, so a publish hung off `addMembers` misses it and nothing fails.
+
+One helper both directions call:
+
+
+```diff title="services/api/src/channels/channels.controller.ts"
+@@ -14,9 +14,15 @@ import {
+   UseGuards,
+ } from "@nestjs/common";
+ 
++import { Inject } from "@nestjs/common";
++
+ import { Accepts, CredentialGuard } from "../auth/credential.guard";
+ import type { RequestWithPrincipal } from "../auth/principal";
+ import { Repository } from "../db/repository";
++import {
++  MEMBERSHIP_PUBLISHER,
++  type MembershipPublisher,
++} from "../membership/publisher";
+ import { ZodValidationPipe } from "../messages/zod-validation.pipe";
+ import { ChannelsService } from "./channels.service";
+ import {
+@@ -58,6 +64,12 @@ export class ChannelsController {
+     // For resolving a user token's subject to a row id. The service takes an id
+     // because the repository's membership lookup is keyed on it.
+     private readonly repo: Repository,
++    // THE CONTROLLER, NOT THE SERVICE (chapter 3.20, FR-004). `ChannelsService`'s
++    // constructor takes only the `Repository`, so it holds no request id and no
++    // logger — and FR-015's failure line needs both. `messages.controller.ts` puts
++    // the fan-out publish at this same layer for this same reason.
++    @Inject(MEMBERSHIP_PUBLISHER)
++    private readonly membership: MembershipPublisher,
+   ) {}
+ 
+   /** 201 on creation, 200 on the idempotent repeat (FR-017, FR-CHN-02).
+@@ -179,8 +191,50 @@ export class ChannelsController {
+   async removeMembers(
+     @Param("channelId") channelId: string,
+     @Body(new ZodValidationPipe(removeMembersBodySchema)) body: RemoveMembersBody,
++    @Req() req: RequestWithPrincipal,
+   ) {
+-    return { results: await this.channels.removeMembers(channelId, body) };
++    const results = await this.channels.removeMembers(channelId, body);
++
++    // ONLY THE ONES THAT CHANGED SOMETHING (FR-005). The route reports per entry and
++    // `not_a_member` is a legitimate outcome, so publishing the whole list would tell
++    // a gateway to revoke access nobody had — and would put a `membership.changed`
++    // frame on a socket whose owner was never removed from anything.
++    //
++    // ONE PUBLISH, BOTH AUDIENCES. The removed user is still a member at the moment
++    // this goes out, so the channel's subject reaches the remaining members and the
++    // subject too (research R1). An addition is the case that cannot do this.
++    //
++    // AFTER the service returns, which is after the transaction that wrote both the
++    // membership row and its outbox row. Constitution II forbids the other order and
++    // the phase order exists for it.
++    for (const removal of results) {
++      if (removal.result !== "removed") continue;
++      await this.announce(req, channelId, removal.external_id, "removed");
++    }
++
++    return { results };
++  }
++
++  /** The one publish both directions and all four routes go through.
++   *
++   * ONE HELPER RATHER THAN FOUR CALL SITES, and FR-004 names four paths: the bulk
++   * add, `join`, the bulk remove, and the ban. Written per route, `join` is the one
++   * that gets forgotten — it is a separate service method calling `repo.addMember`
++   * directly, so a publish hung off `addMembers` leaves it silent and nothing fails.
++   *
++   * The environment is the PRINCIPAL's, established by the guard, never a body's. */
++  private async announce(
++    req: RequestWithPrincipal,
++    channelId: string,
++    user: string,
++    change: "added" | "removed",
++  ): Promise<void> {
++    await this.membership.publish({
++      environment: req.principal?.environmentId ?? "unknown",
++      channel: channelId,
++      user,
++      change,
++    });
+   }
+ 
+   /** The user-initiated half of FR-CHN-03 (chapter 3.15).
+@@ -208,7 +262,19 @@ export class ChannelsController {
+     }
+     const user = await this.repo.getUserByExternalId(req.principal.userExternalId);
+     if (!user) throw new BadRequestException("unknown user");
+-    return { result: await this.channels.join(channelId, user.id) };
++    const result = await this.channels.join(channelId, user.id);
++    // `joined`, not `already_a_member` (FR-005): a join that changed nothing must
++    // publish nothing, or every idempotent retry puts a frame on every member's
++    // screen.
++    if (result === "joined") {
++      await this.announce(
++        req,
++        channelId,
++        req.principal.userExternalId,
++        "added",
++      );
++    }
++    return { result };
+   }
+ 
+   /** Members by external id, users created on first membership (FR-CHN-04).
+@@ -221,7 +287,14 @@ export class ChannelsController {
+   async addMembers(
+     @Param("channelId") channelId: string,
+     @Body(new ZodValidationPipe(addMembersBodySchema)) body: AddMembersBody,
++    @Req() req: RequestWithPrincipal,
+   ) {
+-    return { members: await this.channels.addMembers(channelId, body) };
++    const members = await this.channels.addMembers(channelId, body);
++    // `added` only. `already_a_member` is the idempotent repeat and changed nothing.
++    for (const member of members) {
++      if (member.status !== "added") continue;
++      await this.announce(req, channelId, member.external_id, "added");
++    }
++    return { members };
+   }
+ }
+```
+
+Only outcomes that changed something publish. `not_a_member` is a legitimate answer from the
+removal route and `already_a_member` from the add — publishing those would tell a gateway to
+revoke access nobody had, and put a `membership.changed` frame on a socket whose owner was never
+removed from anything.
+
+<Figure caption="A removal, from the route to the two audiences it reaches in one publish" code={figRemoval} />
+
+## The ban, and a sentinel that never reaches a client
+
+A ban revokes every channel at once. The api knows which channels it revoked; it does **not**
+know which of them any given connection on any given instance holds — and that per-connection
+set is what a client's frames have to match. So the fabric carries one change with an
+all-channels sentinel and the gateway expands it:
+
+
+```diff title="services/api/src/users/users.controller.ts"
+@@ -4,15 +4,25 @@ import {
+   Delete,
+   Get,
+   HttpCode,
++  HttpStatus,
++  Inject,
+   Param,
+   Patch,
+   Post,
+   Put,
+   Query,
++  Req,
+   UseGuards,
+ } from "@nestjs/common";
+ 
++import { ALL_CHANNELS } from "@relay/protocol";
++
+ import { Accepts, CredentialGuard } from "../auth/credential.guard";
++import type { RequestWithPrincipal } from "../auth/principal";
++import {
++  MEMBERSHIP_PUBLISHER,
++  type MembershipPublisher,
++} from "../membership/publisher";
+ import { ZodValidationPipe } from "../messages/zod-validation.pipe";
+ import {
+   listingQuerySchema,
+@@ -42,7 +52,14 @@ import { UsersService } from "./users.service";
+ @UseGuards(CredentialGuard)
+ @Accepts("application")
+ export class UsersController {
+-  constructor(private readonly users: UsersService) {}
++  constructor(
++    private readonly users: UsersService,
++    // Chapter 3.20. The controller for the reason `channels.controller.ts` states:
++    // `UsersService` holds neither a request id nor a logger, and FR-015's failure
++    // line needs both.
++    @Inject(MEMBERSHIP_PUBLISHER)
++    private readonly membership: MembershipPublisher,
++  ) {}
+ 
+   @Get(":externalId/channels")
+   async listChannels(
+@@ -131,13 +148,52 @@ export class UsersController {
+    * `@HttpCode(200)` on the POST for the reason the upsert has it: nothing is created,
+    * and banning an already-banned user is a 200 too. */
+   @Post(":externalId/ban")
+-  @HttpCode(200)
+-  async ban(@Param("externalId") externalId: string) {
+-    return this.users.setBanned(externalId, true);
++  @HttpCode(HttpStatus.OK)
++  async ban(@Param("externalId") externalId: string, @Req() req: RequestWithPrincipal) {
++    const { external_id, banned, revoked } = await this.users.setBanned(
++      externalId,
++      true,
++    );
++    // ONE PUBLISH FOR THE USER, not one per channel. The subject is the principal's
++    // own — `member:{env}:{user}` — because there is no channel subject to use when
++    // the change is "every channel", and because the gateway is the only place that
++    // knows which of them a given connection holds.
++    //
++    // `revoked` empty means nothing changed, so a repeated ban publishes nothing
++    // (FR-005). `ALL_CHANNELS` is the one spelling of the sentinel, and it never
++    // reaches a client: the gateway expands it per channel
++    // (`specs/038-chapter-3-20/contracts/membership-fabric.md`).
++    if (revoked.length > 0) {
++      await this.membership.publish({
++        environment: req.principal?.environmentId ?? "unknown",
++        channel: ALL_CHANNELS,
++        user: externalId,
++        change: "removed",
++      });
++    }
++    return { external_id, banned };
+   }
+ 
++  /** THE UNBAN PUBLISHES NOTHING, and that is a decision rather than an omission.
++   *
++   * A ban leaves the `members` rows alone — it sets `users.banned_at` — so an
++   * unbanned user's memberships are exactly what they were. What the ban destroyed
++   * is the live connection's `channelIds`, and restoring that needs the channel list
++   * the api would have to re-derive plus an `added` frame per channel, which is the
++   * per-channel shape this contract rules out.
++   *
++   * Two things already repair it, and the phase that adds the second says so:
++   * reconnecting reads membership at the door (chapter 3.2), and the backstop's
++   * periodic re-read picks it up within its interval. Both are the mechanism this
++   * chapter already builds; a third would be a special case for the rarer half of a
++   * rare pair. `chapter-notes.md` records the choice. */
+   @Delete(":externalId/ban")
++  @HttpCode(HttpStatus.OK)
+   async unban(@Param("externalId") externalId: string) {
+-    return this.users.setBanned(externalId, false);
++    // The two fields the route has always answered with, named rather than
++    // destructured away: this config does not treat a leading underscore as
++    // "deliberately unused", so `const { revoked: _x, ...rest }` is a lint error.
++    const { external_id, banned } = await this.users.setBanned(externalId, false);
++    return { external_id, banned };
+   }
+ }
+```
+
+```diff title="services/api/src/users/users.service.ts"
+@@ -243,10 +243,22 @@ export class UsersService {
+    * channels, and every route naming them answers 404. Banning one would be a state with
+    * no observable difference.
+    */
+-  async setBanned(externalId: string, banned: boolean): Promise<{ external_id: string; banned: boolean }> {
++  async setBanned(
++    externalId: string,
++    banned: boolean,
++  ): Promise<{ external_id: string; banned: boolean; revoked: string[] }> {
+     const user = await this.requireUser(externalId);
+-    if (banned) await this.repo.banUser(user.id);
+-    else await this.repo.unbanUser(user.id);
+-    return { external_id: externalId, banned };
++    // `revoked` IS THE CHANGE, and the route's body does not carry it. `banUser`
++    // returns the channels the ban actually revoked and an empty array when nothing
++    // changed — `isNull(users.bannedAt)` makes a re-ban touch no row — so the
++    // controller publishes on a non-empty list and nothing on a repeat (FR-005).
++    //
++    // ONE CASE READS AS "NO CHANGE" AND IS NOT: banning a user who belongs to no
++    // channel returns `[]` too. Nothing is lost by the silence — a connection with no
++    // channels receives nothing whether or not it is told — and distinguishing the
++    // two would mean widening the repository's return for a publish with no audience.
++    const revoked = banned ? await this.repo.banUser(user.id) : [];
++    if (!banned) await this.repo.unbanUser(user.id);
++    return { external_id: externalId, banned, revoked };
+   }
+ }
+```
+
+<Why title="Why the sentinel stops at the gateway">
+The contract for this fabric offered two answers and the phase that decided took neither.
+`channel: "*"` on the fabric buys one schema, one parse, one code path — and the objection was
+real: `channel` is `z.string().min(1)`, and a sentinel inside a string reads as a channel id in
+a log line for a year. A separate payload shape avoids that and costs a second schema, a second
+parse and a second delivery path.
+
+The third answer takes the first and closes its objection where it actually matters. A client
+receives exactly the frames N individual removals would have produced. The sentinel survives in
+the fabric payload and in one log line, both internal, with `ALL_CHANNELS` as its single
+spelling.
+</Why>
+
+## The gateway half
+
+
+```ts title="services/gateway/src/membership.ts"
+import {
+  ALL_CHANNELS,
+  membershipFabricSchema,
+  subjectForChannelMembership,
+  subjectForUserMembership,
+  type MembershipFabric,
+} from "@relay/protocol";
+import type { Logger } from "@relay/service-kit";
+import { Redis } from "ioredis";
+
+// Membership's gateway half (chapter 3.20, FR-RTM-10).
+//
+// A THIRD FABRIC, AND THE FIRST ADDRESSED TO A PRINCIPAL. `chan:{channel_id}` carries
+// messages and `presence:{channel_id}` carries transitions, and both assume the
+// receiving instance is already subscribed to the channel. For a removal that holds;
+// for an ADDITION it cannot, because the instance holding the new member is not
+// subscribed to the channel they are about to join. So this module subscribes two
+// ways — per channel, and per locally-connected user.
+//
+// ONE CLIENT, AND THE TASK LIST SAID TWO. Chapter 3.8's rule is that a connection in
+// subscriber mode cannot run ordinary commands, so `fanout.ts` and `presence.ts` each
+// carry a pair — and this module was specified with a pair by analogy. **It runs no
+// ordinary commands.** Subscribe and unsubscribe are subscriber-mode operations, the
+// re-read is an HTTP call to the api, and delivery is in-process; the command client
+// was created, wired to an error listener, disconnected on close, and never used for
+// anything. That makes six Redis connections per gateway rather than seven.
+//
+// NOTHING HERE IS A SOURCE OF TRUTH (constitution IV). The database decides who is a
+// member; this carries the news, and `rereadIntervalMs` below is what makes a lost
+// message recoverable rather than permanent.
+
+export const DEFAULT_REDIS_URL = "redis://localhost:6379";
+
+/** How often a connection re-reads its own membership from the api.
+ *
+ * **THE BACKSTOP IS NOT THE MECHANISM.** The publish meets FR-RTM-10's five seconds;
+ * this bounds the damage when a publish is dropped, which constitution IV requires of
+ * any new delivery mechanism — "durability and resume live in PostgreSQL sequences
+ * and cursors", and a revocation has no cursor.
+ *
+ * Sixty seconds against NFR-SCL-01's 10,000 connections per instance is 167 requests
+ * per second per instance; five seconds would be 2,000. The arithmetic is in
+ * `baseline.txt` and the number is a decision with a cost rather than a default. */
+export const DEFAULT_REREAD_INTERVAL_MS = 60_000;
+
+export interface Membership {
+  /** Register the delivery callback. Set by the session layer at wiring time, as the
+   * fan-out's and presence's are: the fabric knows how to receive, the sessions know
+   * who to hand it to. */
+  onChange(handler: (change: MembershipFabric) => void): void;
+  subscribeChannel(channelId: string): Promise<void>;
+  unsubscribeChannel(channelId: string): Promise<void>;
+  subscribeUser(environmentId: string, user: string): Promise<void>;
+  unsubscribeUser(environmentId: string, user: string): Promise<void>;
+  /** Every connection's periodic re-read, registered by the session layer. Returns a
+   * cancel function, because a connection that closes must not keep asking. */
+  watch(reread: () => Promise<void>): () => void;
+  close(): Promise<void>;
+}
+
+export interface MembershipOptions {
+  url?: string;
+  logger: Logger;
+  /** Defaults to production's. A test injects a short one — sixty seconds does not
+   * fit in a package whose whole wall clock is forty-five, which is why the option
+   * exists at all rather than as a matter of taste. */
+  rereadIntervalMs?: number;
+}
+
+export function createMembership({
+  url = process.env["RELAY_REDIS_URL"] ?? DEFAULT_REDIS_URL,
+  logger,
+  rereadIntervalMs = DEFAULT_REREAD_INTERVAL_MS,
+}: MembershipOptions): Membership {
+  // THE SUBSCRIBER KEEPS IOREDIS'S DEFAULT RETRY, unlike presence's command client.
+  // It MUST reconnect when the store comes back, which is what "the next change
+  // arrives without a restart" rests on. There is no fail-fast client here to
+  // contrast it with, because there are no commands to fail.
+  const subscriber = new Redis(url);
+
+  // THE STATED REASON IS NFR-OBS-01, NOT PROCESS DEATH. `limits.ts` says a missing
+  // listener kills the gateway; chapter 3.18 measured that against ioredis 6.0.0 and
+  // the process stays alive, printing `[ioredis] Unhandled error event: …` itself.
+  // The accurate reason is that those lines are unstructured and unbounded.
+  subscriber.on("error", (error: unknown) => {
+    logger.log("error", "membership.failed", {
+      op: "connection",
+      error: String(error),
+    });
+  });
+
+  let deliver: (change: MembershipFabric) => void = () => {};
+
+  // Reference-counted, because two members of one channel on one instance must not
+  // unsubscribe each other. `fanout.ts` and `presence.ts` keep the same map over the
+  // same ids, and this is the third.
+  const channelCounts = new Map<string, number>();
+  // And one per USER, which neither of those needed: a user with two connections on
+  // one instance holds one subscription to their own subject.
+  const userCounts = new Map<string, number>();
+  const timers = new Set<NodeJS.Timeout>();
+
+  async function failable<T>(op: string, work: () => Promise<T>): Promise<T | null> {
+    try {
+      return await work();
+    } catch (error) {
+      // Swallowed and logged, never rethrown: a membership-path failure must not fail
+      // a connection, a disconnection, a send, or a message delivery (FR-015). And
+      // the log line is the requirement's evidence — a path that silently does
+      // nothing satisfies "the socket still opened" exactly as well as a working one.
+      logger.log("error", "membership.failed", { op, error: String(error) });
+      return null;
+    }
+  }
+
+  async function count(
+    counts: Map<string, number>,
+    key: string,
+    subject: string,
+    direction: 1 | -1,
+    op: string,
+  ): Promise<void> {
+    if (direction === 1) {
+      const next = (counts.get(key) ?? 0) + 1;
+      counts.set(key, next);
+      if (next === 1) {
+        await failable(op, () => subscriber.subscribe(subject));
+      }
+      return;
+    }
+    // `?? 0` and NOT `?? 1`. Chapter 3.19's presence module used the latter and the
+    // coverage ratchet found the arm unreachable through `session.ts`; here an
+    // unsubscribe for something never subscribed leaves the count at -1 with `?? 0`,
+    // which is wrong, so the absent case returns early and is one of the arms the
+    // phase's own list names.
+    const current = counts.get(key);
+    if (current === undefined) return;
+    const next = current - 1;
+    if (next <= 0) {
+      counts.delete(key);
+      await failable(op, () => subscriber.unsubscribe(subject));
+    } else {
+      counts.set(key, next);
+    }
+  }
+
+  subscriber.on("message", (subject: string, raw: string) => {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      logger.log("error", "membership.invalid_payload", { subject });
+      return;
+    }
+    // Validated on receipt even though the fabric is inside the trust boundary.
+    // `fanout.ts:77-79` states the reason and it is unchanged here: "inside" is one
+    // compromised dependency away from "outside", and a malformed payload must not
+    // reach a client.
+    const change = membershipFabricSchema.safeParse(parsed);
+    if (!change.success) {
+      logger.log("error", "membership.invalid_payload", { subject });
+      return;
+    }
+    deliver(change.data);
+  });
+
+  return {
+    onChange(handler) {
+      deliver = handler;
+    },
+
+    async subscribeChannel(channelId) {
+      await count(
+        channelCounts,
+        channelId,
+        subjectForChannelMembership(channelId),
+        1,
+        "subscribe:channel",
+      );
+    },
+
+    async unsubscribeChannel(channelId) {
+      await count(
+        channelCounts,
+        channelId,
+        subjectForChannelMembership(channelId),
+        -1,
+        "unsubscribe:channel",
+      );
+    },
+
+    async subscribeUser(environmentId, user) {
+      await count(
+        userCounts,
+        `${environmentId}:${user}`,
+        subjectForUserMembership(environmentId, user),
+        1,
+        "subscribe:user",
+      );
+    },
+
+    async unsubscribeUser(environmentId, user) {
+      await count(
+        userCounts,
+        `${environmentId}:${user}`,
+        subjectForUserMembership(environmentId, user),
+        -1,
+        "unsubscribe:user",
+      );
+    },
+
+    watch(reread) {
+      const timer = setInterval(() => {
+        void failable("reread", reread);
+      }, rereadIntervalMs);
+      // `unref` so a pending re-read never holds the process open — the same reason
+      // presence's refresh loop does it.
+      timer.unref();
+      timers.add(timer);
+      return () => {
+        clearInterval(timer);
+        timers.delete(timer);
+      };
+    },
+
+    async close() {
+      // Cleared, or a suite standing up two instances leaks a timer into the next
+      // file. Chapter 3.19 recorded that exact failure.
+      for (const timer of timers) clearInterval(timer);
+      timers.clear();
+      channelCounts.clear();
+      userCounts.clear();
+      subscriber.disconnect();
+    },
+  };
+}
+
+/** Exported for the session layer's ban branch and for the tests, so the sentinel is
+ * one string in one place rather than a `"*"` in three files. */
+export { ALL_CHANNELS };
+```
+
+<Trap title="Written with two Redis clients, and the second was never used">
+`fanout.ts` and `presence.ts` each carry a pair, because a connection in subscriber mode cannot
+run ordinary commands. This module was specified with a pair by analogy — and it runs no
+ordinary commands. Subscribe and unsubscribe are subscriber-mode operations, the re-read is an
+HTTP call, delivery is in-process. The command client was created, wired to an error listener,
+disconnected on close, and used for nothing. Six Redis connections per gateway, not seven.
+</Trap>
+
+Wired in `main.ts` beside the other four:
+
+
+```diff title="services/gateway/src/main.ts"
+@@ -4,6 +4,7 @@ import { createLogger, serve, type Logger } from "@relay/service-kit";
+ import { createApiClient } from "./api-client.js";
+ import { createFanout } from "./fanout.js";
+ import { createGatewayLimits } from "./limits.js";
++import { createMembership } from "./membership.js";
+ import { createPresence } from "./presence.js";
+ import { attachSessions } from "./session.js";
+ 
+@@ -49,6 +50,12 @@ export function createServer(logger?: Logger) {
+   // rather than inside `attachSessions` so the tests that call that function
+   // directly stay Redis-free, and so its close has an owner.
+   const presence = createPresence({ logger: log });
++  // Chapter 3.20. The SIXTH Redis client, and only one where presence needed two:
++  // this module subscribes and never runs a command, so there is nothing a
++  // subscriber-mode connection would refuse. Created here rather than inside
++  // `attachSessions` so the tests that call that function directly stay Redis-free,
++  // and so its close has an owner.
++  const membership = createMembership({ logger: log });
+   // Chapter 3.11. THE FIRST SECRET THIS SERVICE HAS EVER HELD, and it is not a
+   // signing secret: chapter 3.2's claim that "the gateway holds no signing
+   // secret" is untouched, because this one verifies nothing and signs nothing.
+@@ -75,6 +82,7 @@ export function createServer(logger?: Logger) {
+     fanout,
+     limits,
+     presence,
++    membership,
+     // Overridable so `meter.itest.ts` can drive a spawned gateway without
+     // waiting a real minute per assertion. The two tests there are the ones an
+     // in-process gateway cannot run — a signal has to arrive at a process — and
+@@ -98,6 +106,7 @@ export function createServer(logger?: Logger) {
+     await fanout.close();
+     await limits.close();
+     await presence.close();
++    await membership.close();
+   }
+   return Object.assign(server, { shutdown });
+ }
+```
+
+```diff title="packages/protocol/src/index.ts"
+@@ -11,3 +11,4 @@ export * from "./codes.js";
+ export * from "./internal.js";
+ export * from "./fanout.js";
+ export * from "./presence.js";
++export * from "./membership.js";
+```
+
+## Send, then cut — and the ordering that turned out not to be the requirement
+
+FR-008 says the removed user is told, and told *before* the cut. The session layer:
+
+```text title="services/gateway/src/session.ts (excerpt)"
+    for (const connection of subject) {
+      // SEND, THEN CUT. Reversing these two statements is the whole of FR-008, and
+      // T065 proves the ordering test bites by removing this line and watching it
+      // fail.
+      send(connection.socket, frame);
+      if (change.change !== "removed") continue;
+```
+
+That comment is wrong, and the task list that produced it was wrong in the same way. The proof
+was run — the two statements were swapped and the suite re-run — and **all twenty-two tests
+stayed green.** The notice goes to a socket reference the function already holds; the cut only
+affects future fabric routing. Swapping them changes nothing any client can observe.
+
+What FR-008 actually forbids is one line further out. `registry.subscribersOf(channel)` is how
+the removed user is found — so cutting them from `channelIds` first removes them from their own
+notice's audience. They are revoked and never told. That implementation was built too, and the
+first test in the file failed in five seconds with no notice at all.
+
+<Trap title="An ordering requirement is a claim about an observable difference">
+This chapter wrote two of them and neither survived its own proof. The second was the addition
+path: subscribe, then insert into `channelIds`, because the reverse "opens a window where
+`registry.subscribersOf` returns a connection for a channel this instance is not yet receiving".
+
+Widening that window to 1.5 seconds with a delayed `fanout.subscribe` and publishing inside it
+produced byte-identical results under both orders. `subscribersOf` returning the connection
+changes nothing while the *instance* is not subscribed: the frame never reaches the process.
+Both orders lose the message.
+
+Both were found by running the proof the task itself asked for. Neither would have been found by
+reading. **When a task says "the ordering is the requirement", it is claiming an observable
+difference — and that claim needs falsifying before the test is written, not after.**
+</Trap>
+
+The removal path in full, and the four things it touches:
+
+
+```diff title="services/gateway/src/session.ts"
+@@ -3,6 +3,7 @@ import type { IncomingMessage, Server } from "node:http";
+ import type { Duplex } from "node:stream";
+ 
+ import {
++  ALL_CHANNELS,
+   CLOSE_CODES,
+   docsUrl,
+   frameSchema,
+@@ -10,6 +11,7 @@ import {
+   type Frame,
+   type Message,
+   isErrorCode,
++  type MembershipFabric,
+   type PresenceFabric,
+ } from "@relay/protocol";
+ import { newRequestId, type Logger } from "@relay/service-kit";
+@@ -20,6 +22,7 @@ import { authenticate, type Identity } from "./auth.js";
+ import type { Fanout } from "./fanout.js";
+ import type { Decision, GatewayLimits } from "./limits.js";
+ import { createMeter, METER_INTERVAL_MS, type Meter } from "./meter.js";
++import { type Membership } from "./membership.js";
+ import { type Presence } from "./presence.js";
+ import { Registry, type Connection } from "./registry.js";
+ import {
+@@ -150,6 +153,11 @@ export interface SessionServerOptions {
+    * server that refused to start without one would be a worse default than a
+    * presence-less one. `main.ts` always supplies it. */
+   presence?: Presence;
++  /** Chapter 3.20. Optional for the same four reasons, and one more that is this
++   * chapter's own: without it a connection's membership is what it was at connect,
++   * which is the state FR-RTM-10 has been unmet in since 2.6. A gateway built
++   * without this is not broken — it is the gateway this chapter starts from. */
++  membership?: Membership;
+ }
+ 
+ // THE FOUR PRESENCE TIMINGS ARE NOT HERE, and an earlier draft of this chapter put
+@@ -174,6 +182,7 @@ export function attachSessions({
+   limits,
+   meterIntervalMs = METER_INTERVAL_MS,
+   presence,
++  membership,
+ }: SessionServerOptions): {
+   registry: Registry;
+   meter: Meter;
+@@ -239,6 +248,239 @@ export function attachSessions({
+     }
+   }
+   presence?.onTransition(deliverPresence);
++
++  /** A membership change arriving from its own fabric (chapter 3.20, FR-RTM-05,
++   * FR-RTM-10).
++   *
++   * `deliverPresence`'s path rather than `deliver`'s, for its reason exactly: a
++   * membership change carries no sequence, so it can neither duplicate a backfilled
++   * row nor leave a gap. It consults neither `connection.phase` nor
++   * `connection.marks` (FR-030) — and here that is not merely harmless but required,
++   * because a notice put into the resume buffer either arrives after the cut-off or
++   * is dropped by the filter this same function installs three lines below.
++   *
++   * MEMBERS, AND THE SUBJECT LAST. The channel's remaining members are told, and the
++   * removed user is told too — as the last frame that channel will ever produce for
++   * them. The ordering is the requirement (FR-008): cut-then-send delivers a notice
++   * to a client whose membership no longer grants access, and the frame is then the
++   * one thing the cut was supposed to stop. */
++  function deliverMembership(change: MembershipFabric): void {
++    // A BAN ARRIVES AS ONE CHANGE AND LEAVES AS N (US4, T091). `channel` is the
++    // all-channels sentinel, which exists on the fabric and in this module's log
++    // lines and **never on the wire**: a client receives exactly the frames N
++    // individual removals would have produced, and never a channel id of `"*"`.
++    //
++    // The expansion is here rather than in the api because the api cannot do it. It
++    // knows which channels the ban revoked; it does not know which of them any given
++    // connection on any given instance holds, and that is the set a client's frames
++    // have to match.
++    //
++    // Recursion of depth one: each inner change names a real channel, so it takes
++    // the branch below and never this one.
++    if (change.channel === ALL_CHANNELS) {
++      for (const connection of registry.connectionsFor(change.user)) {
++        if (connection.identity.environmentId !== change.environment) {
++          logger.log("error", "membership.failed", {
++            op: "environment_mismatch",
++            connection_id: connection.id,
++            channel: change.channel,
++          });
++          continue;
++        }
++        // A COPY, because the recursion below deletes from `channelIds` and
++        // iterating a Set while deleting from it skips entries. The bug that avoids
++        // is a ban which revokes every other channel.
++        for (const channelId of [...connection.channelIds]) {
++          deliverMembership({ ...change, channel: channelId });
++        }
++      }
++      // NO LINE OF ITS OWN. The per-channel `membership.applied` lines below say
++      // what happened and how many times; a summary beside them would be a fifth
++      // name in a vocabulary FR-032 keeps closed, saying nothing the others do not.
++      return;
++    }
++
++    // TWO LOOKUPS, AND THE ASYMMETRY IS RESEARCH R1'S, NOT AN OPTIMISATION.
++    //
++    // On a REMOVAL, `subscribersOf(channel)` is the whole audience: the removed user
++    // is still in `channelIds` at this instant, which is exactly why one publish on
++    // the channel's subject reaches both the remaining members and the subject.
++    //
++    // On an ADDITION it cannot be. The new member is not in that channel yet — that
++    // is what is changing — so `subscribersOf` would return every member EXCEPT the
++    // one the frame is about, and the person being added would never be told. They
++    // are found by who they are: `connectionsFor(user)`, which is why the addition
++    // needs a principal-addressed subject to arrive on in the first place.
++    //
++    // Written first with one lookup for both, and the addition path silently told
++    // everyone but its subject.
++    const audience =
++      change.change === "added"
++        ? [
++            ...registry.subscribersOf(change.channel),
++            ...registry.connectionsFor(change.user),
++          ]
++        : registry.subscribersOf(change.channel);
++    const subject: Connection[] = [];
++    const others: Connection[] = [];
++    const seen = new Set<string>();
++    for (const connection of audience) {
++      // The two lists overlap when a member of the channel is also the subject —
++      // impossible for a genuine addition, and cheap insurance against telling
++      // somebody twice if it ever is.
++      if (seen.has(connection.id)) continue;
++      seen.add(connection.id);
++      // PRINCIPLE I IS STRUCTURAL HERE (FR-006). The environment compared is the
++      // CONNECTION's, established at the door by the api, never the payload's. A
++      // gateway that acted on a payload's environment id would be one compromised
++      // publisher away from cross-tenant delivery — the exact shape the restriction
++      // exists to prevent.
++      if (connection.identity.environmentId !== change.environment) {
++        logger.log("error", "membership.failed", {
++          op: "environment_mismatch",
++          connection_id: connection.id,
++          channel: change.channel,
++        });
++        continue;
++      }
++      if (connection.identity.userExternalId === change.user) subject.push(connection);
++      else others.push(connection);
++    }
++
++    const frame = {
++      type: "membership.changed" as const,
++      payload: { channel: change.channel, user: change.user, change: change.change },
++    };
++    for (const connection of others) send(connection.socket, frame);
++
++    for (const connection of subject) {
++      // SEND, THEN CUT. Reversing these two statements is the whole of FR-008, and
++      // T065 proves the ordering test bites by removing this line and watching it
++      // fail.
++      if (change.change === "added") {
++        // SUBSCRIBE, THEN INSERT, THEN SEND (T080), and the order is the whole of
++        // it. `registry.subscribersOf` reads `channelIds`, so inserting first opens
++        // a window in which this connection is a subscriber of a channel the
++        // instance is not yet receiving — and a message published in that window is
++        // silently lost rather than refused. T086 proves this ordering bites.
++        void Promise.all([
++          fanout?.subscribe(change.channel),
++          presence?.subscribe(change.channel),
++          membership?.subscribeChannel(change.channel),
++        ]).then(
++          () => {
++            connection.channelIds.add(change.channel);
++            send(connection.socket, frame);
++            logger.log("info", "membership.applied", {
++              change: "added",
++              connection_id: connection.id,
++              channel: change.channel,
++              user: change.user,
++            });
++          },
++          (error: unknown) => {
++            // Swallowed and logged (FR-015). An addition whose subscribe failed
++            // leaves the connection as it was: not a member, not told, and repaired
++            // by the backstop rather than by a half-applied state.
++            logger.log("error", "membership.failed", {
++              op: "subscribe:added",
++              channel: change.channel,
++              error: String(error),
++            });
++          },
++        );
++        continue;
++      }
++      send(connection.socket, frame);
++      if (change.change !== "removed") continue;
++
++      // THE FIRST MUTATION OF THIS SET AFTER THE CONNECTION EXISTS. Every reader of
++      // `channelIds` has assumed it immutable since chapter 2.5.
++      connection.channelIds.delete(change.channel);
++      // AND THE BUFFER IS ONE OF THOSE READERS (FR-029). `flushable(buffer, marks)`
++      // filters on `frame.seq` and on nothing else, so a removal landing mid-resume
++      // would unsubscribe the channel and then flush its buffered messages anyway —
++      // access revoked and the backlog delivered in the same act.
++      connection.buffer = connection.buffer.filter(
++        (message) => message.channel !== change.channel,
++      );
++      // DECREMENT, NEVER RELEASE (research R6). This is the first caller of these
++      // counters that is not a connection's own open or close path, and the sharp
++      // test is that a SECOND local member of the same channel still receives —
++      // which an implementation that unsubscribed the channel outright would fail.
++      void Promise.all([
++        fanout?.unsubscribe(change.channel).catch((error: unknown) => {
++          logger.log("error", "fanout.unsubscribe_failed", {
++            channel: change.channel,
++            error: String(error),
++          });
++        }),
++        presence?.unsubscribe(change.channel).catch((error: unknown) => {
++          logger.log("error", "presence.failed", {
++            op: "unsubscribe",
++            channel: change.channel,
++            error: String(error),
++          });
++        }),
++        membership?.unsubscribeChannel(change.channel),
++      ]);
++      // THE WORKING PATH SAYS SOMETHING (FR-031's argument, applied to the delivery
++      // half). `membership.published` is the api's line and means "it went onto the
++      // fabric"; this one means "it took effect on a connection", which is the event
++      // an operator actually wants when a customer says access did not change.
++      //
++      // ONE NAME CARRYING ITS DIRECTION rather than a `granted`/`revoked` pair: the
++      // fabric's own payload spells the direction in a field, and two names would be
++      // two more entries in a closed vocabulary for one event.
++      logger.log("info", "membership.applied", {
++        change: "removed",
++        connection_id: connection.id,
++        channel: change.channel,
++        user: change.user,
++      });
++    }
++  }
++  membership?.onChange(deliverMembership);
++
++  /** The backstop (chapter 3.20, FR-018, constitution IV).
++   *
++   * **CONSTITUTION IV PERMITS A LOSSY FABRIC** *"precisely because durability and
++   * resume live in PostgreSQL sequences and cursors"*, and requires any new delivery
++   * mechanism to preserve that recovery property. A message recovers through its
++   * resume cursor. **A revocation has none** — it is not in a stream, it has no
++   * sequence, and a client cannot ask for the ones it missed. This is what stands in
++   * for the cursor: the truth is re-read on a timer and the difference applied.
++   *
++   * **ONE ACT, TWO TRIGGERS.** Every difference goes through `deliverMembership`,
++   * the same function a published change takes, so the backstop cannot drift from
++   * the fast path — a second application path would be a second set of rules about
++   * buffers, reference counts and frame ordering, kept in step by hope.
++   *
++   * The client cannot tell which trigger fired, and that is correct: a
++   * `membership.changed` frame means the same thing either way. */
++  async function reread(connection: Connection): Promise<void> {
++    const actual = new Set(await api.memberships(connection.identity));
++    const held = new Set(connection.channelIds);
++
++    for (const channelId of held) {
++      if (actual.has(channelId)) continue;
++      deliverMembership({
++        environment: connection.identity.environmentId,
++        channel: channelId,
++        user: connection.identity.userExternalId,
++        change: "removed",
++      });
++    }
++    for (const channelId of actual) {
++      if (held.has(channelId)) continue;
++      deliverMembership({
++        environment: connection.identity.environmentId,
++        channel: channelId,
++        user: connection.identity.userExternalId,
++        change: "added",
++      });
++    }
++  }
+   // noServer: the upgrade is handled by hand so the token can be checked
+   // BEFORE the handshake completes. Letting ws own the upgrade would mean
+   // rejecting a socket that already exists (EIR-WS-05 wants the close code
+@@ -407,8 +649,30 @@ export function attachSessions({
+         // carries two subscriptions. `ioredis` takes a variadic `subscribe`, so the
+         // count doubles and the round trips do not.
+         presence?.subscribe(channelId),
++        // Chapter 3.20, and the third. Without this line the membership fabric has
++        // no receiver at all — the publisher publishes, the module parses nothing,
++        // and every test of the revocation path fails for a reason that looks like a
++        // broken fabric. **No task owned it**: T054 covers the release on a
++        // revocation and T079 covers the user's own subject, and the ordinary open
++        // path fell between them.
++        membership?.subscribeChannel(channelId),
+       ]),
+     );
++    // THE BACKSTOP'S TIMER, one per connection and cancelled at close. Registered
++    // here rather than once per instance because the re-read is per principal: the
++    // api answers for the token this connection presented, and one instance-wide
++    // timer would have to loop the registry and would still make one request per
++    // connection. `watch` returns its own cancel for that reason.
++    const stopWatching = membership?.watch(() => reread(connection));
++    // T079. THE PRINCIPAL'S OWN SUBJECT, reference-counted per user rather than per
++    // channel — the first subscription in this gateway keyed on who someone is
++    // instead of what they can hear. An ADDITION cannot ride the channel's subject:
++    // this instance is not subscribed to a channel the user is about to join, which
++    // is the asymmetry research R1 names and the reason this grammar has two shapes.
++    void membership?.subscribeUser(
++      identity.environmentId,
++      identity.userExternalId,
++    );
+     // AFTER `registry.add`, so "is this the user's first connection here?" is asked
+     // of a registry that already contains it. The close handler needs the opposite
+     // and gets it three lines apart — see the note there.
+@@ -471,6 +735,17 @@ export function attachSessions({
+           connection.channelIds,
+         );
+       }
++      stopWatching?.();
++      // RELEASED PER CONNECTION, NOT PER USER, and the difference from the block
++      // above is deliberate. Presence asks "was that the user's last connection
++      // here?" because a transition is about the person. This is a reference count
++      // over the same subject, so the second connection's release is exactly what
++      // decrements it to zero — and putting it inside the `=== 0` branch would
++      // decrement once for two increments.
++      void membership?.unsubscribeUser(
++        connection.identity.environmentId,
++        connection.identity.userExternalId,
++      );
+       // Releasing a subscription can fail — a broker that went away, or a
+       // fabric already closed while sockets were still draining — and a
+       // close handler is the last place that should throw. The subscribe
+@@ -495,6 +770,10 @@ export function attachSessions({
+               error: String(error),
+             });
+           }),
++          // The membership module swallows and logs its own failures internally, so
++          // there is no `.catch` to add here — `failable()` in `membership.ts` is
++          // where that decision lives, and duplicating it would log twice.
++          membership?.unsubscribeChannel(channelId),
+         ]),
+       );
+       logger.log("info", "connection.closed", {
+```
+
+<Trap title="The resume buffer is the reader nobody expects">
+`flushable(buffer, marks)` filters on `frame.seq` and on nothing else. A removal landing
+mid-resume would unsubscribe the channel and then flush its buffered messages anyway — access
+revoked and the backlog delivered in the same act.
+
+Its test passed with the filter deleted, twice, for two unrelated reasons. First the presented
+cursor equalled the buffered frame's sequence, so the resume marks dropped it and the test was
+about the resume under a title about revocation. Then the connection was not buffering at all:
+that window is one backfill round trip, about twenty milliseconds, and the removal always landed
+after the flush. Slowing the *fabric* does not help — a failed fabric confirmation calls
+`degrade()`, which empties the buffer itself. The seam that works is the `ApiClient`, which
+`attachSessions` already takes as a parameter.
+</Trap>
+
+## A revocation has no cursor
+
+ADR-07 permits this fabric to lose frames, and states its reason plainly: durability lives in
+Postgres, and a client that misses a frame sees the next frame's sequence, detects the gap, and
+refetches. Given that machinery, a lost pub/sub frame is a lost WiFi packet.
+
+**A revocation has none of that machinery.** No sequence, so no gap to detect. Nothing to
+refetch — there is no "the revocations I missed" query, and there could not be. A dropped
+revocation is not a delayed frame; it is a client that keeps receiving a channel it was removed
+from, indefinitely, which is the failure this chapter exists to fix.
+
+Constitution IV requires any new delivery mechanism to preserve the recovery property. So the
+truth is re-read on a timer, and the difference is applied through the same function a published
+change takes:
+
+```text title="services/gateway/src/session.ts (excerpt)"
+  async function reread(connection: Connection): Promise<void> {
+    const actual = new Set(await api.memberships(connection.identity));
+    const held = new Set(connection.channelIds);
+
+    for (const channelId of held) {
+      if (actual.has(channelId)) continue;
+      deliverMembership({ … change: "removed" });
+    }
+    for (const channelId of actual) {
+      if (held.has(channelId)) continue;
+      deliverMembership({ … change: "added" });
+    }
+  }
+```
+
+One act, two triggers. A second application path would be a second set of rules about buffers,
+reference counts and frame ordering, kept in step by hope.
+
+<Figure caption="The backstop: what a re-read is for a payload with no cursor" code={figBackstop} />
+
+The route it reads has been described by the protocol package since chapter 3.2 and served by
+nothing since:
+
+
+```ts title="services/api/src/internal/memberships.controller.ts"
+import {
+  Controller,
+  Get,
+  HttpCode,
+  Req,
+  UnauthorizedException,
+  UseGuards,
+} from "@nestjs/common";
+
+import type { InternalMembershipsResponse } from "@relay/protocol";
+
+import { Accepts, CredentialGuard } from "../auth/credential.guard";
+import type { RequestWithPrincipal } from "../auth/principal";
+import { Repository } from "../db/repository";
+
+// `GET /internal/memberships` (chapter 3.20, FR-017) — REVIVED, not invented.
+//
+// `internalMembershipsResponseSchema` has been exported from
+// `packages/protocol/src/internal.ts` since chapter 3.2 and parsed by nothing. The
+// route it described was replaced that chapter by `POST /internal/session`, which
+// answers identity and memberships in one call at connect — and the schema stayed,
+// with `internalSessionResponseSchema`'s comment two lines below saying it "replaces
+// the memberships response above rather than joining it".
+//
+// **The backstop needs the question this schema asks and not the one `session` asks.**
+// A periodic re-read wants "what may this connection hear, now"; it does not want a
+// fresh identity, a fresh quota decision, a fresh connect policy, or the 402 that
+// `session` can throw when an environment is over its connection allowance. Reusing
+// `session` for the re-read would make a routine refresh capable of failing for a
+// reason that has nothing to do with membership, on a path whose entire job is to be
+// unremarkable.
+//
+// WHY IT IS A GET when `session` is a POST. `session` presents a credential for
+// verification and NFR-SEC-06 forbids a credential in a URL; this presents one in the
+// Authorization header like every other route and reads nothing else. It is a read
+// with no body, so it is a GET.
+//
+// **GET-ONLY IS LOAD-BEARING.** `services/api/src/tenancy/signup.itest.ts:285` POSTs
+// this path with no credential and asserts the status is not 200 and the body carries
+// no `organisation`. A GET-only route answers a POST with 404, so that assertion
+// stands. Registering `ALL`, adding a POST twin, or answering an unauthenticated
+// caller is what would break it — checked as a premise before this file was written,
+// because research R4's first draft claimed the revival would break it and was wrong.
+@Controller("internal")
+@Accepts("user")
+@UseGuards(CredentialGuard)
+export class MembershipsController {
+  constructor(private readonly repo: Repository) {}
+
+  @Get("memberships")
+  @HttpCode(200)
+  async memberships(
+    @Req() req: RequestWithPrincipal,
+  ): Promise<InternalMembershipsResponse> {
+    const principal = req.principal;
+    // The guard has already refused an absent, invalid or wrong-class credential,
+    // so reaching here with anything else is a wiring fault rather than a client
+    // error — `session.controller.ts` says the same about its own narrowing.
+    if (principal?.kind !== "user") {
+      throw new UnauthorizedException("a verified end-user token is required");
+    }
+
+    // A verified token for a user this environment has never seen is a user with no
+    // channels, not an error. 2.5's rule, and the backstop depends on it: a re-read
+    // that threw for a deleted user would turn a routine refresh into a failure the
+    // gateway has to interpret.
+    const user = await this.repo.getUserByExternalId(principal.userExternalId);
+    return {
+      channel_ids: user ? await this.repo.channelsForUser(user.id) : [],
+    };
+  }
+}
+```
+
+```diff title="services/api/src/internal/internal.module.ts"
+@@ -12,6 +12,7 @@ import type { Publisher } from "../outbox/publisher";
+ import { ANALYTICS_PUBLISHER } from "../webhooks/analytics";
+ import { BackfillController } from "./backfill.controller";
+ import { InternalController } from "./internal.controller";
++import { MembershipsController } from "./memberships.controller";
+ import { DispatchController } from "./dispatch.controller";
+ import { SessionController } from "./session.controller";
+ import { UsageController } from "./usage.controller";
+@@ -33,6 +34,10 @@ import { UsageController } from "./usage.controller";
+     InternalController,
+     BackfillController,
+     SessionController,
++    // Chapter 3.20. Registered here for the reason the comment below `UsageController`
++    // gives: a controller nobody registers is a route that does not exist, and chapter
++    // 3.10's third analysis pass found exactly that.
++    MembershipsController,
+     DispatchController,
+     // Chapter 3.11. Registered HERE and not in `app.module.ts`, which carries
+     // only `HealthController` and already imports this module — a controller
+```
+
+```diff title="services/gateway/src/api-client.ts"
+@@ -1,5 +1,6 @@
+ import {
+   internalBackfillResponseSchema,
++  internalMembershipsResponseSchema,
+   internalSendResponseSchema,
+   internalSessionResponseSchema,
+   internalUsageReportResponseSchema,
+@@ -80,6 +81,12 @@ export interface ApiClient {
+   session(
+     token: string,
+   ): Promise<InternalSessionResponse | { quotaExceeded: string } | null>;
++  /** Chapter 3.20's backstop: what this connection may hear, now.
++   *
++   * The one question a periodic re-read has, asked of the route that answers only
++   * it. `session()` would answer this too and three other things, one of which can
++   * refuse. */
++  memberships(identity: Identity): Promise<string[]>;
+   /** Resume backfill (chapter 2.7): everything past the cursors, per
+    * channel, already shaped as wire frames. */
+   backfill(
+@@ -184,6 +191,25 @@ export function createApiClient(
+       }
+       return parse(res, internalSessionResponseSchema, "session");
+     },
++    async memberships(identity) {
++      // Chapter 3.20's backstop. A GET, unlike every other method here: it presents
++      // the token in a header and reads, so there is no body and nothing to POST.
++      //
++      // NOT `session()`. That route answers identity, memberships, limits AND a
++      // connect policy that can throw a 402 when an environment is over its monthly
++      // allowance — so re-reading through it would let a routine refresh fail for a
++      // reason that has nothing to do with membership. This route asks the one
++      // question the backstop has (FR-017).
++      const res = await fetch(`${baseUrl}/internal/memberships`, {
++        headers: headers(identity),
++      });
++      const body = await parse(
++        res,
++        internalMembershipsResponseSchema,
++        "memberships",
++      );
++      return body.channel_ids;
++    },
+     async backfill(identity, cursors) {
+       const res = await fetch(`${baseUrl}/internal/backfill`, {
+         method: "POST",
+```
+
+<Why title="Sixty seconds, and the arithmetic behind it">
+NFR-SCL-01 budgets 10,000 connections per instance, and the re-read is per connection because
+the api answers for the token that connection presented.
+
+    60 s   10,000 / 60   =   167 requests per second per instance
+     5 s   10,000 / 5    = 2,000 requests per second per instance
+
+Two thousand a second is not a backstop, it is a poll. And the mechanism it backs up already
+meets the clause in 34–88 milliseconds measured. **Five seconds and sixty seconds are budgets
+for different events**: five is what a working mechanism gets to take effect; sixty bounds a
+mechanism that did not run at all. Reading them as one number is how a backstop becomes a poll.
+</Why>
+
+## What the clause is, honestly
+
+    on the happy path      34 ms, 88 ms, 87 ms      budget 5,000 ms
+    with the fabric lost   one backstop interval    60,000 ms
+
+FR-RTM-10 is met. The publish carries it at fifty-seven times the margin. Under fabric loss the
+revocation still lands — through the re-read, within sixty seconds rather than five, which
+**exceeds the clause by fifty-five seconds**.
+
+That sentence is in the chapter rather than in an interval nobody wrote down. The revocation is
+guaranteed; what is bounded is how late it can be. No clause in the SRS bounds a post-loss
+revocation, and if one is ever written, sixty seconds is the number it has to argue with.
+
+<Checkpoint>
+```bash
+docker compose up -d --wait
+pnpm --filter @relay/gateway test:integration
+```
+Forty-five tests in `membership.itest.ts`. Remove `membership?.watch(…)` from `session.ts` and
+exactly four of them fail — the four that are about the backstop.
+</Checkpoint>
+
+## What this chapter does not do
+
+**A dropped publish costs sixty seconds, not five.** Stated above and worth repeating here,
+because it is the one number in this chapter that a reader would otherwise have to derive.
+
+**A role change publishes nothing.** Promoting a member to moderator is a membership *write* and
+not a membership *change*: the person is still a member and their access has not moved.
+FR-WHK-02 names two event types and neither is `channel.member_role_changed`. A test asserts the
+silence, because "no frame arrived" is otherwise indistinguishable from a broken publisher.
+
+**FR-WHK-02 is not met.** It names eight event types. Before this chapter one had a producer;
+now three do. **No endpoint subscribes to either new one** — the webhook dispatcher delivers
+what it is subscribed to, and nothing is subscribed to a membership event yet. Two of eight
+names gaining producers is progress against a clause that stays open.
+
+**Three of FR-RTM-05's six frame kinds still have no producer**, and the reasons differ.
+`message.updated` and `message.deleted` wait on an edit and delete surface that does not exist —
+the routes are not built, so there is nothing to announce. `typing` is different: it is the one
+kind that could genuinely reuse `chan:{channel_id}` rather than needing a fourth grammar,
+because it is per channel, ephemeral, and carries no membership question. That is what makes it
+a chapter of its own rather than a paragraph in this one — FR-RTM-08 comes with a five-second
+expiry, a rate limit, and the question of whether a typing indicator is worth a Redis key.
+
+**FR-RTM-09's five-connection cap stays unbuilt.** Its specified shape does not work:
+`conn:{env}:{user}` is a Redis *set* with one TTL, and a TTL is per key rather than per member —
+so one instance refreshing the key keeps a dead instance's entry alive for ever. A sorted set
+scored by heartbeat and pruned on read is the correct version. That is chapter 3.19's
+`gaps.md` item 6, and it is a design change rather than an implementation.
+
+<ForwardRef>
+The typing indicator is the next of FR-RTM-05's kinds to get a producer, and the first that can
+reuse a grammar rather than adding one.
+</ForwardRef>
+
+## What the instruments caught
+
+The derived target list fired for the sixth time in three features. Adding
+`GET /internal/memberships` produced three failures naming the route by hand:
+
+```text title="services/api/src/isolation/targets.itest.ts (excerpt)"
+classifies every derived target exactly once   unclassified: [GET /internal/memberships]
+has grown from chapter 3.12's 24 …             expected 38 to be 39
+leaves nothing exempt by omission              expected 39 to be 38
+```
+
+
+```diff title="services/api/src/isolation/targets.ts"
+@@ -219,6 +219,19 @@ export const CLASSIFICATIONS: readonly Classification[] = [
+   { method: "POST", path: "/internal/session", accepts: "user", shape: "write" },
+   { method: "POST", path: "/internal/backfill", accepts: "user", shape: "write" },
+ 
++  // ── read, internal, end-user token (chapter 3.20) ────────────────────────────
++  //
++  // THE ONLY INTERNAL ROUTE THAT IS NOT A `write`, and the shape is the honest one:
++  // the backstop asks what this connection may hear and changes nothing. `session`
++  // and `backfill` are POSTs classified as writes because they present a credential
++  // in a body-carrying request; this presents one in a header and reads.
++  //
++  // `read` and not `list`: `list` is a collection endpoint a foreign id can be
++  // paged against, and this takes no identifier at all — the subject is the token's
++  // own principal, which is what makes the foreign-id attack inapplicable and the
++  // foreign-CREDENTIAL attack the one that matters.
++  { method: "GET", path: "/internal/memberships", accepts: "user", shape: "read" },
++
+   // ── write, internal, platform credential: carries no environment ────────────
+   { method: "POST", path: "/internal/usage/connections", accepts: "platform", shape: "write" },
+   { method: "POST", path: "/internal/dispatch/expand", accepts: "platform", shape: "write" },
+```
+
+```diff title="services/api/src/isolation/targets.itest.ts"
+@@ -108,18 +108,26 @@ describe("the gauntlet's target list derives from the running application", () =
+   // ── SC-014: THE COUNT MOVED BY EXACTLY WHAT THIS FEATURE ADDS ──────────────
+   //
+   // Chapter 3.12 closed at **24** derived targets, recorded in
+-  // `specs/033-chapter-3-12/baseline.txt` and re-measured at the start of this
+-  // feature (T008). Chapters 3.15 and 3.16 add fourteen routes, so the closing
+-  // number is 38.
++  // `specs/033-chapter-3-12/baseline.txt` and re-measured at the start of that
++  // feature. Chapters 3.15 and 3.16 add fourteen routes, taking it to 38, and
++  // chapter 3.20 revives `GET /internal/memberships` for the membership backstop
++  // — one route, so 39.
+   //
+   // A NUMBER RATHER THAN A DELTA, because a delta cannot fail: `after - before`
+   // computed from the same run is an identity. This is the figure a reader can
+-  // check against the route table, and the route table lists which fourteen.
+-  it("has grown from chapter 3.12's 24 by exactly the routes this feature adds", () => {
+-    // The routes built so far. This assertion moves ONE line per phase, which is
+-    // the point: a phase that adds a route and forgets to classify it fails the
+-    // test above, and a phase that adds a route nobody planned fails this one.
+-    const BUILT_SO_FAR = 14;
++  // check against the route table, and the route table lists which routes.
++  //
++  // **THIS TEST DID ITS JOB AGAIN.** Chapter 3.20 added its route, ran this file,
++  // and got three failures naming the route by hand — unclassified, 38 against 39,
++  // and the entry count. CLAUDE.md calls the derived list the highest-yield check
++  // in the repository on the strength of five previous occasions; this is the
++  // sixth, and the first where the route being added was a REVIVAL of one the
++  // classification list had never carried.
++  it("has grown from chapter 3.12's 24 by exactly the routes since", () => {
++    // This assertion moves ONE line per phase, which is the point: a phase that
++    // adds a route and forgets to classify it fails the test above, and a phase
++    // that adds a route nobody planned fails this one.
++    const BUILT_SO_FAR = 15;
+     expect(derived.length).toBe(24 + BUILT_SO_FAR);
+   });
+ 
+```
+
+And the fence chain caught eighteen files this chapter edited that earlier chapters already
+fence — before a word of this chapter was written.
+
+<Trap title="A published sentence stopped being true, and no checker reads prose">
+ADR-07's deep dive says: *"a lost pub/sub frame is indistinguishable from a lost WiFi packet, and
+both heal identically."* True of every payload that fabric carried when it was written, and
+false of the one this chapter adds.
+
+The load-bearing words are "given that machinery" — and it names machinery a revocation does not
+have. The record is amended rather than deleted: the fabric stays lossy for the reason it gives,
+and the general claim is retired. **Anything new on this fabric has to answer "what recovers it?"
+for itself.**
+
+`git diff` finds a changed sentence. Nothing finds a sentence that stopped being true because
+the code moved underneath it.
+</Trap>
+
+The remaining files this chapter touched, fenced so the chain stays whole:
+
+
+```diff title="services/gateway/src/session.test.ts"
+@@ -66,6 +66,11 @@ function stubApi(overrides: Partial<ApiClient> = {}): ApiClient {
+     // it is the right default here: every test in this file is about the socket,
+     // and a meter that reported would only add a call nobody asserts on.
+     reportUsage: async () => null,
++    // Chapter 3.20's backstop reads this. The default answers what the session
++    // above says, so a stub that never overrides it is a stub whose re-read agrees
++    // with its own connect — which is the state every test in this file that is not
++    // about membership wants.
++    memberships: async () => [CHANNEL],
+     ...overrides,
+   };
+ }
+```
+
+```diff title="services/api/src/outbox/outbox.itest.ts"
+@@ -292,8 +292,15 @@ describe("the outbox", () => {
+     expect(messages.rows[0]!.n).toBeGreaterThan(0);
+ 
+     const owed = (await db.execute(
++      // SCOPED TO THE MESSAGE'S EVENT (chapter 3.20). This counted every row in the
++      // environment, which was the same question while `message.created` was the only
++      // type. The walk's own seed calls `addMember`, and that writes a
++      // `channel.member_added` row now — a correctly written one, for a state change
++      // this invariant is not about. The assertion means "the message's event is
++      // missing" and now says so.
+       `SELECT count(*)::int AS n FROM outbox
+-        WHERE payload->>'environment_id' = '${environmentId}'`,
++        WHERE payload->>'environment_id' = '${environmentId}'
++          AND payload->>'type' = 'message.created'`,
+     )) as unknown as { rows: { n: number }[] };
+     expect(owed.rows[0]!.n).toBe(0);
+   }, 60_000);
+@@ -305,8 +312,12 @@ describe("the outbox", () => {
+     const environmentId = await killInTheGap("outbox");
+ 
+     const rows = (await db.execute(
++      // Scoped for the reason invariant 6 above is: the walk seeds a membership and
++      // `ORDER BY id` put that row first, so the subject assertion below compared the
++      // seed against the message it is about.
+       `SELECT id, subject, payload FROM outbox
+         WHERE published_at IS NULL AND payload->>'environment_id' = '${environmentId}'
++          AND payload->>'type' = 'message.created'
+         ORDER BY id`,
+     )) as unknown as {
+       rows: { id: number; subject: string; payload: { id: string } }[];
+@@ -505,3 +516,139 @@ async function outboxDepthFor(db: Db, environmentId: string): Promise<number> {
+   )) as unknown as { rows: { pending: number }[] };
+   return result.rows[0]?.pending ?? 0;
+ }
++
++// Chapter 3.20. The membership rows, and the transaction that has to hold them.
++//
++// THIS PHASE SHIPS BEFORE ANY PUBLISH EXISTS, which is the ordering constitution II
++// forces: "publish-after-commit without the outbox is forbidden". A phase that built
++// the fabric first would ship the violation and then repair it, and the repair would
++// read as a refactor rather than as the fix it is.
++describe("the membership rows (chapter 3.20, FR-WHK-02)", () => {
++  let db: Db;
++  let repo: Repository;
++  let envId: string;
++  let channelId: string;
++  let mai: { id: string };
++  let hai: { id: string };
++
++  const rowsFor = async (type: string): Promise<Array<Record<string, unknown>>> => {
++    const result = (await db.execute(
++      // Read straight out of the table rather than through the relay: this phase is
++      // about what the transaction wrote, not about what a consumer eventually sees.
++      `select payload from outbox where payload->>'environment_id' = '${envId}'
++         and payload->>'type' = '${type}' order by id`,
++    )) as { rows: Array<{ payload: Record<string, unknown> }> };
++    return result.rows.map((r) => r.payload);
++  };
++
++  beforeAll(async () => {
++    db = createDb(createPool());
++    const env = await createEnvironment(db, {
++      name: `membership-outbox-${Date.now()}`,
++    });
++    envId = env.id;
++    repo = new Repository(db, env.id);
++    mai = await repo.createUser("mai", "Mai");
++    hai = await repo.createUser("hai", "Hai");
++    channelId = (await repo.createChannel("ops", "public")).id;
++  }, 60_000);
++
++  it("writes one row per added member, and none for a repeat", async () => {
++    // ZERO BEFORE THE WRITE, asserted in the same test. The phase's whole subject is
++    // a row that did not exist, and counting only afterwards passes against a fixture
++    // that was never clean.
++    expect(await rowsFor("channel.member_added")).toHaveLength(0);
++
++    expect(await repo.addMember(channelId, mai.id)).toBe("added");
++    const after = await rowsFor("channel.member_added");
++    expect(after).toHaveLength(1);
++    expect(after[0]!.data).toEqual({ channel_id: channelId, user: "mai" });
++
++    // THE IDEMPOTENT BRANCH IS THE ONE A READER ASSUMES WORKS. `sendMessage`'s rule
++    // verbatim: a recognised retry returned without writing anything and must consume
++    // no event either, or a client on a flaky link fires a second webhook.
++    expect(await repo.addMember(channelId, mai.id)).toBe("already_a_member");
++    expect(await rowsFor("channel.member_added")).toHaveLength(1);
++  });
++
++  it("carries the external id, never the uuid a customer cannot use", async () => {
++    const rows = await rowsFor("channel.member_added");
++    const data = rows[0]!.data as { user: string };
++    expect(data.user).toBe("mai");
++    expect(data.user).not.toBe(mai.id);
++  });
++
++  it("writes one row per ACTUALLY removed member, not per id asked for", async () => {
++    await repo.addMember(channelId, hai.id);
++    const before = (await rowsFor("channel.member_removed")).length;
++
++    // Three ids: one member, one user who is not a member, one that is no user at
++    // all. The `RETURNING` clause decides, and only the first should produce a row.
++    const ghost = "00000000-0000-4000-8000-000000000000";
++    const outcome = await repo.removeMembers(channelId, [mai.id, ghost, hai.id]);
++    expect(outcome.get(mai.id)).toBe("removed");
++    expect(outcome.get(ghost)).toBe("not_a_member");
++    expect(outcome.get(hai.id)).toBe("removed");
++
++    const rows = await rowsFor("channel.member_removed");
++    expect(rows).toHaveLength(before + 2);
++    expect(rows.slice(before).map((r) => (r.data as { user: string }).user).sort())
++      .toEqual(["hai", "mai"]);
++  });
++
++  it("writes nothing at all for a role change", async () => {
++    await repo.addMember(channelId, mai.id);
++    const added = (await rowsFor("channel.member_added")).length;
++    const removed = (await rowsFor("channel.member_removed")).length;
++
++    // `moderator`, not `admin`. `members_role_check` is ('owner','moderator','member')
++    // and `memberships_role_check` — the ORGANISATION one — is ('owner','admin',
++    // 'member'). The schema comment predicts this confusion in as many words and the
++    // first draft of this test made it anyway.
++    expect(await repo.setMemberRole(channelId, mai.id, "moderator")).toBe("set");
++
++    // `membership.changed`'s enum has two members and neither means "role".
++    // A reader who sees add and remove producing events will assume a PATCH does
++    // too; this is where they find out it does not.
++    expect(await rowsFor("channel.member_added")).toHaveLength(added);
++    expect(await rowsFor("channel.member_removed")).toHaveLength(removed);
++  });
++
++  it("writes one removal per channel when a user is banned", async () => {
++    const second = (await repo.createChannel("night-shift", "public")).id;
++    const linh = await repo.createUser("linh", "Linh");
++    await repo.addMember(channelId, linh.id);
++    await repo.addMember(second, linh.id);
++    const before = (await rowsFor("channel.member_removed")).length;
++
++    // FR-WHK-02 NAMES NO EVENT TYPE FOR A BAN, so a ban is recorded as what it is:
++    // a removal from every channel. The alternative was no durable record at all,
++    // which makes the fabric publish beside it exactly the publish-after-commit
++    // constitution II forbids. The FABRIC publish stays one per user.
++    const revoked = await repo.banUser(linh.id);
++    expect(revoked.sort()).toEqual([channelId, second].sort());
++
++    const rows = await rowsFor("channel.member_removed");
++    expect(rows).toHaveLength(before + 2);
++
++    // A RE-BAN CHANGES NO STATE AND MUST EMIT NOTHING. `isNull(users.bannedAt)`
++    // already makes the update touch nothing; without the guard on the returning
++    // rows, every repeat would emit a full set for a state that did not change.
++    expect(await repo.banUser(linh.id)).toEqual([]);
++    expect(await rowsFor("channel.member_removed")).toHaveLength(before + 2);
++  });
++
++  it("keeps the row and the write in one transaction — neither survives alone", async () => {
++    // THE PROPERTY IS SYMMETRIC and only a direction is order-dependent, which is
++    // why this fails the write rather than the insert: `addMember` writes its row
++    // last, so nothing fails after it, and the proof has to come from the other side.
++    //
++    // A channel id that is not a uuid makes the INSERT ... SELECT throw inside the
++    // transaction, after nothing and before everything. What it proves is that the
++    // outbox insert cannot outlive a failed membership write — and a row written
++    // beside the transaction rather than inside it passes every other test here.
++    const before = (await rowsFor("channel.member_added")).length;
++    await expect(repo.addMember("not-a-uuid", mai.id)).rejects.toThrow();
++    expect(await rowsFor("channel.member_added")).toHaveLength(before);
++  });
++});
+```
+
+```diff title="services/gateway/src/resume.itest.ts"
+@@ -137,20 +137,24 @@ describe("resume across a real fabric", () => {
+       backfill: async () => {
+         await publishFromElsewhere(frame(43));
+         await settle(150); // give Redis time to actually deliver it
+         return {
+           [CHANNEL]: { messages: [frame(42), frame(43)], truncated: false },
+         };
+       },
+       sendMessage: async () => {
+         throw new Error("not used");
+       },
++      // Chapter 3.20. Agrees with `session` above: this file is about the resume,
++      // and a backstop that disagreed with the connect would be a second subject
++      // under test.
++      memberships: async () => [CHANNEL],
+     });
+     const socket = new WebSocket(
+       `${harness.url}?token=${await token()}&cursor=${CHANNEL}:41`,
+     );
+     const frames = record(socket);
+     await settle(700);
+     const seqs = created(frames);
+     expect(seqs).toEqual([42, 43]);
+     expect(new Set(seqs).size).toBe(seqs.length);
+     socket.close();
+@@ -172,20 +176,24 @@ describe("resume across a real fabric", () => {
+         limits: { connect: 3_000, send: 600 },
+       }),
+       backfill: async () => {
+         await publishFromElsewhere(frame(43));
+         await settle(150);
+         return { [CHANNEL]: { messages: [frame(42)], truncated: false } };
+       },
+       sendMessage: async () => {
+         throw new Error("not used");
+       },
++      // Chapter 3.20. Agrees with `session` above: this file is about the resume,
++      // and a backstop that disagreed with the connect would be a second subject
++      // under test.
++      memberships: async () => [CHANNEL],
+     });
+     const socket = new WebSocket(
+       `${harness.url}?token=${await token()}&cursor=${CHANNEL}:41`,
+     );
+     const frames = record(socket);
+     await settle(700);
+     expect(created(frames)).toEqual([42, 43]);
+     socket.close();
+   });
+ 
+@@ -201,20 +209,24 @@ describe("resume across a real fabric", () => {
+         // Chapter 3.8: the limits ride the session response now. Generous, and
+         // beside the point of every test in this file.
+         limits: { connect: 3_000, send: 600 },
+       }),
+       backfill: async () => ({
+         [CHANNEL]: { messages: [frame(42)], truncated: false },
+       }),
+       sendMessage: async () => {
+         throw new Error("not used");
+       },
++      // Chapter 3.20. Agrees with `session` above: this file is about the resume,
++      // and a backstop that disagreed with the connect would be a second subject
++      // under test.
++      memberships: async () => [CHANNEL],
+     });
+     const socket = new WebSocket(
+       `${harness.url}?token=${await token()}&cursor=${CHANNEL}:41`,
+     );
+     const frames = record(socket);
+     await settle(400);
+     // A frame published AFTER the resume finished must arrive immediately —
+     // the phase went back to normal 2.6 delivery.
+     await publishFromElsewhere(frame(44));
+     await settle(300);
+@@ -250,20 +262,24 @@ describe("resume across a real fabric", () => {
+         // Chapter 3.8: the limits ride the session response now. Generous, and
+         // beside the point of every test in this file.
+         limits: { connect: 3_000, send: 600 },
+       }),
+       backfill: async () => ({
+         [CHANNEL]: { messages: [frame(42)], truncated: false },
+       }),
+       sendMessage: async () => {
+         throw new Error("not used");
+       },
++      // Chapter 3.20. Agrees with `session` above: this file is about the resume,
++      // and a backstop that disagreed with the connect would be a second subject
++      // under test.
++      memberships: async () => [CHANNEL],
+     });
+     const socket = new WebSocket(
+       `${harness.url}?token=${await token()}&cursor=${CHANNEL}:41`,
+     );
+     const frames = record(socket);
+     await settle(400);
+     // The resume has completed. NOW the fabric catches up with a message the
+     // backfill already delivered — the publish that was still in flight while the
+     // backfill query ran.
+     await publishFromElsewhere(frame(42));
+@@ -292,20 +308,24 @@ describe("resume across a real fabric", () => {
+         // Chapter 3.8: the limits ride the session response now. Generous, and
+         // beside the point of every test in this file.
+         limits: { connect: 3_000, send: 600 },
+       }),
+       backfill: async () => ({
+         [CHANNEL]: { messages: [frame(42)], truncated: false },
+       }),
+       sendMessage: async () => {
+         throw new Error("not used");
+       },
++      // Chapter 3.20. Agrees with `session` above: this file is about the resume,
++      // and a backstop that disagreed with the connect would be a second subject
++      // under test.
++      memberships: async () => [CHANNEL],
+     });
+     const socket = new WebSocket(
+       `${harness.url}?token=${await token()}&cursor=${CHANNEL}:41`,
+     );
+     const frames = record(socket);
+     await settle(400);
+     // 43 is ABOVE the mark and must be delivered. A rule that retired the mark on
+     // seeing it would then have nothing left to compare the delayed 42 against.
+     await publishFromElsewhere(frame(43));
+     await settle(150);
+@@ -334,20 +354,24 @@ describe("resume across a real fabric", () => {
+         // Chapter 3.8: the limits ride the session response now. Generous, and
+         // beside the point of every test in this file.
+         limits: { connect: 3_000, send: 600 },
+       }),
+       backfill: async () => {
+         throw new Error("backfill unavailable");
+       },
+       sendMessage: async () => {
+         throw new Error("not used");
+       },
++      // Chapter 3.20. Agrees with `session` above: this file is about the resume,
++      // and a backstop that disagreed with the connect would be a second subject
++      // under test.
++      memberships: async () => [CHANNEL],
+     });
+     const socket = new WebSocket(
+       `${harness.url}?token=${await token()}&cursor=${CHANNEL}:41`,
+     );
+     const frames = record(socket);
+     await settle(400);
+     // A sequence at or below the presented cursor. With no mark retained it must
+     // still arrive: the client was told to page history, not to expect silence.
+     await publishFromElsewhere(frame(41));
+     await settle(300);
+@@ -393,20 +417,23 @@ describe("two instances on one fabric (chapter 3.18)", () => {
+       environment_id: "env-1",
+       user: "tuan",
+       banned: false,
+       channel_ids: channels,
+       limits: { connect: 3_000, send: 600 },
+     }),
+     backfill: async () => ({}),
+     sendMessage: async () => {
+       throw new Error("not used");
+     },
++    // Chapter 3.20. The same list `session` answers with, so the backstop confirms
++    // what the connect already established and changes nothing.
++    memberships: async () => channels,
+   });
+ 
+   afterEach(async () => {
+     for (const socket of sockets.splice(0)) socket.close();
+     await member?.close();
+     await bystander?.close();
+     member = undefined;
+     bystander = undefined;
+   });
+ 
+```
+
+```ts title="packages/protocol/src/membership.test.ts"
+import { describe, expect, it } from "vitest";
+
+import { subjectForChannel } from "./fanout.js";
+import {
+  ALL_CHANNELS,
+  membershipFabricSchema,
+  subjectForChannelMembership,
+  subjectForUserMembership,
+} from "./membership.js";
+import { subjectForPresence } from "./presence.js";
+
+const CHANNEL = "ce419dc5-b06e-441c-ab38-49451f87210e";
+const ENV = "3f2a0000-0000-0000-0000-000000000001";
+
+describe("the subject grammars, together", () => {
+  // FOUR SHAPES ON ONE REDIS AFTER THIS CHAPTER. Cross-kind mis-delivery is a
+  // property of the topology rather than something a filter defends (FR-033), and
+  // this is what proves the topology holds. Chapter 3.19 asserted the same thing
+  // over two; a third and a fourth make it worth asserting pairwise rather than by
+  // eye.
+  it("gives four pairwise distinct subjects for the same id", () => {
+    const subjects = [
+      subjectForChannel(CHANNEL),
+      subjectForPresence(CHANNEL),
+      subjectForChannelMembership(CHANNEL),
+      subjectForUserMembership(ENV, "tuan"),
+    ];
+    expect(new Set(subjects).size).toBe(subjects.length);
+  });
+
+  it("keeps the two membership shapes apart from each other", () => {
+    // The channel-addressed and principal-addressed halves must not collide even
+    // when a channel id and an environment id are the same string — which they can
+    // be, since both are uuids from the same generator.
+    expect(subjectForChannelMembership(ENV)).not.toBe(
+      subjectForUserMembership(ENV, "tuan"),
+    );
+  });
+
+  it("addresses a channel by its id and a user by environment and id", () => {
+    expect(subjectForChannelMembership(CHANNEL)).toBe(`member:${CHANNEL}`);
+    expect(subjectForUserMembership(ENV, "tuan")).toBe(`member:${ENV}:tuan`);
+  });
+});
+
+describe("membershipFabricSchema", () => {
+  const valid = {
+    environment: ENV,
+    channel: CHANNEL,
+    user: "tuan",
+    change: "removed" as const,
+  };
+
+  it("accepts both directions and no third", () => {
+    expect(membershipFabricSchema.safeParse(valid).success).toBe(true);
+    expect(
+      membershipFabricSchema.safeParse({ ...valid, change: "added" }).success,
+    ).toBe(true);
+    // `role` is the one a reader expects to find here and it is not in the enum:
+    // chapter 1.3 published two members and neither means "role".
+    expect(
+      membershipFabricSchema.safeParse({ ...valid, change: "role" }).success,
+    ).toBe(false);
+  });
+
+  it("requires the environment the receiving gateway checks against", () => {
+    // Built by omission rather than destructured away: this config does not treat a
+    // leading underscore as "deliberately unused", so `const { environment: _x, …r }`
+    // is a lint error rather than a convention.
+    const withoutEnv = {
+      channel: valid.channel,
+      user: valid.user,
+      change: valid.change,
+    };
+    expect(membershipFabricSchema.safeParse(withoutEnv).success).toBe(false);
+  });
+
+  it("rejects an unknown field instead of ignoring it", () => {
+    // A field added on one side of a rolling deploy fails loudly on the other
+    // rather than being dropped, which is what `strictObject` buys over `object`.
+    expect(
+      membershipFabricSchema.safeParse({ ...valid, role: "moderator" }).success,
+    ).toBe(false);
+  });
+
+  it("admits a ban's all-channels sentinel", () => {
+    // `channel` is `z.string().min(1)`, so `"*"` parses like any other value. The
+    // schema cannot express "this is a sentinel" and the constant is what says so.
+    expect(
+      membershipFabricSchema.safeParse({ ...valid, channel: ALL_CHANNELS })
+        .success,
+    ).toBe(true);
+  });
+});
+```
+
+```ts title="services/api/src/membership/publisher.test.ts"
+import { createLogger, type Logger } from "@relay/service-kit";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import {
+  createMembershipPublisher,
+  DEFAULT_MEMBERSHIP_REDIS_URL,
+} from "./publisher";
+
+// The membership publisher, Docker-free (chapter 3.20).
+//
+// A FAKE AT THE IOREDIS SEAM, which is `fanout/publisher.test.ts`'s shape and for its
+// reason: the contract is "never rejects", so a test that only checks it resolved
+// cannot tell a swallowed failure from a success — and cannot tell either from a
+// publisher that does nothing at all.
+//
+// The first draft of this file reached for `publisher.redis` instead. The factory
+// closes over its client and exposes no such property, so six of seven tests failed
+// against a fake that was never installed — which is what a mock at the seam avoids.
+const publishes: Array<[string, string]> = [];
+let throwing = false;
+let disconnects = 0;
+let urls: string[] = [];
+let errorHandler: ((e: Error) => void) | undefined;
+vi.mock("ioredis", () => ({
+  Redis: class {
+    constructor(url: string) {
+      urls.push(url);
+    }
+    on(event: string, handler: (e: Error) => void): this {
+      if (event === "error") errorHandler = handler;
+      return this;
+    }
+    async publish(subject: string, payload: string): Promise<number> {
+      if (throwing) throw new Error("ECONNREFUSED");
+      publishes.push([subject, payload]);
+      return 1;
+    }
+    disconnect(): void {
+      disconnects += 1;
+    }
+  },
+}));
+
+const CHANGE = {
+  environment: "3f2a0000-0000-0000-0000-000000000001",
+  channel: "ce419dc5-b06e-441c-ab38-49451f87210e",
+  user: "tuan",
+  change: "removed" as const,
+};
+
+function sink(): { lines: Record<string, unknown>[]; logger: Logger } {
+  const lines: Record<string, unknown>[] = [];
+  // The sink receives a JSON STRING with its fields spread at the top level, not an
+  // object. Chapter 3.19's first version pushed the raw line, so every `msg` was
+  // undefined and the log assertions matched nothing while passing.
+  const logger = createLogger("membership-test", (line) =>
+    lines.push(JSON.parse(line) as Record<string, unknown>),
+  );
+  return { lines, logger };
+}
+
+beforeEach(() => {
+  publishes.length = 0;
+  throwing = false;
+  disconnects = 0;
+  urls = [];
+  errorHandler = undefined;
+});
+
+describe("the membership publisher", () => {
+  it("publishes one subject for a removal", async () => {
+    const { logger } = sink();
+    await createMembershipPublisher({ url: "redis://x", logger }).publish(CHANGE);
+    // The removed user is still a member at the moment this goes out, so the
+    // channel's subject reaches both audiences at once.
+    expect(publishes.map(([s]) => s)).toEqual([`member:${CHANGE.channel}`]);
+  });
+
+  it("publishes two for an addition, because one cannot reach the new member", async () => {
+    const { logger } = sink();
+    await createMembershipPublisher({ url: "redis://x", logger }).publish({
+      ...CHANGE,
+      change: "added",
+    });
+    expect(publishes.map(([s]) => s)).toEqual([
+      `member:${CHANGE.channel}`,
+      `member:${CHANGE.environment}:tuan`,
+    ]);
+  });
+
+  it("publishes only the user's subject for a ban", async () => {
+    const { logger } = sink();
+    await createMembershipPublisher({ url: "redis://x", logger }).publish({
+      ...CHANGE,
+      channel: "*",
+    });
+    expect(publishes.map(([s]) => s)).toEqual([
+      `member:${CHANGE.environment}:tuan`,
+    ]);
+  });
+
+  it("logs membership.published on the working path", async () => {
+    // FR-031. Every log requirement this chapter inherited was about failure, and an
+    // operator who can only see the mechanism breaking cannot tell a quiet system
+    // from a dead one.
+    const { lines, logger } = sink();
+    await createMembershipPublisher({ url: "redis://x", logger }).publish(CHANGE);
+    const published = lines.filter((l) => l["msg"] === "membership.published");
+    expect(published).toHaveLength(1);
+    expect(published[0]!["channel"]).toBe(CHANGE.channel);
+    expect(published[0]!["user"]).toBe("tuan");
+    // No message content and no token (constitution VI).
+    expect(JSON.stringify(published[0])).not.toMatch(/token|text/i);
+  });
+
+  it("resolves when the client throws, and says so in the log", async () => {
+    const { lines, logger } = sink();
+    throwing = true;
+    const publisher = createMembershipPublisher({ url: "redis://x", logger });
+    // FR-016: the write has committed and the outbox row with it. A publish that
+    // threw here would undo a route's success for a delivery the backstop repairs.
+    await expect(publisher.publish(CHANGE)).resolves.toBeUndefined();
+    const failed = lines.filter((l) => l["msg"] === "membership.failed");
+    expect(failed).toHaveLength(1);
+    expect(failed[0]!["op"]).toBe("publish");
+    // AND NOTHING CLAIMS SUCCESS. A publisher that logged both would satisfy the
+    // assertion above while telling an operator the opposite.
+    expect(lines.filter((l) => l["msg"] === "membership.published")).toHaveLength(0);
+  });
+
+  it("survives an ioredis `error` event instead of dying on it", async () => {
+    // Chapter 3.18's test by name. The listener's stated reason is NFR-OBS-01 —
+    // unstructured, unbounded output — rather than process death, which 3.18
+    // measured against ioredis 6.0.0 and found false.
+    const { lines, logger } = sink();
+    createMembershipPublisher({ url: "redis://x", logger });
+    expect(errorHandler).toBeDefined();
+    expect(() => errorHandler!(new Error("ECONNREFUSED"))).not.toThrow();
+    const failed = lines.filter(
+      (l) => l["msg"] === "membership.failed" && l["op"] === "connection",
+    );
+    expect(failed).toHaveLength(1);
+  });
+
+  it("falls back to the documented default when RELAY_REDIS_URL is unset", async () => {
+    // A defaulted parameter is a branch and every other test here passes a url, so
+    // this arm reads zero without one. Chapter 3.19's identical case measured [15, 0]
+    // and needed a test written at close-out purely to take the fallback.
+    const saved = process.env["RELAY_REDIS_URL"];
+    delete process.env["RELAY_REDIS_URL"];
+    try {
+      const { logger } = sink();
+      createMembershipPublisher({ logger });
+      expect(urls).toEqual([DEFAULT_MEMBERSHIP_REDIS_URL]);
+    } finally {
+      if (saved !== undefined) process.env["RELAY_REDIS_URL"] = saved;
+    }
+  });
+
+  it("disconnects on close", async () => {
+    // `close()` is a function and the pin is 100% of functions. `limits.module.ts:10`
+    // states the convention it serves: "a close() nothing calls is a leaked handle in
+    // a service that boots once per integration suite."
+    const { logger } = sink();
+    await createMembershipPublisher({ url: "redis://x", logger }).close();
+    expect(disconnects).toBe(1);
+  });
+});
+```
+
+```ts title="services/gateway/src/membership.test.ts"
+import { describe, expect, it } from "vitest";
+
+import { ALL_CHANNELS, DEFAULT_REREAD_INTERVAL_MS } from "./membership.js";
+
+// PURE LOGIC ONLY, and that is this file's whole shape. `createMembership` builds its
+// own Redis client from a url and cannot be handed a double, so anything
+// reply-dependent lives in `membership.itest.ts`. `presence.test.ts` and
+// `limits.test.ts` are the precedents.
+
+describe("the backstop interval", () => {
+  it("is the sixty seconds the arithmetic chose", () => {
+    // NFR-SCL-01 budgets 10,000 connections per instance, so this is 167 re-reads per
+    // second per instance and five seconds would be 2,000. The number is asserted
+    // here rather than left as a bare constant so a later change to it is a decision
+    // somebody made rather than a diff nobody read.
+    expect(DEFAULT_REREAD_INTERVAL_MS).toBe(60_000);
+  });
+
+  it("is far longer than the clause it backs up, and that is the point", () => {
+    // FR-RTM-10's five seconds is met by the publish. This bounds the damage when a
+    // publish is DROPPED, which is a rarer event and a different budget — reading
+    // them as one number is how a backstop turns into a poll.
+    expect(DEFAULT_REREAD_INTERVAL_MS).toBeGreaterThan(5_000);
+  });
+});
+
+describe("the all-channels sentinel", () => {
+  it("is a value no channel id can collide with", () => {
+    // Channel ids are uuids. `"*"` is not one, which is what makes a sentinel inside
+    // a `z.string().min(1)` safe rather than merely convenient.
+    expect(ALL_CHANNELS).toBe("*");
+    expect(ALL_CHANNELS).not.toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+    );
+  });
+});
+```
+
+<ChapterFooter id="3.20" />

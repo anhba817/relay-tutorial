@@ -631,6 +631,25 @@ export const series: Part[] = [
         // fixed here, because nine manifest entries are not this chapter's to change.
         translatedIn: ["vi"],
       },
+      {
+        id: "3.20",
+        path: "/part-3/chapter-20/the-membership-that-changed",
+        title: "The membership that changed under a live socket",
+        status: "published",
+        // `sourceDoc` is the SAD, and for a stronger reason than 3.18's and 3.19's:
+        // no SRS clause changed — `git diff docs/04-srs.md` is empty — while ADR-20
+        // is new. It extends ADR-07 rather than superseding it: that record permits
+        // a lossy fabric because a dropped message is recovered by its cursor, and a
+        // revocation has none.
+        readerProduces:
+          "A clause unmet since chapter 2.6 and asserted as violated by a test since 3.18, closed with that test inverted and its 5,500 ms wait unchanged; a third subject grammar whose second shape addresses a principal rather than a channel, because an addition cannot ride the subject its own instance has not subscribed to; a ban that arrives as one change and leaves as one frame per channel, with the sentinel never reaching a client; and a periodic re-read standing in for a cursor that does not exist",
+        sourceDoc: "docs/05-sad.md",
+        readerMinutes: 75,
+        titleVi: "Membership đổi ngay dưới một socket đang sống",
+        readerProducesVi:
+          "Một điều khoản chưa được thoả từ chương 2.6 và bị một bài test khẳng định là vi phạm từ 3.18, nay đóng lại bằng chính bài test đó đảo ngược với thời gian chờ 5.500 ms giữ nguyên; một ngữ pháp subject thứ ba mà hình dạng thứ hai gửi tới một principal thay vì một channel, bởi một lần thêm thành viên không thể đi nhờ cái subject mà chính instance của nó chưa subscribe; một lệnh ban tới nơi như một thay đổi và rời đi thành một frame cho mỗi channel, với ký hiệu canh gác không bao giờ chạm tới client; và một lần đọc lại định kỳ đứng thay cho một cursor không tồn tại",
+        translatedIn: ["vi"],
+      },
     ],
   },
   {
