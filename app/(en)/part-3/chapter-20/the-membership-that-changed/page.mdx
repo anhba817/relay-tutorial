@@ -422,7 +422,7 @@ external id comes out of `RETURNING` rather than from a parameter:
    async addMember(
      channelId: string,
      userId: string,
-@@ -2832,40 +2854,71 @@ export class Repository {
+@@ -2832,40 +2854,74 @@ export class Repository {
       * afterwards, which is what US6's first scenario asks for. */
      role?: string,
    ): Promise<AddMemberOutcome> {
@@ -489,14 +489,17 @@ external id comes out of `RETURNING` rather than from a parameter:
 +        // recognised idempotent retry returned above without writing anything and
 +        // must consume no event either." An add that changed nothing publishes
 +        // nothing and records nothing (FR-005).
-+        const row = inserted.rows[0] as { user_external_id: string | null };
-+        // Refused rather than defaulted. The subquery cannot miss — the INSERT's own
-+        // SELECT already joined `users` — but `membershipEvent` throws on an empty
-+        // external id and a silent `""` here is the uuid-in-a-webhook defect wearing
-+        // a different hat.
-+        if (!row.user_external_id) {
-+          throw new Error(`no external id for added member ${userId}`);
-+        }
++        // THE SAME CHECK TWICE, AND THIS COPY IS THE UNREACHABLE ONE. There was a
++        // `if (!row.user_external_id) throw` here, on the grounds that a silent `""`
++        // is the uuid-in-a-webhook defect wearing a different hat. That is right, and
++        // `membershipEvent` already refuses it — `event.test.ts` covers that refusal
++        // by name. The subquery cannot miss either: the INSERT's own SELECT already
++        // joined `users`, so the row exists by the time `RETURNING` reads it.
++        //
++        // Two guards, one reachable. The coverage ratchet found the pair as two
++        // uncovered lines taking this file from 99% to 98.79%, and the honest answer
++        // is to keep the check that a test can reach.
++        const row = inserted.rows[0] as { user_external_id: string };
 +        const event = membershipEvent({
 +          eventId: randomUUID(),
 +          environmentId: this.environmentId,
@@ -527,7 +530,7 @@ external id comes out of `RETURNING` rather than from a parameter:
    }
  
    /** Archive and unarchive, both idempotent (chapter 3.15, FR-020, FR-020a).
-@@ -2920,6 +2973,15 @@ export class Repository {
+@@ -2920,6 +2976,15 @@ export class Repository {
     * schema at the edge still cannot land. R8's trap was a constraint that reused
     * `memberships`' vocabulary — it would accept `admin`, refuse `moderator`, and
     * read as correct in review. */
@@ -543,7 +546,7 @@ external id comes out of `RETURNING` rather than from a parameter:
    async setMemberRole(
      channelId: string,
      userId: string,
-@@ -2983,6 +3045,16 @@ export class Repository {
+@@ -2983,6 +3048,16 @@ export class Repository {
     * carries no `environment_id` — the catalogue calls it a `hop` — so the join is
     * what keeps a foreign channel's rows out of reach.
     */
@@ -560,7 +563,7 @@ external id comes out of `RETURNING` rather than from a parameter:
    async removeMembers(
      channelId: string,
      userIds: string[],
-@@ -3000,7 +3072,8 @@ export class Repository {
+@@ -3000,7 +3075,8 @@ export class Repository {
      //
      // A hundred round trips to answer one request is the cost chapter 2.4 measured
      // away on the read path; there is no reason to reintroduce it on this one.
@@ -570,7 +573,7 @@ external id comes out of `RETURNING` rather than from a parameter:
        .delete(members)
        .where(
          and(
-@@ -3013,10 +3086,41 @@ export class Repository {
+@@ -3013,10 +3089,38 @@ export class Repository {
                         AND c.environment_id = ${this.environmentId})`,
          ),
        )
@@ -591,12 +594,9 @@ external id comes out of `RETURNING` rather than from a parameter:
 +    // The returning clause already existed; no second query is needed to find out
 +    // who was actually removed.
 +    for (const row of deleted) {
-+      // Refused rather than defaulted, as on the add path: `membershipEvent` throws
-+      // on an empty external id, and a silent `""` is the uuid-in-a-webhook defect
-+      // wearing a different hat.
-+      if (!row.userExternalId) {
-+        throw new Error(`no external id for removed member ${row.userId}`);
-+      }
++      // No guard here either, for the reason the add path states: `membershipEvent`
++      // refuses an empty external id and a test reaches that refusal, while a guard
++      // in this loop cannot be reached at all.
 +      const event = membershipEvent({
 +        eventId: randomUUID(),
 +        environmentId: this.environmentId,
@@ -1004,11 +1004,9 @@ One helper both directions call:
    ) {}
  
    /** 201 on creation, 200 on the idempotent repeat (FR-017, FR-CHN-02).
-@@ -179,8 +191,50 @@ export class ChannelsController {
-   async removeMembers(
+@@ -180,7 +192,51 @@ export class ChannelsController {
      @Param("channelId") channelId: string,
      @Body(new ZodValidationPipe(removeMembersBodySchema)) body: RemoveMembersBody,
-+    @Req() req: RequestWithPrincipal,
    ) {
 -    return { results: await this.channels.removeMembers(channelId, body) };
 +    const results = await this.channels.removeMembers(channelId, body);
@@ -1027,7 +1025,7 @@ One helper both directions call:
 +    // the phase order exists for it.
 +    for (const removal of results) {
 +      if (removal.result !== "removed") continue;
-+      await this.announce(req, channelId, removal.external_id, "removed");
++      await this.announce(channelId, removal.external_id, "removed");
 +    }
 +
 +    return { results };
@@ -1042,13 +1040,16 @@ One helper both directions call:
 +   *
 +   * The environment is the PRINCIPAL's, established by the guard, never a body's. */
 +  private async announce(
-+    req: RequestWithPrincipal,
 +    channelId: string,
 +    user: string,
 +    change: "added" | "removed",
 +  ): Promise<void> {
 +    await this.membership.publish({
-+      environment: req.principal?.environmentId ?? "unknown",
++      // THE REPOSITORY'S SCOPE, NOT AN OPTIONAL CHAIN OFF THE PRINCIPAL. Both read
++      // the same id from the same verified credential, and `?? "unknown"` carries a
++      // branch the guard makes unreachable — the coverage ratchet found the identical
++      // arm in `users.controller.ts` at 75% against a pin of 100.
++      environment: this.repo.environment,
 +      channel: channelId,
 +      user,
 +      change,
@@ -1056,7 +1057,7 @@ One helper both directions call:
    }
  
    /** The user-initiated half of FR-CHN-03 (chapter 3.15).
-@@ -208,7 +262,19 @@ export class ChannelsController {
+@@ -208,7 +264,14 @@ export class ChannelsController {
      }
      const user = await this.repo.getUserByExternalId(req.principal.userExternalId);
      if (!user) throw new BadRequestException("unknown user");
@@ -1066,29 +1067,22 @@ One helper both directions call:
 +    // publish nothing, or every idempotent retry puts a frame on every member's
 +    // screen.
 +    if (result === "joined") {
-+      await this.announce(
-+        req,
-+        channelId,
-+        req.principal.userExternalId,
-+        "added",
-+      );
++      await this.announce(channelId, req.principal.userExternalId, "added");
 +    }
 +    return { result };
    }
  
    /** Members by external id, users created on first membership (FR-CHN-04).
-@@ -221,7 +287,14 @@ export class ChannelsController {
-   async addMembers(
+@@ -222,6 +285,12 @@ export class ChannelsController {
      @Param("channelId") channelId: string,
      @Body(new ZodValidationPipe(addMembersBodySchema)) body: AddMembersBody,
-+    @Req() req: RequestWithPrincipal,
    ) {
 -    return { members: await this.channels.addMembers(channelId, body) };
 +    const members = await this.channels.addMembers(channelId, body);
 +    // `added` only. `already_a_member` is the idempotent repeat and changed nothing.
 +    for (const member of members) {
 +      if (member.status !== "added") continue;
-+      await this.announce(req, channelId, member.external_id, "added");
++      await this.announce(channelId, member.external_id, "added");
 +    }
 +    return { members };
    }
@@ -1111,7 +1105,7 @@ all-channels sentinel and the gateway expands it:
 
 
 ```diff title="services/api/src/users/users.controller.ts"
-@@ -4,15 +4,25 @@ import {
+@@ -4,6 +4,8 @@ import {
    Delete,
    Get,
    HttpCode,
@@ -1120,16 +1114,15 @@ all-channels sentinel and the gateway expands it:
    Param,
    Patch,
    Post,
-   Put,
-   Query,
-+  Req,
+@@ -12,7 +14,15 @@ import {
    UseGuards,
  } from "@nestjs/common";
  
 +import { ALL_CHANNELS } from "@relay/protocol";
 +
++import { Repository } from "../db/repository";
++
  import { Accepts, CredentialGuard } from "../auth/credential.guard";
-+import type { RequestWithPrincipal } from "../auth/principal";
 +import {
 +  MEMBERSHIP_PUBLISHER,
 +  type MembershipPublisher,
@@ -1137,13 +1130,16 @@ all-channels sentinel and the gateway expands it:
  import { ZodValidationPipe } from "../messages/zod-validation.pipe";
  import {
    listingQuerySchema,
-@@ -42,7 +52,14 @@ import { UsersService } from "./users.service";
+@@ -42,7 +52,17 @@ import { UsersService } from "./users.service";
  @UseGuards(CredentialGuard)
  @Accepts("application")
  export class UsersController {
 -  constructor(private readonly users: UsersService) {}
 +  constructor(
 +    private readonly users: UsersService,
++    // For its `environment` alone — the tenant this request is scoped to, resolved
++    // from a verified credential. See the ban route.
++    private readonly repo: Repository,
 +    // Chapter 3.20. The controller for the reason `channels.controller.ts` states:
 +    // `UsersService` holds neither a request id nor a logger, and FR-015's failure
 +    // line needs both.
@@ -1153,15 +1149,14 @@ all-channels sentinel and the gateway expands it:
  
    @Get(":externalId/channels")
    async listChannels(
-@@ -131,13 +148,52 @@ export class UsersController {
+@@ -131,13 +151,58 @@ export class UsersController {
     * `@HttpCode(200)` on the POST for the reason the upsert has it: nothing is created,
     * and banning an already-banned user is a 200 too. */
    @Post(":externalId/ban")
 -  @HttpCode(200)
--  async ban(@Param("externalId") externalId: string) {
--    return this.users.setBanned(externalId, true);
 +  @HttpCode(HttpStatus.OK)
-+  async ban(@Param("externalId") externalId: string, @Req() req: RequestWithPrincipal) {
+   async ban(@Param("externalId") externalId: string) {
+-    return this.users.setBanned(externalId, true);
 +    const { external_id, banned, revoked } = await this.users.setBanned(
 +      externalId,
 +      true,
@@ -1177,7 +1172,13 @@ all-channels sentinel and the gateway expands it:
 +    // (`specs/038-chapter-3-20/contracts/membership-fabric.md`).
 +    if (revoked.length > 0) {
 +      await this.membership.publish({
-+        environment: req.principal?.environmentId ?? "unknown",
++        // THE REPOSITORY'S SCOPE, NOT THE PRINCIPAL'S OPTIONAL CHAIN. `req.principal
++        // ?.environmentId ?? "unknown"` reads the same value and carries a branch no
++        // test can take: the guard has already refused a request without a principal,
++        // so the fallback is unreachable and the coverage ratchet said so — branches
++        // 75% against a pin of 100. `Repository.environment` is the same id, scoped
++        // from the same verified credential, and it is not optional.
++        environment: this.repo.environment,
 +        channel: ALL_CHANNELS,
 +        user: externalId,
 +        change: "removed",
@@ -2003,19 +2004,12 @@ nothing since:
 
 
 ```ts title="services/api/src/internal/memberships.controller.ts"
-import {
-  Controller,
-  Get,
-  HttpCode,
-  Req,
-  UnauthorizedException,
-  UseGuards,
-} from "@nestjs/common";
+import { Controller, Get, HttpCode, Req, UseGuards } from "@nestjs/common";
 
 import type { InternalMembershipsResponse } from "@relay/protocol";
 
 import { Accepts, CredentialGuard } from "../auth/credential.guard";
-import type { RequestWithPrincipal } from "../auth/principal";
+import type { UserPrincipal } from "../auth/principal";
 import { Repository } from "../db/repository";
 
 // `GET /internal/memberships` (chapter 3.20, FR-017) — REVIVED, not invented.
@@ -2055,21 +2049,27 @@ export class MembershipsController {
   @Get("memberships")
   @HttpCode(200)
   async memberships(
-    @Req() req: RequestWithPrincipal,
+    // NARROWED IN THE SIGNATURE RATHER THAN BY A RUNTIME CHECK, and the coverage
+    // ratchet is why. `session.controller.ts` writes
+    // `if (principal?.kind !== "user") throw` and calls it "a wiring fault rather
+    // than a client error" — which is exactly the point: `@Accepts("user")` plus
+    // `CredentialGuard` have already refused an absent, invalid or wrong-class
+    // credential, so that throw cannot be reached and its branch read 0 against a
+    // pin of 100. A check no request can fail is not a check; it is an invariant,
+    // and an invariant belongs in the type.
+    //
+    // The class decorators above are the justification, and moving either one
+    // breaks this signature's claim — which is the trade: a compile-time assertion
+    // that depends on two lines twelve lines up.
+    @Req() req: { principal: UserPrincipal },
   ): Promise<InternalMembershipsResponse> {
-    const principal = req.principal;
-    // The guard has already refused an absent, invalid or wrong-class credential,
-    // so reaching here with anything else is a wiring fault rather than a client
-    // error — `session.controller.ts` says the same about its own narrowing.
-    if (principal?.kind !== "user") {
-      throw new UnauthorizedException("a verified end-user token is required");
-    }
-
     // A verified token for a user this environment has never seen is a user with no
     // channels, not an error. 2.5's rule, and the backstop depends on it: a re-read
     // that threw for a deleted user would turn a routine refresh into a failure the
     // gateway has to interpret.
-    const user = await this.repo.getUserByExternalId(principal.userExternalId);
+    const user = await this.repo.getUserByExternalId(
+      req.principal.userExternalId,
+    );
     return {
       channel_ids: user ? await this.repo.channelsForUser(user.id) : [],
     };
@@ -2310,6 +2310,75 @@ the code moved underneath it.
 
 The remaining files this chapter touched, fenced so the chain stays whole:
 
+
+```diff title="services/api/src/internal/internal.itest.ts"
+@@ -6,6 +6,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
+ 
+ import {
+   internalSendResponseSchema,
++  internalMembershipsResponseSchema,
+   internalSessionResponseSchema,
+ } from "@relay/protocol";
+ 
+@@ -170,6 +171,57 @@ describe("the internal surface", () => {
+     expect(res.status).toBe(401);
+   });
+ 
++  // ── THE BACKSTOP'S ROUTE (chapter 3.20, FR-017) ─────────────────────────────
++  //
++  // `GET /internal/memberships` is the one question a periodic re-read has. It was
++  // exercised end to end from the gateway's suite the moment it shipped — and the
++  // coverage ratchet still read **28.57% statements, 0% branches** for it, because
++  // that suite runs in another package and this one is where the api's coverage is
++  // measured. A route can be thoroughly tested and completely uncovered.
++  it("answers the caller's own channels, in the contract's shape", async () => {
++    const res = await fetch(`${url}/internal/memberships`, {
++      headers: await headers(),
++    });
++    expect(res.status).toBe(200);
++    const parsed = internalMembershipsResponseSchema.safeParse(await res.json());
++    expect(parsed.error?.issues ?? []).toEqual([]);
++    expect(parsed.data?.channel_ids).toContain(channelId);
++  });
++
++  it("answers a user with no row as a user with no channels", async () => {
++    // The branch the backstop depends on. A re-read that threw for a deleted user
++    // would turn a routine refresh into a failure the gateway has to interpret, and
++    // 2.5's rule already says a token for an unseen user is a user with no channels
++    // rather than an error.
++    const res = await fetch(`${url}/internal/memberships`, {
++      headers: await headers("nobody-here"),
++    });
++    expect(res.status).toBe(200);
++    expect(
++      internalMembershipsResponseSchema.parse(await res.json()).channel_ids,
++    ).toEqual([]);
++  });
++
++  it("refuses an unverifiable token", async () => {
++    const res = await fetch(`${url}/internal/memberships`, {
++      headers: { authorization: "Bearer not-a-token" },
++    });
++    expect(res.status).toBe(401);
++  });
++
++  it("answers a POST with 404, which is what keeps the signup fixture standing", async () => {
++    // NOT A FORMALITY. `services/api/src/tenancy/signup.itest.ts` POSTs this path
++    // with no credential and asserts the status is not 200 — a check written when
++    // the route did not exist. A GET-only route answers a POST with 404, so that
++    // assertion still means what it meant. Registering `ALL` or adding a POST twin
++    // is what would break it, and this is the test that would notice.
++    const res = await fetch(`${url}/internal/memberships`, {
++      method: "POST",
++      headers: await headers(),
++    });
++    expect(res.status).toBe(404);
++  });
++
+   // ── THE SOCKET'S ROUTE INHERITS THE CHECK (chapter 3.15, FR-001) ────────────
+   //
+   // `POST /internal/messages` resolves the user from the forwarded token and then
+```
 
 ```diff title="services/gateway/src/session.test.ts"
 @@ -66,6 +66,11 @@ function stubApi(overrides: Partial<ApiClient> = {}): ApiClient {
