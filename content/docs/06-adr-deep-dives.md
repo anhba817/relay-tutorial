@@ -423,6 +423,20 @@ the gap, and refetches — or, if fully disconnected, resumes by cursor on recon
 hop (Tuan's tunnel — no broker fixes his radio). Given that machinery, a lost pub/sub
 frame is indistinguishable from a lost WiFi packet, and both heal identically.
 
+> **Amended 2026-08-30 (chapter 3.20).** The sentence above is true of every payload
+> this fabric carried when it was written, and **false of one added since**. A
+> membership revocation has no sequence and no cursor: a client cannot detect a gap in
+> it, and there is nothing to refetch. A dropped one is not a delayed frame, it is a
+> client that keeps receiving a channel it was removed from, indefinitely.
+>
+> The clause "given that machinery" is the load-bearing part, and it names machinery a
+> revocation does not have. ADR-20 supplies the missing half — a periodic re-read of
+> the connection's own memberships, which is that payload's cursor — and the fabric
+> stays lossy for the reason this record gives. **What does not survive is the general
+> claim.** Anything new put on this fabric has to answer the question this paragraph
+> answers for messages: what recovers it? "The fabric is allowed to lose it" is only
+> half an argument, and the other half is per payload.
+
 Once the fabric is *permitted* to be lossy, it should be — Redis pub/sub is single-digit
 milliseconds, requires zero consumer state, and one `SUBSCRIBE chan:{id}` per channel per
 gateway instance. JetStream for live fan-out means durable consumer state per

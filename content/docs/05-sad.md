@@ -578,6 +578,8 @@ aggregate that cannot identify a person needs no erasing.
 | `rl:{env}:{bucket}` | Token buckets (FR-RTL-01) | window |
 | `emoji:{env}:{version}` → shortcode→URL map | Resolution-map cache (→ ADR-12) | 24 h, version-keyed |
 | pub/sub `chan:{channel_id}` | Fan-out fabric (D2) | — |
+| pub/sub `member:{channel_id}` | Membership changes to a channel's members, and to the member being removed — who is still one at the instant it publishes (ADR-20) | — |
+| pub/sub `member:{env}:{user}` | Membership changes addressed to a **principal** rather than a channel (ADR-20). An addition cannot ride the channel's subject: the instance holding the new member is not subscribed to it yet. A ban rides this one alone, carrying `channel: "*"`, which the gateway expands per channel and never sends to a client | — |
 
 **Nothing in Redis is a source of truth.** Total Redis loss ⇒ all clients reconnect and
 resume from cursors; no data loss (NFR-REL-04 analysis depends on this property).
@@ -855,7 +857,8 @@ FR-ANL-06 undetectably); CDC/Debezium (operational mass, D8); publish-before-com
 (phantom events, worse).
 
 ### ADR-07 — Fan-out fabric: Redis pub/sub, at-most-once, by design
-**Status:** accepted · **Drivers:** D2, D3
+**Status:** accepted · **Drivers:** D2, D3 · **extended by ADR-20** (chapter 3.20), which
+carries a payload this record's loss argument does not cover — a revocation has no cursor
 
 Live fan-out uses fire-and-forget Redis pub/sub. A dropped pub/sub frame is *not* a lost
 message: durability lives in Postgres, and the client's cursor + sequence-gap detection
@@ -1108,6 +1111,63 @@ fan-out above, not the trigger. **The trigger remains undischarged** and so does
 
 **Revisit when:** presence fan-out exceeds ~30% of gateway publish volume in load tests, or
 the doubled subscription count becomes the constraint on connections per instance.
+
+### ADR-20 — Membership on a third subject grammar, with a periodic re-read behind it
+**Status:** accepted (chapter 3.20) · extends ADR-07's loss argument to a payload that has no
+cursor · **Drivers:** D2, D8
+
+Membership changes publish on `member:{channel_id}` and `member:{env}:{user}`, and every
+connection re-reads its own memberships from the api on a sixty-second timer.
+
+**ADR-07 permits a lossy fabric with a stated reason, and this payload falls outside it.**
+That record says a dropped frame "is *not* a lost message: durability lives in Postgres, and
+the client's cursor + sequence-gap detection recovers anything missed". A revocation has no
+sequence and no cursor. It is not in a stream, a client cannot detect a gap in it, and there
+is nothing to refetch — a dropped one is a client that keeps receiving a channel it was
+removed from, indefinitely, which is FR-RTM-10's failure and not a delivery delay.
+Constitution IV requires any new mechanism to preserve the recovery property; the periodic
+re-read is what preserves it. **It is this payload's cursor.**
+
+**Two subject shapes, and the second is the first event addressed to a principal.** A removal
+rides `member:{channel_id}` and reaches the removed user and the remaining members in one
+publish, because the removed user is still a member at the instant it goes out. An **addition
+cannot**: the instance holding the new member is not subscribed to that channel — that is
+precisely what is changing — so `member:{env}:{user}` exists. Every other subject in this
+system names a thing to hear about; this one names someone to tell.
+
+**Why not `presence:{channel_id}`'s grammar, or `chan:`'s.** ADR-19's argument transfers
+unchanged: the message path is typed to messages at three points, and a membership frame
+riding it would mean editing the highest-volume path in the system for the lowest-volume
+traffic on it. Presence's subject carries a payload with a different schema and a different
+audience rule. Each fabric owning its grammar is now the pattern rather than the exception.
+
+**The interval is sixty seconds because of the connection budget, not because of a clause.**
+NFR-SCL-01 budgets 10,000 connections per instance and the re-read is per connection, so
+sixty seconds is 167 requests per second per instance and five seconds would be 2,000. **No
+SRS clause bounds a post-loss revocation.** FR-RTM-10's five seconds is the budget for a
+working mechanism, met by the publish at 34–88 ms measured; sixty seconds bounds a mechanism
+that did not run at all. Reading the two as one number turns a backstop into a poll.
+
+**The honest consequence:** under fabric loss a revocation lands within sixty seconds rather
+than five, exceeding FR-RTM-10 by 55 seconds. The revocation is guaranteed; what is bounded
+is how late it can be.
+
+**Rejected: publishing revocations through JetStream** for durability. It is ADR-07's own
+rejected alternative with a stronger case — per-channel consumer management for a payload
+that is administrative and rare — and it would give the gateway a second broker client for
+one event kind. **Rejected: holding the api's publish until every gateway acknowledges the
+subscription.** That makes an administrative route wait on the fabric and invents a failure
+mode for news the reader can already fetch.
+
+**Rejected: reusing `POST /internal/session` for the re-read.** It answers identity, limits
+and a connect policy that can refuse with a 402 when an environment is over its monthly
+allowance — so a routine refresh could fail for a reason unrelated to membership.
+`GET /internal/memberships`, described in the protocol package since chapter 3.2 and served
+by nothing since, asks the one question the backstop has.
+
+**Revisit when:** the re-read's request rate becomes a constraint on connections per
+instance, or a clause is written that bounds a post-loss revocation — in which case sixty
+seconds is the number it has to argue with.
 
 ## 10. Risks and technical debt register
 
