@@ -580,6 +580,7 @@ aggregate that cannot identify a person needs no erasing.
 | pub/sub `chan:{channel_id}` | Fan-out fabric (D2) | — |
 | pub/sub `member:{channel_id}` | Membership changes to a channel's members, and to the member being removed — who is still one at the instant it publishes (ADR-20) | — |
 | pub/sub `member:{env}:{user}` | Membership changes addressed to a **principal** rather than a channel (ADR-20). An addition cannot ride the channel's subject: the instance holding the new member is not subscribed to it yet. A ban rides this one alone, carrying `channel: "*"`, which the gateway expands per channel and never sends to a client | — |
+| pub/sub `typing:{channel_id}` | Typing signals, one subject per channel (ADR-21). **The TTL column is `—` and that is the point**: no key is created, nothing is stored, and the five-second expiry lives in the receiving client because the published frame carries no `state` field (ADR-22) | — |
 
 **Nothing in Redis is a source of truth.** Total Redis loss ⇒ all clients reconnect and
 resume from cursors; no data loss (NFR-REL-04 analysis depends on this property).
@@ -858,7 +859,9 @@ FR-ANL-06 undetectably); CDC/Debezium (operational mass, D8); publish-before-com
 
 ### ADR-07 — Fan-out fabric: Redis pub/sub, at-most-once, by design
 **Status:** accepted · **Drivers:** D2, D3 · **extended by ADR-20** (chapter 3.20), which
-carries a payload this record's loss argument does not cover — a revocation has no cursor
+carries a payload this record's loss argument does not cover — a revocation has no cursor ·
+and by **ADR-22** (chapter 3.21), which carries the opposite case: a dropped typing frame
+self-corrects within one renewal interval, so this record's argument holds for it exactly
 
 Live fan-out uses fire-and-forget Redis pub/sub. A dropped pub/sub frame is *not* a lost
 message: durability lives in Postgres, and the client's cursor + sequence-gap detection
@@ -1078,7 +1081,9 @@ room for roles, no foreign key).
 
 ### ADR-19 — Presence on its own subject grammar, superseding ADR-10's
 **Status:** accepted (chapter 3.19) · supersedes ADR-10's subject clause · closes SRS Open
-Question 3 · **Drivers:** D8
+Question 3 · **Drivers:** D8 · **extended by ADR-21** (chapter 3.21), which re-derived this
+record's count of the message path's typed points and found seven where this says three —
+the argument is unchanged and stronger
 
 ADR-10 said presence "transitions publish on the affected channels' subjects only". They
 publish on `presence:{channel_id}` instead — a subject **derived from** each affected
@@ -1114,7 +1119,8 @@ the doubled subscription count becomes the constraint on connections per instanc
 
 ### ADR-20 — Membership on a third subject grammar, with a periodic re-read behind it
 **Status:** accepted (chapter 3.20) · extends ADR-07's loss argument to a payload that has no
-cursor · **Drivers:** D2, D8
+cursor · **Drivers:** D2, D8 · **the count it borrows from ADR-19 is corrected in ADR-21**
+(chapter 3.21): seven typed points, not three. The argument it carries is unchanged
 
 Membership changes publish on `member:{channel_id}` and `member:{env}:{user}`, and every
 connection re-reads its own memberships from the api on a sixty-second timer.
@@ -1168,6 +1174,84 @@ by nothing since, asks the one question the backstop has.
 **Revisit when:** the re-read's request rate becomes a constraint on connections per
 instance, or a clause is written that bounds a post-loss revocation — in which case sixty
 seconds is the number it has to argue with.
+
+### ADR-21 — Typing on a fourth subject grammar
+**Status:** accepted (chapter 3.21) · extends ADR-19 and ADR-20 · **Drivers:** D2, D8
+
+Typing signals publish on `typing:{channel_id}`. One shape, not two.
+
+**The chapter's plan assumed the opposite and the grep settled it.** Typing was described
+as the one remaining real-time kind that could reuse `chan:{channel_id}` — per channel,
+ephemeral, carrying no membership question — so ADR-19's argument for a separate grammar
+looked inapplicable. That argument rests on a count, and the count was wrong: ADR-19 says
+the message path is typed to messages at three points, and re-deriving it returns eight
+lines covering **seven** — `onDelivery`, `publish(message: Message)` and a `deliver` type in
+`fanout.ts`, the `messageCreatedSchema` parse there, and three separate literal
+`message.created` sends in `session.ts`. Carrying a second kind on `chan:` means widening a
+type in four places, loosening a parse that currently rejects everything that is not a
+message, and editing the highest-volume path in the system to serve the lowest-volume
+traffic on it.
+
+**Three chapters have now reached this from three starting points, so it is the pattern
+rather than a judgement call: a fabric owns its subject grammar, and a kind that cannot
+share a payload type cannot share a subject.**
+
+**One shape, where ADR-20 needed two.** That record's second subject exists because an
+addition cannot ride the channel it adds you to — the instance holding the new member is not
+subscribed to it yet. Typing has no such case: a signal is only ever interesting to people
+already in the channel, and a member who cannot hear the subject has nothing to be told.
+
+**Rejected: an enveloped payload on `chan:`.** ADR-19 rejected the same thing for presence
+and the objection is stronger here — it puts a discriminated-union parse on every message
+every instance receives, and during a rolling deploy an old instance logs
+`fanout.invalid_payload` for every keystroke on every channel. Typing is higher frequency
+than presence by orders of magnitude.
+
+**Rejected: a bidirectional `typing` frame.** Reusing the published outbound frame for the
+client's signal would let a client name a user, which is what chapter 3.12's direction
+gauntlet forbids. The inbound frame is `typing.send` and carries a channel and nothing else;
+the connection supplies the identity.
+
+**Revisit when:** a fifth kind arrives whose payload the typing fabric could carry unchanged
+— at which point the question is whether two kinds share one grammar, not whether typing
+should have moved to `chan:`.
+
+### ADR-22 — The typing expiry belongs to the receiving client
+**Status:** accepted (chapter 3.21) · **Drivers:** D2, D8 · qualifies FR-RTM-08
+
+FR-RTM-08 reads *"Typing indicators shall expire automatically after 5 seconds without
+renewal and shall not be persisted."* **The platform cannot keep the first half, and this
+record is where that is said rather than discovered.**
+
+`typingSchema` has published `{ channel, user }` since chapter 1.3 — no `state` field, no
+deadline — so there is no frame with which to end an indicator, and nothing anywhere knows
+one exists. No table, no Redis key, no server timer. **A server that does not know an
+indicator started cannot announce that it stopped.** The five seconds therefore live in the
+receiving client, counted from the last frame for each `(channel, user)`.
+
+**What the platform owes, and does:** it emits a `typing` frame when a member signals, and it
+stops emitting when they stop. The gateway holds a two-second debounce per connection and
+channel so a keystroke is not a publish — 2.5 renewals per expiry window, so one dropped
+publish does not make an indicator flicker.
+
+**The second half of the clause is met absolutely.** "Shall not be persisted" is true because
+nothing is stored anywhere, which is a stronger property than a TTL would have given.
+
+**Why not add a `state` field and a stop frame.** It would edit a published schema that
+`frames.test.ts` asserts and twenty chapters of clients parse, to add a message whose loss
+is unrecoverable: a dropped `typing.stop` leaves an indicator showing for ever, where a
+dropped renewal self-corrects within one interval. **A lost typing frame converges on the
+truth; a lost stop frame converges on a lie.** Chapter 3.20 took the opposite decision for
+membership for exactly this reason, and the two records are the same argument with the
+inputs reversed.
+
+**The honest consequence:** a customer implementing a client from the published documents
+alone will not expire an indicator, because FR-RTM-08's plain reading puts the timer on the
+server. This ADR is the correction, and the clause is unchanged — a requirement is the
+customer's contract and a chapter does not rewrite one to match its code.
+
+**Revisit when:** an SDK exists in this repository. The timer would then have a home the
+platform owns, and "the client" would stop meaning "code we do not control".
 
 ## 10. Risks and technical debt register
 

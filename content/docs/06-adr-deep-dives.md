@@ -1269,7 +1269,165 @@ inherited intact, and now answerable only by the second half of its remedy, chan
 in. Or when the doubled subscription count becomes the binding constraint on connections per
 instance, which is the measurement NFR-SCL-01 has been owed since the SAD was written.
 
-## Reading the nineteen together
+## ADR-20 — Membership on a third subject grammar
+
+### Problem
+
+A membership change has to reach two audiences that a channel subject can only serve one of.
+A removal is fine: the removed user is still a member at the instant it publishes, so
+`member:{channel_id}` reaches them and the remaining members in one go. An **addition** is
+not, and the reason is topology rather than taste — the instance holding the new member is
+not subscribed to that channel, because not being in it is precisely what is changing.
+
+### Options
+
+**One subject per channel.** Cheapest, and cannot deliver an addition.
+
+**One publish per remaining member's user subject.** Correct, and replaces one publish with
+one per member — a thousand of them at FR-CHN-07's ceiling, for one removal.
+
+**Two shapes: the channel's and the principal's.** Two publishes for an addition, one for a
+removal, and the second shape is the first event in this system addressed to *someone to
+tell* rather than *a thing to hear about*.
+
+### Analysis
+
+ADR-07 permits a lossy fabric because "durability lives in Postgres, and the client's cursor
++ sequence-gap detection recovers anything missed". **A revocation has neither.** It is not
+in a stream, a client cannot detect a gap in it, and there is nothing to refetch. A dropped
+one leaves a client receiving a channel it was removed from, indefinitely — FR-RTM-10's
+failure, not a delivery delay.
+
+Constitution IV requires a new mechanism to preserve the recovery property, so the periodic
+re-read exists to be this payload's cursor. Sixty seconds comes from the connection budget:
+NFR-SCL-01's 10,000 per instance at one re-read each is 167 requests per second, where five
+seconds would be 2,000.
+
+### Decision
+
+Two subject shapes and a sixty-second re-read per connection.
+
+### Consequences
+
+Under fabric loss a revocation lands within sixty seconds rather than FR-RTM-10's five,
+**exceeding the clause by 55 seconds**. The revocation is guaranteed; what is bounded is how
+late it can be. That is stated here rather than left for a reader to derive, because the
+alternative — reading the two numbers as one — turns a backstop into a poll.
+
+### Revisit when
+
+The re-read's request rate becomes a constraint on connections per instance, or a clause is
+written that bounds a post-loss revocation.
+
+## ADR-21 — Typing on a fourth subject grammar
+
+### Problem
+
+Typing was the one real-time kind that looked like it needed no new grammar: per channel,
+ephemeral, no membership question. ADR-19 refused `chan:{channel_id}` for presence because
+the message path is typed to messages **at three points** — and if that were the whole cost,
+typing might have been worth paying it.
+
+### Options
+
+**Reuse `chan:{channel_id}`.** Widen the types, loosen the parse, edit the highest-volume
+path in the system.
+
+**An enveloped payload on `chan:`.** ADR-19 rejected this for presence: a
+discriminated-union parse on every message every instance receives, and during a rolling
+deploy an old instance logs `fanout.invalid_payload` for every keystroke on every channel.
+
+**A fourth grammar.** One more subject shape, one more reference-counted subscription per
+channel, and nothing else changes.
+
+### Analysis
+
+**The count was wrong, and re-deriving it is what settled the chapter.** ADR-19 says three
+typed points; the grep returns eight lines covering **seven** — `onDelivery`,
+`publish(message: Message)` and a `deliver` type in `fanout.ts`, the `messageCreatedSchema`
+parse there, and three separate literal `message.created` sends in `session.ts`. The
+argument is not weakened by the correction; it is stronger, and it had been carried forward
+by two chapters without anyone re-running it.
+
+The envelope option is worse here than it was for presence, because typing is higher
+frequency by orders of magnitude — the invalid-payload log during a rolling deploy is per
+keystroke rather than per transition.
+
+### Decision
+
+`typing:{channel_id}`. One shape, where ADR-20 needed two: a typing signal is only ever
+interesting to people already in the channel, so there is no audience the channel's subject
+cannot reach.
+
+### Consequences
+
+Four grammars share one Redis and every gateway subscribes to a string, so the topology now
+needs a test of its own — five subject builders, pairwise distinct for the same id, plus a
+delivery test proving four kinds arrive under four types. A builder can be distinct while a
+handler is wired to the wrong one.
+
+**And a rule, reached three times from three starting points: a fabric owns its subject
+grammar, and a kind that cannot share a payload type cannot share a subject.**
+
+### Revisit when
+
+A fifth kind arrives whose payload the typing fabric could carry unchanged — at which point
+the question is whether two kinds share one grammar, not whether typing should have moved.
+
+## ADR-22 — The typing expiry belongs to the receiving client
+
+### Problem
+
+FR-RTM-08 says *"Typing indicators shall expire automatically after 5 seconds without
+renewal and shall not be persisted."* Read plainly, that is a server obligation. The server
+cannot meet it.
+
+### Options
+
+**A Redis key with a five-second TTL.** The obvious reading of the clause, and it fails on
+its own terms: the gateway would learn an indicator had lapsed and have no frame to say so
+with. A key that expires silently is a key nobody can act on.
+
+**A `state` field and a `typing.stop` frame.** Complete, and it edits a schema published
+since chapter 1.3 that twenty chapters of clients parse — to add a message whose loss is
+unrecoverable.
+
+**The client's timer.** Five seconds from the last frame per `(channel, user)`, counted
+where the indicator is drawn.
+
+### Analysis
+
+**A dropped renewal self-corrects within one interval; a dropped stop frame leaves an
+indicator showing for ever.** That asymmetry decides it. Chapter 3.20 reached the opposite
+conclusion for membership from the same test — a revocation has no cursor, so it needed a
+backstop — and the two records are one argument with the inputs reversed. **A lost typing
+frame converges on the truth; a lost revocation converges on a lie.**
+
+The clause's second half is met absolutely rather than approximately: nothing is stored
+anywhere, which is stronger than any TTL would have been.
+
+### Decision
+
+No key, no timer, no stored fact. The platform emits and stops emitting; the disappearance
+is the client's.
+
+### Consequences
+
+**A customer implementing a client from the published documents alone will not expire an
+indicator**, because FR-RTM-08's plain reading puts the timer on the server. This record is
+the correction. The clause itself is unchanged — a requirement is the customer's contract,
+and a chapter does not rewrite one to match its code.
+
+The gateway holds a two-second debounce per connection and channel, so a keystroke is not a
+publish: 2.5 renewals per expiry window, chosen so one dropped publish does not make an
+indicator flicker.
+
+### Revisit when
+
+An SDK exists in this repository. The timer would then have a home the platform owns, and
+"the client" would stop meaning "code we do not control".
+
+## Reading the twenty-two together
 
 Three themes recur, and naming them is the best summary of the architecture's character:
 

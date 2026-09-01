@@ -261,15 +261,23 @@ goes through.
 
 **Status:** WebSocket `error` frame, then close 4002 · **Retryable:** no
 
-The frame's `type` names something a CLIENT may not send. `message.send` is the only
-inbound frame; every other member of the frame union is server-to-client, and a client
-uttering one is a protocol violation rather than a malformed frame.
+The frame's `type` names something a CLIENT may not send. **Two frames are inbound —
+`message.send` and `typing.send`** — and every other member of the frame union is
+server-to-client, so a client uttering one is a protocol violation rather than a malformed
+frame.
+
+**The inbound set is named rather than listed by exception, and the spelling is the rule:
+an inbound frame ends in `.send`.** A frame whose type is outside that set is refused here
+however well-formed it is.
 
 This one closes the connection (4002) where `invalid_frame` does not, and the distinction
 is deliberate: a bad frame is a bug in one message, and a client claiming to be the server
-is a bug in the client's model of the protocol.
+is a bug in the client's model of the protocol. The two are also reached in that order — a
+type the union does not contain at all fails schema validation first and gets
+`invalid_frame` with the socket left open.
 
-**What to do:** send `message.send`. Do not send events; receive them.
+**What to do:** send `message.send` to post a message, or `typing.send` to say you are
+typing in a channel. Do not send events; receive them.
 
 ## internal_error
 
