@@ -650,6 +650,26 @@ export const series: Part[] = [
           "Một điều khoản chưa được thoả từ chương 2.6 và bị một bài test khẳng định là vi phạm từ 3.18, nay đóng lại bằng chính bài test đó đảo ngược với thời gian chờ 5.500 ms giữ nguyên; một ngữ pháp subject thứ ba mà hình dạng thứ hai gửi tới một principal thay vì một channel, bởi một lần thêm thành viên không thể đi nhờ cái subject mà chính instance của nó chưa subscribe; một lệnh ban tới nơi như một thay đổi và rời đi thành một frame cho mỗi channel, với ký hiệu canh gác không bao giờ chạm tới client; và một lần đọc lại định kỳ đứng thay cho một cursor không tồn tại",
         translatedIn: ["vi"],
       },
+      {
+        id: "3.21",
+        path: "/part-3/chapter-21/the-frame-nobody-may-send",
+        title: "The frame nobody may send",
+        status: "published",
+        // `sourceDoc` is the SAD, and this chapter adds TWO records rather than
+        // one: ADR-21 takes the fourth subject grammar, and ADR-22 says the
+        // typing expiry belongs to the receiving client. The second exists
+        // because FR-RTM-08 reads as a server obligation the platform cannot
+        // keep, and the clause is the customer's contract — so the boundary is
+        // recorded rather than the requirement rewritten.
+        readerProduces:
+          "The first second inbound frame in twenty chapters, behind a named set whose size and membership a test pins; a fourth subject grammar taken rather than avoided, after re-deriving ADR-19's count and finding seven typed points where the record says three; a two-second renewal interval that is a different quantity from FR-RTM-08's five-second expiry, at 2.5 renewals per window so one dropped publish does not flicker; and an honest verdict on a clause this platform cannot perform — no frame ends an indicator, so the timer is the receiving client's",
+        sourceDoc: "docs/05-sad.md",
+        readerMinutes: 70,
+        titleVi: "Cái frame không ai được gửi",
+        readerProducesVi:
+          "Frame đầu vào thứ hai đầu tiên sau hai mươi chương, đứng sau một tập hợp có tên mà một bài test ghim cả kích thước lẫn thành viên; một ngữ pháp subject thứ tư được nhận chứ không phải né, sau khi đếm lại con số của ADR-19 và tìm thấy bảy điểm được định kiểu chứ không phải ba như bản ghi viết; một khoảng renew hai giây vốn là đại lượng khác với hạn năm giây của FR-RTM-08, ở mức 2,5 lần renew mỗi cửa sổ nên một lần publish bị rơi không làm nhấp nháy; và một phán quyết thành thật về một điều khoản nền tảng này không thực hiện được — không frame nào kết thúc một chỉ báo, nên timer thuộc về bên nhận",
+        translatedIn: ["vi"],
+      },
     ],
   },
   {

@@ -1,0 +1,2640 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figInboundSeam, figFourGrammars, figExpiry } from "./figures";
+
+export const metadata = {
+  title: "Cái frame không ai được gửi — Building Relay",
+  description:
+    "Bản kế hoạch nói typing là loại real-time duy nhất không cần ngữ pháp subject mới. Đếm lại con số đã quyết định điều đó thì thấy bảy điểm được định kiểu, chứ không phải ba như bản ghi viết. Và FR-RTM-08 đòi một cái hết hạn mà nền tảng này không làm được — đó mới là nửa thú vị hơn.",
+  alternates: {
+    canonical: "/vi/part-3/chapter-21/the-frame-nobody-may-send",
+    languages: {
+      en: "/part-3/chapter-21/the-frame-nobody-may-send",
+      vi: "/vi/part-3/chapter-21/the-frame-nobody-may-send",
+    },
+  },
+};
+
+<ChapterHeader id="3.21" locale="vi" />
+
+Suốt hai mươi chương, một dòng trong `session.ts` quyết định client được phép nói gì:
+
+```text title="services/gateway/src/session.ts before this chapter (excerpt)"
+if (frame.data.type !== "message.send") {
+  sendError(connection.socket, "unknown_frame_type", …);
+  connection.socket.close(4002, CLOSE_CODES[4002]);
+  return;
+}
+```
+
+Một phép so sánh, một hằng chuỗi. Mọi thành viên còn lại của frame union là thứ server nói và
+client chỉ được nghe. Lời từ chối đó là bề mặt hẹp nhất trong hệ thống, nó chưa từng nhúc nhích,
+và chương này nới nó ra — một thay đổi lớn hơn vẻ ngoài của nó, bởi seam đầu vào là nơi một
+protocol bị tấn công, và hai mươi chương test đều khẳng định đúng một kiểu được chấp nhận.
+
+<Figure caption="Seam đầu vào sau chương này: hai lời từ chối, và bạn gặp cái nào là tuỳ frame của bạn có parse được hay không" code={figInboundSeam} />
+
+## Kế hoạch cho chương này đã sai, và một lệnh grep là thứ nói ra điều đó
+
+FR-RTM-05 gọi tên sáu loại event thời gian thực. Chương 3.18 cho `message.created` một nơi sản
+xuất, 3.19 cho presence, 3.20 cho membership. `typing` là loại thứ tư, và bản kế hoạch cho các
+chương khép lại Phần 3 nói đây là loại dễ: **loại duy nhất còn lại có thể tái dùng
+`chan:{channel_id}` thay vì thêm một ngữ pháp subject thứ tư.** Theo từng channel, phù du, không
+mang câu hỏi nào về membership — lập luận của ADR-19 cho một ngữ pháp riêng trông như không áp
+dụng được.
+
+Lập luận ấy đặt trên một con số. ADR-19 nói đường đi của message được định kiểu theo message *ở
+ba điểm*, nên chở một loại thứ hai ở đó nghĩa là sửa ba chỗ. Ba thì rẻ. Ba thì đáng trả để khỏi
+phải thêm một ngữ pháp thứ tư.
+
+Đếm lại thì ra tám dòng phủ **bảy** điểm:
+
+```text title="the grep that changed the chapter (excerpt)"
+services/gateway/src/fanout.ts
+  44: onDelivery(handler: (channelId: string, message: Message) => void): void;
+  47: publish(message: Message): Promise<void>;
+  62: let deliver: (channelId: string, message: Message) => void = () => {};
+  80: const message = messageCreatedSchema.shape.payload.safeParse(parsed);
+
+services/gateway/src/session.ts
+  223: send(connection.socket, { type: "message.created", payload: message });
+  896:          type: "message.created",
+  912: send(connection.socket, { type: "message.created", payload: message });
+```
+
+Kiểu `deliver` ở `fanout.ts:62` và hai trong ba lệnh gửi `message.created` đã nằm đó suốt. ADR-19
+đếm ba vào lúc nó được viết, chương 3.20 trích lại ba mà không chạy lại gì cả, và chính mục
+nghiên cứu của chương này nói *bốn* trước khi một task bắt nó chạy lệnh.
+
+<Why>
+Một con số trong bản ghi quyết định là một phép đo có ngày tháng. Ba của ADR-19 đúng với đoạn mã
+trước mặt nó; hai chương sau, cùng câu ấy mô tả một cây mã khác. `git diff` tìm ra một dòng đã
+đổi, và không có gì tìm ra một câu đã thôi đúng vì đoạn mã dịch chuyển bên dưới nó — đó là lý do
+danh sách task có một pha chạy lại các tiền đề trước khi xây trên chúng, và là lý do pha ấy xứng
+đáng có mặt.
+</Why>
+
+**Lập luận không yếu đi vì lần đính chính này. Nó mạnh lên**, và giờ thuộc về ba chương chứ không
+phải một:
+
+> Một fabric sở hữu ngữ pháp subject của nó, và một loại không thể chia sẻ kiểu payload thì không
+> thể chia sẻ subject.
+
+Nên typing lấy `typing:{channel_id}`, và ngữ pháp thứ tư được **nhận** chứ không phải né.
+
+<Figure caption="Bốn ngữ pháp trên một Redis, và fabric đầu tiên mà service này vừa publish vừa tiêu thụ" code={figFourGrammars} />
+
+## Một hình dạng, nơi membership cần hai
+
+Chương 3.20 cần một subject thứ hai vì một lần **thêm** không thể đi nhờ chính channel mà nó thêm
+bạn vào: instance đang giữ thành viên mới chưa subscribe channel đó — đúng cái đang thay đổi.
+Typing không có trường hợp ấy. Một tín hiệu chỉ đáng quan tâm với người đã ở trong channel, và một
+thành viên không nghe được subject thì cũng chẳng có gì để báo.
+
+```ts title="packages/protocol/src/typing.ts"
+import { z } from "zod";
+
+/** Typing's own fabric: one subject shape and the payload that crosses it
+ * (chapter 3.21, FR-RTM-05, FR-RTM-08).
+ *
+ * WHY THIS IS NOT IN `fanout.ts`, `presence.ts` OR `membership.ts`. Each fabric
+ * owns its subject grammar in its own file — `internal.ts` established that for
+ * the event spine, chapter 3.19 followed it for presence and 3.20 for
+ * membership. A new file is a whole-file fence and leaves three chapters' hunks
+ * over `fanout.ts` alone.
+ *
+ * **Three chapters have now reached the same rule from three starting points, so
+ * it is the pattern rather than a judgement call: a fabric owns its subject
+ * grammar, and a kind that cannot share a payload type cannot share a subject.**
+ * The brief for this chapter assumed the opposite — that typing was the one
+ * remaining kind that could reuse `chan:{channel_id}` — and research R1 ran the
+ * grep that settled it: the message path is typed to messages at SEVEN places,
+ * where ADR-19's record counts three.
+ *
+ * NOT `subjectFor`, WHICH `internal.ts` ALREADY EXPORTS. Chapter 3.18 paid for
+ * that collision once:
+ *
+ *     error TS2308: Module "./internal.js" has already exported a member
+ *     named 'subjectFor'.
+ *
+ * WHY ONE SHAPE AND NOT TWO. Chapter 3.20 needed a second, principal-addressed
+ * subject because an addition cannot ride the channel it adds you to — the
+ * instance holding the new member is not subscribed yet. Typing has no such
+ * case: a signal is only ever interesting to people already in the channel, and
+ * a member who cannot hear the subject has nothing to be told. */
+export function subjectForTyping(channelId: string): string {
+  return `typing:${channelId}`;
+}
+
+/** What crosses `typing:{channel_id}` between gateway instances. Consumed only by
+ * gateways and **never sent to a client** — the wire frame is `frames.ts`'s.
+ *
+ * `environment` IS ON THE FABRIC AND NOT ON THE WIRE, as chapter 3.20's is and
+ * for the same reason: a receiving gateway checks it against the connection it is
+ * about to act on, while a client already knows its own environment and has no
+ * use for a tenant id.
+ *
+ * `user` IS HERE AND IS NOT ON THE INBOUND FRAME. `typingSendSchema` carries a
+ * channel and nothing else, because the connection supplies the identity — a
+ * client that could name a user could type as anybody (FR-006). The publishing
+ * gateway fills this field in from the authenticated connection, which is the
+ * one place it can be trusted.
+ *
+ * `strictObject`, so an unknown field is a rejection rather than a silent ignore:
+ * a field added on one side of a rolling deploy fails loudly on the other instead
+ * of being dropped. Chapters 3.19 and 3.20 chose the same strictness for the same
+ * reason.
+ *
+ * **NO `state` FIELD, AND THE ABSENCE IS THE CHAPTER.** There is no "started" or
+ * "stopped" to carry: `typingSchema` has published `{ channel, user }` since
+ * chapter 1.3, so nothing on the wire can end an indicator and the five-second
+ * expiry belongs to the receiving client (FR-009). Adding one here would be the
+ * first half of a design this protocol cannot finish. */
+export const typingFabricSchema = z.strictObject({
+  environment: z.string().min(1),
+  channel: z.string().min(1),
+  user: z.string().min(1),
+});
+
+export type TypingFabric = z.infer<typeof typingFabricSchema>;
+```
+
+Bài test đôi một khác nhau mới là bài đáng kể, và nó có một nhánh mà task không hề yêu cầu:
+
+```ts title="packages/protocol/src/typing.test.ts"
+import { describe, expect, it } from "vitest";
+
+import { subjectForChannel } from "./fanout.js";
+import {
+  subjectForChannelMembership,
+  subjectForUserMembership,
+} from "./membership.js";
+import { subjectForPresence } from "./presence.js";
+import { subjectForTyping, typingFabricSchema } from "./typing.js";
+
+describe("subjectForTyping", () => {
+  it("is `typing:` and the channel id", () => {
+    expect(subjectForTyping("c1")).toBe("typing:c1");
+  });
+
+  it("passes the id through untouched, including a uuid", () => {
+    const id = "7a1f5c2e-0b3d-4e6a-9c8b-1d2e3f4a5b6c";
+    expect(subjectForTyping(id)).toBe(`typing:${id}`);
+  });
+});
+
+// T022. FIVE BUILDERS, PAIRWISE DISTINCT FOR THE SAME ID.
+//
+// Cross-kind mis-delivery is a property of the TOPOLOGY, not of any one module,
+// and this is the test that holds the topology. Four fabrics now share one Redis:
+// a message, a presence transition, two membership shapes and a typing signal can
+// all name channel `c1` in the same second, and every subscriber is listening on
+// a string. If two builders ever agreed, a gateway would parse one kind's payload
+// with another kind's schema — and `strictObject` would turn that into
+// `*.invalid_payload` on every publish rather than anything a reader could trace.
+//
+// The environment-scoped builder takes two arguments, so it is fed the same id in
+// both positions: the point is that no output collides, and feeding it something
+// unrelated would weaken the test rather than the topology.
+describe("the five subject grammars, together", () => {
+  const id = "c1";
+  const builders: ReadonlyArray<readonly [string, string]> = [
+    ["chan", subjectForChannel(id)],
+    ["presence", subjectForPresence(id)],
+    ["member:channel", subjectForChannelMembership(id)],
+    ["member:user", subjectForUserMembership(id, id)],
+    ["typing", subjectForTyping(id)],
+  ];
+
+  it("produces five distinct subjects for one id", () => {
+    const subjects = builders.map(([, subject]) => subject);
+    expect(new Set(subjects).size).toBe(builders.length);
+  });
+
+  it("gives every pair a different string", () => {
+    for (const [nameA, a] of builders) {
+      for (const [nameB, b] of builders) {
+        if (nameA === nameB) continue;
+        expect(a, `${nameA} and ${nameB} collide on \`${a}\``).not.toBe(b);
+      }
+    }
+  });
+
+  it("keeps typing's prefix off every other grammar", () => {
+    // A prefix collision is the one a `new Set` cannot see: `psubscribe` and any
+    // future wildcard read would match across grammars even where the exact
+    // strings differ.
+    const others = builders
+      .filter(([name]) => name !== "typing")
+      .map(([, subject]) => subject);
+    for (const subject of others) {
+      expect(subject.startsWith("typing:")).toBe(false);
+    }
+  });
+});
+
+describe("typingFabricSchema", () => {
+  const valid = { environment: "env_1", channel: "c1", user: "u1" };
+
+  it("accepts the three fields the fabric carries", () => {
+    expect(typingFabricSchema.safeParse(valid).success).toBe(true);
+  });
+
+  it("requires an environment", () => {
+    expect(
+      typingFabricSchema.safeParse({ channel: "c1", user: "u1" }).success,
+    ).toBe(false);
+  });
+
+  it("rejects an empty environment rather than treating it as absent", () => {
+    expect(
+      typingFabricSchema.safeParse({ ...valid, environment: "" }).success,
+    ).toBe(false);
+  });
+
+  it("rejects an unknown field instead of ignoring it", () => {
+    // The whole reason for `strictObject`: a field added on one side of a rolling
+    // deploy fails loudly on the other rather than being silently dropped.
+    expect(
+      typingFabricSchema.safeParse({ ...valid, state: "started" }).success,
+    ).toBe(false);
+  });
+
+  it("rejects a `state` field in particular, which is the one somebody will add", () => {
+    // Named separately from the test above because this is not a hypothetical
+    // unknown field. `typing.start`/`typing.stop` is the design this protocol
+    // does not have, and a `state` on the fabric would be its first half.
+    const result = typingFabricSchema.safeParse({ ...valid, state: "stopped" });
+    expect(result.success).toBe(false);
+  });
+});
+```
+
+<Why>
+Một `new Set` trên năm subject bắt được hai cái bằng nhau và không thấy được hai cái chung tiền
+tố. Hôm nay chưa có gì subscribe theo wildcard, nên một va chạm tiền tố hôm nay không tốn gì —
+đúng loại tính chất tiềm ẩn mà một bài test viết bây giờ thì rẻ, còn viết sau sự cố thì không.
+</Why>
+
+## Module này publish, điều không module nào khác làm
+
+`chan:` do api publish. `member:` do api publish. `presence:` publish ở đây nhưng không bao giờ
+được đọc lại để giao. **Typing là fabric đầu tiên mà service này vừa publish vừa tiêu thụ**: tín
+hiệu của một client đến gateway của chính nó qua socket, instance ấy đặt lên Redis, và cũng
+instance ấy đang subscribe vì nó giữ thành viên của channel đó.
+
+Điều đó có một hệ quả mà danh sách task đã hiểu sai. Nó nói một Redis client, mang phát hiện của
+chương 3.20 sang — module ấy *"được viết với hai client và cái thứ hai được tạo ra, gắn listener,
+đóng lại, rồi không dùng bao giờ"*. Đúng với module ấy, nơi api làm việc publish. Làm theo ở đây
+thì ra một module subscribe thành công rồi hỏng mọi lần publish, vì `fanout.ts:33` đã nêu quy tắc:
+
+> một connection đang ở chế độ subscribe không chạy được lệnh thường, nên publisher và subscriber
+> phải là hai connection
+
+<Trap>
+Một bài học từ chương trước là một khẳng định về đoạn mã của chương đó. Nó chỉ chuyển sang được
+khi hình dạng khớp nhau, và "một client, không phải hai" là khẳng định về một module chỉ nhận.
+Cái này là Redis client thứ bảy và thứ tám mà gateway giữ.
+</Trap>
+
+```ts title="services/gateway/src/typing.ts"
+import {
+  subjectForTyping,
+  typingFabricSchema,
+  type TypingFabric,
+} from "@relay/protocol";
+import type { Logger } from "@relay/service-kit";
+import { Redis } from "ioredis";
+
+// Typing's gateway half (chapter 3.21, FR-RTM-05, FR-RTM-08).
+//
+// A FOURTH FABRIC, AND THE FIRST THIS SERVICE BOTH PUBLISHES AND CONSUMES.
+// `chan:{channel_id}` is published by the api; `presence:{channel_id}` is
+// published here but never read back for delivery; `member:{…}` is published by
+// the api again. Typing is neither: a client's signal arrives at its own gateway
+// over the socket, that instance puts it on the fabric, and the same instance is
+// subscribed because it holds members of that channel. **Both roles coexist on
+// every instance.**
+//
+// TWO CLIENTS, AND THE TASK LIST SAID ONE. It carried chapter 3.20's finding
+// forward — that module was "written with two by analogy and the second was
+// created, listened to, closed and never used" — to a module with a different
+// shape. That chapter's gateway half only ever RECEIVED; its api did the
+// publishing. Here there is no api in the path, and `fanout.ts:33` states the
+// rule this module has to obey:
+//
+//     a subscribed connection cannot issue ordinary commands, so publisher and
+//     subscriber must be two connections
+//
+// `PUBLISH` is an ordinary command. One client would subscribe successfully and
+// then fail every publish it made. **A lesson from the previous chapter is a
+// claim about that chapter's code, and it transfers only when the shapes match.**
+//
+// NOTHING HERE IS STORED. No key, no TTL, no timer per indicator. The five-second
+// expiry is the receiving client's, because `typingSchema` carries no `state`
+// field and no frame ends an indicator (FR-009). What this module holds is
+// transport and a reference count, and both die with the process.
+
+export const DEFAULT_REDIS_URL = "redis://localhost:6379";
+
+export interface Typing {
+  /** Register the delivery callback. Set by the session layer at wiring time. */
+  onSignal(handler: (signal: TypingFabric) => void): void;
+  /** Put one signal on its channel's subject. Failures are swallowed and logged:
+   * a typing indicator that does not arrive is a cosmetic loss that the next
+   * renewal corrects, and it must never fail the socket that sent it (FR-015). */
+  publish(signal: TypingFabric): Promise<void>;
+  subscribe(channelId: string): Promise<void>;
+  unsubscribe(channelId: string): Promise<void>;
+  close(): Promise<void>;
+}
+
+export interface TypingOptions {
+  url?: string;
+  logger: Logger;
+}
+
+export function createTyping({
+  url = process.env["RELAY_REDIS_URL"] ?? DEFAULT_REDIS_URL,
+  logger,
+}: TypingOptions): Typing {
+  // The subscriber keeps ioredis's default retry, as chapter 3.20's does and for
+  // the same reason: it MUST reconnect when the store comes back, which is what
+  // "the next signal arrives without a restart" rests on.
+  const subscriber = new Redis(url);
+  const publisher = new Redis(url);
+
+  // THE STATED REASON IS NFR-OBS-01, NOT PROCESS DEATH. `limits.ts` says a missing
+  // listener kills the gateway; chapter 3.18 measured that against ioredis 6.0.0
+  // and the process stays alive, printing `[ioredis] Unhandled error event: …`
+  // itself. The accurate reason is that those lines are unstructured and unbounded.
+  //
+  // ONE LISTENER PER CLIENT. Two clients, two listeners — and a test that emits on
+  // only one of them proves half of this.
+  for (const [role, client] of [
+    ["subscriber", subscriber],
+    ["publisher", publisher],
+  ] as const) {
+    client.on("error", (error: unknown) => {
+      logger.log("error", "typing.failed", {
+        op: "connection",
+        role,
+        error: String(error),
+      });
+    });
+  }
+
+  let deliver: (signal: TypingFabric) => void = () => {};
+
+  // Reference-counted, because two members of one channel on one instance must not
+  // unsubscribe each other. `fanout.ts`, `presence.ts` and `membership.ts` keep the
+  // same map over the same ids, and this is the fourth.
+  const counts = new Map<string, number>();
+
+  async function failable<T>(
+    op: string,
+    work: () => Promise<T>,
+  ): Promise<T | null> {
+    try {
+      return await work();
+    } catch (error) {
+      // Swallowed on purpose (FR-015). A typing failure must not fail a
+      // connection, a send, or a message delivery — the socket carrying the
+      // signal is carrying everything else too.
+      logger.log("error", "typing.failed", { op, error: String(error) });
+      return null;
+    }
+  }
+
+  subscriber.on("message", (subject: string, raw: string) => {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      logger.log("error", "typing.invalid_payload", { subject });
+      return;
+    }
+    // Validated on receipt even though the fabric is inside the trust boundary.
+    // `fanout.ts:77-79` states the reason and it is unchanged here: "inside" is one
+    // compromised dependency away from "outside", and a malformed payload must not
+    // reach a client.
+    const signal = typingFabricSchema.safeParse(parsed);
+    if (!signal.success) {
+      logger.log("error", "typing.invalid_payload", { subject });
+      return;
+    }
+    deliver(signal.data);
+  });
+
+  return {
+    onSignal(handler) {
+      deliver = handler;
+    },
+
+    async publish(signal) {
+      await failable("publish", async () => {
+        await publisher.publish(
+          subjectForTyping(signal.channel),
+          JSON.stringify(signal),
+        );
+        logger.log("info", "typing.published", {
+          channel: signal.channel,
+          user: signal.user,
+        });
+      });
+    },
+
+    async subscribe(channelId) {
+      const subject = subjectForTyping(channelId);
+      const next = (counts.get(channelId) ?? 0) + 1;
+      counts.set(channelId, next);
+      if (next === 1) {
+        await failable("subscribe", () => subscriber.subscribe(subject));
+      }
+    },
+
+    async unsubscribe(channelId) {
+      const current = counts.get(channelId);
+      // A channel never subscribed, or already released. Not an error: the session
+      // layer releases on close and on revocation, and a connection can meet both.
+      if (current === undefined) return;
+      const next = current - 1;
+      if (next <= 0) {
+        counts.delete(channelId);
+        await failable("unsubscribe", () =>
+          subscriber.unsubscribe(subjectForTyping(channelId)),
+        );
+      } else {
+        counts.set(channelId, next);
+      }
+    },
+
+    async close() {
+      counts.clear();
+      subscriber.disconnect();
+      publisher.disconnect();
+    },
+  };
+}
+```
+
+## Seam, và cái giá một tập hợp phải trả mà một phép so sánh thì không
+
+Nới lời từ chối là ba dòng. Đây, và sau đó là lý do bản hiển nhiên không biên dịch được:
+
+```diff title="services/gateway/src/session.ts"
+@@ -10,6 +10,7 @@ import {
+   type ErrorCode,
+   type Frame,
+   type Message,
++  type TypingFabric,
+   isErrorCode,
+   type MembershipFabric,
+   type PresenceFabric,
+@@ -25,6 +26,7 @@ import { createMeter, METER_INTERVAL_MS, type Meter } from "./meter.js";
+ import { type Membership } from "./membership.js";
+ import { type Presence } from "./presence.js";
+ import { Registry, type Connection } from "./registry.js";
++import { type Typing } from "./typing.js";
+ import {
+   MAX_BUFFERED_FRAMES,
+   SUBSCRIBE_DEADLINE_MS,
+@@ -46,6 +48,66 @@ import {
+ const PING_INTERVAL_MS = 30_000;
+ const MAX_MISSED_PINGS = 2;
+ 
++/** THE RENEWAL INTERVAL (chapter 3.21, FR-011).
++ *
++ * **TWO SECONDS AGAINST FR-RTM-08's FIVE, AND THEY ARE TWO QUANTITIES.** Five is
++ * the receiving client's expiry and cannot move — it is the clause. Two is this
++ * gateway's minimum gap between publishes for one connection and one channel, and
++ * it is argued: 2.5 renewals per expiry window, so **one dropped publish does not
++ * make an indicator flicker**. At 1.67 s the margin is thinner for no gain; at
++ * 4 s a single loss blanks the indicator for a user who never stopped typing.
++ *
++ * Chapter 3.19 armed a grace check at exactly its own grace period and stranded a
++ * user online for ever — two deadlines on one instant, reached by two clocks. The
++ * ratio here is what keeps these two numbers from becoming one. */
++export const DEFAULT_RENEWAL_INTERVAL_MS = 2_000;
++
++/** THE FRAME TYPES A CLIENT MAY SEND (chapter 3.21, FR-003).
++ *
++ * A SET WITH A NAME, not a second `!==` and not an array inlined at the check.
++ * For twenty chapters this was one literal compared with `!==`, and a second
++ * comparison would have been the cheapest edit and the worst one: two conditions
++ * to keep in step, and nothing anywhere that says how many there are. A named set
++ * has one home, and `session.test.ts` asserts both its size and its membership —
++ * so a third inbound frame is a decision somebody made rather than a diff nobody
++ * read.
++ *
++ * **BOTH MEMBERS END IN `.send`, and that is the rule rather than a coincidence.**
++ * `message.send` was the only one until this chapter; `typing.send` was named to
++ * match it, so the next person adding an inbound frame has a spelling to follow
++ * and `frames.test.ts` asserts the correspondence.
++ *
++ * THE AUTHORITY IS STILL THIS FILE. `isolation.itest.ts`'s DIRECTIONS table
++ * classifies every union member and its `inbound` rows must equal this set —
++ * that test is the bridge, and it was `it.fails` from phase 2 until this line
++ * landed. */
++export type InboundFrameType = "message.send" | "typing.send";
++
++export const INBOUND_FRAME_TYPES: ReadonlySet<InboundFrameType> = new Set([
++  "message.send",
++  "typing.send",
++]);
++
++/** **A `Set.has` IS NOT A TYPE GUARD, AND THE SINGLE `!==` WAS ONE FOR FREE.**
++ *
++ * Replacing `frame.data.type !== "message.send"` with a set lookup compiled and
++ * then broke the send path forty lines below with three `TS2339`s — `channel`,
++ * `text` and `idem_key` "does not exist on type" — because the union was no
++ * longer narrowed. The comparison had been doing two jobs and only one of them
++ * was visible.
++ *
++ * A predicate keeps both: the set stays the single home FR-003 asks for, and the
++ * narrowing comes back. **It has to take the FRAME rather than the type string** —
++ * the first version took `type: string` and compiled, and the send path still did
++ * not narrow, because TypeScript cannot push a narrowing of `.type` back onto the
++ * discriminated union it came from. The alternative was an unreachable
++ * `if (type !== "message.send") return;` after the branch below, which is dead
++ * code the coverage ratchet would have to be told to ignore — and this chapter's
++ * pins are 100/100/100/100. */
++function isInboundFrame(frame: Frame): frame is Extract<Frame, { type: InboundFrameType }> {
++  return INBOUND_FRAME_TYPES.has(frame.type as InboundFrameType);
++}
++
+ function send(socket: WebSocket, frame: Frame): void {
+   socket.send(JSON.stringify(frame));
+ }
+@@ -158,6 +220,21 @@ export interface SessionServerOptions {
+    * which is the state FR-RTM-10 has been unmet in since 2.6. A gateway built
+    * without this is not broken — it is the gateway this chapter starts from. */
+   membership?: Membership;
++  /** Chapter 3.21. Optional for the same reasons as the four above, and its own:
++   * without it a client's typing signal is refused at the seam rather than
++   * published, which is the gateway phase 2 left behind.
++   *
++   * **THE DESTRUCTURING IS NOT HERE**, and that is deliberate rather than an
++   * omission. `no-unused-vars` rejects a binding whose first consumer is a later
++   * phase, which makes the phase uncommittable — chapter 3.20 paid for that exact
++   * task once. Phase 5 destructures it in the same commit that calls it. */
++  typing?: Typing;
++  /** Chapter 3.21. Injectable for the reason `meterIntervalMs` above and chapter
++   * 3.20's `rereadIntervalMs` are: **a test that waits out two real seconds pays
++   * them in the package that paces the lane**, which has about four seconds of
++   * headroom in the whole budget. That chapter's itest builds with 40 to test a
++   * sixty-second backstop; this one builds with 40 and with 0. */
++  renewalIntervalMs?: number;
+ }
+ 
+ // THE FOUR PRESENCE TIMINGS ARE NOT HERE, and an earlier draft of this chapter put
+@@ -183,6 +260,8 @@ export function attachSessions({
+   meterIntervalMs = METER_INTERVAL_MS,
+   presence,
+   membership,
++  typing,
++  renewalIntervalMs = DEFAULT_RENEWAL_INTERVAL_MS,
+ }: SessionServerOptions): {
+   registry: Registry;
+   meter: Meter;
+@@ -225,6 +304,52 @@ export function attachSessions({
+   }
+   fanout?.onDelivery(deliver);
+ 
++  /** A typing signal arriving from its own fabric (chapter 3.21, T043).
++   *
++   * **DO NOT COPY `deliverPresence` BELOW, WHICH IS DELIBERATELY UNFILTERED.**
++   * That function walks `subscribersOf` and sends to everyone, so a user sees
++   * their own presence transition — chapter 3.20 confirmed it from the other
++   * side, counting two frames where a watcher correctly sees their own arrival.
++   * **Typing's rule is the opposite, and the two functions sit adjacent in this
++   * file with opposite self-delivery rules.** The reason is worth a sentence
++   * rather than a convention: "you are online" is worth telling your other
++   * devices, and "you are typing" is not.
++   *
++   * SKIP EVERY CONNECTION WHOSE IDENTITY IS THE SIGNALLER, not the socket that
++   * sent it (FR-005). The signal arrives here from Redis with no socket
++   * reference — on the publishing instance too, which subscribes to its own
++   * subject — and a user may hold several connections. A socket comparison would
++   * show a user their own indicator on their own second device, and a test with
++   * one connection per user cannot tell the two apart.
++   *
++   * THE ENVIRONMENT IS CHECKED AGAINST THE CONNECTION, not trusted from the
++   * payload. Principle I is structural here: the fabric carries a tenant id
++   * precisely so a receiving gateway can refuse a frame that does not match the
++   * connection it is about to write to.
++   *
++   * Like presence, this consults neither `connection.phase` nor
++   * `connection.marks`: a typing signal carries no sequence, so it can neither
++   * duplicate a backfilled row nor leave a gap, and buffering it during a resume
++   * would delay a frame for no benefit (FR-018). */
++  function deliverTyping(signal: TypingFabric): void {
++    for (const connection of registry.subscribersOf(signal.channel)) {
++      if (connection.identity.environmentId !== signal.environment) {
++        logger.log("error", "typing.failed", {
++          op: "environment_mismatch",
++          connection_id: connection.id,
++          channel: signal.channel,
++        });
++        continue;
++      }
++      if (connection.identity.userExternalId === signal.user) continue;
++      send(connection.socket, {
++        type: "typing",
++        payload: { channel: signal.channel, user: signal.user },
++      });
++    }
++  }
++  typing?.onSignal(deliverTyping);
++
+   /** A presence transition arriving from its own fabric.
+    *
+    * NOT `deliver`'s path, and the differences are the point. Presence carries no
+@@ -367,6 +492,12 @@ export function attachSessions({
+           fanout?.subscribe(change.channel),
+           presence?.subscribe(change.channel),
+           membership?.subscribeChannel(change.channel),
++          // Chapter 3.21 (T043a). **Without this a user added mid-connection
++          // receives messages and presence but no typing**, and FR-004 is silently
++          // false for exactly the case the previous chapter built. Found by
++          // analysis pass 2 reading this function rather than the feature's own
++          // documents, every one of which was internally consistent and wrong.
++          typing?.subscribe(change.channel),
+         ]).then(
+           () => {
+             connection.channelIds.add(change.channel);
+@@ -423,7 +554,16 @@ export function attachSessions({
+           });
+         }),
+         membership?.unsubscribeChannel(change.channel),
++        // Chapter 3.21 (T043b). A revoked channel leaves `channelIds`, and its
++        // reference count has to follow it — otherwise this instance keeps a
++        // subscription for a channel it holds no member of.
++        typing?.unsubscribe(change.channel),
+       ]);
++      // And the debounce entry, in the same act (T043b). A revoked channel leaves
++      // `channelIds`, so a signal for it would be refused above — but the entry
++      // would sit in the map until the connection closed, and a re-added member
++      // would inherit a stale timestamp from a membership they no longer had.
++      lastPublished.get(connection.id)?.delete(change.channel);
+       // THE WORKING PATH SAYS SOMETHING (FR-031's argument, applied to the delivery
+       // half). `membership.published` is the api's line and means "it went onto the
+       // fabric"; this one means "it took effect on a connection", which is the event
+@@ -656,6 +796,13 @@ export function attachSessions({
+         // revocation and T079 covers the user's own subject, and the ordinary open
+         // path fell between them.
+         membership?.subscribeChannel(channelId),
++        // Chapter 3.21, and the fourth. A channel now carries four subscriptions
++        // on one instance, all reference-counted, all released by the last member
++        // to leave. **This line and the two release sites below are what the
++        // previous chapter's own note warned about**: its equivalent had no task,
++        // because the revocation release and the user subject each had one and the
++        // ordinary open path fell between them.
++        typing?.subscribe(channelId),
+       ]),
+     );
+     // THE BACKSTOP'S TIMER, one per connection and cancelled at close. Registered
+@@ -774,8 +921,16 @@ export function attachSessions({
+           // there is no `.catch` to add here — `failable()` in `membership.ts` is
+           // where that decision lives, and duplicating it would log twice.
+           membership?.unsubscribeChannel(channelId),
++          // Chapter 3.21. Like the membership module, `typing.ts` swallows and
++          // logs its own failures in `failable()`, so there is no `.catch` here —
++          // adding one would log twice.
++          typing?.unsubscribe(channelId),
+         ]),
+       );
++      // Chapter 3.21: the debounce entry for this whole connection. One of the
++      // three deletions the map needs; the other two are a revocation dropping a
++      // channel, and an elapsed entry deleted on read.
++      lastPublished.delete(connection.id);
+       logger.log("info", "connection.closed", {
+         connection_id: connection.id,
+         code,
+@@ -928,6 +1083,89 @@ export function attachSessions({
+     });
+   }
+ 
++  /** THE DEBOUNCE (chapter 3.21, T054): the last publish time per (connection,
++   * channel).
++   *
++   * **IN THIS CLOSURE, NOT ON `Connection`.** That type lives in `registry.ts`,
++   * which chapters 3.7, 3.8, 3.11 and 3.19 all fence — a field there is four
++   * chapters' diffs regenerated for a value with a two-second lifetime. A closure
++   * map needs no fenced type and has a clearer end: it dies with `attachSessions`.
++   *
++   * **NOT A TOKEN BUCKET, AND THE PLANNED THIRD `operation` IS NOT BUILT**
++   * (FR-013a). Research R5 recommended `limits.ts`'s bucket and analysis pass 1
++   * found it cannot express this rule on three counts, each fatal alone: that
++   * limiter keys on `rl:{environmentId}:{operation}:{window}`, so it is per TENANT
++   * where this is per connection; its window is 60 seconds where this is 2; and
++   * its `operation` is a two-member union that a third member would change at
++   * every call site. `limits.ts` is not edited by this chapter.
++   *
++   * **THREE DELETIONS, and the third is the one an obvious implementation
++   * misses.** The connection's whole entry goes in the close handler and a
++   * channel's on revocation — but an entry whose interval has elapsed is also
++   * deleted on READ, below. Without that the bound is channels a connection has
++   * EVER typed in while connected rather than channels it is typing in, and a
++   * stale entry is pure weight: the next signal republishes regardless. */
++  const lastPublished = new Map<string, Map<string, number>>();
++
++  /** CHAPTER 3.21 (T033): a client's typing signal, on its way out.
++   *
++   * **THREE THINGS THE CLIENT DOES NOT GET TO DECIDE**, and each is one line:
++   *
++   *   the user           `connection.identity.userExternalId`, never the payload.
++   *                      `typingSendSchema` has no `user` field at all, so this is
++   *                      belt and braces — but the field is what a reader checks,
++   *                      and a schema is not where they look (FR-006).
++   *   the environment    the connection's, for the same reason. It travels on the
++   *                      fabric and not on the wire, so a receiving gateway can
++   *                      check it against the connection it is about to act on.
++   *   the audience       whoever is subscribed to the channel's subject, which is
++   *                      not this function's business at all.
++   *
++   * **A SIGNAL FOR A CHANNEL THE CONNECTION DOES NOT HOLD PUBLISHES NOTHING AND
++   * SAYS NOTHING** (FR-007). Not an error frame: an error would tell a client
++   * whether a channel exists, which is the probe chapter 3.15 closed on the REST
++   * surface. `channelIds` is the membership this connection was granted, kept
++   * current by chapter 3.20's two branches, so the check is a set lookup rather
++   * than a question for the api.
++   *
++   * No await on delivery, no ack, nothing stored. `publish` swallows its own
++   * failures and logs them (FR-015): a lost typing frame costs one renewal
++   * interval and corrects itself, and it must never fail the socket that sent
++   * it. */
++  async function signalTyping(
++    connection: Connection,
++    channelId: string,
++  ): Promise<void> {
++    if (!connection.channelIds.has(channelId)) return;
++
++    // T055. DROPPED WITH NO FRAME, NO CLOSE CODE AND NO LOG LINE (FR-013).
++    //
++    // **The first refusal in this platform that answers with nothing at all**, and
++    // the reason is NFR-OBS-01 rather than politeness: a client renewing on every
++    // keystroke is expected traffic, not a failure, and one line per keystroke is
++    // exactly the unbounded output that clause exists to prevent. A refused
++    // connect is a 429 with `Retry-After`; a refused send is an error frame the
++    // client must handle; a refused typing signal is dropped on the floor,
++    // defensibly, because the feature is cosmetic.
++    const now = Date.now();
++    const channels = lastPublished.get(connection.id) ?? new Map<string, number>();
++    const last = channels.get(channelId);
++    if (last !== undefined && now - last < renewalIntervalMs) return;
++    // Deleted on read once elapsed, so the map holds what is being typed in
++    // rather than what has ever been typed in. Set below either way.
++    for (const [channel, at] of channels) {
++      if (now - at > renewalIntervalMs) channels.delete(channel);
++    }
++    channels.set(channelId, now);
++    lastPublished.set(connection.id, channels);
++
++    await typing?.publish({
++      environment: connection.identity.environmentId,
++      channel: channelId,
++      user: connection.identity.userExternalId,
++    });
++  }
++
+   async function handle(connection: Connection, raw: string): Promise<void> {
+     let parsed: unknown;
+     try {
+@@ -945,7 +1183,7 @@ export function attachSessions({
+       );
+       return;
+     }
+-    if (frame.data.type !== "message.send") {
++    if (!isInboundFrame(frame.data)) {
+       // Everything else in the union is server → client. A client uttering
+       // one is a protocol violation, not a malformed frame (EIR-WS-06).
+       sendError(
+@@ -957,6 +1195,15 @@ export function attachSessions({
+       return;
+     }
+ 
++    // Chapter 3.21. THE SECOND INBOUND FRAME, and it leaves before the send
++    // limiter below: a typing signal is not a send and must not spend a send's
++    // budget (FR-014). It also never reaches the api — the whole path is this
++    // gateway, Redis, and whoever is subscribed.
++    if (frame.data.type === "typing.send") {
++      await signalTyping(connection, frame.data.payload.channel);
++      return;
++    }
++
+     // Chapter 3.8. THE SEND LIMIT IS SPENT ON THE FRAME, not on the api call
+     // it becomes — a socket send and a REST send count against one budget
+     // (FR-RTL-01), or a client could double its allowance by opening a socket.
+```
+
+<Trap>
+Thay `frame.data.type !== "message.send"` bằng `INBOUND_FRAME_TYPES.has(...)` thì biên dịch được ở
+seam và làm hỏng đường gửi bốn mươi dòng bên dưới với ba lỗi `TS2339` — `channel`, `text` và
+`idem_key` "does not exist on type". **Phép so sánh đơn ấy đã làm hai việc và chỉ một việc là
+nhìn thấy được**: nó từ chối các kiểu khác *và* thu hẹp discriminated union cho mọi thứ phía sau.
+
+Một predicate trên chuỗi kiểu thì biên dịch được, đọc thì đúng, mà vẫn không thu hẹp —
+TypeScript không đẩy được việc thu hẹp `.type` ngược lên union mà nó đến từ đó. Predicate phải
+nhận cả cái frame.
+</Trap>
+
+Lựa chọn thay thế là một dòng không bao giờ chạy tới, `if (type !== "message.send") return;`, đặt
+sau nhánh typing. Đó là mã chết, trong một chương có ngưỡng coverage 100/100/100/100 — và cái
+ratchet trong dự án này đã **xoá** mã năm lần thay vì phủ nó.
+
+## Hai hàm cạnh nhau với hai quy tắc ngược nhau
+
+`deliverTyping` bỏ qua mọi connection có danh tính là người phát tín hiệu. `deliverPresence`, ngay
+bên dưới nó, không bỏ qua ai — một người dùng thấy chính chuyển trạng thái của mình, và chương
+3.20 đã xác nhận điều đó từ phía bên kia trong lúc đếm frame.
+
+<Why>
+"Bạn đang online" thì đáng nói cho các thiết bị khác của bạn. "Bạn đang gõ" thì không. Hai quy tắc
+ngược nhau vì hai sản phẩm ngược nhau, và nước đi tự nhiên — chép hàm bên cạnh — cho ra cái sai,
+nên file nói rõ điều đó ngay chỗ người ta sẽ chép.
+</Why>
+
+Và việc bỏ qua là theo **danh tính**, không bao giờ theo socket. Tín hiệu đến từ Redis không kèm
+tham chiếu socket nào, kể cả trên instance đã publish, và một người dùng có thể giữ nhiều
+connection. So sánh socket sẽ cho người dùng thấy chỉ báo của chính họ trên thiết bị thứ hai của
+họ — và một bài test với một connection mỗi người thì đằng nào cũng xanh, nên mới có một bài test
+với ba.
+
+## Con số chương này không thể làm cho thành thật
+
+FR-RTM-08 viết:
+
+> Typing indicators shall expire automatically after 5 seconds without renewal and shall not
+> be persisted.
+
+Đọc theo nghĩa đen, nửa đầu là nghĩa vụ của server. **Server không làm được**, và lý do là một
+schema đã công bố từ chương 1.3:
+
+```ts title="packages/protocol/src/frames.ts, chapter 1.3 (excerpt)"
+export const typingSchema = z.strictObject({
+  type: z.literal("typing"),
+  payload: z.strictObject({
+    channel: z.string().min(1),
+    user: z.string().min(1),
+  }),
+});
+```
+
+Không `state`. Không hạn chót. Không có frame nào để kết thúc một chỉ báo, và không nơi nào biết
+là có một chỉ báo — không bảng, không khoá Redis, không timer. **Một server không biết một chỉ báo
+đã bắt đầu thì không thể loan báo rằng nó đã dừng.**
+
+<Figure caption="Cái hết hạn, vốn là một timer server không bao giờ chạm vào" code={figExpiry} />
+
+Cách sửa hiển nhiên là một khoá Redis với TTL năm giây, và nó hỏng ngay trên chính điều kiện của
+nó: gateway sẽ biết một chỉ báo đã hết hạn mà không có cách nào nói ra. Cách sửa trọn vẹn là thêm
+một trường `state` và một frame `typing.stop`, tức sửa một schema mà hai mươi chương client đang
+parse, để thêm một thông điệp mà mất nó thì không khôi phục được.
+
+**Một lần renew bị rơi tự sửa trong vòng một khoảng. Một frame stop bị rơi để lại chỉ báo sáng
+mãi.** Sự bất đối xứng ấy quyết định, và đó chính là phép thử chương 3.20 áp lên membership với
+đầu vào đảo ngược: một frame typing bị mất hội tụ về sự thật, một lần thu hồi bị mất hội tụ về một
+lời nói dối. Nguyên tắc IV của hiến pháp được thoả ở đây một cách rỗng, và chính sự rỗng ấy là
+phát hiện.
+
+<Trap>
+Điều khoản không đổi. Một requirement là hợp đồng với khách hàng và một chương không viết lại nó
+cho khớp với mã của mình — nên ranh giới được ghi vào ADR-22, một tài liệu đã công bố mà khách
+hàng đọc được. Cái bị cấm là tuyên bố đã khép mà không kèm lập luận.
+</Trap>
+
+## Hai giây, và vì sao không phải năm
+
+Khoảng renew là của gateway, và nó là một đại lượng khác với cái hết hạn:
+
+```ts title="services/gateway/src/session.ts (excerpt)"
+export const DEFAULT_RENEWAL_INTERVAL_MS = 2_000;
+```
+
+Hai so với năm là **2,5 lần renew trong mỗi cửa sổ hết hạn**, nên một lần publish bị rơi không làm
+chỉ báo nhấp nháy. Ở 1,67 s biên độ mỏng hơn mà chẳng được gì; ở 4 s một lần mất làm tắt chỉ báo
+của người chưa hề ngừng gõ.
+
+<Why>
+Chương 3.19 kích hoạt một lần kiểm tra ân hạn đúng bằng chính khoảng ân hạn của nó và bỏ mặc một
+người dùng online mãi mãi — hai hạn chót trên một khoảnh khắc, đến từ hai đồng hồ. Năm và hai là
+hai đại lượng, và tỉ lệ giữa chúng chính là toàn bộ thiết kế.
+</Why>
+
+Trạng thái là một `Map` trong closure của `attachSessions`, khoá theo connection rồi theo channel.
+Không phải một trường trên `Connection`: kiểu ấy nằm trong `registry.ts`, file mà bốn chương đang
+fence, và một giá trị sống hai giây không đáng để tái sinh bốn bản diff. Nó có ba lần xoá — trong
+close handler, khi một lần thu hồi xảy ra, và **một mục bị xoá lúc đọc khi đã quá hạn**, thiếu nó
+thì giới hạn là số channel một connection **từng** gõ vào chứ không phải số channel nó **đang** gõ.
+
+Và một tín hiệu đến trong khoảng renew bị bỏ đi, không frame, không close code và **không dòng
+log**. Đây là lời từ chối đầu tiên trong nền tảng này trả lời bằng đúng không gì cả: một dòng mỗi
+lần gõ phím chính là loại output không giới hạn mà NFR-OBS-01 tồn tại để ngăn.
+
+## Protocol, và hai bộ đếm phải dịch chuyển
+
+```diff title="packages/protocol/src/frames.ts"
+@@ -101,6 +101,31 @@ export const typingSchema = z.strictObject({
+   }),
+ });
+ 
++/** CLIENT → SERVER: "I am typing in this channel" (chapter 3.21, FR-001).
++ *
++ * **`typing.send`, and the name is an argument.** `typing.start` would read as a
++ * state machine with a missing `typing.stop` — and `typing.stop` is exactly the
++ * frame this protocol does not have, because `typingSchema` above carries no
++ * `state` field and the expiry therefore belongs to the receiving client
++ * (FR-009). A name that says *signal* rather than *state* keeps that honest.
++ *
++ * The `.send` suffix is the other half: `message.send` is the only inbound frame
++ * this protocol had for twenty chapters, so the inbound set becomes
++ * `{ message.send, typing.send }` and **the rule is legible — an inbound frame
++ * ends in `.send`**. FR-003 asks for a named set rather than a list, and a set
++ * with a spelling rule is one a reader can extend correctly.
++ *
++ * **NO `user` IN THE PAYLOAD, AND THE ABSENCE IS THE SECURITY PROPERTY**
++ * (data-model §2, FR-006). The connection supplies the identity; a client that
++ * could name a user could type as anybody. `typingSchema` carries a `user`
++ * because the SERVER fills it in on the way out. */
++export const typingSendSchema = z.strictObject({
++  type: z.literal("typing.send"),
++  payload: z.strictObject({
++    channel: z.string().min(1),
++  }),
++});
++
+ /** Protocol-level error — EIR-API-04's error shape, reused on the socket
+  * (chapter 1.3's recorded decision).
+  *
+@@ -137,6 +162,7 @@ export const frameSchema = z.discriminatedUnion("type", [
+   membershipChangedSchema,
+   presenceChangedSchema,
+   typingSchema,
++  typingSendSchema,
+   errorFrameSchema,
+ ]);
+```
+
+
+
+```diff title="packages/protocol/src/index.ts"
+@@ -12,3 +12,4 @@ export * from "./internal.js";
+ export * from "./fanout.js";
+ export * from "./presence.js";
+ export * from "./membership.js";
++export * from "./typing.js";
+```
+
+Thêm thành viên thứ mười một vào union làm hai bài test đỏ, ở hai lane khác nhau:
+
+```diff title="services/gateway/src/isolation.itest.ts"
+@@ -12,7 +12,7 @@ import { WebSocket } from "ws";
+ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+ 
+ import { createApiClient } from "./api-client.js";
+-import { attachSessions } from "./session.js";
++import { attachSessions, INBOUND_FRAME_TYPES } from "./session.js";
+ import { seedSocketTenants, type SocketTenants } from "./isolation-fixtures.js";
+ 
+ // THE SOCKET HALF OF THE GAUNTLET (FR-007, NFR-SEC-09, constitution I).
+@@ -705,10 +705,10 @@ describe("the socket gauntlet", () => {
+   });
+ });
+ 
+-// ── T049, T050: the ten frames, classified ───────────────────────────────────
++// ── T049, T050: the eleven frames, classified ────────────────────────────────
+ //
+ // THE MEMBER LIST IS DERIVED; THE DIRECTION IS NOT. `frameSchema.options` yields
+-// all ten discriminator values at runtime, so a frame added to the union appears
++// all eleven discriminator values at runtime, so a frame added to the union appears
+ // here without an edit and fails the totality check until somebody classifies it
+ // — the same property `targets.itest.ts` gives the route list.
+ //
+@@ -728,6 +728,17 @@ const DIRECTIONS: ReadonlyArray<readonly [string, "inbound" | "outbound", string
+   ["membership.changed", "outbound", "membership is written through the api, never the socket"],
+   ["presence.changed", "outbound", "derived from connections the gateway holds, not claimed"],
+   ["typing", "outbound", "server-fanned; a client claiming one could type as anybody"],
++  // CHAPTER 3.21, and the second inbound frame in twenty chapters. It carries no
++  // `user` — the connection supplies it — which is what keeps the row above true
++  // rather than contradicted: same subject, two frames, and only the server's
++  // names a person.
++  //
++  // AND NO CASE IN `sample()` BELOW, which an earlier version of this task
++  // mandated. That builder feeds the refusal loop, and the loop iterates
++  // `DIRECTIONS.filter(([, d]) => d === "outbound")` — so nothing ever asks for
++  // an inbound frame's sample and the case would be dead code a task required.
++  // Said here because the next reader adding an inbound type will wonder.
++  ["typing.send", "inbound", "chapter 3.21: a client may say it is typing (session.ts)"],
+   ["error", "outbound", "the server's refusal shape"],
+ ];
+ 
+@@ -773,8 +784,11 @@ describe("every frame in the union is classified, in both directions", () => {
+     (option) => (option.shape.type as { value: string }).value,
+   );
+ 
+-  it("derives all ten members from the union itself", () => {
+-    expect(members.length).toBe(10);
++  it("derives all eleven members from the union itself", () => {
++    // ELEVEN with chapter 3.21's `typing.send`. **The title carries the number
++    // too**, and updating the assertion without the title is how chapter 3.19
++    // shipped a good test under a false name.
++    expect(members.length).toBe(11);
+   });
+ 
+   it("classifies every member exactly once", () => {
+@@ -792,12 +806,24 @@ describe("every frame in the union is classified, in both directions", () => {
+     expect(stale, `classified but no longer in frameSchema: ${stale.join(", ")}`).toEqual([]);
+   });
+ 
+-  it("agrees with the gateway: exactly one member is inbound", () => {
++  /** **THIS WAS `it.fails` FROM PHASE 2 TO PHASE 4, and the gap was the point.**
++   * Phase 2 classified `typing.send` as inbound in the table above while
++   * `session.ts` still accepted only `message.send`; the two disagreed, and this
++   * assertion is the bridge that says so. Phase 4 widened the seam to a named
++   * set, the disagreement closed, and the test is ordinary again.
++   *
++   * T015 predicted the union widening would fail the gauntlet three ways and it
++   * failed TWO: the count, and the totality check. "names no frame the union
++   * does not have" cannot fail on an ADDITION — only a removal reaches it. This
++   * was the third failure, and it arrived one edit later than predicted. */
++  it("agrees with the gateway: exactly the inbound set is inbound", () => {
+     const inbound = DIRECTIONS.filter(([, d]) => d === "inbound").map(([t]) => t);
+-    // Not a taste assertion. `session.ts` compares against this one literal and
+-    // closes 4002 on everything else, so a second inbound frame here would be a
+-    // classification the code does not implement.
+-    expect(inbound).toEqual(["message.send"]);
++    // Not a taste assertion, and no longer a literal: `session.ts` refuses every
++    // type outside `INBOUND_FRAME_TYPES` with 4002, so this compares the table
++    // against the code itself. A row added here without a member added there is
++    // a classification the gateway does not implement — which is exactly the
++    // state phase 2 left behind on purpose, and phase 4 closed.
++    expect(inbound.sort()).toEqual([...INBOUND_FRAME_TYPES].sort());
+   });
+ });
+```
+
+
+
+```diff title="services/gateway/src/main.test.ts"
+@@ -35,7 +35,12 @@ describe("gateway skeleton", () => {
+       const expectedFrames = frameSchema.options.map((o) => o.shape.type.value);
+       expect(body.protocol.frames).toEqual(expectedFrames);
+       expect(body.protocol.frames).toContain("connection.ack");
+-      expect(body.protocol.frames).toHaveLength(10);
++      // ELEVEN from chapter 3.21's `typing.send`. The `toEqual` above is derived
++      // on both sides and needed nothing; this line is the second of the two
++      // hard-coded frame counts in the repository, and the only one no task
++      // owned until analysis pass 17. It failed here in the UNIT lane, which
++      // `test:integration` does not run and no phase gate ran until pass 18.
++      expect(body.protocol.frames).toHaveLength(11);
+       expect(body.protocol.close_codes).toEqual(
+         Object.keys(CLOSE_CODES).map(Number),
+       );
+```
+
+<Trap>
+Trong repo này có đúng hai con số frame viết cứng và chỉ một trong hai từng được một task nhận.
+Của `isolation.itest.ts` là integration test; của `main.test.ts` là **unit** test, nên
+`test:integration` không bao giờ chạy nó — và các cổng pha chạy `lint` với `typecheck` chứ không
+chạy `test`. Bỏ mặc thì nó sẽ hiện ra lần đầu chín pha sau, bị quy cho bất cứ thứ gì được sửa gần
+nhất.
+
+Endpoint `/health` quảng bá bộ từ vựng trên dây, tính ra từ chính package nên không lệch được. Sau
+chương này nó quảng bá mười một frame qua HTTP cho bất cứ ai hỏi.
+</Trap>
+
+```diff title="packages/protocol/src/frames.test.ts"
+@@ -1,6 +1,6 @@
+ import { describe, expect, it } from "vitest";
+ 
+-import { parseFrame } from "./frames.js";
++import { frameSchema, parseFrame } from "./frames.js";
+ 
+ // The contract must bite: for every frame, one specimen that parses and a
+ // table of malformed near-misses that MUST reject. A schema that accepts
+@@ -37,6 +37,9 @@ const valid: Record<string, unknown> = {
+     payload: { user: "u1", state: "online" },
+   },
+   typing: { type: "typing", payload: { channel: "c1", user: "u1" } },
++  // Chapter 3.21, and the only INBOUND member besides `message.send`. One
++  // field: the connection supplies the user.
++  "typing.send": { type: "typing.send", payload: { channel: "c1" } },
+   error: {
+     type: "error",
+     payload: {
+@@ -111,9 +114,60 @@ describe("malformed frames reject", () => {
+     ],
+   ];
+ 
++  // Chapter 3.21. THE `user` REJECTION IS THE SECURITY PROPERTY, not a schema
++  // nicety: a client that could name a user could type as anybody (FR-006).
++  rejects.push(
++    [
++      "typing.send naming a user",
++      { type: "typing.send", payload: { channel: "c1", user: "someone-else" } },
++    ],
++    [
++      "typing.send with an unknown field",
++      { type: "typing.send", payload: { channel: "c1", renew: true } },
++    ],
++    ["typing.send with no channel", { type: "typing.send", payload: {} }],
++    [
++      "typing.send with an empty channel",
++      { type: "typing.send", payload: { channel: "" } },
++    ],
++  );
++
+   for (const [name, frame] of rejects) {
+     it(name, () => {
+       expect(parseFrame(frame).success).toBe(false);
+     });
+   }
+ });
++
++// T014. THE COUNT AND THE SET, both asserted, on `codes.test.ts`'s precedent:
++// an exact count makes a new member a decision rather than an accident, and an
++// exact set makes it the RIGHT decision. The count alone would pass if somebody
++// swapped one member for another.
++describe("the frame union's membership (chapter 3.21)", () => {
++  const members = frameSchema.options.map((o) => o.shape.type.value);
++
++  it("has eleven members", () => {
++    expect(members).toHaveLength(11);
++  });
++
++  it("names exactly two inbound frames, and both end in `.send`", () => {
++    // The direction is not derivable from the schema — `isolation.itest.ts`'s
++    // DIRECTIONS table is where it lives, and this asserts the naming rule that
++    // makes the table's inbound rows predictable rather than remembered.
++    expect(members.filter((m) => m.endsWith(".send")).sort()).toEqual([
++      "message.send",
++      "typing.send",
++    ]);
++  });
++
++  it("keeps `typing` outbound-shaped: it carries a user and the inbound frame does not", () => {
++    // FR-008: `typingSchema` is not edited by this chapter. The pair is the
++    // proof — same subject, two frames, and only the server's has a `user`.
++    expect(parseFrame({ type: "typing", payload: { channel: "c1" } }).success).toBe(
++      false,
++    );
++    expect(
++      parseFrame({ type: "typing.send", payload: { channel: "c1" } }).success,
++    ).toBe(true);
++  });
++});
+```
+
+
+
+```diff title="services/gateway/src/session.test.ts"
+@@ -15,7 +15,7 @@ import type { InternalSendResponse, Message } from "@relay/protocol";
+ import type { ApiClient } from "./api-client.js";
+ import type { Fanout } from "./fanout.js";
+ import { decide, type GatewayLimits } from "./limits.js";
+-import { attachSessions } from "./session.js";
++import { attachSessions, INBOUND_FRAME_TYPES } from "./session.js";
+ 
+ // The door, the frames, and the liveness clock — all provable without a
+ // database, because the gateway has no database (ADR-05). The api is a
+@@ -989,3 +989,38 @@ describe("the socket's limits (chapter 3.8)", () => {
+     expect(CLOSE_CODES[4009]).toBeDefined();
+   });
+ });
++
++// T038. THE INBOUND SET, ASSERTED BY SIZE AND BY MEMBERSHIP.
++//
++// For twenty chapters this was one string literal in one `!==`, and nothing said
++// how many inbound frames there were because one is not a number anybody writes
++// down. Widening it to a set is what makes the count a fact, and a fact is what a
++// test can hold.
++//
++// `codes.test.ts` is the precedent: it asserts the exact close-code set AND the
++// exact count, which is what makes a seventeenth code a decision rather than an
++// accident. The same argument applies harder here — **the inbound seam is where a
++// protocol is attacked**, and a third member arriving unnoticed is the failure
++// this file exists to prevent.
++describe("INBOUND_FRAME_TYPES (chapter 3.21)", () => {
++  it("has exactly two members", () => {
++    expect(INBOUND_FRAME_TYPES.size).toBe(2);
++  });
++
++  it("is exactly message.send and typing.send", () => {
++    expect([...INBOUND_FRAME_TYPES].sort()).toEqual([
++      "message.send",
++      "typing.send",
++    ]);
++  });
++
++  it("holds no server-to-client type, checked against the ones that matter", () => {
++    // Not a restatement of the test above. That one pins the set; this one says
++    // WHY the pin matters, in the vocabulary of the frames a forger would reach
++    // for first — an ack a client could fake, and the outbound `typing` a client
++    // could use to type as somebody else.
++    for (const forgeable of ["message.ack", "message.created", "typing"]) {
++      expect(INBOUND_FRAME_TYPES.has(forgeable as never)).toBe(false);
++    }
++  });
++});
+```
+
+## Đấu nối, và cái miễn trừ phải tự nói ra trường hợp của mình
+
+```diff title="services/gateway/src/main.ts"
+@@ -7,6 +7,7 @@ import { createGatewayLimits } from "./limits.js";
+ import { createMembership } from "./membership.js";
+ import { createPresence } from "./presence.js";
+ import { attachSessions } from "./session.js";
++import { createTyping } from "./typing.js";
+ 
+ // The gateway — SAD §4.1: terminates WebSockets and never writes to the
+ // database (ADR-05). Chapter 1.4 stood up the HTTP half (health, request
+@@ -56,6 +57,12 @@ export function createServer(logger?: Logger) {
+   // `attachSessions` so the tests that call that function directly stay Redis-free,
+   // and so its close has an owner.
+   const membership = createMembership({ logger: log });
++  // Chapter 3.21: the SEVENTH and EIGHTH Redis clients. Chapter 3.20 closed at
++  // six, and this module needs two of its own — a publisher and a subscriber —
++  // because it is the first fabric this service both publishes to and consumes
++  // from. `fanout.ts:33` states why they cannot be one client: a subscribed
++  // connection cannot issue ordinary commands, and PUBLISH is one.
++  const typing = createTyping({ logger: log });
+   // Chapter 3.11. THE FIRST SECRET THIS SERVICE HAS EVER HELD, and it is not a
+   // signing secret: chapter 3.2's claim that "the gateway holds no signing
+   // secret" is untouched, because this one verifies nothing and signs nothing.
+@@ -107,6 +114,7 @@ export function createServer(logger?: Logger) {
+     await limits.close();
+     await presence.close();
+     await membership.close();
++    await typing.close();
+   }
+   return Object.assign(server, { shutdown });
+ }
+```
+
+
+
+<Why>
+Bốn module gateway giờ giữ một Redis client thô và mỗi mục tự biện hộ trường hợp của nó. Mục này
+là trường hợp của fan-out và sạch nhất trong bốn: PUBLISH và SUBSCRIBE lên một uuid channel,
+không khoá nào cả, nên nó không cần lập luận mà presence và membership từng phải đưa ra về một id
+gắn environment.
+</Why>
+
+## Các bài test, và hai bài lẽ ra đã chẳng chứng minh được gì
+
+```ts title="services/gateway/src/typing.test.ts"
+import { describe, expect, it } from "vitest";
+
+import { DEFAULT_REDIS_URL } from "./typing.js";
+
+// PURE SURFACE ONLY, and for this module that is one constant.
+//
+// **T025 asked for "the pure helpers" and this module has none**, which is worth
+// saying rather than padding. `presence.ts` exports `graceCheckDelay` and
+// `wonTransition` because presence has arithmetic — three thirty-second numbers
+// that are three quantities. Typing has no arithmetic at all: the five-second
+// expiry belongs to the receiving client and the two-second renewal interval
+// lives in `session.ts`, not here. What is left is transport and a reference
+// count, and every branch of both needs a client to reach.
+//
+// So this module's arms are `typing.itest.ts`'s:
+//
+//     the JSON.parse catch          a body that is not JSON
+//     the safeParse rejection       JSON the fabric schema rejects
+//     `counts.get(c) ?? 0`          unsubscribe for a channel never subscribed
+//     the onSignal no-op default    a signal arriving with no handler wired
+//     close() with subscriptions    close while a channel is still held
+//     `url ?? DEFAULT_REDIS_URL`    neither supplied
+//     the publish failure           the publisher throws — swallowed and logged
+//     TWO error listeners           one per client; emit on each to reach both
+//
+// `createTyping` is not constructed here on purpose: ioredis connects on
+// construction, so a unit test that built one would open two sockets to nothing
+// and leak them past the file. `limits.test.ts` and `presence.test.ts` are the
+// precedent for the boundary, not for the shape.
+
+describe("DEFAULT_REDIS_URL", () => {
+  it("is the local store, matching the other three fabrics", () => {
+    // Four modules now declare this same default. They agree by copy rather than
+    // by import, which is the same call `limits.ts` made about the api's window
+    // arithmetic and stated: a constant small enough to duplicate is cheaper
+    // duplicated than abstracted (constitution VII).
+    expect(DEFAULT_REDIS_URL).toBe("redis://localhost:6379");
+  });
+});
+```
+
+
+
+```ts title="services/gateway/src/typing.itest.ts"
+import { randomUUID } from "node:crypto";
+import type { Server } from "node:http";
+import {
+  createServer as createNetServer,
+  connect as connectSocket,
+  type AddressInfo,
+  type Server as NetServer,
+  type Socket,
+} from "node:net";
+
+import {
+  docsUrl,
+  subjectForChannel,
+  subjectForChannelMembership,
+  subjectForPresence,
+  subjectForTyping,
+  subjectForUserMembership,
+} from "@relay/protocol";
+import { createLogger, serve, type Logger } from "@relay/service-kit";
+import { Redis } from "ioredis";
+import { afterEach, describe, expect, it } from "vitest";
+import { WebSocket } from "ws";
+
+import type { ApiClient } from "./api-client.js";
+import type { Decision, GatewayLimits } from "./limits.js";
+import { createFanout } from "./fanout.js";
+import { createMembership, type Membership } from "./membership.js";
+import { createPresence } from "./presence.js";
+import { attachSessions } from "./session.js";
+import { createTyping, type Typing } from "./typing.js";
+
+// Chapter 3.21's fabric, against a REAL Redis.
+//
+// NO API IS SPAWNED, AND THAT IS THE POINT OF THE FILE'S SHAPE. Seven of the
+// gateway's nine integration files spawn their own api, and five of the seven
+// failures across chapter 3.20's forty battery runs were one of those fixtures
+// failing to come up. `resume.itest.ts` spawns none — it stubs the `ApiClient`
+// and boots gateways in process — and typing needs no api either, because it
+// writes nothing and reads nothing. **This is a tenth file and the spawn count
+// stays at seven.**
+//
+// AND NO PORT RANGE. `server.listen(0)` lets the OS assign, so two in-process
+// instances get two distinct ports for free and this file appears nowhere in the
+// lane's port map. The seven files that hold ranges are the seven that spawn an
+// api. Chapter 3.20 reached for a fixed range instead and collided twice — once
+// taking `isolation.itest.ts`'s exactly, then overlapping it again.
+//
+//   docker compose up -d redis
+//   pnpm --filter @relay/gateway test:integration
+
+const url = `redis://localhost:${process.env.RELAY_REDIS_PORT ?? "6379"}`;
+const silent: Logger = createLogger("gateway", () => {});
+
+const VALID_TOKEN = "token-for-tuan";
+
+interface Instance {
+  url: string;
+  typing: Typing;
+  close: () => Promise<void>;
+}
+
+/** One gateway, in process, with a real typing fabric and a stubbed api.
+ *
+ * `channels` is what the stub says this connection may hear — the same list the
+ * session layer copies into `connection.channelIds`, which is what
+ * `signalTyping` checks a signal against. */
+async function boot(options: {
+  user: string;
+  channels: string[];
+  environment?: string;
+  /** T050. `createLogger`'s sink receives a JSON **string** with the fields at
+   * the top level, not an object — so a test that destructured `fields` would
+   * silently assert nothing. Parsed here once, and one known line is asserted
+   * before anything relies on the mechanism. */
+  lines?: Record<string, unknown>[];
+  membership?: Membership;
+  limits?: GatewayLimits;
+  renewalIntervalMs?: number;
+  /** Chapter 3.21 phase 7. **The `ApiClient` is the seam that widens the resume
+   * window**, and chapter 3.20 recorded why nothing else does: slowing the FABRIC
+   * calls `degrade()`, which empties the buffer itself. A connection is
+   * `buffering` only from the upgrade until `api.backfill` returns — about twenty
+   * milliseconds on this lane — so a test about mid-resume delivery has to make
+   * that call slow. The code path is the real one; only the clock moves. */
+  backfillDelayMs?: number;
+  backfillFrames?: Record<string, { messages: unknown[]; truncated: boolean }>;
+  /** Points this instance's fabric at a proxy instead of Redis, so a test can
+   * sever the connection without touching anything shared. */
+  redisUrl?: string;
+  /** T072 only: the other three fabrics, so one watcher can receive all four
+   * kinds over the same channel. */
+  allFabrics?: boolean;
+}): Promise<Instance> {
+  const environment = options.environment ?? "env-1";
+  const logger =
+    options.lines === undefined
+      ? silent
+      : createLogger("gateway", (line: string) => {
+          options.lines?.push(JSON.parse(line) as Record<string, unknown>);
+        });
+  const typing = createTyping({ url: options.redisUrl ?? url, logger });
+  const server: Server = serve({
+    service: "gateway",
+    health: () => ({}),
+    logger: silent,
+    notFoundDocsUrl: docsUrl("not_found"),
+  });
+  const api: ApiClient = {
+    session: async () => ({
+      environment_id: environment,
+      user: options.user,
+      banned: false,
+      channel_ids: options.channels,
+      limits: { connect: 3_000, send: 600 },
+    }),
+    memberships: async () => options.channels,
+    backfill: async () => {
+      if (options.backfillDelayMs !== undefined) {
+        await new Promise((r) => setTimeout(r, options.backfillDelayMs));
+      }
+      return (options.backfillFrames ?? {}) as never;
+    },
+    sendMessage: async () => {
+      throw new Error("not used");
+    },
+    reportUsage: async () => null,
+  };
+  const fanout = options.allFabrics ? createFanout({ url, logger: silent }) : undefined;
+  const presence = options.allFabrics
+    ? createPresence({ url, logger: silent })
+    : undefined;
+  const membership =
+    options.membership ??
+    (options.allFabrics ? createMembership({ url, logger: silent }) : undefined);
+  const sessions = attachSessions({
+    server,
+    api,
+    logger,
+    typing,
+    ...(fanout === undefined ? {} : { fanout }),
+    ...(presence === undefined ? {} : { presence }),
+    ...(membership === undefined ? {} : { membership }),
+    ...(options.limits === undefined ? {} : { limits: options.limits }),
+    ...(options.renewalIntervalMs === undefined
+      ? {}
+      : { renewalIntervalMs: options.renewalIntervalMs }),
+  });
+  await new Promise<void>((resolve) => server.listen(0, resolve));
+  const { port } = server.address() as AddressInfo;
+  return {
+    url: `ws://127.0.0.1:${port}/v1/ws`,
+    typing,
+    close: async () => {
+      await sessions.close();
+      await typing.close();
+      await fanout?.close();
+      await presence?.close();
+      // Only the one this harness built: an injected module belongs to its test.
+      if (options.membership === undefined) await membership?.close();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    },
+  };
+}
+
+/** A raw subscriber on the typing subject, which is what a publish assertion has
+ * to be made on.
+ *
+ * NOT THIS CHAPTER'S OWN MODULE. Counting publishes through the code that
+ * publishes is the shape chapter 3.18 warned about — a publisher that does
+ * nothing satisfies it. `presence.itest.ts` and `membership.itest.ts` both
+ * reached for a raw client for the same reason, and both took the
+ * `DRIVER_EXEMPT_TESTS` entry this file also takes. */
+async function watch(channelId: string): Promise<{
+  signals: unknown[];
+  close: () => Promise<void>;
+}> {
+  const subscriber = new Redis(url);
+  const signals: unknown[] = [];
+  subscriber.on("message", (_subject: string, raw: string) => {
+    signals.push(JSON.parse(raw));
+  });
+  await subscriber.subscribe(subjectForTyping(channelId));
+  return {
+    signals,
+    close: async () => {
+      subscriber.disconnect();
+    },
+  };
+}
+
+/** A TCP proxy in front of the real Redis, so a test can sever and restore a
+ * connection without touching anything shared.
+ *
+ * **NEVER `docker compose stop redis`.** These files run in PARALLEL, and
+ * `services/api/src/limits/limits.itest.ts:484` already writes the rule down: "a
+ * dead port rather than stopping the container, because the lane runs files in
+ * PARALLEL and stopping Redis would break every other suite mid-run". A dead port
+ * covers "down" and cannot cover "restored", and `redis-server` is not installed
+ * on the lane machine, so the proxy is what is left.
+ *
+ * Copied from `presence.itest.ts` rather than shared. The duplication is the
+ * cheaper half of the trade: a helper extracted into a fourth file would be
+ * imported by two suites that run in parallel and would then need its own
+ * lifetime story. */
+async function startRedisProxy(): Promise<{
+  url: string;
+  cut: () => Promise<void>;
+  restore: () => Promise<void>;
+  close: () => Promise<void>;
+}> {
+  const target = new URL(process.env.RELAY_REDIS_URL ?? "redis://localhost:6379");
+  const live = new Set<Socket>();
+  let server: NetServer | null = null;
+  let port = 0;
+
+  const listen = (onPort: number): Promise<number> =>
+    new Promise<number>((resolve) => {
+      const next = createNetServer((client) => {
+        const upstream = connectSocket(
+          Number(target.port || 6379),
+          target.hostname,
+        );
+        client.pipe(upstream);
+        upstream.pipe(client);
+        for (const socket of [client, upstream]) {
+          live.add(socket);
+          socket.on("error", () => socket.destroy());
+          socket.on("close", () => live.delete(socket));
+        }
+      });
+      next.listen(onPort, "127.0.0.1", () => {
+        server = next;
+        resolve((next.address() as AddressInfo).port);
+      });
+    });
+
+  port = await listen(0);
+  return {
+    url: `redis://127.0.0.1:${port}`,
+    cut: async () => {
+      for (const socket of live) socket.destroy();
+      live.clear();
+      await new Promise<void>((resolve) =>
+        server ? server.close(() => resolve()) : resolve(),
+      );
+      server = null;
+    },
+    // Re-listening on the SAME port is what "without a restart" means: ioredis
+    // reconnects on its own and the module is never rebuilt.
+    restore: async () => {
+      await listen(port);
+    },
+    close: async () => {
+      for (const socket of live) socket.destroy();
+      await new Promise<void>((resolve) =>
+        server ? server.close(() => resolve()) : resolve(),
+      );
+    },
+  };
+}
+
+const settle = (ms = 300): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+describe("a typing signal on its way out (chapter 3.21)", () => {
+  const open: Array<() => Promise<void>> = [];
+  const sockets: WebSocket[] = [];
+
+  afterEach(async () => {
+    // Sockets before servers. `afterEach` runs in reverse registration order and
+    // a describe-level teardown that closed servers first cost chapter 3.20
+    // seven tests and eighty-three seconds, every failure naming a hook.
+    for (const socket of sockets.splice(0)) socket.close();
+    for (const close of open.splice(0)) await close();
+  });
+
+  const connect = (instance: Instance): WebSocket => {
+    const socket = new WebSocket(`${instance.url}?token=${VALID_TOKEN}`);
+    sockets.push(socket);
+    return socket;
+  };
+
+  const acked = (socket: WebSocket): Promise<void> =>
+    new Promise((resolve) => {
+      socket.on("message", (raw) => {
+        if ((JSON.parse(String(raw)) as { type: string }).type === "connection.ack")
+          resolve();
+      });
+    });
+
+  /** T036. A CHANNEL THE CONNECTION DOES NOT HOLD PUBLISHES NOTHING (FR-007).
+   *
+   * **Asserted on the subscriber, not on the socket.** A silence assertion at the
+   * socket cannot tell a filtered publish from a broken publisher: both look like
+   * nothing arriving. The subscriber can — it sees the signal for the channel the
+   * connection DOES hold, in the same run, so "nothing published" is a claim
+   * about the filter rather than about the fabric being asleep.
+   *
+   * And no error frame: an error would tell a client whether a channel exists,
+   * which is the probe chapter 3.15 closed on the REST surface. */
+  it("publishes nothing for a channel the connection is not a member of, and says nothing", async () => {
+    const mine = randomUUID();
+    const theirs = randomUUID();
+    const instance = await boot({ user: "tuan", channels: [mine] });
+    open.push(instance.close);
+
+    const watchMine = await watch(mine);
+    const watchTheirs = await watch(theirs);
+    open.push(watchMine.close, watchTheirs.close);
+
+    const socket = connect(instance);
+    const frames: { type: string }[] = [];
+    socket.on("message", (raw) => frames.push(JSON.parse(String(raw))));
+    await acked(socket);
+
+    socket.send(JSON.stringify({ type: "typing.send", payload: { channel: theirs } }));
+    await settle();
+
+    expect(watchTheirs.signals).toEqual([]);
+    expect(frames.filter((f) => f.type === "error")).toEqual([]);
+    expect(socket.readyState).toBe(WebSocket.OPEN);
+
+    // The same connection, the same fabric, a channel it does hold: the publisher
+    // works, so the silence above is the filter.
+    socket.send(JSON.stringify({ type: "typing.send", payload: { channel: mine } }));
+    await settle();
+    expect(watchMine.signals).toEqual([
+      { environment: "env-1", channel: mine, user: "tuan" },
+    ]);
+  });
+
+  /** T037's second half: the delivered signal names the CONNECTION's identity.
+   *
+   * The inbound frame carries no user at all, so this cannot be tested by sending
+   * a false one — the schema rejects that, and `session.itest.ts` covers it. What
+   * is testable here is the positive: the value on the fabric is the
+   * authenticated one, and it is the only place it could have come from. */
+  it("names the connection's own identity and environment on the fabric", async () => {
+    const channel = randomUUID();
+    const instance = await boot({
+      user: "mai",
+      channels: [channel],
+      environment: "env-7",
+    });
+    open.push(instance.close);
+    const watcher = await watch(channel);
+    open.push(watcher.close);
+
+    const socket = connect(instance);
+    await acked(socket);
+    socket.send(JSON.stringify({ type: "typing.send", payload: { channel } }));
+    await settle();
+
+    expect(watcher.signals).toEqual([
+      { environment: "env-7", channel, user: "mai" },
+    ]);
+  });
+  /** Every collector in this file filters by CHANNEL and by TYPE (T049).
+   *
+   * Chapter 3.20 counted `presence.changed` frames by type alone and read two
+   * where a watcher correctly saw their own arrival — the fourth occurrence of
+   * that mistake across two chapters. A socket here can carry a
+   * `connection.ack`, a `message.created` and a typing frame for a channel the
+   * test is not asking about, and only the pair narrows it to the subject. */
+  const typingFor = (
+    frames: { type: string; payload?: { channel?: string; user?: string } }[],
+    channel: string,
+  ): { channel?: string; user?: string }[] =>
+    frames
+      .filter((f) => f.type === "typing" && f.payload?.channel === channel)
+      .map((f) => f.payload as { channel?: string; user?: string });
+
+  const collect = (
+    socket: WebSocket,
+  ): { type: string; payload?: { channel?: string; user?: string } }[] => {
+    const frames: { type: string; payload?: { channel?: string; user?: string } }[] = [];
+    socket.on("message", (raw) => frames.push(JSON.parse(String(raw))));
+    return frames;
+  };
+
+  /** **POLL FOR AN ARRIVAL, NEVER SLEEP FOR ONE.**
+   *
+   * A connection is acked before its Redis SUBSCRIBE has necessarily landed: the
+   * non-resume branch of `open()` acks without awaiting `subscribing`. So a test
+   * that acks a watcher and immediately signals can miss the frame, and a fixed
+   * `settle()` after the signal only makes that unlikely rather than impossible.
+   *
+   * Found the honest way — `sends nothing at all after the signal` failed once at
+   * 315 ms in a run that passed on repeat, which is exactly the shape the
+   * twenty-run battery exists to catch and exactly the shape that gets waved away
+   * as "flaky". Negative assertions still use a fixed wait, because there is
+   * nothing to poll for. */
+  const untilTyping = async (
+    frames: { type: string; payload?: { channel?: string; user?: string } }[],
+    channel: string,
+    count: number,
+    ms = 4_000,
+  ): Promise<{ channel?: string; user?: string }[]> => {
+    const deadline = Date.now() + ms;
+    for (;;) {
+      const found = typingFor(frames, channel);
+      if (found.length >= count) return found;
+      if (Date.now() > deadline) {
+        throw new Error(
+          `only ${found.length} of ${count} typing frames for ${channel}; saw ${frames
+            .map((f) => f.type)
+            .join(", ")}`,
+        );
+      }
+      await new Promise((r) => setTimeout(r, 20));
+    }
+  };
+
+  /** The fabric-side twin of `untilTyping`: poll a subscriber for N signals.
+   *
+   * Needed for the same reason and one more — an instance publishing through the
+   * TCP proxy opens a fresh connection through an extra hop, and the first
+   * publish after a boot can land later than a fixed 300 ms wait. That is what
+   * `expected [] to have a length of 1` was, and it is a property of the fixture
+   * rather than of the code. */
+  const untilSignals = async (
+    watcher: { signals: unknown[] },
+    count: number,
+    ms = 5_000,
+  ): Promise<unknown[]> => {
+    const deadline = Date.now() + ms;
+    for (;;) {
+      if (watcher.signals.length >= count) return watcher.signals;
+      if (Date.now() > deadline) {
+        throw new Error(
+          `only ${watcher.signals.length} of ${count} signals reached the fabric`,
+        );
+      }
+      await new Promise((r) => setTimeout(r, 20));
+    }
+  };
+
+  /** T044. CROSS-INSTANCE, which is the only delivery that proves the fabric.
+   *
+   * Two instances, one channel, one signal. If both sockets lived on one gateway
+   * the test would pass against an implementation that never published at all —
+   * `subscribersOf` would find the watcher in the same registry. */
+  it("delivers one frame to a member on another instance, naming the signaller", async () => {
+    const channel = randomUUID();
+    const tuan = await boot({ user: "tuan", channels: [channel] });
+    const mai = await boot({ user: "mai", channels: [channel] });
+    open.push(tuan.close, mai.close);
+
+    const watcher = connect(mai);
+    const frames = collect(watcher);
+    await acked(watcher);
+
+    const signaller = connect(tuan);
+    await acked(signaller);
+    signaller.send(JSON.stringify({ type: "typing.send", payload: { channel } }));
+
+    expect(await untilTyping(frames, channel, 1)).toEqual([
+      { channel, user: "tuan" },
+    ]);
+  });
+
+  /** T045. THE SIGNALLER RECEIVES NOTHING, in the same run in which someone else
+   * does — which is what makes it an assertion about the filter rather than
+   * about a fabric that is asleep. Chapter 3.19's presence collector was
+   * unfiltered in three consecutive phases and every time the behaviour was
+   * right and the assertion was wrong. */
+  it("sends the signaller nothing while another member receives", async () => {
+    const channel = randomUUID();
+    const tuan = await boot({ user: "tuan", channels: [channel] });
+    const mai = await boot({ user: "mai", channels: [channel] });
+    open.push(tuan.close, mai.close);
+
+    const signaller = connect(tuan);
+    const own = collect(signaller);
+    await acked(signaller);
+    const watcher = connect(mai);
+    const theirs = collect(watcher);
+    await acked(watcher);
+
+    signaller.send(JSON.stringify({ type: "typing.send", payload: { channel } }));
+
+    expect(await untilTyping(theirs, channel, 1)).toEqual([
+      { channel, user: "tuan" },
+    ]);
+    expect(typingFor(own, channel)).toEqual([]);
+  });
+
+  /** T045b. THE SIGNALLER'S OWN SECOND CONNECTION RECEIVES NOTHING EITHER.
+   *
+   * **The test above cannot see this**, and that is the whole reason this one
+   * exists: with one connection per user it passes whether the filter compares
+   * identities or sockets. The wrong implementation shows a user their own
+   * indicator on their own second device, and FR-011a requires the topology to
+   * exist by making the renewal interval per connection. */
+  it("sends nothing to the signaller's OTHER connection, which a socket filter would", async () => {
+    const channel = randomUUID();
+    const tuan = await boot({ user: "tuan", channels: [channel] });
+    const alsoTuan = await boot({ user: "tuan", channels: [channel] });
+    const mai = await boot({ user: "mai", channels: [channel] });
+    open.push(tuan.close, alsoTuan.close, mai.close);
+
+    const signaller = connect(tuan);
+    await acked(signaller);
+    const second = connect(alsoTuan);
+    const secondFrames = collect(second);
+    await acked(second);
+    const watcher = connect(mai);
+    const watcherFrames = collect(watcher);
+    await acked(watcher);
+
+    signaller.send(JSON.stringify({ type: "typing.send", payload: { channel } }));
+
+    expect(await untilTyping(watcherFrames, channel, 1)).toEqual([
+      { channel, user: "tuan" },
+    ]);
+    expect(typingFor(secondFrames, channel)).toEqual([]);
+  });
+
+  /** T046. A MEMBER OF A DIFFERENT CHANNEL RECEIVES NOTHING, in a run where a
+   * member of the signalled channel does. A must-not-receive test that passes
+   * because the producer is dead proves nothing. */
+  it("reaches no one in another channel, while reaching the right channel", async () => {
+    const signalled = randomUUID();
+    const other = randomUUID();
+    const tuan = await boot({ user: "tuan", channels: [signalled] });
+    const mai = await boot({ user: "mai", channels: [signalled] });
+    const someoneElse = await boot({ user: "linh", channels: [other] });
+    open.push(tuan.close, mai.close, someoneElse.close);
+
+    const watcher = connect(mai);
+    const watched = collect(watcher);
+    await acked(watcher);
+    const outsider = connect(someoneElse);
+    const outside = collect(outsider);
+    await acked(outsider);
+
+    const signaller = connect(tuan);
+    await acked(signaller);
+    signaller.send(JSON.stringify({ type: "typing.send", payload: { channel: signalled } }));
+
+    expect(await untilTyping(watched, signalled, 1)).toEqual([
+      { channel: signalled, user: "tuan" },
+    ]);
+    expect(outside.filter((f) => f.type === "typing")).toEqual([]);
+  });
+
+  /** T048. ANOTHER TENANT RECEIVES NOTHING, in the same run.
+   *
+   * The two connections share a channel id — deliberately, because that is the
+   * case a channel-scoped subject cannot separate on its own. The subject is
+   * `typing:{channel_id}` with no environment in it, so both instances are
+   * subscribed to the same string and the refusal has to happen at delivery,
+   * against the connection the gateway is about to write to. Principle I is
+   * structural here rather than topological, and this is the test that says so. */
+  it("refuses a signal whose environment does not match the connection, and logs it", async () => {
+    const channel = randomUUID();
+    const lines: Record<string, unknown>[] = [];
+    const tuan = await boot({ user: "tuan", channels: [channel], environment: "env-1" });
+    const other = await boot({
+      user: "stranger",
+      channels: [channel],
+      environment: "env-2",
+      lines,
+    });
+    open.push(tuan.close, other.close);
+
+    const outsider = connect(other);
+    const outsideFrames = collect(outsider);
+    await acked(outsider);
+    // T050: assert one KNOWN line before relying on the sink at all.
+    expect(lines.some((l) => l["msg"] === "connection.opened")).toBe(true);
+
+    const signaller = connect(tuan);
+    await acked(signaller);
+    signaller.send(JSON.stringify({ type: "typing.send", payload: { channel } }));
+    await settle();
+
+    expect(typingFor(outsideFrames, channel)).toEqual([]);
+    expect(
+      lines.filter(
+        (l) => l["msg"] === "typing.failed" && l["op"] === "environment_mismatch",
+      ),
+    ).toHaveLength(1);
+  });
+
+  /** T048a. NOTHING FOLLOWS A SIGNAL (FR-009a).
+   *
+   * **This is FR-RTM-08's actual obligation** — "the indicator expires with no
+   * frame sent to end it" — and it had no task until analysis pass 1. The
+   * assertion is on the watcher's WHOLE frame list rather than on the absence of
+   * one type, because "the server sends nothing to end an indicator" is
+   * otherwise satisfied by a server that sends nothing at all. */
+  it("sends nothing at all after the signal, until another signal is sent", async () => {
+    const channel = randomUUID();
+    // **`renewalIntervalMs: 40`, AND PHASE 6 IS WHY.** This test was written in
+    // phase 5 with the default and passed; phase 6 gave the default a two-second
+    // debounce and the probe below — a second signal, sent to show the fabric is
+    // still alive — landed inside it and was dropped. The failure was
+    // `expected [ … ] to have a length of 2 but got 1`, and it is a P2 story's
+    // mechanism changing a P1 story's test. The subject here is FR-009a's
+    // silence, not the interval, so the interval is set out of the way.
+    const tuan = await boot({
+      user: "tuan",
+      channels: [channel],
+      renewalIntervalMs: 40,
+    });
+    const mai = await boot({ user: "mai", channels: [channel] });
+    open.push(tuan.close, mai.close);
+
+    const watcher = connect(mai);
+    const frames = collect(watcher);
+    await acked(watcher);
+    const signaller = connect(tuan);
+    await acked(signaller);
+
+    signaller.send(JSON.stringify({ type: "typing.send", payload: { channel } }));
+    await untilTyping(frames, channel, 1);
+    const afterSignal = frames.length;
+
+    // **A SECOND AND A HALF, NOT FIVE AND A HALF, AND THE ARGUMENT IS THE
+    // CHAPTER'S OWN.** The obvious version of this test waits past FR-RTM-08's
+    // five seconds to watch the expiry instant go by unannounced. It cost 5.6 s,
+    // tripped vitest's 5 s default timeout, and would have added its own weight
+    // to a package that paces the lane — against roughly four seconds of
+    // headroom in the whole budget.
+    //
+    // And it would have been waiting for nothing. **There is no server timer to
+    // wait for**: no Redis key, no `setTimeout`, no row — the gateway does not
+    // know an indicator exists, which is exactly why it cannot end one. The five
+    // seconds live in the receiving client. So any silence window proves the same
+    // property, and FR-009a names no duration.
+    await settle(1_500);
+    expect(frames).toHaveLength(afterSignal);
+
+    // And the fabric is still alive, so the silence above was a decision.
+    signaller.send(JSON.stringify({ type: "typing.send", payload: { channel } }));
+    expect(await untilTyping(frames, channel, 2)).toHaveLength(2);
+  }, 15_000);
+  /** T048b. A TYPING SIGNAL SPENDS NO MESSAGE QUOTA (FR-014).
+   *
+   * **Moved out of US3 by analysis pass 1**, and the reason is worth keeping:
+   * leaving it in a P2 story meant stopping after the MVP could ship a cosmetic
+   * feature able to exhaust a customer's message budget.
+   *
+   * Asserted on the limiter itself rather than on a counter in Redis. The
+   * requirement is that the typing branch never REACHES `limits.spend` — it
+   * returns above it — and a recording double says exactly that, where a counter
+   * reading would also pass if the branch spent and refunded. */
+  it("never reaches the send limiter, however many signals arrive", async () => {
+    const channel = randomUUID();
+    const spends: string[] = [];
+    const limits: GatewayLimits = {
+      spend: async (_environmentId, operation): Promise<Decision> => {
+        spends.push(operation);
+        return {
+          over: false,
+          limit: 600,
+          remaining: 599,
+          resetSeconds: Math.floor(Date.now() / 1000) + 60,
+          retryAfterSeconds: 1,
+        };
+      },
+      close: async () => {},
+    };
+    const instance = await boot({ user: "tuan", channels: [channel], limits });
+    open.push(instance.close);
+
+    const socket = connect(instance);
+    await acked(socket);
+    // The handshake spends `connect`, which is chapter 3.11's and not this
+    // chapter's business — recorded so the assertion below is about `send`.
+    expect(spends).toEqual(["connect"]);
+
+    for (let i = 0; i < 5; i += 1) {
+      socket.send(JSON.stringify({ type: "typing.send", payload: { channel } }));
+    }
+    await settle();
+
+    expect(spends.filter((op) => op === "send")).toEqual([]);
+  });
+
+  /** T048c. THE MID-CONNECTION JOIN (FR-004a).
+   *
+   * **The obvious test — a member who was in the channel at connect — passes
+   * against an implementation that never touches chapter 3.20's `added`
+   * branch.** So this one connects first, joins second, and signals third.
+   *
+   * Without `typing?.subscribe` in that branch, a user added mid-connection
+   * receives messages and presence and no typing, and FR-004 is silently false
+   * for exactly the case the previous chapter built. Found by analysis pass 2
+   * reading `session.ts` rather than this feature's documents. */
+  it("delivers to a member added to the channel mid-connection", async () => {
+    const channel = randomUUID();
+    const membership = createMembership({ url, logger: silent });
+    open.push(async () => {
+      await membership.close();
+    });
+
+    // Mai connects holding NOTHING, then is added.
+    const mai = await boot({ user: "mai", channels: [], membership });
+    const tuan = await boot({ user: "tuan", channels: [channel] });
+    open.push(mai.close, tuan.close);
+
+    const watcher = connect(mai);
+    const frames = collect(watcher);
+    await acked(watcher);
+
+    // The api's half of chapter 3.20's fabric, published directly: what is under
+    // test is whether the gateway's `added` branch subscribes the typing subject,
+    // not whether the api can compose the event.
+    //
+    // **ON THE USER SUBJECT, NOT THE CHANNEL'S — and the first version of this
+    // test used the channel's and delivered nothing.** That is the previous
+    // chapter's central asymmetry, walked into from the outside: an ADDITION
+    // cannot ride `member:{channel_id}`, because the instance holding the new
+    // member is not subscribed to that channel yet. Which is precisely the case
+    // under test here, since Mai connects holding nothing.
+    const announcer = new Redis(url);
+    open.push(async () => {
+      announcer.disconnect();
+    });
+    await announcer.publish(
+      subjectForUserMembership("env-1", "mai"),
+      JSON.stringify({
+        environment: "env-1",
+        channel,
+        user: "mai",
+        change: "added",
+      }),
+    );
+    await settle();
+
+    const signaller = connect(tuan);
+    await acked(signaller);
+    signaller.send(JSON.stringify({ type: "typing.send", payload: { channel } }));
+
+    expect(await untilTyping(frames, channel, 1)).toEqual([
+      { channel, user: "tuan" },
+    ]);
+  });
+  /** T057. REPEATED SIGNALS INSIDE THE INTERVAL PRODUCE AT MOST ONE PUBLISH.
+   *
+   * **Asserted on a raw `ioredis` subscriber, not on frame counts at a socket and
+   * not through this chapter's own module.** Counting publishes through the code
+   * that publishes is the shape chapter 3.18 warned about — a publisher that does
+   * nothing satisfies it — and counting frames at a socket cannot distinguish one
+   * publish from two when the second is deduplicated downstream. */
+  it("publishes once for a burst inside the interval", async () => {
+    const channel = randomUUID();
+    const instance = await boot({
+      user: "tuan",
+      channels: [channel],
+      renewalIntervalMs: 2_000,
+    });
+    open.push(instance.close);
+    const watcher = await watch(channel);
+    open.push(watcher.close);
+
+    const socket = connect(instance);
+    await acked(socket);
+    for (let i = 0; i < 8; i += 1) {
+      socket.send(JSON.stringify({ type: "typing.send", payload: { channel } }));
+    }
+    await settle();
+
+    expect(watcher.signals).toHaveLength(1);
+  });
+
+  /** T060. THE INTERVAL BITES — as a case, not a source edit.
+   *
+   * The same burst against an instance built with `renewalIntervalMs: 0`
+   * publishes eight times where the test above publishes once. **Edit-and-restore
+   * is the proof form that has now failed twice** — chapter 3.20 ran it on two
+   * orderings and got no failure either time, because both were unobservable — and
+   * a proof written as a case stays in the suite instead of being something
+   * somebody did once and wrote down. */
+  it("publishes every signal when the interval is zero, which is what makes the test above a proof", async () => {
+    const channel = randomUUID();
+    const instance = await boot({
+      user: "tuan",
+      channels: [channel],
+      renewalIntervalMs: 0,
+    });
+    open.push(instance.close);
+    const watcher = await watch(channel);
+    open.push(watcher.close);
+
+    const socket = connect(instance);
+    await acked(socket);
+    for (let i = 0; i < 8; i += 1) {
+      socket.send(JSON.stringify({ type: "typing.send", payload: { channel } }));
+    }
+    await settle();
+
+    expect(watcher.signals).toHaveLength(8);
+  });
+
+  /** T047, MOVED HERE FROM PHASE 5 DURING IMPLEMENTATION. Both halves need an
+   * interval, and the option that supplies one is this phase's.
+   *
+   * **BUILT WITH 40 ms RATHER THAN WAITING OUT TWO REAL SECONDS.** The gateway
+   * package paces the lane at ~45 s and the whole budget has about four seconds of
+   * headroom; chapter 3.20 tests a sixty-second backstop at 40 ms for the same
+   * reason. And the wait below is 120 ms against a 40 ms interval — **never
+   * exactly the interval**, which would put two deadlines on one instant reached
+   * by two clocks, the shape that stranded a user online for ever in 3.19. */
+  it("publishes again after the interval, and not inside it", async () => {
+    const channel = randomUUID();
+    const instance = await boot({
+      user: "tuan",
+      channels: [channel],
+      renewalIntervalMs: 40,
+    });
+    open.push(instance.close);
+    const watcher = await watch(channel);
+    open.push(watcher.close);
+
+    const socket = connect(instance);
+    await acked(socket);
+
+    socket.send(JSON.stringify({ type: "typing.send", payload: { channel } }));
+    socket.send(JSON.stringify({ type: "typing.send", payload: { channel } }));
+    await settle(120);
+    expect(watcher.signals, "the second was inside the interval").toHaveLength(1);
+
+    socket.send(JSON.stringify({ type: "typing.send", payload: { channel } }));
+    await settle();
+    expect(watcher.signals, "the third was after it").toHaveLength(2);
+  });
+
+  /** T058. A DROPPED SIGNAL WRITES NO LOG LINE (FR-013).
+   *
+   * The sink is captured across the burst and compared before and after. **A line
+   * per keystroke is the unbounded output NFR-OBS-01 exists to prevent**, and this
+   * is the first refusal in the platform that answers with nothing at all — so
+   * "nothing" has to include the log, not just the wire. */
+  it("drops a signal with no frame, no close and no log line", async () => {
+    const channel = randomUUID();
+    const lines: Record<string, unknown>[] = [];
+    const instance = await boot({
+      user: "tuan",
+      channels: [channel],
+      renewalIntervalMs: 2_000,
+      lines,
+    });
+    open.push(instance.close);
+
+    const socket = connect(instance);
+    const frames = collect(socket);
+    await acked(socket);
+
+    socket.send(JSON.stringify({ type: "typing.send", payload: { channel } }));
+    await settle();
+    const afterFirst = lines.length;
+    expect(lines.some((l) => l["msg"] === "typing.published")).toBe(true);
+
+    for (let i = 0; i < 6; i += 1) {
+      socket.send(JSON.stringify({ type: "typing.send", payload: { channel } }));
+    }
+    await settle();
+
+    expect(lines).toHaveLength(afterFirst);
+    expect(frames.filter((f) => f.type === "error")).toEqual([]);
+    expect(socket.readyState).toBe(WebSocket.OPEN);
+  });
+
+  /** T059 and T059a. THE INTERVAL IS PER CONNECTION AND PER CHANNEL (FR-011a),
+   * and the same topology answers a second question.
+   *
+   * Two connections of one user in one channel both publish — a well-behaved
+   * client and a hostile one cost the fabric the same, and the state is per
+   * connection rather than per user. And one connection typing in two channels
+   * publishes twice.
+   *
+   * **T059a rides the same fixture**: the signaller's OTHER connection receives
+   * nothing, which T045 cannot see because with one connection per user it passes
+   * whether the filter compares identities or sockets. */
+  it("debounces per connection and per channel, and still tells neither of the user's own sockets", async () => {
+    const first = randomUUID();
+    const second = randomUUID();
+    const tuanA = await boot({
+      user: "tuan",
+      channels: [first, second],
+      renewalIntervalMs: 2_000,
+    });
+    const tuanB = await boot({
+      user: "tuan",
+      channels: [first],
+      renewalIntervalMs: 2_000,
+    });
+    const mai = await boot({ user: "mai", channels: [first] });
+    open.push(tuanA.close, tuanB.close, mai.close);
+
+    const watchFirst = await watch(first);
+    const watchSecond = await watch(second);
+    open.push(watchFirst.close, watchSecond.close);
+
+    const a = connect(tuanA);
+    const aFrames = collect(a);
+    await acked(a);
+    const b = connect(tuanB);
+    const bFrames = collect(b);
+    await acked(b);
+    const watcher = connect(mai);
+    const watcherFrames = collect(watcher);
+    await acked(watcher);
+
+    // Two connections of one user, one channel: the interval is per connection,
+    // so both publish.
+    a.send(JSON.stringify({ type: "typing.send", payload: { channel: first } }));
+    b.send(JSON.stringify({ type: "typing.send", payload: { channel: first } }));
+    await settle();
+    expect(watchFirst.signals).toHaveLength(2);
+
+    // One connection, a second channel: the interval is per channel, so it
+    // publishes again despite having just published.
+    a.send(JSON.stringify({ type: "typing.send", payload: { channel: second } }));
+    await settle();
+    expect(watchSecond.signals).toHaveLength(1);
+
+    // T059a. Neither of Tuan's sockets heard either of Tuan's signals, and Mai
+    // heard both — so the silence is the identity filter and not a dead fabric.
+    expect(await untilTyping(watcherFrames, first, 2)).toHaveLength(2);
+    expect(typingFor(aFrames, first)).toEqual([]);
+    expect(typingFor(bFrames, first)).toEqual([]);
+  });
+  /** T063. A TYPING FRAME ARRIVING MID-RESUME IS SENT IMMEDIATELY (FR-018).
+   *
+   * **CHAPTER 3.20's EQUIVALENT PASSED TWICE WITH ITS SUBJECT DELETED**, and its
+   * record in `specs/038-chapter-3-20/baseline.txt` is what this test is built
+   * against. Both of its traps are handled here:
+   *
+   *   the connection was not buffering — a connection is born `buffering` only
+   *     when a CURSOR is presented (`session.ts:766`), and only until
+   *     `api.backfill` returns, which is about twenty milliseconds on this lane.
+   *     So the socket below presents a cursor and the stub sleeps 800 ms.
+   *   the cursor and the frame had the same sequence — does not apply to typing,
+   *     which carries no sequence at all. That absence is why the frame cannot be
+   *     buffered meaningfully in the first place.
+   *
+   * **THE ASSERTION IS AN ORDERING, not an arrival.** A buffered frame still
+   * arrives — after the flush — so "it arrived" proves nothing. What separates
+   * the two is that an immediate frame arrives BEFORE the backfilled
+   * `message.created`, and a buffered one after it. */
+  it("sends a typing frame during a resume, before the backfill it is racing", async () => {
+    const channel = randomUUID();
+    const mai = await boot({
+      user: "mai",
+      channels: [channel],
+      backfillDelayMs: 800,
+      backfillFrames: {
+        [channel]: {
+          messages: [
+            {
+              id: randomUUID(),
+              channel,
+              seq: 9,
+              user: "tuan",
+              text: "backfilled",
+              created_at: new Date(0).toISOString(),
+            },
+          ],
+          truncated: false,
+        },
+      },
+    });
+    const tuan = await boot({ user: "tuan", channels: [channel] });
+    open.push(mai.close, tuan.close);
+
+    // The signaller first, and acked, so nothing below waits on it.
+    const signaller = connect(tuan);
+    await acked(signaller);
+
+    // **DO NOT AWAIT THE WATCHER'S ACK.** On the resume path the order is
+    // "confirm, backfill, ack, emit, flush, live" (`session.ts`'s own comment),
+    // so the ack goes out AFTER `api.backfill` returns. The first version of this
+    // test awaited it and had therefore already slept through the whole 800 ms
+    // window it was trying to test — the backfilled frame arrived within 300 ms
+    // and the assertion read `expected [ { type: 'message.created' } ] to deeply
+    // equal []`. **A wait for the wrong signal closes the window it was meant to
+    // hold open.**
+    //
+    // A cursor BELOW the backfilled frame's sequence, so the flush has something
+    // to deliver and the ordering below means something.
+    const watcher = new WebSocket(`${mai.url}?token=${VALID_TOKEN}&cursor=${channel}:1`);
+    sockets.push(watcher);
+    const frames = collect(watcher);
+
+    // Inside the 800 ms window: the connection is registered at upgrade and
+    // `buffering` until the backfill returns.
+    await settle(250);
+    signaller.send(JSON.stringify({ type: "typing.send", payload: { channel } }));
+    await settle(250);
+    expect(typingFor(frames, channel)).toHaveLength(1);
+    expect(frames.filter((f) => f.type === "message.created")).toEqual([]);
+
+    // And the backfill still arrives afterwards, so the resume was real.
+    await settle(900);
+    expect(frames.filter((f) => f.type === "message.created")).toHaveLength(1);
+    const typingAt = frames.findIndex((f) => f.type === "typing");
+    const backfilledAt = frames.findIndex((f) => f.type === "message.created");
+    expect(typingAt).toBeLessThan(backfilledAt);
+  }, 15_000);
+
+  /** T064. A RECONNECTING CLIENT RECEIVES NO TYPING FRAMES FOR SIGNALS SENT WHILE
+   * IT WAS AWAY (FR-018, SC-009).
+   *
+   * **A typing indicator replayed after a reconnect is a claim about the present
+   * that was true five seconds ago.** Nothing stores one, so there is nothing to
+   * replay — and this test is what turns that from an argument into a fact. */
+  it("replays no typing frames to a client that reconnects", async () => {
+    const channel = randomUUID();
+    const mai = await boot({ user: "mai", channels: [channel] });
+    const tuan = await boot({ user: "tuan", channels: [channel] });
+    open.push(mai.close, tuan.close);
+
+    const first = connect(mai);
+    await acked(first);
+    const signaller = connect(tuan);
+    await acked(signaller);
+
+    // Signalled while Mai is connected, so the fabric is demonstrably working.
+    signaller.send(JSON.stringify({ type: "typing.send", payload: { channel } }));
+    await settle();
+
+    first.close();
+    await settle(200);
+
+    // Signalled while Mai is away. Two of them, past the interval, so the
+    // publisher is not debouncing them into one.
+    signaller.send(JSON.stringify({ type: "typing.send", payload: { channel } }));
+    await settle(2_100);
+    signaller.send(JSON.stringify({ type: "typing.send", payload: { channel } }));
+    await settle();
+
+    const second = new WebSocket(`${mai.url}?token=${VALID_TOKEN}&cursor=${channel}:1`);
+    sockets.push(second);
+    const frames = collect(second);
+    await acked(second);
+    await settle(500);
+
+    expect(typingFor(frames, channel)).toEqual([]);
+  }, 15_000);
+  /** T068 and T071. THE FABRIC SEVERED, AND RESTORED.
+   *
+   * A publish failure must not fail the connection, the send, or a message
+   * delivery (FR-015). The socket stays open, the client is told nothing, and
+   * **one** structured event is logged — one, because a burst of keystrokes
+   * against a dead Redis must not become a burst of log lines.
+   *
+   * Then the proxy re-listens on the SAME port and the next signal publishes with
+   * no restart, which is what ioredis's default retry on the publisher buys. */
+  it("survives a severed fabric, logs it once, and publishes again when it returns", async () => {
+    const channel = randomUUID();
+    const lines: Record<string, unknown>[] = [];
+    const proxy = await startRedisProxy();
+    open.push(proxy.close);
+
+    const instance = await boot({
+      user: "tuan",
+      channels: [channel],
+      redisUrl: proxy.url,
+      renewalIntervalMs: 0,
+      lines,
+    });
+    open.push(instance.close);
+    // Watched through the REAL Redis, not the proxy: the assertion is about what
+    // reached the fabric, and a watcher behind the same proxy would be cut too.
+    const watcher = await watch(channel);
+    open.push(watcher.close);
+
+    const socket = connect(instance);
+    const frames = collect(socket);
+    await acked(socket);
+
+    socket.send(JSON.stringify({ type: "typing.send", payload: { channel } }));
+    expect(await untilSignals(watcher, 1)).toHaveLength(1);
+
+    await proxy.cut();
+    const beforeFailure = lines.length;
+
+    socket.send(JSON.stringify({ type: "typing.send", payload: { channel } }));
+    await settle(600);
+
+    // The client learns nothing and keeps its socket. This is FR-015's first two
+    // clauses and they hold.
+    expect(frames.filter((f) => f.type === "error")).toEqual([]);
+    expect(socket.readyState).toBe(WebSocket.OPEN);
+
+    // **AND THE PUBLISH DOES NOT FAIL, WHICH FR-015 DID NOT EXPECT.**
+    //
+    // Measured rather than assumed. After the cut the sink holds five lines and
+    // every one of them is `typing.failed` with `op: "connection"` — ioredis's
+    // error listener firing once per reconnect attempt on each of the two
+    // clients. There is no `op: "publish"` line at all, because
+    // `publisher.publish()` never rejects: ioredis's default offline queue
+    // accepts the command and resolves it when the connection returns.
+    //
+    // So a severed fabric does not drop this signal. It DELAYS it — which is
+    // better for the product and worse for the requirement, because FR-015 says a
+    // failure "MUST be logged once" and what is logged once per outage is
+    // nothing, while what is logged per retry is unbounded. **A publisher that
+    // queues satisfies "the socket stayed open" the way chapter 3.18's fan-out
+    // satisfied "the send returned 201 while Redis was down": trivially.**
+    //
+    // Not fixed here. All four fabric modules share this listener shape, and
+    // bounding it is a cross-module decision rather than this chapter's — it goes
+    // to `gaps.md` with the measurement attached.
+    const afterCut = lines.slice(beforeFailure);
+    expect(afterCut.length).toBeGreaterThan(0);
+    expect(
+      afterCut.filter((l) => l["msg"] === "typing.failed" && l["op"] === "connection")
+        .length,
+    ).toBe(afterCut.length);
+    expect(
+      afterCut.filter((l) => l["op"] === "publish"),
+      "the publish queues rather than failing",
+    ).toEqual([]);
+
+    await proxy.restore();
+    // ioredis reconnects on its own; nothing here is rebuilt.
+    await settle(1_200);
+    socket.send(JSON.stringify({ type: "typing.send", payload: { channel } }));
+    expect((await untilSignals(watcher, 2)).length).toBeGreaterThanOrEqual(2);
+  }, 20_000);
+
+  /** T069 and T070. THE LOG VOCABULARY, AS THE SET AN INSTANCE ACTUALLY EMITTED.
+   *
+   * **Not as what a grep finds.** Chapter 3.20's FR-032 declared three names while
+   * the code emitted six — `rejected`, `granted`, `revoked` and `revoked_all`
+   * beside the two it shared — and the clause had to be amended with its argument
+   * afterwards. A set assertion is what would have caught that on the day.
+   *
+   * T070 rides the same instance: **no name is emitted for a signal dropped
+   * inside the renewal interval.** It is expected traffic rather than a failure,
+   * and one line per keystroke over the limit is the unbounded output NFR-OBS-01
+   * exists to prevent. */
+  it("emits exactly the three names it declares, and none for a debounced signal", async () => {
+    const channel = randomUUID();
+    const lines: Record<string, unknown>[] = [];
+    const instance = await boot({
+      user: "tuan",
+      channels: [channel],
+      renewalIntervalMs: 5_000,
+      lines,
+    });
+    open.push(instance.close);
+
+    const socket = connect(instance);
+    await acked(socket);
+
+    // One publish, then a burst inside the interval that must be silent.
+    socket.send(JSON.stringify({ type: "typing.send", payload: { channel } }));
+    await settle();
+    const afterPublish = lines.length;
+    for (let i = 0; i < 5; i += 1) {
+      socket.send(JSON.stringify({ type: "typing.send", payload: { channel } }));
+    }
+    await settle();
+    expect(lines, "a debounced signal writes nothing").toHaveLength(afterPublish);
+
+    // An unparseable body on the subject, to reach the third name.
+    const injector = new Redis(url);
+    await injector.publish(subjectForTyping(channel), "{ not json");
+    await injector.publish(
+      subjectForTyping(channel),
+      JSON.stringify({ environment: "env-1", channel, user: "x", state: "no" }),
+    );
+    injector.disconnect();
+    await settle();
+
+    const emitted = new Set(
+      lines
+        .map((l) => String(l["msg"]))
+        .filter((msg) => msg.startsWith("typing.")),
+    );
+    expect([...emitted].sort()).toEqual([
+      "typing.invalid_payload",
+      "typing.published",
+    ]);
+    // `typing.failed` is the third declared name and is reached by the severed
+    // fabric test above and by the environment mismatch earlier in this file —
+    // asserted there rather than forced here, because a name reached only by a
+    // test that exists to reach it is a name nothing needs.
+  });
+  /** T072. FR-017's CROSS-KIND PROPERTY: four fabrics, one channel, one watcher.
+   *
+   * **Five subject shapes now share one Redis** — `chan:{id}`,
+   * `presence:{id}`, `member:{id}`, `member:{env}:{user}` and `typing:{id}` —
+   * and every gateway subscribes to a string. This is the test that says the
+   * topology holds: each kind arrives ONCE, under its OWN `type`, and no kind
+   * arrives as another.
+   *
+   * `typing.test.ts`'s pairwise-distinctness test proves the SUBJECTS cannot
+   * collide; this proves the DELIVERY does not, which is a different claim. A
+   * builder can be distinct while a handler is wired to the wrong one. */
+  it("keeps four kinds apart over one channel, each arriving once under its own type", async () => {
+    const channel = randomUUID();
+    const instance = await boot({
+      user: "mai",
+      channels: [channel],
+      allFabrics: true,
+    });
+    open.push(instance.close);
+
+    const socket = connect(instance);
+    const frames = collect(socket);
+    await acked(socket);
+    // The subscribes are in flight at ack time, so give all four a moment before
+    // publishing into them.
+    await settle(400);
+
+    const publisher = new Redis(url);
+    open.push(async () => {
+      publisher.disconnect();
+    });
+
+    await publisher.publish(
+      subjectForChannel(channel),
+      JSON.stringify({
+        id: randomUUID(),
+        channel,
+        seq: 4_242,
+        user: "tuan",
+        text: "one message",
+        created_at: new Date(0).toISOString(),
+      }),
+    );
+    await publisher.publish(
+      subjectForPresence(channel),
+      JSON.stringify({
+        environment: "env-1",
+        channel,
+        user: "tuan",
+        state: "online",
+        transition: randomUUID(),
+      }),
+    );
+    await publisher.publish(
+      subjectForChannelMembership(channel),
+      JSON.stringify({
+        environment: "env-1",
+        channel,
+        user: "linh",
+        change: "added",
+      }),
+    );
+    await publisher.publish(
+      subjectForTyping(channel),
+      JSON.stringify({ environment: "env-1", channel, user: "tuan" }),
+    );
+
+    await settle(700);
+
+    const byType = (type: string): unknown[] =>
+      frames.filter((f) => f.type === type);
+    expect(byType("message.created"), "message").toHaveLength(1);
+    expect(byType("presence.changed"), "presence").toHaveLength(1);
+    expect(byType("membership.changed"), "membership").toHaveLength(1);
+    expect(typingFor(frames, channel), "typing").toEqual([
+      { channel, user: "tuan" },
+    ]);
+    // And nothing arrived twice or under a borrowed name: four publishes, four
+    // frames, plus the `connection.ack` the handshake sent.
+    expect(frames.filter((f) => f.type !== "connection.ack")).toHaveLength(4);
+  }, 15_000);
+});
+```
+
+<Trap>
+Hai trong số này lúc đầu viết sai, và những lần đỏ đáng giá hơn chính bài test.
+
+Bài test tham gia giữa chừng publish lên `member:{channel_id}` và không giao được gì — đó chính là
+sự bất đối xứng cốt lõi của chương trước, gặp lại từ bên ngoài. Còn bài test giữa lúc resume thì
+chờ `connection.ack` của watcher trước khi phát tín hiệu, mà trên đường resume cái ack ấy đến *sau*
+khi `api.backfill` trả về: nó ngủ hết cửa sổ 800 ms mà nó định kiểm tra. **Chờ nhầm tín hiệu là
+đóng lại chính cửa sổ mình định giữ cho mở.**
+</Trap>
+
+Bài test cắt fabric cũng đo được một thứ mà requirement không lường trước. FR-015 đòi một sự kiện
+được ghi khi hỏng; cắt connection thì sinh ra năm dòng `typing.failed` với `op: "connection"` và
+**không có dòng nào** với `op: "publish"`, vì hàng đợi offline của ioredis nhận lệnh và trả nó về
+khi kết nối trở lại. Một fabric bị cắt không **làm rơi** tín hiệu typing — nó **làm chậm** tín hiệu.
+
+<Checkpoint>
+Hai socket trên hai instance gateway cùng một channel. Một bên gửi `typing.send`; bên kia nhận
+đúng một frame `typing` gọi tên người phát, còn người gửi không nhận gì. Gửi tám cái liên tiếp thì
+fabric thấy một. Ngừng lại, và không có gì đến cả — chỉ báo biến mất theo timer của chính bên nhận,
+năm giây sau, không cần server giúp gì.
+</Checkpoint>
+
+## FR-RTM-05 đang đứng ở đâu
+
+Bốn trong sáu loại đã có nơi sản xuất: `message.created` (3.18), `presence.changed` (3.19),
+`membership.changed` (3.20) và `typing` (chương này). `message.updated` và `message.deleted` là
+hai loại vẫn chưa có, và chúng đang chờ một bề mặt chưa tồn tại — không có route sửa và không có
+route xoá để mà loan báo, tức là chương 3.23.
+
+<ForwardRef>
+Chương 3.22 xây trần năm connection của FR-RTM-09, và việc đầu tiên của nó là một quyết định chứ
+không phải một lần cài đặt. SRS mô tả `conn:{env}:{user}` là một **set** Redis với một TTL, mà TTL
+thì theo khoá chứ không theo từng phần tử — nên một instance làm tươi khoá sẽ giữ mãi mục của một
+instance đã chết. **Điều chương ấy phải quyết định là một cái hết hạn theo từng phần tử được diễn
+đạt ra sao**, và dù nó chọn cấu trúc nào, lập luận nó nợ là vì sao các phần tử hết hạn độc lập với
+nhau.
+</ForwardRef>
+
+<ChapterFooter id="3.21" locale="vi" />
