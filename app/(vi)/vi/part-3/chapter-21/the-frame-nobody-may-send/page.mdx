@@ -1264,7 +1264,27 @@ chương này nó quảng bá mười một frame qua HTTP cho bất cứ ai h�
    // Chapter 3.11. THE FIRST SECRET THIS SERVICE HAS EVER HELD, and it is not a
    // signing secret: chapter 3.2's claim that "the gateway holds no signing
    // secret" is untouched, because this one verifies nothing and signs nothing.
-@@ -107,6 +114,7 @@ export function createServer(logger?: Logger) {
+@@ -83,6 +90,19 @@ export function createServer(logger?: Logger) {
+     limits,
+     presence,
+     membership,
++    // CHAPTER 3.21, AND THIS LINE HAD NO OWNER UNTIL THE SEALED CLIENT ASKED FOR
++    // IT. Phase 3's task deferred the destructuring in `session.ts` to keep that
++    // phase committable — `no-unused-vars` rejects a binding whose first consumer
++    // is a later phase — and recorded the wiring as a later task's job. No later
++    // task had it.
++    //
++    // Everything looked correct: the module is built above, its `close()` is
++    // awaited in `shutdown()` so lint saw a used variable, the seam accepts
++    // `typing.send`, and `/healthz` advertises eleven frames. `signalTyping` then
++    // called `typing?.publish(...)` on `undefined` and the optional chain made it
++    // a silent no-op. **The feature was inert in the product and green in every
++    // test**, because every test injects this option directly.
++    typing,
+     // Overridable so `meter.itest.ts` can drive a spawned gateway without
+     // waiting a real minute per assertion. The two tests there are the ones an
+     // in-process gateway cannot run — a signal has to arrive at a process — and
+@@ -107,6 +127,7 @@ export function createServer(logger?: Logger) {
      await limits.close();
      await presence.close();
      await membership.close();
@@ -2376,13 +2396,17 @@ describe("a typing signal on its way out (chapter 3.21)", () => {
   /** T068 and T071. THE FABRIC SEVERED, AND RESTORED.
    *
    * A publish failure must not fail the connection, the send, or a message
-   * delivery (FR-015). The socket stays open, the client is told nothing, and
-   * **one** structured event is logged — one, because a burst of keystrokes
-   * against a dead Redis must not become a burst of log lines.
+   * delivery (FR-015). The socket stays open and the client is told nothing.
+   *
+   * **THE TITLE SAID "logs it once" UNTIL T098 READ IT AGAINST THE BODY**, and
+   * the body proves the opposite: five `op: "connection"` lines and zero
+   * `op: "publish"`. FR-015's third clause is what this test refutes, so a title
+   * quoting that clause was a good test under a false name — chapter 3.19's
+   * exact failure, in this chapter's own file.
    *
    * Then the proxy re-listens on the SAME port and the next signal publishes with
    * no restart, which is what ioredis's default retry on the publisher buys. */
-  it("survives a severed fabric, logs it once, and publishes again when it returns", async () => {
+  it("survives a severed fabric, logs the CONNECTION failure rather than a publish one, and publishes again when it returns", async () => {
     const channel = randomUUID();
     const lines: Record<string, unknown>[] = [];
     const proxy = await startRedisProxy();
@@ -2467,7 +2491,7 @@ describe("a typing signal on its way out (chapter 3.21)", () => {
    * inside the renewal interval.** It is expected traffic rather than a failure,
    * and one line per keystroke over the limit is the unbounded output NFR-OBS-01
    * exists to prevent. */
-  it("emits exactly the three names it declares, and none for a debounced signal", async () => {
+  it("emits the two names this run reaches, and none at all for a debounced signal", async () => {
     const channel = randomUUID();
     const lines: Record<string, unknown>[] = [];
     const instance = await boot({
@@ -2597,6 +2621,235 @@ describe("a typing signal on its way out (chapter 3.21)", () => {
     expect(frames.filter((f) => f.type !== "connection.ack")).toHaveLength(4);
   }, 15_000);
 });
+
+/** THE MODULE'S OWN ARMS, driven directly rather than through a gateway.
+ *
+ * Four of `typing.ts`'s branches are not reachable from a socket, and the
+ * coverage ratchet found all four at 100/100/100/100's expense: the url default,
+ * the `onSignal` no-op, and both sides of the reference count. **None of them is
+ * dead code** — which is the question T097 asks first, because this project's
+ * ratchet has removed code five times rather than covered it. They are reachable
+ * and nothing had reached them.
+ */
+describe("createTyping's own arms (chapter 3.21)", () => {
+  const built: Typing[] = [];
+
+  afterEach(async () => {
+    for (const t of built.splice(0)) await t.close();
+  });
+
+  const make = (options: Partial<Parameters<typeof createTyping>[0]> = {}): Typing => {
+    const t = createTyping({ url, logger: silent, ...options });
+    built.push(t);
+    return t;
+  };
+
+  it("falls back to DEFAULT_REDIS_URL when neither a url nor the env var is given", async () => {
+    const saved = process.env["RELAY_REDIS_URL"];
+    delete process.env["RELAY_REDIS_URL"];
+    try {
+      // No `url`, no env var: the default parameter's right-hand side. The
+      // default happens to be the store this lane runs, so the client connects
+      // and the test is about the branch rather than about reachability.
+      const t = createTyping({ logger: silent });
+      built.push(t);
+      const channel = randomUUID();
+      let delivered: unknown;
+      t.onSignal((signal) => {
+        delivered = signal;
+      });
+      await t.subscribe(channel);
+      await t.publish({ environment: "env-1", channel, user: "tuan" });
+      await settle();
+      // **ASSERTED, not merely exercised.** The first version of this test had no
+      // `expect` at all: it took the branch, moved the coverage number, and
+      // proved nothing about where the client connected. A round trip through
+      // the fallback url is what says the default is the store this lane runs.
+      expect(delivered).toEqual({ environment: "env-1", channel, user: "tuan" });
+    } finally {
+      if (saved === undefined) delete process.env["RELAY_REDIS_URL"];
+      else process.env["RELAY_REDIS_URL"] = saved;
+    }
+  });
+
+  it("drops a signal on the floor when no handler is wired", async () => {
+    // `deliver` starts as a no-op and every other test in this file replaces it
+    // through `attachSessions`. A module built and subscribed but never wired is
+    // the shape a gateway has for the instant between construction and wiring.
+    const channel = randomUUID();
+    const receiver = make();
+    await receiver.subscribe(channel);
+
+    // A SECOND receiver, wired, on the same subject. Without it this test would
+    // assert nothing about its own subject: "no throw" is also true of a module
+    // that never received the signal at all. The wired one proves the publish
+    // landed, so the unwired one's silence is the no-op default running.
+    const wired = make();
+    let delivered = 0;
+    wired.onSignal(() => {
+      delivered += 1;
+    });
+    await wired.subscribe(channel);
+
+    const sender = make();
+    await sender.publish({ environment: "env-1", channel, user: "tuan" });
+    await settle();
+
+    expect(delivered, "the wired module received it, so the publish landed").toBe(1);
+  });
+
+  it("counts references: a second subscribe does not re-subscribe, and one release does not unsubscribe", async () => {
+    const channel = randomUUID();
+    const receiver = make();
+    let delivered = 0;
+    receiver.onSignal(() => {
+      delivered += 1;
+    });
+
+    // Two holders of one channel on one instance — two connections of one user,
+    // or two users. The second `subscribe` finds a count and increments it.
+    await receiver.subscribe(channel);
+    await receiver.subscribe(channel);
+
+    // One releases. The subscription must survive, because the other holder is
+    // still there — this is the arm that would silently break the remaining
+    // member's typing if the count were not kept.
+    await receiver.unsubscribe(channel);
+
+    const sender = make();
+    await sender.publish({ environment: "env-1", channel, user: "tuan" });
+    await settle();
+    expect(delivered, "still subscribed after one of two releases").toBe(1);
+
+    // The last release does unsubscribe.
+    await receiver.unsubscribe(channel);
+    // And a release for a channel never held is not an error.
+    await receiver.unsubscribe(randomUUID());
+
+    await sender.publish({ environment: "env-1", channel, user: "mai" });
+    await settle();
+    expect(delivered, "unsubscribed after the last release").toBe(1);
+  });
+});
+```
+
+```diff title="packages/outsider/src/integrate.itest.ts"
+@@ -308,6 +308,115 @@ describe("integrating with Relay from the outside", () => {
+     socket.close();
+   });
+ 
++  /** CHAPTER 3.21, T100a — **the first `socket.send` in this file's history.**
++   *
++   * `grep -c "\.send(" packages/outsider/src/integrate.itest.ts` read **0** across
++   * eleven tests before this one: ten REST, and one socket test whose title says
++   * "sent over REST" because chapter 3.18 corrected it. This file is the only
++   * check in the repository that uses the public surface as a customer does —
++   * Node's global `WebSocket`, no workspace import — and until now it had never
++   * exercised the inbound seam at all.
++   *
++   * That matters for this chapter in particular: **every other check on the
++   * inbound frame is in-workspace, using the `ws` package this file refuses to
++   * import.** A protocol a customer cannot drive is a protocol nobody has tested
++   * from outside. */
++  it("says it is typing, and a second member's socket hears it", async () => {
++    const second = await post("/auth/dev-token", { user: "ben", ttl_seconds: 3600 }, credential);
++    expect(second.status).toBe(200);
++    const benToken = second.body["token"] as string;
++
++    const open = async (
++      forToken: string,
++    ): Promise<{
++      socket: WebSocket;
++      frames: { type: string; payload?: { channel?: string; user?: string } }[];
++    }> => {
++      const socket = new WebSocket(`${ws}/v1/ws?token=${forToken}`);
++      const frames: { type: string; payload?: { channel?: string; user?: string } }[] = [];
++      socket.addEventListener("message", (event) => {
++        frames.push(JSON.parse(String(event.data)) as { type: string });
++      });
++      socket.addEventListener("error", () => undefined);
++      await new Promise<void>((resolve, reject) => {
++        socket.addEventListener("open", () => resolve());
++        setTimeout(() => reject(new Error(`no socket at ${ws} within 10s`)), 10_000);
++      });
++      return { socket, frames };
++    };
++
++    const until = async (
++      frames: { type: string; payload?: { channel?: string; user?: string } }[],
++      predicate: (f: { type: string; payload?: { channel?: string; user?: string } }) => boolean,
++      what: string,
++    ): Promise<void> => {
++      const deadline = Date.now() + 10_000;
++      for (;;) {
++        if (frames.some(predicate)) return;
++        if (Date.now() > deadline) {
++          throw new Error(`no ${what}; saw ${frames.map((f) => f.type).join(", ") || "nothing"}`);
++        }
++        await new Promise((r) => setTimeout(r, 50));
++      }
++    };
++
++    const ana = await open(token);
++    const ben = await open(benToken);
++    await until(ana.frames, (f) => f.type === "connection.ack", "ana's ack");
++    await until(ben.frames, (f) => f.type === "connection.ack", "ben's ack");
++
++    ana.socket.send(JSON.stringify({ type: "typing.send", payload: { channel: channelId } }));
++
++    await until(
++      ben.frames,
++      (f) => f.type === "typing" && f.payload?.channel === channelId && f.payload?.user === "ana",
++      "a typing frame naming ana",
++    );
++    // And the signaller hears nothing of their own — checked here rather than only
++    // in-workspace, because it is the half a customer would notice.
++    expect(ana.frames.filter((f) => f.type === "typing")).toEqual([]);
++
++    ana.socket.close();
++    ben.socket.close();
++  });
++
++  /** CHAPTER 3.21, T100b — the refusal, from outside.
++   *
++   * `docs/08-error-reference.md` tells a customer *"send `message.send` … Do not
++   * send events; receive them."* **Nothing had ever checked what happens when they
++   * do.** This is that correction in bytes rather than in prose. */
++  it("is refused with unknown_frame_type for a frame only the server may send", async () => {
++    const socket = new WebSocket(`${ws}/v1/ws?token=${token}`);
++    const frames: { type: string; payload?: { code?: string } }[] = [];
++    socket.addEventListener("message", (event) => {
++      frames.push(JSON.parse(String(event.data)) as { type: string });
++    });
++    socket.addEventListener("error", () => undefined);
++    const closed = new Promise<number>((resolve) => {
++      socket.addEventListener("close", (event) => resolve((event as CloseEvent).code));
++    });
++    await new Promise<void>((resolve, reject) => {
++      socket.addEventListener("open", () => resolve());
++      setTimeout(() => reject(new Error(`no socket at ${ws} within 10s`)), 10_000);
++    });
++
++    // `message.ack` is the server's word. A client sending it is claiming to be the
++    // server, which is a protocol violation rather than a malformed frame.
++    socket.send(JSON.stringify({ type: "message.ack", payload: { seq: 1 } }));
++
++    const deadline = Date.now() + 10_000;
++    for (;;) {
++      const error = frames.find((f) => f.type === "error");
++      if (error) {
++        expect(error.payload?.code).toBe("unknown_frame_type");
++        break;
++      }
++      if (Date.now() > deadline) throw new Error("no error frame within 10s");
++      await new Promise((r) => setTimeout(r, 50));
++    }
++    expect(await closed).toBe(4002);
++  });
++
+   it("cannot see another tenant's channel, and cannot tell it apart from an absent one", async () => {
+     // The documented isolation property, exercised the only way an outsider can:
+     // with an id that is well formed and is not theirs. The reference says both
 ```
 
 <Trap>
