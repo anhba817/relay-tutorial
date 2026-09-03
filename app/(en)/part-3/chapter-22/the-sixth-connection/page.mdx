@@ -1,0 +1,2761 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figSlotWalk, figTwoInstances, figThreeRefusals, figSlotLifecycle } from "./figures";
+
+export const metadata = {
+  title: "The sixth connection, and where the count lives — Building Relay",
+  description:
+    "FR-RTM-09 caps a user at five concurrent connections. Half the clause has been true since chapter 1.3 and nobody noticed; the other half is a number no gateway instance can compute on its own. The SAD published a shape for it years of chapters ago, and this chapter argues that shape down.",
+  alternates: {
+    canonical: "/part-3/chapter-22/the-sixth-connection",
+    languages: {
+      en: "/part-3/chapter-22/the-sixth-connection",
+      vi: "/vi/part-3/chapter-22/the-sixth-connection",
+    },
+  },
+};
+
+<ChapterHeader id="3.22" />
+
+FR-RTM-09 is one sentence with two halves, and they have been in completely different states
+for twenty-one chapters:
+
+> A user shall be permitted up to 5 concurrent connections; each shall receive all events
+> independently.
+
+The second half has been true since delivery existed. `subscribersOf` walks connections, not
+users — a message published to a channel reaches every socket subscribed to it, and two tabs
+belonging to one person are two subscribers like any others. Nothing had to be built for
+that. Nothing had been *tested* for it either, which is a different sentence, and this
+chapter writes those tests first, against unchanged code, so that they are a regression
+guard rather than a description of code written to satisfy them.
+
+The first half was enforced nowhere. A person could open five hundred connections.
+
+<Why>
+**Why a cap at all.** Not to save memory — a websocket is cheap. It is a blast-radius limit:
+a client with a reconnect bug that opens a socket per retry and never closes the old one
+becomes, within minutes, an accidental denial of service against one tenant's own gateway
+budget. Five is the number the SRS chose. What makes it hard is not the enforcement; it is
+that five is a fact about a **person**, and the connections are on machines that do not know
+about each other.
+</Why>
+
+## The count cannot live where the connections do
+
+CON-02 says no sticky routing for correctness. A load balancer puts a user's five sockets on
+whichever instances it likes, and any instance asked "how many does this person have?" can
+only answer for itself.
+
+<Figure caption="Three places on one gateway and two on another. The sixth knocks on either door and gets the same answer, because neither door is where the count lives." code={figTwoInstances} />
+
+So the count goes to Redis, which is where every other piece of cross-instance connection
+state already lives. And the SAD has described that key since its first draft — twice, in two
+shapes and two tenses, which is where this chapter's first real work turned out to be.
+
+The architecture overview said the gateway *"registers the connection in Redis
+(`conn:{env}:{user}` → instance ID, TTL-refreshed)"*, in the present tense, describing
+something that did not exist. The Redis table said the same key held a *set* of instance IDs
+and marked it **"Not built"** — and then, in the same row, prescribed the fix:
+
+> a Redis TTL is per key, not per set member, so one instance refreshing the key keeps a dead
+> instance's entry alive for ever. A sorted set scored by heartbeat time, pruned with
+> `ZREMRANGEBYSCORE` on read, is the correct version.
+
+<Trap>
+**The hand-off this chapter was given said its first job was a decision.** It was not. The
+decision had already been published in the document the chapter was about to implement. The
+job was narrower and more uncomfortable: decide whether to accept a decision already in the
+tree. Reading beat deriving, and it beat it by about a day.
+</Trap>
+
+## Why this chapter refuses the shape the SAD published
+
+The row is right about the defect and wrong about the fix, and the reason is one requirement
+the row does not mention.
+
+**A cap is a claim, not a count.** Two connections arriving at the same instant, with four
+places held, must not both take the fifth. That needs an atomic check-and-insert, and a
+sorted set has none. `ZADD` then `ZCARD` is check-then-act with a window. Add-then-verify —
+add yourself, count, remove yourself if the count is over five — never over-admits, and
+refuses **both** of the two arrivals: each adds, each counts six, each backs out, and the
+fifth place stays empty with two people told they are at their limit. Safe, and wrong.
+
+The atomic version is a Lua script. And Constitution VII admits a second language into this
+repository only through a superseding ADR carrying **profiling evidence** — which this
+repository cannot produce. The largest fixture in the lane holds five channels. NFR-SCL-01
+asks about ten thousand connections per instance and the SAD flags it as unmeasured. An ADR
+arguing that a sorted set beats five keys at that scale would be arguing from a lane that
+cannot see the difference.
+
+<Why>
+**Why not just write the Lua anyway.** Because the principle is not a preference about
+languages, it is a rule about who may add a runtime nobody has profiled. `grep` for `.eval(`,
+`defineCommand` and `.multi(` across the platform returns zero: no multi-command Redis
+operation has ever shipped here. The first one should arrive with a measurement, not with a
+cap that could be built without it.
+</Why>
+
+So the member becomes the key. `conn:{env}:{user}:{slot}` for slots 0 to 4. **When each
+member is a key, the per-key TTL is per member** — the defect the SAD's row recorded stops
+existing rather than being worked around. That is ADR-23, and the row now says so.
+
+## Five keys, three commands, every one conditional
+
+<Figure caption="The claim walks the five slots. Two commands per contested slot: NX for a free one, IFEQ against a tombstone for one somebody just let go." code={figSlotWalk} />
+
+```ts title="services/gateway/src/connections.ts"
+import { Redis } from "ioredis";
+
+import type { Logger } from "@relay/service-kit";
+
+const DEFAULT_REDIS_URL = "redis://localhost:6379";
+
+/** FR-RTM-09's five, and **FR-002 says it is stated exactly once**. The
+ * requirement is about drift, not about the value: a second literal five is how
+ * two figures come apart, which is what `services/api/src/limits/policy.ts` did
+ * when it derived `connect: 3_000` from "ten thousand divided by five" and shipped
+ * a third number. `connections.test.ts` asserts this constant is the only one. */
+export const MAX_CONNECTIONS_PER_USER = 5;
+
+/** How long after a connection's last successful renewal its place stops counting.
+ * `docs/05-sad.md:574` already published 60 s for this key and the figure is kept.
+ *
+ * IT IS ALSO HOW LONG A CRASHED TAB HOLDS A SLOT, which the spec's Q1 names as the
+ * accepted cost of refusing the newest rather than evicting the oldest. */
+export const DEFAULT_BOUND_MS = 60_000;
+
+/** Three renewals per bound, so two consecutive misses do not free a live
+ * connection's place.
+ *
+ * **NOT `PING_INTERVAL_MS`, which is also a number in this file's neighbourhood.**
+ * `session.ts:48` sets the protocol keepalive to 30_000, and chapter 3.19 paid for
+ * conflating three 30-second numbers that turned out to be three quantities — a TTL
+ * equal to its own refresh interval expires a connected user. Tying a Redis TTL to
+ * a client-visible keepalive means changing the ping starts expiring slots. Separate
+ * timer, separate number, and the tests assert the RATIO rather than the values. */
+export const DEFAULT_HEARTBEAT_MS = 20_000;
+
+/** Written into a slot key to retire it. Any value that cannot be a connection id
+ * does, and `randomUUID` never produces this one.
+ *
+ * **IT MEANS FREE, NOT BUSY**, and reading it the other way was a defect. See
+ * `walk` below: a claim takes a tombstoned slot rather than stepping over it. */
+const TOMBSTONE = "-";
+
+/** How long a tombstone lingers. One millisecond is enough to be a conditional
+ * delete and short enough to be invisible — but the number is named and injectable
+ * because **a test that has to fit inside one millisecond is a test that races**,
+ * and the arithmetic below only worked by accident when it was a literal. */
+export const DEFAULT_TOMBSTONE_MS = 1;
+
+/** What a claim attempt resolved to. `held` is for FR-015's log line and is
+ * discovered by the walk rather than read: five keys have no cheap `ZCARD`, and
+ * `research.md` R3 records that as the design's stated cost. */
+export type ClaimOutcome =
+  | { readonly kind: "claimed"; readonly slot: number; readonly held: number }
+  | { readonly kind: "full"; readonly held: number }
+  | { readonly kind: "unenforced" };
+
+/** What a renewal resolved to. **`reclaimed` carries a slot that may differ from
+ * the one handed in** — FR-011b's common case is that the outage cost nothing and
+ * some other slot was free, so the caller must store the new number. */
+export type RenewOutcome =
+  | { readonly kind: "renewed" }
+  | { readonly kind: "reclaimed"; readonly slot: number }
+  | { readonly kind: "full" }
+  | { readonly kind: "unenforced" };
+
+export interface Connections {
+  claim(
+    environmentId: string,
+    user: string,
+    connectionId: string,
+  ): Promise<ClaimOutcome>;
+  renew(
+    environmentId: string,
+    user: string,
+    connectionId: string,
+    slot: number,
+  ): Promise<RenewOutcome>;
+  release(
+    environmentId: string,
+    user: string,
+    connectionId: string,
+    slot: number,
+  ): Promise<void>;
+  /** Every place this instance holds, freed at once. FR-011a: a deployment must
+   * cost no more than one reconnection cycle (NFR-REL-03), and `wss.close()` does
+   * not close established sockets — so without this a deploy holds five slots for
+   * a full bound and the next connection is refused. */
+  releaseAll(
+    held: readonly {
+      readonly environmentId: string;
+      readonly user: string;
+      readonly connectionId: string;
+      readonly slot: number;
+    }[],
+  ): Promise<void>;
+  close(): Promise<void>;
+}
+
+export interface ConnectionsOptions {
+  url?: string;
+  logger: Logger;
+  boundMs?: number;
+  /** Widened by one test, to hold the window open long enough to assert what
+   * happens inside it. */
+  tombstoneMs?: number;
+}
+
+/** `conn:{env}:{user}:{slot}`, one key per place, and the shape is an argument
+ * against a published row.
+ *
+ * `docs/05-sad.md:574` prescribes a sorted set pruned with `ZREMRANGEBYSCORE` on
+ * read. That needs Lua for FR-013's atomic check-and-insert, Constitution VII
+ * requires "a superseding ADR with profiling evidence" for a second language, and
+ * this lane cannot produce it — its largest fixture holds five channels while
+ * NFR-SCL-01 asks about ten thousand connections. **Making each member its own key
+ * means the TTL is per member by construction rather than worked around**, which
+ * was the defect that row recorded in the first place. ADR-23 carries the drivers
+ * and the reversal condition. */
+const key = (environmentId: string, user: string, slot: number): string =>
+  `conn:${environmentId}:${user}:${slot}`;
+
+export function createConnections({
+  url = process.env["RELAY_REDIS_URL"] ?? DEFAULT_REDIS_URL,
+  logger,
+  boundMs = DEFAULT_BOUND_MS,
+  tombstoneMs = DEFAULT_TOMBSTONE_MS,
+}: ConnectionsOptions): Connections {
+  // THE SAME THREE OPTIONS `limits.ts:95` AND `presence.ts:133` USE, and the cap
+  // needs them more than either. With ioredis' defaults an unreachable Redis does
+  // not fail — it queues the command and retries, so `claim` HANGS. Measured at
+  // 20 s in `connections.test.ts` before these were added, against NFR-PRF-04's
+  // p95 < 1 s from handshake to `connection.ack`. **A cap that fails open must
+  // fail open QUICKLY**, or FR-016's "accept the connection" is indistinguishable
+  // from refusing it.
+  const client = new Redis(url, {
+    lazyConnect: true,
+    maxRetriesPerRequest: 0,
+    connectTimeout: 1_000,
+  });
+  // One `error` listener, because a client without one turns a connection error
+  // into an unhandled rejection that takes the process down. Chapter 3.18's R10
+  // found `createFanout` without one while both rate limiters had one and
+  // explained why.
+  client.on("error", (error: Error) => {
+    logger.log("error", "connections.redis", { detail: error.message });
+  });
+
+  /** `SET … IFEQ … PX` THROUGH `call`, AND THE REASON IS THE TYPED CLIENT RATHER
+   * THAN THE SERVER. Redis 8.10.0 accepts the combination — verified by hand
+   * against the lane before this module existed. ioredis 6.0.0 declares only
+   * `set(key, value, 'IFEQ', cmp)` and `set(key, value, 'IFEQ', cmp, 'GET')`;
+   * **there is no overload pairing `IFEQ` with `PX`**, so the typed API cannot
+   * express it and `call` is the documented escape hatch.
+   *
+   * The premise check in Phase 1 said `IFEQ` was "present in
+   * `RedisCommander.d.ts`, so no cast" — and the TOKEN's presence is not an
+   * overload. Same class as everything else this chapter has corrected: a grep
+   * for a shape rather than for the set.
+   *
+   * The alternatives are worse. `SET … IFEQ` then `PEXPIRE` is two commands, and
+   * a failure between them leaves a slot with no TTL — leaked for ever, which is
+   * the original defect rather than a variation on it. `KEEPTTL` preserves the
+   * ORIGINAL expiry, so a renewal would never extend anything and every slot
+   * would die 60 s after its claim. */
+  const setIfEq = async (
+    k: string,
+    value: string,
+    comparison: string,
+    px: number,
+  ): Promise<string | null> =>
+    (await client.call(
+      "SET",
+      k,
+      value,
+      "IFEQ",
+      comparison,
+      "PX",
+      String(px),
+    )) as string | null;
+
+  /** COULD NOT ASK is a distinct OUTCOME, not a distinct value — and the first
+   * version of this function got that wrong in a way its own comment denied.
+   *
+   * It returned `T | null` and read `null` as failure. But `SET … NX` returns
+   * **nil on a miss**, which is the ordinary case when a slot is taken, so every
+   * claim past the first was reported as `unenforced`: six of fourteen unit tests
+   * red, all with `expected { kind: 'unenforced' }`. **Arm 1 and arm 5 of the arms
+   * list produce the same wire value**, and listing them separately did not stop
+   * me writing code that could not tell them apart.
+   *
+   * A wrapper makes the two unmistakable. `presence.ts:232` gets away with `T |
+   * null` because its `SET` uses `NX`/`XX` where nil and failure lead to the same
+   * branch; this module has to distinguish them. */
+  type Asked<T> = { readonly asked: true; readonly reply: T } | { readonly asked: false };
+
+  async function failable<T>(op: string, work: () => Promise<T>): Promise<Asked<T>> {
+    try {
+      return { asked: true, reply: await work() };
+    } catch (error) {
+      logger.log("error", "connections.failed", {
+        op,
+        detail: error instanceof Error ? error.message : String(error),
+      });
+      return { asked: false };
+    }
+  }
+
+  /** Walk the slots, claiming the first free one.
+   *
+   * **`SET NX` IS THE ATOMICITY AND THAT IS THE WHOLE ARGUMENT** (FR-013). Two
+   * connections racing for one slot cannot both win it: the loser's `NX` returns
+   * nil and it walks to the next. When all five are held both correctly refuse.
+   * The race is settled by the command rather than by a check-then-act, which is
+   * why no Lua is needed here.
+   *
+   * **TWO COMMANDS PER CONTESTED SLOT, AND THE SECOND ONE IS A BUG FIX.** A
+   * tombstone means the previous holder let the place go, so it is free — and the
+   * first version of this walk stepped over it, because `NX` refuses any key that
+   * exists. One slot briefly skipped is harmless and the release's comment said so.
+   * `releaseAll` tombstones ALL FIVE AT ONCE, and then the walk found nothing free
+   * and refused a connection with `connection_limit_reached` — a close code whose
+   * documented remedy is "close one of the connections you already hold", which a
+   * client reconnecting after a deploy cannot do: they went with the old instance.
+   *
+   * Found as a 2-in-6 flake in the clean-shutdown test, whose first message —
+   * `no connection.ack within 5s` — was true of a socket that had been refused 4004
+   * half a second earlier. Widening the tombstone to 500 ms turns it from a flake
+   * into a test.
+   *
+   * `IFEQ TOMBSTONE` keeps the race settled inside the command: two connections
+   * both finding the tombstone both attempt it, the first wins, the second's
+   * comparison now fails against the winner's id and it walks on. No connection id
+   * can equal `-`, so this can never take a live place. */
+  async function walk(
+    environmentId: string,
+    user: string,
+    connectionId: string,
+  ): Promise<ClaimOutcome> {
+    for (let slot = 0; slot < MAX_CONNECTIONS_PER_USER; slot += 1) {
+      const k = key(environmentId, user, slot);
+      const free = await failable("claim", () =>
+        client.set(k, connectionId, "PX", boundMs, "NX"),
+      );
+      if (!free.asked) return { kind: "unenforced" };
+      // `null` HERE MEANS THE SLOT IS TAKEN, which is arm 1 and not arm 5.
+      if (free.reply === "OK") return { kind: "claimed", slot, held: slot };
+      const released = await failable("claim", () =>
+        setIfEq(k, connectionId, TOMBSTONE, boundMs),
+      );
+      if (!released.asked) return { kind: "unenforced" };
+      if (released.reply === "OK") return { kind: "claimed", slot, held: slot };
+    }
+    return { kind: "full", held: MAX_CONNECTIONS_PER_USER };
+  }
+
+  return {
+    claim: walk,
+
+    /** **`IFEQ`, NEVER `XX`, and this was a corrected decision.** `XX` tests that
+     * the key exists and nothing more — measured on Redis 8.10.0, `SET k B XX`
+     * against a key holding `A` returns OK and the value becomes B. So a connection
+     * whose slot expired during an outage would come back, find the slot re-claimed,
+     * and silently take it: six connections against a count of five, FR-001 and
+     * FR-011 both violated. `IFEQ` compares before writing and is refused both when
+     * the key holds another id and when the key is gone. */
+    renew: async (environmentId, user, connectionId, slot) => {
+      const asked = await failable("renew", () =>
+        setIfEq(key(environmentId, user, slot), connectionId, connectionId, boundMs),
+      );
+      if (!asked.asked) return { kind: "unenforced" };
+      if (asked.reply === "OK") return { kind: "renewed" };
+      // Refused: the key is gone, or somebody else holds it. Either way this
+      // connection has lost its place and FR-011b says what happens next — one
+      // more attempt to claim, because after a brief outage nothing else took the
+      // slot and closing the connection would cost a user their place for Redis's
+      // downtime.
+      const again = await walk(environmentId, user, connectionId);
+      if (again.kind === "claimed") return { kind: "reclaimed", slot: again.slot };
+      if (again.kind === "full") return { kind: "full" };
+      return { kind: "unenforced" };
+    },
+
+    /** A one-millisecond tombstone, written only if the slot is still ours.
+     *
+     * **NOT `DEL`, which has no ownership check** — the same hole `IFEQ` closed on
+     * the renewal, on the path that fix introduced. A connection whose slot expired
+     * and was re-claimed would `DEL` the new owner's key and free a place that is
+     * in use. `SET key - IFEQ id PX 1` refuses that.
+     *
+     * THIS COMMENT USED TO SAY the millisecond fails in the safe direction — a
+     * claim arriving inside it finds the key present, its `NX` fails, and it walks
+     * to the next slot; one slot briefly skipped, never an over-admit. True of one
+     * slot and false of five, which is what `releaseAll` writes. The walk above now
+     * claims a tombstoned slot instead of stepping over it, so the window is not a
+     * window any more. `GETDEL` exists and is unconditional, so it is no use
+     * here. */
+    release: async (environmentId, user, connectionId, slot) => {
+      await failable("release", () =>
+        setIfEq(key(environmentId, user, slot), TOMBSTONE, connectionId, tombstoneMs),
+      );
+    },
+
+    releaseAll: async (held) => {
+      for (const one of held) {
+        await failable("releaseAll", () =>
+          setIfEq(
+            key(one.environmentId, one.user, one.slot),
+            TOMBSTONE,
+            one.connectionId,
+            tombstoneMs,
+          ),
+        );
+      }
+    },
+
+    close: async () => {
+      await client.quit();
+    },
+  };
+}
+```
+
+Three things in that module are worth stopping on.
+
+**`SET NX` is the atomicity, and it is the whole argument.** Two connections racing for one
+slot cannot both win it: the loser's `NX` returns nil and it walks on. No check-then-act
+window exists to lose, so no Lua is needed to close one.
+
+**`IFEQ`, never `XX`.** The renewal has to refuse a slot that somebody else now holds. `XX`
+tests that the key exists and nothing more — measured on Redis 8.10.0, `SET k B XX` against a
+key holding `A` returns OK and the value becomes `B`. Under `XX` a connection whose place had
+expired during an outage would come back, find the slot re-claimed, and silently take it:
+six connections against a count of five. `IFEQ` compares before writing.
+
+<Trap>
+**The first draft of ADR-23 argued for this decision with a driver that was false.** It said
+`XX` could not resurrect a lost place, and cited `presence.ts:195`, which refreshes with `XX`
+for a related-looking reason. The analogy does not transfer: presence's value is the literal
+`"1"` and carries no identity, so there is nothing for a comparison to be wrong about. The
+decision survived its own broken driver, which is the least comfortable way for one to be
+right — and Constitution VII says disagreement attacks the driver, so an ADR is not allowed
+to ship carrying a false one.
+</Trap>
+
+**A release is a conditional delete, and Redis has no such command.** `DEL` does not check
+who owns the key, so a connection whose place had already expired and been re-claimed would
+delete the new owner's key and hand out a place that is in use — the same ownership hole
+`IFEQ` closed on the renewal, on the path that fix introduced. `GETDEL` is unconditional too.
+So the release writes a value no connection id can equal, with a one-millisecond expiry, only
+if the place is still ours.
+
+## A tombstone means free, and reading it the other way was a defect
+
+That millisecond looked harmless. The module's own comment said so: a claim arriving inside
+the window finds the key present, its `NX` fails, and it walks to the next slot — one slot
+briefly skipped, never an over-admit.
+
+**True of one slot. False of five.** A deploy calls `releaseAll()`, which tombstones every
+place the instance holds, and a walk that steps over tombstones then finds nothing free and
+returns `full`. The client reconnecting to the new instance is refused with
+`connection_limit_reached`, whose documented remedy is to close one of the connections it
+already holds. Those went with the old instance.
+
+<Trap>
+**It arrived as a flaky test, and the message threw the evidence away.** The clean-shutdown
+test failed 2 runs in 6 with `no connection.ack within 5s` — true, and true of a socket that
+had been refused 4004 half a second earlier. Rewritten to carry what it saw, the next failure
+read `frames: error (connection_limit_reached); close: 4004`, which names the defect. A
+20-millisecond sleep in the test would have made it green every time and hidden it; a sleep
+in the *unit* test for the same property had been doing exactly that for two phases.
+</Trap>
+
+The fix is one more command in the walk: after `NX` fails, try `SET … IFEQ - PX`. A tombstone
+means the previous holder let the place go, so it is free, and claiming it is what a claim
+should do. The race stays inside the command — two connections both finding the tombstone
+both attempt it, the first wins, the second's comparison now fails against the winner's id
+and it walks on.
+
+## Where the refusal goes
+
+The cap is checked at the upgrade, after authentication — the environment and the user are
+not known before it — and after the establishment rate limiter, because a client hammering
+the door should meet the cheaper check first: the limiter is one `INCR` and this is a walk of
+up to five keys.
+
+But the refusal does **not** happen there.
+
+```diff title="services/gateway/src/session.ts"
+@@ -18,10 +18,15 @@ import {
+ import { newRequestId, type Logger } from "@relay/service-kit";
+ import { WebSocketServer, type WebSocket } from "ws";
+ 
+ import { ApiError, type ApiClient } from "./api-client.js";
+ import { authenticate, type Identity } from "./auth.js";
++import {
++  DEFAULT_HEARTBEAT_MS,
++  MAX_CONNECTIONS_PER_USER,
++  type Connections,
++} from "./connections.js";
+ import type { Fanout } from "./fanout.js";
+ import type { Decision, GatewayLimits } from "./limits.js";
+ import { createMeter, METER_INTERVAL_MS, type Meter } from "./meter.js";
+ import { type Membership } from "./membership.js";
+ import { type Presence } from "./presence.js";
+@@ -233,10 +238,30 @@ export interface SessionServerOptions {
+    * 3.20's `rereadIntervalMs` are: **a test that waits out two real seconds pays
+    * them in the package that paces the lane**, which has about four seconds of
+    * headroom in the whole budget. That chapter's itest builds with 40 to test a
+    * sixty-second backstop; this one builds with 40 and with 0. */
+   renewalIntervalMs?: number;
++  /** Chapter 3.22, FR-RTM-09's five-connection cap.
++   *
++   * **OPTIONAL, LIKE THE OTHER FIVE, AND THAT IS A DECISION RATHER THAN A
++   * DEFAULT.** For a typing indicator "optional" means no typing; for a cap it
++   * means NO CAP. Optional is also what let chapter 3.21's module go unpassed
++   * from `main.ts` and still compile, leaving the feature inert while 1,174
++   * coverage tests were green.
++   *
++   * Required would make that impossible — the compiler would catch a fixture
++   * that forgot — and it would break three fixtures, two of them fenced by
++   * earlier chapters, for a cap those fixtures do not test. The bet is that
++   * `main.ts`'s two edits and the sealed outsider test are enough, and it is
++   * named here so the next chapter to add a module can decide otherwise and pay
++   * the fixture edits once. */
++  connections?: Connections;
++  /** Injectable for the reason `meterIntervalMs` and `renewalIntervalMs` are: a
++   * test that waits out a real minute pays it in the package that paces the lane.
++   * Defaults to `DEFAULT_HEARTBEAT_MS`, and the tests assert the RATIO to the
++   * bound rather than either value. */
++  heartbeatMs?: number;
+ }
+ 
+ // THE FOUR PRESENCE TIMINGS ARE NOT HERE, and an earlier draft of this chapter put
+ // them here. `meterIntervalMs` is a session option because `attachSessions` BUILDS
+ // the meter; `fanout`, `limits` and `presence` are injected already built, and an
+@@ -260,16 +285,36 @@ export function attachSessions({
+   meterIntervalMs = METER_INTERVAL_MS,
+   presence,
+   membership,
+   typing,
+   renewalIntervalMs = DEFAULT_RENEWAL_INTERVAL_MS,
++  connections,
++  heartbeatMs = DEFAULT_HEARTBEAT_MS,
+ }: SessionServerOptions): {
+   registry: Registry;
+   meter: Meter;
+   close: () => Promise<void>;
+ } {
+   const registry = new Registry();
++  /** CHAPTER 3.22, FR-011a. What this instance holds, so a shutdown can free it
++   * all at once.
++   *
++   * A MAP IN THE CLOSURE RATHER THAN A FIELD ON `Connection`. Chapter 3.21 put
++   * one on the connection and corrected it to this; the shared type in
++   * `registry.ts` belongs to every chapter and this is one chapter's concern.
++   *
++   * WITHOUT THIS A DEPLOY HOLDS FIVE SLOTS FOR A FULL BOUND. `sessions.close()`
++   * calls `wss.close()`, which stops the server accepting connections and does
++   * NOT close established sockets — so whether each connection's own close
++   * handler runs is a race with process exit. NFR-REL-03 allows a deployment no
++   * more than one reconnection cycle, and a bound's worth of refusals after every
++   * deploy is more than one. Found by building `traceability.md` during planning:
++   * the release was implemented and untested. */
++  const heldPlaces = new Map<
++    string,
++    { environmentId: string; user: string; connectionId: string; slot: number }
++  >();
+   // Chapter 3.11. A second timer beside the heartbeat, not a second job for it.
+   const meter: Meter = createMeter({
+     api,
+     registry,
+     logger,
+@@ -674,11 +719,79 @@ export function attachSessions({
+             environment_id: result.identity.environmentId,
+           });
+           return;
+         }
+       }
++      // CHAPTER 3.22, T037. THE CAP IS CHECKED HERE, after `authenticate` and
++      // after the establishment limiter, and both orderings are reasons rather
++      // than habits. After authenticate because the environment and the user are
++      // not known before it — the comment above says the same of the rate limit.
++      // After the limiter because a client hammering the door should meet the
++      // cheaper check first; the limiter is one INCR and this is a walk of up to
++      // five.
++      //
++      // CLAIMED BEFORE THE HANDSHAKE AND REFUSED INSIDE IT (T039). Only a
++      // connection that is going to be accepted claims a place, so a bad token
++      // — already known here — leaks nothing. But the REFUSAL completes the
++      // handshake in order to close it, which is the shape `:715` below
++      // established for the quota: a browser cannot read the body of a FAILED
++      // upgrade, so refusing at the seam gives it a bare connection failure with
++      // no code and no message.
++      let claimed: number | undefined;
++      let capFull = false;
++      let pendingId: string | undefined;
++      if (result.outcome === "ok" && connections !== undefined) {
++        const outcome = await connections.claim(
++          result.identity.environmentId,
++          result.identity.userExternalId,
++          // The id the connection will carry. Minted here rather than below so
++          // the claim and the connection agree on it, which FR-011 requires: a
++          // connection occupies exactly one place for its lifetime.
++          (pendingId = randomUUID()),
++        );
++        if (outcome.kind === "claimed") claimed = outcome.slot;
++        else if (outcome.kind === "full") capFull = true;
++        else {
++          // FR-016 and FR-016a. The connection is accepted with the cap
++          // UNENFORCED, and this line is the only externally visible evidence of
++          // that — from outside, an accepted connection looks identical whether
++          // the cap was checked and satisfied or not checked at all. Chapter
++          // 3.18's lesson: the assertion that carries the requirement is the log
++          // line.
++          logger.log("error", "connection.cap_unenforced", {
++            connection_id: pendingId,
++            environment_id: result.identity.environmentId,
++            user: result.identity.userExternalId,
++          });
++        }
++      }
+       wss.handleUpgrade(req, socket, head, (ws) => {
++        if (capFull) {
++          // T038. An error frame first, because a close reason is a short string
++          // and what a client needs is the limit and the count. Then close 4004,
++          // whose correct handling is the only one in the set that is not a retry
++          // of some kind: close one of the connections you already hold.
++          sendError(
++            ws,
++            "connection_limit_reached",
++            `already holding ${String(MAX_CONNECTIONS_PER_USER)} of ${String(
++              MAX_CONNECTIONS_PER_USER,
++            )} connections; close one and reconnect`,
++          );
++          ws.close(4004, CLOSE_CODES[4004]);
++          // FR-015. The user, the environment and the observed count — and NOT the
++          // credential presented, which is how a live secret reaches a support
++          // ticket (NFR-SEC-06).
++          logger.log("info", "connection.rejected", {
++            reason: "connection_limit_reached",
++            environment_id:
++              result.outcome === "ok" ? result.identity.environmentId : undefined,
++            user: result.outcome === "ok" ? result.identity.userExternalId : undefined,
++            held: MAX_CONNECTIONS_PER_USER,
++          });
++          return;
++        }
+         if (result.outcome === "refused") {
+           // 4001: "invalid or expired token" (EIR-WS-05). The close code is
+           // the protocol package's, not a number invented here.
+           ws.close(4001, CLOSE_CODES[4001]);
+           logger.log("info", "connection.rejected", { reason: "bad_token" });
+@@ -736,10 +849,12 @@ export function attachSessions({
+           ws,
+           result.identity,
+           result.channelIds,
+           req.url ?? "/",
+           result.limits.send,
++          pendingId,
++          claimed,
+         );
+       });
+     })();
+   });
+ 
+@@ -747,16 +862,22 @@ export function attachSessions({
+     socket: WebSocket,
+     identity: Identity,
+     channelIds: string[],
+     url: string,
+     sendLimit: number,
++    /** Chapter 3.22. The id the cap claimed a place with, so the connection and
++     * its slot agree — FR-011's "exactly one place for its lifetime". Absent when
++     * no `connections` module is wired, which is every fixture that does not opt
++     * in and the reason the cap is not enforced there. */
++    claimedId?: string,
++    claimedSlot?: number,
+   ): Promise<void> {
+     // Cursors are read BEFORE anything else, because their presence decides
+     // whether this connection is born buffering or born live.
+     const presented = parseCursors(url);
+     const connection: Connection = {
+-      id: randomUUID(),
++      id: claimedId ?? randomUUID(),
+       identity,
+       socket,
+       // Chapter 3.2: memberships arrived with the identity, from the session
+       // call at the door. There is no second lookup to fail here — the api is
+       // still the only source of membership (ADR-05), it just answers both
+@@ -826,15 +947,26 @@ export function attachSessions({
+     void presence?.connected(
+       identity.environmentId,
+       identity.userExternalId,
+       connection.channelIds,
+     );
++    // FR-016a, AND IT IS A POSITIVE STATEMENT RATHER THAN AN ABSENCE. An accepted
++    // connection looks identical from outside whether the cap was checked and
++    // satisfied or could not be checked at all; the requirement is that the two be
++    // told apart from the logs. Reading `connection.cap_unenforced` and inferring
++    // the other case from its absence needs both lines and a connection id to join
++    // them on — so the accept line carries the fact itself.
++    //
++    // ABSENT, NOT `true`, WHEN NO MODULE IS WIRED. Every gateway module is an
++    // optional parameter and most fixtures pass none; saying `cap_enforced: true`
++    // there would claim a check that never happened.
+     logger.log("info", "connection.opened", {
+       connection_id: connection.id,
+       user: identity.userExternalId,
+       channels: connection.channelIds.size,
+       resuming: presented !== undefined,
++      ...(connections === undefined ? {} : { cap_enforced: claimedSlot !== undefined }),
+     });
+ 
+     // Listeners go on BEFORE the resume, not after the ack. A resume takes
+     // a round trip to the api, and a socket that dies inside that window
+     // must still be removed from the registry and release its subscriptions
+@@ -842,20 +974,120 @@ export function attachSessions({
+     // worth of state per attempt.
+     socket.on("pong", () => {
+       connection.missedPings = 0;
+     });
+     socket.on("message", (raw) => void handle(connection, raw.toString()));
++    // CHAPTER 3.22, T040 and T040a. ONE RENEWAL TIMER PER CONNECTION, and it is
++    // cleared on close below — an interval that outlives its connection refreshes
++    // a place nobody holds, which the `IFEQ` guard cannot fix on its own because
++    // the value would still be this connection's id.
++    //
++    // FR-011b's THREE BRANCHES, and the first is the common one. A brief Redis
++    // outage expires the slot while nothing else takes it, so the re-claim
++    // succeeds on a possibly different slot number and the connection carries on:
++    // closing here would cost a user their place for the registry's downtime. All
++    // five held by other connections means the cap is genuinely exceeded and this
++    // connection is the one that must go — the alternative is six open against a
++    // count of five. An unreachable registry is FR-016 again: keep it, log it.
++    //
++    // FR-005 IS NOT IN TENSION WITH THIS, and a reader who finds them adjacent
++    // needs the sentence. FR-005 governs a REFUSAL — opening a sixth must not cost
++    // the five. Here the connection has already lost its place to a competitor,
++    // and the choice is between closing it and running over the cap.
++    let slot = claimedSlot;
++    if (slot !== undefined) {
++      heldPlaces.set(connection.id, {
++        environmentId: identity.environmentId,
++        user: identity.userExternalId,
++        connectionId: connection.id,
++        slot,
++      });
++    }
++    const renewal =
++      connections === undefined || slot === undefined
++        ? undefined
++        : setInterval(() => {
++            void (async () => {
++              if (slot === undefined) return;
++              const outcome = await connections.renew(
++                identity.environmentId,
++                identity.userExternalId,
++                connection.id,
++                slot,
++              );
++              if (outcome.kind === "renewed") return;
++              if (outcome.kind === "reclaimed") {
++                slot = outcome.slot;
++                heldPlaces.set(connection.id, {
++                  environmentId: identity.environmentId,
++                  user: identity.userExternalId,
++                  connectionId: connection.id,
++                  slot: outcome.slot,
++                });
++                logger.log("info", "connection.reclaimed", {
++                  connection_id: connection.id,
++                  slot: outcome.slot,
++                });
++                return;
++              }
++              if (outcome.kind === "unenforced") {
++                logger.log("error", "connection.cap_unenforced", {
++                  connection_id: connection.id,
++                  environment_id: identity.environmentId,
++                  user: identity.userExternalId,
++                });
++                return;
++              }
++              // `full`: the place is gone and there is no other. Same code and
++              // message a refused sixth connection gets, because that is what it
++              // means.
++              slot = undefined;
++              sendError(
++                connection.socket,
++                "connection_limit_reached",
++                `already holding ${String(MAX_CONNECTIONS_PER_USER)} of ${String(
++                  MAX_CONNECTIONS_PER_USER,
++                )} connections; close one and reconnect`,
++              );
++              connection.socket.close(4004, CLOSE_CODES[4004]);
++              logger.log("info", "connection.rejected", {
++                reason: "connection_limit_reached",
++                environment_id: identity.environmentId,
++                user: identity.userExternalId,
++                held: MAX_CONNECTIONS_PER_USER,
++              });
++            })();
++          }, heartbeatMs);
++    if (renewal !== undefined) renewal.unref();
++
+     socket.on("close", (code) => {
+       // Chapter 3.11, and the ORDER MATTERS. The meter is told first, because
+       // the line below removes this connection from the registry the meter walks
+       // — and a socket that opened and closed between two reports would
+       // otherwise be counted zero. That is not a rounding error: it is the one
+       // thing the wall-clock-minute unit was chosen to charge (research R19).
+       //
+       // Handing over totals rather than reporting them. This handler is already
+       // documented as the last place that should throw, and a mass disconnect
+       // would turn one event into a burst of HTTP requests.
++      // CHAPTER 3.22, T041. The timer first, then the place. An interval that
++      // outlives its connection renews a slot nobody holds.
++      //
++      // NO 4009 DRAIN PATH IS ADDED HERE, and that is deliberate:
++      // `session.test.ts:965` says "4009 IS STILL EMITTED BY NOTHING" and `:982`
++      // asserts the gateway never sends it. The deploy case is `releaseAll` in
++      // this module's `close`, not a close code.
++      if (renewal !== undefined) clearInterval(renewal);
++      heldPlaces.delete(connection.id);
++      if (connections !== undefined && slot !== undefined) {
++        void connections.release(
++          identity.environmentId,
++          identity.userExternalId,
++          connection.id,
++          slot,
++        );
++      }
+       meter?.closed(connection, new Date());
+       registry.remove(connection.id);
+       // Chapter 3.19, AND THIS HANDLER NOW CARRIES THREE ORDERING CONSTRAINTS, not
+       // one. The meter is told BEFORE `registry.remove` — a socket that opened and
+       // closed between two reports would otherwise be counted zero, which is the one
+@@ -1350,9 +1582,18 @@ export function attachSessions({
+     // the process leaves before the request does.
+     close: async () => {
+       clearInterval(heartbeat);
+       meter.stop();
+       await meter.reportOnce(new Date());
++      // CHAPTER 3.22, FR-011a. Before `wss.close()`, because that call does not
++      // close established sockets — so their own close handlers may never run and
++      // this is the last chance to free their places. SC-013: after a deployment a
++      // user whose connections were on the replaced instance reconnects
++      // immediately rather than waiting out the bound.
++      if (connections !== undefined && heldPlaces.size > 0) {
++        await connections.releaseAll([...heldPlaces.values()]);
++        heldPlaces.clear();
++      }
+       wss.close();
+     },
+   };
+ }
+```
+
+<Why>
+**Why complete a handshake in order to close it.** Chapter 3.11 settled this for the closest
+analogue and the sentence is worth repeating: *a browser cannot read the body of a failed
+upgrade*. Refusing at the HTTP seam gives the client a bare connection failure with no code
+and no message — indistinguishable from the gateway being down. Completing the upgrade and
+then closing with a code and an error frame is the only way the client learns which of the
+several reasons it was.
+</Why>
+
+## A sixth close code, and why none of the five would do
+
+```diff title="packages/protocol/src/codes.ts"
+@@ -19,6 +19,26 @@ export const CLOSE_CODES = {
+   // protocol violation — and a ban is none of them. Numbered here, the way chapter 1.3
+   // numbered 4002 and 4008.
+   4003: "banned in this environment",
++  // CHAPTER 3.22, FR-RTM-09. A SIXTH CODE, AND EVERY REUSE FAILS THIS FILE'S OWN TEST.
++  //
++  // The remedy for this refusal is unlike every other one here: close one of the
++  // connections you already hold, and reconnect immediately. No waiting, no new
++  // credential, no client fix. That is why none of the five above can carry it —
++  // "a client that cannot tell them apart retries the wrong one for ever":
++  //
++  //   4001  would send a client to re-authenticate. The token is valid; minting a
++  //         new one succeeds and connecting fails again, which is chapter 3.15's
++  //         infinite loop against a wall.
++  //   4002  would blame a client that did nothing wrong.
++  //   4003  would tell a person they are barred while four of their connections
++  //         are working.
++  //   4008  would tell a client to wait for a quota window. Waiting never helps,
++  //         and the slot it needs may free a second later.
++  //
++  // EIR-WS-06 names four classes to distinguish — authentication, quota, shutdown,
++  // protocol violation — and a concurrency cap is none of them, exactly as a ban
++  // was none of them. Numbered here, in the space chapters 1.3 and 3.15 drew from.
++  4004: "connection limit reached",
+   4008: "quota exhausted",
+   4009: "server shutdown (drain)",
+ } as const;
+@@ -159,6 +179,22 @@ export const ERROR_CODES = {
+   // state to reconcile — so it is refused rather than absorbed.
+   connection_environment_conflict:
+     "this connection was first reported for a different environment; a connection belongs to one environment for its whole life",
++  // Chapter 3.22, FR-RTM-09, and the socket's half of the connection cap: an error
++  // frame carrying the limit and the count, sent immediately before close 4004.
++  //
++  // THE FIGURES GO IN THE MESSAGE, not in payload fields. `errorFrameSchema` is a
++  // `z.strictObject` of `code`, `message`, `docs_url`, `request_id` and an optional
++  // `field`, so two new fields would mean widening a shape every error frame shares
++  // for one code's benefit. `quota_exceeded` above set the precedent — its message
++  // names the dimension, the figures and the date — and the reference's Status line
++  // is where the close code is recorded.
++  //
++  // NOT `rate_limited`, which is one word away in the register and means the
++  // opposite thing. That code throttles a tenant's establishments per window and
++  // its own message reads "too many connections; retry after the window resets".
++  // Retrying is exactly what this code must not suggest.
++  connection_limit_reached:
++    "the user already holds the maximum concurrent connections; the message names the limit and the count, and the remedy is to close one and reconnect",
+ } as const;
+ 
+ export type ErrorCode = keyof typeof ERROR_CODES;
+```
+
+<Figure caption="Three refusals a client can meet at the door. Two are answered by waiting or by fetching something; the third is answered by giving something up." code={figThreeRefusals} />
+
+The rule for adding one is in the file's own comment: *"a client that cannot tell them apart
+retries the wrong one for ever."* Every reuse fails it. 4008 says a window will reset, and no
+window resets here. 4001 says fetch a new token, which changes nothing. 4002 says the client
+sent something invalid, and it did not. 4003 says the user is banned, which is a different
+fact about a different subject. 4009 says the server is going away, and it is not.
+
+**4004 is the only refusal in the set whose correct handling is not a retry.** Reconnecting
+at once produces the same answer; backing off produces it more slowly. The remedy is to close
+a connection you already hold — and then to reconnect immediately, with no waiting period at
+all, which is the observable difference between this and a rate limit.
+
+```diff title="packages/protocol/src/codes.test.ts"
+@@ -15,9 +15,9 @@ describe("close codes cover EIR-WS-06's four classes", () => {
+   // THIS ASSERTION IS WHY THE NUMBER IS DELIBERATE. It failed on the build that added
+   // 4003 — an exact-set assertion is the only kind that makes a new close code a decision
+   // rather than an accident, and updating it is the act of making that decision.
+-  it("contains exactly 4001, 4002, 4003, 4008, 4009", () => {
++  it("contains exactly 4001, 4002, 4003, 4004, 4008, 4009", () => {
+     expect(Object.keys(CLOSE_CODES).map(Number).sort()).toEqual([
+-      4001, 4002, 4003, 4008, 4009,
++      4001, 4002, 4003, 4004, 4008, 4009,
+     ]);
+   });
+ 
+@@ -59,7 +59,7 @@ describe("error codes stay unique and described", () => {
+ // that is not in this object cannot be constructed anywhere in the platform without
+ // failing the build. This suite checks the shape of the object those types rest on.
+ describe("the registry is the whole vocabulary (FR-024)", () => {
+-  it("holds seventeen codes", () => {
++  it("holds eighteen codes", () => {
+     // A number, so adding one is a visible edit rather than a silent widening. The
+     // count is here and not in a comment because a comment does not fail.
+     //
+@@ -71,7 +71,7 @@ describe("the registry is the whole vocabulary (FR-024)", () => {
+     // failed on the build that added it** — "expected 16 but got 17", which is the
+     // third time this line has turned a new code into a decision instead of an
+     // accident. Chapter 3.11's close-code set did the same for 4003.
+-    expect(Object.keys(ERROR_CODES)).toHaveLength(17);
++    expect(Object.keys(ERROR_CODES)).toHaveLength(18);
+   });
+ 
+   it("contains the five the status ladder emits", () => {
+```
+
+<Trap>
+**One code changed four pinned places in one file, and the task that specified it found
+two.** The close-code title, the close-code assertion, the error-code count in another test's
+title, and that test's `toHaveLength`. A test title carrying a number is a pinned place; a
+count in a heading is a claim.
+</Trap>
+
+## What a connection does when it loses its place
+
+A renewal can be refused, and a design that closes the connection whenever that happens gets
+the common case wrong.
+
+<Figure caption="The slot's life. Four ways out of `held` compare the connection id before writing. One does not, and it is the only one that works when the instance is gone." code={figSlotLifecycle} />
+
+After a brief Redis outage the slot has expired and **nothing else took it** — the user is
+under the limit and their connection is fine. So a refused renewal tries once to claim
+another place. If it gets one, the connection carries on, on a different slot number, and the
+gateway logs that it did. If all five are held by other connections, the cap is genuinely
+exceeded and this connection is the one that must go: it gets the same error frame and the
+same 4004 a refused sixth connection gets, because that is what has happened to it.
+
+<Trap>
+**FR-005 and this are not in tension, and a reader who meets them adjacent needs the
+sentence.** FR-005 governs a refusal: opening a sixth must not cost the five. Here the
+connection has already lost its place to a competitor, and the choice is between closing it
+and running over the cap.
+</Trap>
+
+## Failing open, and why the log line is the only evidence
+
+An unreachable registry accepts the connection. Redis is not a source of truth here —
+Principle IV names the connection registry in its own list of ephemeral state — and a cap
+that denies service when its bookkeeping is unavailable has chosen the wrong failure.
+
+The difficulty is that this decision is invisible. An accepted connection is an accepted
+connection; nothing a client sees says whether five was checked. So the gateway says it:
+
+```text
+{"msg":"connection.cap_unenforced","connection_id":"…","user":"tuan"}
+{"msg":"connection.opened","connection_id":"…","cap_enforced":false}
+
+{"msg":"connection.opened","connection_id":"…","cap_enforced":true}
+```
+
+<Trap>
+**Delete that error line and eighteen of the chapter's twenty integration tests stay green**
+— including the one that opens six connections against an unreachable registry, because six
+connections is what failing open means. From outside, *accepted with the cap unenforced* and
+*accepted because the user was under it* are the same event. Chapter 3.18 found this shape in
+the fan-out, where `publish` swallows its errors and resolves, so "the send returned 201 while
+Redis was down" was equally true of a publisher that did nothing at all.
+</Trap>
+
+The spec considered falling back to counting this instance's own connections and rejected it
+explicitly. Five per instance across four gateways is an effective cap of twenty wearing the
+label five, and a wrong number that looks right is worse than a stated absence.
+
+## The tests, and the eight ways they were broken on purpose
+
+```ts title="services/gateway/src/connections.test.ts"
+import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { afterAll, beforeEach, describe, expect, it } from "vitest";
+
+import {
+  createConnections,
+  DEFAULT_BOUND_MS,
+  DEFAULT_HEARTBEAT_MS,
+  MAX_CONNECTIONS_PER_USER,
+  type Connections,
+} from "./connections.js";
+
+// CHAPTER 3.22 — the slot registry.
+//
+// AGAINST A REAL REDIS, NOT A STUB, and that is the correctness argument rather
+// than a preference. The whole design rests on what `SET … NX` and `SET … IFEQ`
+// do: `NX` settles FR-013's race inside the command, and `IFEQ` is what stops a
+// returning connection taking a slot somebody else now holds. **A stubbed client
+// would pass with a non-atomic implementation, with an `XX` renewal that hijacks,
+// and with a `DEL` release that frees another connection's place** — all three of
+// which this chapter's analysis passes found and corrected. It would also pass
+// against a server that does not support `IFEQ` at all.
+//
+// That is chapter 3.17's T047c one dimension over: a test that passes with half
+// its subject applied.
+
+const REDIS = process.env["RELAY_REDIS_URL"] ?? "redis://localhost:6379";
+const silent = { log: () => {} };
+
+/** A per-run environment, so nothing here collides with the two integration files
+ * that share a constant `"env-1"` and both lean on the user name "tuan". */
+const ENV = `env-${randomUUID()}`;
+
+describe("the slot registry", () => {
+  let registry: Connections;
+  let user: string;
+
+  beforeEach(() => {
+    registry = createConnections({ url: REDIS, logger: silent });
+    // A fresh user per test rather than a flush: `FLUSHDB` would delete the keys
+    // of every other suite running in parallel, and this package's config sets no
+    // `fileParallelism`.
+    user = `u-${randomUUID()}`;
+  });
+
+  afterAll(async () => {
+    await registry.close();
+  });
+
+  // ---- ARM 1 and ARM 2: the walk -----------------------------------------
+
+  it("claims the first free slot, and reports how many were held", async () => {
+    const first = await registry.claim(ENV, user, randomUUID());
+    expect(first).toEqual({ kind: "claimed", slot: 0, held: 0 });
+
+    const second = await registry.claim(ENV, user, randomUUID());
+    // ARM 1: `SET NX` missed on slot 0 and the walk moved on.
+    expect(second).toEqual({ kind: "claimed", slot: 1, held: 1 });
+  });
+
+  it("refuses when every slot is held, and says five (FR-001 (3.22))", async () => {
+    for (let i = 0; i < MAX_CONNECTIONS_PER_USER; i += 1) {
+      expect((await registry.claim(ENV, user, randomUUID())).kind).toBe("claimed");
+    }
+    // ARM 2: the walk found no free slot.
+    expect(await registry.claim(ENV, user, randomUUID())).toEqual({
+      kind: "full",
+      held: 5,
+    });
+  });
+
+  it("counts each environment separately for one user identifier (FR-012 (3.22))", async () => {
+    const other = `env-${randomUUID()}`;
+    for (let i = 0; i < MAX_CONNECTIONS_PER_USER; i += 1) {
+      await registry.claim(ENV, user, randomUUID());
+    }
+    expect((await registry.claim(other, user, randomUUID())).kind).toBe("claimed");
+  });
+
+  // ---- ARM 3 and ARM 9: the renewal, and the re-claim --------------------
+
+  it("renews a slot it still holds (FR-008 (3.22))", async () => {
+    const id = randomUUID();
+    const claimed = await registry.claim(ENV, user, id);
+    if (claimed.kind !== "claimed") throw new Error("expected a slot");
+    expect(await registry.renew(ENV, user, id, claimed.slot)).toEqual({
+      kind: "renewed",
+    });
+  });
+
+  it("re-claims when its slot is GONE and nothing else took it (FR-011b (3.22))", async () => {
+    // ARM 3 then ARM 9. A short-lived registry so the bound elapses inside a test
+    // rather than in a minute: the boundMs option exists for exactly this, the way
+    // `membership.ts`'s reread interval does — sixty seconds does not fit in a
+    // package whose whole wall clock is forty-five.
+    const brief = createConnections({ url: REDIS, logger: silent, boundMs: 60 });
+    const id = randomUUID();
+    const claimed = await brief.claim(ENV, user, id);
+    if (claimed.kind !== "claimed") throw new Error("expected a slot");
+    await new Promise((resolve) => setTimeout(resolve, 120));
+
+    // THE COMMON CASE AFTER ANY BRIEF OUTAGE, and the branch a design that closes
+    // on every refused renewal gets wrong. The user is under the limit; the slot
+    // simply expired.
+    expect(await brief.renew(ENV, user, id, claimed.slot)).toEqual({
+      kind: "reclaimed",
+      slot: 0,
+    });
+    await brief.close();
+  });
+
+  // ---- ARM 4 and ARM 10: the hijack, and the cap genuinely full ----------
+
+  it("refuses to renew a slot ANOTHER connection now holds (FR-011 (3.22))", async () => {
+    // ARM 4, and the one test in the chapter that catches `IFEQ` being replaced by
+    // `XX`. `XX` tests existence and not ownership — measured on 8.10.0,
+    // `SET k B XX` against a key holding `A` returns OK — so under `XX` this
+    // renewal would silently take the slot and the count would say five while six
+    // connections were open.
+    const brief = createConnections({ url: REDIS, logger: silent, boundMs: 60 });
+    const mine = randomUUID();
+    const claimed = await brief.claim(ENV, user, mine);
+    if (claimed.kind !== "claimed") throw new Error("expected a slot");
+    await new Promise((resolve) => setTimeout(resolve, 120));
+
+    // Somebody else takes the expired slot, and fills the rest so the re-claim has
+    // nowhere to go — ARM 10.
+    for (let i = 0; i < MAX_CONNECTIONS_PER_USER; i += 1) {
+      await brief.claim(ENV, user, randomUUID());
+    }
+    expect(await brief.renew(ENV, user, mine, claimed.slot)).toEqual({
+      kind: "full",
+    });
+    await brief.close();
+  });
+
+  // ---- ARM 6, ARM 7 and ARM 8: the release ------------------------------
+
+  it("frees a slot it holds, and the slot is reusable at once (FR-010 (3.22))", async () => {
+    const id = randomUUID();
+    const claimed = await registry.claim(ENV, user, id);
+    if (claimed.kind !== "claimed") throw new Error("expected a slot");
+    await registry.release(ENV, user, id, claimed.slot);
+    // THE SAME SLOT, WITH NO WAIT. This assertion used to sleep 20 ms and accept
+    // any slot, and its comment said either outcome was correct because "the
+    // tombstone carries a one-millisecond expiry, so a claim may find it and walk
+    // to the next slot". The walk now takes the tombstoned slot, so the outcome is
+    // determinate — and the sleep was hiding the case below.
+    expect(await registry.claim(ENV, user, randomUUID())).toEqual({
+      kind: "claimed",
+      slot: 0,
+      held: 0,
+    });
+  });
+
+  it("claims a slot whose tombstone has NOT expired (FR-010 (3.22))", async () => {
+    // A HALF-SECOND TOMBSTONE, so the window is a window rather than a coin flip.
+    // With the shipped one-millisecond value this test would pass against the
+    // broken walk about half the time, which is how the defect survived: two of six
+    // runs of the clean-shutdown test, reported as `no connection.ack within 5s`.
+    const slow = createConnections({
+      url: REDIS,
+      logger: silent,
+      tombstoneMs: 500,
+    });
+    const id = randomUUID();
+    const claimed = await slow.claim(ENV, user, id);
+    if (claimed.kind !== "claimed") throw new Error("expected a slot");
+    await slow.release(ENV, user, id, claimed.slot);
+    expect(await slow.claim(ENV, user, randomUUID())).toEqual({
+      kind: "claimed",
+      slot: 0,
+      held: 0,
+    });
+    await slow.close();
+  });
+
+  it("accepts a claim immediately after releaseAll frees all five (FR-011a (3.22))", async () => {
+    // THE CASE THAT WAS ACTUALLY BROKEN, and it is a deploy. One slot tombstoned is
+    // one slot skipped; five tombstoned is a walk that finds nothing free and
+    // reports `full` — so a client reconnecting to the new instance is refused with
+    // `connection_limit_reached`, and the remedy that close code names is to close
+    // one of the connections it already holds. Those went with the old instance.
+    const slow = createConnections({
+      url: REDIS,
+      logger: silent,
+      tombstoneMs: 500,
+    });
+    const held = [];
+    for (let i = 0; i < MAX_CONNECTIONS_PER_USER; i += 1) {
+      const id = randomUUID();
+      const claimed = await slow.claim(ENV, user, id);
+      if (claimed.kind !== "claimed") throw new Error("expected a slot");
+      held.push({ environmentId: ENV, user, connectionId: id, slot: claimed.slot });
+    }
+    await slow.releaseAll(held);
+    expect(await slow.claim(ENV, user, randomUUID())).toEqual({
+      kind: "claimed",
+      slot: 0,
+      held: 0,
+    });
+    await slow.close();
+  });
+
+  it("does NOT free a slot another connection now holds (FR-010 (3.22))", async () => {
+    // ARM 6, and the reason the release is conditional. Under a plain `DEL` this
+    // would delete the new owner's key and hand out a place that is in use — the
+    // same ownership hole `IFEQ` closed on the renewal, on the path that fix
+    // introduced.
+    const brief = createConnections({ url: REDIS, logger: silent, boundMs: 60 });
+    const mine = randomUUID();
+    const claimed = await brief.claim(ENV, user, mine);
+    if (claimed.kind !== "claimed") throw new Error("expected a slot");
+    await new Promise((resolve) => setTimeout(resolve, 120));
+
+    const theirs = randomUUID();
+    const retaken = await brief.claim(ENV, user, theirs);
+    expect(retaken).toEqual({ kind: "claimed", slot: 0, held: 0 });
+
+    await brief.release(ENV, user, mine, claimed.slot);
+    // Still theirs: the release was refused. Renewing proves it.
+    expect(await brief.renew(ENV, user, theirs, 0)).toEqual({ kind: "renewed" });
+    await brief.close();
+  });
+
+  it("is a no-op for a slot the connection never held", async () => {
+    // ARM 7. Nothing to free, nothing to break, and no error.
+    await expect(
+      registry.release(ENV, user, randomUUID(), 3),
+    ).resolves.toBeUndefined();
+  });
+
+  it("releases every slot this instance holds (FR-011a (3.22))", async () => {
+    const held = [];
+    for (let i = 0; i < 3; i += 1) {
+      const id = randomUUID();
+      const claimed = await registry.claim(ENV, user, id);
+      if (claimed.kind !== "claimed") throw new Error("expected a slot");
+      held.push({ environmentId: ENV, user, connectionId: id, slot: claimed.slot });
+    }
+    await registry.releaseAll(held);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    // All three back, so the next three claims all succeed.
+    for (let i = 0; i < 3; i += 1) {
+      expect((await registry.claim(ENV, user, randomUUID())).kind).toBe("claimed");
+    }
+  });
+
+  it("releases nothing when it holds nothing", async () => {
+    // ARM 8: the empty loop, which is the shutdown path of an instance that never
+    // had a connection.
+    await expect(registry.releaseAll([])).resolves.toBeUndefined();
+  });
+
+  // ---- ARM 5 and ARM 11: the registry cannot be reached -----------------
+
+  it("returns unenforced rather than zero when Redis is unreachable (FR-016 (3.22))", async () => {
+    // ARM 5 and ARM 11. A port nothing listens on, so every command rejects.
+    //
+    // `null` MEANS COULD NOT ASK, and the distinction is the requirement: FR-016
+    // accepts the connection and logs that the cap was not enforced, which is a
+    // different fact from a user being under the limit. Conflating them is what
+    // chapter 3.18 found in the fan-out — "the send returned 201 while Redis was
+    // down" is true of a publisher that does nothing at all.
+    const lines: Record<string, unknown>[] = [];
+    const gone = createConnections({
+      url: "redis://127.0.0.1:6399",
+      logger: {
+        log: (_level: string, msg: string, fields?: Record<string, unknown>) => {
+          lines.push({ msg, ...fields });
+        },
+      },
+      boundMs: 60,
+    });
+    expect(await gone.claim(ENV, user, randomUUID())).toEqual({
+      kind: "unenforced",
+    });
+    expect(lines.some((l) => l["msg"] === "connections.failed")).toBe(true);
+    await gone.close().catch(() => {});
+  }, 20_000);
+
+  // ---- FR-009 and FR-002: the numbers, and where they live --------------
+
+  it("keeps the heartbeat strictly inside the bound, three to one (FR-009 (3.22))", async () => {
+    // THE RATIO, NOT THE VALUES. A test pinning 20_000 and 60_000 goes red on a
+    // deliberate re-derivation and says nothing about the property. What FR-009
+    // requires is that two consecutive missed renewals cannot free a live
+    // connection's place, and three-to-one is what delivers it.
+    expect(DEFAULT_HEARTBEAT_MS).toBeLessThan(DEFAULT_BOUND_MS);
+    expect(DEFAULT_BOUND_MS / DEFAULT_HEARTBEAT_MS).toBeGreaterThanOrEqual(3);
+    // And it is NOT the protocol keepalive, which chapter 3.19 paid for conflating.
+    expect(DEFAULT_HEARTBEAT_MS).not.toBe(30_000);
+  });
+
+  it("states the maximum in exactly one place (FR-002 (3.22))", async () => {
+    // The requirement is about DRIFT, not about the value. `policy.ts` derived
+    // `connect: 3_000` from "ten thousand divided by five" and shipped a third
+    // number; a second literal five in this module is how the same thing starts.
+    //
+    // Read from disk rather than reasoned about: the module's own source is the
+    // only thing that can answer "how many fives are in it".
+    const here = dirname(fileURLToPath(import.meta.url));
+    const source = readFileSync(join(here, "connections.ts"), "utf8");
+    const body = source
+      .split("\n")
+      .filter((line) => !line.trimStart().startsWith("*"))
+      .filter((line) => !line.trimStart().startsWith("//"))
+      .filter((line) => !line.trimStart().startsWith("/*"))
+      .join("\n");
+    const fives = body.match(/(?<![\w.])5(?![\w.])/g) ?? [];
+    expect(fives, `bare 5 outside comments: ${fives.length}`).toHaveLength(1);
+    expect(MAX_CONNECTIONS_PER_USER).toBe(5);
+  });
+});
+```
+
+Every one of those runs against a **real** Redis rather than a stub, and that is a
+correctness argument rather than a preference. The whole design rests on what `SET … NX` and
+`SET … IFEQ` do. A stubbed client would pass with a non-atomic implementation, with an `XX`
+renewal that hijacks, with a `DEL` release that frees another connection's place — and against
+a server that does not support `IFEQ` at all.
+
+```ts title="services/gateway/src/connections.itest.ts"
+import { randomUUID } from "node:crypto";
+import type { Server } from "node:http";
+import type { AddressInfo } from "node:net";
+
+import { docsUrl, subjectForChannelMembership } from "@relay/protocol";
+import { serve } from "@relay/service-kit";
+import { Redis } from "ioredis";
+import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
+import { WebSocket } from "ws";
+
+import type { ApiClient } from "./api-client.js";
+import { createFanout } from "./fanout.js";
+import { createConnections, MAX_CONNECTIONS_PER_USER, type Connections } from "./connections.js";
+import { createMembership } from "./membership.js";
+import { attachSessions } from "./session.js";
+
+// CHAPTER 3.22 — FR-RTM-09's five-connection cap.
+//
+// PHASE 2 IS US3 AND IT RUNS AGAINST UNCHANGED CODE, deliberately. FR-RTM-09's
+// second clause — "each shall receive all events independently" — is a property
+// of code that already ships: delivery walks connections, never users. Writing
+// these tests BEFORE the cap exists makes them a regression guard for it.
+// Written afterwards they would prove nothing, because nobody would know they
+// had ever passed.
+//
+// A PER-RUN ENVIRONMENT, and not the constant the neighbours use. `typing.itest.ts`
+// defaults to "env-1" and `resume.itest.ts` hardcodes it; both lean on the user
+// name "tuan"; and the gateway's integration config sets no `fileParallelism`, so
+// all three files run at once. Once Phase 5 lands, slot keys are namespaced by
+// environment, and a constant here would leak this file's tests into each other.
+const ENVIRONMENT = `env-${randomUUID()}`;
+const REDIS = process.env["RELAY_REDIS_URL"] ?? "redis://localhost:6379";
+
+const silent = { log: () => {} };
+
+/** Every environment this run has booted an instance in — the one above, plus the
+ * second one FR-012's test needs. Populated by `boot`, and read only by the sweep
+ * below. */
+const environments = new Set<string>();
+
+/** T050c. **A SLOT'S TTL OUTLIVES THE PACKAGE'S RUN**: 60,000 ms of bound against
+ * a gateway integration lane of about forty-five seconds. So a slot leaked by a
+ * close handler that never ran survives into the next file and into the next
+ * battery run — and this is the only file that deliberately fills all five.
+ *
+ * Scoped to this run's own environment prefixes, which are UUIDs, so it cannot
+ * touch another suite's keys. `limits.itest.ts:297` deletes its three rate-limit
+ * keys by name for the same reason and is the only other Redis cleanup in the
+ * gateway's integration files; a name list is not available here because the
+ * production code chooses the user and the slot. */
+const raw = new Redis(REDIS);
+
+afterEach(async () => {
+  for (const environment of environments) {
+    const keys = await raw.keys(`conn:${environment}:*`);
+    if (keys.length > 0) await raw.del(...keys);
+  }
+});
+
+afterAll(async () => {
+  await raw.quit();
+});
+
+interface Instance {
+  url: string;
+  /** FR-011a's path ON ITS OWN, with the sockets left open — which is the only way
+   * to see it. `sessions.close()` calls `releaseAll()` and then `wss.close()`, and
+   * `wss.close()` does not close established sockets; the fixture's own `close()`
+   * below waits on `server.close()`, which does not return while a socket is open.
+   * So a test that wants to observe the deploy path calls this and leaves the rest
+   * to teardown. */
+  shutdown: () => Promise<void>;
+  /** FR-007. The instance stops being able to reach the registry, and nothing
+   * closes its sockets.
+   *
+   * **WHAT A `kill -9` LOOKS LIKE FROM REDIS'S SIDE, which is the only side that
+   * can see it**: no release lands, no renewal lands, and the five keys sit there
+   * until their bound elapses. In process there is no way to make the server's own
+   * `close` handlers not run — destroying the socket is what triggers them — so the
+   * simulation is at the registry rather than at the socket. It does not reproduce
+   * a half-written command or a torn connection, and it is not claimed to. */
+  crash: () => Promise<void>;
+  close: () => Promise<void>;
+}
+
+/** One gateway, in process, with a stubbed api — the shape `resume.itest.ts` and
+ * `typing.itest.ts` use. No api is spawned, so this file claims no port range and
+ * adds nothing to the seven spawning files in the lane. */
+async function boot(options: {
+  user: string;
+  channels: string[];
+  /** FR-012's test needs a second one, and every other test wants this run's own.
+   * `typing.itest.ts:94` defaults to `"env-1"` and `resume.itest.ts` hardcodes it
+   * in seven places; both lean on the user name "tuan". Those two claim no slots,
+   * so the reason here is hygiene within this file rather than a collision with
+   * them — but this file fills all five places on purpose, and a shared identity
+   * would leak one test's slots into the next. */
+  environment?: string;
+  /** Chapter 3.22, T050a. **ONE MODULE PER INSTANCE, BUILT HERE**, the way
+   * `typing.itest.ts:101` calls `createTyping(...)` inside `boot()`.
+   *
+   * `releaseAll()` is what makes this correctness rather than style: it frees the
+   * places *this instance* holds, so a fixture sharing one module across two
+   * gateways would have the crashed instance release the surviving one's slots —
+   * and T052 would pass for the wrong reason. Two instances, two modules, two
+   * client pairs, both closed in teardown.
+   *
+   * Absent means the cap is not enforced at all, which is what US3's tests want:
+   * every gateway module is an optional `attachSessions` parameter, so a fixture
+   * opts in. */
+  cap?: { boundMs?: number; heartbeatMs?: number; url?: string };
+  /** FR-015's log line is the assertion that carries the requirement, so a test
+   * needs the lines. Chapter 3.18: a publisher that does nothing satisfies "the
+   * send returned 201". */
+  lines?: Record<string, unknown>[];
+}): Promise<Instance> {
+  const environment = options.environment ?? ENVIRONMENT;
+  environments.add(environment);
+  const fanout = createFanout({ url: REDIS, logger: silent });
+  const membership = createMembership({ url: REDIS, logger: silent });
+  const logger =
+    options.lines === undefined
+      ? silent
+      : {
+          log: (_level: string, msg: string, fields?: Record<string, unknown>) => {
+            options.lines?.push({ msg, ...fields });
+          },
+        };
+  const server: Server = serve({
+    service: "gateway",
+    health: () => ({}),
+    logger: silent,
+    notFoundDocsUrl: docsUrl("not_found"),
+  });
+  const api: ApiClient = {
+    session: async () => ({
+      environment_id: environment,
+      user: options.user,
+      banned: false,
+      channel_ids: options.channels,
+      limits: { connect: 3_000, send: 600 },
+    }),
+    memberships: async () => options.channels,
+    backfill: async () => ({}) as never,
+    sendMessage: async () => {
+      throw new Error("not used");
+    },
+    reportUsage: async () => null,
+  };
+  const registry: Connections | undefined =
+    options.cap === undefined
+      ? undefined
+      : createConnections({
+          url: options.cap.url ?? REDIS,
+          logger,
+          ...(options.cap.boundMs === undefined ? {} : { boundMs: options.cap.boundMs }),
+        });
+  const sessions = attachSessions({
+    server,
+    api,
+    logger,
+    fanout,
+    membership,
+    ...(registry === undefined ? {} : { connections: registry }),
+    ...(options.cap?.heartbeatMs === undefined
+      ? {}
+      : { heartbeatMs: options.cap.heartbeatMs }),
+  });
+  await new Promise<void>((resolve) => server.listen(0, resolve));
+  const { port } = server.address() as AddressInfo;
+  let stopped = false;
+  const stop = async (): Promise<void> => {
+    if (stopped) return;
+    stopped = true;
+    await sessions.close();
+  };
+  return {
+    url: `ws://127.0.0.1:${port}/v1/ws`,
+    shutdown: stop,
+    // Only the client goes. Teardown then runs the ordinary path, where every
+    // release and every `releaseAll` throws inside the module's own `failable` and
+    // is logged rather than thrown — so the timers still get cleared and the slots
+    // still stay held.
+    crash: async () => {
+      await registry?.close().catch(() => {});
+    },
+    close: async () => {
+      await stop();
+      await fanout.close();
+      await membership.close();
+      await registry?.close().catch(() => {});
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    },
+  };
+}
+
+interface Recorded {
+  socket: WebSocket;
+  frames: { type: string; payload: Record<string, unknown> }[];
+  /** The close code once it arrives, captured by `record` rather than by whoever
+   * happens to be waiting. A listener attached later can miss a close that has
+   * already happened, which is how "no ack within 5s" hid a 4004 for two hours. */
+  closed?: number;
+}
+
+/** Every frame kept, not just the first matching one. **That distinction is the
+ * whole point of T014**: chapter 3.18 already asserts both of a user's sockets
+ * receive a message, using a `waitFor` that resolves on the first match — so a
+ * DUPLICATE passes it unnoticed. Story 3 scenario 1 says "both receive it, and
+ * each receives it once", and only a count can say the second half. */
+function record(socket: WebSocket): Recorded {
+  const r: Recorded = { socket, frames: [] };
+  socket.on("message", (raw) => {
+    r.frames.push(JSON.parse(String(raw)) as Recorded["frames"][number]);
+  });
+  socket.on("close", (code: number) => {
+    r.closed = code;
+  });
+  return r;
+}
+
+/** **THE FAILURE CARRIES WHAT THE SOCKET ACTUALLY GOT**, and the first version of
+ * this message did not. `no connection.ack within 5s` was true of a socket that
+ * had been refused 4004 half a second earlier, and it took a falsification run and
+ * six repeats to find that out — chapter 3.21's rule one level down: a check that
+ * throws away the evidence costs more than the defect. */
+async function untilAcked(r: Recorded): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    if (r.frames.some((f) => f.type === "connection.ack")) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  const seen = r.frames.map((f) => f.type).join(", ") || "nothing";
+  const codes = r.frames
+    .filter((f) => f.type === "error")
+    .map((f) => String(f.payload["code"]))
+    .join(", ");
+  throw new Error(
+    `no connection.ack within 5s — frames: ${seen}${
+      codes === "" ? "" : ` (${codes})`
+    }; close: ${r.closed === undefined ? "still open" : String(r.closed)}`,
+  );
+}
+
+/** Polls rather than waits on a single frame. A connection is acked before its
+ * SUBSCRIBE has necessarily landed, which cost chapter 3.21 a flake at 315 ms —
+ * the fix there was polling helpers, not a re-run. */
+async function untilCount(
+  r: Recorded,
+  type: string,
+  atLeast: number,
+): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    if (r.frames.filter((f) => f.type === type).length >= atLeast) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(
+    `only ${r.frames.filter((f) => f.type === type).length} ${type} within 5s`,
+  );
+}
+
+const count = (r: Recorded, type: string): number =>
+  r.frames.filter((f) => f.type === type).length;
+
+describe("every connection a person holds is a first-class recipient (US3)", () => {
+  const open: Instance[] = [];
+  const sockets: WebSocket[] = [];
+
+  /** A FRESH USER PER TEST, and the first version of this file had one per FILE.
+   * Slot keys are `conn:{env}:{user}:{slot}`, so tests sharing a user share five
+   * places — and the cap tests fill all five. Two of them failed at 5 s with the
+   * previous test's slots still held, because a release is fire-and-forget from a
+   * close handler and the registry client had already been quit inside the test
+   * body. Per-test users make the leak impossible; the instance owning its own
+   * module, closed after `sessions.close()`, makes the release possible. */
+  let user: string;
+
+  const connect = (instance: Instance): Recorded => {
+    const socket = new WebSocket(`${instance.url}?token=any`);
+    sockets.push(socket);
+    return record(socket);
+  };
+
+  beforeEach(() => {
+    user = `u-${randomUUID()}`;
+  });
+
+  afterEach(async () => {
+    // Sockets before servers. `afterEach` runs in reverse registration order and
+    // a teardown that closed servers first cost chapter 3.20 seven tests and
+    // eighty-three seconds, every failure naming a hook.
+    for (const socket of sockets.splice(0)) socket.close();
+    // A beat for each close handler to run its release before the client goes.
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    for (const instance of open.splice(0)) await instance.close();
+  });
+
+  it("accepts five and refuses the sixth with 4004 (FR-001 (3.22), FR-003, SC-002)", async () => {
+    const channel = randomUUID();
+    const instance = await boot({ user, channels: [channel], cap: {} });
+    open.push(instance);
+
+    const five: Recorded[] = [];
+    for (let i = 0; i < MAX_CONNECTIONS_PER_USER; i += 1) {
+      const r = connect(instance);
+      await untilAcked(r);
+      five.push(r);
+    }
+    expect(five).toHaveLength(5);
+
+    // THE CLOSE CODE AND THE ERROR CODE, NOT THE FACT OF CLOSING. A socket that
+    // closes for the wrong reason is identical from outside, which is what
+    // `contracts/refusal.md` is about — every reuse of the five existing codes
+    // sends a client to the wrong remedy.
+    const sixth = connect(instance);
+    const code = await new Promise<number>((resolve) => {
+      sixth.socket.on("close", (c) => resolve(c));
+    });
+    expect(code).toBe(4004);
+    const error = sixth.frames.find((f) => f.type === "error");
+    expect(error?.payload["code"]).toBe("connection_limit_reached");
+    expect(String(error?.payload["message"])).toContain("close one and reconnect");
+
+    // FR-005 and SC-012: the five are undisturbed. A message published now
+    // reaches all of them — the refusal cost them nothing.
+    const fanout = createFanout({ url: REDIS, logger: silent });
+    await fanout.publish({
+      id: randomUUID(),
+      channel,
+      seq: 3,
+      user,
+      text: `after the refusal ${randomUUID()}`,
+      created_at: new Date(0).toISOString(),
+    });
+    for (const [i, r] of five.entries()) {
+      await untilCount(r, "message.created", 1);
+      expect(count(r, "message.created"), `on ${String(i)}`).toBe(1);
+    }
+    await fanout.close();
+  }, 40_000);
+
+  it("frees a slot on close, reusable with NO waiting period (FR-010 (3.22), SC-003)", async () => {
+    const channel = randomUUID();
+    const instance = await boot({ user, channels: [channel], cap: {} });
+    open.push(instance);
+
+    const five: Recorded[] = [];
+    for (let i = 0; i < MAX_CONNECTIONS_PER_USER; i += 1) {
+      const r = connect(instance);
+      await untilAcked(r);
+      five.push(r);
+    }
+    // Close one and take its place. **No clock is involved** — that is the
+    // observable difference between this refusal and a rate limit, whose remedy
+    // is to wait.
+    five[0]?.socket.close();
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    const replacement = connect(instance);
+    await untilAcked(replacement);
+    expect(count(replacement, "connection.ack")).toBe(1);
+  }, 40_000);
+
+  it("logs the refusal with the user, the environment and the count, and no credential (FR-015 (3.22), SC-008)", async () => {
+    const channel = randomUUID();
+    const lines: Record<string, unknown>[] = [];
+    const instance = await boot({ user, channels: [channel], cap: {}, lines });
+    open.push(instance);
+
+    for (let i = 0; i < MAX_CONNECTIONS_PER_USER; i += 1) {
+      await untilAcked(connect(instance));
+    }
+    const sixth = connect(instance);
+    await new Promise<number>((resolve) => {
+      sixth.socket.on("close", (c) => resolve(c));
+    });
+
+    const rejected = lines.find(
+      (l) => l["msg"] === "connection.rejected" && l["reason"] === "connection_limit_reached",
+    );
+    expect(rejected, "connection.rejected was not logged").toBeTruthy();
+    expect(rejected?.["user"]).toBe(user);
+    expect(rejected?.["environment_id"]).toBe(ENVIRONMENT);
+    expect(rejected?.["held"]).toBe(5);
+    // NFR-SEC-06. "the key rk_dev_abc… is invalid" is how a live secret reaches a
+    // support ticket, so the whole line is checked rather than one field.
+    expect(JSON.stringify(rejected)).not.toContain("token");
+    expect(JSON.stringify(rejected)).not.toContain("rk_");
+  }, 40_000);
+
+  it("delivers a message to both of one user's connections, each exactly once (FR-014 (3.22), SC-001)", async () => {
+    const channel = randomUUID();
+    const instance = await boot({ user, channels: [channel] });
+    open.push(instance);
+
+    const a = connect(instance);
+    const b = connect(instance);
+    await untilAcked(a);
+    await untilAcked(b);
+
+    const fanout = createFanout({ url: REDIS, logger: silent });
+    const text = `to both tabs ${randomUUID()}`;
+    await fanout.publish({
+      id: randomUUID(),
+      channel,
+      seq: 1,
+      user,
+      text,
+      created_at: new Date(0).toISOString(),
+    });
+
+    await untilCount(a, "message.created", 1);
+    await untilCount(b, "message.created", 1);
+    // Settle, so a duplicate has time to arrive and be counted. Asserting a
+    // count immediately after the first arrival cannot see a second.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    expect(count(a, "message.created"), "on a").toBe(1);
+    expect(count(b, "message.created"), "on b").toBe(1);
+    expect(
+      (a.frames.find((f) => f.type === "message.created")?.payload as { text: string })
+        .text,
+    ).toBe(text);
+    await fanout.close();
+  }, 30_000);
+
+  it("delivers a membership change to both of one user's connections (FR-014 (3.22))", async () => {
+    const channel = randomUUID();
+    const instance = await boot({ user, channels: [channel] });
+    open.push(instance);
+
+    const a = connect(instance);
+    const b = connect(instance);
+    await untilAcked(a);
+    await untilAcked(b);
+
+    // The membership fabric, not the message one. `deliverPresence` is
+    // deliberately UNFILTERED and typing's rule is the opposite, and the two sit
+    // adjacent in `session.ts` — so a test copied from one to the other asserts
+    // the wrong thing. This asserts arrival on both, which is FR-014's subject.
+    //
+    // PUBLISHED RAW, because the `Membership` module has no `publish`: the api
+    // publishes a change and the gateway only ever subscribes. `membership.itest.ts`
+    // reached for a raw client for the same reason, and counting a publish through
+    // the code that publishes is the shape chapter 3.18 warned about anyway.
+    const publisher = new Redis(REDIS);
+    await publisher.publish(
+      subjectForChannelMembership(channel),
+      JSON.stringify({
+        environment: ENVIRONMENT,
+        channel,
+        user,
+        change: "added",
+      }),
+    );
+
+    await untilCount(a, "membership.changed", 1);
+    await untilCount(b, "membership.changed", 1);
+    await publisher.quit();
+  }, 30_000);
+
+  it("keeps delivering to a live connection when an EARLIER one is gone (FR-014 (3.22))", async () => {
+    const channel = randomUUID();
+    const instance = await boot({ user, channels: [channel] });
+    open.push(instance);
+
+    const a = connect(instance);
+    const b = connect(instance);
+    await untilAcked(a);
+    await untilAcked(b);
+
+    // THE FIRST CONNECTION IS THE ONE TERMINATED, and the order is the test.
+    // `subscribersOf` returns `[...byId.values()]` — a `Map`, so insertion order —
+    // so `a` is delivered to first. Terminating `b` instead would leave a
+    // delivery loop that dies on its first failure looking correct, because it
+    // would already have reached `a`. **A test that passes whichever way the
+    // subject behaves proves nothing**, and the first draft of this test
+    // terminated `b`.
+    //
+    // AND FR-014's SECOND HALF IS NOT WHAT THIS TESTS, because it could not be
+    // falsified. The clause says one connection's delivery failure must not
+    // prevent another's. `send` is a bare `socket.send(...)` with no try/catch,
+    // so the falsification is to make it throw on a socket that is not OPEN —
+    // and that leaves all three tests green, because `registry.remove` runs from
+    // the terminated socket's own close handler before any publish arrives.
+    // **There is no failing send to survive**: a dead connection is gone from
+    // the registry, not present-and-broken.
+    //
+    // So the property is real and unobservable through this fixture, which is
+    // chapter 3.20's lesson in its own words — a claim about an observable
+    // difference needs falsifying before the test is written. What this test does
+    // assert is narrower and still worth having: a surviving connection keeps
+    // receiving after an earlier one is gone.
+    a.socket.terminate();
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    const fanout = createFanout({ url: REDIS, logger: silent });
+    await fanout.publish({
+      id: randomUUID(),
+      channel,
+      seq: 2,
+      user,
+      text: `after b is gone ${randomUUID()}`,
+      created_at: new Date(0).toISOString(),
+    });
+
+    await untilCount(b, "message.created", 1);
+    expect(count(b, "message.created")).toBe(1);
+    await fanout.close();
+  }, 30_000);
+});
+
+// ---------------------------------------------------------------------------
+// PHASE 6 — US2: the count survives the gateway it was counted on.
+//
+// Two of the three halves `docs/05-sad.md` gets wrong about `conn:{env}:{user}`.
+// Line 167 describes it in the present tense as an instance-id lookup that does
+// not exist; line 574 calls the same key "Not built". What is actually needed is
+// neither: a count that no single gateway owns, so CON-02's "no sticky routing for
+// correctness" survives contact with a cap.
+// ---------------------------------------------------------------------------
+
+describe("the count survives the gateway it was counted on (US2)", () => {
+  const open: Instance[] = [];
+  const sockets: WebSocket[] = [];
+  let user: string;
+
+  const connect = (instance: Instance): Recorded => {
+    const socket = new WebSocket(`${instance.url}?token=any`);
+    sockets.push(socket);
+    return record(socket);
+  };
+
+  /** **BOUNDED, and for the reason `refusedOn` polls.** An unbounded wait on a
+   * close turns an implementation that keeps the connection into a test that hangs
+   * until its own timeout — measured at 40,172 ms on the falsification below,
+   * against a lane with eleven seconds of headroom. */
+  const untilClosed = async (r: Recorded): Promise<number> => {
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline) {
+      if (r.closed !== undefined) return r.closed;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    throw new Error("the socket was still open after 5s");
+  };
+
+  /** Connect and expect the door to be shut, returning both codes. The close code
+   * AND the error code, never the fact of closing: a socket that closes for the
+   * wrong reason is identical from outside, which is the whole subject of
+   * `contracts/refusal.md`.
+   *
+   * **THE ACK IS RACED AGAINST THE CLOSE**, and that is a falsification's finding
+   * rather than a nicety. Waiting only for a close means an implementation that
+   * ADMITS the connection hangs until the test's own timeout — measured at 40,192
+   * ms against a per-instance count, one red test costing forty seconds of a lane
+   * with eleven seconds of headroom. Racing them turns the same defect into a
+   * one-line diff in about thirty milliseconds. */
+  const refusedOn = async (
+    instance: Instance,
+  ): Promise<{ code: number; error: string | undefined }> => {
+    const r = connect(instance);
+    // POLLED RATHER THAN `Promise.race`d. `untilAcked` rejects at its own deadline,
+    // and a rejection nobody is waiting on any more is an unhandled rejection —
+    // which in this package takes the process down.
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline) {
+      if (r.closed !== undefined) {
+        const frame = r.frames.find((f) => f.type === "error");
+        return { code: r.closed, error: frame?.payload["code"] as string | undefined };
+      }
+      if (r.frames.some((f) => f.type === "connection.ack")) {
+        return { code: -1, error: "accepted" };
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    throw new Error("neither refused nor acked within 5s");
+  };
+
+  const fill = async (instance: Instance, howMany: number): Promise<Recorded[]> => {
+    const held: Recorded[] = [];
+    for (let i = 0; i < howMany; i += 1) {
+      const r = connect(instance);
+      await untilAcked(r);
+      held.push(r);
+    }
+    return held;
+  };
+
+  const slotKey = (slot: number, environment = ENVIRONMENT): string =>
+    `conn:${environment}:${user}:${String(slot)}`;
+
+  beforeEach(() => {
+    user = `u-${randomUUID()}`;
+  });
+
+  afterEach(async () => {
+    for (const socket of sockets.splice(0)) socket.close();
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    for (const instance of open.splice(0)) await instance.close();
+  });
+
+  it("counts five across two instances and refuses the sixth on either (FR-006 (3.22), SC-004)", async () => {
+    // CON-02 AS A TEST. Two gateways, two registry modules, one Redis, and a cap
+    // that neither instance can compute on its own: three places on A and two on
+    // B is five, and the sixth has nowhere to go whichever door it knocks on.
+    // A per-instance count would accept five more on each.
+    const channel = randomUUID();
+    const a = await boot({ user, channels: [channel], cap: {} });
+    const b = await boot({ user, channels: [channel], cap: {} });
+    open.push(a, b);
+
+    await fill(a, 3);
+    await fill(b, 2);
+
+    // ON EITHER, and both halves are asserted. A test that only tries the
+    // instance holding three would pass against a cap that counts per instance
+    // and happens to be full there.
+    expect(await refusedOn(a)).toEqual({
+      code: 4004,
+      error: "connection_limit_reached",
+    });
+    expect(await refusedOn(b)).toEqual({
+      code: 4004,
+      error: "connection_limit_reached",
+    });
+  }, 40_000);
+
+  it("frees a dead instance's slots after the bound (FR-007 (3.22), SC-005)", async () => {
+    // AN INJECTED BOUND, the way `presence.itest.ts` injects `graceMs`. The
+    // wall-clock version — sixty seconds of waiting — belongs in `quickstart.md`,
+    // and it is what proves this injected one is telling the truth.
+    const channel = randomUUID();
+    const dying = await boot({
+      user,
+      channels: [channel],
+      cap: { boundMs: 1_000, heartbeatMs: 300 },
+    });
+    open.push(dying);
+    await fill(dying, MAX_CONNECTIONS_PER_USER);
+
+    await dying.crash();
+    const survivor = await boot({
+      user,
+      channels: [channel],
+      cap: { boundMs: 1_000, heartbeatMs: 300 },
+    });
+    open.push(survivor);
+
+    // The last renewal landed at most 300 ms before the crash, so the five keys
+    // are gone by 1,000 ms after it and no later.
+    await new Promise((resolve) => setTimeout(resolve, 1_300));
+    const replacement = connect(survivor);
+    await untilAcked(replacement);
+    expect(count(replacement, "connection.ack")).toBe(1);
+  }, 40_000);
+
+  it("still refuses BEFORE the bound elapses (FR-007 (3.22), SC-005)", async () => {
+    // **THE HALF USUALLY SKIPPED**, and the two halves were measured to be
+    // independent rather than assumed to be. Dropping the `PX` from the claim
+    // turns the test above red and this one green; making the `PX` 1 ms turns this
+    // one red and the test above green. So this is the assertion that says the
+    // places are really held, and that one says the holding really ends.
+    //
+    // The first draft of this comment said a slot-frees-eventually test "passes
+    // against an implementation whose keys carry no TTL", which is backwards: with
+    // no TTL it is the freeing that fails. What this test catches is a cap that
+    // claims nothing.
+    const channel = randomUUID();
+    const dying = await boot({
+      user,
+      channels: [channel],
+      cap: { boundMs: 1_000, heartbeatMs: 300 },
+    });
+    open.push(dying);
+    await fill(dying, MAX_CONNECTIONS_PER_USER);
+
+    await dying.crash();
+    const survivor = await boot({
+      user,
+      channels: [channel],
+      cap: { boundMs: 1_000, heartbeatMs: 300 },
+    });
+    open.push(survivor);
+
+    // 200 ms in, with expiry no earlier than 700 ms.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(await refusedOn(survivor)).toEqual({
+      code: 4004,
+      error: "connection_limit_reached",
+    });
+  }, 40_000);
+
+  it("frees the slots IMMEDIATELY on a clean shutdown (FR-011a (3.22), SC-013)", async () => {
+    // FOUND BY BUILDING `traceability.md` DURING PLANNING: one task wrote
+    // `releaseAll()`, another asserted `connections.close()` was *registered* in
+    // `main.ts`, and nothing asserted anything was released. The crash test above
+    // covers the opposite path.
+    //
+    // THE DEFAULT BOUND IS THE POINT. Sixty seconds, and this test finishes in
+    // about one — so expiry cannot explain the acceptance, and neither can a
+    // socket's own close handler, because the sockets are still open. The default
+    // twenty-second heartbeat matters too: a short one would have a renewal
+    // re-claim the places straight after `releaseAll()` freed them.
+    const channel = randomUUID();
+    const replaced = await boot({ user, channels: [channel], cap: {} });
+    open.push(replaced);
+    await fill(replaced, MAX_CONNECTIONS_PER_USER);
+
+    const successor = await boot({ user, channels: [channel], cap: {} });
+    open.push(successor);
+    // NFR-REL-03 allows a deployment no more than one reconnection cycle, and a
+    // bound's worth of refusals after every deploy is more than one.
+    expect(await refusedOn(successor)).toEqual({
+      code: 4004,
+      error: "connection_limit_reached",
+    });
+
+    // RECONNECTED WITH NO WAIT AT ALL, which is what found the tombstone defect:
+    // a 20 ms sleep here made this test pass every time and hid it.
+    await replaced.shutdown();
+    const reconnected = connect(successor);
+    await untilAcked(reconnected);
+    expect(count(reconnected, "connection.ack")).toBe(1);
+  }, 40_000);
+
+  it("keeps a heartbeating connection's slot across three bounds (FR-008 (3.22), SC-006)", async () => {
+    // CHAPTER 3.19 SHIPPED A PRESENCE BUG BY ARMING A CHECK AT EXACTLY ITS OWN
+    // GRACE PERIOD — two deadlines on one instant, reached by two clocks, and the
+    // losing side stranded a user online for ever. This is the test that would
+    // have caught the same mistake here: three renewals per bound, so two
+    // consecutive misses still do not free a live connection's place.
+    const channel = randomUUID();
+    const lines: Record<string, unknown>[] = [];
+    const instance = await boot({
+      user,
+      channels: [channel],
+      cap: { boundMs: 600, heartbeatMs: 200 },
+      lines,
+    });
+    open.push(instance);
+
+    const live = await fill(instance, 1);
+    const before = await raw.get(slotKey(0));
+    expect(before, "the connection did not claim slot 0").toBeTruthy();
+
+    await new Promise((resolve) => setTimeout(resolve, 2_000));
+
+    // THE SAME VALUE IN THE SAME KEY, three bounds later. Non-null alone would be
+    // satisfied by a slot the connection lost and then re-claimed, which is a
+    // different outcome — so the log is checked for the re-claim as well.
+    expect(await raw.get(slotKey(0))).toBe(before);
+    expect(live[0]?.socket.readyState).toBe(WebSocket.OPEN);
+    expect(lines.filter((l) => l["msg"] === "connection.reclaimed")).toEqual([]);
+    expect(lines.filter((l) => l["msg"] === "connection.rejected")).toEqual([]);
+  }, 40_000);
+
+  it("counts each environment separately for one user (FR-012 (3.22))", async () => {
+    // CONSTITUTION I. The key carries the environment, so the same person in a
+    // customer's staging and production environments has two allowances rather
+    // than one shared between them.
+    const channel = randomUUID();
+    const other = `env-${randomUUID()}`;
+    const here = await boot({ user, channels: [channel], cap: {} });
+    const there = await boot({
+      user,
+      channels: [channel],
+      environment: other,
+      cap: {},
+    });
+    open.push(here, there);
+
+    await fill(here, MAX_CONNECTIONS_PER_USER);
+    // Accepted in the other environment while this one is full.
+    const across = connect(there);
+    await untilAcked(across);
+    expect(count(across, "connection.ack")).toBe(1);
+    // AND THE FIRST ENVIRONMENT REALLY WAS FULL, which is the half that makes the
+    // acceptance above mean something. Without it the test passes against a cap
+    // that counts nothing.
+    expect(await refusedOn(here)).toEqual({
+      code: 4004,
+      error: "connection_limit_reached",
+    });
+  }, 40_000);
+
+  it("does not resurrect an expired slot on renewal (FR-011 (3.22))", async () => {
+    // THE KEY IS DELETED RATHER THAN WAITED OUT, so the state is exact and no
+    // sleep is being trusted to be longer than a TTL.
+    //
+    // THE LOG LINE IS THE DISCRIMINATOR, and there is no other. Under `IFEQ` the
+    // renewal is refused and the module re-claims — `connection.reclaimed`. Under a
+    // plain `SET` the renewal succeeds against a key that does not exist, the slot
+    // is resurrected, and no line appears. The end state of the two is the same
+    // key holding the same id, which is why this test reads the logs.
+    const channel = randomUUID();
+    const lines: Record<string, unknown>[] = [];
+    const instance = await boot({
+      user,
+      channels: [channel],
+      cap: { heartbeatMs: 200 },
+      lines,
+    });
+    open.push(instance);
+    await fill(instance, 1);
+    expect(await raw.get(slotKey(0))).toBeTruthy();
+
+    await raw.del(slotKey(0));
+    await new Promise((resolve) => setTimeout(resolve, 500));
+
+    const reclaimed = lines.filter((l) => l["msg"] === "connection.reclaimed");
+    expect(reclaimed, "the renewal was not refused").toHaveLength(1);
+    expect(reclaimed[0]?.["slot"]).toBe(0);
+  }, 40_000);
+
+  it("refuses to renew a slot another connection took, rather than overwriting it (FR-011 (3.22))", async () => {
+    // A DIFFERENT STATE FROM THE TEST ABOVE, and the one FR-011's second sentence
+    // was written for: the slot did not just expire, somebody else has it.
+    //
+    // `XX` TESTS EXISTENCE AND NOT OWNERSHIP — measured on Redis 8.10.0, `SET k B
+    // XX` against a key holding `A` returns OK — so under `XX` this renewal would
+    // take the rival's place back and six connections would be open against a
+    // count of five. The test above stays green under `XX`, because `XX` also
+    // refuses a key that is absent.
+    //
+    // T056's task text called this "the only test in the chapter that catches that
+    // substitution" and the falsification says otherwise: `IFEQ` → `XX` turns this
+    // test AND the cap-really-full test below red, two of sixteen. The claim was
+    // inherited from the task list and not re-run — this chapter's most common
+    // finding, one level up.
+    //
+    // PLANTED WITH ONE COMMAND rather than a delete followed by a claim. The two-
+    // command version has a window: a renewal firing inside it re-claims slot 0
+    // legitimately, the rival lands on slot 1, and the assertion below fails for a
+    // reason that is not a defect.
+    const channel = randomUUID();
+    const lines: Record<string, unknown>[] = [];
+    const instance = await boot({
+      user,
+      channels: [channel],
+      cap: { heartbeatMs: 200 },
+      lines,
+    });
+    open.push(instance);
+    await fill(instance, 1);
+
+    const rival = randomUUID();
+    await raw.set(slotKey(0), rival, "PX", 60_000);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+
+    // Still the rival's. The renewal was refused and the connection went and found
+    // slot 1 instead.
+    expect(await raw.get(slotKey(0))).toBe(rival);
+    const reclaimed = lines.filter((l) => l["msg"] === "connection.reclaimed");
+    expect(reclaimed, "the renewal was not refused").toHaveLength(1);
+    expect(reclaimed[0]?.["slot"]).toBe(1);
+    expect(await raw.get(slotKey(1))).toBeTruthy();
+  }, 40_000);
+
+  it("keeps the connection working on a NEW slot after a re-claim (FR-011b (3.22), SC-014)", async () => {
+    // THE BRANCH A DESIGN THAT CLOSES ON ANY REFUSED RENEWAL GETS WRONG, and the
+    // one that happens after every brief outage: the slot expired, nothing else
+    // took it, and the user is under the limit. Closing here would cost somebody
+    // their connection for the registry's downtime.
+    //
+    // THE ASSERTION IS DELIVERY, not the log line the two tests above read. A
+    // socket can be open and no longer subscribed to anything.
+    const channel = randomUUID();
+    const lines: Record<string, unknown>[] = [];
+    const instance = await boot({
+      user,
+      channels: [channel],
+      cap: { heartbeatMs: 200 },
+      lines,
+    });
+    open.push(instance);
+    const [live] = await fill(instance, 1);
+    if (live === undefined) throw new Error("expected a connection");
+
+    await raw.del(slotKey(0));
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(lines.filter((l) => l["msg"] === "connection.reclaimed")).toHaveLength(1);
+
+    const fanout = createFanout({ url: REDIS, logger: silent });
+    await fanout.publish({
+      id: randomUUID(),
+      channel,
+      seq: 4,
+      user,
+      text: `after the re-claim ${randomUUID()}`,
+      created_at: new Date(0).toISOString(),
+    });
+    await untilCount(live, "message.created", 1);
+    expect(live.socket.readyState).toBe(WebSocket.OPEN);
+    expect(live.frames.filter((f) => f.type === "error")).toEqual([]);
+    await fanout.close();
+  }, 40_000);
+
+  it("never admits a sixth under many simultaneous claims (FR-013 (3.22))", async () => {
+    // **THE RACE IS OBSERVABLE, AND T058'S FIRST ANSWER WAS THAT IT WAS NOT.**
+    // Replacing `SET NX` with a `GET` followed by a `SET` — check-then-act, which
+    // is exclusive when the calls are sequential and racy in the window between the
+    // two commands — left every one of the sixteen existing tests green. Under this
+    // test it admits **all twelve**, six runs out of six, because every attempt
+    // reads slot 0 as free before any of them writes it.
+    //
+    // So "nothing went red, therefore the ordering is unobservable" was a statement
+    // about the suite and not about the system, and T058's own instruction to read
+    // it that way would have been wrong. The difference is only observable to a
+    // test that puts several claims in flight at once, and that test did not exist
+    // until it was written to find out.
+    //
+    // TWO INSTANCES, because `Promise.all` of twelve connects against one gateway
+    // is not a race — they reach Redis through one client on one socket and the
+    // commands serialise there. Two modules are two clients on two sockets, which
+    // the server is free to interleave.
+    const channel = randomUUID();
+    const a = await boot({ user, channels: [channel], cap: {} });
+    const b = await boot({ user, channels: [channel], cap: {} });
+    open.push(a, b);
+
+    const ATTEMPTS = 12;
+    const tried = Array.from({ length: ATTEMPTS }, (_, i) =>
+      connect(i % 2 === 0 ? a : b),
+    );
+    const acked = (r: Recorded): boolean =>
+      r.frames.some((f) => f.type === "connection.ack");
+    const settled = (r: Recorded): boolean => r.closed !== undefined || acked(r);
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline && !tried.every(settled)) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    expect(
+      tried.filter((r) => !settled(r)),
+      "an attempt neither acked nor closed",
+    ).toHaveLength(0);
+
+    // FIVE IN, SEVEN OUT, AND THE KEYS AGREE. The count of accepted sockets and
+    // the count of live keys are two different oracles and both are checked: a
+    // registry that hands the same slot to two connections satisfies the second
+    // and fails the first.
+    expect(tried.filter(acked)).toHaveLength(MAX_CONNECTIONS_PER_USER);
+    expect(tried.filter((r) => r.closed === 4004)).toHaveLength(
+      ATTEMPTS - MAX_CONNECTIONS_PER_USER,
+    );
+    expect(await raw.keys(`conn:${ENVIRONMENT}:${user}:*`)).toHaveLength(
+      MAX_CONNECTIONS_PER_USER,
+    );
+  }, 40_000);
+
+  it("closes the connection when the cap is genuinely full at renewal (FR-011b (3.22), SC-014)", async () => {
+    // THE OTHER BRANCH, and it has to close: the place is gone, all five are held
+    // by other connections, and leaving this one open is six against a count of
+    // five. FR-005 is not in tension with this — it governs a REFUSAL, where
+    // opening a sixth must not cost the five. Here the connection has already lost
+    // its place to a competitor.
+    //
+    // The same code and the same message a refused sixth connection gets, because
+    // that is what it means.
+    const channel = randomUUID();
+    const lines: Record<string, unknown>[] = [];
+    const instance = await boot({
+      user,
+      channels: [channel],
+      cap: { heartbeatMs: 200 },
+      lines,
+    });
+    open.push(instance);
+    const [live] = await fill(instance, 1);
+    if (live === undefined) throw new Error("expected a connection");
+
+    // Every place taken by somebody else, this connection's included.
+    for (let slot = 0; slot < MAX_CONNECTIONS_PER_USER; slot += 1) {
+      await raw.set(slotKey(slot), randomUUID(), "PX", 60_000);
+    }
+
+    expect(await untilClosed(live)).toBe(4004);
+    const error = live.frames.find((f) => f.type === "error");
+    expect(error?.payload["code"]).toBe("connection_limit_reached");
+    expect(String(error?.payload["message"])).toContain("close one and reconnect");
+    const rejected = lines.filter(
+      (l) =>
+        l["msg"] === "connection.rejected" &&
+        l["reason"] === "connection_limit_reached",
+    );
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]?.["held"]).toBe(5);
+  }, 40_000);
+});
+
+// ---------------------------------------------------------------------------
+// PHASE 8 — failing open, where the log line is the only evidence.
+//
+// FR-016 chooses availability over the cap: a registry the gateway cannot reach
+// must not stop people connecting. The whole difficulty is that this decision is
+// INVISIBLE. An accepted connection is an accepted connection; nothing a client
+// sees says whether five was checked. Chapter 3.18 found the general case — the
+// fan-out's `publish` swallows its errors and resolves, so "the send returned 201
+// while Redis was down" is equally true of a publisher that does nothing at all.
+// The assertion that carries the requirement is the log line.
+// ---------------------------------------------------------------------------
+
+const UNREACHABLE = "redis://127.0.0.1:6399";
+
+describe("the cap fails open, and says so (US4)", () => {
+  const open: Instance[] = [];
+  const sockets: WebSocket[] = [];
+  let user: string;
+
+  const connect = (instance: Instance): Recorded => {
+    const socket = new WebSocket(`${instance.url}?token=any`);
+    sockets.push(socket);
+    return record(socket);
+  };
+
+  beforeEach(() => {
+    user = `u-${randomUUID()}`;
+  });
+
+  afterEach(async () => {
+    for (const socket of sockets.splice(0)) socket.close();
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    for (const instance of open.splice(0)) await instance.close();
+  });
+
+  it("logs that the cap was not enforced when the registry is unreachable (FR-016 (3.22), SC-011)", async () => {
+    // THE LOG LINE, NOT THE ACCEPTANCE. `expect(acked).toBe(true)` here would pass
+    // against a build with no cap at all, against one whose claim always succeeds,
+    // and against this one. It says nothing.
+    const channel = randomUUID();
+    const lines: Record<string, unknown>[] = [];
+    const instance = await boot({
+      user,
+      channels: [channel],
+      cap: { url: UNREACHABLE },
+      lines,
+    });
+    open.push(instance);
+
+    const r = connect(instance);
+    await untilAcked(r);
+
+    const unenforced = lines.filter((l) => l["msg"] === "connection.cap_unenforced");
+    expect(unenforced, "nothing said the cap went unchecked").toHaveLength(1);
+    expect(unenforced[0]?.["user"]).toBe(user);
+    expect(unenforced[0]?.["environment_id"]).toBe(ENVIRONMENT);
+    // The id the claim was attempted with, so the line joins to the accept line
+    // below rather than floating free among however many connections are in flight.
+    const opened = lines.find((l) => l["msg"] === "connection.opened");
+    expect(unenforced[0]?.["connection_id"]).toBe(opened?.["connection_id"]);
+    // NFR-SEC-06, the same check the refusal gets: a failure surface is where a
+    // credential ends up in a support ticket.
+    expect(JSON.stringify(unenforced[0])).not.toContain("rk_");
+  }, 40_000);
+
+  it("tells 'not enforced' apart from 'enforced and under the limit' (FR-016a (3.22), SC-014)", async () => {
+    // BOTH DIRECTIONS, because one alone is satisfied by a line that always says
+    // the same thing. A single "accepted" satisfies neither.
+    const channel = randomUUID();
+    const blind: Record<string, unknown>[] = [];
+    const seeing: Record<string, unknown>[] = [];
+    const withoutRegistry = await boot({
+      user,
+      channels: [channel],
+      cap: { url: UNREACHABLE },
+      lines: blind,
+    });
+    const withRegistry = await boot({
+      user,
+      channels: [channel],
+      cap: {},
+      lines: seeing,
+    });
+    open.push(withoutRegistry, withRegistry);
+
+    await untilAcked(connect(withoutRegistry));
+    await untilAcked(connect(withRegistry));
+
+    const openedBlind = blind.find((l) => l["msg"] === "connection.opened");
+    const openedSeeing = seeing.find((l) => l["msg"] === "connection.opened");
+    expect(openedBlind?.["cap_enforced"]).toBe(false);
+    expect(openedSeeing?.["cap_enforced"]).toBe(true);
+    // And the error-level line exists on one side only, which is what an alert
+    // would be built on.
+    expect(blind.some((l) => l["msg"] === "connection.cap_unenforced")).toBe(true);
+    expect(seeing.some((l) => l["msg"] === "connection.cap_unenforced")).toBe(false);
+  }, 40_000);
+
+  it("does NOT fall back to counting this instance's own connections (FR-016b (3.22))", async () => {
+    // THE SPEC'S Q2, REJECTED EXPLICITLY. Falling back to
+    // `registry.connectionsFor(user)` looks like defence and is not: five per
+    // instance across four gateways is an effective cap of twenty wearing the
+    // label five. A wrong number that looks right is worse than a stated absence,
+    // and the stated absence is the log line the two tests above assert.
+    //
+    // SIX, not five, and the sixth is the assertion. A local fallback refuses it.
+    const channel = randomUUID();
+    const instance = await boot({
+      user,
+      channels: [channel],
+      cap: { url: UNREACHABLE },
+    });
+    open.push(instance);
+
+    for (let i = 0; i < MAX_CONNECTIONS_PER_USER + 1; i += 1) {
+      const r = connect(instance);
+      await untilAcked(r);
+      expect(r.closed, `attempt ${String(i)} was closed`).toBeUndefined();
+    }
+  }, 60_000);
+});
+```
+
+<Checkpoint>
+Twenty tests here, sixteen green on their first run, which the chapter did not treat as
+evidence. Each was broken on purpose instead:
+
+    IFEQ -> XX                        2 red   the hijack, the cap-really-full
+    IFEQ -> plain SET                 4 red   + the resurrection, the re-claim
+    the claim drops its PX            1 red   frees after the bound
+    the claim's PX is 1 ms            1 red   still refuses before the bound
+    one key tag per module            1 red   five across two instances
+    releaseAll deleted                1 red   frees immediately on shutdown
+    renew reports success unasked     1 red   the slot across three bounds
+    the full branch keeps the socket  1 red   closed when the cap is really full
+</Checkpoint>
+
+Two of those mechanisms corrected a claim rather than confirming one. The task list said the
+hijack test was the only one that catches `IFEQ` becoming `XX`; it catches two. And the
+"before the bound" test's own comment had the argument backwards — dropping the TTL turns the
+*other* half red, and what this half catches is a cap that never really holds the places.
+
+**The race needed a test to be seen at all.** Replacing `SET NX` with a `GET` followed by a
+`SET` left all sixteen existing tests green. The obvious reading — the ordering is not
+observable, so assert the invariant instead — is a statement about the suite and not about
+the system. Twelve simultaneous connections across the two instances tell the two apart
+immediately: the atomic version admits five, the check-then-act version admits all twelve,
+six runs out of six.
+
+## Wiring, and the test that asks whether anything was forgotten
+
+```diff title="services/gateway/src/main.ts"
+@@ -7,6 +7,7 @@ import { createGatewayLimits } from "./limits.js";
+ import { createMembership } from "./membership.js";
+ import { createPresence } from "./presence.js";
+ import { attachSessions } from "./session.js";
++import { createConnections } from "./connections.js";
+ import { createTyping } from "./typing.js";
+ 
+ // The gateway — SAD §4.1: terminates WebSockets and never writes to the
+@@ -63,6 +64,7 @@ export function createServer(logger?: Logger) {
+   // from. `fanout.ts:33` states why they cannot be one client: a subscribed
+   // connection cannot issue ordinary commands, and PUBLISH is one.
+   const typing = createTyping({ logger: log });
++  const connections = createConnections({ logger: log });
+   // Chapter 3.11. THE FIRST SECRET THIS SERVICE HAS EVER HELD, and it is not a
+   // signing secret: chapter 3.2's claim that "the gateway holds no signing
+   // secret" is untouched, because this one verifies nothing and signs nothing.
+@@ -103,6 +105,18 @@ export function createServer(logger?: Logger) {
+     // a silent no-op. **The feature was inert in the product and green in every
+     // test**, because every test injects this option directly.
+     typing,
++    // CHAPTER 3.22, T042. **THIS LINE IS THE ONE CHAPTER 3.21 FORGOT.** That
++    // chapter built its module, awaited its `close()` in `shutdown()` — so lint
++    // saw a used variable — and never passed it here. The feature was inert in
++    // the product while 1,174 coverage tests and 174 gateway integration tests
++    // were green, and `**/main.ts` is excluded from the ratchet so no number
++    // could have shown it. `packages/outsider/src/integrate.itest.ts` is what
++    // found it, and it is the only instrument that boots the shipped binary.
++    //
++    // Registering `close()` below is the OTHER half and neither substitutes for
++    // the other: without this line the cap does nothing, without that one every
++    // gateway leaks a Redis client.
++    connections,
+     // Overridable so `meter.itest.ts` can drive a spawned gateway without
+     // waiting a real minute per assertion. The two tests there are the ones an
+     // in-process gateway cannot run — a signal has to arrive at a process — and
+@@ -128,6 +142,7 @@ export function createServer(logger?: Logger) {
+     await presence.close();
+     await membership.close();
+     await typing.close();
++    await connections.close();
+   }
+   return Object.assign(server, { shutdown });
+ }
+```
+
+```diff title="services/gateway/src/main.test.ts"
+@@ -2,6 +2,10 @@ import type { AddressInfo } from "node:net";
+ import type { Server } from "node:http";
+ 
+ import { CLOSE_CODES, frameSchema } from "@relay/protocol";
++import { readFileSync } from "node:fs";
++import { dirname, join } from "node:path";
++import { fileURLToPath } from "node:url";
++
+ import { describe, expect, it } from "vitest";
+ 
+ import { createLogger } from "@relay/service-kit";
+@@ -63,4 +67,48 @@ describe("gateway skeleton", () => {
+       server.close();
+     }
+   });
++
++  // CHAPTER 3.22, T042b. THE SHUTDOWN SET, NAMED EXPLICITLY AND FAILING ON AN
++  // UNKNOWN MEMBER.
++  //
++  // Nothing verified the registration before analysis pass 6. `shutdown()` awaits
++  // each module's `close()`, `main.test.ts` called `server.close()` and asserted
++  // nothing about which modules closed, so a missing registration leaks one Redis
++  // client per gateway — silently and for ever.
++  //
++  // THIS IS CHAPTER 3.21'S DEFECT INVERTED. There, awaiting `close()` made lint
++  // see a used variable and hid a module that was never passed to
++  // `attachSessions`. Here, NOT awaiting it is what nothing could see. The two
++  // halves need two checks, and this is the second one's.
++  //
++  // Read from the source rather than executed: a shutdown that actually closes
++  // seven Redis clients is not something a unit test can observe without seven
++  // servers. What it CAN observe is that every module the file builds is also
++  // closed, which is the property that breaks when somebody adds an eighth.
++  it("closes every module it builds (T042b (3.22))", () => {
++    const here = dirname(fileURLToPath(import.meta.url));
++    const source = readFileSync(join(here, "main.ts"), "utf8");
++    const built = [...source.matchAll(/^ {2}const (\w+) = create(\w+)\(/gm)].map(
++      (m) => m[1],
++    );
++    // TWO NAMED EXCEPTIONS, and named rather than pattern-excluded. `createLogger`
++    // returns a writer with nothing to release and `createServer` is this file's
++    // own export, not a module it owns. **The first version of this test had
++    // neither and went red on the logger** — which is the check working: an
++    // unknown member fails instead of being quietly skipped, and adding one to
++    // this list is a decision somebody has to write down.
++    const NOT_CLOSEABLE = ["logger", "server"];
++    const closeable = built.filter((name) => !NOT_CLOSEABLE.includes(name ?? ""));
++    // Six modules today: fanout, limits, presence, membership, typing,
++    // connections. A seventh arriving without a `close()` turns this red instead
++    // of leaking a client per gateway.
++    expect(closeable).toHaveLength(6);
++    const shutdown = source.slice(source.indexOf("async function shutdown"));
++    for (const name of closeable) {
++      expect(
++        shutdown.includes(`await ${String(name)}.close()`),
++        `${String(name)} is built but never closed in shutdown()`,
++      ).toBe(true);
++    }
++  });
+ });
+```
+
+<Why>
+**Why a test reads `main.ts` as text.** The previous chapter built a module, awaited its
+`close()`, and never passed it to `attachSessions` — 1,174 coverage tests and 174 gateway
+integration tests were green while the feature did not exist in the product, because every
+one of them injects the module directly. Coverage cannot see an omission: every line
+executed, and the defect was an argument that was not there. So one test parses the file and
+asserts that every `create*` module it builds is closed in `shutdown()`, with a two-name list
+of the exceptions written out rather than pattern-matched.
+</Why>
+
+And the only check in this repository that talks to a built image rather than importing
+source:
+
+```diff title="packages/outsider/src/integrate.itest.ts"
+@@ -385,6 +385,62 @@ describe("integrating with Relay from the outside", () => {
+    * `docs/08-error-reference.md` tells a customer *"send `message.send` … Do not
+    * send events; receive them."* **Nothing had ever checked what happens when they
+    * do.** This is that correction in bytes rather than in prose. */
++  it("holds five connections and is refused a sixth with 4004 (FR-RTM-09 (3.22))", async () => {
++    // CHAPTER 3.22, T048. **THE ONLY INSTRUMENT THAT BOOTS THE SHIPPED BINARY**,
++    // and the reason this task is a plan requirement rather than a polish item.
++    //
++    // Chapter 3.21 built a module, awaited its `close()` so lint saw a used
++    // variable, and never passed it to `attachSessions`. The feature was inert in
++    // the product while 1,174 coverage tests and 174 gateway integration tests
++    // were green — `**/main.ts` is excluded from the ratchet, so no number could
++    // have shown it — and this file is what found it. A chapter that adds an
++    // argument to `attachSessions` owes a test here.
++    //
++    // Nothing in this file is stubbed: the api and the gateway are the built
++    // artifacts, the token came from the real dev-token endpoint, and the socket
++    // is a browser `WebSocket`.
++    const sockets: WebSocket[] = [];
++    const openOne = async (): Promise<WebSocket> => {
++      const socket = new WebSocket(`${ws}/v1/ws?token=${token}`);
++      sockets.push(socket);
++      socket.addEventListener("error", () => undefined);
++      await new Promise<void>((resolve, reject) => {
++        socket.addEventListener("open", () => resolve());
++        socket.addEventListener("close", (event) =>
++          reject(new Error(`closed ${(event as CloseEvent).code}`)),
++        );
++        setTimeout(() => reject(new Error(`no socket at ${ws} within 10s`)), 10_000);
++      });
++      return socket;
++    };
++
++    try {
++      for (let i = 0; i < 5; i += 1) await openOne();
++
++      const sixth = new WebSocket(`${ws}/v1/ws?token=${token}`);
++      sockets.push(sixth);
++      const frames: { type: string; payload?: { code?: string } }[] = [];
++      sixth.addEventListener("message", (event) => {
++        frames.push(JSON.parse(String(event.data)) as { type: string });
++      });
++      sixth.addEventListener("error", () => undefined);
++      const code = await new Promise<number>((resolve, reject) => {
++        sixth.addEventListener("close", (event) =>
++          resolve((event as CloseEvent).code),
++        );
++        setTimeout(() => reject(new Error("the sixth was not closed within 10s")), 10_000);
++      });
++
++      // The code a client branches on, and the frame that carries the detail.
++      expect(code).toBe(4004);
++      expect(frames.find((f) => f.type === "error")?.payload?.code).toBe(
++        "connection_limit_reached",
++      );
++    } finally {
++      for (const socket of sockets) socket.close();
++    }
++  }, 60_000);
++
+   it("is refused with unknown_frame_type for a frame only the server may send", async () => {
+     const socket = new WebSocket(`${ws}/v1/ws?token=${token}`);
+     const frames: { type: string; payload?: { code?: string } }[] = [];
+```
+
+That test opens five connections through a real api, a real gateway and a browser
+`WebSocket`, and asserts the sixth is refused with 4004. Running it needed the images
+rebuilt — without that it would have tested the previous chapter's code and passed for the
+wrong reason.
+
+```diff title="services/gateway/src/presence.itest.ts"
+@@ -728,6 +728,17 @@ describe("presence: the grace period (FR-RTM-06)", () => {
+   // T045, and FR-RTM-09's five is enforced NOWHERE — `policy.ts:13` mentions it in a
+   // comment and nothing counts — so the reference count is unbounded and two is the
+   // easy case. Five connections, closed one at a time: nothing until the last.
++  //
++  // CHAPTER 3.22 BUILT THE CAP AND THE SENTENCE ABOVE IS STILL TRUE HERE, which is a
++  // decision rather than an oversight. Every gateway module is an optional parameter
++  // and this fixture passes no `connections`, so nothing counts in THIS file after
++  // that chapter either. The cap lives where a fixture asks for it: the new
++  // `connections.itest.ts` and `session.itest.ts`'s "cap at the door" describe.
++  //
++  // The five below is therefore still free, and it is also now exactly the cap. A
++  // future edit adding a sixth connection to this test would be fine here and
++  // refused in either of those two files — worth knowing before somebody copies the
++  // pattern.
+   it("publishes nothing until the fifth of five connections closes", async () => {
+     const who = takeSubject();
+     const watcher = await arrive("linh");
+```
+
+
+The lint config gains two entries — and the first of them is a fifth reason for an
+exemption four other tests share:
+
+```ts title="eslint.config.mjs (excerpt)"
+const DRIVER_EXEMPT_TESTS = [
+  // …
+  "services/gateway/src/typing.itest.ts",
+  // Chapter 3.22, and NOT for the reason the four above give. This file needs no
+  // raw client to assert a publish — its subject is delivery, and it asserts on
+  // frames a socket received. It needs one to CAUSE a state: plant a rival in a
+  // slot key, delete one, and watch what a live connection does about it.
+  "services/gateway/src/connections.itest.ts",
+];
+```
+
+<Why>
+**Why an excerpt, and why the real hunk is in the appendix.** The state `eslint.config.mjs`
+reaches after every chapter of this series has run is 73 lines. `DRIVER_EXEMPT_TESTS` is not
+one of them — the whole list arrives from `fences/post-series.md`, which is applied after the
+last chapter. A hunk anchored on a line that does not exist yet matches zero times, so this
+chapter shows the lines and the appendix carries the change. Chapter 3.19 was the first to
+hit this and wrote the rule down; this is the second.
+</Why>
+
+## Where FR-RTM-09 stands now
+
+Both halves. The cap is enforced across instances, the second clause has tests it did not
+have, and the SAD's `conn:` rows say what the platform does in the tense it does it.
+
+What this chapter did not do is discharge NFR-SCL-01. Ten thousand connections per instance
+is still a budget rather than a measurement, and the load test the SAD has called its single
+most urgent action item since the first draft is still owed. ADR-23's reversal condition
+depends on it: the day somebody needs a user's connection count *without* claiming a place,
+five reads is the wrong shape, and the sorted set comes back with the evidence it does not
+have today.
+
+<ForwardRef>
+Chapter 3.23 gives `message.updated` and `message.deleted` their first producers — the last
+two of FR-RTM-05's six kinds without one. They have been waiting on a surface that does not
+exist: there is no edit route and no delete route to announce. **What that chapter has to
+decide is what a deletion leaves behind** — FR-MSG-08 keeps the row, so the question is what
+a client holding a cursor sees when it resumes across one, and whether an edit and a deletion
+are one event kind or two.
+</ForwardRef>
+
+<ChapterFooter id="3.22" />
+

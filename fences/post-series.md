@@ -2811,3 +2811,58 @@ whose title claimed it, and one branch was deleted rather than covered.
      },
    },
 ```
+
+## `eslint.config.mjs` — the cap's exemption, and a fifth reason (chapter 3.22)
+
+**The same wall chapter 3.19 hit, in the same place, for the same measured reason.** The
+state `eslint.config.mjs` reaches after every chapter has run is still 73 lines;
+`DRIVER_EXEMPT_TESTS` is not one of them. A hunk anchored on `"services/gateway/src/typing.itest.ts",`
+matches **zero** times in the post-chapter state, because an entry above is what puts that
+line there. So chapter 3.22 shows these lines as an excerpt and says where they really live.
+
+The exemption itself is worth reading rather than skimming. The four entries above it are all
+one argument — a raw client is the only way to see what reached the fabric, because a spy on
+the publisher proves that an object was asked to publish. **The fifth is a different
+argument**: `connections.itest.ts` uses its raw client as the STIMULUS rather than the oracle.
+It plants a rival in a slot key, or deletes one, to put the registry into a state the
+production code cannot be asked to produce — and then asserts through a real socket.
+
+The second hunk adds the module to the production block, which is the list of files allowed
+to construct an `ioredis` client at all.
+
+```diff title="eslint.config.mjs"
+@@ -114,6 +114,14 @@ const DRIVER_EXEMPT_TESTS = [
+   // chapter's own module would be satisfied by a module that does nothing —
+   // chapter 3.18's warning, in a new place.
+   "services/gateway/src/typing.itest.ts",
++  // Chapter 3.22, and NOT for the reason the four above give. This file needs no
++  // raw client to assert a publish — its subject is delivery, and it asserts on
++  // the sockets. It needs one to CAUSE a membership change: `Membership` exposes
++  // `onChange`, `subscribeChannel` and `watch` and no `publish`, because the api
++  // publishes and the gateway only ever subscribes. So the raw client is the
++  // stimulus rather than the oracle, which is a fifth reason this rule cannot
++  // express and the reason it is listed here explicitly.
++  "services/gateway/src/connections.itest.ts",
+ ];
+ 
+ 
+@@ -285,6 +293,18 @@ export default tseslint.config(
+       // silently overrode it. The typing suite's exemption lives in
+       // `DRIVER_EXEMPT_TESTS` instead, which is the list that governs test files.
+       "services/gateway/src/typing.ts",
++      // Chapter 3.22's connection registry, and its keys are the strongest case on
++      // this list rather than the weakest. `conn:{env}:{user}:{slot}` puts the
++      // environment FIRST, so Principle I is structural in the key itself: a
++      // cross-tenant read would need a caller to hand this module another
++      // environment's id, which the session layer takes from the api's verified
++      // identity and never from a payload.
++      //
++      // The `.itest.ts` file is NOT listed here, for the reason the typing note
++      // above gives: the later `**/*.itest.ts` block would silently override it.
++      // Its exemption is in `DRIVER_EXEMPT_TESTS`, and so is `connections.test.ts`'s
++      // — a unit test, but one that reads the module's own source from disk.
++      "services/gateway/src/connections.ts",
+       // The test harness IS data access — its whole job is to plant rows the
+       // repository layer must never plant and to hold a connection carrying an
+       // exemption no product code may carry (feature 030). Restricting it from
+```

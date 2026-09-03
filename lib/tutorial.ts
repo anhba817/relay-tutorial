@@ -670,6 +670,25 @@ export const series: Part[] = [
           "Frame đầu vào thứ hai đầu tiên sau hai mươi chương, đứng sau một tập hợp có tên mà một bài test ghim cả kích thước lẫn thành viên; một ngữ pháp subject thứ tư được nhận chứ không phải né, sau khi đếm lại con số của ADR-19 và tìm thấy bảy điểm được định kiểu chứ không phải ba như bản ghi viết; một khoảng renew hai giây vốn là đại lượng khác với hạn năm giây của FR-RTM-08, ở mức 2,5 lần renew mỗi cửa sổ nên một lần publish bị rơi không làm nhấp nháy; và một phán quyết thành thật về một điều khoản nền tảng này không thực hiện được — không frame nào kết thúc một chỉ báo, nên timer thuộc về bên nhận",
         translatedIn: ["vi"],
       },
+      {
+        id: "3.22",
+        path: "/part-3/chapter-22/the-sixth-connection",
+        title: "The sixth connection, and where the count lives",
+        status: "published",
+        // `sourceDoc` is the SAD, and this chapter CONTRADICTS a row of it.
+        // §6.3 has prescribed a sorted set pruned with `ZREMRANGEBYSCORE` since
+        // the first draft; ADR-23 argues it down, because making the claim
+        // atomic needs Lua and Constitution VII admits a second language only on
+        // profiling evidence a five-channel fixture cannot produce.
+        readerProduces:
+          "FR-RTM-09 closed in both halves: a five-connection cap that no gateway instance can compute on its own, held as five slot keys claimed with `SET NX PX` and renewed with `SET IFEQ PX`; a sixth close code, because all five existing ones send a client to the wrong remedy and this is the only refusal in the set whose correct handling is not a retry; a refusal that completes the handshake in order to close it, because a browser cannot read the body of a failed upgrade; and a cap that fails open loudly, where the log line is the only thing that distinguishes `unenforced` from `under the limit`",
+        sourceDoc: "docs/05-sad.md",
+        readerMinutes: 70,
+        titleVi: "Kết nối thứ sáu, và con số ấy sống ở đâu",
+        readerProducesVi:
+          "FR-RTM-09 đóng lại ở cả hai nửa: một cái trần năm kết nối mà không instance gateway nào tự tính được, giữ dưới dạng năm khoá slot giành bằng `SET NX PX` và gia hạn bằng `SET IFEQ PX`; một mã đóng thứ sáu, vì cả năm mã cũ đều đẩy client tới phương thuốc sai còn đây là lời từ chối duy nhất trong bộ mà cách xử lý đúng không phải là thử lại; một lời từ chối hoàn tất cái bắt tay chỉ để đóng nó, vì trình duyệt không đọc được thân phản hồi của một lần upgrade thất bại; và một cái trần hỏng theo hướng mở một cách ồn ào, nơi dòng log là thứ duy nhất phân biệt `unenforced` với `dưới mức trần`",
+        translatedIn: ["vi"],
+      },
     ],
   },
   {
