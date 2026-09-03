@@ -689,6 +689,27 @@ export const series: Part[] = [
           "FR-RTM-09 đóng lại ở cả hai nửa: một cái trần năm kết nối mà không instance gateway nào tự tính được, giữ dưới dạng năm khoá slot giành bằng `SET NX PX` và gia hạn bằng `SET IFEQ PX`; một mã đóng thứ sáu, vì cả năm mã cũ đều đẩy client tới phương thuốc sai còn đây là lời từ chối duy nhất trong bộ mà cách xử lý đúng không phải là thử lại; một lời từ chối hoàn tất cái bắt tay chỉ để đóng nó, vì trình duyệt không đọc được thân phản hồi của một lần upgrade thất bại; và một cái trần hỏng theo hướng mở một cách ồn ào, nơi dòng log là thứ duy nhất phân biệt `unenforced` với `dưới mức trần`",
         translatedIn: ["vi"],
       },
+      {
+        id: "3.23",
+        path: "/part-3/chapter-23/the-words-somebody-wants-back",
+        title: "The words somebody wants back",
+        status: "published",
+        // `sourceDoc` is the SAD, and this chapter builds a table that document
+        // has published since its first draft — three columns and a composite
+        // key, reproduced rather than redesigned. It also amends two things in
+        // that document that had stopped being true: §342's deletion diagram
+        // named a route that does not exist and an INSERT into a table that
+        // does not exist, and ADR-07's loss argument rests on gap detection,
+        // which cannot see an edit below a client's cursor.
+        readerProduces:
+          "FR-MSG-07, FR-MSG-08 and FR-MSG-10 built, and the last two of FR-RTM-05's six event kinds given their first producers: a fifth subject grammar, `revision:{channel_id}`, carrying both mutations with the kind in the payload, because a tombstone is not a `Message` and an edit is one and would be indistinguishable from a creation; `message_edits` reproduced from SAD §6.1 as published, with what the composite key costs written down; two error codes rather than the generic 403, because no credential grants authorship and no permission change makes a message yours; a tenancy check taught that reachability is not adjacency, after it refused the new table in four milliseconds; and the one soft edge documented rather than closed — a message older than a client's cursor that changed during a disconnect produces no frame **and no sequence gap**, so the mechanism that repairs every other missed frame sees nothing to repair",
+        sourceDoc: "docs/05-sad.md",
+        readerMinutes: 75,
+        titleVi: "Những lời ai đó muốn lấy lại",
+        readerProducesVi:
+          "FR-MSG-07, FR-MSG-08 và FR-MSG-10 được dựng, và hai kind cuối trong sáu kind của FR-RTM-05 lần đầu có bên phát: một ngữ pháp subject thứ năm, `revision:{channel_id}`, mang cả hai loại thay đổi với cái kind nằm trong payload, bởi một bia mộ không phải `Message` còn một lần sửa thì là và sẽ không phân biệt được với một lần tạo; bảng `message_edits` dựng lại đúng như SAD §6.1 đã công bố, kèm cái giá của khoá chính ghép được viết ra; hai mã lỗi thay cho 403 chung chung, bởi không credential nào cấp quyền tác giả và không thay đổi phân quyền nào biến một tin nhắn thành của bạn; một phép kiểm tenancy được dạy rằng khả năng tới được không phải là kề nhau, sau khi nó từ chối cái bảng mới trong bốn mili giây; và cái mép mềm duy nhất được ghi lại thay vì đóng lại — một tin nhắn cũ hơn con trỏ của client mà đổi trong lúc mất kết nối thì không sinh frame nào **và không có lỗ hổng số thứ tự nào**, nên cơ chế sửa chữa mọi frame bị lỡ khác chẳng thấy gì để sửa",
+        translatedIn: ["vi"],
+      },
     ],
   },
   {
