@@ -2866,3 +2866,52 @@ to construct an `ioredis` client at all.
        // repository layer must never plant and to hold a connection carrying an
        // exemption no product code may carry (feature 030). Restricting it from
 ```
+
+## `vitest.coverage.config.mts` — chapter 3.22's connections pin
+
+The ratchet's per-file entry for `services/gateway/src/connections.ts`, at 100 on all
+four metrics. It belongs here for the reason every entry above it does: the file is
+lane configuration, not something a chapter walks a reader through, and the chapter
+that adds a pin discusses the module rather than the config.
+
+**It took three deletions and one test.** The first measurement read 96.15 / 82.60 /
+100 / 97.67, and three of the four uncovered arms were arms nothing could take — a
+second "could not ask" path that needed Redis to die between two commands, a
+re-wrapping of outcomes that already meant the same thing, and an `instanceof Error`
+ternary whose other half no test can reach. The fourth was a real gap: the `url`
+default and the `??` inside it, neither reachable while the lane sets
+`RELAY_REDIS_URL`.
+
+```diff title="vitest.coverage.config.mts"
+@@ -671,6 +671,30 @@ export default defineConfig({
+           lines: 100,
+           statements: 100,
+         },
++        // CHAPTER 3.22. `services/gateway/src/connections.ts` at 100 on all four,
++        // and it took three deletions to get there rather than three tests. The
++        // first measurement read **96.15 / 82.60 / 100 / 97.67** with four arms
++        // uncovered, and three of them were arms nothing could take:
++        //
++        //   two `failable` wrappers in the walk   the second "could not ask" arm
++        //                                         needs Redis to die BETWEEN two
++        //                                         commands — merged into one
++        //   `renew` re-wrapping the walk's        `full` and `unenforced` mean the
++        //   outcomes                              same here as there — returned whole
++        //   `instanceof Error ? … : String(…)`    `presence.ts:241` uses `String`
++        //                                         alone, and the other arm is
++        //                                         unreachable from any test
++        //
++        // The fourth was a real gap and got a real test: the `url` default and the
++        // `??` inside it, neither reachable while the lane sets `RELAY_REDIS_URL`.
++        // That is the ratchet removing code for the fourth time in this repository
++        // rather than covering it.
++        "services/gateway/src/connections.ts": {
++          branches: 100,
++          functions: 100,
++          lines: 100,
++          statements: 100,
++        },
+         "services/gateway/src/typing.ts": {
+           branches: 100,
+           functions: 100,
+```

@@ -164,7 +164,7 @@ export type ClaimOutcome =
 export type RenewOutcome =
   | { readonly kind: "renewed" }
   | { readonly kind: "reclaimed"; readonly slot: number }
-  | { readonly kind: "full" }
+  | { readonly kind: "full"; readonly held: number }
   | { readonly kind: "unenforced" };
 
 export interface Connections {
@@ -301,10 +301,12 @@ export function createConnections({
     try {
       return { asked: true, reply: await work() };
     } catch (error) {
-      logger.log("error", "connections.failed", {
-        op,
-        detail: error instanceof Error ? error.message : String(error),
-      });
+      // `String(error)` RATHER THAN A TERNARY ON `instanceof Error`, which is what
+      // `presence.ts:241` does and what the coverage ratchet asked for: the
+      // non-Error arm is unreachable from any test and a branch nothing can take is
+      // a branch to delete. `String` on an Error yields "Error: …", one word longer
+      // than `.message` and never absent.
+      logger.log("error", "connections.failed", { op, detail: String(error) });
       return { asked: false };
     }
   }
@@ -342,17 +344,19 @@ export function createConnections({
   ): Promise<ClaimOutcome> {
     for (let slot = 0; slot < MAX_CONNECTIONS_PER_USER; slot += 1) {
       const k = key(environmentId, user, slot);
-      const free = await failable("claim", () =>
-        client.set(k, connectionId, "PX", boundMs, "NX"),
-      );
-      if (!free.asked) return { kind: "unenforced" };
-      // `null` HERE MEANS THE SLOT IS TAKEN, which is arm 1 and not arm 5.
-      if (free.reply === "OK") return { kind: "claimed", slot, held: slot };
-      const released = await failable("claim", () =>
-        setIfEq(k, connectionId, TOMBSTONE, boundMs),
-      );
-      if (!released.asked) return { kind: "unenforced" };
-      if (released.reply === "OK") return { kind: "claimed", slot, held: slot };
+      // BOTH COMMANDS UNDER ONE `failable`, and that is the coverage ratchet's
+      // doing. Two wrappers meant two "could not ask" arms, and the second was
+      // unreachable: for it to fire, Redis would have to die between a command that
+      // answered and the next one. One wrapper has one failure path, and the arm
+      // that nothing could take is gone rather than covered.
+      const got = await failable("claim", async () => {
+        const free = await client.set(k, connectionId, "PX", boundMs, "NX");
+        // `null` HERE MEANS THE SLOT IS TAKEN, which is arm 1 and not arm 5.
+        if (free === "OK") return free;
+        return await setIfEq(k, connectionId, TOMBSTONE, boundMs);
+      });
+      if (!got.asked) return { kind: "unenforced" };
+      if (got.reply === "OK") return { kind: "claimed", slot, held: slot };
     }
     return { kind: "full", held: MAX_CONNECTIONS_PER_USER };
   }
@@ -380,8 +384,12 @@ export function createConnections({
       // downtime.
       const again = await walk(environmentId, user, connectionId);
       if (again.kind === "claimed") return { kind: "reclaimed", slot: again.slot };
-      if (again.kind === "full") return { kind: "full" };
-      return { kind: "unenforced" };
+      // RETURNED WHOLE, because `full` and `unenforced` mean here exactly what they
+      // mean there. Re-wrapping them cost two branches and one of them was
+      // unreachable — the walk can only answer `unenforced` if Redis stopped
+      // answering between this renewal and it. `full` now carries `held` for the
+      // same reason a claim's does: the caller logs the number.
+      return again;
     },
 
     /** A one-millisecond tombstone, written only if the slot is still ours.
@@ -490,9 +498,7 @@ up to five keys.
 But the refusal does **not** happen there.
 
 ```diff title="services/gateway/src/session.ts"
-@@ -18,10 +18,15 @@ import {
- import { newRequestId, type Logger } from "@relay/service-kit";
- import { WebSocketServer, type WebSocket } from "ws";
+@@ -20,6 +20,11 @@ import { WebSocketServer, type WebSocket } from "ws";
  
  import { ApiError, type ApiClient } from "./api-client.js";
  import { authenticate, type Identity } from "./auth.js";
@@ -504,11 +510,7 @@ But the refusal does **not** happen there.
  import type { Fanout } from "./fanout.js";
  import type { Decision, GatewayLimits } from "./limits.js";
  import { createMeter, METER_INTERVAL_MS, type Meter } from "./meter.js";
- import { type Membership } from "./membership.js";
- import { type Presence } from "./presence.js";
-@@ -233,10 +238,30 @@ export interface SessionServerOptions {
-    * 3.20's `rereadIntervalMs` are: **a test that waits out two real seconds pays
-    * them in the package that paces the lane**, which has about four seconds of
+@@ -235,6 +240,26 @@ export interface SessionServerOptions {
     * headroom in the whole budget. That chapter's itest builds with 40 to test a
     * sixty-second backstop; this one builds with 40 and with 0. */
    renewalIntervalMs?: number;
@@ -535,11 +537,7 @@ But the refusal does **not** happen there.
  }
  
  // THE FOUR PRESENCE TIMINGS ARE NOT HERE, and an earlier draft of this chapter put
- // them here. `meterIntervalMs` is a session option because `attachSessions` BUILDS
- // the meter; `fanout`, `limits` and `presence` are injected already built, and an
-@@ -260,16 +285,36 @@ export function attachSessions({
-   meterIntervalMs = METER_INTERVAL_MS,
-   presence,
+@@ -262,12 +287,32 @@ export function attachSessions({
    membership,
    typing,
    renewalIntervalMs = DEFAULT_RENEWAL_INTERVAL_MS,
@@ -572,11 +570,7 @@ But the refusal does **not** happen there.
    // Chapter 3.11. A second timer beside the heartbeat, not a second job for it.
    const meter: Meter = createMeter({
      api,
-     registry,
-     logger,
-@@ -674,11 +719,79 @@ export function attachSessions({
-             environment_id: result.identity.environmentId,
-           });
+@@ -676,7 +721,75 @@ export function attachSessions({
            return;
          }
        }
@@ -652,11 +646,7 @@ But the refusal does **not** happen there.
          if (result.outcome === "refused") {
            // 4001: "invalid or expired token" (EIR-WS-05). The close code is
            // the protocol package's, not a number invented here.
-           ws.close(4001, CLOSE_CODES[4001]);
-           logger.log("info", "connection.rejected", { reason: "bad_token" });
-@@ -736,10 +849,12 @@ export function attachSessions({
-           ws,
-           result.identity,
+@@ -738,6 +851,8 @@ export function attachSessions({
            result.channelIds,
            req.url ?? "/",
            result.limits.send,
@@ -665,11 +655,7 @@ But the refusal does **not** happen there.
          );
        });
      })();
-   });
- 
-@@ -747,16 +862,22 @@ export function attachSessions({
-     socket: WebSocket,
-     identity: Identity,
+@@ -749,12 +864,18 @@ export function attachSessions({
      channelIds: string[],
      url: string,
      sendLimit: number,
@@ -689,11 +675,7 @@ But the refusal does **not** happen there.
        identity,
        socket,
        // Chapter 3.2: memberships arrived with the identity, from the session
-       // call at the door. There is no second lookup to fail here — the api is
-       // still the only source of membership (ADR-05), it just answers both
-@@ -826,15 +947,26 @@ export function attachSessions({
-     void presence?.connected(
-       identity.environmentId,
+@@ -828,11 +949,22 @@ export function attachSessions({
        identity.userExternalId,
        connection.channelIds,
      );
@@ -716,11 +698,7 @@ But the refusal does **not** happen there.
      });
  
      // Listeners go on BEFORE the resume, not after the ack. A resume takes
-     // a round trip to the api, and a socket that dies inside that window
-     // must still be removed from the registry and release its subscriptions
-@@ -842,20 +974,120 @@ export function attachSessions({
-     // worth of state per attempt.
-     socket.on("pong", () => {
+@@ -844,6 +976,89 @@ export function attachSessions({
        connection.missedPings = 0;
      });
      socket.on("message", (raw) => void handle(connection, raw.toString()));
@@ -810,10 +788,7 @@ But the refusal does **not** happen there.
      socket.on("close", (code) => {
        // Chapter 3.11, and the ORDER MATTERS. The meter is told first, because
        // the line below removes this connection from the registry the meter walks
-       // — and a socket that opened and closed between two reports would
-       // otherwise be counted zero. That is not a rounding error: it is the one
-       // thing the wall-clock-minute unit was chosen to charge (research R19).
-       //
+@@ -854,6 +1069,23 @@ export function attachSessions({
        // Handing over totals rather than reporting them. This handler is already
        // documented as the last place that should throw, and a mass disconnect
        // would turn one event into a burst of HTTP requests.
@@ -837,11 +812,7 @@ But the refusal does **not** happen there.
        meter?.closed(connection, new Date());
        registry.remove(connection.id);
        // Chapter 3.19, AND THIS HANDLER NOW CARRIES THREE ORDERING CONSTRAINTS, not
-       // one. The meter is told BEFORE `registry.remove` — a socket that opened and
-       // closed between two reports would otherwise be counted zero, which is the one
-@@ -1350,9 +1582,18 @@ export function attachSessions({
-     // the process leaves before the request does.
-     close: async () => {
+@@ -1352,6 +1584,15 @@ export function attachSessions({
        clearInterval(heartbeat);
        meter.stop();
        await meter.reportOnce(new Date());
@@ -857,7 +828,6 @@ But the refusal does **not** happen there.
        wss.close();
      },
    };
- }
 ```
 
 <Why>
@@ -1165,6 +1135,7 @@ describe("the slot registry", () => {
     }
     expect(await brief.renew(ENV, user, mine, claimed.slot)).toEqual({
       kind: "full",
+      held: 5,
     });
     await brief.close();
   });
@@ -1176,16 +1147,27 @@ describe("the slot registry", () => {
     const claimed = await registry.claim(ENV, user, id);
     if (claimed.kind !== "claimed") throw new Error("expected a slot");
     await registry.release(ENV, user, id, claimed.slot);
-    // THE SAME SLOT, WITH NO WAIT. This assertion used to sleep 20 ms and accept
-    // any slot, and its comment said either outcome was correct because "the
-    // tombstone carries a one-millisecond expiry, so a claim may find it and walk
-    // to the next slot". The walk now takes the tombstoned slot, so the outcome is
-    // determinate — and the sleep was hiding the case below.
-    expect(await registry.claim(ENV, user, randomUUID())).toEqual({
-      kind: "claimed",
-      slot: 0,
-      held: 0,
-    });
+    // NO WAIT, AND THE SLOT IS NOT PINNED — because at the default one-millisecond
+    // tombstone there are THREE outcomes, not two, and the coverage lane found the
+    // third by failing here with `slot: 1` where this assertion had demanded 0.
+    //
+    //   the tombstone is still there   `SET NX` fails, `SET IFEQ -` takes it -> 0
+    //   it expired before the walk     `SET NX` succeeds                     -> 0
+    //   it expires BETWEEN the two     both fail, the walk moves on          -> 1
+    //
+    // The third is a millisecond wide and harmless: a slot is skipped, never
+    // over-admitted, and the connection is accepted. What must not happen is a
+    // refusal, and that is what this asserts. The determinate version lives in the
+    // test below, where the window is held open at 500 ms so it cannot race.
+    //
+    // This test's FIRST version slept 20 ms and accepted any slot; the sleep is
+    // what hid the `releaseAll` defect for two phases. Removing the sleep was
+    // right and pinning the slot with it was not — the two changes arrived
+    // together and only one of them was justified.
+    const again = await registry.claim(ENV, user, randomUUID());
+    expect(again.kind).toBe("claimed");
+    if (again.kind !== "claimed") throw new Error("unreachable");
+    expect(again.slot, "a released slot cost more than one place").toBeLessThanOrEqual(1);
   });
 
   it("claims a slot whose tombstone has NOT expired (FR-010 (3.22))", async () => {
@@ -1258,8 +1240,15 @@ describe("the slot registry", () => {
     await brief.close();
   });
 
-  it("is a no-op for a slot the connection never held", async () => {
-    // ARM 7. Nothing to free, nothing to break, and no error.
+  it("does not throw for a slot the connection never held", async () => {
+    // ARM 7, AND THE TITLE SAYS ONLY WHAT THE ASSERTION PROVES. It used to read
+    // "is a no-op", which claims more: a no-op is a statement about the key, and
+    // `resolves.toBeUndefined()` is a statement about the promise. The stronger
+    // property is not observable through this module's own surface — a claim walks
+    // from slot 0, so whatever an unconditional release did to slot 3 cannot be
+    // seen from here — and the ownership half of it is the test below. Chapter
+    // 3.20's rule: a claim about an observable difference needs falsifying before
+    // the test is written.
     await expect(
       registry.release(ENV, user, randomUUID(), 3),
     ).resolves.toBeUndefined();
@@ -1281,9 +1270,10 @@ describe("the slot registry", () => {
     }
   });
 
-  it("releases nothing when it holds nothing", async () => {
+  it("does not throw when it holds nothing", async () => {
     // ARM 8: the empty loop, which is the shutdown path of an instance that never
-    // had a connection.
+    // had a connection. Renamed for the same reason as the test above — "releases
+    // nothing" describes the keys and the assertion describes the promise.
     await expect(registry.releaseAll([])).resolves.toBeUndefined();
   });
 
@@ -1325,6 +1315,35 @@ describe("the slot registry", () => {
     expect(DEFAULT_BOUND_MS / DEFAULT_HEARTBEAT_MS).toBeGreaterThanOrEqual(3);
     // And it is NOT the protocol keepalive, which chapter 3.19 paid for conflating.
     expect(DEFAULT_HEARTBEAT_MS).not.toBe(30_000);
+  });
+
+  it("builds without a url, from the environment or from the default", async () => {
+    // TWO BRANCHES IN ONE LINE, and the ratchet wanted both: the default parameter
+    // — which every test above steps over by passing `url` — and the `??` inside
+    // it, whose right-hand side the lane can never reach because it always sets
+    // `RELAY_REDIS_URL`. `codes.test.ts:128` established the swap-and-restore
+    // shape for exactly this; the `finally` is what keeps a failure here from
+    // silently pointing every later suite at a different Redis.
+    const defaulted = createConnections({ logger: silent });
+    const outcome = await defaulted.claim(ENV, `u-${randomUUID()}`, randomUUID());
+    expect(outcome.kind).toBe("claimed");
+    await defaulted.close();
+
+    const before = process.env["RELAY_REDIS_URL"];
+    try {
+      delete process.env["RELAY_REDIS_URL"];
+      // `DEFAULT_REDIS_URL` is localhost:6379, which is where the lane's Redis is,
+      // so this claims a place rather than failing open — and the assertion is that
+      // it reached A Redis, not that it reached a particular one.
+      const fallback = createConnections({ logger: silent });
+      expect((await fallback.claim(ENV, `u-${randomUUID()}`, randomUUID())).kind).toBe(
+        "claimed",
+      );
+      await fallback.close();
+    } finally {
+      if (before === undefined) delete process.env["RELAY_REDIS_URL"];
+      else process.env["RELAY_REDIS_URL"] = before;
+    }
   });
 
   it("states the maximum in exactly one place (FR-002 (3.22))", async () => {
@@ -2577,7 +2596,7 @@ six runs out of six.
 +  // seven Redis clients is not something a unit test can observe without seven
 +  // servers. What it CAN observe is that every module the file builds is also
 +  // closed, which is the property that breaks when somebody adds an eighth.
-+  it("closes every module it builds (T042b (3.22))", () => {
++  it("closes every module it builds (chapter 3.22)", () => {
 +    const here = dirname(fileURLToPath(import.meta.url));
 +    const source = readFileSync(join(here, "main.ts"), "utf8");
 +    const built = [...source.matchAll(/^ {2}const (\w+) = create(\w+)\(/gm)].map(
