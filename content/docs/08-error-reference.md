@@ -115,13 +115,58 @@ the acceptable senders would be an enumeration endpoint behind a 403.
 of this: its send is attributed to the token's subject, and naming `user` in the body is
 refused.
 
+## not_message_author
+
+**Status:** 403 · **Retryable:** no
+
+The caller did not write this message. Only its author may change what it says, and only
+its author or a tenant API key may delete it.
+
+This has its own code rather than a generic `forbidden` for a reason the generic entry
+below states about itself: its client action is *a change of credential or of permission*,
+and **authorship is neither.** No credential grants it, no permission screen confers it,
+and no retry acquires it — a message belongs to whoever wrote it, permanently. A developer
+sent to look for a permissions setting by a `forbidden` would not find one.
+
+An **end user** editing or deleting somebody else's message and a **tenant API key**
+editing anybody's both arrive here, because the cause is the same in both cases and so is
+the answer. A tenant key may still *delete* any message in its environment — that is a
+different route and not a refusal.
+
+**What to do:** nothing, for this message and this caller. If the operation is meant to be
+a moderation action rather than the author's own, use the deletion route with a tenant API
+key; editing on somebody's behalf is not offered, because a message rewritten by somebody
+else would say something its author never wrote with nothing on the wire to say so.
+
+## message_deleted
+
+**Status:** 403 · **Retryable:** no
+
+This message has been deleted. Its text cannot be changed; its edit history is unaffected.
+
+Only the message's **author** ever receives this code. A caller who did not write the
+message is refused with `not_message_author` first, whether or not the message still says
+anything — so this answer cannot tell anybody that a message they could not otherwise see
+exists.
+
+It is a 403 rather than a 404 because the message is still there and the author can still
+read it: deleted messages stay in history in their original position, so a `404` here would
+deny the existence of a row the same caller can fetch through the history route. One
+resource answering two ways depending on the verb is the defect the platform fixed for
+channels and does not reintroduce for messages. It is not a `410` either — that says *it
+was here and it is gone*, which is more than this API says anywhere.
+
+**What to do:** stop offering an edit control for this message and re-read the channel's
+history. The row is there with a null `text` and a `deleted_at`, which is the state the
+client should be showing. Deleting it again succeeds and changes nothing.
+
 ## forbidden
 
 **Status:** 403 · **Retryable:** no
 
 The credential is valid and is not permitted to perform this operation. The generic case:
-where a more specific code exists — `wrong_credential_type`, `wrong_credential_service` —
-that one is sent instead.
+where a more specific code exists — `wrong_credential_type`, `wrong_credential_service`,
+`not_message_author` — that one is sent instead.
 
 **What to do:** nothing the client can retry. This is a change of credential or of
 permission.

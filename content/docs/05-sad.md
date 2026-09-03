@@ -337,10 +337,10 @@ sequenceDiagram
     participant W as Webhook dispatcher
     participant I as Analytics ingester
 
-    S->>A: DELETE /v1/messages/{id} (API key)
+    S->>A: DELETE /v1/channels/{channelId}/messages/{messageId}<br/>(API key, or the author's token)
     A->>A: verify key scope
-    A->>P: UPDATE message SET text=NULL, attachments=NULL,<br/>deleted_at=now() — tombstone (FR-MSG-08)
-    A->>P: INSERT audit_log + outbox event (one transaction)
+    A->>P: UPDATE message SET text=NULL, attachments=NULL,<br/>deleted_at=now(),<br/>metadata.deleted_by (FR-MSG-08, FR-006a of 3.23)
+    A->>P: INSERT outbox event (same transaction)
     A-->>S: 204
     P->>J: outbox relay drains event
     J->>G: message.deleted → push to connected members (FR-RTM-05)
@@ -351,6 +351,25 @@ sequenceDiagram
 One write path serves four consumers — Priya's real-time removal, the audit trail
 (FR-MOD-03), the customer's webhook, and metering — without any of them coupling to the
 others. This scenario is the clearest illustration of why the outbox/queue spine exists.
+
+> **Amended 2026-09-03 (chapter 3.23), and three things in the diagram above were wrong.**
+> The route is on the channel's message resource, not `/v1/messages/{id}`, and it accepts
+> the message's **author's** token as well as a tenant API key (FR-MOD-02 grants the key
+> deletion of any message; FR-013 of chapter 3.23 grants the author their own).
+>
+> **There is no `audit_log` table**, in §6.1 or anywhere in the schema, so the second
+> `INSERT` in the original diagram wrote to something that does not exist and the
+> paragraph above counts a consumer that is not built. What the deletion records instead
+> is `metadata.deleted_by` on the message row — the actor's KIND, and their external id
+> when there is one — which is FR-MSG-08's "deletion metadata" and not FR-MOD-03's log.
+> The distinction is real and narrow: a single mutable column on the row it describes
+> carries no request id, cannot be appended to, and says nothing about moderation actions
+> that leave no row. FR-MOD-03 is P3 and unbuilt; the boundary is written down in chapter
+> 3.23's `gaps.md` item 2.
+>
+> **And the deletion is idempotent** (FR-009 of chapter 3.23): the second DELETE answers
+> 204, changes nothing — `deleted_at` in particular does not move — and emits no second
+> event, so nothing downstream in this diagram fires twice for one deletion.
 
 ---
 
@@ -420,7 +439,7 @@ CREATE TABLE messages (
     sequence        BIGINT NOT NULL,
     user_id         UUID REFERENCES users(id),
     text            TEXT,                                   -- NULL ⇒ tombstone
-    metadata        JSONB NOT NULL DEFAULT '{}',
+    metadata        JSONB NOT NULL DEFAULT '{}',            -- see below
     attachments     JSONB,
     idempotency_key TEXT,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -432,7 +451,7 @@ CREATE UNIQUE INDEX messages_idem
     ON messages (channel_id, idempotency_key)
     WHERE idempotency_key IS NOT NULL;                      -- DR-03
 
-CREATE TABLE message_edits (
+CREATE TABLE message_edits (                                -- built in 3.23
     message_id  UUID NOT NULL REFERENCES messages(id),
     edited_at   TIMESTAMPTZ NOT NULL,
     prior_text  TEXT NOT NULL,                              -- FR-MSG-07
@@ -525,6 +544,56 @@ IDs on every build.
 **Growth management:** `messages` is the only unbounded table. Partitioning by
 `created_at` (monthly, `pg_partman`) keeps retention deletion (FR-MOD-06) as partition
 drops rather than bulk DELETEs. Under ASM-04 (≤10 M messages/day) this holds to v2.
+
+**What `messages.metadata` holds (added 2026-09-03, chapter 3.23).** Three tables in §6.1
+declare a `metadata JSONB NOT NULL DEFAULT '{}'` and this document said what none of them
+holds. For `messages` there is now exactly one key, and it arrived with FR-MSG-08's
+deletion metadata:
+
+    metadata.deleted_by = { "kind": "user", "user": "<external id>" }
+    metadata.deleted_by = { "kind": "application" }
+
+The kind is always recorded; the external id exists only for a user principal, because an
+application credential has no user of its own. **This is a different fact from `user_id`** —
+a tenant API key may delete any message in its environment (FR-MOD-02), so who removed a
+message and who wrote it are two people, and FR-MSG-08 itemises *"sequence number, author,
+timestamps, and deletion metadata"* with timestamps listed separately, so the last item has
+to mean more than `deleted_at`.
+
+**Writers merge rather than replace.** Chapter 3.23 is this column's first writer anywhere
+in the platform, so every row that predates it carries `'{}'`; a later writer of a second
+key must not erase this one.
+
+**Which credential an application deletion presented is NOT here.** That is FR-MOD-03's
+audit log — actor, action, target, timestamp, request id, retained a year, across every
+moderation action — and a single mutable column on the row it describes is not one.
+
+**What reads it: nothing.** Not the history route, not the channel listing, not the
+`message.deleted` frame, not the webhook event. The frame and the event carry the message's
+AUTHOR, deliberately, because a client already holds that name beside the message. So the
+actor is recorded and answerable only by a database query today; a read surface for it
+would decide, with no requirement asking, who may learn that an operator removed somebody's
+message.
+
+**What every read path does with a tombstone (added 2026-09-03, chapter 3.23, FR-017).**
+Derived by reading the four code paths rather than from a requirement list, because a list
+goes stale and the code does not:
+
+| Path | A deleted message |
+|---|---|
+| REST history (`GET /v1/channels/:id/messages`) | **returned**, in its original position, `text: null`. `listMessages` has never had a predicate on `messages.text` |
+| Resume backfill (`POST /internal/backfill`) | **dropped.** A tombstone is not a `message.created` and there is no truthful `text` to invent, so `toFrame` returns nothing for it and the client sees a gap it repairs through history |
+| Channel listing (`GET /v1/users/:id/channels`) | **previewed** with a `null` text at its own sequence, and **still counted as one unread** — unread is `last_sequence - read_position`, so a tombstone keeps its place in the arithmetic |
+| Backfill truncation flag | computed from **rows read**, not frames delivered. A page at the cap containing tombstones returns fewer frames and still reports `truncated: true`: dropping an unrenderable row is not a reason to tell the client to go page history, and hiding a real cap would be |
+
+The fourth row is not a per-state answer like the first three, which is why it is easy to
+miss — the requirement counted three paths until a fourth was measured.
+
+**And the edit's equivalent is one line:** every read path returns the CURRENT text, because
+the superseded text lives in `message_edits` and no read path but
+`GET …/:messageId/edits` touches that table. An edit keeps its sequence number, so a
+resuming client receives the corrected text as a `message.created` under the sequence it
+always had.
 
 ### 6.2 ClickHouse — analytical schema (representative table)
 
@@ -884,6 +953,34 @@ none); gateway-to-gateway mesh (O(n²) connections, discovery complexity).
 > proposal that also moves presence off Redis (NATS KV) would reopen it legitimately, and
 > would be a larger decision than this ADR — it would delete a store from the deployment,
 > not swap a fabric.
+
+> **Amended 2026-09-03 (chapter 3.23) — THE CURSOR RECOVERS CREATIONS AND NOTHING ELSE,
+> and this record's loss argument rests on it.** *"The client's cursor + sequence-gap
+> detection recovers anything missed"* is true of every payload this fabric carried when
+> the sentence was written, and chapter 3.20 already narrowed it once for a revocation,
+> which has no sequence. A **message revision** narrows it a second way, and differently:
+> an edit and a deletion both have a sequence, and it is the sequence of a message the
+> client may already hold.
+>
+> So a cursor cannot address them. A cursor is a position in a channel's sequence and a
+> sequence orders **creations**; an edit creates nothing, so there is no position at which
+> it happened. Concretely (FR-016a and FR-016b of chapter 3.23): **a message older than a
+> client's cursor that changed during a disconnect produces no frame AND no sequence
+> gap.** The absent gap is the half that matters — gap detection is the mechanism this
+> record names as the recovery, and it sees nothing to recover.
+>
+> **The repair is a history re-read**, which returns current state: the corrected text for
+> an edit, and the row with a `null` text for a deletion. That is documented as a property
+> of a cursor rather than as a limitation, because the alternative is a different design
+> rather than a fix. **Slack does exactly this** — `conversations.history` returns current
+> state and replays no event stream, with `message_changed` and `message_deleted` existing
+> only as live events. Matrix takes the other shape: an append-only timeline where a
+> redaction is an event of its own, so a resuming client receives it — at the cost of a
+> timeline that grows with edits rather than with messages. IMAP's CONDSTORE/QRESYNC takes
+> a third: a `MODSEQ` beside the sequence, so a client asks *what changed since modseq N* —
+> a second monotonic counter per mailbox that every mutation has to maintain. Both
+> alternatives add a per-channel counter; this platform is already the first shape, and
+> chapter 3.23 chose to say so rather than to add one.
 
 ### ADR-08 — ClickHouse single-node in v1, schema designed for cluster
 **Status:** accepted · **Drivers:** D5, D8, NFR-SCL-05
