@@ -1291,6 +1291,43 @@ a dashboard, a support tool answering "why can this person not connect". Five re
 wrong shape for that, and by then the load test R2 has been owed since the first draft will
 have produced the evidence Constitution VII asks for.
 
+### ADR-24 — Message revisions take a fifth subject grammar
+**Status:** accepted (chapter 3.23) · **Drivers:** D2, D8 · qualifies FR-RTM-05, extends
+§6.3's pub/sub rows
+
+FR-RTM-05 names six real-time event kinds. `message.updated` and `message.deleted` have been
+in the published protocol since chapter 1.3 with nothing emitting them, and chapter 3.23 gives
+them producers. **Neither can reach a socket on the subject that already exists.**
+
+`chan:{channel_id}` carries a wire frame's payload rather than a shape of its own — §6.3's row
+and the code's own comment both say so — and that payload is a `Message`. Two consequences:
+
+**A deletion is not a `Message`.** `messageSchema.text` is `z.string()` and a tombstone has no
+text, which is the same constraint that gave `message.deleted` its own frame payload in the
+same chapter. It cannot ride `chan:` even in principle.
+
+**An edit is a `Message` and still cannot ride it.** The kind was never on the fabric: the
+receiving gateway stamped `type: "message.created"` at the call site, so an edit arriving on
+`chan:` is indistinguishable from a creation. Putting the kind in `chan:`'s payload would widen
+a grammar four chapters have treated as message-shaped, and would make every existing consumer
+branch on a field it has never seen.
+
+**A kind that cannot share a payload type cannot share a subject.** ADR-19 took
+`presence:{channel_id}` on that argument, ADR-20 took `member:{channel_id}` and
+`member:{env}:{user}`, ADR-21 took `typing:{channel_id}`. This is the fourth application of
+one rule, which is why it is stated as a rule rather than re-derived here.
+
+**One subject, not two.** `revision:{channel_id}` carries both mutations with a discriminator —
+`kind: "updated" | "deleted"` — following ADR-20's `change: "added" | "removed"` rather than
+ADR-19's single-purpose subject. An edit and a deletion are two things that happen to one
+message; a receiver wants both or neither, and two subjects would double the subscription
+bookkeeping for a distinction the payload already makes.
+
+**Revisit when:** a mutation arrives that is not per-channel — a moderation sweep across an
+environment, or a retention job deleting by age. `member:{env}:{user}` exists because
+membership found exactly that case, and this grammar would need its principal-addressed
+sibling for the same reason.
+
 ## 10. Risks and technical debt register
 
 | # | Risk / debt | Exposure | Mitigation / trigger |

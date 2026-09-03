@@ -1530,7 +1530,84 @@ wrong shape for a question asked from outside the connection path, and by then t
 R2 has been owed since the first draft will have produced exactly the profiling evidence
 Constitution VII asks for. The sorted set returns with an argument it does not have today.
 
-## Reading the twenty-three together
+## ADR-24 — Message revisions take a fifth subject grammar
+
+### Problem
+
+FR-RTM-05's last two kinds get producers in chapter 3.23. The fabric that carries a message
+between gateway instances is `chan:{channel_id}`, and its payload has been a `Message` since
+chapter 2.2 — §6.3's row calls it *"the fan-out fabric"* and the code's comment says the
+subject *"has always carried a wire frame's payload rather than a shape of its own."*
+
+Neither new kind fits that shape, for two different reasons, and the second is the one that
+makes this an architecture decision rather than a refactor.
+
+### Options
+
+**Ride `chan:` unchanged.** Impossible for a deletion: `messageSchema.text` is `z.string()`
+and a tombstone has none. The same constraint gave `message.deleted` its own frame payload in
+this chapter, and two places in the api had already refused to publish a tombstone and said
+why.
+
+**Widen `chan:`'s payload to a discriminated union.** An edit *is* a `Message`, so only the
+kind is missing — and the kind was never on the fabric at all: the receiving gateway stamped
+`type: "message.created"` at the call site. Adding a discriminator means every existing
+consumer branches on a field it has never seen, and a grammar four chapters have treated as
+message-shaped stops being one.
+
+**Two new subjects, one per kind.** Precise, and it doubles the subscription bookkeeping: a
+gateway would subscribe to both for every channel it holds, because a client that wants edits
+wants deletions.
+
+**One new subject with a discriminator in the payload.**
+
+### Analysis
+
+**A kind that cannot share a payload type cannot share a subject.** Three chapters reached
+that independently before this one — presence, membership, typing — and each took a grammar
+rather than widening `chan:`. The rule is not about tidiness: a subject's payload schema is
+the contract two instances agree on across a rolling deploy, and a union is a contract that
+changes shape under both of them at once.
+
+**The choice between one subject and two is ADR-20's, not ADR-19's.** Presence took a
+single-purpose subject because presence is one thing. Membership took one subject carrying
+`change: "added" | "removed"`, because an addition and a removal are two things that happen to
+one membership and a receiver wants both. An edit and a deletion are two things that happen to
+one message. The shape follows the audience, not the arity.
+
+**No `environment` on the payload**, unlike `membershipFabricSchema`. Membership needs it
+because `member:{env}:{user}` names a user, unique only within an environment, and a receiving
+gateway must check it before acting. A channel id is a UUID and identifies its tenant
+transitively — the assumption `chan:{channel_id}` has relied on since chapter 2.2.
+
+### Decision
+
+`revision:{channel_id}`, carrying `{ kind: "updated", message }` or
+`{ kind: "deleted", message }` as a discriminated union of strict objects. The deleted arm
+reuses the wire frame's own payload schema rather than restating it, so the fabric and the
+frame cannot drift.
+
+Five grammars now: `chan:`, `member:` in two shapes, `presence:`, `typing:`, `revision:`.
+
+### Consequences
+
+**The gateway stops deciding the kind at the call site.** It reads it from the payload, which
+is the change that makes an edit distinguishable from a creation — and the falsification for
+that is in the chapter: stamp `message.created` again and the delivery test goes red.
+
+**A sixth grammar is now likelier than a fifth was**, and that is worth saying rather than
+discovering. Four of these five arrived one per chapter, each with the same argument. If a
+seventh kind appears, the question to ask first is whether the subject count is the design or
+a symptom — this record is the fourth in a row and none has asked it.
+
+### Revisit when
+
+A mutation arrives that is not per-channel: a moderation sweep across an environment, or a
+retention job deleting by age. `member:{env}:{user}` exists because membership found exactly
+that case one chapter after taking its channel subject, and this grammar would need its
+principal-addressed sibling for the same reason.
+
+## Reading the twenty-four together
 
 Three themes recur, and naming them is the best summary of the architecture's character:
 
