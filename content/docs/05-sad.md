@@ -163,8 +163,9 @@ assignment, idempotency, isolation) in one codebase (→ ADR-04). Emits an event
 queue after every state change.
 
 **Gateway service** `[Phase 1]`
-Terminates WebSockets. Validates the JWT on connect, registers the connection in Redis
-(`conn:{env}:{user}` → instance ID, TTL-refreshed), subscribes to the Redis pub/sub
+Terminates WebSockets. Validates the JWT on connect, claims one of five slot keys in Redis
+(`conn:{env}:{user}:{slot}`, TTL-refreshed while the connection lives) and refuses a sixth
+connection with close 4004 (FR-RTM-09, → ADR-23), subscribes to the Redis pub/sub
 subjects for the user's channels, pushes frames. Handles resume: on connect-with-cursor it
 reads backfill *through the API service's internal history endpoint*, not from Postgres
 directly (single-writer/single-reader discipline, → ADR-04). Sends message frames received
@@ -571,7 +572,7 @@ aggregate that cannot identify a person needs no erasing.
 
 | Key pattern | Purpose | TTL |
 |---|---|---|
-| `conn:{env}:{user}` → set of instance IDs | Connection registry (FR-RTM-09). **Not built, and this shape does not work:** a Redis TTL is per key, not per set member, so one instance refreshing the key keeps a dead instance's entry alive for ever. A sorted set scored by heartbeat time, pruned with `ZREMRANGEBYSCORE` on read, is the correct version. Presence (ADR-19) needs none of it — it asks a yes-or-no question of the key below rather than counting members | 60 s, heartbeat-refreshed |
+| `conn:{env}:{user}:{slot}` → connection ID, slot 0-4 | Connection registry (FR-RTM-09), built in chapter 3.22. **One key per place, and this row used to prescribe a sorted set** — correct about the defect and wrong about the fix. A Redis TTL is per key and not per set member, so a set keeps a dead instance's entry alive for ever; making each member its own key makes the TTL per member by construction. `SET NX PX` claims, `SET IFEQ PX` renews, a conditional one-millisecond tombstone releases, and **the TTL is the only unconditional way a place is freed**. The sorted set with `ZREMRANGEBYSCORE` needs Lua to make the claim atomic, which Constitution VII will not admit without profiling evidence this lane cannot produce (→ ADR-23). Presence (ADR-19) needs none of it — it asks a yes-or-no question of the key below rather than counting members | 60 s, refreshed every 20 s |
 | `presence:{env}:{user}` | Presence with 30 s grace (FR-RTM-06). Its existence IS the state. **The TTL and the grace are two different quantities** and both are 30 s by coincidence: the TTL is refreshed every 10 s while a connection is open, and the closing instance re-pins it to the grace so the key dies when the grace ends rather than up to a refresh interval earlier | 30 s, refreshed every 10 s |
 | `presence:offline:{env}:{user}` | Elects one publisher when two instances' last connections close together (ADR-19). Cleared by the next `online` | 30 s |
 | pub/sub `presence:{channel_id}` | Presence fan-out, one subject per channel (ADR-19) | — |
@@ -1252,6 +1253,43 @@ customer's contract and a chapter does not rewrite one to match its code.
 
 **Revisit when:** an SDK exists in this repository. The timer would then have a home the
 platform owns, and "the client" would stop meaning "code we do not control".
+
+### ADR-23 — Five slot keys, not a sorted set
+**Status:** accepted (chapter 3.22) · **Drivers:** D2, D4, D8 · supersedes §6.3's
+`conn:{env}:{user}` row
+
+FR-RTM-09 caps a user at five concurrent connections. §6.3 has carried a remedy since the
+first draft — a sorted set scored by heartbeat time, pruned with `ZREMRANGEBYSCORE` on read
+— and this record rejects it. **The row was right about the defect and wrong about the fix.**
+
+**A cap is a claim, not a count.** FR-013 requires that two connections arriving at the same
+instant cannot both take the fifth place, which needs an atomic check-and-insert. A sorted
+set has none. `ZADD` then `ZCARD` is check-then-act. Add-then-verify — add, count, remove if
+over — refuses **both** of two connections arriving at four held: safe, and wrong. The
+atomic version needs Lua.
+
+**Constitution VII permits a second language only with a superseding ADR carrying profiling
+evidence, and this lane cannot produce it.** The largest fixture in the repository holds
+five channels; NFR-SCL-01 asks about ten thousand connections per instance and stands
+undischarged (R2). An ADR arguing for Lua from a five-channel fixture would be arguing from
+nothing. `grep` for `.eval(`, `defineCommand` and `.multi(` returns zero across the
+platform: no multi-command Redis operation has ever shipped here.
+
+**So the member becomes the key.** `conn:{env}:{user}:{slot}` for slots 0 to 4, claimed with
+`SET NX PX`, renewed with `SET IFEQ PX`, released with a conditional one-millisecond
+tombstone. Three commands, every one of them conditional, and **the TTL is the only
+unconditional way a place is freed**. That is the defect §6.3's row recorded — a Redis TTL is
+per key and not per set member — repaired by construction rather than worked around: when
+each member is a key, the per-key TTL *is* per member.
+
+**The cost, stated rather than hidden.** Counting a user's connections is five reads instead
+of one `ZCARD`, and the count arrives as a by-product of the walk rather than as a query.
+Nothing in this chapter needs the count without also claiming a place, so nothing pays it.
+
+**Revisit when:** a chapter needs a user's count **without** claiming a slot — an admin API,
+a dashboard, a support tool answering "why can this person not connect". Five reads is the
+wrong shape for that, and by then the load test R2 has been owed since the first draft will
+have produced the evidence Constitution VII asks for.
 
 ## 10. Risks and technical debt register
 

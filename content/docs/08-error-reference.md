@@ -279,6 +279,30 @@ type the union does not contain at all fails schema validation first and gets
 **What to do:** send `message.send` to post a message, or `typing.send` to say you are
 typing in a channel. Do not send events; receive them.
 
+## connection_limit_reached
+
+**Status:** WebSocket `error` frame, then close 4004 · **Retryable:** no, not unchanged
+
+A user may hold five concurrent connections in an environment (FR-RTM-09) and this one would
+have been the sixth. **The count is per user per environment and is shared by every gateway
+instance**, so opening the sixth against a different host does not help. The five already
+open are untouched — nothing is closed to make room, and they keep receiving while the
+refusal happens.
+
+**The count is a live one.** A connection that ends frees its place immediately, with no
+waiting period. A connection whose gateway died frees its place when the 60-second lease on
+it expires, which is the one case where waiting is the answer.
+
+**This is the only refusal in the WebSocket set whose correct handling is not a retry.**
+Reconnecting at once produces the same refusal; backing off produces it more slowly. Every
+other close code this platform sends — an expired token, a quota, a drain — is answered by
+trying again in some form. This one is answered by giving something up.
+
+**What to do:** close one of the connections you already hold, then connect — immediately,
+with no delay. If you believe you hold fewer than five, count sockets rather than tabs: a
+page that opens a connection per component holds several, and a reconnect loop that does not
+close the old socket first holds two for as long as the old one takes to notice.
+
 ## internal_error
 
 **Status:** 500 · **Retryable:** yes, with backoff

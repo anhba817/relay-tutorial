@@ -1427,7 +1427,110 @@ indicator flicker.
 An SDK exists in this repository. The timer would then have a home the platform owns, and
 "the client" would stop meaning "code we do not control".
 
-## Reading the twenty-two together
+## ADR-23 — Five slot keys, not a sorted set
+
+### Problem
+
+FR-RTM-09 says *"A user shall be permitted up to 5 concurrent connections."* Five is a
+number about a **person**, and connections for one person land on whichever gateway
+instances the load balancer picked — CON-02 forbids sticky routing for correctness. So the
+count lives outside every instance's memory, in Redis, and the question is what shape it
+takes there.
+
+§6.3 of the SAD has carried an answer since the first draft, and carried it as a correction:
+`conn:{env}:{user}` as a **set** of instance IDs does not work, because a Redis TTL is per
+key and not per set member, so one live instance refreshing the key keeps a dead instance's
+entry alive for ever. The row's prescribed fix is a sorted set scored by heartbeat time,
+pruned with `ZREMRANGEBYSCORE` on read.
+
+### Options
+
+**The sorted set with Lua.** `ZREMRANGEBYSCORE`, `ZCARD`, `ZADD` in one script, which is the
+only version that makes the cap atomic. Constitution VII allows a second language into this
+repository only through a superseding ADR carrying profiling evidence.
+
+**The sorted set with add-then-verify.** No Lua: add the member, count, remove yourself if
+the count is over five. It never over-admits. It also **refuses both** of two connections
+arriving when four places are held — each adds, each counts six, each backs out, and the
+fifth place stays empty with two people told they are at their limit. Safe and wrong.
+
+**A single counter.** `INCR` on connect, `DECR` on close, and it cannot expire per member:
+a crashed instance's increment is permanent. That is §6.3's original defect wearing a
+different shape rather than a fix for it.
+
+**One key per place.** `conn:{env}:{user}:{slot}` for slots 0 to 4. `SET NX PX` claims,
+`SET IFEQ PX` renews, and a conditional one-millisecond tombstone releases.
+
+### Analysis
+
+**The atomicity is the requirement, and it is the whole of the argument.** A cap is not a
+count that is checked; it is a place that is claimed. `SET NX` settles a race inside the
+command — the loser gets nil and walks to the next slot — so no check-then-act window exists
+to lose, and no Lua is needed to close one. This was measured rather than assumed: replacing
+`SET NX` with a `GET` followed by a `SET` admits **all twelve** of twelve simultaneous
+attempts.
+
+**Constitution VII's evidence cannot be produced by this repository.** The largest fixture
+holds five channels. NFR-SCL-01's ten thousand connections per instance is a budget the SAD
+itself flags as unmeasured (R2, "the SAD's single most urgent action item"). An ADR arguing
+that a sorted set outperforms five keys at that scale would be arguing from a lane that
+cannot see the difference — and the honest reading of the principle is that the ADR is not
+available, not that the principle is inconvenient.
+
+**Making the member a key makes the TTL per member by construction.** The defect §6.3
+recorded is not worked around here; it stops existing. A slot key expires on its own
+schedule because it is its own key.
+
+**The driver that was wrong.** The first draft of this decision argued that a returning
+connection could not resurrect a place it had lost, because the renewal used `SET XX` and
+`XX` would refuse a key that had been re-claimed — citing `presence.ts:195`, which refreshes
+with `XX` for a related-looking reason. **`XX` tests existence, not ownership.** Measured on
+Redis 8.10.0: `SET k B XX` against a key holding `A` returns OK and the value becomes `B`. So
+under `XX` a connection whose place had expired and been taken would silently take it back,
+and six connections would be open against a count of five. The analogy did not transfer
+because presence's value is the literal `"1"` and carries no identity — there is nothing for
+a comparison to be wrong about. The renewal uses `IFEQ`, which compares before writing.
+
+The decision survived its own broken driver, which is the least comfortable way for one to
+be right. Constitution VII says disagreement attacks the driver; an ADR is therefore not
+allowed to ship carrying a false one.
+
+### Decision
+
+Five keys, `conn:{env}:{user}:{slot}`. Three commands, all conditional: `SET NX PX` to claim,
+`SET IFEQ PX` to renew, `SET <tombstone> IFEQ PX` to release. **The TTL is the only
+unconditional way a place is freed**, which is what makes a crashed instance recoverable
+without anybody sweeping anything.
+
+### Consequences
+
+**Counting a user's connections costs five reads.** There is no `ZCARD` here, and the count
+comes back as a by-product of the walk — the index of the slot that was claimed. Nothing in
+chapter 3.22 needs the count without also claiming a place.
+
+**A tombstone means free, not busy.** The release cannot use `DEL`, which has no ownership
+check and would let a connection whose place had already been re-claimed delete the new
+owner's key. It writes a value no connection id can equal, with a one-millisecond expiry,
+only if the place is still ours. The walk claims a tombstoned slot rather than stepping over
+it — and reading it the other way was a defect that reached the integration suite: a deploy
+releases all five places at once, and a walk that skips tombstones finds none free and
+refuses the reconnect with `connection_limit_reached`, whose documented remedy is to close
+one of the connections the client is holding. They went with the old instance.
+
+**The cap is enforced, and it fails open.** An unreachable registry accepts the connection
+and logs that five was not checked, because Redis is not a source of truth here (Principle
+IV) and a cap that denies service when its bookkeeping is unavailable has chosen the wrong
+failure.
+
+### Revisit when
+
+A chapter needs a user's connection count **without** claiming a place — an admin API, a
+dashboard, a support tool answering "why can this person not connect". Five reads is the
+wrong shape for a question asked from outside the connection path, and by then the load test
+R2 has been owed since the first draft will have produced exactly the profiling evidence
+Constitution VII asks for. The sorted set returns with an argument it does not have today.
+
+## Reading the twenty-three together
 
 Three themes recur, and naming them is the best summary of the architecture's character:
 
