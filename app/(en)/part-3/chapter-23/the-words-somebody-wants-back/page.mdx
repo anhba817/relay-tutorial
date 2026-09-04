@@ -855,7 +855,7 @@ nobody has.
        // no caller fills in is a check that never fires, and this one did not, on
        // the only send path a customer's own client uses.
        //
-@@ -4327,6 +4404,406 @@ export class Repository {
+@@ -4327,6 +4404,420 @@ export class Repository {
      });
    }
  
@@ -1055,7 +1055,14 @@ nobody has.
 +      userExternalId,
 +    }: { userId?: string; userExternalId?: string },
 +  ): Promise<{
-+    deleted: MessageWithSender & { deleted_at: string };
++    /** `user` IS NARROWED TO A STRING, unlike `MessageWithSender`'s.
++     *
++     * FR-018 refuses a row with no author before this method can return either branch,
++     * so a tombstone this method produced always has one. The narrowing is here rather
++     * than at the caller because this is where that argument lives — and the caller's
++     * alternative was `deleted.user ?? "unknown"`, which is an uncovered arm and a lie
++     * in the same expression. */
++    deleted: MessageWithSender & { user: string; deleted_at: string };
 +    alreadyDeleted: boolean;
 +  }> {
 +    return this.db.transaction(async (tx) => {
@@ -1099,6 +1106,13 @@ nobody has.
 +      if (userId !== undefined && row.userId !== userId) {
 +        throw new NotMessageAuthorError(messageId);
 +      }
++      // THE AUTHOR IS A STRING FROM HERE DOWN, and the foreign key is the argument.
++      // `messages.user_id` references `users(id)`, and the check above established it is
++      // not null — so the left join matched and `row.author` is that user's external id.
++      // Asserted rather than defaulted: a `??` here would put a placeholder on the wire
++      // as somebody's name, and the only state that could reach it is a violated
++      // constraint, which should crash rather than publish.
++      const author = row.author!;
 +
 +      // ALREADY A TOMBSTONE: nothing to do, and nothing to announce.
 +      //
@@ -1114,7 +1128,7 @@ nobody has.
 +            seq: row.seq,
 +            text: null,
 +            created_at: toIso(row.createdAt),
-+            user: row.author,
++            user: author,
 +            // THE INSTANT ALREADY ON THE ROW, not a fresh reading. FR-009 says a
 +            // repeated deletion changes nothing, and the timestamp is the column that
 +            // would otherwise move.
@@ -1173,7 +1187,7 @@ nobody has.
 +          id: row.id,
 +          channel_id: channelId,
 +          seq: row.seq,
-+          user: row.author,
++          user: author,
 +          deleted_at: deletedAt,
 +        },
 +      });
@@ -1189,7 +1203,7 @@ nobody has.
 +          seq: row.seq,
 +          text: null,
 +          created_at: toIso(row.createdAt),
-+          user: row.author,
++          user: author,
 +          // THE COMMITTED INSTANT, read back from the UPDATE. The outbox event above
 +          // quotes this same value, so a consumer and a socket client comparing the
 +          // event with the frame see one timestamp rather than two readings of one
@@ -1262,7 +1276,7 @@ nobody has.
    /** Refuse the send if a hard cap is already met (chapter 3.10, FR-RTL-08).
     *
     * Reads the caps and the usage in ONE query, in the transaction that is about to
-@@ -4744,6 +5221,19 @@ export class Repository {
+@@ -4744,6 +5235,19 @@ export class Repository {
        user: users.externalId,
        text: messages.text,
        created_at: messages.createdAt,
@@ -1282,7 +1296,7 @@ nobody has.
      };
      const scoped = (extra?: SQL) =>
        and(
-@@ -4780,7 +5270,14 @@ export class Repository {
+@@ -4780,7 +5284,14 @@ export class Repository {
            .where(scoped(gt(messages.sequence, afterSeq)))
            .orderBy(asc(messages.sequence))
            .limit(limit));
@@ -1341,7 +1355,36 @@ lives in the shape of the statement.
  import type { RequestWithPrincipal } from "../auth/principal";
  import { ZodValidationPipe } from "./zod-validation.pipe";
  
-@@ -86,8 +94,14 @@ export class MessagesController {
+@@ -44,6 +52,28 @@ function actingUser(req: RequestWithPrincipal): string | undefined {
+   return req.principal?.kind === "user" ? req.principal.userExternalId : undefined;
+ }
+ 
++/** The two fields every publish here has to carry (NFR-OBS-01, NFR-OBS-06).
++ *
++ * ONE FUNCTION AND NOT THREE COPIES, and the coverage ratchet is what asked. Chapter
++ * 3.23 added two more publish sites to this file, each with its own
++ * `req.requestId ?? "unknown"` and `req.principal?.environmentId ?? "unknown"` — six
++ * uncovered branch arms where there had been two, all of them the same two arms written
++ * three times. Collapsing them does not make the arms reachable; it stops the count
++ * growing every time a route publishes.
++ *
++ * THE FALLBACKS STAY. `requestId` is set by middleware and `principal` by the guard, so
++ * neither is absent on any path a request can take — but a log line that says `unknown`
++ * is findable, and one that says `undefined` reads like a bug in the logger. */
++function publishContext(req: RequestWithPrincipal): {
++  requestId: string;
++  environmentId: string;
++} {
++  return {
++    requestId: req.requestId ?? "unknown",
++    environmentId: req.principal?.environmentId ?? "unknown",
++  };
++}
++
+ // The api's first product endpoint (chapter 2.2). Validation is zod at the
+ // boundary — the same schema family as @relay/protocol, so the REST body
+ // and the WebSocket frame payload cannot drift (1.3's payoff, again).
+@@ -86,8 +116,14 @@ export class MessagesController {
      // This route called `this.messages.send(channelId, body)` with no user for
      // twenty-three chapters, and the membership check in `sendMessage` is gated on
      // `userId` being present — so the check could not fire on the only send path a
@@ -1358,7 +1401,19 @@ lives in the shape of the statement.
      //
      // A LOOKUP PER SEND, and it is the same one the internal route already pays.
      // `sendMessage`'s own comment explains why the id is threaded rather than
-@@ -229,6 +243,237 @@ export class MessagesController {
+@@ -208,10 +244,7 @@ export class MessagesController {
+           text: message.text,
+           created_at: message.created_at,
+         },
+-        {
+-          requestId: req.requestId ?? "unknown",
+-          environmentId: req.principal?.environmentId ?? "unknown",
+-        },
++        publishContext(req),
+       );
+     }
+ 
+@@ -229,6 +262,233 @@ export class MessagesController {
      };
    }
  
@@ -1443,10 +1498,7 @@ lives in the shape of the statement.
 +          created_at: edited.created_at,
 +        },
 +      },
-+      {
-+        requestId: req.requestId ?? "unknown",
-+        environmentId: req.principal?.environmentId ?? "unknown",
-+      },
++      publishContext(req),
 +    );
 +
 +    // THE FIELD LIST IS SPELLED OUT, like the send path's, so a new column joins the
@@ -1538,21 +1590,20 @@ lives in the shape of the statement.
 +            // delete anybody's message, so the two are different facts and the wire
 +            // carries the one every client already has beside the message.
 +            //
-+            // `?? "unknown"` NEVER FIRES, and it is here because the compiler cannot
-+            // know that: `deleteMessage` refuses a senderless row with
-+            // `NotMessageAuthorError` (FR-018) before this line can be reached, so a
-+            // null author is unrepresentable here and the type is still nullable.
-+            user: deleted.user ?? "unknown",
++            // A STRING, NOT A `?? "unknown"`. The first draft had one, and it was both
++            // an uncovered arm and a lie: `deleteMessage` refuses a senderless row with
++            // `NotMessageAuthorError` (FR-018) before it can return, so the value can
++            // never be missing — and if it somehow were, putting the word "unknown" on
++            // the wire as somebody's name is worse than the crash. The narrowing lives
++            // in the repository now, where the argument for it lives too.
++            user: deleted.user,
 +            // THE ROW'S INSTANT, not a reading taken here. The outbox event built
 +            // inside the transaction quotes the same value, so a consumer comparing
 +            // its webhook against a client's frame sees one timestamp.
 +            deleted_at: deleted.deleted_at,
 +          },
 +        },
-+        {
-+          requestId: req.requestId ?? "unknown",
-+          environmentId: req.principal?.environmentId ?? "unknown",
-+        },
++        publishContext(req),
 +      );
 +    }
 +  }
@@ -1899,7 +1950,7 @@ that catches a rename.
  
  // The thin layer between HTTP and the repository (chapters 2.2 + 2.3). It
  // owns two things: turning the layer's domain error into the wire's 404,
-@@ -169,6 +173,135 @@ export class MessagesService {
+@@ -169,6 +173,137 @@ export class MessagesService {
      }
    }
  
@@ -1997,7 +2048,9 @@ that catches a rename.
 +    messageId: string,
 +    { userId, userExternalId }: { userId?: string; userExternalId?: string },
 +  ): Promise<{
-+    deleted: MessageWithSender & { deleted_at: string };
++    /** `user` narrowed to a string by the repository — FR-018 refuses a row with no
++     * author before `deleteMessage` can return, so a tombstone it produced has one. */
++    deleted: MessageWithSender & { user: string; deleted_at: string };
 +    alreadyDeleted: boolean;
 +  }> {
 +    if (!(await this.repo.channelVisibleTo(channelId, userId))) {
@@ -2770,7 +2823,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
 +
 +// ══ EDITING A MESSAGE (chapter 3.23, US1) ═══════════════════════════════════
 +describe("editMessage (chapter 3.23)", () => {
-+  it("T027: keeps the sequence, the channel, the author and the creation time (FR-002)", async () => {
++  it("keeps the sequence, the channel, the author and the creation time (FR-002)", async () => {
 +    // A THING NOT DONE LEAVES NO TRACE TO ASSERT ON, so this asserts the VALUES rather
 +    // than the absence of an assignment. `editMessage`'s `SET` list is the guarantee —
 +    // `sequence`, `channelId`, `userId` and `createdAt` are not in it — and this is
@@ -2806,7 +2859,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
 +    expect(new Date(row!.created_at).toISOString()).toBe(before.created_at);
 +  });
 +
-+  it("T027: records edited_at, and it was null before (FR-003)", async () => {
++  it("records edited_at, and it was null before (FR-003)", async () => {
 +    const author = await repoA.createUser("t027b-author", "Author");
 +    const channel = await repoA.createChannel("t027b", "public");
 +    await repoA.addMember(channel.id, author.id);
@@ -2829,7 +2882,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
 +    expect(edited.edited_at).not.toBe(edited.created_at);
 +  });
 +
-+  it("T028: three edits leave three history rows, oldest first, none overwritten (FR-004)", async () => {
++  it("three edits leave three history rows, oldest first, none overwritten (FR-004)", async () => {
 +    const author = await repoA.createUser("t028-author", "Author");
 +    const channel = await repoA.createChannel("t028", "public");
 +    await repoA.addMember(channel.id, author.id);
@@ -2858,7 +2911,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
 +    expect(text).toBe("four");
 +  });
 +
-+  it("T034: an edit does not move the channel in the activity ordering (FR-015)", async () => {
++  it("an edit does not move the channel in the activity ordering (FR-015)", async () => {
 +    // Two channels, one edited afterwards. The listing orders by most recent activity
 +    // and FR-014 (3.15) decided what that means: a message. Correcting a typo is not a
 +    // new message, so the order must not change.
@@ -2881,7 +2934,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
 +    expect(orderAfter).toEqual(orderBefore);
 +  });
 +
-+  it("T036: an edit on a row with no author is refused (FR-018)", async () => {
++  it("an edit on a row with no author is refused (FR-018)", async () => {
 +    // PLANTED WITH RAW SQL, because no write path can produce one any more — chapter
 +    // 3.17 made `userId` required — and 121,250 of them exist in the lane, written
 +    // before chapter 2.6 recorded a sender.
@@ -2943,7 +2996,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
 +    expect(await repoA.listMessageEdits(channel.id, sent.id)).toEqual([]);
 +  });
 +
-+  it("T036b: the history survives its channel being archived and its author deleted", async () => {
++  it("the history survives its channel being archived and its author deleted", async () => {
 +    const author = await repoA.createUser("t036b-author", "Author");
 +    const channel = await repoA.createChannel("t036b", "public");
 +    await repoA.addMember(channel.id, author.id);
@@ -2960,7 +3013,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
 +    expect(edits.map((e) => e.prior_text)).toEqual(["before"]);
 +  });
 +
-+  it("lists no edits for a message that has never been edited, and for one that does not exist", async () => {
++  it("lists no edits for a message never edited, for one that does not exist, and for another tenant's", async () => {
 +    // TWO FACTS, ONE VALUE, which is why the route asks `messageExistsIn` separately.
 +    const author = await repoA.createUser("t033f-author", "Author");
 +    const channel = await repoA.createChannel("t033f", "public");
@@ -2997,7 +3050,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
 +    return res[0]!;
 +  };
 +
-+  it("T040: keeps the sequence, author and created_at; drops text and attachments (FR-006)", async () => {
++  it("keeps the sequence, author and created_at; drops text and attachments (FR-006)", async () => {
 +    // THE COLUMNS ARE `docs/05-sad.md:342`'s, and this is the first tombstone the
 +    // PLATFORM writes. Chapter 3.15's suite plants one by hand a few describes above,
 +    // and the two agree column for column — which is what makes that chapter's reader
@@ -3031,7 +3084,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
 +    );
 +  });
 +
-+  it("T040: records WHO deleted it, in two shapes (FR-006a)", async () => {
++  it("records WHO deleted it, in two shapes, without erasing a key already in metadata (FR-006a)", async () => {
 +    // **THIS CHAPTER IS `messages.metadata`'S FIRST WRITER ANYWHERE.** Every row in the
 +    // platform carries the `'{}'` default today, which is why the merge below matters:
 +    // a later chapter's key must survive a deletion.
@@ -3071,7 +3124,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
 +    });
 +  });
 +
-+  it("T042: a second deletion changes nothing and writes no second event (FR-009)", async () => {
++  it("a second deletion changes nothing and writes no second event (FR-009)", async () => {
 +    const author = await repoA.createUser("t042-author", "Author");
 +    const channel = await repoA.createChannel("t042", "public");
 +    await repoA.addMember(channel.id, author.id);
@@ -3110,7 +3163,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
 +    expect(events[0]!.n).toBe(1);
 +  });
 +
-+  it("T042a: a deletion of a row with no author is refused (FR-018)", async () => {
++  it("a deletion of a row with no author is refused (FR-018)", async () => {
 +    // FR-018 says "an edit OR deletion" and the first draft of the task list tested only
 +    // the edit. **The deletion is the half a tenant API key can reach** — FR-012 lets a
 +    // key delete anybody's message — so it is the more exposed one, and it is checked
@@ -3134,7 +3187,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
 +    expect((await rowOf(sent.id)).text).toBe("orphan");
 +  });
 +
-+  it("T048: a deleted message still counts as one unread", async () => {
++  it("a deleted message still counts as one unread", async () => {
 +    // Chapter 3.15 decided this against a planted tombstone and stated the
 +    // approximation: unread is `last_sequence - read_position`, so a tombstone keeps its
 +    // sequence and therefore its place in the arithmetic. Counting rows instead would
@@ -3152,7 +3205,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
 +    expect(row.unread).toBe(2);
 +  });
 +
-+  it("T049: deleting the NEWEST message leaves the preview at that sequence with a null text", async () => {
++  it("deleting the NEWEST message leaves the preview at that sequence with a null text", async () => {
 +    // Not "the message before it". The listing's preview is the channel's last message
 +    // and a tombstone is still the last message — reporting the previous one would make
 +    // a deletion look like the conversation had rewound.
@@ -3170,7 +3223,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
 +    expect(row.last_message?.user).not.toBeNull();
 +  });
 +
-+  it("T047: history returns the tombstone in its original position, with a real writer behind it", async () => {
++  it("history returns the tombstone in its original position, with a real writer behind it", async () => {
 +    // The twin of T009's test a few describes above, which proved the READER against a
 +    // hand-planted tombstone. This proves the reader and the WRITER agree — the thing
 +    // that would break is a writer whose columns differ from what that test planted.
@@ -3225,7 +3278,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
    //
    // So the repository test passed while the route it protects was open. A repository
    // test proves a check exists; only a route test proves it fires.
-@@ -445,3 +446,548 @@ describe("POST /v1/channels/:channelId/messages", () => {
+@@ -445,3 +446,578 @@ describe("POST /v1/channels/:channelId/messages", () => {
      });
    });
  });
@@ -3325,7 +3378,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
 +    return (await res.json()) as { messages: Array<Record<string, unknown>> };
 +  };
 +
-+  it("T024: the author edits their message and the text changes (FR-001, FR-003)", async () => {
++  it("the author edits their message and the text changes (FR-001, FR-003)", async () => {
 +    const sent = await sendAsAuthor("frist");
 +    const res = await patch(sent.id, { text: "first" }, await tokenFor("author"));
 +    expect(res.status).toBe(200);
@@ -3341,7 +3394,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
 +    expect(rows[0]!["text"]).toBe("first");
 +  });
 +
-+  it("T024: an unedited message reports no edited_at (FR-003)", async () => {
++  it("an unedited message reports edited_at as null, with the key present (FR-003)", async () => {
 +    // The control for the assertion above. `edited_at` being a string after an edit
 +    // means nothing unless it is absent before one — a column defaulting to `now()`
 +    // would pass the test above and fail this.
@@ -3354,7 +3407,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
 +    expect(rows[0]!).toHaveProperty("edited_at", null);
 +  });
 +
-+  it("T024: somebody else's message is refused with not_message_author (FR-013)", async () => {
++  it("somebody else's message is refused with not_message_author (FR-013)", async () => {
 +    const sent = await sendAsAuthor("mine");
 +    const res = await patch(sent.id, { text: "yours now" }, await tokenFor("bystander"));
 +    expect(res.status).toBe(403);
@@ -3366,7 +3419,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
 +    expect(rows[0]!["text"]).toBe("mine");
 +  });
 +
-+  it("T024: a tenant API key may not edit at all (FR-013a)", async () => {
++  it("a tenant API key may not edit at all (FR-013a)", async () => {
 +    // The decision the spec records: a key deletes anything and edits nothing. An
 +    // application credential has no author to compare against, so `@Accepts("user")`
 +    // on the method is what answers — and the class declares BOTH classes, so a route
@@ -3377,7 +3430,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
 +    expect(((await res.json()) as { code: string }).code).toBe("wrong_credential_type");
 +  });
 +
-+  it("T024: a message in a channel this tenant cannot see is a 404 (FR-014)", async () => {
++  it("a message in a channel this tenant cannot see is a 404 (FR-014)", async () => {
 +    // Indistinguishable from a message id that does not exist, which is the pair the
 +    // isolation oracle asserts everywhere else in this file.
 +    const token = await tokenFor("author");
@@ -3390,7 +3443,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
 +    );
 +  });
 +
-+  it("T024: a message id that is not in this channel is a 404 (FR-014)", async () => {
++  it("a message id that is not in this channel is a 404 (FR-014)", async () => {
 +    // The pair above shares a tenant boundary. This one does not: both channels belong
 +    // to this environment and the message belongs to the other one, so the only thing
 +    // that can refuse it is the route checking the message against the channel in the
@@ -3401,7 +3454,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
 +    expect(res.status).toBe(404);
 +  });
 +
-+  it("T024: a non-member of a private channel gets the not-found envelope, not a 403 (FR-014)", async () => {
++  it("a non-member of a private channel gets the not-found envelope, not a 403 (FR-014)", async () => {
 +    // WRITTEN BECAUSE THE FALSIFICATION CAME BACK GREEN. Removing `channelVisibleTo`
 +    // from `messages.service.edit` broke nothing: `editMessage`'s join already carries
 +    // the environment, so a FOREIGN channel refuses either way, and the foreign/missing
@@ -3451,7 +3504,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
 +      headers: { authorization: `Bearer ${auth}` },
 +    });
 +
-+  it("T033d: the edit history reads back oldest first, through the route (SC-002)", async () => {
++  it("the edit history reads back oldest first, through the route (SC-002)", async () => {
 +    // THROUGH THE ROUTE AND NOT THE DATABASE. `repository.itest.ts` proves the rows
 +    // exist; only this proves anybody can retrieve them — the distinction CLAUDE.md
 +    // records as "a repository test proves a check exists; only a route test proves it
@@ -3471,7 +3524,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
 +    for (const entry of body.edits) expect(typeof entry.edited_at).toBe("string");
 +  });
 +
-+  it("T033e: an end user is refused, including the message's author (FR-023a, SC-002a)", async () => {
++  it("an end user is refused, including the message's author (FR-023a, SC-002a)", async () => {
 +    // THE AUTHOR IS THE CASE THAT MATTERS. A refusal that let the author through would
 +    // look reasonable and would still be the leak: an end user who can see a channel
 +    // can see every message in it, so "only your own" is not a narrowing at all once a
@@ -3498,7 +3551,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
 +    ).toEqual(["before"]);
 +  });
 +
-+  it("T033f: a message with no edits answers 200 and an empty list, not 404", async () => {
++  it("a message with no edits answers 200 and an empty list, not 404", async () => {
 +    // The absence of edits is a fact about the message, not the absence of a resource.
 +    const sent = await sendAsAuthor("never edited");
 +    const res = await edits(sent.id, credential);
@@ -3506,7 +3559,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
 +    expect((await res.json()) as unknown).toEqual({ edits: [] });
 +  });
 +
-+  it("T033f: a message id that does not exist IS a 404, which is the other half", async () => {
++  it("a message id that does not exist IS a 404, which is the other half", async () => {
 +    // Without this, `{ edits: [] }` would be the answer for a message that was never
 +    // there — and the route would be unable to tell a caller which of the two it got.
 +    // `listMessageEdits` returning `[]` cannot distinguish them; `messageExistsIn` is
@@ -3515,12 +3568,12 @@ describe("the revision fabric payload (chapter 3.23)", () => {
 +    expect(res.status).toBe(404);
 +  });
 +
-+  it("T033f: the edit history of a foreign channel's message is a 404", async () => {
++  it("the edit history of a foreign channel's message is a 404", async () => {
 +    const res = await edits(randomUUID(), credential, foreignChannelId);
 +    expect(res.status).toBe(404);
 +  });
 +
-+  it("T036a: editing a message to the text it already has is still an edit (FR-021)", async () => {
++  it("editing a message to the text it already has is still an edit (FR-021)", async () => {
 +    // THE PLATFORM DOES NOT COMPARE TEXTS, and the spec says why: every definition of
 +    // equality — whitespace, case, unicode normalisation, an invisible character — is a
 +    // decision a customer would have to be told about. So an identical edit records an
@@ -3570,7 +3623,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
 +      headers: { authorization: `Bearer ${auth}` },
 +    });
 +
-+  it("T038: the author deletes their message and the row becomes a tombstone (FR-006)", async () => {
++  it("the author deletes their message and the row becomes a tombstone (FR-006)", async () => {
 +    const sent = await sendAsAuthor("regrettable");
 +    const res = await remove(sent.id, await tokenFor("author"));
 +    expect(res.status).toBe(204);
@@ -3585,7 +3638,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
 +    expect(rows[0]!["user"]).toBe("author");
 +  });
 +
-+  it("T038: a tenant API key deletes anybody's message (FR-012)", async () => {
++  it("a tenant API key deletes anybody's message (FR-012)", async () => {
 +    // FR-MOD-02 grants a key deletion of any message irrespective of author, and this
 +    // route is the one place in the chapter where the class-level
 +    // `@Accepts("application", "user")` is CORRECT rather than inherited by accident.
@@ -3595,7 +3648,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
 +    expect(rows[0]!["text"]).toBeNull();
 +  });
 +
-+  it("T038: an end user may not delete somebody else's message (FR-013)", async () => {
++  it("an end user may not delete somebody else's message (FR-013)", async () => {
 +    const sent = await sendAsAuthor("not yours to remove");
 +    const res = await remove(sent.id, await tokenFor("bystander"));
 +    expect(res.status).toBe(403);
@@ -3606,7 +3659,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
 +    expect(rows[0]!["text"]).toBe("not yours to remove");
 +  });
 +
-+  it("T043: deleting twice answers 204 twice, changes nothing, and emits ONE event (FR-009, SC-007)", async () => {
++  it("deleting twice answers 204 twice, changes nothing, and emits ONE event (FR-009, SC-007)", async () => {
 +    // TWO 204s PROVE NOTHING — idempotence is about what the second call DID, and the
 +    // answer is the same either way. The event count is the assertion that carries the
 +    // requirement, read straight out of the outbox: a second `message.deleted` there
@@ -3628,7 +3681,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
 +    expect(events).toBe(1);
 +  });
 +
-+  it("T044: editing a tombstone is refused with message_deleted, and a stranger is refused first (FR-010)", async () => {
++  it("editing a tombstone is refused with message_deleted, and a stranger is refused first (FR-010)", async () => {
 +    const sent = await sendAsAuthor("about to go");
 +    const token = await tokenFor("author");
 +    expect((await remove(sent.id, token)).status).toBe(204);
@@ -3645,7 +3698,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
 +    expect(((await asStranger.json()) as { code: string }).code).toBe("not_message_author");
 +  });
 +
-+  it("T038: deleting a message of a channel this tenant cannot see is a 404 (FR-014)", async () => {
++  it("deleting a message of a channel this tenant cannot see is a 404 (FR-014)", async () => {
 +    const token = await tokenFor("author");
 +    const foreign = await remove(randomUUID(), token, foreignChannelId);
 +    const missing = await remove(randomUUID(), token, randomUUID());
@@ -3656,7 +3709,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
 +    );
 +  });
 +
-+  it("T038: a non-member of a private channel gets the not-found envelope on DELETE too (FR-014)", async () => {
++  it("a non-member of a private channel gets the not-found envelope on DELETE too (FR-014)", async () => {
 +    // The same leak the edit route's test covers, on the other verb — and worth its own
 +    // test because the two routes resolve visibility separately.
 +    const authorToken = await tokenFor("author");
@@ -3675,7 +3728,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
 +    expect((await remove(inside.id, credential, privateChannelId)).status).toBe(204);
 +  });
 +
-+  it("T052: a key's tombstone is the SAME tombstone an author's deletion produces (FR-012, SC-004)", async () => {
++  it("a key's tombstone is the SAME tombstone an author's deletion produces (FR-012, SC-004)", async () => {
 +    // NOT "both are null". Two messages, one deleted by its author and one by the
 +    // tenant key, compared field by field through the read path — because FR-012 grants
 +    // a key deletion of any message and SC-004 asks that the content be gone from every
@@ -3704,7 +3757,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
 +    expect(b["user"]).toBe("author");
 +  });
 +
-+  it("T054: an end user who is not the author is refused on BOTH routes (FR-013)", async () => {
++  it("an end user who is not the author is refused on BOTH routes (FR-013)", async () => {
 +    // ONE TEST FOR THE PAIR, because FR-013 is one requirement covering both verbs and
 +    // the two paths reach the refusal through different methods. Same code, same status,
 +    // and nothing written either way.
@@ -3722,7 +3775,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
 +    expect(rows[0]!["edited_at"]).toBeNull();
 +  });
 +
-+  it("T055: another environment's message is 404 on both routes, never 403 (FR-014)", async () => {
++  it("another environment's message is 404 on both routes, never 403 (FR-014)", async () => {
 +    // 403 WOULD BE THE LEAK. A permission refusal on a foreign id says the id is real;
 +    // chapter 2.8 made a foreign channel a 404 for exactly this, and the pair below is
 +    // the assertion the isolation oracle makes everywhere else in this file.
@@ -3741,7 +3794,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
 +    }
 +  });
 +
-+  it("T069: an edit writes exactly one message.updated event, and a second edit writes a second (FR-019)", async () => {
++  it("an edit writes exactly one message.updated event, and a second edit writes a second (FR-019)", async () => {
 +    // THE COUNTERPART TO T043, AND THE OPPOSITE ANSWER. A repeated deletion writes no
 +    // second event because the row did not change (FR-009); a repeated edit writes one
 +    // every time, because FR-021 says the platform does not compare texts and every
@@ -3765,7 +3818,37 @@ describe("the revision fabric payload (chapter 3.23)", () => {
 +    expect(await outboxCount(sent.id, "message.updated")).toBe(2);
 +  });
 +
-+  it("T024: an empty text is a 400 through the protocol envelope (FR-001)", async () => {
++  it("refuses a token minted for an identifier with no user row, on all three routes", async () => {
++    // THE SAME ARM THE SEND PATH ALREADY TESTS, on the three routes this chapter adds
++    // and on the history route beside them. `mintUserToken` signs a token for any
++    // identifier; `POST /auth/dev-token` creates the row at mint time (FR-039a) and this
++    // suite does not go through it, so a subject with no row is still reachable — and it
++    // is the arm every one of these handlers has, because resolving the caller is the
++    // first thing each of them does.
++    //
++    // WRITTEN BECAUSE THE RATCHET NAMED IT. `messages.controller.ts` fell from 100% lines
++    // to 93.61% when this chapter added two more copies of that resolution, and the
++    // uncovered statements were exactly these throws.
++    const stranger = await tokenFor("never-seen-before");
++    const sent = await sendAsAuthor("something to aim at");
++
++    const edited = await patch(sent.id, { text: "x" }, stranger);
++    const removed = await remove(sent.id, stranger);
++    const read = await fetch(`${url}/v1/channels/${channelId}/messages?limit=1`, {
++      headers: { authorization: `Bearer ${stranger}` },
++    });
++
++    expect([edited.status, removed.status, read.status]).toEqual([400, 400, 400]);
++    expect(((await edited.json()) as { code: string }).code).toBe("invalid_request");
++    expect(((await removed.json()) as { code: string }).code).toBe("invalid_request");
++    // AND NOTHING WAS WRITTEN. A 400 raised after the write would pass every assertion
++    // above.
++    const rows = (await history()).messages.filter((m) => m["id"] === sent.id);
++    expect(rows[0]!["text"]).toBe("something to aim at");
++    expect(rows[0]!["edited_at"]).toBeNull();
++  });
++
++  it("an empty text is a 400 through the protocol envelope (FR-001)", async () => {
 +    const sent = await sendAsAuthor("something");
 +    const res = await patch(sent.id, { text: "" }, await tokenFor("author"));
 +    expect(res.status).toBe(400);
@@ -3793,7 +3876,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
 +  // The gateway's half is that it replays what it was handed, which `resume.itest.ts`
 +  // does test, with a stub that says so.
 +
-+  it("T058: a message ABOVE the cursor, edited while away, replays with its CURRENT text (FR-016)", async () => {
++  it("a message ABOVE the cursor, edited while away, replays with its CURRENT text (FR-016)", async () => {
 +    // THE BACKFILL READS ROWS, IT DOES NOT REPLAY A LOG. That is the whole of FR-016's
 +    // answer and it is a property of the query rather than a feature anybody built: the
 +    // superseded text lives in `message_edits`, which no read path on this route
@@ -3811,7 +3894,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
 +    expect(page.messages.map((m) => m.text)).not.toContain("the frist draft");
 +  });
 +
-+  it("T059: a message DELETED while away is not replayed at all (FR-016)", async () => {
++  it("a message DELETED while away is not replayed at all (FR-016)", async () => {
 +    // `backfill.controller.ts`'s `toFrame` already drops a null-text row and its comment
 +    // says why: a tombstone is not a creation, and there is no truthful `text` to
 +    // invent. **This is the first test with a real writer behind that line** — the
@@ -3834,7 +3917,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
 +    expect(page.messages.map((m) => m.seq)).not.toContain(gone.seq);
 +  });
 +
-+  it("T059a: truncation is reported as the READ found it, tombstones and all", async () => {
++  it("truncation is reported as the READ found it, tombstones and all", async () => {
 +    // `backfill.controller.ts:64` decided this and says why — *"dropping an unrenderable
 +    // row does not mean the client should go page history, and hiding a real cap
 +    // would"* — and `repository.ts` computes it as `rows.length > limit`. **The decision
@@ -3857,7 +3940,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
 +    expect(page.messages.length).toBe(BACKFILL_LIMIT - 1);
 +  }, 120_000);
 +
-+  it("T060: a message BELOW the cursor, edited while away, produces no frame and no gap (FR-016a)", async () => {
++  it("a message BELOW the cursor, edited while away, produces no frame and no gap (FR-016a)", async () => {
 +    // THE SOFT EDGE IN THE CONTRACT, demonstrated rather than asserted. Resume is
 +    // ordered by the channel sequence alone: a message older than the cursor is not in
 +    // the page whatever happened to it, so an edit below the cursor is invisible.
@@ -3885,7 +3968,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
 +    for (let i = 1; i < seqs.length; i += 1) expect(seqs[i]! - seqs[i - 1]!).toBe(1);
 +  });
 +
-+  it("T061: re-reading the range through history repairs it (SC-006)", async () => {
++  it("re-reading the range through history repairs it (SC-006)", async () => {
 +    // THE DOCUMENTED REPAIR, end to end. A client away across an edit below its cursor
 +    // and a deletion above it re-reads the range and ends with what a client that never
 +    // left is holding: the current text for the edit, and a tombstone for the deletion.
@@ -3958,7 +4041,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
      expect(await timesHandled(db, DISPATCHER, e.eventId)).toBe(1);
    });
  
-+  it("T069: a subscriber to the two new message events is told about an edit and a deletion (FR-019, SC-011)", async () => {
++  it("a subscriber to the two new message events is told about an edit and a deletion (FR-019, SC-011)", async () => {
 +    // **`seedEndpoint` IS PARAMETERISED AND EVERY EXISTING CALL SITE PASSES
 +    // `["message.created"]`.** A test that forgot to pass the new types would seed an
 +    // endpoint subscribed to creations, receive nothing, and read as though the
@@ -4184,7 +4267,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
 +   * would pass on a list that had quietly lost a member, which is the failure mode this
 +   * repository has paid for five times — a pattern matching the examples in front of it
 +   * rather than the set the rule names. */
-+  it("T049a: sends every one of FR-RTM-05's six event kinds from this service", async () => {
++  it("names every one of FR-RTM-05's six event kinds in a send position in session.ts", async () => {
 +    const source = await readFile(new URL("session.ts", import.meta.url), "utf8");
 +
 +    // FR-RTM-05's six, in its own order, mapped to the frame type this service sends.
@@ -4277,7 +4360,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
      await raw.fanout.close();
    });
  
-+  it("T018h: delivers an edit on the revision subject and NOT on the message one", async () => {
++  it("delivers an edit on the revision subject and NOT on the message one", async () => {
 +    // Chapter 3.23, ADR-24. The `updated` arm's payload is a `Message`, which is exactly
 +    // why this test names both callbacks. Route on the wrong one and an edit is shown to
 +    // every member as a brand new message — and nothing about its shape would say so.
@@ -4297,7 +4380,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
 +    await g2.fanout.unsubscribe(CHANNEL);
 +  });
 +
-+  it("T018h: delivers a deletion, which cannot be a message at all", async () => {
++  it("delivers a deletion, which cannot be a message at all", async () => {
 +    await g2.fanout.subscribe(CHANNEL);
 +    g2.deliveries.length = 0;
 +    await g1.fanout.publishRevision({
@@ -4318,7 +4401,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
 +    await g2.fanout.unsubscribe(CHANNEL);
 +  });
 +
-+  it("T018h: one subscribe covers both subjects, and one unsubscribe drops both", async () => {
++  it("one subscribe covers both subjects, and one unsubscribe drops both", async () => {
 +    // The reference count is shared by construction. The test that carries it is the
 +    // NEGATIVE one: after the last holder leaves, a revision must go nowhere. Two counts
 +    // would leave the revision subject subscribed after the message one closed.
@@ -4339,7 +4422,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
 +    await expect(nextDelivery(g2, 300)).rejects.toThrow("deadline");
 +  });
 +
-+  it("T018h: drops a revision the contract does not allow", async () => {
++  it("drops a revision the contract does not allow", async () => {
 +    // A deletion carrying a text is the malformed case that matters: it is what a producer
 +    // reaching for `messageSchema` would emit, and `strictObject` is what refuses it.
 +    await g2.fanout.subscribe(CHANNEL);
@@ -4516,7 +4599,7 @@ describe("the revision fabric payload (chapter 3.23)", () => {
 +   * to a real socket as `message.updated` — not as `message.created`, which is the
 +   * failure the whole ADR exists to prevent and which no shape check can see, because
 +   * the updated arm's payload IS a `Message`. */
-+  it("edits a message over REST, and a member's socket hears message.updated", async () => {
++  it("edits a message over REST, and a member's socket hears message.updated exactly once, with no second creation", async () => {
 +    const minted = await post(
 +      "/auth/dev-token",
 +      { user: "watcher", ttl_seconds: 3600 },
@@ -4609,6 +4692,68 @@ describe("the revision fabric payload (chapter 3.23)", () => {
    it("cannot see another tenant's channel, and cannot tell it apart from an absent one", async () => {
      // The documented isolation property, exercised the only way an outsider can:
      // with an id that is well formed and is not theirs. The reference says both
+```
+
+The coverage ratchet fired last, on `messages.controller.ts`, and its answer was to delete two
+things rather than test them: a `?? "unknown"` on the deletion frame's author, which was
+unreachable **and** would have put that word on the wire as somebody's name, and three copies
+of the same two context fallbacks, one per publish site. Branches finished above where the
+chapter found them, so the pin went up.
+
+```diff title="vitest.coverage.config.mts"
+@@ -422,11 +422,49 @@ export default defineConfig({
+         // `text` as non-nullable and a null would publish a frame the delivery side
+         // drops silently. A guard against a state the type system forbids is cheap; the
+         // alternative is a silent drop.
++        // CHAPTER 3.23 MOVED THIS FILE IN BOTH DIRECTIONS, and the branch number is the
++        // one worth reading. The chapter added two routes to it — an edit and a deletion,
++        // each resolving a caller, each publishing — and the first measurement after that
++        // was **91.66 / 78.84 / 100 / 93.61** against pins of 96 / 87 / 100 / 100. Three
++        // of four red.
++        //
++        // WHAT WAS TESTED, and it was the largest part: every one of those routes throws
++        // a 400 when the token's subject has no user row, and nothing exercised it. The
++        // send path had had that test since chapter 3.15; the two new routes and the
++        // history route beside them did not. One test covering all three took lines to
++        // 97.87 and branches to 84.61.
++        //
++        // WHAT WAS REMOVED RATHER THAN TESTED, which is the ratchet's preferred outcome
++        // and the fifth time it has produced one:
++        //
++        //   - `deleted.user ?? "unknown"` on the deletion frame. `deleteMessage` refuses
++        //     a senderless row (FR-018 of 3.23) before it can return, so the arm was
++        //     unreachable — AND the value it would have produced was a lie: the word
++        //     "unknown" on the wire as somebody's name. The narrowing moved to the
++        //     repository, where the foreign-key argument for it lives.
++        //   - Three copies of `req.requestId ?? "unknown"` and
++        //     `req.principal?.environmentId ?? "unknown"`, one per publish site, which is
++        //     six uncovered arms for two distinct ones. `publishContext(req)` is one
++        //     function called three times. The fallbacks stay — a log line saying
++        //     `unknown` is findable where one saying `undefined` reads like a broken
++        //     logger — but the count stops growing with every route that publishes.
++        //
++        // Branches finished at **92.85, above the 87 this chapter inherited**, so the pin
++        // goes UP to 92 — 0.85 of headroom, the same margin chapter 3.17 left on
++        // `repository.ts` at 92.59.
++        //
++        // LINES DROP FROM 100 TO 97, and the one uncovered statement is named: the
++        // narrowing throw in `edit`, which fires when a request reaches that handler with
++        // no user subject. `@Accepts("user")` on the method means the guard has already
++        // refused every credential that could produce it, so it is unreachable while that
++        // decorator is there — and it is there to be loud if somebody removes it. A `!`
++        // would restore 100% by moving the assumption somewhere a decorator change
++        // cannot invalidate, which is the trade this file declines to make.
+         "services/api/src/messages/messages.controller.ts": {
+-          branches: 87,
++          branches: 92,
+           functions: 100,
+-          lines: 100,
+-          statements: 96,
++          lines: 97,
++          statements: 97,
+         },
+ 
+         "services/api/src/webhooks/disable.ts": {
 ```
 
 <Checkpoint>
