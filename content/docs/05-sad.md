@@ -568,6 +568,53 @@ key must not erase this one.
 audit log — actor, action, target, timestamp, request id, retained a year, across every
 moderation action — and a single mutable column on the row it describes is not one.
 
+**What `messages.attachments` holds (added 2026-09-04, chapter 3.24).** §6.1 declares
+`attachments JSONB` and this document said nothing about it — the same omission chapter
+3.23 filled for `messages.metadata` above, in the same table, one column across.
+
+It holds an array of objects, or `NULL`:
+
+    [ { "type": "url", "kind": "image" | "audio" | "video", "url": "https://…" } ]
+
+**`NULL` and `[]` are different values, and only one of them is written.** A message with
+no attachments stores `NULL`; `[]` is what every read path returns for it (FR-MSG-11's
+external-URL half, chapter 3.24 FR-007), so a client needs no special case and the
+platform keeps the distinction between *no attachments* and *a list that happens to be
+empty*. Exactly one place converts — the map in `listMessages` — and three tests hold it
+there.
+
+**The platform stores a reference and never fetches it.** No bytes cross Relay compute;
+the URL is a string it hands back. That is §4.14's whole premise, and it is why a `data:`
+or `javascript:` URL is refused at the boundary rather than sanitised somewhere later: the
+allowed schemes are `http` and `https`, checked with a URL parser rather than a prefix
+match.
+
+**Bounds.** Ten attachments per message and 2,048 characters per URL — the second takes
+the platform's only precedent for a stored URL, `users.avatar_url`, capped at 2,048 since
+chapter 3.16. Multiplied, that is about 20 KB of attachment on a message whose text may be
+8,000 characters and whose metadata may be 4 KB.
+
+**What each read path does with the column (SC-006, chapter 3.24).** Six shapes return a
+message and they do not agree, which is a fact about this codebase rather than a design:
+
+| Read | Carries attachments |
+|---|---|
+| `listMessages` — history, and the resume replay | yes, `[]` when the column is `NULL` |
+| `getMessageByIdempotencyKey` — the retry replay | yes |
+| `editMessage`'s internal read | yes, so the edit event carries what the message has |
+| `deleteMessage`'s internal read | no — a tombstone's attachments are unlinked |
+| `listMessagesRaw` | no — a test-only helper returning `id`, `seq`, `text` |
+| `listChannelsForUser.last_message` | no — a preview shows what was said |
+
+**An edit does not change them** (FR-MSG-07 changes message *text*), and `message_edits`
+keeps the three columns this document publishes: an edit records what the text WAS and
+says nothing about attachments, because nothing about them changed.
+
+**A deletion unlinks them.** The tombstone's column becomes `NULL` alongside its text, and
+the `message.deleted` event carries no attachment field at all — for the reason it carries
+no text: a payload with the field can carry what somebody asked to have removed, and a URL
+is exactly as recoverable.
+
 **What reads it: nothing.** Not the history route, not the channel listing, not the
 `message.deleted` frame, not the webhook event. The frame and the event carry the message's
 AUTHOR, deliberately, because a client already holds that name beside the message. So the

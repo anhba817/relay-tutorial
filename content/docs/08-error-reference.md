@@ -171,6 +171,33 @@ where a more specific code exists — `wrong_credential_type`, `wrong_credential
 **What to do:** nothing the client can retry. This is a change of credential or of
 permission.
 
+## media_not_available
+
+**Status:** 422 · **Retryable:** no
+
+The attachment named `{"type": "media", "media_id": …}`, and Relay does not host media yet.
+Attach an `http` or `https` URL instead: `{"type": "url", "kind": "image", "url": "…"}`.
+
+**This is not a mistake in your request**, which is why it is not `invalid_request`.
+FR-MSG-11 publishes both ways to attach and only one of them is built, so a developer
+reading the clause and sending a `media_id` has done exactly what the contract describes.
+An `invalid_request` would send them to check their JSON, and there is nothing there to
+find.
+
+**Status 422 and not 400** for the same reason: the request is well-formed and understood,
+and what cannot be done is the thing it asks for.
+
+**Over a WebSocket the code is `invalid_frame`**, carrying this same sentence in its
+`message`. The gateway validates the frame before the API sees it and answers with the one
+code every malformed frame gets, so the sentence is what distinguishes this case there.
+
+**What to do:** send the attachment as a URL you host, using the `url` arm — Relay stores a
+reference and never fetches it. If your media is already in Relay-hosted storage, there is
+nothing to wait for in your code: that half of FR-MSG-11 is not built, and this code is how
+you can tell.
+
+When hosted media ships, this code stops being emitted and this section goes with it.
+
 ## not_found
 
 **Status:** 404 · **Retryable:** no
