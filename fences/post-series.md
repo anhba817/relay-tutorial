@@ -2972,3 +2972,1096 @@ reads as fully covered. Constitution VI's 100%-branch clause is stated in exactl
            branches: 100,
            functions: 100,
 ```
+
+## Feature 043 — fixing the review's findings
+
+Not a chapter. `docs/09-platform-implementation-review-2026-09-03.md` recorded ten findings
+against `part3-ch24`, and Part 3 is closed, so nothing here teaches this work — it lands as
+amendments. Fourteen of the fifteen platform files it edits are fenced by a published chapter;
+the fifteenth, `services/gateway/src/limits.itest.ts`, is published only as an `(excerpt)`, so
+`check-fence-chain` never collects it and there is nothing here to amend. That is `gaps.md`
+3.22-3 in practice rather than in principle.
+
+
+The exemption for `reset-lane.itest.ts`. Constitution I forbids raw `pg` outside the repository
+layer, and `packages/test-harness/**` is exempt while its `.itest.ts` files are not — a later
+block overrides that, which the config says in a comment and then points at
+`DRIVER_EXEMPT_TESTS`. Counting organisations to prove a script did NOT delete them is a read no
+repository method offers.
+
+```diff title="eslint.config.mjs"
+@@ -60,6 +60,12 @@ const DRIVER_EXEMPT_TESTS = [
+   "services/api/src/db/history-drift.itest.ts",
+   // The harness IS data access (see the note on `packages/test-harness/**`).
+   "packages/test-harness/src/guard.itest.ts",
++  // Feature 043. `reset-lane.mjs` clears lane debris and must leave the seeded demo
++  // tenant alone — the constitution requires `docker compose up` to bring the stack
++  // up with one. Counting organisations to prove a script did NOT delete them is a
++  // read no repository method offers, and doing it through the repository layer would
++  // scope the count to one environment, which is the opposite of what it has to check.
++  "packages/test-harness/src/reset-lane.itest.ts",
+   // Redis, read with neither service's code, which is the whole subject: the api
+   // and the gateway must increment the SAME key.
+   "services/api/src/limits/limits.itest.ts",
+```
+
+The api logs the port it BOUND. `port` is the request — `Number(process.env.PORT ?? 4000)` — so
+under `PORT=0` this line reported `0` while the server listened elsewhere. A log stating a
+requested value as though it were assigned is wrong whether or not anybody reads it; that it also
+makes `PORT=0` usable by a harness is the second reason, not the first.
+
+```diff title="services/api/src/main.ts"
+@@ -39,7 +39,17 @@ async function bootstrap(): Promise<void> {
+   // Nest calls onModuleDestroy on shutdown hooks; without this the relay's loop
+   // would outlive the process's intent to stop.
+   app.enableShutdownHooks();
+-  createLogger("api").log("info", "listening", { port });
++  // THE PORT IT BOUND, NOT THE ONE IT ASKED FOR (feature 043, FR-002). `port` is the
++  // REQUEST — `Number(process.env.PORT ?? 4000)` — and with `PORT=0` the operating system
++  // assigns an ephemeral one, so this line used to report `0` while the server listened
++  // somewhere else. A log that states a requested value as though it were the assigned one
++  // is wrong whether or not anybody reads it; that it also makes `PORT=0` usable by a test
++  // harness is the second reason, not the first.
++  const bound = (app.getHttpServer() as { address(): { port: number } | string | null })
++    .address();
++  createLogger("api").log("info", "listening", {
++    port: typeof bound === "object" && bound !== null ? bound.port : port,
++  });
+ }
+ 
+ void bootstrap();
+```
+
+The same change, the same shape, in the gateway's entry point.
+
+```diff title="services/gateway/src/main.ts"
+@@ -151,7 +151,13 @@ if (import.meta.main) {
+   const port = Number(process.env.PORT ?? 4001);
+   const logger = createLogger("gateway");
+   const server = createServer(logger).listen(port, () => {
+-    logger.log("info", "listening", { port });
++    // THE PORT IT BOUND, NOT THE ONE IT ASKED FOR (feature 043, FR-002), and the api's
++    // entry point carries the same change for the same reason. With `PORT=0` this line
++    // used to report `0` while the server listened on an ephemeral port.
++    const bound = server.address();
++    logger.log("info", "listening", {
++      port: typeof bound === "object" && bound !== null ? bound.port : port,
++    });
+   });
+ 
+   // A GRACEFUL SHUTDOWN, WHICH THIS SERVICE DID NOT HAVE (research R11, FR-RTL-05).
+```
+
+**The edit's UPDATE became a compare-and-set, and it closes a defect the record said was not
+there.** `gaps.md` 3.23-3 asserted that both orderings of a concurrent edit and deletion end in a
+tombstone. They do not: the edit read the row, threw if it was deleted, and then updated
+`WHERE id = ?` unconditionally, so a deletion committing in that window was overwritten —
+`deleted_at` set with `text` present, four such rows left in the lane. Three runs in five.
+
+```diff title="services/api/src/db/repository.ts"
+@@ -4537,12 +4537,33 @@ export class Repository {
+       // would be two instants, and the history row's own primary key is
+       // (message_id, edited_at), so a caller reading the history could not match an
+       // entry to the message state it produced.
++      // THE WRITE REFUSES, NOT ONLY THE READ (feature 043, FR-007).
++      //
++      // This was `.where(eq(messages.id, messageId))`, and the `row.text === null`
++      // check above it is a read taken earlier in the same transaction. Neither this
++      // method nor `deleteMessage` takes a row lock, so a deletion committing in that
++      // window left the edit free to overwrite it: `text` restored, `deleted_at` still
++      // set — **a row one filter calls deleted and another calls alive**, and a
++      // deletion that returned successfully undone by an edit already in flight.
++      //
++      // `gaps.md` 3.23-3 recorded the opposite — *"both interleavings end in a
++      // tombstone… there is no order of the two that leaves a message saying something
++      // nobody wrote"* — and the test that item asked for is what disproved it: three
++      // of five runs, and four incoherent rows left behind in the lane.
++      //
++      // A COMPARE-AND-SET, NOT A LOCK. `SELECT … FOR UPDATE` in both methods would
++      // close it too, and would serialise a pair `assertWithinQuota` deliberately
++      // declined to serialise on the send path. A conditional UPDATE costs nothing
++      // when there is no race and refuses exactly when there is one: zero rows
++      // affected means the row stopped being editable between the read and the write,
++      // which is what `MessageDeletedError` already says.
+       const [updated] = await tx
+         .update(messages)
+         .set({ text, editedAt: sql`now()` })
+-        .where(eq(messages.id, messageId))
++        .where(and(eq(messages.id, messageId), isNull(messages.deletedAt)))
+         .returning({ editedAt: messages.editedAt });
+-      const editedAt = updated!.editedAt!;
++      if (!updated) throw new MessageDeletedError(messageId);
++      const editedAt = updated.editedAt!;
+ 
+       // FR-004. The row carries what the message said BEFORE this edit — `row.text`,
+       // read above and narrowed to a string by the tombstone check.
+```
+
+The four tests that found it. Three cover the orderings; the fourth reproduces the guard's case
+deterministically, because a race cannot be commanded and an assertion that one happened proved
+flaky in one run of three.
+
+```diff title="services/api/src/db/repository.itest.ts"
+@@ -1424,3 +1424,140 @@ describe("the read shapes that do NOT carry attachments (FR-009 (3.24))", () =>
+     expect(Object.keys(rows[0]!).sort()).toEqual(["id", "seq", "text"]);
+   });
+ });
++
++// A CONCURRENT EDIT AND DELETION OF ONE MESSAGE (feature 043, FR-007).
++//
++// `gaps.md` 3.23-3 has carried this since chapter 3.23 built both writes. Neither takes
++// a row lock — no `FOR UPDATE`, following `assertWithinQuota`'s recorded decision to
++// state an overshoot rather than engineer around it — so the two orderings are not
++// symmetrical, and the claim that has never been tested is that **both of them end in a
++// tombstone**. Not the outcome: the claim.
++//
++// DO NOT START FROM `Promise.all` ON ONE CLIENT. Chapter 3.22 spent a phase learning
++// that two operations issued on one connection serialise at the socket, so a test built
++// that way proves the code cannot race by never letting it. The third case below uses
++// TWO POOLS, which is what that chapter found it needed.
++describe("a concurrent edit and deletion (feature 043, FR-007)", () => {
++  const seed = async (label: string) => {
++    const author = await repoA.createUser(`${label}-author`, "Author");
++    const channel = await repoA.createChannel(label, "public");
++    await repoA.addMember(channel.id, author.id);
++    const sent = await repoA.sendMessage(channel.id, {
++      text: "the original",
++      userId: author.id,
++    });
++    return { author, channel, sent };
++  };
++
++  const tombstoned = async (id: string) => {
++    const [row] = (
++      await db.execute<{ text: string | null; deleted_at: Date | null }>(
++        sql`SELECT text, deleted_at FROM messages WHERE id = ${id}`,
++      )
++    ).rows;
++    return row!.text === null && row!.deleted_at !== null;
++  };
++
++  it("delete then edit: the edit is refused and the tombstone stands", async () => {
++    const { author, channel, sent } = await seed("race-de");
++    await repoA.deleteMessage(channel.id, sent.id, { userId: author.id });
++    await expect(
++      repoA.editMessage(channel.id, sent.id, { text: "too late", userId: author.id }),
++    ).rejects.toThrow(MessageDeletedError);
++    expect(await tombstoned(sent.id)).toBe(true);
++  });
++
++  it("edit then delete: the tombstone stands and the history keeps what the edit superseded", async () => {
++    const { author, channel, sent } = await seed("race-ed");
++    await repoA.editMessage(channel.id, sent.id, { text: "corrected", userId: author.id });
++    await repoA.deleteMessage(channel.id, sent.id, { userId: author.id });
++    expect(await tombstoned(sent.id)).toBe(true);
++
++    // THE HISTORY ROW HOLDS THE TEXT THE EDIT SUPERSEDED, and that is correct rather
++    // than a leak: the edit did happen, and `message_edits` records what was replaced.
++    // A deletion removes the message's text; it does not rewrite the fact that an edit
++    // occurred before it.
++    const [edit] = (
++      await db.execute<{ prior_text: string }>(
++        sql`SELECT prior_text FROM message_edits WHERE message_id = ${sent.id}`,
++      )
++    ).rows;
++    expect(edit!.prior_text).toBe("the original");
++  });
++
++  it("both at once from two separate pools: whichever lands first, the message ends a tombstone", async () => {
++    // TWO POOLS, NOT TWO CALLS. `poolB` is a second connection pool with its own
++    // sockets, so the two statements are genuinely in flight together instead of being
++    // serialised by one client's write queue.
++    const poolB = createPool();
++    const dbB = createDb(poolB);
++    const repoB2 = new Repository(dbB, envA.id);
++    // WHICH ORDERING ACTUALLY HAPPENED, COUNTED AND REPORTED. The assertions below
++    // hold whether the edit lands first or the deletion does — which is the property,
++    // and also exactly how a test passes while exercising one branch and never the
++    // other. Counting is how a reader learns which case the run covered.
++    let editRefused = 0;
++    try {
++      // Ten attempts rather than one. A race asserted once is a race observed once,
++      // and the outcome is the same either way — which is the property.
++      for (let i = 0; i < 10; i++) {
++        const { author, channel, sent } = await seed(`race-both-${String(i)}`);
++        const results = await Promise.allSettled([
++          repoA.editMessage(channel.id, sent.id, {
++            text: `corrected ${String(i)}`,
++            userId: author.id,
++          }),
++          repoB2.deleteMessage(channel.id, sent.id, { userId: author.id }),
++        ]);
++
++        // The deletion always wins the row: it is the only one of the two that can
++        // refuse the other, and the edit's refusal is `MessageDeletedError`.
++        expect(await tombstoned(sent.id), `attempt ${String(i)}`).toBe(true);
++
++        const edit = results[0];
++        if (edit.status === "rejected") {
++          editRefused++;
++          expect(edit.reason).toBeInstanceOf(MessageDeletedError);
++        }
++        // And the deletion never fails: FR-009 makes a second one idempotent, and a
++        // concurrent edit is not a reason to refuse the first.
++        expect(results[1].status, `attempt ${String(i)}`).toBe("fulfilled");
++      }
++    } finally {
++      await poolB.end();
++    }
++    // WHAT THIS TEST CANNOT PROMISE, SAID OUT LOUD. `editRefused` counts the attempts
++    // where the deletion won, and it is NOT asserted to be greater than zero: measured
++    // over three runs it was zero in one of them, so requiring a race would make this
++    // flaky about one run in three. **A race cannot be commanded, so the test does not
++    // claim it happened.**
++    //
++    // The evidence that the interleaving is real is a measurement, not this assertion:
++    // before the compare-and-set went into `editMessage`, this same test failed in
++    // three runs of five, at attempts 3, 8 and 3, and left four rows in the lane with
++    // `deleted_at` set and `text` present. What survives here is the invariant — the
++    // message ends a tombstone whichever way the two land — and the deterministic
++    // proof of the guard is the test below.
++    expect(editRefused).toBeGreaterThanOrEqual(0);
++  }, 60_000);
++
++  it("the edit's UPDATE refuses a tombstone even if the read said otherwise", async () => {
++    // THE GUARD, DETERMINISTICALLY. The test above can only hit the compare-and-set
++    // when the two writes genuinely interleave, which no test can force. This one
++    // reproduces the state that predicate exists for — a row deleted after the edit's
++    // read — by deleting first and then issuing exactly the statement `editMessage`
++    // issues. Zero rows affected is what makes it throw `MessageDeletedError` instead
++    // of overwriting the tombstone.
++    const { author, channel, sent } = await seed("race-guard");
++    await repoA.deleteMessage(channel.id, sent.id, { userId: author.id });
++
++    const affected = await db.execute(
++      sql`UPDATE messages SET text = 'resurrected', edited_at = now()
++          WHERE id = ${sent.id} AND deleted_at IS NULL`,
++    );
++    expect(affected.rowCount).toBe(0);
++
++    // And the row is untouched: still a tombstone, still no text.
++    expect(await tombstoned(sent.id)).toBe(true);
++  });
++});
+```
+
+**Port 0 and a teardown that waits.** Every child now binds an ephemeral port and the harness
+reads the assignment out of the child's own `listening` line — from the buffer `capture` already
+filled and only ever used for a failure message. `stop()` waits for each child with a one-second
+grace then SIGKILL: the api holds its listener for all 5,035 ms of a graceful exit, so awaiting
+one cost 30.56 s on a lane with 5.39 s of headroom.
+
+```diff title="packages/e2e/src/harness.ts"
+@@ -349,6 +349,38 @@ export async function boot({ gateways = 2 } = {}): Promise<System> {
+     });
+     return child;
+   };
++  /** THE PORT THE CHILD ACTUALLY BOUND (feature 043, FR-002).
++   *
++   * Every child is spawned with `PORT=0`, so the operating system assigns one nothing
++   * else holds and there is no range to register, collide with, or maintain by hand.
++   * The value comes back out of the child's own `listening` line, which
++   * `services/api/src/main.ts` and `services/gateway/src/main.ts` were changed to
++   * report correctly — both used to log the port they ASKED for, which is `0`.
++   *
++   * IT READS THE BUFFER `capture` ALREADY FILLS. `gaps.md` 3.22-6 counts eleven files
++   * that spawn a child and six that discard its output entirely; this one captured it
++   * and used it for a failure message only. Now it is load-bearing.
++   *
++   * The alternative was a fixed port, which collides always under contention, or a
++   * random one from a band, which `session.itest.ts:133` draws and chapter 3.23
++   * measured as self-colliding 2.96% of runs. Binding 0 cannot collide at all. */
++  const boundPort = async (name: string, timeoutMs = 30_000): Promise<number> => {
++    const deadline = Date.now() + timeoutMs;
++    for (;;) {
++      for (const line of output.get(name) ?? []) {
++        const m = /"msg":"listening","port":(\d+)/.exec(line);
++        if (m) return Number(m[1]);
++      }
++      if (Date.now() > deadline) {
++        throw new Error(
++          `${name} never reported a listening port within ${timeoutMs}ms\n` +
++            (output.get(name) ?? []).slice(-12).join("\n"),
++        );
++      }
++      await new Promise((r) => setTimeout(r, 50));
++    }
++  };
++
+   const dump = (what: string) => {
+     const lines = [`${what}; child output follows:`];
+     for (const [name, log] of output) {
+@@ -408,33 +440,40 @@ export async function boot({ gateways = 2 } = {}): Promise<System> {
+     RELAY_DELIVERY_RELAY: "off",
+   };
+ 
+-  const apiPort = Number(process.env.RELAY_E2E_API_PORT ?? 4100);
++  // `RELAY_E2E_API_PORT` IS GONE, AND SO IS THE 4100 BEHIND IT (feature 043, FR-002).
++  // A fixed default put three ports inside a range `limits.itest.ts` registers to
++  // itself, unlisted in that file's map; `PORT=0` needs no map and no variable.
+   children.push(
+     capture(
+       "api",
+       spawn("node", [join(REPO, "services", "api", "dist", "main.js")], {
+-        env: { ...env, PORT: String(apiPort) },
++        env: { ...env, PORT: "0" },
+         stdio: ["ignore", "pipe", "pipe"],
+       }),
+     ),
+   );
++  const apiPort = await boundPort("api");
+   const apiUrl = `http://127.0.0.1:${apiPort}`;
+   await waitForHealth(`${apiUrl}/healthz`, "api");
+   say(`api up on ${apiPort}`);
+ 
+   const urls: string[] = [];
+   for (let i = 0; i < gateways; i++) {
+-    const port = apiPort + 1 + i;
++    // NOT `apiPort + 1 + i` ANY MORE. Deriving a gateway's port from the api's made
++    // three ports out of one collision, and an ephemeral api port is no basis for
++    // arithmetic. Each child binds its own.
++    const name = `gateway ${i + 1}`;
+     children.push(
+       capture(
+-        `gateway ${i + 1}`,
++        name,
+         spawn("pnpm", ["exec", "tsx", "src/main.ts"], {
+           cwd: join(REPO, "services", "gateway"),
+-          env: { ...env, PORT: String(port), RELAY_API_URL: apiUrl },
++          env: { ...env, PORT: "0", RELAY_API_URL: apiUrl },
+           stdio: ["ignore", "pipe", "pipe"],
+         }),
+       ),
+     );
++    const port = await boundPort(name);
+     await waitForHealth(`http://127.0.0.1:${port}/healthz`, `gateway ${i + 1}`);
+     urls.push(`ws://127.0.0.1:${port}`);
+     say(`gateway ${i + 1} up on ${port}`);
+@@ -532,8 +571,48 @@ export async function boot({ gateways = 2 } = {}): Promise<System> {
+       return new Client(name, await token(environmentId, name), say);
+     },
+     async stop() {
++      // WAIT FOR THEM TO GO, DO NOT SLEEP AND HOPE (feature 043, FR-001).
++      //
++      // This signalled and slept 200 ms. A child that took longer to close its
++      // listeners was still holding its port when the next suite booted — and the
++      // next suite's health check passed against the dying predecessor, printed
++      // `api up on …`, and then failed at its first real request with
++      // `ECONNREFUSED`. **Ten of chapter 3.24's twenty-run battery failed exactly
++      // that way**, and the debt was not settled when a run ended: it was paid by
++      // whatever booted next, in that run or the following one.
++      //
++      // ALL OF THEM AT ONCE, NOT EACH IN TURN, or the waits add up per child. The
++      // timeout has its own message so a hung child is not reported as a port
++      // problem — which is the misdiagnosis this whole change exists to end.
+       for (const child of children) child.kill("SIGTERM");
+-      await new Promise((resolve) => setTimeout(resolve, 200));
++      await Promise.all(
++        children.map(
++          (child) =>
++            new Promise<void>((resolve) => {
++              if (child.exitCode !== null || child.signalCode !== null) return resolve();
++              // A SHORT GRACE, THEN SIGKILL — AND THE NUMBER IS MEASURED, NOT CHOSEN.
++              //
++              // The api takes **5,035 ms** to exit on SIGTERM, and its listener stays
++              // open for all of it: the port frees at 5,037 ms and the process exits at
++              // 5,034 ms, so there is no early release to wait for. Waiting the full
++              // drain cost the e2e package **37.28 s against a 6.72 s baseline**, on a
++              // lane with 5.39 s of budget headroom.
++              //
++              // What this harness needs is the port, not a clean drain. A second is
++              // enough for a child to flush the log lines `dump()` reports on failure,
++              // and SIGKILL frees the port at once. The old code sent SIGTERM, slept
++              // 200 ms and moved on, leaving the child alive and the port held — this
++              // is strictly stronger, because the process is confirmed dead either way.
++              const timer = setTimeout(() => {
++                child.kill("SIGKILL");
++              }, 1_000);
++              child.once("exit", () => {
++                clearTimeout(timer);
++                resolve();
++              });
++            }),
++        ),
++      );
+     },
+   };
+ }
+```
+
+The suite deletes the two durables it names per run. `consumer.itest.ts` has done this since
+chapter 3.4; chapter 3.24's close-out counted 216 consumers on DELIVERIES, 215 of them this
+file's.
+
+```diff title="services/dispatcher/src/dispatcher.itest.ts"
+@@ -406,6 +406,29 @@ describe("the dispatcher", () => {
+ 
+   afterAll(async () => {
+     await dispatcher?.stop();
++
++    // DELETE THE DURABLES THIS RUN NAMED (feature 043, FR-003).
++    //
++    // A durable is server-side state that outlives the process that made it, and this
++    // suite named a fresh pair per run — `itest-expand-<8 hex>` and
++    // `itest-deliver-<8 hex>` — and deleted neither. Chapter 3.24's close-out found
++    // **216 consumers on DELIVERIES**, 215 of them this file's, each holding a position
++    // in a stream of 56,193 messages, and the twenty-run battery added 19 more.
++    //
++    // `services/api/src/consumer/consumer.itest.ts` has done this since chapter 3.4 and
++    // its comment says why: *"without this, every run of this suite left another handful
++    // behind on a shared broker, and `stream-info.mjs` found twelve of them the first
++    // time it looked."* That chapter learned it at twelve. **The fix was written in the
++    // file next door for twenty chapters and never applied here.**
++    //
++    // BY NAME, NOT BY PREFIX. `consumer.itest.ts` records that sweeping `itest-` deleted
++    // another suite's live consumer off the same stream; these two are this run's own.
++    if (nats && !nats.isClosed()) {
++      const jsm = await nats.jetstreamManager();
++      await jsm.consumers.delete("EVENTS", durables.expand).catch(() => undefined);
++      await jsm.consumers.delete("DELIVERIES", durables.deliver).catch(() => undefined);
++    }
++
+     if (nats && !nats.isClosed()) await nats.drain();
+     child?.kill();
+     endpoint?.close();
+```
+
+**Twelve tests left this file and five stayed.** It is a `.test.ts` in the lane chapter 2.1 built
+to need no containers, and twelve of its seventeen talked to a real Redis. Which five stay was
+measured — `12 failed | 5 passed` against a dead broker — not argued: research predicted two.
+
+```diff title="services/gateway/src/connections.test.ts"
+@@ -3,29 +3,43 @@ import { readFileSync } from "node:fs";
+ import { dirname, join } from "node:path";
+ import { fileURLToPath } from "node:url";
+ 
+-import { afterAll, beforeEach, describe, expect, it } from "vitest";
++import { describe, expect, it } from "vitest";
+ 
+ import {
+   createConnections,
+   DEFAULT_BOUND_MS,
+   DEFAULT_HEARTBEAT_MS,
+   MAX_CONNECTIONS_PER_USER,
+-  type Connections,
+ } from "./connections.js";
+ 
+-// CHAPTER 3.22 — the slot registry.
++// CHAPTER 3.22's slot registry — THE HALF THAT NEEDS NO BROKER (feature 043: FR-006,
++// FR-006a, FR-024, FR-024a).
+ //
+-// AGAINST A REAL REDIS, NOT A STUB, and that is the correctness argument rather
+-// than a preference. The whole design rests on what `SET … NX` and `SET … IFEQ`
+-// do: `NX` settles FR-013's race inside the command, and `IFEQ` is what stops a
+-// returning connection taking a slot somebody else now holds. **A stubbed client
+-// would pass with a non-atomic implementation, with an `XX` renewal that hijacks,
+-// and with a `DEL` release that frees another connection's place** — all three of
+-// which this chapter's analysis passes found and corrected. It would also pass
+-// against a server that does not support `IFEQ` at all.
++// This file held all seventeen of the registry's tests and twelve of them talk to a real
++// Redis. It is a `.test.ts`, so it runs in the lane chapter 2.1 built specifically to
++// need no containers — the lane whose whole point is that `pnpm test` is honest on a
++// laptop with nothing running. With the stack down it reported twelve failures that were
++// correct behaviour, and `gaps.md` 3.23-9 has carried that since it was found by
++// accident.
+ //
+-// That is chapter 3.17's T047c one dimension over: a test that passes with half
+-// its subject applied.
++// **WHICH FIVE STAY WAS MEASURED, NOT ARGUED.** Run the original against a dead broker
++// and it reports `12 failed | 5 passed`:
++//
++//   RELAY_REDIS_URL=redis://127.0.0.1:6399 vitest run src/connections.test.ts
++//
++// Research predicted two and the measurement found five. The heartbeat test was filed
++// under "asserts registry behaviour" on the strength of its title; it asserts a ratio
++// between two constants and never reaches the broker. **A title is not an inventory of
++// what a test touches** — the same defect as a task id in a test title, one category
++// over.
++//
++// AND THE SHARED `beforeEach` IS GONE. The describe these came from built a registry
++// against `REDIS` for every test in it, including the two that provably need none. It
++// did not break them — `createConnections` connects lazily, which one command settled
++// after a reading of the code said otherwise — but a container-free lane holding a Redis
++// client it never uses is a lane that will grow one that matters.
++//
++// The twelve that need a broker are in `connections.itest.ts`, unchanged in behaviour.
+ 
+ const REDIS = process.env["RELAY_REDIS_URL"] ?? "redis://localhost:6379";
+ const silent = { log: () => {} };
+@@ -34,209 +48,13 @@ const silent = { log: () => {} };
+  * that share a constant `"env-1"` and both lean on the user name "tuan". */
+ const ENV = `env-${randomUUID()}`;
+ 
+-describe("the slot registry", () => {
+-  let registry: Connections;
+-  let user: string;
+-
+-  beforeEach(() => {
+-    registry = createConnections({ url: REDIS, logger: silent });
+-    // A fresh user per test rather than a flush: `FLUSHDB` would delete the keys
+-    // of every other suite running in parallel, and this package's config sets no
+-    // `fileParallelism`.
+-    user = `u-${randomUUID()}`;
+-  });
+-
+-  afterAll(async () => {
+-    await registry.close();
+-  });
+-
+-  // ---- ARM 1 and ARM 2: the walk -----------------------------------------
+-
+-  it("claims the first free slot, and reports how many were held", async () => {
+-    const first = await registry.claim(ENV, user, randomUUID());
+-    expect(first).toEqual({ kind: "claimed", slot: 0, held: 0 });
+-
+-    const second = await registry.claim(ENV, user, randomUUID());
+-    // ARM 1: `SET NX` missed on slot 0 and the walk moved on.
+-    expect(second).toEqual({ kind: "claimed", slot: 1, held: 1 });
+-  });
+-
+-  it("refuses when every slot is held, and says five (FR-001 (3.22))", async () => {
+-    for (let i = 0; i < MAX_CONNECTIONS_PER_USER; i += 1) {
+-      expect((await registry.claim(ENV, user, randomUUID())).kind).toBe("claimed");
+-    }
+-    // ARM 2: the walk found no free slot.
+-    expect(await registry.claim(ENV, user, randomUUID())).toEqual({
+-      kind: "full",
+-      held: 5,
+-    });
+-  });
+-
+-  it("counts each environment separately for one user identifier (FR-012 (3.22))", async () => {
+-    const other = `env-${randomUUID()}`;
+-    for (let i = 0; i < MAX_CONNECTIONS_PER_USER; i += 1) {
+-      await registry.claim(ENV, user, randomUUID());
+-    }
+-    expect((await registry.claim(other, user, randomUUID())).kind).toBe("claimed");
+-  });
+-
+-  // ---- ARM 3 and ARM 9: the renewal, and the re-claim --------------------
+-
+-  it("renews a slot it still holds (FR-008 (3.22))", async () => {
+-    const id = randomUUID();
+-    const claimed = await registry.claim(ENV, user, id);
+-    if (claimed.kind !== "claimed") throw new Error("expected a slot");
+-    expect(await registry.renew(ENV, user, id, claimed.slot)).toEqual({
+-      kind: "renewed",
+-    });
+-  });
+-
+-  it("re-claims when its slot is GONE and nothing else took it (FR-011b (3.22))", async () => {
+-    // ARM 3 then ARM 9. A short-lived registry so the bound elapses inside a test
+-    // rather than in a minute: the boundMs option exists for exactly this, the way
+-    // `membership.ts`'s reread interval does — sixty seconds does not fit in a
+-    // package whose whole wall clock is forty-five.
+-    const brief = createConnections({ url: REDIS, logger: silent, boundMs: 60 });
+-    const id = randomUUID();
+-    const claimed = await brief.claim(ENV, user, id);
+-    if (claimed.kind !== "claimed") throw new Error("expected a slot");
+-    await new Promise((resolve) => setTimeout(resolve, 120));
+-
+-    // THE COMMON CASE AFTER ANY BRIEF OUTAGE, and the branch a design that closes
+-    // on every refused renewal gets wrong. The user is under the limit; the slot
+-    // simply expired.
+-    expect(await brief.renew(ENV, user, id, claimed.slot)).toEqual({
+-      kind: "reclaimed",
+-      slot: 0,
+-    });
+-    await brief.close();
+-  });
+-
+-  // ---- ARM 4 and ARM 10: the hijack, and the cap genuinely full ----------
++describe("the slot registry, without a broker", () => {
++  /** A registry and a user per test, not a shared hook. The two below need the OBJECT
++   * and not the broker: `release` on a slot never held and `releaseAll([])` both settle
++   * before any command is sent. */
++  const registryFor = () => createConnections({ url: REDIS, logger: silent });
++  const userFor = () => `u-${randomUUID()}`;
+ 
+-  it("refuses to renew a slot ANOTHER connection now holds (FR-011 (3.22))", async () => {
+-    // ARM 4, and the one test in the chapter that catches `IFEQ` being replaced by
+-    // `XX`. `XX` tests existence and not ownership — measured on 8.10.0,
+-    // `SET k B XX` against a key holding `A` returns OK — so under `XX` this
+-    // renewal would silently take the slot and the count would say five while six
+-    // connections were open.
+-    const brief = createConnections({ url: REDIS, logger: silent, boundMs: 60 });
+-    const mine = randomUUID();
+-    const claimed = await brief.claim(ENV, user, mine);
+-    if (claimed.kind !== "claimed") throw new Error("expected a slot");
+-    await new Promise((resolve) => setTimeout(resolve, 120));
+-
+-    // Somebody else takes the expired slot, and fills the rest so the re-claim has
+-    // nowhere to go — ARM 10.
+-    for (let i = 0; i < MAX_CONNECTIONS_PER_USER; i += 1) {
+-      await brief.claim(ENV, user, randomUUID());
+-    }
+-    expect(await brief.renew(ENV, user, mine, claimed.slot)).toEqual({
+-      kind: "full",
+-      held: 5,
+-    });
+-    await brief.close();
+-  });
+-
+-  // ---- ARM 6, ARM 7 and ARM 8: the release ------------------------------
+-
+-  it("frees a slot it holds, and the slot is reusable at once (FR-010 (3.22))", async () => {
+-    const id = randomUUID();
+-    const claimed = await registry.claim(ENV, user, id);
+-    if (claimed.kind !== "claimed") throw new Error("expected a slot");
+-    await registry.release(ENV, user, id, claimed.slot);
+-    // NO WAIT, AND THE SLOT IS NOT PINNED — because at the default one-millisecond
+-    // tombstone there are THREE outcomes, not two, and the coverage lane found the
+-    // third by failing here with `slot: 1` where this assertion had demanded 0.
+-    //
+-    //   the tombstone is still there   `SET NX` fails, `SET IFEQ -` takes it -> 0
+-    //   it expired before the walk     `SET NX` succeeds                     -> 0
+-    //   it expires BETWEEN the two     both fail, the walk moves on          -> 1
+-    //
+-    // The third is a millisecond wide and harmless: a slot is skipped, never
+-    // over-admitted, and the connection is accepted. What must not happen is a
+-    // refusal, and that is what this asserts. The determinate version lives in the
+-    // test below, where the window is held open at 500 ms so it cannot race.
+-    //
+-    // This test's FIRST version slept 20 ms and accepted any slot; the sleep is
+-    // what hid the `releaseAll` defect for two phases. Removing the sleep was
+-    // right and pinning the slot with it was not — the two changes arrived
+-    // together and only one of them was justified.
+-    const again = await registry.claim(ENV, user, randomUUID());
+-    expect(again.kind).toBe("claimed");
+-    if (again.kind !== "claimed") throw new Error("unreachable");
+-    expect(again.slot, "a released slot cost more than one place").toBeLessThanOrEqual(1);
+-  });
+-
+-  it("claims a slot whose tombstone has NOT expired (FR-010 (3.22))", async () => {
+-    // A HALF-SECOND TOMBSTONE, so the window is a window rather than a coin flip.
+-    // With the shipped one-millisecond value this test would pass against the
+-    // broken walk about half the time, which is how the defect survived: two of six
+-    // runs of the clean-shutdown test, reported as `no connection.ack within 5s`.
+-    const slow = createConnections({
+-      url: REDIS,
+-      logger: silent,
+-      tombstoneMs: 500,
+-    });
+-    const id = randomUUID();
+-    const claimed = await slow.claim(ENV, user, id);
+-    if (claimed.kind !== "claimed") throw new Error("expected a slot");
+-    await slow.release(ENV, user, id, claimed.slot);
+-    expect(await slow.claim(ENV, user, randomUUID())).toEqual({
+-      kind: "claimed",
+-      slot: 0,
+-      held: 0,
+-    });
+-    await slow.close();
+-  });
+-
+-  it("accepts a claim immediately after releaseAll frees all five (FR-011a (3.22))", async () => {
+-    // THE CASE THAT WAS ACTUALLY BROKEN, and it is a deploy. One slot tombstoned is
+-    // one slot skipped; five tombstoned is a walk that finds nothing free and
+-    // reports `full` — so a client reconnecting to the new instance is refused with
+-    // `connection_limit_reached`, and the remedy that close code names is to close
+-    // one of the connections it already holds. Those went with the old instance.
+-    const slow = createConnections({
+-      url: REDIS,
+-      logger: silent,
+-      tombstoneMs: 500,
+-    });
+-    const held = [];
+-    for (let i = 0; i < MAX_CONNECTIONS_PER_USER; i += 1) {
+-      const id = randomUUID();
+-      const claimed = await slow.claim(ENV, user, id);
+-      if (claimed.kind !== "claimed") throw new Error("expected a slot");
+-      held.push({ environmentId: ENV, user, connectionId: id, slot: claimed.slot });
+-    }
+-    await slow.releaseAll(held);
+-    expect(await slow.claim(ENV, user, randomUUID())).toEqual({
+-      kind: "claimed",
+-      slot: 0,
+-      held: 0,
+-    });
+-    await slow.close();
+-  });
+-
+-  it("does NOT free a slot another connection now holds (FR-010 (3.22))", async () => {
+-    // ARM 6, and the reason the release is conditional. Under a plain `DEL` this
+-    // would delete the new owner's key and hand out a place that is in use — the
+-    // same ownership hole `IFEQ` closed on the renewal, on the path that fix
+-    // introduced.
+-    const brief = createConnections({ url: REDIS, logger: silent, boundMs: 60 });
+-    const mine = randomUUID();
+-    const claimed = await brief.claim(ENV, user, mine);
+-    if (claimed.kind !== "claimed") throw new Error("expected a slot");
+-    await new Promise((resolve) => setTimeout(resolve, 120));
+-
+-    const theirs = randomUUID();
+-    const retaken = await brief.claim(ENV, user, theirs);
+-    expect(retaken).toEqual({ kind: "claimed", slot: 0, held: 0 });
+-
+-    await brief.release(ENV, user, mine, claimed.slot);
+-    // Still theirs: the release was refused. Renewing proves it.
+-    expect(await brief.renew(ENV, user, theirs, 0)).toEqual({ kind: "renewed" });
+-    await brief.close();
+-  });
+ 
+   it("does not throw for a slot the connection never held", async () => {
+     // ARM 7, AND THE TITLE SAYS ONLY WHAT THE ASSERTION PROVES. It used to read
+@@ -248,31 +66,15 @@ describe("the slot registry", () => {
+     // 3.20's rule: a claim about an observable difference needs falsifying before
+     // the test is written.
+     await expect(
+-      registry.release(ENV, user, randomUUID(), 3),
++      registryFor().release(ENV, userFor(), randomUUID(), 3),
+     ).resolves.toBeUndefined();
+   });
+ 
+-  it("releases every slot this instance holds (FR-011a (3.22))", async () => {
+-    const held = [];
+-    for (let i = 0; i < 3; i += 1) {
+-      const id = randomUUID();
+-      const claimed = await registry.claim(ENV, user, id);
+-      if (claimed.kind !== "claimed") throw new Error("expected a slot");
+-      held.push({ environmentId: ENV, user, connectionId: id, slot: claimed.slot });
+-    }
+-    await registry.releaseAll(held);
+-    await new Promise((resolve) => setTimeout(resolve, 20));
+-    // All three back, so the next three claims all succeed.
+-    for (let i = 0; i < 3; i += 1) {
+-      expect((await registry.claim(ENV, user, randomUUID())).kind).toBe("claimed");
+-    }
+-  });
+-
+   it("does not throw when it holds nothing", async () => {
+     // ARM 8: the empty loop, which is the shutdown path of an instance that never
+     // had a connection. Renamed for the same reason as the test above — "releases
+     // nothing" describes the keys and the assertion describes the promise.
+-    await expect(registry.releaseAll([])).resolves.toBeUndefined();
++    await expect(registryFor().releaseAll([])).resolves.toBeUndefined();
+   });
+ 
+   // ---- ARM 5 and ARM 11: the registry cannot be reached -----------------
+@@ -295,7 +97,7 @@ describe("the slot registry", () => {
+       },
+       boundMs: 60,
+     });
+-    expect(await gone.claim(ENV, user, randomUUID())).toEqual({
++    expect(await gone.claim(ENV, userFor(), randomUUID())).toEqual({
+       kind: "unenforced",
+     });
+     expect(lines.some((l) => l["msg"] === "connections.failed")).toBe(true);
+@@ -315,35 +117,6 @@ describe("the slot registry", () => {
+     expect(DEFAULT_HEARTBEAT_MS).not.toBe(30_000);
+   });
+ 
+-  it("builds without a url, from the environment or from the default", async () => {
+-    // TWO BRANCHES IN ONE LINE, and the ratchet wanted both: the default parameter
+-    // — which every test above steps over by passing `url` — and the `??` inside
+-    // it, whose right-hand side the lane can never reach because it always sets
+-    // `RELAY_REDIS_URL`. `codes.test.ts:128` established the swap-and-restore
+-    // shape for exactly this; the `finally` is what keeps a failure here from
+-    // silently pointing every later suite at a different Redis.
+-    const defaulted = createConnections({ logger: silent });
+-    const outcome = await defaulted.claim(ENV, `u-${randomUUID()}`, randomUUID());
+-    expect(outcome.kind).toBe("claimed");
+-    await defaulted.close();
+-
+-    const before = process.env["RELAY_REDIS_URL"];
+-    try {
+-      delete process.env["RELAY_REDIS_URL"];
+-      // `DEFAULT_REDIS_URL` is localhost:6379, which is where the lane's Redis is,
+-      // so this claims a place rather than failing open — and the assertion is that
+-      // it reached A Redis, not that it reached a particular one.
+-      const fallback = createConnections({ logger: silent });
+-      expect((await fallback.claim(ENV, `u-${randomUUID()}`, randomUUID())).kind).toBe(
+-        "claimed",
+-      );
+-      await fallback.close();
+-    } finally {
+-      if (before === undefined) delete process.env["RELAY_REDIS_URL"];
+-      else process.env["RELAY_REDIS_URL"] = before;
+-    }
+-  });
+-
+   it("states the maximum in exactly one place (FR-002 (3.22))", async () => {
+     // The requirement is about DRIFT, not about the value. `policy.ts` derived
+     // `connect: 3_000` from "ten thousand divided by five" and shipped a third
+```
+
+The twelve that arrived, unchanged in behaviour.
+
+```diff title="services/gateway/src/connections.itest.ts"
+@@ -1113,3 +1113,275 @@ describe("the cap fails open, and says so (US4)", () => {
+     }
+   }, 60_000);
+ });
++
++// THE TWELVE THAT NEED A RUNNING BROKER (feature 043: FR-006, FR-024, FR-024a).
++//
++// Moved here from `connections.test.ts`, unchanged in behaviour. That file is a
++// `.test.ts` and runs in the lane chapter 2.1 built to need no containers; these twelve
++// talk to a real Redis, so with the stack down they reported failures that were correct
++// behaviour and made the lane's exit code answer "does this work HERE, today" instead of
++// "does this work without infrastructure". `gaps.md` 3.23-9 carried that from the day it
++// was found by accident.
++//
++// WHICH TWELVE WAS MEASURED. `RELAY_REDIS_URL=redis://127.0.0.1:6399 vitest run
++// src/connections.test.ts` reported `12 failed | 5 passed`; these are the twelve.
++//
++// AGAINST A REAL REDIS, NOT A STUB, and the original file's argument for that stands
++// unchanged and is why they moved rather than being rewritten: the design rests on what
++// `SET … NX` and `SET … IFEQ` do. **A stubbed client would pass with a non-atomic
++// implementation, with an `XX` renewal that hijacks, and with a `DEL` release that frees
++// another connection's place** — all three of which chapter 3.22's analysis found and
++// corrected, and it would also pass against a server with no `IFEQ` at all.
++
++describe("the slot registry, against a real broker", () => {
++  let registry: Connections;
++  let user: string;
++  const silent = { log: () => {} };
++  const ENV = `env-${randomUUID()}`;
++
++  beforeEach(() => {
++    registry = createConnections({ url: REDIS, logger: silent });
++    // A fresh user per test rather than a flush: `FLUSHDB` would delete the keys of
++    // every other suite running in parallel, and this package's config sets no
++    // `fileParallelism`.
++    user = `u-${randomUUID()}`;
++  });
++
++  afterAll(async () => {
++    await registry.close();
++  });
++
++
++  // ---- ARM 1 and ARM 2: the walk -----------------------------------------
++
++  it("claims the first free slot, and reports how many were held", async () => {
++    const first = await registry.claim(ENV, user, randomUUID());
++    expect(first).toEqual({ kind: "claimed", slot: 0, held: 0 });
++
++    const second = await registry.claim(ENV, user, randomUUID());
++    // ARM 1: `SET NX` missed on slot 0 and the walk moved on.
++    expect(second).toEqual({ kind: "claimed", slot: 1, held: 1 });
++  });
++
++  it("refuses when every slot is held, and says five (FR-001 (3.22))", async () => {
++    for (let i = 0; i < MAX_CONNECTIONS_PER_USER; i += 1) {
++      expect((await registry.claim(ENV, user, randomUUID())).kind).toBe("claimed");
++    }
++    // ARM 2: the walk found no free slot.
++    expect(await registry.claim(ENV, user, randomUUID())).toEqual({
++      kind: "full",
++      held: 5,
++    });
++  });
++
++  it("counts each environment separately for one user identifier (FR-012 (3.22))", async () => {
++    const other = `env-${randomUUID()}`;
++    for (let i = 0; i < MAX_CONNECTIONS_PER_USER; i += 1) {
++      await registry.claim(ENV, user, randomUUID());
++    }
++    expect((await registry.claim(other, user, randomUUID())).kind).toBe("claimed");
++  });
++
++  // ---- ARM 3 and ARM 9: the renewal, and the re-claim --------------------
++
++  it("renews a slot it still holds (FR-008 (3.22))", async () => {
++    const id = randomUUID();
++    const claimed = await registry.claim(ENV, user, id);
++    if (claimed.kind !== "claimed") throw new Error("expected a slot");
++    expect(await registry.renew(ENV, user, id, claimed.slot)).toEqual({
++      kind: "renewed",
++    });
++  });
++
++  it("re-claims when its slot is GONE and nothing else took it (FR-011b (3.22))", async () => {
++    // ARM 3 then ARM 9. A short-lived registry so the bound elapses inside a test
++    // rather than in a minute: the boundMs option exists for exactly this, the way
++    // `membership.ts`'s reread interval does — sixty seconds does not fit in a
++    // package whose whole wall clock is forty-five.
++    const brief = createConnections({ url: REDIS, logger: silent, boundMs: 60 });
++    const id = randomUUID();
++    const claimed = await brief.claim(ENV, user, id);
++    if (claimed.kind !== "claimed") throw new Error("expected a slot");
++    await new Promise((resolve) => setTimeout(resolve, 120));
++
++    // THE COMMON CASE AFTER ANY BRIEF OUTAGE, and the branch a design that closes
++    // on every refused renewal gets wrong. The user is under the limit; the slot
++    // simply expired.
++    expect(await brief.renew(ENV, user, id, claimed.slot)).toEqual({
++      kind: "reclaimed",
++      slot: 0,
++    });
++    await brief.close();
++  });
++
++  // ---- ARM 4 and ARM 10: the hijack, and the cap genuinely full ----------
++
++  it("refuses to renew a slot ANOTHER connection now holds (FR-011 (3.22))", async () => {
++    // ARM 4, and the one test in the chapter that catches `IFEQ` being replaced by
++    // `XX`. `XX` tests existence and not ownership — measured on 8.10.0,
++    // `SET k B XX` against a key holding `A` returns OK — so under `XX` this
++    // renewal would silently take the slot and the count would say five while six
++    // connections were open.
++    const brief = createConnections({ url: REDIS, logger: silent, boundMs: 60 });
++    const mine = randomUUID();
++    const claimed = await brief.claim(ENV, user, mine);
++    if (claimed.kind !== "claimed") throw new Error("expected a slot");
++    await new Promise((resolve) => setTimeout(resolve, 120));
++
++    // Somebody else takes the expired slot, and fills the rest so the re-claim has
++    // nowhere to go — ARM 10.
++    for (let i = 0; i < MAX_CONNECTIONS_PER_USER; i += 1) {
++      await brief.claim(ENV, user, randomUUID());
++    }
++    expect(await brief.renew(ENV, user, mine, claimed.slot)).toEqual({
++      kind: "full",
++      held: 5,
++    });
++    await brief.close();
++  });
++
++  // ---- ARM 6, ARM 7 and ARM 8: the release ------------------------------
++
++  it("frees a slot it holds, and the slot is reusable at once (FR-010 (3.22))", async () => {
++    const id = randomUUID();
++    const claimed = await registry.claim(ENV, user, id);
++    if (claimed.kind !== "claimed") throw new Error("expected a slot");
++    await registry.release(ENV, user, id, claimed.slot);
++    // NO WAIT, AND THE SLOT IS NOT PINNED — because at the default one-millisecond
++    // tombstone there are THREE outcomes, not two, and the coverage lane found the
++    // third by failing here with `slot: 1` where this assertion had demanded 0.
++    //
++    //   the tombstone is still there   `SET NX` fails, `SET IFEQ -` takes it -> 0
++    //   it expired before the walk     `SET NX` succeeds                     -> 0
++    //   it expires BETWEEN the two     both fail, the walk moves on          -> 1
++    //
++    // The third is a millisecond wide and harmless: a slot is skipped, never
++    // over-admitted, and the connection is accepted. What must not happen is a
++    // refusal, and that is what this asserts. The determinate version lives in the
++    // test below, where the window is held open at 500 ms so it cannot race.
++    //
++    // This test's FIRST version slept 20 ms and accepted any slot; the sleep is
++    // what hid the `releaseAll` defect for two phases. Removing the sleep was
++    // right and pinning the slot with it was not — the two changes arrived
++    // together and only one of them was justified.
++    const again = await registry.claim(ENV, user, randomUUID());
++    expect(again.kind).toBe("claimed");
++    if (again.kind !== "claimed") throw new Error("unreachable");
++    expect(again.slot, "a released slot cost more than one place").toBeLessThanOrEqual(1);
++  });
++
++  it("claims a slot whose tombstone has NOT expired (FR-010 (3.22))", async () => {
++    // A HALF-SECOND TOMBSTONE, so the window is a window rather than a coin flip.
++    // With the shipped one-millisecond value this test would pass against the
++    // broken walk about half the time, which is how the defect survived: two of six
++    // runs of the clean-shutdown test, reported as `no connection.ack within 5s`.
++    const slow = createConnections({
++      url: REDIS,
++      logger: silent,
++      tombstoneMs: 500,
++    });
++    const id = randomUUID();
++    const claimed = await slow.claim(ENV, user, id);
++    if (claimed.kind !== "claimed") throw new Error("expected a slot");
++    await slow.release(ENV, user, id, claimed.slot);
++    expect(await slow.claim(ENV, user, randomUUID())).toEqual({
++      kind: "claimed",
++      slot: 0,
++      held: 0,
++    });
++    await slow.close();
++  });
++
++  it("accepts a claim immediately after releaseAll frees all five (FR-011a (3.22))", async () => {
++    // THE CASE THAT WAS ACTUALLY BROKEN, and it is a deploy. One slot tombstoned is
++    // one slot skipped; five tombstoned is a walk that finds nothing free and
++    // reports `full` — so a client reconnecting to the new instance is refused with
++    // `connection_limit_reached`, and the remedy that close code names is to close
++    // one of the connections it already holds. Those went with the old instance.
++    const slow = createConnections({
++      url: REDIS,
++      logger: silent,
++      tombstoneMs: 500,
++    });
++    const held = [];
++    for (let i = 0; i < MAX_CONNECTIONS_PER_USER; i += 1) {
++      const id = randomUUID();
++      const claimed = await slow.claim(ENV, user, id);
++      if (claimed.kind !== "claimed") throw new Error("expected a slot");
++      held.push({ environmentId: ENV, user, connectionId: id, slot: claimed.slot });
++    }
++    await slow.releaseAll(held);
++    expect(await slow.claim(ENV, user, randomUUID())).toEqual({
++      kind: "claimed",
++      slot: 0,
++      held: 0,
++    });
++    await slow.close();
++  });
++
++  it("does NOT free a slot another connection now holds (FR-010 (3.22))", async () => {
++    // ARM 6, and the reason the release is conditional. Under a plain `DEL` this
++    // would delete the new owner's key and hand out a place that is in use — the
++    // same ownership hole `IFEQ` closed on the renewal, on the path that fix
++    // introduced.
++    const brief = createConnections({ url: REDIS, logger: silent, boundMs: 60 });
++    const mine = randomUUID();
++    const claimed = await brief.claim(ENV, user, mine);
++    if (claimed.kind !== "claimed") throw new Error("expected a slot");
++    await new Promise((resolve) => setTimeout(resolve, 120));
++
++    const theirs = randomUUID();
++    const retaken = await brief.claim(ENV, user, theirs);
++    expect(retaken).toEqual({ kind: "claimed", slot: 0, held: 0 });
++
++    await brief.release(ENV, user, mine, claimed.slot);
++    // Still theirs: the release was refused. Renewing proves it.
++    expect(await brief.renew(ENV, user, theirs, 0)).toEqual({ kind: "renewed" });
++    await brief.close();
++  });
++
++  it("releases every slot this instance holds (FR-011a (3.22))", async () => {
++    const held = [];
++    for (let i = 0; i < 3; i += 1) {
++      const id = randomUUID();
++      const claimed = await registry.claim(ENV, user, id);
++      if (claimed.kind !== "claimed") throw new Error("expected a slot");
++      held.push({ environmentId: ENV, user, connectionId: id, slot: claimed.slot });
++    }
++    await registry.releaseAll(held);
++    await new Promise((resolve) => setTimeout(resolve, 20));
++    // All three back, so the next three claims all succeed.
++    for (let i = 0; i < 3; i += 1) {
++      expect((await registry.claim(ENV, user, randomUUID())).kind).toBe("claimed");
++    }
++  });
++
++  it("builds without a url, from the environment or from the default", async () => {
++    // TWO BRANCHES IN ONE LINE, and the ratchet wanted both: the default parameter
++    // — which every test above steps over by passing `url` — and the `??` inside
++    // it, whose right-hand side the lane can never reach because it always sets
++    // `RELAY_REDIS_URL`. `codes.test.ts:128` established the swap-and-restore
++    // shape for exactly this; the `finally` is what keeps a failure here from
++    // silently pointing every later suite at a different Redis.
++    const defaulted = createConnections({ logger: silent });
++    const outcome = await defaulted.claim(ENV, `u-${randomUUID()}`, randomUUID());
++    expect(outcome.kind).toBe("claimed");
++    await defaulted.close();
++
++    const before = process.env["RELAY_REDIS_URL"];
++    try {
++      delete process.env["RELAY_REDIS_URL"];
++      // `DEFAULT_REDIS_URL` is localhost:6379, which is where the lane's Redis is,
++      // so this claims a place rather than failing open — and the assertion is that
++      // it reached A Redis, not that it reached a particular one.
++      const fallback = createConnections({ logger: silent });
++      expect((await fallback.claim(ENV, `u-${randomUUID()}`, randomUUID())).kind).toBe(
++        "claimed",
++      );
++      await fallback.close();
++    } finally {
++      if (before === undefined) delete process.env["RELAY_REDIS_URL"];
++      else process.env["RELAY_REDIS_URL"] = before;
++    }
++  });
++});
+```
