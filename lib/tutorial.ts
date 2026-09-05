@@ -710,6 +710,25 @@ export const series: Part[] = [
           "FR-MSG-07, FR-MSG-08 và FR-MSG-10 được dựng, và hai kind cuối trong sáu kind của FR-RTM-05 lần đầu có bên phát: một ngữ pháp subject thứ năm, `revision:{channel_id}`, mang cả hai loại thay đổi với cái kind nằm trong payload, bởi một bia mộ không phải `Message` còn một lần sửa thì là và sẽ không phân biệt được với một lần tạo; bảng `message_edits` dựng lại đúng như SAD §6.1 đã công bố, kèm cái giá của khoá chính ghép được viết ra; hai mã lỗi thay cho 403 chung chung, bởi không credential nào cấp quyền tác giả và không thay đổi phân quyền nào biến một tin nhắn thành của bạn; một phép kiểm tenancy được dạy rằng khả năng tới được không phải là kề nhau, sau khi nó từ chối cái bảng mới trong bốn mili giây; và cái mép mềm duy nhất được ghi lại thay vì đóng lại — một tin nhắn cũ hơn con trỏ của client mà đổi trong lúc mất kết nối thì không sinh frame nào **và không có lỗ hổng số thứ tự nào**, nên cơ chế sửa chữa mọi frame bị lỡ khác chẳng thấy gì để sửa",
         translatedIn: ["vi"],
       },
+      {
+        id: "3.24",
+        path: "/part-3/chapter-24/the-message-that-is-not-only-text",
+        title: "The message that is not only text",
+        status: "published",
+        // `sourceDoc` is the SAD, whose §6.1 declares `attachments JSONB` and
+        // said nothing about it — the same omission chapter 3.23 filled for
+        // `messages.metadata`, one column across in the same table. This chapter
+        // fills it, and adds what each of the six read paths does with the
+        // column, which is the form SC-006 asks for.
+        readerProduces:
+          "FR-MSG-11's external-URL half built: a message carries attachments, bounded at ten and 2,048 characters, refused unless the scheme is http or https. The media_id half is deferred to §4.14 and refused by name, with a code of its own.",
+        sourceDoc: "docs/05-sad.md",
+        readerMinutes: 70,
+        titleVi: "Tin nhắn không chỉ có chữ",
+        readerProducesVi:
+          "Nửa external-URL của FR-MSG-11 được dựng: một tin nhắn mang attachment, giới hạn mười phần tử và 2.048 ký tự, bị từ chối trừ khi scheme là http hoặc https. Nửa media_id được hoãn tới §4.14 và bị từ chối đích danh, bằng một mã lỗi riêng.",
+        translatedIn: ["vi"],
+      },
     ],
   },
   {
