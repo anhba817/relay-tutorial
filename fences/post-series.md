@@ -5410,3 +5410,299 @@ constitution VI's 100%-branch clause is stated in.
    },
 ```
 
+## A channel counts its own revisions
+
+Resume is ordered by the channel sequence, and an edit or a deletion carries the sequence of
+the message it CHANGES rather than a new one. A message revised below a client's cursor is
+therefore in neither the replay nor the live stream — and consumes no sequence, so no gap
+appears for a client to notice. SRS FR-016a already said the stale copy was repairable by
+re-reading history; nothing told a client when to.
+
+**Measured before it was built.** A client holding message seq 1, reconnecting on cursor 2
+after that message was edited, received exactly one frame — the ack — and zero sequences. The
+same probe confirmed the other half: a message edited ABOVE the cursor comes back on the
+replay carrying its new text, because the backfill reads current state.
+
+One column, `bigint` to match `last_sequence`, `default 0` so existing channels start where
+every client's stored count starts. **A count reconstructed from history would have been
+correct and useless** — it would exceed every client's stored count on the first reconnect
+after shipping and tell every client to repair every channel once.
+
+```diff title="services/api/src/db/schema.ts"
+@@ -326,6 +326,22 @@ export const channels = pgTable(
+     lastSequence: bigint("last_sequence", { mode: "number" })
+       .notNull()
+       .default(0), // ADR-03
++    /** How many revisions this channel's messages have received (feature 044, FR-001).
++     *
++     * A REVISION IS AN EDIT OR A DELETION, and each raises this by exactly one. A SEND
++     * DOES NOT (FR-011): a new message is delivered by the ordinary replay, and counting
++     * sends here would make every active channel report a repair after every absence.
++     *
++     * WHAT IT ANSWERS. Resume is ordered by `lastSequence` above, and a revision carries
++     * the sequence of the message it changes rather than a new one — so a message revised
++     * below a client's cursor reaches it on no frame and consumes no sequence, leaving no
++     * gap to notice. This is the number a reconnecting client compares against to learn
++     * that it holds something stale.
++     *
++     * `{ mode: "number" }` and `bigint`, matching `lastSequence` for the same reason. */
++    revisionSequence: bigint("revision_sequence", { mode: "number" })
++      .notNull()
++      .default(0),
+     archivedAt: timestamp("archived_at", { withTimezone: true }),
+     // WHEN THIS CHANNEL LAST TOOK A MESSAGE (chapter 3.15, FR-014).
+     //
+```
+
+
+The counter rises inside the transaction that applies the revision, so a revision that commits
+and a count that rises are the same event. **After** the compare-and-set on the edit path,
+which refuses an edit to an already-deleted message by affecting zero rows — bumping before it
+would raise the count for an edit that then threw.
+
+**A deletion is a revision**, and raises the count exactly as an edit does. The test that
+catches the opposite mistake is the one asserting a SEND does not: a counter bumped on send
+makes every active channel report a repair after every absence, and every other assertion
+passes with that defect in place.
+
+```diff title="services/api/src/db/repository.ts"
+@@ -3275,18 +3275,39 @@ export class Repository {
+     return rows.map((r) => r.user_id);
+   }
+ 
+-  async channelsForUser(userId: string): Promise<string[]> {
+-    const rows = await this.db
+-      .select({ channel_id: members.channelId })
++  /** The channels a user belongs to, each with its revision count (feature 044, FR-014).
++   *
++   * ONE QUERY, NOT TWO. The count could have come from a second call, and giving each
++   * caller its own is the two-lists-that-must-agree defect `gaps.md` 3.23-4 records about
++   * `targets.ts` — two things that must match, maintained separately, with nothing
++   * comparing them. The join costs nothing: `members` is already reached and `channels` is
++   * one hop from it on a primary key.
++   *
++   * FR-014 IS WHY THE COUNT RIDES THIS QUERY AT ALL. At 10,000 connections a per-channel
++   * read per handshake is 10,000 extra reads, and the reconnect rate measured before this
++   * feature was 1,402 per second. The count has to arrive on work the api already does.
++   *
++   * TWO CALLERS, AND BOTH ARE REPAIRED IN THE SAME CHANGE. `session.controller.ts` wants
++   * the counts; `memberships.controller.ts` wants ids alone and maps them. Widening the
++   * return without fixing both leaves the second assigning objects to a `string[]`, which
++   * is a typecheck failure at exactly the boundary this project commits at. */
++  async channelsForUser(
++    userId: string,
++  ): Promise<{ channel_id: string; revision_sequence: number }[]> {
++    return await this.db
++      .select({
++        channel_id: members.channelId,
++        revision_sequence: channels.revisionSequence,
++      })
+       .from(members)
+       .innerJoin(users, eq(users.id, members.userId))
++      .innerJoin(channels, eq(channels.id, members.channelId))
+       .where(
+         and(
+           eq(members.userId, userId),
+           eq(users.environmentId, this.environmentId),
+         ),
+       );
+-    return rows.map((r) => r.channel_id);
+   }
+ 
+   /** Upsert a user by external id, updating the profile fields present (chapter 3.15,
+@@ -4565,6 +4586,25 @@ export class Repository {
+       if (!updated) throw new MessageDeletedError(messageId);
+       const editedAt = updated.editedAt!;
+ 
++      // FEATURE 044, FR-002/FR-003. The channel's revision counter rises by one, inside the
++      // transaction that applies the revision — so a revision that commits and a count that
++      // rises are the same event, and a count can never describe a revision the transaction
++      // refused.
++      //
++      // AFTER THE COMPARE-AND-SET ABOVE, deliberately. That statement refuses an edit to an
++      // already-deleted message by affecting zero rows; bumping before it would raise the
++      // count for an edit that then threw.
++      //
++      // AN EXTRA ROUND TRIP, AND THE RIGHT SIDE OF THE TRADE. The send path updates this row
++      // anyway, so `lastActivityAt` there "costs an extra assignment rather than an extra
++      // round trip"; this path touches `messages` and `message_edits` only, so the counter
++      // costs one UPDATE. Revisions are rare and reconnects are not, and the alternative puts
++      // a scan on the handshake (FR-014).
++      await tx
++        .update(channels)
++        .set({ revisionSequence: sql`${channels.revisionSequence} + 1` })
++        .where(eq(channels.id, channelId));
++
+       // FR-004. The row carries what the message said BEFORE this edit — `row.text`,
+       // read above and narrowed to a string by the tombstone check.
+       //
+@@ -4798,6 +4838,14 @@ export class Repository {
+       // assigned, and the event and the frame must both quote that one.
+       const deletedAt = toIso(updated!.deletedAt!);
+ 
++      // FEATURE 044, FR-002/FR-003. A DELETION IS A REVISION and raises the count exactly as
++      // an edit does — US1's third acceptance scenario fails if only edits are counted. Same
++      // transaction, same argument as the edit path.
++      await tx
++        .update(channels)
++        .set({ revisionSequence: sql`${channels.revisionSequence} + 1` })
++        .where(eq(channels.id, channelId));
++
+       // THE EVENT COMMITS WITH THE TOMBSTONE (ADR-06), on the send path's argument at
+       // its own outbox insert: publishing after the commit leaves a gap where the row
+       // changed and the event never existed, silently, with nothing to reconcile.
+```
+
+
+The count reaches the gateway on the membership query the api already runs, because at 10,000
+connections a per-channel read per handshake is 10,000 extra reads — the reconnect rate
+measured before this feature was 1,402 per second. **Both callers of that query are repaired
+in the same change**: widening the return without fixing both leaves the second assigning
+objects to a `string[]`.
+
+```diff title="services/api/src/internal/session.controller.ts"
+@@ -126,7 +126,10 @@ export class SessionController {
+       // verified token naming somebody with no row, which chapter 2.5 decided is a user
+       // with no channels rather than an error — and a user with no row has no ban either.
+       banned: user?.banned_at != null,
+-      channel_ids: user ? await this.repo.channelsForUser(user.id) : [],
++      // Ids here; the counts ride the same rows and are filled in below (feature 044).
++      channel_ids: user
++        ? (await this.repo.channelsForUser(user.id)).map((c) => c.channel_id)
++        : [],
+       limits: {
+         connect: policy.limits.connect,
+         send: policy.limits.send,
+```
+
+And the caller that wants ids alone maps them off, so one query stands behind both.
+
+```diff title="services/api/src/internal/memberships.controller.ts"
+@@ -65,7 +65,12 @@ export class MembershipsController {
+       req.principal.userExternalId,
+     );
+     return {
+-      channel_ids: user ? await this.repo.channelsForUser(user.id) : [],
++      // Ids alone: this route answers what a user may hear, not what has changed in it.
++      // `channelsForUser` carries revision counts for the session route (feature 044);
++      // mapping them off here keeps one query behind both.
++      channel_ids: user
++        ? (await this.repo.channelsForUser(user.id)).map((c) => c.channel_id)
++        : [],
+     };
+   }
+ }
+```
+
+The tests, including the one that asserts a send moves nothing.
+
+```diff title="services/api/src/db/repository.itest.ts"
+@@ -1437,6 +1437,106 @@ describe("the read shapes that do NOT carry attachments (FR-009 (3.24))", () =>
+ // that two operations issued on one connection serialise at the socket, so a test built
+ // that way proves the code cannot race by never letting it. The third case below uses
+ // TWO POOLS, which is what that chapter found it needed.
++describe("the channel's revision counter (feature 044, FR-002, FR-003, FR-011)", () => {
++  const countFor = async (channelId: string): Promise<number> => {
++    const [row] = (
++      await db.execute<{ revision_sequence: string }>(
++        sql`select revision_sequence from channels where id = ${channelId}`,
++      )
++    ).rows;
++    return Number(row!.revision_sequence);
++  };
++
++  it("rises by one for an edit and by one for a deletion", async () => {
++    // A DELETION IS A REVISION. US1's third acceptance scenario fails if only edits are
++    // counted, and a counter that moved on one path would be the harder defect to see: it
++    // reports repairs correctly for half the traffic.
++    const author = await repoA.createUser("t044-a", "A");
++    const channel = await repoA.createChannel("t044-a", "public");
++    await repoA.addMember(channel.id, author.id);
++    expect(await countFor(channel.id)).toBe(0);
++
++    const m1 = await repoA.sendMessage(channel.id, {
++      text: "one", userId: author.id, userExternalId: "t044-a",
++    });
++    const m2 = await repoA.sendMessage(channel.id, {
++      text: "two", userId: author.id, userExternalId: "t044-a",
++    });
++
++    await repoA.editMessage(channel.id, m1.id, { text: "one edited", userId: author.id });
++    expect(await countFor(channel.id)).toBe(1);
++
++    await repoA.deleteMessage(channel.id, m2.id, { userId: author.id, userExternalId: "t044-a" });
++    expect(await countFor(channel.id)).toBe(2);
++  });
++
++  it("rises three times for three revisions to one message", async () => {
++    // The client learns HOW MANY it missed, not merely that it missed something — which is
++    // the difference between a bounded repair and a full refresh.
++    const author = await repoA.createUser("t044-b", "B");
++    const channel = await repoA.createChannel("t044-b", "public");
++    await repoA.addMember(channel.id, author.id);
++    const m = await repoA.sendMessage(channel.id, {
++      text: "v0", userId: author.id, userExternalId: "t044-b",
++    });
++
++    for (const text of ["v1", "v2", "v3"]) {
++      await repoA.editMessage(channel.id, m.id, { text, userId: author.id });
++    }
++    expect(await countFor(channel.id)).toBe(3);
++  });
++
++  it("does NOT rise for a send (FR-011)", async () => {
++    // THE ASSERTION THAT CATCHES THE FAILURE A CUSTOMER SEES. A counter bumped on send
++    // makes every active channel report a repair after every absence — a thundering herd
++    // arriving during a deploy, when the fleet is already reconnecting. Every other test
++    // here passes with that defect in place.
++    const author = await repoA.createUser("t044-c", "C");
++    const channel = await repoA.createChannel("t044-c", "public");
++    await repoA.addMember(channel.id, author.id);
++
++    for (const text of ["a", "b", "c", "d", "e"]) {
++      await repoA.sendMessage(channel.id, { text, userId: author.id, userExternalId: "t044-c" });
++    }
++    expect(await countFor(channel.id)).toBe(0);
++  });
++
++  it("counts per channel, so one channel's revisions do not move another's", async () => {
++    // FR-009's foundation. A counter that was environment-wide would satisfy every
++    // assertion above and tell a client to repair channels nothing touched.
++    const author = await repoA.createUser("t044-d", "D");
++    const left = await repoA.createChannel("t044-d-left", "public");
++    const right = await repoA.createChannel("t044-d-right", "public");
++    await repoA.addMember(left.id, author.id);
++    await repoA.addMember(right.id, author.id);
++    const m = await repoA.sendMessage(left.id, {
++      text: "in left", userId: author.id, userExternalId: "t044-d",
++    });
++
++    await repoA.editMessage(left.id, m.id, { text: "edited in left", userId: author.id });
++
++    expect(await countFor(left.id)).toBe(1);
++    expect(await countFor(right.id)).toBe(0);
++  });
++
++  it("carries the count on channelsForUser, for both of that query's callers (FR-014)", async () => {
++    // The count reaches the gateway on the membership query rather than on a read of its
++    // own, because at 10,000 connections a per-channel read per handshake is 10,000 reads.
++    const author = await repoA.createUser("t044-e", "E");
++    const channel = await repoA.createChannel("t044-e", "public");
++    await repoA.addMember(channel.id, author.id);
++    const m = await repoA.sendMessage(channel.id, {
++      text: "x", userId: author.id, userExternalId: "t044-e",
++    });
++    await repoA.editMessage(channel.id, m.id, { text: "y", userId: author.id });
++
++    const rows = await repoA.channelsForUser(author.id);
++    const row = rows.find((r) => r.channel_id === channel.id);
++    expect(row).toBeDefined();
++    expect(row!.revision_sequence).toBe(1);
++  });
++});
++
+ describe("a concurrent edit and deletion (feature 043, FR-007)", () => {
+   const seed = async (label: string) => {
+     const author = await repoA.createUser(`${label}-author`, "Author");
+```
+
