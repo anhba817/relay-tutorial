@@ -311,7 +311,7 @@ sequenceDiagram
     G->>G: subscribe Redis subjects FIRST,<br/>buffer incoming live frames
     G->>A: GET /internal/backfill {user, cursors}
     A-->>G: messages where seq > cursor,<br/>per channel, cap 500
-    G-->>T: connection.ack {resume_ok}
+    G-->>T: connection.ack {resume_ok, revisions}
     G-->>T: backfilled frames, sequence order per channel
     G->>G: flush buffer, discard seq ≤ backfill high-water mark
     G-->>T: live frames resume
@@ -324,6 +324,56 @@ flushes the buffer discarding anything with `seq ≤` the backfill's high-water 
 Sequence numbers make the deduplication trivial — which is a large part of why they exist
 (→ ADR-03). Backfill beyond 500 messages per channel returns `truncated: true` and the
 client refetches history instead (FR-RTM-04).
+
+**The one thing a cursor cannot recover, and the field that reports it.** Resume is ordered by
+the channel sequence, and an edit or a deletion carries the sequence of the message it *changes*
+rather than a new one. So a message revised **below** a client's cursor appears in neither the
+backfill nor the live stream, and consumes no sequence — no gap appears for the deduplication
+above to notice, because there is nothing out of order. Gap detection is the mechanism this
+document names as the recovery, and here it sees nothing to recover.
+
+The ack therefore carries `revisions`: a per-channel count of how many revisions that channel's
+messages have received, for **every** channel the user belongs to.
+
+    connection.ack.payload.revisions = { "<channel_id>": 7, … }
+
+A client compares each count with the one it stored at its last connection, and there are three
+outcomes:
+
+| Comparison | What it means | What the client does |
+|---|---|---|
+| reported **>** stored | one or more messages it already holds were edited or deleted while it was away | re-read that channel's history (FR-MSG-09), which returns current state — the corrected text for an edit, a `null` text for a deletion |
+| reported **=** stored | nothing was missed | nothing |
+| reported **<** stored | its stored number is stale, restored from a backup, or wrong | nothing — treat it as *nothing missed*, and store the reported count |
+
+**Store the reported counts in every case**, including the ones that needed no repair. A client
+that only stores counts when it repairs never establishes a baseline for the channels it did not
+repair, and its next reconnect is the first one again.
+
+**The difference counts revisions, not messages.** Three revisions may be three edits of one
+message or one edit each of three, so the number bounds how much changed and does not identify
+what: the repair is a history re-read for the channel, not a fetch of three messages.
+
+**The platform reports and never compares** — it is not told what a client holds, so a stale or
+invented client-side number cannot make it refuse a connection or send anybody on a repair. That
+is why the third row above is the client's rule rather than the server's: refusing a connection
+over a number the client supplied would be a denial of service the client controls.
+
+A client holding **no** count for a channel — a first connection, a client built before the field
+existed, or a channel joined during the absence — repairs nothing and stores what it was told. It
+holds nothing in that channel that a count could show to be stale, and its messages arrive by the
+ordinary backfill above.
+
+**Counting revisions and not messages.** A send does not raise the count: a new message is
+delivered by the ordinary backfill above, and counting sends here would make every active channel
+report a repair after every absence — the same herd this design avoids, arriving from the other
+direction.
+
+**Why this is documented here.** There is no public protocol reference in these repositories to
+put it in; the implementation review lists one as absent and it belongs to Part 4. §5.2 is the
+runtime view that already carries `connection.ack` in its sequence diagram, so it is the nearest
+published home rather than the obvious one, and that choice is recorded rather than left for a
+reader to reconstruct.
 
 ### 5.3 Priya's moderation delete (journey 3, stage 5)
 

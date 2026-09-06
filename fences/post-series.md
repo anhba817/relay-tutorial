@@ -6710,3 +6710,279 @@ still green. Chapter 3.23 made the identical repair to this identical pair of bu
        return { type, payload: message };
      // CHAPTER 3.23 SPLIT THIS CASE OFF. `message.deleted` shared the `Message` above
 ```
+
+### The close-out pass, and the two tests it changed
+
+**A title audit is a source change like any other**, which is why these hunks exist at all. The
+audit read each of this feature's fifteen new test titles against what the test actually asserts
+and found four that claimed more than they proved — one of them a `describe` citing a requirement
+a schema file cannot see, and one claiming to cover both callers of a query it calls once.
+
+```diff title="packages/protocol/src/frames.test.ts"
+@@ -345,13 +345,13 @@ describe("the message-length maximum (feature 043, FR-008)", () => {
+       created_at: "2026-09-06T00:00:00.000Z",
+     };
+     expect(messageSchema.safeParse(long).success).toBe(true);
+   });
+ });
+ 
+-describe("the revision count on the ack (feature 044, FR-004, FR-007, FR-009)", () => {
++describe("the revision count on the ack (feature 044, FR-007, FR-009)", () => {
+   const ack = (revisions: unknown) =>
+     parseFrame({
+       type: "connection.ack",
+       payload: {
+         user: "u1",
+         cursor: { c1: 42 },
+@@ -382,13 +382,13 @@ describe("the revision count on the ack (feature 044, FR-004, FR-007, FR-009)",
+       type: "connection.ack",
+       payload: { user: "u1", cursor: {}, resume_ok: true, truncated: [] },
+     });
+     expect(withoutIt.success).toBe(false);
+   });
+ 
+-  it("refuses a negative count and a fractional one", () => {
++  it("refuses a negative count, a fractional one, and a string", () => {
+     // A count that falls would silently tell a client it is up to date (FR-002), and a
+     // fraction is not a number of revisions. Neither is reachable from the writer, which
+     // is why the door is here rather than trusted upstream.
+     expect(ack({ c1: -1 }).success).toBe(false);
+     expect(ack({ c1: 1.5 }).success).toBe(false);
+     expect(ack({ c1: "7" }).success).toBe(false);
+@@ -401,13 +401,13 @@ describe("the revision count on the ack (feature 044, FR-004, FR-007, FR-009)",
+     // the correct response unrepresentable.
+     expect(ack({ c1: 3, c2: 0 }).success).toBe(true);
+     // And the empty map, which is what a user in no channels gets.
+     expect(ack({}).success).toBe(true);
+   });
+ 
+-  it("exports the count schema on its own, so the internal hop validates the same rule", () => {
++  it("exports the count schema on its own, not only as part of the ack", () => {
+     // `internalSessionResponseSchema` reuses this rather than restating it. Two schemas
+     // that must agree and are spelled twice are two schemas that will stop agreeing —
+     // feature 043 found that with `editMessageBodySchema.text`, from the other side: two
+     // that must DIFFER cannot share a reference at all.
+     expect(revisionCountSchema.safeParse({ c1: 0 }).success).toBe(true);
+     expect(revisionCountSchema.safeParse({ c1: -1 }).success).toBe(false);
+```
+
+**And it found FR-003 cited by two titles and asserted by neither.** The first remedy was itself
+vacuous: delete a message, edit it, confirm the count did not move. It passes — and it passes
+identically with the counter moved outside the transaction, because the edit path refuses a
+deleted message *before* the counter's statement is ever reached. The bump never runs, so the
+test says nothing about the property it named.
+
+The behavioural test keeps its real property under an honest title, and FR-003 gets a
+source-reading test instead — the instrument `main.test.ts` already uses for producers nothing
+else can see. It scans the repository for both bumps and asserts each runs on `tx`. Moving one
+onto `this.db` turns it red, which is the whole point of writing it that way.
+
+```diff title="services/api/src/db/repository.itest.ts"
+@@ -1,9 +1,16 @@
+ import { randomUUID } from "node:crypto";
++import { readFileSync } from "node:fs";
++import { join } from "node:path";
+ 
+ import { afterAll, beforeAll, describe, expect, it } from "vitest";
++
++// `__dirname`, not `import.meta` — this service builds to CommonJS, and `import.meta`
++// is a hard compile error there. `migrations.test.ts` carries the same line and the same
++// reason, three files away, which is where this was read from rather than rediscovered.
++const HERE = __dirname;
+ import { sql } from "drizzle-orm";
+ 
+ import { createDb, createPool, DEFAULT_DATABASE_URL, type Db } from "./client";
+ import { migrate } from "./migrate";
+ import {
+   createEnvironment,
+@@ -1516,13 +1523,13 @@ describe("the channel's revision counter (feature 044, FR-002, FR-003, FR-011)",
+     await repoA.editMessage(left.id, m.id, { text: "edited in left", userId: author.id });
+ 
+     expect(await countFor(left.id)).toBe(1);
+     expect(await countFor(right.id)).toBe(0);
+   });
+ 
+-  it("carries the count on channelsForUser, for both of that query's callers (FR-014)", async () => {
++  it("carries the count on channelsForUser, the query the gateway's session read already makes", async () => {
+     // The count reaches the gateway on the membership query rather than on a read of its
+     // own, because at 10,000 connections a per-channel read per handshake is 10,000 reads.
+     const author = await repoA.createUser("t044-e", "E");
+     const channel = await repoA.createChannel("t044-e", "public");
+     await repoA.addMember(channel.id, author.id);
+     const m = await repoA.sendMessage(channel.id, {
+@@ -1532,12 +1539,70 @@ describe("the channel's revision counter (feature 044, FR-002, FR-003, FR-011)",
+ 
+     const rows = await repoA.channelsForUser(author.id);
+     const row = rows.find((r) => r.channel_id === channel.id);
+     expect(row).toBeDefined();
+     expect(row!.revision_sequence).toBe(1);
+   });
++
++  it("does not rise for an edit refused before it is applied", async () => {
++    // WHAT THIS PROVES, AND WHAT IT DOES NOT. The edit path refuses a deleted message
++    // twice — once on the read (`MessageDeletedError`) and once on the compare-and-set
++    // that affects zero rows — and BOTH refusals happen before the counter's statement.
++    // So this asserts that the refusal path does not count, which is worth having and is
++    // NOT FR-003: the bump never executes here, so the test would pass just as well with
++    // the bump outside the transaction entirely.
++    //
++    // It was written titled `(FR-003)` and the title audit caught it. FR-003's actual
++    // failure mode — a bump that commits when the revision behind it does not — is
++    // asserted by the source test below, because nothing after the bump can be made to
++    // fail from out here without breaking the repository to do it.
++    const author = await repoA.createUser("t044-f", "F");
++    const channel = await repoA.createChannel("t044-f", "public");
++    await repoA.addMember(channel.id, author.id);
++    const m = await repoA.sendMessage(channel.id, {
++      text: "to be deleted", userId: author.id, userExternalId: "t044-f",
++    });
++
++    await repoA.deleteMessage(channel.id, m.id, { userId: author.id, userExternalId: "t044-f" });
++    const afterDeletion = await countFor(channel.id);
++    expect(afterDeletion).toBe(1);
++
++    await expect(
++      repoA.editMessage(channel.id, m.id, { text: "too late", userId: author.id }),
++    ).rejects.toThrow();
++    // Unmoved — because the edit was refused before the counter was reached.
++    expect(await countFor(channel.id)).toBe(afterDeletion);
++  });
++
++  it("raises the counter INSIDE the transaction, on both revision paths (FR-003)", () => {
++    // FR-003 says a revision that commits and a count that rises are the same event. The
++    // way that stops being true is somebody moving the bump onto `this.db`, where it
++    // commits on its own — and then a failure in the `messageEdits` or `outbox` insert
++    // that follows it leaves a count describing a revision that never happened.
++    //
++    // NO RUNTIME TEST CAN REACH THAT. Everything after the bump succeeds unless the
++    // repository is broken on purpose, so the property is read off the source instead —
++    // the same instrument `main.test.ts` uses for the producers it cannot otherwise see.
++    const source = readFileSync(join(HERE, "repository.ts"), "utf8");
++    const MARKER = "revisionSequence: sql";
++    const at: number[] = [];
++    for (let i = source.indexOf(MARKER); i !== -1; i = source.indexOf(MARKER, i + 1)) {
++      at.push(i);
++    }
++    // Two revision paths, and a third would need its own decision rather than inheriting
++    // this assertion silently.
++    expect(at).toHaveLength(2);
++    for (const i of at) {
++      // The statement this bump belongs to, read back to the `await` that opens it.
++      const statement = source.slice(source.lastIndexOf("await ", i), i);
++      expect(statement, `the bump at ${i} must run on the transaction`).toContain("tx\n");
++      expect(statement, `the bump at ${i} must not run on the pool`).not.toContain(
++        "this.db",
++      );
++    }
++  });
+ });
+ 
+ describe("a concurrent edit and deletion (feature 043, FR-007)", () => {
+   const seed = async (label: string) => {
+     const author = await repoA.createUser(`${label}-author`, "Author");
+     const channel = await repoA.createChannel(label, "public");
+```
+
+**The ratchet's new pins, and one of them carries a measured swing rather than a measurement.**
+Two full coverage runs on identical code, twenty minutes apart, gave `session.ts` 87.80% and
+85.36% functions — about one function of forty — while every other file this feature pinned was
+byte-identical across both. A floor at the measured value would go red on the next run for no
+change to the code, and the fix would then be to lower it: a ratchet that teaches people to lower
+ratchets. Both numbers are in the config so the next feature does not rediscover them.
+
+The pins were proved live before being trusted. Demanding 101% of a file at 100% names the key;
+demanding 101% of a file that does not exist produces **nothing at all**, which is the failure
+mode this class of threshold has and the reason the probe is worth running every time.
+
+```diff title="vitest.coverage.config.mts"
+@@ -198,12 +198,89 @@ export default defineConfig({
+           branches: 92,
+           functions: 100,
+           lines: 99,
+           statements: 97,
+         },
+ 
++        // ── feature 044: the revision watermark ──────────────────────────────
++        //
++        // FIVE FILES THIS FEATURE CHANGED AND NOTHING PINNED. `repository.ts`,
++        // `resume.ts`, `frames.ts` and `memberships.controller.ts` were already
++        // here and all four still meet their floors, so only the unpinned ones
++        // are added — at the values measured on 2026-09-06, not at round numbers
++        // chosen to look tidy.
++        //
++        // AND `services/api/src/db/schema.ts` IS DELIBERATELY NOT PINNED. It
++        // measures 59.15 statements / 40.81 functions, which looks alarming and
++        // is not: the file is drizzle table declarations, and the "functions"
++        // are the per-table callbacks that build indexes, executed only when a
++        // query touches that table. A floor here would ratchet on which tables
++        // the suite happens to query, which is not a property anybody wants to
++        // defend. The column this feature added is covered by
++        // `repository.itest.ts` at the level that matters — whether it moves.
++        "packages/protocol/src/internal.ts": {
++          // 85.71 branches, 60 functions. The functions figure is the schema
++          // module's shape rather than a gap: most exports are zod schemas whose
++          // `.default()` and refinement callbacks only run on the inputs a test
++          // supplies, and this feature's `channel_revisions` default is one of
++          // them — exercised by the fixtures that omit it.
++          branches: 85,
++          functions: 60,
++          lines: 92,
++          statements: 91,
++        },
++        "services/gateway/src/auth.ts": {
++          // 100 across all four. The counts pass through this file untouched, so
++          // the arm that reads them is on the path every socket takes.
++          branches: 100,
++          functions: 100,
++          lines: 100,
++          statements: 100,
++        },
++        "services/gateway/src/registry.ts": {
++          branches: 100,
++          functions: 87,
++          lines: 87,
++          statements: 88,
++        },
++        "services/gateway/src/session.ts": {
++          // The largest file this feature touched, and the ack's three call
++          // sites are all on covered paths — the fresh connect, the resume and
++          // the degrade each have a test in `resume.itest.ts`.
++          //
++          // UNUSUAL HEADROOM, AND IT WAS MEASURED RATHER THAN CHOSEN. Two full
++          // coverage runs on IDENTICAL code gave 87.80% and 85.36% functions —
++          // a 2.44-point swing, about one function of forty. The other three
++          // metrics moved by a third of a point and every other file this
++          // feature pinned was byte-identical across both runs.
++          //
++          // A floor at the measured value would have been red on the next run
++          // for no change to the code, and the fix would then be to lower it —
++          // which is a ratchet that trains people to lower ratchets. Pinned
++          // below the lower observation by roughly the observed swing, and the
++          // swing is recorded so the next feature does not rediscover it.
++          //
++          // The instability itself is a `C7` case in `gaps.md`: something in
++          // this suite is timing-dependent, and coverage reports the symptom
++          // without naming the arm.
++          branches: 90,
++          functions: 83,
++          lines: 93,
++          statements: 93,
++        },
++        "services/api/src/internal/session.controller.ts": {
++          // 62.5 branches, and the uncovered arms are the null-user paths this
++          // feature did not touch: a verified token naming somebody with no row.
++          // Pinned at what it measures so a later change cannot lower it
++          // silently, and not raised to a number the file does not reach.
++          branches: 62,
++          functions: 100,
++          lines: 83,
++          statements: 83,
++        },
++
+         // The dispatcher's two decision-bearing files (chapter 3.5). `expand.ts`
+         // decides whether a redelivered event produces a second set of webhooks
+         // — constitution VI names idempotency explicitly — and `deliver.ts`
+         // holds the post-then-report ordering that chooses a duplicate over a
+         // silent loss. Pinned here because they measured 0% and 87.5% when the
+         // service arrived, which is exactly what research R12 warned a new
+```
