@@ -5706,3 +5706,1007 @@ The tests, including the one that asserts a send moves nothing.
      const author = await repoA.createUser(`${label}-author`, "Author");
 ```
 
+### The shape the count travels in
+
+Two schemas, and the second one exists because of one word in the first. `cursorSchema` is
+`.positive()` — every channel that has never been revised has a count of **zero**, so reusing it
+would have made an unrevised channel unrepresentable, forced the api to omit it, and left the
+gateway unable to tell "no revisions" from "not reported". Those are exactly the two states the
+client contract turns on.
+
+The ack's field is **required**, not optional, and that is the correct direction here for the
+reason chapter 3.24 got wrong from the other side: required is a claim about what you WRITE, and
+the platform builds every ack it sends. A reader of anything durable — 3.24's `outboxEventSchema`
+— cannot require a field its writer did not have. The two cases look identical in a diff and
+invert in consequence.
+
+```diff title="packages/protocol/src/frames.ts"
+@@ -12,12 +12,29 @@ import {
+ // so the types and the validation cannot drift — there is no second
+ // definition. Payloads are strict: unknown fields are rejected.
+ 
+ /** Per-channel resume cursor: { channel_id: highest seq seen } (ADR-03). */
+ export const cursorSchema = z.record(z.string(), z.number().int().positive());
+ 
++/** Per-channel revision count: { channel_id: revisions this channel has seen } (feature 044).
++ *
++ * NOT `cursorSchema`, AND THE DIFFERENCE IS ONE WORD. That schema is `.positive()`, and every
++ * channel that has never been revised has a count of **zero** — so reusing it would make an
++ * unrevised channel unrepresentable, force the api to omit it, and leave the gateway unable to
++ * tell "no revisions" from "not reported". Those are exactly the two states FR-007 turns on: a
++ * count of zero can signal a repair once the channel is revised, and an absent count never
++ * does, because the client holds nothing there to be stale.
++ *
++ * A COUNTER RATHER THAN A TIMESTAMP (FR-010). A clock the client and the platform disagree
++ * about produces wrong repairs in both directions, and a counter answers "how many" for free —
++ * which is the difference between a bounded repair and a full refresh. */
++export const revisionCountSchema = z.record(
++  z.string(),
++  z.number().int().nonnegative(),
++);
++
+ /** FR-MSG-01's message-length maximum, in one place because it is one rule (FR-008).
+  *
+  * THREE DOORS ENFORCE IT AND ONE OF THEM DID NOT. The REST body and the internal hop each
+  * spelled `8000` as a literal, and `messageSendSchema` below — the socket door a customer's
+  * client writes to — carried `z.string()` with no bound at all. A rule the contract
+  * publishes and one door does not enforce is the review's finding, and three literals is
+@@ -72,12 +89,31 @@ export const connectionAckSchema = z.strictObject({
+   type: z.literal("connection.ack"),
+   payload: z.strictObject({
+     user: z.string().min(1),
+     cursor: cursorSchema,
+     resume_ok: z.boolean(),
+     truncated: z.array(z.string().min(1)),
++    /** How many revisions each of this user's channels has seen (feature 044, FR-004).
++     *
++     * WHAT IT IS FOR. Resume is ordered by the channel sequence, and an edit or a deletion
++     * carries the sequence of the message it CHANGES rather than a new one — so a message
++     * revised below this client's cursor arrives on no frame and consumes no sequence,
++     * leaving no gap to notice. Measured: a client on cursor 2 whose message at seq 1 was
++     * edited while away receives exactly this ack and nothing else. SRS FR-016a says the
++     * stale copy is repairable by re-reading history; this is what says when.
++     *
++     * EVERY CHANNEL THE USER BELONGS TO, including those at zero and those the client asked
++     * nothing about (FR-007a). A client needing no repair still needs a baseline to store,
++     * or its next reconnect is the first one again.
++     *
++     * A CLIENT COMPARES, THE PLATFORM DOES NOT DECIDE. Higher here than the client holds
++     * means one or more messages it already has were revised; equal means nothing was; and
++     * a client presenting MORE than this is told nothing is needed rather than refused
++     * (FR-008) — refusing over a number the client supplied is a denial of service the
++     * client controls. */
++    revisions: revisionCountSchema,
+   }),
+ });
+ 
+ /** Client → server send (SAD §5.1: `message.send {idem_key, channel, text}`).
+  * The idempotency key is client-supplied (FR-SDK-06), deduplicated
+  * server-side within 24 h (FR-MSG-04). */
+```
+
+The internal hop carries the same map, and **only on the session response**. The memberships
+response is a backstop that answers "is this user still in this channel"; a revision count there
+would be a second place for the same number to be read from and disagree.
+
+`.default({})` follows `banned`'s precedent in this same schema: during a rolling deploy an api
+built before this feature still satisfies it, and the gateway then reports every channel at zero
+— which is the pre-feature behaviour rather than a crash at the door.
+
+```diff title="packages/protocol/src/internal.ts"
+@@ -3,13 +3,17 @@ import { z } from "zod";
+ import {
+   attachmentSchema,
+   MAX_ATTACHMENTS,
+   refineTextAndAttachments,
+ } from "./attachments.js";
+ 
+-import { MESSAGE_TEXT_MAX, messageSchema } from "./frames.js";
++import {
++  MESSAGE_TEXT_MAX,
++  messageSchema,
++  revisionCountSchema,
++} from "./frames.js";
+ 
+ // The INTERNAL service contract (chapter 2.5) — distinct from the wire
+ // contract above it. `frames.ts` is what a customer's client speaks;
+ // this is what the gateway and the API service speak to each other over
+ // the internal HTTP hop (ADR-05).
+ //
+@@ -170,12 +174,37 @@ export const internalMembershipsResponseSchema = z.strictObject({
+  * `user` is the EXTERNAL id, as everywhere else on this contract: internal uuids
+  * are the api's business. */
+ export const internalSessionResponseSchema = z.strictObject({
+   environment_id: z.string().min(1),
+   user: z.string().min(1),
+   channel_ids: z.array(z.string().min(1)),
++  /** How many revisions each of those channels has seen (feature 044, FR-004, FR-014).
++   *
++   * IT RIDES THIS RESPONSE FOR THE REASON `banned` AND THE LIMITS DO: the gateway has no
++   * database and must not gain one, `revision_sequence` is a column in Postgres, and the api
++   * is the only service that reads Postgres. So the counts travel on the one call the gateway
++   * already makes at connect — no new table reaches the gateway and no new round trip is
++   * added. At 10,000 connections a second call per handshake is 10,000 calls, and the
++   * reconnect rate measured before this feature was 1,402 per second.
++   *
++   * ON THIS RESPONSE AND NOT ON `internalMembershipsResponseSchema` above. That route answers
++   * what a user MAY HEAR — the periodic re-read ADR-20 uses as its backstop — and a revision
++   * count is no part of that question. The watermark is a connect-time signal.
++   *
++   * A PARALLEL MAP RATHER THAN A WIDENED `channel_ids`. Eleven chapters publish that field;
++   * turning it into an array of objects would edit all of them for a field they do not read.
++   * The keys here are the ids above.
++   *
++   * `revisionCountSchema` IMPORTED, NOT RESPELLED. The same shape appears on the ack, and two
++   * records that must agree and are maintained separately is the defect `gaps.md` 3.23-4
++   * records about `targets.ts` — one file apart in this case.
++   *
++   * `.default({})` FOR THE DEPLOY WINDOW, following `banned` below: an api built before this
++   * feature still satisfies the schema during a rolling deploy, and the gateway then reports
++   * every channel at zero, which is today's behaviour. */
++  channel_revisions: revisionCountSchema.default({}),
+   /** Chapter 3.15, FR-031. Whether this user is banned in this environment.
+    *
+    * IT RIDES THIS RESPONSE FOR THE REASON THE LIMITS DO: the gateway has no database and
+    * must not gain one, `banned_at` is a column in Postgres, and the api is the only
+    * service that reads Postgres. So the ban travels on the one call the gateway already
+    * makes at connect — no new table reaches the gateway and no new round trip is added.
+```
+
+**The protocol's own suite went red the moment the field became required**, at the specimen every
+frame test parses. That is the pinned place a payload change is supposed to move, and it was
+repaired rather than relaxed.
+
+```diff title="packages/protocol/src/frames.test.ts"
+@@ -1,14 +1,17 @@
+ import { describe, expect, it } from "vitest";
+ 
+ import {
++  connectionAckSchema,
++  cursorSchema,
+   frameSchema,
+   MESSAGE_TEXT_MAX,
+   messageDeletedSchema,
+   messageSchema,
+   parseFrame,
++  revisionCountSchema,
+ } from "./frames.js";
+ 
+ // The contract must bite: for every frame, one specimen that parses and a
+ // table of malformed near-misses that MUST reject. A schema that accepts
+ // garbage is worse than no schema — it certifies garbage.
+ 
+@@ -26,13 +29,24 @@ const message = {
+   created_at: "2026-08-01T09:00:00.000Z",
+ };
+ 
+ const valid: Record<string, unknown> = {
+   "connection.ack": {
+     type: "connection.ack",
+-    payload: { user: "u1", cursor: { c1: 42 }, resume_ok: true, truncated: [] },
++    // Feature 044: `revisions` is REQUIRED here, and this specimen went red the moment it
++    // was added — which is the point. The ack is a frame the platform BUILDS, so required
++    // is what makes every construction site name it. Chapter 3.24's inverse case is the
++    // one to keep straight: a reader of anything durable cannot require a field its writer
++    // did not have, and `outboxEventSchema` learned that the expensive way.
++    payload: {
++      user: "u1",
++      cursor: { c1: 42 },
++      resume_ok: true,
++      truncated: [],
++      revisions: { c1: 7 },
++    },
+   },
+   "message.send": {
+     type: "message.send",
+     payload: { idem_key: "k-1", channel: "c1", text: "hi" },
+   },
+   "message.ack": { type: "message.ack", payload: { seq: 43 } },
+@@ -330,6 +344,72 @@ describe("the message-length maximum (feature 043, FR-008)", () => {
+       attachments: [],
+       created_at: "2026-09-06T00:00:00.000Z",
+     };
+     expect(messageSchema.safeParse(long).success).toBe(true);
+   });
+ });
++
++describe("the revision count on the ack (feature 044, FR-004, FR-007, FR-009)", () => {
++  const ack = (revisions: unknown) =>
++    parseFrame({
++      type: "connection.ack",
++      payload: {
++        user: "u1",
++        cursor: { c1: 42 },
++        resume_ok: true,
++        truncated: [],
++        revisions,
++      },
++    });
++
++  it("accepts a count of ZERO, which is the whole reason it is not `cursorSchema`", () => {
++    // The two schemas differ by one word — `.positive()` against `.nonnegative()` — and
++    // the difference decides whether a never-revised channel can be reported at all.
++    // Reusing `cursorSchema` would have forced the api to omit those channels, and an
++    // omitted channel is indistinguishable from one the platform never mentioned, which
++    // is exactly the pair FR-007 turns on.
++    expect(ack({ c1: 0 }).success).toBe(true);
++    expect(cursorSchema.safeParse({ c1: 0 }).success).toBe(false);
++    // And the other direction still holds, so nothing was relaxed by accident: a cursor
++    // of zero is still refused, because sequence numbering starts at one.
++    expect(cursorSchema.safeParse({ c1: 1 }).success).toBe(true);
++  });
++
++  it("REQUIRES the field, because the platform is the one that builds it", () => {
++    // The specimen above went red when this was added and was repaired rather than
++    // relaxed. Required on a frame the server emits names every construction site; the
++    // compiler cannot do that for an optional field.
++    const withoutIt = connectionAckSchema.safeParse({
++      type: "connection.ack",
++      payload: { user: "u1", cursor: {}, resume_ok: true, truncated: [] },
++    });
++    expect(withoutIt.success).toBe(false);
++  });
++
++  it("refuses a negative count and a fractional one", () => {
++    // A count that falls would silently tell a client it is up to date (FR-002), and a
++    // fraction is not a number of revisions. Neither is reachable from the writer, which
++    // is why the door is here rather than trusted upstream.
++    expect(ack({ c1: -1 }).success).toBe(false);
++    expect(ack({ c1: 1.5 }).success).toBe(false);
++    expect(ack({ c1: "7" }).success).toBe(false);
++  });
++
++  it("does not require the cursor and the counts to name the same channels", () => {
++    // The joined-during-absence case, at the schema layer. A client resuming presents a
++    // cursor for the channels it held; the platform reports counts for every channel the
++    // user belongs to, which is a superset. A schema that tied them together would make
++    // the correct response unrepresentable.
++    expect(ack({ c1: 3, c2: 0 }).success).toBe(true);
++    // And the empty map, which is what a user in no channels gets.
++    expect(ack({}).success).toBe(true);
++  });
++
++  it("exports the count schema on its own, so the internal hop validates the same rule", () => {
++    // `internalSessionResponseSchema` reuses this rather than restating it. Two schemas
++    // that must agree and are spelled twice are two schemas that will stop agreeing —
++    // feature 043 found that with `editMessageBodySchema.text`, from the other side: two
++    // that must DIFFER cannot share a reference at all.
++    expect(revisionCountSchema.safeParse({ c1: 0 }).success).toBe(true);
++    expect(revisionCountSchema.safeParse({ c1: -1 }).success).toBe(false);
++  });
++});
+```
+
+### One query, two fields
+
+The api already resolved the caller's memberships on `/internal/session`; the count rides the
+same rows. The membership query was widened to return the column and both of its callers were
+repaired in the same commit — the other one throws the count away and maps back to bare ids,
+which is what its response has always been.
+
+**No per-channel query per handshake.** At the ten thousand connections this platform was
+measured at, that cost is the one this feature cannot pay.
+
+```diff title="services/api/src/internal/session.controller.ts"
+@@ -111,28 +111,39 @@ export class SessionController {
+           HttpStatus.PAYMENT_REQUIRED,
+         );
+       }
+       throw error;
+     }
+ 
++    // ONE QUERY FEEDING TWO FIELDS (feature 044, FR-014). Hoisted out of the object below
++    // because `channel_ids` and `channel_revisions` come from the same rows — calling
++    // `channelsForUser` twice would be two queries per handshake, and at 10,000 connections
++    // that is 10,000 extra reads on the one call this feature was careful not to add.
++    const memberships = user ? await this.repo.channelsForUser(user.id) : [];
++
+     return {
+       environment_id: principal.environmentId,
+       user: principal.userExternalId,
+       // Chapter 3.15, FR-031. THE ROW IS ALREADY IN HAND — `getUserByExternalId` above
+       // reads it for the channel list — so carrying the ban costs one field and no query.
+       // The gateway refuses the socket; this route only reports the fact, because the
+       // gateway has no database and the column is in Postgres.
+       //
+       // A USER THIS ENVIRONMENT HAS NEVER SEEN IS NOT BANNED. `user` is null for a
+       // verified token naming somebody with no row, which chapter 2.5 decided is a user
+       // with no channels rather than an error — and a user with no row has no ban either.
+       banned: user?.banned_at != null,
+-      // Ids here; the counts ride the same rows and are filled in below (feature 044).
+-      channel_ids: user
+-        ? (await this.repo.channelsForUser(user.id)).map((c) => c.channel_id)
+-        : [],
++      channel_ids: memberships.map((c) => c.channel_id),
++      /** The counts, from the same rows (feature 044, FR-004).
++       *
++       * EVERY CHANNEL, INCLUDING THOSE AT ZERO. The gateway reports all of them on the ack
++       * so a client needing no repair still has a baseline to store (FR-007a); omitting the
++       * zeros here would make that impossible one layer up. */
++      channel_revisions: Object.fromEntries(
++        memberships.map((c) => [c.channel_id, c.revision_sequence]),
++      ),
+       limits: {
+         connect: policy.limits.connect,
+         send: policy.limits.send,
+       },
+     };
+   }
+```
+
+### The gateway reports, and does not compare
+
+The counts arrive with the identity and the memberships, from the session call at the door, for
+the reason `banned` and `limits` arrived the same way: the gateway has no database and must not
+gain one.
+
+**A draft had the client present its own counts on the upgrade URL** so the gateway could compare
+and answer with the stale channels. It was built and removed. A parameter the server parses and
+never acts on is a contract it can never remove — and the removal keeps the rsplit rule intact,
+which a third cursor field would have broken silently, parsing a revision count as a sequence and
+resuming every client from a plausible wrong place.
+
+```diff title="services/gateway/src/auth.ts"
+@@ -36,12 +36,19 @@ export type { Identity } from "./api-client.js";
+  * acts on by re-authenticating for ever. */
+ export type Authentication =
+   | {
+       outcome: "ok";
+       identity: Identity;
+       channelIds: string[];
++      /** How many revisions each of those channels has seen (feature 044, FR-004).
++       *
++       * Carried for the same reason `channelIds` and `limits` are: the api read a column
++       * the gateway has no database to read, and this is the one call the gateway makes at
++       * connect. The gateway puts it on the ack and does nothing else with it — it never
++       * learns what a client holds, so it cannot be wrong about it. */
++      channelRevisions: Record<string, number>;
+       /** Chapter 3.8. The environment's two socket allowances, read from
+        * Postgres by the api and carried on the same response — the gateway has
+        * no database client and R12 spent its whole argument on keeping it that
+        * way. */
+       limits: { connect: number; send: number };
+     }
+@@ -85,12 +92,13 @@ export async function authenticate(
+         userExternalId: session.user,
+         // Carried, not trusted: the internal hop forwards this instead of
+         // asserting an identity the gateway invented.
+         token,
+       },
+       channelIds: session.channel_ids,
++      channelRevisions: session.channel_revisions,
+       limits: session.limits,
+     };
+   } catch (error) {
+     return { outcome: "unavailable", error: String(error) };
+   }
+ }
+```
+
+```diff title="services/gateway/src/registry.ts"
+@@ -16,12 +16,23 @@ import type { ResumePhase } from "./resume.js";
+ 
+ export interface Connection {
+   readonly id: string;
+   readonly identity: Identity;
+   readonly socket: WebSocket;
+   channelIds: Set<string>;
++  /** How many revisions each of those channels has seen, as the api reported them at
++   *  connect (feature 044, FR-004).
++   *
++   * ON THE CONNECTION RATHER THAN PASSED DOWN, because `ack` is a sibling of the function
++   * that receives them and is called from three places. A parameter threaded through all
++   * three would have to be threaded through `resume` as well, for a value that belongs to
++   * the connection exactly as `channelIds` does.
++   *
++   * READ ONLY. Nothing updates this after connect: it is what the platform said when the
++   * socket opened, and a client that wants a fresher figure reconnects. */
++  revisions: Record<string, number>;
+   missedPings: number;
+   /** Chapter 2.7. A connection resuming through the tunnel spends its first
+    * milliseconds holding live frames back so the backfill can go first; a
+    * fresh connect is born "live" and never buffers. Delivery reads this
+    * field and nothing else — the resume machinery is invisible to it. */
+   phase: ResumePhase;
+```
+
+`revisions` sits inside the single `ack()` helper rather than at its three call sites — the fresh
+connect, the successful resume, and the degrade. All three carry it by construction, which is the
+difference between one fact and three branches somebody has to keep matching.
+
+Reported on every ack, resume or not: a fresh connect holds nothing that can be stale, and giving
+it the counts anyway is what lets its NEXT reconnect compare.
+
+```diff title="services/gateway/src/session.ts"
+@@ -889,12 +889,13 @@ export function attachSessions({
+           return;
+         }
+         void open(
+           ws,
+           result.identity,
+           result.channelIds,
++          result.channelRevisions,
+           req.url ?? "/",
+           result.limits.send,
+           pendingId,
+           claimed,
+         );
+       });
+@@ -902,12 +903,22 @@ export function attachSessions({
+   });
+ 
+   async function open(
+     socket: WebSocket,
+     identity: Identity,
+     channelIds: string[],
++    /** How many revisions each of those channels has seen (feature 044, FR-004).
++     *
++     * Arrives with the memberships, from the same session call at the door, for the same
++     * reason: the api read a column the gateway has no database to read. It goes onto the
++     * ack and nowhere else — the gateway reports it and the client decides what it means,
++     * so the gateway never learns what a client holds and cannot be wrong about it.
++     *
++     * Defaults to `{}` for the fixtures that do not wire a session response, which then
++     * report every channel at zero — the pre-feature behaviour. */
++    channelRevisions: Record<string, number>,
+     url: string,
+     sendLimit: number,
+     /** Chapter 3.22. The id the cap claimed a place with, so the connection and
+      * its slot agree — FR-011's "exactly one place for its lifetime". Absent when
+      * no `connections` module is wired, which is every fixture that does not opt
+      * in and the reason the cap is not enforced there. */
+@@ -923,12 +934,13 @@ export function attachSessions({
+       socket,
+       // Chapter 3.2: memberships arrived with the identity, from the session
+       // call at the door. There is no second lookup to fail here — the api is
+       // still the only source of membership (ADR-05), it just answers both
+       // questions at once, and a failure now closes the socket before it opens.
+       channelIds: new Set(channelIds),
++      revisions: channelRevisions,
+       missedPings: 0,
+       phase: presented === undefined ? "live" : "buffering",
+       buffer: [],
+       overflowed: false,
+       // A fresh connect suppresses nothing; a resume fills this in when it
+       // succeeds, and leaves it null when it degrades.
+@@ -1239,13 +1251,26 @@ export function attachSessions({
+       resume_ok: boolean;
+       truncated: string[];
+     },
+   ): void {
+     send(connection.socket, {
+       type: "connection.ack",
+-      payload: { user: connection.identity.userExternalId, ...payload },
++      payload: {
++        user: connection.identity.userExternalId,
++        ...payload,
++        /** EVERY CHANNEL THIS USER BELONGS TO, including those at zero and those this
++         *  client asked nothing about (feature 044, FR-004, FR-007a).
++         *
++         * A client needing no repair still needs a baseline to store, or its next
++         * reconnect is the first one again — so a response carrying only the changed
++         * channels would leave most clients unable to establish one.
++         *
++         * Reported on every ack, resume or not. A fresh connect holds nothing that can be
++         * stale, and giving it the counts anyway is what lets its NEXT reconnect compare. */
++        revisions: connection.revisions,
++      },
+     });
+   }
+ 
+   /** The five steps (chapter 2.7, SAD §5.2). Steps 1 and 2 already happened
+    * — the connection was born `buffering` and the subscribes are in flight
+    * — so what is left is: confirm, backfill, ack, emit, flush, live. */
+```
+
+And the parameter that is not there is recorded where it would have been, because a reader who
+wonders why the client sends nothing deserves the answer in the file rather than in a commit
+message.
+
+```diff title="services/gateway/src/resume.ts"
+@@ -173,6 +173,26 @@ export async function withDeadline(
+       deadline,
+     ]);
+   } finally {
+     if (timer) clearTimeout(timer);
+   }
+ }
++
++/** THERE IS NO `?rev=` PARAMETER ON THIS URL, AND THAT IS A DECISION (feature 044).
++ *
++ * A draft of the revision watermark had the client present the counts it holds so the gateway
++ * could compare and answer with the channels that were stale. It was built here and removed:
++ * `connection.ack` carries the platform's count for **every** channel the user belongs to, so
++ * a client that stores those counts compares them itself, and the parameter was never read.
++ *
++ * The whole of the request table in that feature's contract is satisfied without it. A client
++ * built before the feature simply ignores the new ack field, which is the same outcome as
++ * "presented no counts, so no repair signalled" — reached by doing nothing rather than by a
++ * rule the gateway has to hold.
++ *
++ * **A parameter the server parses and never acts on is a contract it can never remove.**
++ *
++ * It also keeps `parseCursors` above untouched, which matters more than it looks: that
++ * function splits on the LAST colon because a channel id is opaque and may contain one, so a
++ * `<channel>:<seq>:<rev>` entry would have parsed `rev` as the sequence. Every resume would
++ * have silently resumed from the wrong place, producing plausible numbers rather than an
++ * error. */
+```
+
+### The fixtures that had to say something
+
+Every stub of the session response now states a revision count, and the ones that state `{}` are
+saying the pre-feature thing on purpose. A stub that does not say is a stub that has not thought
+about it — the same argument chapter 3.15 made when `banned` was added to this response.
+
+```diff title="services/gateway/src/session.test.ts"
+@@ -51,12 +51,16 @@ function stubApi(overrides: Partial<ApiClient> = {}): ApiClient {
+             environment_id: "env-1",
+             user: "tuan",
+             // Chapter 3.15: the api now reports whether the user is banned, and a stub
+             // that does not say is a stub that has not thought about it.
+             banned: false,
+             channel_ids: [CHANNEL],
++            // Feature 044: the api reports a revision count per channel. These fixtures wire
++            // none, so every channel reports zero — the pre-feature behaviour, and what a
++            // client that stores the counts will compare against next time.
++            channel_revisions: {},
+             // Chapter 3.8. The limits ride the session response because the
+             // gateway has no database to read them from — so the stub supplies
+             // them, exactly as the api would. Generous by default: every test
+             // above this line is about something else.
+             limits: { connect: 3_000, send: 600 },
+           }
+@@ -986,12 +990,16 @@ describe("the socket's limits (chapter 3.8)", () => {
+           environment_id: "env-1",
+           user: "tuan",
+           // Chapter 3.15: the api now reports whether the user is banned, and a stub
+           // that does not say is a stub that has not thought about it.
+           banned: false,
+           channel_ids: [CHANNEL],
++          // Feature 044: the api reports a revision count per channel. These fixtures wire
++          // none, so every channel reports zero — the pre-feature behaviour, and what a
++          // client that stores the counts will compare against next time.
++          channel_revisions: {},
+           limits: { connect: 2, send: 600 },
+         }),
+       }),
+       undefined,
+       undefined,
+       undefined,
+@@ -1022,12 +1030,16 @@ describe("the socket's limits (chapter 3.8)", () => {
+           environment_id: "env-1",
+           user: "tuan",
+           // Chapter 3.15: the api now reports whether the user is banned, and a stub
+           // that does not say is a stub that has not thought about it.
+           banned: false,
+           channel_ids: [CHANNEL],
++          // Feature 044: the api reports a revision count per channel. These fixtures wire
++          // none, so every channel reports zero — the pre-feature behaviour, and what a
++          // client that stores the counts will compare against next time.
++          channel_revisions: {},
+           limits: { connect: 3_000, send: configured },
+         }),
+       }),
+       undefined,
+       undefined,
+       undefined,
+```
+
+```diff title="services/gateway/src/resume.itest.ts"
+@@ -124,20 +124,24 @@ describe("resume across a real fabric", () => {
+     // different fanout client on the same subject — publishes into the
+     // window. Neither side coordinates; only the buffer saves this.
+     harness = await boot({
+       session: async () => ({
+         environment_id: "env-1",
+         user: "tuan",
+         // Chapter 3.15: the api now reports whether the user is banned, and a stub
+         // that does not say is a stub that has not thought about it.
+         banned: false,
+         channel_ids: [CHANNEL],
++        // Feature 044: the api reports a revision count per channel. These fixtures wire
++        // none, so every channel reports zero — the pre-feature behaviour, and what a
++        // client that stores the counts will compare against next time.
++        channel_revisions: {},
+         // Chapter 3.8: the limits ride the session response now. Generous, and
+         // beside the point of every test in this file.
+         limits: { connect: 3_000, send: 600 },
+       }),
+       backfill: async () => {
+         await publishFromElsewhere(frame(43));
+         await settle(150); // give Redis time to actually deliver it
+         return {
+           [CHANNEL]: { messages: [frame(42), frame(43)], truncated: false },
+         };
+@@ -165,20 +169,24 @@ describe("resume across a real fabric", () => {
+     // Committed after the backfill's snapshot: it exists ONLY in the buffer,
+     // and the flush is the only reason the client ever sees it.
+     harness = await boot({
+       session: async () => ({
+         environment_id: "env-1",
+         user: "tuan",
+         // Chapter 3.15: the api now reports whether the user is banned, and a stub
+         // that does not say is a stub that has not thought about it.
+         banned: false,
+         channel_ids: [CHANNEL],
++        // Feature 044: the api reports a revision count per channel. These fixtures wire
++        // none, so every channel reports zero — the pre-feature behaviour, and what a
++        // client that stores the counts will compare against next time.
++        channel_revisions: {},
+         // Chapter 3.8: the limits ride the session response now. Generous, and
+         // beside the point of every test in this file.
+         limits: { connect: 3_000, send: 600 },
+       }),
+       backfill: async () => {
+         await publishFromElsewhere(frame(43));
+         await settle(150);
+         return { [CHANNEL]: { messages: [frame(42)], truncated: false } };
+       },
+       sendMessage: async () => {
+@@ -200,20 +208,24 @@ describe("resume across a real fabric", () => {
+ 
+   it("goes live after the flush, with no buffering left behind", async () => {
+     harness = await boot({
+       session: async () => ({
+         environment_id: "env-1",
+         user: "tuan",
+         // Chapter 3.15: the api now reports whether the user is banned, and a stub
+         // that does not say is a stub that has not thought about it.
+         banned: false,
+         channel_ids: [CHANNEL],
++        // Feature 044: the api reports a revision count per channel. These fixtures wire
++        // none, so every channel reports zero — the pre-feature behaviour, and what a
++        // client that stores the counts will compare against next time.
++        channel_revisions: {},
+         // Chapter 3.8: the limits ride the session response now. Generous, and
+         // beside the point of every test in this file.
+         limits: { connect: 3_000, send: 600 },
+       }),
+       backfill: async () => ({
+         [CHANNEL]: { messages: [frame(42)], truncated: false },
+       }),
+       sendMessage: async () => {
+         throw new Error("not used");
+       },
+@@ -253,20 +265,24 @@ describe("resume across a real fabric", () => {
+     //
+     // One number different from the test above it. That is the whole bug.
+     harness = await boot({
+       session: async () => ({
+         environment_id: "env-1",
+         user: "tuan",
+         // Chapter 3.15: the api now reports whether the user is banned, and a stub
+         // that does not say is a stub that has not thought about it.
+         banned: false,
+         channel_ids: [CHANNEL],
++        // Feature 044: the api reports a revision count per channel. These fixtures wire
++        // none, so every channel reports zero — the pre-feature behaviour, and what a
++        // client that stores the counts will compare against next time.
++        channel_revisions: {},
+         // Chapter 3.8: the limits ride the session response now. Generous, and
+         // beside the point of every test in this file.
+         limits: { connect: 3_000, send: 600 },
+       }),
+       backfill: async () => ({
+         [CHANNEL]: { messages: [frame(42)], truncated: false },
+       }),
+       sendMessage: async () => {
+         throw new Error("not used");
+       },
+@@ -299,20 +315,24 @@ describe("resume across a real fabric", () => {
+     // retiring the mark once a higher sequence arrived — which would see the 43,
+     // drop the mark, and then deliver the 42 (research R3).
+     harness = await boot({
+       session: async () => ({
+         environment_id: "env-1",
+         user: "tuan",
+         // Chapter 3.15: the api now reports whether the user is banned, and a stub
+         // that does not say is a stub that has not thought about it.
+         banned: false,
+         channel_ids: [CHANNEL],
++        // Feature 044: the api reports a revision count per channel. These fixtures wire
++        // none, so every channel reports zero — the pre-feature behaviour, and what a
++        // client that stores the counts will compare against next time.
++        channel_revisions: {},
+         // Chapter 3.8: the limits ride the session response now. Generous, and
+         // beside the point of every test in this file.
+         limits: { connect: 3_000, send: 600 },
+       }),
+       backfill: async () => ({
+         [CHANNEL]: { messages: [frame(42)], truncated: false },
+       }),
+       sendMessage: async () => {
+         throw new Error("not used");
+       },
+@@ -358,20 +378,24 @@ describe("resume across a real fabric", () => {
+    * **THE ABSENCE IS THE ASSERTION.** A resume that carried `message.updated` for a
+    * message the client is receiving for the first time would be telling it that
+    * something it has never seen has changed. */
+   it("chapter 3.23: replays an edited message as message.created with its current text, and no message.updated", async () => {
+     harness = await boot({
+       session: async () => ({
+         environment_id: "env-1",
+         user: "tuan",
+         banned: false,
+         channel_ids: [CHANNEL],
++        // Feature 044: the api reports a revision count per channel. These fixtures wire
++        // none, so every channel reports zero — the pre-feature behaviour, and what a
++        // client that stores the counts will compare against next time.
++        channel_revisions: {},
+         limits: { connect: 3_000, send: 600 },
+       }),
+       // The api's backfill returns ROWS AS THEY ARE NOW — which for an edited message
+       // is the corrected text under its original sequence. The stub says exactly that,
+       // and `backfill.itest.ts` proves the real one does.
+       backfill: async () => ({
+         [CHANNEL]: {
+           messages: [{ ...frame(42), text: "m42, corrected" }],
+           truncated: false,
+         },
+@@ -404,20 +428,24 @@ describe("resume across a real fabric", () => {
+     // would suppress messages the client never got — turning this chapter's
+     // duplicate into a gap, which constitution II ranks worse.
+     harness = await boot({
+       session: async () => ({
+         environment_id: "env-1",
+         user: "tuan",
+         // Chapter 3.15: the api now reports whether the user is banned, and a stub
+         // that does not say is a stub that has not thought about it.
+         banned: false,
+         channel_ids: [CHANNEL],
++        // Feature 044: the api reports a revision count per channel. These fixtures wire
++        // none, so every channel reports zero — the pre-feature behaviour, and what a
++        // client that stores the counts will compare against next time.
++        channel_revisions: {},
+         // Chapter 3.8: the limits ride the session response now. Generous, and
+         // beside the point of every test in this file.
+         limits: { connect: 3_000, send: 600 },
+       }),
+       backfill: async () => {
+         throw new Error("backfill unavailable");
+       },
+       sendMessage: async () => {
+         throw new Error("not used");
+       },
+@@ -434,20 +462,144 @@ describe("resume across a real fabric", () => {
+     // A sequence at or below the presented cursor. With no mark retained it must
+     // still arrive: the client was told to page history, not to expect silence.
+     await publishFromElsewhere(frame(41));
+     await settle(300);
+ 
+     expect(created(frames)).toEqual([41]);
+     socket.close();
+   });
+ });
+ 
++// ── feature 044: the revision count on every ack (US1) ──────────────────────
++//
++// WHY HERE AND NOT IN `session.itest.ts`. The task named that file and the four
++// `cursor`/`rev` combinations from the contract. `rev` was built and removed —
++// a client sends nothing to obtain this — so there are no four combinations
++// left to enumerate; what remains is which ACK a connection gets, and there are
++// three of those. This file is where a stubbed api lets a test SAY what the
++// counts are, which is the only way to assert the case the earlier draft got
++// wrong: a channel the presented cursor never mentions.
++//
++// The end-to-end half — a real edit raising a real count on a real ack — is in
++// `session.itest.ts`, which spawns an api. Neither fixture does both.
++describe("the revision count rides every ack (feature 044, FR-004, FR-007a)", () => {
++  let harness: Harness | undefined;
++
++  afterEach(async () => {
++    await harness?.close();
++    harness = undefined;
++  });
++
++  const OTHER = randomUUID();
++
++  /** The counts a test wants reported, wired into an api stub that is otherwise
++   * every other stub in this file. */
++  async function bootReporting(
++    revisions: Record<string, number>,
++    backfill: Omit<ApiClient, "reportUsage">["backfill"],
++  ): Promise<Harness> {
++    return boot({
++      session: async () => ({
++        environment_id: "env-1",
++        user: "tuan",
++        banned: false,
++        channel_ids: [CHANNEL, OTHER],
++        channel_revisions: revisions,
++        limits: { connect: 3_000, send: 600 },
++      }),
++      backfill,
++      sendMessage: async () => {
++        throw new Error("not used");
++      },
++      memberships: async () => [CHANNEL, OTHER],
++    });
++  }
++
++  const ackOf = (frames: Frame[]) =>
++    frames.find((f) => f.type === "connection.ack") as
++      | {
++          payload: {
++            cursor: Record<string, number>;
++            resume_ok: boolean;
++            revisions: Record<string, number>;
++          };
++        }
++      | undefined;
++
++  it("reports on a FRESH connect, which presents no cursor and holds nothing stale", async () => {
++    // FR-007's first absence. A first connection cannot be stale — it has nothing —
++    // and it gets the counts anyway, because the baseline it stores now is what its
++    // NEXT reconnect compares against. A response that gave it nothing would make
++    // every reconnect the first one again (FR-007a).
++    harness = await bootReporting({ [CHANNEL]: 7, [OTHER]: 0 }, async () => ({}));
++    const socket = new WebSocket(`${harness.url}?token=${await token()}`);
++    const frames = record(socket);
++    await settle(400);
++
++    const ack = ackOf(frames);
++    expect(ack?.payload.revisions).toEqual({ [CHANNEL]: 7, [OTHER]: 0 });
++    // Including the zero. `cursorSchema` could not have carried that channel at all.
++    expect(ack?.payload.revisions[OTHER]).toBe(0);
++    socket.close();
++  });
++
++  it("reports a channel the presented cursor never mentions", async () => {
++    // FR-007's THIRD absence, and the one a literal reading of the earlier draft got
++    // wrong: it said an absent count was "treated as presenting zero", and zero
++    // compares as lower than any revised channel — so a channel joined during the
++    // absence signalled a repair to a client that holds nothing in it to repair.
++    //
++    // The gateway now compares nothing at all, so this asserts the shape rather than
++    // a branch: the counts are reported WHOLE, never scoped to the presented cursor.
++    harness = await bootReporting({ [CHANNEL]: 2, [OTHER]: 5 }, async () => ({
++      [CHANNEL]: { messages: [frame(42)], truncated: false },
++    }));
++    const socket = new WebSocket(
++      `${harness.url}?token=${await token()}&cursor=${CHANNEL}:41`,
++    );
++    const frames = record(socket);
++    await settle(400);
++
++    const ack = ackOf(frames);
++    expect(ack?.payload.resume_ok).toBe(true);
++    expect(ack?.payload.revisions).toEqual({ [CHANNEL]: 2, [OTHER]: 5 });
++    // The cursor is scoped to what the client presented; the counts are not. That
++    // asymmetry is the requirement, so both halves are asserted here rather than
++    // trusting the one that happens to be easier to read.
++    expect(ack?.payload.cursor).toEqual({ [CHANNEL]: 41 });
++    socket.close();
++  });
++
++  it("reports on a DEGRADED resume too, where the client is told to page everything", async () => {
++    // The ack a client gets when the backfill failed. It is the one most likely to be
++    // written without the field — the code path exists to say "resume did not happen" —
++    // and it is the one where the counts matter most: a client about to re-read every
++    // channel still needs the baseline to compare against NEXT time.
++    //
++    // Structural, not incidental: `revisions` sits inside the single `ack()` helper
++    // rather than at its three call sites, so all three carry it by construction.
++    harness = await bootReporting({ [CHANNEL]: 4, [OTHER]: 0 }, async () => {
++      throw new Error("backfill unavailable");
++    });
++    const socket = new WebSocket(
++      `${harness.url}?token=${await token()}&cursor=${CHANNEL}:41`,
++    );
++    const frames = record(socket);
++    await settle(400);
++
++    const ack = ackOf(frames);
++    expect(ack?.payload.resume_ok).toBe(false);
++    expect(ack?.payload.revisions).toEqual({ [CHANNEL]: 4, [OTHER]: 0 });
++    socket.close();
++  });
++});
++
+ // ── chapter 3.18: two instances, one fabric (US2) ───────────────────────────
+ //
+ // `boot()` IS UNTOUCHED. It is called six times above and each call builds its
+ // own `createFanout` and its own server, so two calls already give two gateway
+ // instances sharing one Redis — which is precisely what SC-002 needs. Changing
+ // the fixture to "support" that would have changed six passing tests to prove
+ // nothing new (3.17's T040b, the fifth such incident in two features).
+ //
+ // WHAT THIS PROVES AND WHAT IT DOES NOT. The api here is a stub, as everywhere
+ // in this file: the gateway has no database (ADR-05) and these suites are about
+@@ -471,20 +623,24 @@ describe("two instances on one fabric (chapter 3.18)", () => {
+     sockets.push(socket);
+     return record(socket);
+   };
+ 
+   const stub = (channels: string[]) => ({
+     session: async () => ({
+       environment_id: "env-1",
+       user: "tuan",
+       banned: false,
+       channel_ids: channels,
++      // Feature 044: the api reports a revision count per channel. These fixtures wire
++      // none, so every channel reports zero — the pre-feature behaviour, and what a
++      // client that stores the counts will compare against next time.
++      channel_revisions: {},
+       limits: { connect: 3_000, send: 600 },
+     }),
+     backfill: async () => ({}),
+     sendMessage: async () => {
+       throw new Error("not used");
+     },
+     // Chapter 3.20. The same list `session` answers with, so the backstop confirms
+     // what the connect already established and changes nothing.
+     memberships: async () => channels,
+   });
+```
+
+```diff title="services/gateway/src/connections.itest.ts"
+@@ -135,12 +135,16 @@ async function boot(options: {
+   const api: ApiClient = {
+     session: async () => ({
+       environment_id: environment,
+       user: options.user,
+       banned: false,
+       channel_ids: options.channels,
++      // Feature 044: the api reports a revision count per channel. These fixtures wire
++      // none, so every channel reports zero — the pre-feature behaviour, and what a
++      // client that stores the counts will compare against next time.
++      channel_revisions: {},
+       limits: { connect: 3_000, send: 600 },
+     }),
+     memberships: async () => options.channels,
+     backfill: async () => ({}) as never,
+     sendMessage: async () => {
+       throw new Error("not used");
+```
+
+```diff title="services/gateway/src/typing.itest.ts"
+@@ -108,12 +108,16 @@ async function boot(options: {
+   const api: ApiClient = {
+     session: async () => ({
+       environment_id: environment,
+       user: options.user,
+       banned: false,
+       channel_ids: options.channels,
++      // Feature 044: the api reports a revision count per channel. These fixtures wire
++      // none, so every channel reports zero — the pre-feature behaviour, and what a
++      // client that stores the counts will compare against next time.
++      channel_revisions: {},
+       limits: { connect: 3_000, send: 600 },
+     }),
+     memberships: async () => options.channels,
+     backfill: async () => {
+       if (options.backfillDelayMs !== undefined) {
+         await new Promise((r) => setTimeout(r, options.backfillDelayMs));
+```
+
+**The forged-frame builder is the one that mattered.** It asserts that a well-formed outbound
+frame is refused for its DIRECTION, and a sample missing a newly-required field is refused a
+phase earlier for its SHAPE — turning nine direction assertions into nine parser assertions,
+still green. Chapter 3.23 made the identical repair to this identical pair of builders when
+`message.deleted` gained its own payload. Second incident, same two files.
+
+```diff title="services/gateway/src/isolation.itest.ts"
+@@ -803,13 +803,19 @@ function sample(type: string, channel: string, user: string): unknown {
+     // `invalid_frame` — a phase before the direction check this suite is about.
+     attachments: [],
+     created_at: new Date().toISOString(),
+   };
+   switch (type) {
+     case "connection.ack":
+-      return { type, payload: { user, cursor: {}, resume_ok: true, truncated: [] } };
++      // Feature 044 added a required `revisions` to this payload, and a sample missing
++      // it is refused for its SHAPE a phase before the direction check — see the
++      // `message.deleted` note below, which is chapter 3.23 making the same repair.
++      return {
++        type,
++        payload: { user, cursor: {}, resume_ok: true, truncated: [], revisions: {} },
++      };
+     case "message.ack":
+       return { type, payload: { seq: 1 } };
+     case "message.created":
+     case "message.updated":
+       return { type, payload: message };
+     // CHAPTER 3.23 SPLIT THIS CASE OFF. `message.deleted` shared the `Message` above
+```
