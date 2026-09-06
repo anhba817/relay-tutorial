@@ -4952,3 +4952,343 @@ refusing everything would pass the refusal test and break every customer.
      await repo.createUser("profiled", "Before");
 ```
 
+## A refusal that names the customer's mistake
+
+Five throws in `webhooks.service.ts` were bare `UnprocessableEntityException`s.
+`ProtocolErrorFilter` derives an error code from 400, 401, 403 and 404 and answers
+`internal_error` for everything else — so every one of those refusals told a customer that
+**Relay** had failed, when Relay had understood them perfectly and declined.
+
+`codes.ts` had already written the rule they broke: *"a 422 MUST supply this code explicitly
+through `protocolError` — an unnamed 422 ships a body calling itself an internal error"*. It
+even named the five as still open. Reverting one and re-running the test reproduces it:
+`expected 'internal_error' to be 'webhook_url_insecure'`.
+
+**Six codes, not five.** Validating the event-type set creates a refusal that did not exist
+to be counted. `codes.test.ts`'s exact-count assertion moves 21 -> 27 deliberately, which is
+the fifth time that line has turned a new code into a decision rather than an accident.
+
+**And the tests assert the code, not the status.** `webhooks.itest.ts` checked `status` and
+the message text, both of which were right the whole time while the body said
+`internal_error`. That is why this has been open since chapter 3.5.
+
+```diff title="packages/protocol/src/codes.ts"
+@@ -245,6 +245,39 @@ export const ERROR_CODES = {
+    * platform no longer has — at which point it is deleted, not repurposed. */
+   media_not_available:
+     "hosted media is not available yet; attach an http or https url instead",
++  /** THE FIVE BARE 422s, NAMED (feature 043, FR-014). `gaps.md` records them as still
++   * open and the paragraph above says exactly what they cost: `ProtocolErrorFilter`
++   * answers `internal_error` for any status outside 400/401/403/404, so every one of
++   * these refusals told a customer the PLATFORM had failed when the platform had
++   * understood them perfectly and declined.
++   *
++   * SIX CODES, NOT FIVE. The plan said one per bare throw; validating the event-type set
++   * (FR-016) adds a refusal that did not exist to be counted. Chapter 3.24's plan
++   * expected one new code and shipped two, and `codes.test.ts`'s exact-count assertion is
++   * what caught it — so the count moves deliberately here rather than being discovered
++   * there.
++   *
++   * ALL 422 AND NOT 400. Each body is well-formed and each request is understood; what
++   * cannot be done is the thing it asks for. That is the same line `media_not_available`
++   * draws above. It is also why the avatar scheme rule in `users.schema.ts` is a 400 and
++   * these are not: a bad scheme fails SCHEMA validation, and these fail after it. */
++  webhook_endpoint_limit_reached:
++    "this environment already holds the maximum number of webhook endpoints; delete one before adding another",
++  webhook_url_invalid:
++    "the endpoint url is not a valid absolute url",
++  webhook_url_insecure:
++    "the endpoint url must use https — a signature over a plaintext channel protects the body, not the reader",
++  webhook_url_private_address:
++    "the endpoint url points at a loopback, link-local or private address, which this platform will not call",
++  webhook_event_types_empty:
++    "event_types must name at least one event type",
++  /** THE REFUSAL THE REVIEW ASKED FOR, AND NOT THE ONE IT RECOMMENDED. It says to compare
++   * a subscription with the types the platform EMITS. Measured: 741 stored subscriptions
++   * name `channel.created`, which FR-WHK-02 declares and the platform has not built. Those
++   * customers made no mistake, so the comparand is the DECLARED eight and this code is for
++   * a name outside them — a typo, which is the finding. */
++  webhook_event_type_unknown:
++    "that event type is not one this platform declares; the message names the accepted set",
+   not_found:
+     "no such resource for this tenant — and DELIBERATELY the same answer as for a resource in another tenant (FR-TEN-05)",
+   internal_error:
+```
+
+And the count that makes the sixth a decision.
+
+```diff title="packages/protocol/src/codes.test.ts"
+@@ -77,7 +77,12 @@ describe("the registry is the whole vocabulary (FR-024)", () => {
+     // its plan did not expect. **One pinned place, not the four chapter 3.22's close code
+     // moved** — that chapter's task predicted two and found four, so this one counted
+     // before editing: this assertion is the only place in the file that names a total.
+-    expect(Object.keys(ERROR_CODES)).toHaveLength(21);
++    // Twenty-one until feature 043 named the five bare 422s in `webhooks.service.ts` and
++    // added the event-type refusal alongside them — SIX, where the plan said "one per
++    // customer-caused webhook refusal" and would have counted five. The sixth is FR-016's,
++    // and it did not exist to be counted until validating the set created it. Fifth time
++    // this line has turned a new code into a decision instead of an accident.
++    expect(Object.keys(ERROR_CODES)).toHaveLength(27);
+   });
+ 
+   it("names the non-author refusal separately from the generic 403 (chapter 3.23)", () => {
+```
+
+The five throws, and the event-type check beside them.
+
+```diff title="services/api/src/webhooks/webhooks.service.ts"
+@@ -1,9 +1,7 @@
+-import {
+-  Inject,
+-  Injectable,
+-  NotFoundException,
+-  UnprocessableEntityException,
+-} from "@nestjs/common";
++import { Inject, Injectable, NotFoundException } from "@nestjs/common";
++
++import { WEBHOOK_EVENT_TYPES } from "../outbox/event";
++import { protocolError } from "../protocol-error";
+ 
+ import type { Db } from "../db/client";
+ import {
+@@ -85,8 +83,10 @@ export class WebhooksService {
+ 
+     const existing = await this.repo.countEndpoints();
+     if (existing >= MAX_ENDPOINTS_PER_ENVIRONMENT) {
+-      throw new UnprocessableEntityException(
++      throw protocolError(
++        "webhook_endpoint_limit_reached",
+         `an environment may have at most ${MAX_ENDPOINTS_PER_ENVIRONMENT} webhook endpoints; this one already has ${existing}`,
++        422,
+       );
+     }
+ 
+@@ -190,25 +190,62 @@ export class WebhooksService {
+     try {
+       parsed = new URL(raw);
+     } catch {
+-      throw new UnprocessableEntityException("url must be a valid absolute URL");
++      throw protocolError(
++        "webhook_url_invalid",
++        "url must be a valid absolute URL",
++        422,
++        "url",
++      );
+     }
+     if (parsed.protocol !== "https:") {
+-      throw new UnprocessableEntityException(
++      throw protocolError(
++        "webhook_url_insecure",
+         "url must use https — a signature over a plaintext channel protects the body, not the reader",
++        422,
++        "url",
+       );
+     }
+     const host = parsed.hostname;
+     if (BLOCKED_HOSTS.test(host) || BLOCKED_RANGES.some((r) => r.test(host))) {
+-      throw new UnprocessableEntityException(
++      throw protocolError(
++        "webhook_url_private_address",
+         "url must not point at a loopback, link-local or private address",
++        422,
++        "url",
+       );
+     }
+   }
+ 
++  /** FR-016. Validate against the DECLARED eight, not the emitted five.
++   *
++   * THE REVIEW AND `gaps.md` 3.23-1 BOTH RECOMMEND `OUTBOX_EVENT_TYPES`, AND BOTH ARE
++   * WRONG. That array holds the five types the platform emits; FR-WHK-02 declares eight.
++   * Measured before this was written: **741 stored subscriptions name
++   * `channel.created`**, which is declared and not yet built. Comparing against the
++   * emitted set would refuse every one of them, and those customers made no mistake —
++   * they subscribed to a published event type and are waiting for the feature.
++   *
++   * So a name outside the declared eight is a typo and is refused; a declared name the
++   * platform does not emit yet is accepted, and the refusal message for the typo names
++   * the set so a customer can see which they hit. */
+   private assertEventTypes(types: string[]): void {
+     if (!Array.isArray(types) || types.length === 0) {
+-      throw new UnprocessableEntityException(
++      throw protocolError(
++        "webhook_event_types_empty",
+         "event_types must list at least one event type",
++        422,
++        "event_types",
++      );
++    }
++    const declared = Object.keys(WEBHOOK_EVENT_TYPES);
++    const unknown = types.filter((t) => !declared.includes(t));
++    if (unknown.length > 0) {
++      throw protocolError(
++        "webhook_event_type_unknown",
++        `not an event type this platform declares: ${unknown.join(", ")}. ` +
++          `The accepted set is ${declared.join(", ")}.`,
++        422,
++        "event_types",
+       );
+     }
+   }
+```
+
+
+## The declared eight, and the five that are built
+
+FR-WHK-02 declares eight event types; the platform emits five. Those were two lists that had
+to agree, maintained separately, with nothing comparing them — the defect `gaps.md` 3.23-4
+records about `targets.ts`. Now `WEBHOOK_EVENT_TYPES` carries the eight with an `emitted`
+flag each, `satisfies` makes a type added without deciding a compile error, and
+`OUTBOX_EVENT_TYPES` is derived.
+
+**The obvious derivation would have destroyed a production guarantee.**
+`Object.entries(...).filter(...).map(...)` returns `string[]`, which widens
+`OutboxEventType` to `string` — and `outboxEventSchema` is a discriminated union that must
+cover every emitted type, because `consumer/runtime.ts:163` answers a failed parse with
+`message.term()`. A missing branch is a customer's event destroyed, and the lane cannot see
+it: it runs `RELAY_EVENT_CONSUMER=off`. So the union is derived at the type level and stays
+as sharp as the tuple it replaced.
+
+**The guarantee also turned out not to live where this file said it did.** `event.ts` has
+claimed since chapter 3.23 that adding a type "forces a branch here". It did not — the
+typecheck failure came from `event.test.ts`'s `Record<…, unknown>` map, which happens to be
+exhaustive. A guarantee living in another file's incidental map is one a refactor deletes,
+so there is now an explicit `Assert<…>` in `event.ts` itself. Removing a branch fails there
+even with the test's map neutralised.
+
+**Validation is against the declared eight and not the emitted five**, which is where the
+review's recommendation was wrong. 838 stored subscriptions name `channel.created` —
+declared, published, unbuilt. Comparing against the emitted set would refuse all of them.
+
+```diff title="services/api/src/outbox/event.ts"
+@@ -81,29 +81,67 @@ export interface MembershipChangedData {
+  * WIDENED FROM A LITERAL. `type` was `"message.created"` alone, which is the shape a
+  * consumer narrows on: every `switch` and every `===` against it sees this change,
+  * which is what a typecheck catches and an integration lane does not. */
+-/** THE ARRAY IS THE SOURCE AND THE TYPE IS DERIVED, so the set has a size a test can
+- * read. A bare union has no runtime form: "the union has exactly three members" is
+- * unassertable, and chapter 3.19's `codes.test.ts` earned its keep precisely by
+- * asserting an exact set and an exact count — which is what makes a new member a
+- * decision rather than an accident. `as const` plus `(typeof …)[number]` costs one
+- * line and buys that. */
+-export const OUTBOX_EVENT_TYPES = [
+-  "message.created",
++/** FR-WHK-02's DECLARED SET, AND WHETHER THE PLATFORM EMITS EACH ONE (feature 043,
++ * FR-016).
++ *
++ * TWO LISTS THAT MUST AGREE AND ARE MAINTAINED SEPARATELY IS THE DEFECT. `gaps.md`
++ * 3.23-4 records it about `targets.ts`, and `eslint.config.mjs`'s own comment says *MUST
++ * AGREE* with nothing comparing them. The declared eight and the emitted five were
++ * exactly that pair: FR-WHK-02 names eight, this array named five, and the only thing
++ * connecting them was somebody remembering.
++ *
++ * `emitted` IS NOT OPTIONAL, AND THAT IS THE POINT. `satisfies Record<string, { emitted:
++ * boolean }>` makes a type added without deciding a compile error. A type declared and
++ * not emitted is a subscription a customer can create and never hear from — which is
++ * survivable when it is written down and a silent trap when it is not.
++ *
++ * THE THREE FALSE ONES ARE NOT OVERSIGHTS. `channel.created`, `user.connected` and
++ * `user.disconnected` are declared by FR-WHK-02 and unbuilt, and **741 stored
++ * subscriptions name `channel.created`**. The review and `gaps.md` 3.23-1 both recommend
++ * validating subscriptions against the EMITTED set; doing that would refuse those rows,
++ * and those customers made no mistake. */
++export const WEBHOOK_EVENT_TYPES = {
++  "message.created": { emitted: true },
+   // CHAPTER 3.23's TWO, spelled as FR-WHK-02 spells them because a customer's
+   // subscription filters on these exact strings.
+-  //
+-  // BROUGHT FORWARD FROM PHASE 9, and the reason is ADR-06 rather than convenience.
+-  // `repository.deleteMessage` writes its event INSIDE the transaction that writes the
+-  // tombstone — publishing after the commit leaves a window where the row changed and
+-  // the event never existed — so the envelope cannot arrive three phases after the
+-  // transaction that has to build it. FR-009's "no second event" is also unassertable
+-  // without it: two 204s prove nothing, and the outbox row is what carries the
+-  // requirement. `baseline.txt` records the ordering defect.
+-  "message.updated",
+-  "message.deleted",
+-  "channel.member_added",
+-  "channel.member_removed",
+-] as const;
++  "message.updated": { emitted: true },
++  "message.deleted": { emitted: true },
++  "channel.created": { emitted: false },
++  "channel.member_added": { emitted: true },
++  "channel.member_removed": { emitted: true },
++  "user.connected": { emitted: false },
++  "user.disconnected": { emitted: false },
++} as const satisfies Record<string, { emitted: boolean }>;
++
++export type WebhookEventType = keyof typeof WEBHOOK_EVENT_TYPES;
++
++/** THE EMITTED NAMES, DERIVED AT THE TYPE LEVEL AND NOT ONLY AT RUNTIME.
++ *
++ * This is the part that cannot be done the obvious way.
++ * `Object.entries(...).filter(...).map(...)` returns `string[]`, which would widen
++ * `OutboxEventType` to `string` — and `outboxEventSchema` below is a discriminated union
++ * **exhaustive over those literals**. Widening it means every branch still typechecks and
++ * the compile error that catches a MISSING branch never fires again.
++ *
++ * What that error protects is not tidiness. `consumer/runtime.ts:163` answers a failed
++ * parse with `message.term()`, which stops redelivery for good, so a type added with no
++ * branch is a customer's event DESTROYED in production — and the api's own suite cannot
++ * see it, because it runs `RELAY_EVENT_CONSUMER=off`.
++ *
++ * So the union is derived from the object's literal keys, and stays as sharp as the
++ * hand-written tuple it replaced. */
++type Declared = typeof WEBHOOK_EVENT_TYPES;
++type EmittedName = {
++  [K in keyof Declared]: Declared[K]["emitted"] extends true ? K : never;
++}[keyof Declared];
++
++/** THE ARRAY IS STILL THE RUNTIME FORM, so the set has a size a test can read. A bare
++ * union has no runtime form: "the union has exactly five members" is unassertable, and
++ * chapter 3.19's `codes.test.ts` earned its keep by asserting an exact set and an exact
++ * count — which is what makes a new member a decision rather than an accident. */
++export const OUTBOX_EVENT_TYPES = (
++  Object.keys(WEBHOOK_EVENT_TYPES) as WebhookEventType[]
++).filter((name): name is EmittedName => WEBHOOK_EVENT_TYPES[name].emitted);
+ 
+ export type OutboxEventType = (typeof OUTBOX_EVENT_TYPES)[number];
+ 
+@@ -302,9 +340,13 @@ const envelope = {
+  * second, permissive envelope in `packages/protocol/src/internal.ts:276` whose `type`
+  * is `z.string().min(1)`, which is what a grep for "outboxEventSchema" finds first.
+  *
+- * Adding a type to `OUTBOX_EVENT_TYPES` now forces a branch here: the union is
+- * exhaustive over the same three names, and a fourth added above without one below is
+- * a typecheck failure rather than a terminated message in production. */
++ * Adding an emitted type forces a branch here — and until feature 043 this comment was
++ * overstating where that came from. `z.discriminatedUnion` builds from whatever branches
++ * are listed; nothing in this file compared them with the type. **The typecheck failure
++ * came from `event.test.ts:405`**, whose `Record<(typeof OUTBOX_EVENT_TYPES)[number],
++ * unknown>` happens to be exhaustive. A real guarantee living in another file's
++ * incidental map is one an unrelated refactor can delete. The assertion below moves it
++ * here, where the claim is made. */
+ export const outboxEventSchema = z.discriminatedUnion("type", [
+   z.strictObject({
+     ...envelope,
+@@ -409,3 +451,22 @@ export const outboxEventSchema = z.discriminatedUnion("type", [
+     }),
+   }),
+ ]);
++
++/** COMPILE-TIME PROOF THAT EVERY EMITTED TYPE HAS A BRANCH ABOVE (feature 043).
++ *
++ * `Assert<T extends true>` fails to instantiate when the condition is false, so a type
++ * added to `WEBHOOK_EVENT_TYPES` with `emitted: true` and no branch in the union is a
++ * compile error in THIS file rather than a coincidence in a test.
++ *
++ * What it protects: `consumer/runtime.ts:163` answers a failed parse with
++ * `message.term()`, which stops redelivery permanently. A missing branch is a customer's
++ * event destroyed, and the lane cannot see it — it runs `RELAY_EVENT_CONSUMER=off`, so
++ * the api suite stayed green through 505 tests with exactly that defect in place.
++ *
++ * Exported rather than a local `const`, because an unused local trips this repository's
++ * eslint config, which sets no `varsIgnorePattern`. */
++type Assert<T extends true> = T;
++export type EveryEmittedTypeHasASchemaBranch = Assert<
++  OutboxEventType extends z.infer<typeof outboxEventSchema>["type"] ? true : false
++>;
++
+```
+

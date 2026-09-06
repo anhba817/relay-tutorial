@@ -221,6 +221,100 @@ you can tell.
 
 When hosted media ships, this code stops being emitted and this section goes with it.
 
+## webhook_endpoint_limit_reached
+
+**Status:** 422 · **Retryable:** no, not until you delete one
+
+You asked for another webhook endpoint and this environment already holds the maximum. The
+message names the limit and the count you are at, because "too many endpoints" leaves you
+counting.
+
+**The cap is per environment, not per organisation.** A second environment has its own
+allowance, which is the shape most customers want anyway: staging and production endpoints
+that cannot exhaust each other.
+
+**What to do:** delete an endpoint you no longer deliver to, or move the subscription into
+another environment. If you are near the cap because you have one endpoint per event type,
+consider one endpoint subscribed to several — `event_types` takes a list.
+
+## webhook_url_invalid
+
+**Status:** 422 · **Retryable:** no · **Field:** `url`
+
+The `url` you sent is not a valid absolute URL. Relay parses it with a real URL parser
+before storing it, because an endpoint that cannot be parsed is an endpoint that will never
+be called and you would not find out until a delivery was due.
+
+**A path is not enough.** `/hooks/relay` has no host for Relay to connect to. Send the whole
+thing: scheme, host, and path.
+
+**What to do:** send an absolute `https://` URL. If you are building it by concatenation,
+check for a missing scheme or a doubled slash.
+
+## webhook_url_insecure
+
+**Status:** 422 · **Retryable:** no · **Field:** `url`
+
+The `url` uses a scheme other than `https`. Relay signs every delivery, and **a signature
+over a plaintext channel protects the body, not the reader** — anyone on the path can read
+the payload even though they cannot forge it.
+
+**This is refused rather than warned about**, because a webhook carries your customers'
+message content and the decision to send that in the clear is not one to make by accident.
+
+**What to do:** put TLS on the endpoint. For local development, use a tunnel that terminates
+TLS for you rather than pointing Relay at `http://localhost`.
+
+## webhook_url_private_address
+
+**Status:** 422 · **Retryable:** no · **Field:** `url`
+
+The `url` resolves to a loopback, link-local, or private address, and Relay will not call
+it. That includes `127.0.0.1`, `localhost`, `10.x`, `192.168.x`, `172.16-31.x`, and the
+link-local range.
+
+**This is not about your network being unreachable.** Relay's delivery workers run inside a
+network of their own, so an address that is private to you is either unreachable or — worse
+— something else entirely from where they stand. Refusing the address is how a request for
+your internal service stops being a request against ours.
+
+**What to do:** give Relay a publicly resolvable HTTPS endpoint. In development, use a
+tunnelling service; the endpoint you register should be the tunnel's public URL.
+
+## webhook_event_types_empty
+
+**Status:** 422 · **Retryable:** no · **Field:** `event_types`
+
+`event_types` was absent, empty, or not a list. An endpoint subscribed to nothing would
+never fire, and creating one silently is how a customer waits for deliveries that were
+never going to come.
+
+**What to do:** name at least one event type. The accepted set is in
+[`webhook_event_type_unknown`](#webhook_event_type_unknown) below, and the refusal for a
+misspelling lists it too.
+
+## webhook_event_type_unknown
+
+**Status:** 422 · **Retryable:** no · **Field:** `event_types`
+
+One of the names in `event_types` is not an event type Relay declares. The message lists the
+ones that are, so you can see which you meant.
+
+**A typo used to succeed.** `mesage.updated` would be stored, the endpoint would be created,
+and nothing would ever be delivered to it — a permanently silent endpoint with a `201` in
+your logs. That is the failure this refusal exists to prevent.
+
+**Some declared types are not emitted yet, and those are accepted.** Relay declares eight
+event types and currently emits five. Subscribing to one of the other three is not a
+mistake: the subscription is stored and starts delivering when the feature ships. You will
+not receive an error for it, and you will not receive deliveries until then either. The
+[close-code table](#websocket-close-codes) at the top of this page lists what Relay sends on
+a socket; for webhooks, the emitted set is what the delivery pipeline currently produces.
+
+**What to do:** check the spelling against the list in the message. If the name is right and
+you are receiving nothing, the type is probably one of the declared-but-unbuilt three rather
+than a mistake on your side.
+
 ## not_found
 
 **Status:** 404 · **Retryable:** no
