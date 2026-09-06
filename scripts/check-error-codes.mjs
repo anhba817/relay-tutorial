@@ -40,7 +40,7 @@ if (!existsSync(REFERENCE) || !existsSync(REGISTRY)) {
 }
 
 const require_ = createRequire(import.meta.url);
-const { ERROR_CODES } = require_(REGISTRY);
+const { ERROR_CODES, CLOSE_CODES } = require_(REGISTRY);
 const codes = Object.keys(ERROR_CODES);
 
 const markdown = readFileSync(REFERENCE, "utf8");
@@ -89,9 +89,57 @@ for (const section of sections) {
   }
 }
 
+// THE CLOSE CODES, HELD TO THE SAME STANDARD AND IN THE SAME TWO DIRECTIONS (feature 043,
+// FR-019). EIR-WS-06 requires the close codes to distinguish authentication failure, quota
+// exhaustion, shutdown and protocol violation — and until now nothing compared `CLOSE_CODES`
+// with this document at all. The review found 4003 undocumented and 4001, 4008 and 4009
+// "scattered or absent", which is what an unchecked half of a registry looks like.
+//
+// THEY ARE NOT `h2` HEADINGS, and that is deliberate rather than a workaround. This
+// document's `##` level means "an error code in ERROR_CODES" — the orphan check above is
+// exactly that claim — so a `## 4001` would have to be exempted from it, and an exemption
+// is how a class list stops meaning anything. The close codes live in a table instead, and
+// this rule reads the table.
+//
+// A BARE NUMBER DOES NOT COUNT. `4001` appears in prose that happens to mention it; what
+// this requires is a row or a status line that says `close 4001` or `closes 4001`, because
+// the thing being checked is whether a reader can look the code up, not whether the
+// character sequence is present.
+const closeCodes = Object.keys(CLOSE_CODES);
+// TWO SHAPES COUNT, because the document has two honest ways to say it: a row in the
+// close-code table, and a `**Status:**` line on the error code that carries it. 4009 is
+// why both are needed — it is declared and never emitted, so no status line can name it
+// and only the table can.
+const mentions = (code) =>
+  new RegExp(`clos(?:e|es|ing)\\s+${code}\\b`).test(markdown) ||
+  new RegExp(`^\\|\\s*${code}\\s*\\|`, "m").test(markdown);
+
+const undocumentedCloses = closeCodes.filter((c) => !mentions(c));
+if (undocumentedCloses.length > 0) {
+  console.error(
+    `check-error-codes: these close codes are in CLOSE_CODES and documented nowhere:\n  ${undocumentedCloses.join("\n  ")}`,
+  );
+  status = 1;
+}
+
+// The other direction. A close code this document describes and the platform cannot send
+// is the same lie as a section for a retired error code — and it is the likelier of the
+// two here, because a renumber leaves the prose behind.
+const described = [
+  ...[...markdown.matchAll(/clos(?:e|es|ing)\s+(4\d{3})\b/g)].map((m) => m[1]),
+  ...[...markdown.matchAll(/^\|\s*(4\d{3})\s*\|/gm)].map((m) => m[1]),
+];
+const invented = [...new Set(described)].filter((c) => !closeCodes.includes(c));
+if (invented.length > 0) {
+  console.error(
+    `check-error-codes: the reference describes close codes the platform cannot send:\n  ${invented.join("\n  ")}`,
+  );
+  status = 1;
+}
+
 if (status === 0) {
   console.log(
-    `check-error-codes: ${codes.length} codes, ${codes.length} sections, each with a cause and a client action`,
+    `check-error-codes: ${codes.length} codes, ${codes.length} sections, each with a cause and a client action; ${closeCodes.length} close codes documented`,
   );
 }
 process.exit(status);

@@ -33,6 +33,29 @@ WebSocket `error` frame):
 `field` is present only when one key is at fault. `request_id` is on every response,
 header and body alike, and it is the thing to quote in a support request.
 
+### WebSocket close codes
+
+A socket refusal has two parts: an `error` frame carrying one of the codes below, and then
+a close code. **The close code is the part that survives** — a client that reconnects
+automatically often sees only the close, so the number has to distinguish the cause on its
+own (EIR-WS-06).
+
+The set is closed and checked in both directions against `CLOSE_CODES` in `@relay/protocol`,
+exactly as the error codes below are.
+
+| Close | Meaning | Sent with | What to do |
+|---|---|---|---|
+| 4001 | invalid or expired token | *no error frame* | Mint a new token and reconnect. The socket closes before the handshake completes, so there is nothing to carry a frame. |
+| 4002 | protocol violation | `unknown_frame_type` | Fix the client. It sent a frame only the server may send. |
+| 4003 | banned in this environment | `user_banned` | Do not reconnect. The token is valid and the user is barred; re-authenticating succeeds and connecting fails again. |
+| 4004 | connection limit reached | `connection_limit_reached` | Close one of the connections you already hold, then reconnect immediately. |
+| 4008 | quota exhausted | `quota_exceeded` | Wait for the quota window, or raise the plan's limit. |
+| 4009 | server shutdown (drain) | *not currently emitted* | Reconnect. **Declared and unused:** the gateway's shutdown closes sockets without a drain code, and this row says so rather than describing a behaviour the platform does not have. |
+
+**4001 carries no error frame, and that is the one asymmetry here.** Authentication is
+checked before the connection is established, so the close is all there is. Every other row
+sends the frame first.
+
 ---
 
 ## invalid_request
@@ -52,7 +75,7 @@ identically.
 
 ## unauthorized
 
-**Status:** 401 · **Retryable:** no, not with the same credential
+**Status:** 401 · **Retryable:** no, not with the same credential · on a WebSocket connect the socket closes 4001 with no error frame
 
 No credential was presented, or the one presented is not valid for this route: an expired
 end-user token, a malformed one, one signed by another environment's secret, or no
@@ -265,7 +288,7 @@ against the same archived channel will keep failing.
 
 ## user_banned
 
-**Status:** 403 · **Retryable:** no, until the ban is lifted
+**Status:** 403 · **Retryable:** no, until the ban is lifted · on a WebSocket connect, close 4003
 
 The user is banned in this environment. A ban is tenant-scope rather than per channel: they
 cannot open a socket and cannot send anywhere. Their existing messages stay exactly where
@@ -294,7 +317,7 @@ wait for the window to turn over and send again on the connection you still have
 
 ## quota_exceeded
 
-**Status:** 402 · **Retryable:** yes, from the date in the message
+**Status:** 402 · **Retryable:** yes, from the date in the message · on a WebSocket connect, close 4008
 
 A monthly quota is exhausted. The message names the dimension (messages, active users or
 connection-minutes), the figure used, the figure allowed, and the date it resumes.
