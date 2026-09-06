@@ -1472,6 +1472,36 @@ environment, or a retention job deleting by age. `member:{env}:{user}` exists be
 membership found exactly that case, and this grammar would need its principal-addressed
 sibling for the same reason.
 
+### ADR-25 — A measured threshold for consolidating the subject grammars
+**Status:** accepted (2026-09-06) · **Drivers:** D2, D8 · bounds ADR-19, ADR-20, ADR-21, ADR-24 ·
+discharges NFR-SCL-01
+
+Five subject grammars carry real-time events between instances, each admitted by the same rule:
+**a kind that cannot share a payload type cannot share a subject.** The rule was sound and
+unbounded — applied indefinitely it ends somewhere nobody chose — and the cost of a grammar could
+not be stated, because NFR-SCL-01 had been P1 and unverified since v1.0.
+
+**Measured** (`docs/11-scalability-measurement-2026-09-06.md`): one gateway instance sustains
+**10,000 concurrent connections** for 90 seconds past two ping intervals at 160 MB, and 20,000
+also holds. The subscription cost is exactly `5 × channels + 1 × connected users` — **60,000
+subjects at one channel per user, costing Redis 18 MB**, with the gateway's RSS indistinguishable
+from the 11,000-subject case.
+
+**So the grammars are not what costs.** A sixth is about 10,000 subjects and 3 MB in the worst
+ratio. Consolidating onto a typed envelope would buy four SUBSCRIBEs per channel and spend the
+property the five grammars exist to protect: a receiver subscribing to what it wants rather than
+to every kind on the channel.
+
+**The rule stands, bounded.** Consolidate when per-channel SUBSCRIBEs would exceed **six**, or
+when a gateway's **projected** subject count exceeds **250,000** by the formula above at the
+deployment's own channel-to-user ratio. The projection is the operative half: **which term
+dominates is a property of the customer's data, not of the platform** — the five grammars are 9%
+of subjects at 200 channels and 83% at one channel per user, so a threshold expressed as a raw
+count would be wrong for half of all deployments.
+
+A sixth grammar is pre-approved at this scale; a seventh reopens the record. Full argument,
+options and the measurement table: ADR-25 in `06-adr-deep-dives.md`.
+
 ## 10. Risks and technical debt register
 
 | # | Risk / debt | Exposure | Mitigation / trigger |

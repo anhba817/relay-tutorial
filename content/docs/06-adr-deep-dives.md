@@ -1636,3 +1636,134 @@ fires, the argument for change is already written. ADR-19 is the first record to
 claim, and it complicates it: the change arrived, the prepared argument fit, and the trigger
 had not fired. A written remedy can be reached by a road it did not anticipate — which is
 worth knowing, because the trigger it was attached to is then still owed.
+
+## ADR-25 — A measured threshold for consolidating the subject grammars
+
+### Problem
+
+Five subject grammars carry real-time events between gateway instances, and each arrived by the
+same argument: **a kind that cannot share a payload type cannot share a subject.** ADR-19 took
+`presence:{channel_id}`, ADR-20 took `member:{channel_id}` and `member:{env}:{user}`, ADR-21
+took `typing:{channel_id}`, ADR-24 took `revision:{channel_id}` alongside the original
+`chan:{channel_id}`.
+
+Each was right on its own terms. The implementation review of 2026-09-03 raised the shape rather
+than any instance:
+
+> One subject grammar per real-time kind is becoming a default rather than a measured decision.
+> ADR-19→24 preserve payload compatibility well, but add subscriptions, Redis clients, recovery
+> paths, and operational complexity per event kind. NFR-SCL-01 remains unmeasured. Define a
+> threshold for consolidating typed envelopes or introducing a versioned event bus before adding
+> another fabric.
+
+**The rule was sound and unbounded.** Applied indefinitely it ends somewhere nobody chose, and
+there was no number at which anyone would notice. NFR-SCL-01 — 10,000 concurrent connections per
+gateway instance, **P1** — had never been verified, so the cost of a grammar could not be stated
+even approximately.
+
+### Options
+
+**A. Consolidate now onto a typed envelope.** One subject per channel; the payload carries
+`kind`. Collapses the per-channel subscription count from five to one.
+
+**B. Introduce a versioned event bus.** Replace Redis pub/sub for real-time with a broker that
+multiplexes kinds over one connection.
+
+**C. Set a threshold and keep the rule below it.** Measure the cost, write down the number at
+which A or B becomes correct, and leave the rule in force until then.
+
+**D. Leave it.** Continue applying the rule; revisit when something hurts.
+
+### Analysis
+
+**The measurement is `docs/11-scalability-measurement-2026-09-06.md`**, run because NFR-SCL-01's
+own verification method is `A` — analysis including load testing — and because a threshold is a
+number that nobody had.
+
+One api and one gateway, real client sockets, the gateway's RSS from `/proc`, and the broker's
+subscription count from `PUBSUB CHANNELS` — the subscriptions are visible only from Redis's side,
+so reading them off the source would not have been a measurement.
+
+    connections  channels  survived  gateway RSS  redis subjects  redis mem
+        10,000       200    10,000        160 MB          11,000       7 MB
+        10,000    10,000    10,000        157 MB          60,000      18 MB
+        20,000       200    20,000        371 MB          11,000       9 MB
+
+**NFR-SCL-01 is met**, and the clause's verb is *sustain*: the 10,000 were held 90 seconds, past
+two of the gateway's 30-second ping intervals with `MAX_MISSED_PINGS = 2`, with zero closures.
+Twice the clause also holds.
+
+**The subscription cost is exactly** `5 × channels + 1 × connected users`, satisfied to the unit
+in every row. The five per channel are `chan`, `revision`, `presence`, `typing` and `member`; the
+one per user is `member:{env}:{user}`.
+
+**Three things follow, and the third is the one that decides this.**
+
+**The grammars are not what costs.** Redis holds 60,000 subscriptions in 18 MB — roughly 300
+bytes each — and the gateway's RSS is indistinguishable between 11,000 and 60,000 subjects,
+157 MB against 160 MB. A sixth grammar costs about 10,000 subjects and 3 MB in the worst ratio.
+
+**Consolidating would trade a real property for a saving nobody needs.** Under a typed envelope a
+receiver takes every kind on a channel whether it wants them or not, and the five grammars exist
+precisely so that it does not. Option A buys 4 SUBSCRIBEs per channel and spends the property
+ADR-19 through ADR-24 were each written to protect.
+
+**Which term dominates is a property of the customer's data, not of the platform.** At 200
+channels the five grammars are 9% of subjects; at one channel per user they are 83%. **A threshold
+expressed as a raw subject count would therefore be wrong for half of all deployments** — it has
+to name the ratio, or name a projection that includes it.
+
+Option B is Option A's cost plus a new operational dependency, for the same saving. Option D is
+what the review objected to, and correctly.
+
+### Decision
+
+**Option C. The rule stands; the threshold is written down.**
+
+> A new real-time kind takes its own subject when it cannot share an existing payload type —
+> ADR-19's rule, unchanged.
+>
+> **Consolidate onto a typed envelope when either holds:**
+>
+> - per-channel SUBSCRIBEs would exceed **six**, or
+> - a gateway instance's **projected** subject count exceeds **250,000**, computed as
+>   `5 × channels + 1 × connected users` at the deployment's own channel-to-user ratio.
+>
+> 250,000 is 10,000 connections at one channel each under six grammars, plus a 50% margin. It is
+> chosen so that the worst ratio at NFR-SCL-01's stated scale sits below it and a seventh grammar
+> at that ratio does not.
+
+**The projection is the operative half.** Anyone proposing a sixth or seventh grammar computes
+`5 × channels + 1 × connected users` for the largest deployment in view. That is one query and a
+multiplication, and it is the step the review found missing.
+
+### Consequences
+
+**The rule is now falsifiable.** "One grammar per kind" was unbounded and is bounded, by a number
+derived from a measurement rather than from taste.
+
+**A sixth grammar is pre-approved and a seventh is not**, at NFR-SCL-01's scale. The next kind
+that cannot share a payload type takes its subject without an argument; the one after that
+reopens this record.
+
+**NFR-SCL-01 is discharged** as a side effect, recorded at SRS revision 1.9. It had been P1 and
+unverified since v1.0.
+
+**A finding this did not set out to make.** `DEFAULT_LIMITS.connect` is 3,000 per minute and the
+gateway accepts 1,125-1,675 per second — so filling an instance from cold takes **3 minutes 20
+seconds by policy** where capacity would take 7.7. The limiter's own comment derives it from
+NFR-SCL-01, so this is deliberate; the two numbers had simply never been placed side by side. It
+bears on rolling restarts and on ADR-20's revocation window, and it is recorded rather than
+changed here.
+
+**The measurement left 10,604 channels and 24,020 users in the test lane**, prefixed `scale-c-*`
+and `scale-u-*`. Identifiable, removable in one statement, and worth knowing before the next
+measurement is taken on that lane.
+
+### Revisit when
+
+- a proposed kind would make per-channel SUBSCRIBEs **seven**;
+- a deployment's projected subject count exceeds **250,000** by the formula above;
+- NFR-SCL-01 is raised beyond 10,000 per instance, which moves the projection;
+- Redis pub/sub is replaced for a reason unrelated to this record, at which point the threshold
+  is about the replacement's costs and not these.
