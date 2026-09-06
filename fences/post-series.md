@@ -4572,3 +4572,383 @@ there — asserting that the snapshots, the config and the dependency are all st
 ```text title="services/api/drizzle.config.ts (deleted)"
 ```
 
+## One message-length maximum, and the door that never had one
+
+FR-MSG-01 fixes the message-length maximum at 8,000 characters, and the platform enforced
+it at two doors out of three. The REST body and the internal hop each spelled `8000` as a
+literal; `messageSendSchema` — the socket door a customer's client writes to — carried
+`z.string()` with no bound at all.
+
+What that cost is not "no bound". The api's `internalSendRequestSchema` caught the
+over-long text one hop later, so the customer got `invalid_request`, a code that names the
+INTERNAL contract, for a field on the frame they wrote. Removing the bound and re-running
+the test reproduces it exactly: `expected 'invalid_request' to be 'invalid_frame'`.
+
+**The constant goes in `frames.ts`, not `attachments.ts`**, whose six exports are all about
+attachments. And it is a constant rather than a shared schema for a reason chapter 3.24
+paid for: `editMessageBodySchema.text` was once `sendMessageBodySchema.shape.text`, so
+relaxing the send's `.min(1)` silently relaxed the edit's, and an edit has no attachments
+field to justify empty text. **The maximum is common to all four sites; the floor is what
+must differ. A number cannot drag a floor along with it.**
+
+```diff title="packages/protocol/src/frames.ts"
+@@ -15,6 +15,24 @@ import {
+ /** Per-channel resume cursor: { channel_id: highest seq seen } (ADR-03). */
+ export const cursorSchema = z.record(z.string(), z.number().int().positive());
+ 
++/** FR-MSG-01's message-length maximum, in one place because it is one rule (FR-008).
++ *
++ * THREE DOORS ENFORCE IT AND ONE OF THEM DID NOT. The REST body and the internal hop each
++ * spelled `8000` as a literal, and `messageSendSchema` below — the socket door a customer's
++ * client writes to — carried `z.string()` with no bound at all. A rule the contract
++ * publishes and one door does not enforce is the review's finding, and three literals is
++ * how it happened.
++ *
++ * NOT IN `attachments.ts`, whose six exports are all about attachments. A message-text
++ * bound on that shelf is the drift this constant exists to remove.
++ *
++ * A CONSTANT IS SAFE TO SHARE WHERE A SCHEMA WAS NOT. Chapter 3.24 found
++ * `editMessageBodySchema.text` defined as `sendMessageBodySchema.shape.text`, so relaxing
++ * the send's `.min(1)` silently relaxed the edit's — and an edit has no attachments to
++ * justify empty text. The maximum is common to all four sites; the FLOOR is what must
++ * differ. A number cannot drag a floor along with it. */
++export const MESSAGE_TEXT_MAX = 8000;
++
+ /** The message on the wire — derived from the SAD §6.1 `messages` columns.
+  * Wire spellings follow SAD §5.1's own frame line (`channel`, `seq`).
+  *
+@@ -69,7 +87,19 @@ export const messageSendSchema = z.strictObject({
+     .strictObject({
+       idem_key: z.string().min(1).max(255),
+       channel: z.string().min(1),
+-      text: z.string(),
++      /** BOUNDED HERE FOR THE FIRST TIME (feature 043, FR-008/FR-009).
++       *
++       * This was `z.string()`. The REST and internal doors have refused over-long text
++       * since chapter 2.2, and a socket client could send any length at all — the api's
++       * `internalSendRequestSchema` caught it one hop later, so the refusal named the
++       * internal contract rather than the field the customer wrote.
++       *
++       * The refusal now happens at the gateway, before the internal request is made:
++       * `session.ts:1452` fails the frame parse and answers `invalid_frame` with
++       * `payload.text` as the field. That is the same shape the attachments bound already
++       * takes, and `refineTextAndAttachments` below records why one payload must not be
++       * refused at two layers under two codes. */
++      text: z.string().max(MESSAGE_TEXT_MAX),
+       /** OPTIONAL here and required on the outbound `messageSchema`, which is not an
+        * inconsistency: a caller may send none, and a payload the platform BUILDS must
+        * always say. The bound is imported rather than spelled — two schemas that happen
+```
+
+The internal door stops spelling the number.
+
+```diff title="packages/protocol/src/internal.ts"
+@@ -6,7 +6,7 @@ import {
+   refineTextAndAttachments,
+ } from "./attachments.js";
+ 
+-import { messageSchema } from "./frames.js";
++import { MESSAGE_TEXT_MAX, messageSchema } from "./frames.js";
+ 
+ // The INTERNAL service contract (chapter 2.5) — distinct from the wire
+ // contract above it. `frames.ts` is what a customer's client speaks;
+@@ -29,7 +29,7 @@ export const internalSendRequestSchema = z
+      * would meet FR-019 on the REST door alone: a REST client could send a
+      * photograph with no caption and a socket client could not, with no
+      * requirement anywhere saying so. The 8,000 stays — FR-MSG-01 is untouched. */
+-    text: z.string().max(8000), // FR-MSG-01
++    text: z.string().max(MESSAGE_TEXT_MAX), // FR-MSG-01, imported not spelled
+     idempotency_key: z.string().min(1).max(255).optional(), // FR-MSG-04
+     attachments: z.array(attachmentSchema).max(MAX_ATTACHMENTS).optional(),
+   })
+```
+
+The REST door, and the edit body beside it — which keeps its own `.min(1)` and now
+shares only the maximum.
+
+```diff title="services/api/src/messages/messages.schema.ts"
+@@ -1,6 +1,7 @@
+ import {
+   attachmentSchema,
+   MAX_ATTACHMENTS,
++  MESSAGE_TEXT_MAX,
+   refineTextAndAttachments,
+ } from "@relay/protocol";
+ import { z } from "zod";
+@@ -15,7 +16,7 @@ export const sendMessageBodySchema = z
+      * refinement below rather than disappearing. An attachments-only message is a
+      * photograph with no caption, and it stores `text = ""` rather than a null so
+      * chapter 3.23's tombstone predicate — `text === null` — is untouched. */
+-    text: z.string().max(8000),
++    text: z.string().max(MESSAGE_TEXT_MAX),
+     metadata: z.record(z.string(), z.unknown()).optional(),
+     // Chapter 2.3 (FR-MSG-04): the client's idempotency key — minted at send
+     // time (FR-SDK-06), optional because server-originated messages may not
+@@ -53,10 +54,18 @@ export type SendMessageBody = z.infer<typeof sendMessageBodySchema>;
+ 
+ /** The edit body (chapter 3.23, FR-001).
+  *
+- * THE SAME BOUNDS AS THE SEND BODY'S `text`, and the same reason: FR-MSG-01 fixes them
+- * for a message and an edited message is still a message. Written as a reference to that
+- * shape rather than as a second `z.string().min(1).max(8000)`, so the two cannot drift
+- * when FR-EMJ-02's code-point counting replaces the character bound.
++ * THE SAME MAXIMUM AS THE SEND BODY'S `text` AND A DIFFERENT FLOOR, which is the whole
++ * history of this field in one line. FR-MSG-01 fixes the maximum for a message and an
++ * edited message is still a message, so both import `MESSAGE_TEXT_MAX` and neither
++ * spells it.
++ *
++ * THE FLOORS DIVERGED IN CHAPTER 3.24 AND MUST STAY DIVERGED. This paragraph used to say
++ * the field was "written as a reference to that shape" — it was
++ * `sendMessageBodySchema.shape.text` — and that is what broke: FR-019 removed the send's
++ * `.min(1)` so an attachments-only message could carry empty text, and the edit's floor
++ * went with it silently, because the types are identical either way. An edit has no
++ * attachments field to justify empty text. 3.24 separated them into two literals; this
++ * feature shares the number they agree on and leaves the rule they do not.
+  *
+  * ONE FIELD, AND THE ABSENCES ARE DECISIONS:
+  *
+@@ -84,7 +93,17 @@ export type SendMessageBody = z.infer<typeof sendMessageBodySchema>;
+  * chapter has already recorded twice; two schemas that must DIFFER cannot share a
+  * reference at all. */
+ export const editMessageBodySchema = z.strictObject({
+-  text: z.string().min(1).max(8000),
++  /** THE MAXIMUM IS SHARED; THE FLOOR IS NOT, AND THAT IS THE WHOLE POINT (FR-008).
++   *
++   * Chapter 3.24 found this field defined as `sendMessageBodySchema.shape.text`, so
++   * relaxing the send's `.min(1)` for attachments-only messages silently relaxed the
++   * edit's too — and an edit has no attachments field to restore its floor. The compiler
++   * could not see it: the types are identical either way.
++   *
++   * Importing a NUMBER cannot bring that back. `MESSAGE_TEXT_MAX` is FR-MSG-01's bound,
++   * common to all four doors; `.min(1)` is this schema's own rule and stays written here
++   * where it can be read. */
++  text: z.string().min(1).max(MESSAGE_TEXT_MAX),
+ });
+ 
+ export type EditMessageBody = z.infer<typeof editMessageBodySchema>;
+```
+
+The tests, including the one asserting that `messageSchema` is deliberately NOT
+bounded: it is what the server emits, read off rows already stored, and a reader of
+anything durable cannot impose a rule its writer did not have.
+
+```diff title="packages/protocol/src/frames.test.ts"
+@@ -1,9 +1,15 @@
+ import { describe, expect, it } from "vitest";
+ 
+-import { frameSchema, messageDeletedSchema, messageSchema, parseFrame } from "./frames.js";
++import {
++  frameSchema,
++  MESSAGE_TEXT_MAX,
++  messageDeletedSchema,
++  messageSchema,
++  parseFrame,
++} from "./frames.js";
+ 
+ // The contract must bite: for every frame, one specimen that parses and a
+ // table of malformed near-misses that MUST reject. A schema that accepts
+ // garbage is worse than no schema — it certifies garbage.
+ 
+ const message = {
+@@ -277,6 +283,53 @@ describe("the frame union's membership (chapter 3.21)", () => {
+     );
+     expect(
+       parseFrame({ type: "typing.send", payload: { channel: "c1" } }).success,
+     ).toBe(true);
+   });
+ });
++
++describe("the message-length maximum (feature 043, FR-008)", () => {
++  const send = (text: string) =>
++    parseFrame({
++      type: "message.send",
++      payload: { idem_key: "k1", channel: "c1", text },
++    });
++
++  it("refuses a socket send one character over the maximum", () => {
++    // The door this feature closed. It was `z.string()` — no bound at all — so an
++    // over-long text parsed here and was refused one hop later by the api's
++    // `internalSendRequestSchema`, under a code that named the internal contract rather
++    // than the field the customer wrote.
++    expect(send("a".repeat(MESSAGE_TEXT_MAX)).success).toBe(true);
++    expect(send("a".repeat(MESSAGE_TEXT_MAX + 1)).success).toBe(false);
++  });
++
++  it("names `payload.text` when it refuses, which is what the gateway sends as `field`", () => {
++    // `session.ts` answers a failed frame parse with `invalid_frame` and
++    // `issues[0].path.join(".")`. This asserts the path that produces, because the
++    // field a customer sees is this array and not a string written anywhere.
++    const result = send("a".repeat(MESSAGE_TEXT_MAX + 1));
++    expect(result.success).toBe(false);
++    if (result.success) return;
++    expect(result.error.issues[0]?.path.join(".")).toBe("payload.text");
++  });
++
++  it("does NOT bound the outbound message, and that is deliberate", () => {
++    // `messageSchema` is what the server EMITS, read off rows the platform already
++    // stored. Chapter 3.24's `outboxEventSchema` defect is the argument: a reader of
++    // anything durable cannot impose a rule its writer did not have. Every stored row
++    // came through a bounded door, so the bound buys nothing here and would turn a
++    // hypothetical long row into an undeliverable one.
++    //
++    // This test exists because the task for FR-008 named THIS schema by line number.
++    const long = {
++      id: "m1",
++      channel: "c1",
++      seq: 1,
++      user: "u1",
++      text: "a".repeat(MESSAGE_TEXT_MAX + 1),
++      attachments: [],
++      created_at: "2026-09-06T00:00:00.000Z",
++    };
++    expect(messageSchema.safeParse(long).success).toBe(true);
++  });
++});
+```
+
+
+## The avatar URL's scheme
+
+`avatar_url` was `z.string().url()`. Re-measured against zod 4.4.3 on 2026-09-06 — the same
+table research R7 ran — that validator ACCEPTS `javascript:alert(1)`, `data:text/html,…`,
+`file:///etc/passwd`, `vbscript:` and `ftp:`. It refuses `not-a-url` and little else.
+
+So a field the API publishes as a URL would store a scheme the customer's own client
+executes when it renders the avatar. `attachments.ts` said this in chapter 3.24 — *"A URL
+validator that accepts `javascript:alert(1)` is not a scheme rule"* — and the avatar field,
+which is older, never got the same treatment.
+
+**The red probe proved it by writing two of them.** Reverting the rule to check the tests
+could see its absence left `javascript:alert(1)` stored on two users, accepted with a 200.
+
+One fragment, consumed by both the PATCH and the bulk upsert, because
+`upsertUserEntrySchema`'s own comment already promises the two routes cannot drift into
+accepting different things for the same column.
+
+```diff title="services/api/src/users/users.schema.ts"
+@@ -49,9 +49,46 @@ const userMetadataSchema = z
+  * `null` CLEARS, and it is distinct from absent. `{"display_name": null}` removes the
+  * name; `{}` leaves it. Both columns are nullable, so the API can express the difference
+  * and a PATCH that could only set would leave a customer unable to undo one. */
++/** FR-011, FR-012. The schemes an avatar URL may use — a list, because the list is the
++ * requirement, and `packages/protocol/src/attachments.ts:49` is the precedent.
++ *
++ * `z.url()` IS NOT THIS CHECK. Re-measured against zod 4.4.3 on 2026-09-06, the same
++ * table research R7 ran: `z.string().url()` ACCEPTS `javascript:alert(1)`,
++ * `data:text/html,<b>`, `file:///etc/passwd`, `vbscript:` and `ftp:`. It refuses
++ * `not-a-url` and almost nothing else. So the field this API publishes as a URL would
++ * store a scheme the customer's own client executes when it renders the avatar — an
++ * `<img src>` or an `<a href>` built from a value we accepted.
++ *
++ * `attachments.ts` already said this in chapter 3.24 — *"A URL validator that accepts
++ * `javascript:alert(1)` is not a scheme rule"* — and the avatar field, which is older,
++ * never got the same treatment. One schema fragment, consumed twice below, because
++ * `upsertUserEntrySchema`'s own comment already promises the two routes "cannot drift
++ * into accepting different things for the same column". */
++export const AVATAR_URL_SCHEMES = ["http:", "https:"] as const;
++
++const avatarUrl = z
++  .string()
++  .url()
++  .max(2048)
++  .refine(
++    (value) => {
++      // `new URL`, not a prefix match. A prefix match passes `https:/example.test` and
++      // `httpsx://…` depending on how it is written, and the parser already knows what a
++      // scheme is. Same argument, same code, as `attachments.ts`.
++      let parsed: URL;
++      try {
++        parsed = new URL(value);
++      } catch {
++        return false;
++      }
++      return (AVATAR_URL_SCHEMES as readonly string[]).includes(parsed.protocol);
++    },
++    { message: "avatar_url must use the http or https scheme" },
++  );
++
+ export const userProfileBodySchema = z.strictObject({
+   display_name: z.string().min(1).max(255).nullable().optional(),
+-  avatar_url: z.string().url().max(2048).nullable().optional(),
++  avatar_url: avatarUrl.nullable().optional(),
+   metadata: userMetadataSchema.optional(),
+   /** A bot's description, editable here (chapter 3.17, FR-004).
+    *
+@@ -89,7 +126,7 @@ export const upsertUserEntrySchema = z
+   .strictObject({
+     external_id: z.string().min(1).max(255),
+     display_name: z.string().min(1).max(255).nullable().optional(),
+-    avatar_url: z.string().url().max(2048).nullable().optional(),
++    avatar_url: avatarUrl.nullable().optional(),
+     metadata: userMetadataSchema.optional(),
+     /** What kind of thing this user is (chapter 3.17, FR-USR-07).
+      *
+```
+
+And the tests, including the control that catches an over-tight refinement: a rule
+refusing everything would pass the refusal test and break every customer.
+
+```diff title="services/api/src/users/users.itest.ts"
+@@ -485,6 +485,60 @@ describe("a user's channel listing", () => {
+       body: JSON.stringify(body),
+     });
+ 
++  // ── Feature 043: the avatar's scheme (FR-011, FR-012, SC-005) ───────────────
++  it("refuses an avatar_url whose scheme the browser would execute, naming the field", async () => {
++    // MEASURED, NOT ASSUMED. zod 4.4.3's `z.string().url()` accepts every one of these —
++    // re-run on 2026-09-06, the same table research R7 produced. The field is published
++    // as a URL and a customer's client renders it into an `<img src>` or an `<a href>`,
++    // so `javascript:` here is a value we handed them to execute.
++    await repo.createUser("schemer", "Schemer");
++    for (const bad of [
++      "javascript:alert(1)",
++      "data:text/html,<script>alert(1)</script>",
++      "file:///etc/passwd",
++      "vbscript:msgbox(1)",
++    ]) {
++      const res = await patchProfile("schemer", { avatar_url: bad });
++      expect(res.status).toBe(400);
++      const body = (await res.json()) as { code: string; field?: string };
++      // THE FIELD, NOT ONLY THE STATUS. A 400 that does not name `avatar_url` sends a
++      // customer to check their whole body, and this route takes four fields.
++      expect(body.field).toBe("avatar_url");
++    }
++  });
++
++  it("accepts http and https, so the rule is a scheme rule and not a ban on URLs", async () => {
++    // THE CONTROL, and it is the half that catches an over-tight refinement. A rule that
++    // refused everything would pass the test above and break every customer.
++    await repo.createUser("schemer-ok", "Fine");
++    for (const good of [
++      "https://cdn.example.com/a/b.png",
++      "http://cdn.example.com/a/b.png",
++    ]) {
++      const res = await patchProfile("schemer-ok", { avatar_url: good });
++      expect(res.status).toBe(200);
++    }
++  });
++
++  it("applies the same rule on the bulk upsert, not just the PATCH", async () => {
++    // TWO ROUTES, ONE FRAGMENT. `upsertUserEntrySchema`'s own comment promises the two
++    // "cannot drift into accepting different things for the same column" — and before
++    // this feature both accepted `javascript:`, which is agreement of the wrong kind.
++    const res = await fetch(`${url}/v1/users`, {
++      method: "POST",
++      headers: {
++        "content-type": "application/json",
++        authorization: `Bearer ${credential}`,
++      },
++      body: JSON.stringify({
++        users: [{ external_id: "bulk-schemer", avatar_url: "javascript:alert(1)" }],
++      }),
++    });
++    expect(res.status).toBe(400);
++    const body = (await res.json()) as { field?: string };
++    expect(body.field).toContain("avatar_url");
++  });
++
+   // ── T131: the round trip, all three fields (SC-011) ─────────────────────────
+   it("round-trips display name, avatar url and metadata", async () => {
+     await repo.createUser("profiled", "Before");
+```
+
