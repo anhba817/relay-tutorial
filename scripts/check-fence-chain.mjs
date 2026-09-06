@@ -209,6 +209,35 @@ if (existsSync(POST_SERIES)) {
   for (const f of fencesIn(POST_SERIES)) {
     const where = `fences/post-series.md:${f.line}`;
     if (NOT_A_FILE(f.title)) continue;
+
+    // A POST-SERIES FENCE CAN RETIRE A FILE, NOT ONLY AMEND ONE (feature 043).
+    //
+    // `replay` has understood `path (deleted)` since chapter 3.2 retired
+    // `environment-context.guard.ts`. This loop did not, so the appendix could change any
+    // published file and delete none of them — and once Part 3 closed, the appendix is
+    // the ONLY place a change can land. Retiring `drizzle.config.ts` is the first time
+    // anything needed it, and the checker answered "must be a diff", which is true of an
+    // amendment and not of a deletion.
+    //
+    // The inverse check below already covers the other direction: a path retired here
+    // must actually be gone from the repository.
+    const goneHere = DELETION.exec(f.title);
+    if (goneHere) {
+      const path = goneHere[1];
+      if (!en.state.has(path)) {
+        problems.push({
+          kind: "APPLY",
+          where,
+          detail: `${path} is retired here but no chapter ever showed it`,
+        });
+        continue;
+      }
+      en.state.delete(path);
+      en.source.delete(path);
+      en.deleted.set(path, where);
+      continue;
+    }
+
     if (f.lang !== "diff") {
       problems.push({
         kind: "APPLY",
