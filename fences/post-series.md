@@ -135,7 +135,7 @@ show a reader code it never mentions, which is what this file exists to avoid.
 + * The comment on `spawnedDurables` below had already written down the rule that
 + * would have prevented this: a prefix sweep deletes things it did not create.
 + * That reasoning was applied to the walk's durables and not to this suite's own.
-+ * Found by chapter 3.6's baseline.
++ * Found by the retry-and-disable chapter's baseline.
 + *
 + * Two names, because they answer two different questions. `SUITE` is what the
 + * teardown sweeps — this suite's whole namespace, so a run that crashed before
@@ -241,7 +241,7 @@ show a reader code it never mentions, which is what this file exists to avoid.
 +    // had to drain all of them inside a fixed budget of 800 polls before the
 +    // three under test were even reachable.
 +    //
-+    // Found on run 11 of chapter 3.7's twenty post-fix lane runs: `expected
++    // Found on run 11 of the deduplication chapter's twenty post-fix lane runs: `expected
 +    // [ …(2756) ] to include '<uuid>'`. 2,756 events drained and the backlog
 +    // still not cleared. It is the same shape as the sweep and the drain in
 +    // `deliveries.itest.ts` — a test riding a shared, growing resource with a
@@ -334,7 +334,7 @@ an instance is not fixing a class.
 +    // ONE environment, and both runtimes filtered to it (feature 030, T032).
 +    //
 +    // This used to call `ENV()` three times and construct both runtimes with no
-+    // filter, which is instance 3 exactly — the fault chapter 3.7 fixed forty lines
++    // filter, which is instance 3 exactly — the fault the deduplication chapter fixed forty lines
 +    // down in this same file, in the test above this one. Three environments means
 +    // no single subject covers them, and an unfiltered durable starts at the head
 +    // of a stream holding every event earlier chapters left behind; the 400-pass
@@ -432,7 +432,7 @@ legitimately differs.
 +import { parseApiKeyCredential } from "./api-key";
  import { MAX_TOKEN_LIFETIME_SECONDS } from "./user-token";
  
- // The refusals, over real HTTP against the compose Postgres (chapter 3.2).
+ // The refusals, over real HTTP against the compose Postgres.
 @@ -295,10 +296,29 @@ describe("credentials", () => {
      }
  
@@ -450,7 +450,7 @@ legitimately differs.
 +    // contained an underscore, this checked only the fragment after the LAST
 +    // one, so a log line leaking the first thirty characters of a secret passed.
 +    //
-+    // Found by chapter 3.6's baseline, which ran the lane three times.
++    // Found by the retry-and-disable chapter's baseline, which ran the lane three times.
 +    const parsed = parseApiKeyCredential(key.credential);
 +    expect(parsed).not.toBeNull();
 +    const secret = parsed!.secret;
@@ -468,7 +468,7 @@ legitimately differs.
  import { parseApiKeyCredential } from "./api-key";
  import { MAX_TOKEN_LIFETIME_SECONDS } from "./user-token";
  
-+// Chapter 3.8 added `request_id` to every error body (constitution V's fourth
++// The rate-limit chapter added `request_id` to every error body (constitution V's fourth
 +// field, promised since 1.3). It is unique per request BY DESIGN, so two error
 +// bodies can no longer be compared whole — and comparing them whole is how this
 +// suite proves a foreign resource is indistinguishable from an absent one, which
@@ -485,14 +485,14 @@ legitimately differs.
 +}
 +
 +
- // The refusals, over real HTTP against the compose Postgres (chapter 3.2).
+ // The refusals, over real HTTP against the compose Postgres.
  // Invariants 1-7, 9 and 11 of contracts/credentials.md live here; 8 and 12 are
  // pure and live in the unit lane; 10 needs a socket and lives in the gateway's
 @@ -86,6 +103,31 @@ describe("credentials", () => {
    };
  
    beforeAll(async () => {
-+    // Chapter 3.8. This suite submits bad credentials ON PURPOSE — that is what
++    // This suite submits bad credentials ON PURPOSE — that is what
 +    // it is for — and the failed-authentication limiter counts them all against
 +    // one loopback address. The default is ten a minute.
 +    //
@@ -503,7 +503,7 @@ legitimately differs.
 +    // key instead — see `limits.itest.ts` (research R21).
 +    //
 +    // Explicit and visible, rather than the default being chosen to suit the
-+    // tests. Chapter 3.6's `RELAY_DISABLE_SWEEP` states the rule: a flag whose
++    // tests. The retry-and-disable chapter's `RELAY_DISABLE_SWEEP` states the rule: a flag whose
 +    // default disabled a requirement would be a requirement nobody had built.
 +    process.env["RELAY_AUTH_FAILURES_PER_MINUTE"] = "10000";
 +    // AND ITS OWN BUCKET. Raising the threshold is private to this worker —
@@ -648,7 +648,7 @@ never mentions webhooks.
 +
 +  /** The same drain, retried until a row this suite owns has settled.
 +   *
-+   * FOUND AT CHAPTER 3.7'S POST-FIX MEASUREMENT, on run 2 of 20: "expected null
++   * FOUND AT THE DEDUPLICATION CHAPTER'S POST-FIX MEASUREMENT, on run 2 of 20: "expected null
 +   * not to be null" for a delivery that was unambiguously due. The comment above
 +   * had the principle right and the implementation one call short.
 +   *
@@ -724,7 +724,7 @@ never mentions webhooks.
 +    // one, so they fill the batch and this endpoint is never reached. The suite
 +    // then fails on a shared database and passes on a fresh one.
 +    //
-+    // Found at chapter 3.7's baseline, after 781 endpoints had accumulated an open
++    // Found at the deduplication chapter's baseline, after 781 endpoints had accumulated an open
 +    // run. Note which assertion caught it: `disabled >= 1` PASSED, because the
 +    // sweep had just disabled a hundred endpoints belonging to nobody. Only the
 +    // assertion about THIS endpoint could tell the difference.
@@ -814,7 +814,7 @@ chapter's baseline found it, and that chapter teaches something else.
 +    // A delta is two reads with a gap. Another suite delivering one of its own
 +    // rows in that gap moves the second read by one more, and the assertion is a
 +    // local fact about a global operation with an extra step — the twelfth
-+    // occurrence of the fault this lane has been recording since chapter 3.3, and
++    // occurrence of the fault this lane has been recording since the outbox chapter, and
 +    // the third whose defence was a comment explaining why it was fine.
 +    //
 +    // The global function still has a caller, because it is the number an operator
@@ -895,8 +895,8 @@ Two address formats were the whole of the isolation.
 -    const before = await db.execute(
 -      `SELECT count(*)::int AS n FROM organisations`,
 -    );
--    // Chapter 3.2: there is no header left to forge here. The assertion is
-+    // Chapter 3.2: there is no header left to forge here. The property is
+-    // There is no header left to forge here. The assertion is
++    // There is no header left to forge here. The property is
      // unchanged — no route but signup creates a tenant — and a credential-free
      // internal call is now refused before it reaches a handler, which is a
      // stronger form of the same guarantee.
@@ -912,7 +912,7 @@ Two address formats were the whole of the isolation.
 +    // that assertion was not about this request. The count is global, every other
 +    // suite in the lane signs organisations up while this runs, and vitest runs
 +    // these files in parallel — so it asserted that nobody anywhere created a
-+    // tenant during one `fetch`. Chapter 3.7's lane runs caught it at 9,917
++    // tenant during one `fetch`. The deduplication chapter's lane runs caught it at 9,917
 +    // organisations: `expected 9918 to be 9917`.
 +    //
 +    // What is left is the property itself, asserted where it can be attributed to
@@ -929,7 +929,7 @@ Two address formats were the whole of the isolation.
    let provider: Awaited<ReturnType<typeof standInProvider>>;
  
    beforeAll(async () => {
-+    // Chapter 3.8 limited account creation per source address (FR-AUT-12), and this
++    // The rate-limit chapter limited account creation per source address (FR-AUT-12), and this
 +    // suite drives the signup routes repeatedly from one loopback address — which
 +    // is what a suite about signup does.
 +    //
@@ -1013,17 +1013,17 @@ of the system. Switched off here exactly as `RELAY_OUTBOX_RELAY` and
 +      // the backlog itself, so the next run passes — which is why it reads as a
 +      // flake rather than as the threshold it is.
 +      //
-+      // Found at chapter 3.8's baseline. Chapter 3.7 fixed the same global drain
++      // Found at the rate-limit chapter's baseline. The deduplication chapter fixed the same global drain
 +      // in `deliveries.itest.ts` twice and never looked at this door.
 +      batchSize: 10_000,
      });
      return r.drainOnce();
    };
 @@ -108,6 +108,8 @@ function spawnApi(port: number, credential: string): ChildProcess {
-       // Chapter 3.3's finding 4, for the third time: this suite drives the relay
+       // The outbox chapter's finding 4, for the third time: this suite drives the relay
        // explicitly, so a background copy draining the same table would race it.
        RELAY_OUTBOX_RELAY: "off",
-+      // Chapter 3.8: nor the notification relay, for the same reason.
++      // The rate-limit chapter: nor the notification relay, for the same reason.
 +      RELAY_NOTIFICATION_RELAY: "off",
        RELAY_EVENT_CONSUMER: "off",
        RELAY_DELIVERY_RELAY: "off",
@@ -1202,7 +1202,7 @@ This one is lane hygiene, which no chapter teaches.
        "services/gateway/src/limits.ts",
        "services/gateway/src/limits.itest.ts",
        "services/gateway/src/fanout.ts",
-+      // Chapter 3.18. THE RULE'S REASON DOES NOT APPLY HERE, and that is the
++      // THE RULE'S REASON DOES NOT APPLY HERE, and that is the
 +      // whole justification rather than a convenience. The restriction exists
 +      // because rate-limit counters are keyed `rl:{environment_id}:…`, so an
 +      // unrestricted client can read another tenant's counter. This client
@@ -1647,7 +1647,7 @@ explains.
        RELAY_DELIVERY_RELAY: "off",
        RELAY_NOTIFICATION_RELAY: "off",
        RELAY_EVENT_CONSUMER: "off",
-+      // Chapter 3.10's relay, the fourth. Same reason as the other three.
++      // The quota chapter's relay, the fourth. Same reason as the other three.
 +      RELAY_QUOTA_RELAY: "off",
      },
      include: ["src/**/*.itest.ts"],
@@ -1661,7 +1661,7 @@ explains.
        RELAY_DELIVERY_RELAY: "off",
        RELAY_NOTIFICATION_RELAY: "off",
        RELAY_EVENT_CONSUMER: "off",
-+      // Chapter 3.10's relay, the fourth. Same reason as the other three.
++      // The quota chapter's relay, the fourth. Same reason as the other three.
 +      RELAY_QUOTA_RELAY: "off",
      },
      setupFiles: ["./packages/test-harness/src/setup.ts"],
@@ -1675,7 +1675,7 @@ explains.
      tuan: Client;
    }>;
    seedForeignTenant: () => Promise<{ channel: string; text: string }>;
-+  /** Set an environment's quota policy (chapter 3.10).
++  /** Set an environment's quota policy.
 +   *
 +   * Here rather than in the test, because `packages/e2e` may not import `pg` —
 +   * the driver restriction chapter 2.5 added, and this package is not on its
@@ -1731,7 +1731,7 @@ a reader code the chapter never discusses.
            statements: 100,
          },
 +
-+        // CHAPTER 3.11's three, pinned at what they measure, with a reason each.
++        // The connection-metering chapter's three, pinned at what they measure, with a reason each.
 +        //
 +        // `credit.ts` is here at 100 on everything and has no excuse not to be:
 +        // two functions, no clock, no store, no framework, and between them they
@@ -1789,9 +1789,9 @@ a reader code the chapter never discusses.
                  "drainOutbox",
                  "drainDueDeliveries",
                  "drainDisableNotifications",
-+                // Chapter 3.11 added this one, and chapter 3.10 should have.
++                // The connection-metering chapter added this one, and the quota chapter should have.
 +                // `drainQuotaNotifications` claims undelivered rows across every
-+                // environment, exactly as its three siblings above do, and 3.10
++                // environment, exactly as its three siblings above do, and the quota chapter
 +                // listed it in neither this rule nor `exempt.ts` — whose comment
 +                // says the two MUST AGREE.
 +                //
@@ -1824,7 +1824,7 @@ a reader code the chapter never discusses.
 +import { resolvePrincipal } from "./authenticate.middleware";
  import { MAX_TOKEN_LIFETIME_SECONDS } from "./user-token";
  
- // Chapter 3.8 added `request_id` to every error body (constitution V's fourth
+ // The rate-limit chapter added `request_id` to every error body (constitution V's fourth
 @@ -164,7 +165,22 @@ describe("credentials", () => {
        environmentId: env.id,
        name: "once",
@@ -1839,7 +1839,7 @@ a reader code the chapter never discusses.
 +    //
 +    //     AssertionError: expected '[{"public_id":"9e5240d…' not to contain 'A'
 +    //
-+    // Latent since chapter 3.1 and found by chapter 3.11's twenty-run battery on
++    // Latent since the tenancy chapter and found by the connection-metering chapter's twenty-run battery on
 +    // the gate run after it. Parsed with the same shape the production code
 +    // parses (`CREDENTIAL` in `api-key.ts`) rather than a guess about delimiters.
 +    const secret = /^rk_(?:dev|live)_[0-9a-f]{32}_(.+)$/.exec(
@@ -1854,7 +1854,7 @@ a reader code the chapter never discusses.
      });
    });
 +
-+  // --- chapter 3.11: one credential per service ---------------------------
++  // --- one credential per service ---------------------------
 +
 +  describe("which service presented it", () => {
 +    // SET, not read, for the reason the block above gives.
@@ -1922,7 +1922,7 @@ a reader code the chapter never discusses.
  }
  
 -async function boot(api: ApiClient): Promise<Harness> {
-+/** Chapter 3.11 widened `ApiClient` with `reportUsage`, and every stub in this
++/** The connection-metering chapter widened `ApiClient` with `reportUsage`, and every stub in this
 + * file is about resume rather than metering — so the method is supplied here
 + * once instead of six times, and the `Omit` says which half these tests speak
 + * to. */
@@ -1990,8 +1990,8 @@ second time, in the same chapter.
 +// ── THE TWO RESTRICTION SETS, NAMED SO THEY CAN BE COMBINED ──────────────────
 +//
 +// `no-restricted-imports` is one rule, and in flat config a later block REPLACES
-+// an earlier block's setting for it rather than merging. That is the bug chapter
-+// 3.12 found (R23, FR-043): a second block for `**/*.itest.ts` carrying feature
++// an earlier block's setting for it rather than merging. That is the bug the
++// isolation gauntlet found (R23, FR-043): a second block for `**/*.itest.ts` carrying feature
 +// 030's global-drain restriction switched the driver-and-engine ban OFF for every
 +// integration test in the workspace. Measured — `npx eslint
 +// services/api/src/quotas/period.itest.ts` exited 0 while that file imports
@@ -2021,7 +2021,7 @@ second time, in the same chapter.
 +    {
 +      name: "ioredis",
 +      message:
-+        "The counter store lives in services/api/src/limits and services/gateway/src/limits.ts only (constitution I, chapter 3.8). Its keys are per environment; an unrestricted client is a cross-tenant read.",
++        "The counter store lives in services/api/src/limits and services/gateway/src/limits.ts only (constitution I). Its keys are per environment; an unrestricted client is a cross-tenant read.",
 +    },
 +  ],
 +  patterns: [
@@ -2055,17 +2055,17 @@ second time, in the same chapter.
 +  "services/api/src/quotas/quotas.itest.ts",
 +  "services/api/src/quotas/period.itest.ts",
 +  "services/api/src/quotas/connections.itest.ts",
-+  // Chapter 3.17. THE SUBJECT IS A ROW NO REPOSITORY METHOD CAN WRITE ANY MORE, which
++  // THE SUBJECT IS A ROW NO REPOSITORY METHOD CAN WRITE ANY MORE, which
 +  // is the same reason the three quota suites are here. `sendMessage` requires a sender
 +  // as of FR-MSG-15, so a senderless message — 121,250 of them exist in the lane, and
-+  // any deployment older than chapter 3.17 has them — can only be planted by hand. The
++  // any deployment older than the sender chapter has them — can only be planted by hand. The
 +  // arms that read one (history's `user: null`, the resume's drop) have no other fixture.
 +  //
 +  // Exempted explicitly rather than reached through a helper in another file: the note
 +  // at the top of this rule says a helper would make the SQL invisible to it, and an
 +  // invisible exemption is worse than a listed one.
 +  "services/api/src/internal/backfill.itest.ts",
-+  // Chapter 3.18. THE SAME ARGUMENT AS THE TWO LIMITS SUITES: its subject is what
++  // THE SAME ARGUMENT AS THE TWO LIMITS SUITES: its subject is what
 +  // reaches the fabric, and the only way to check that is to subscribe with
 +  // neither the api's publisher nor the gateway's `createFanout`. A spy on either
 +  // would prove that an object was asked to publish, not that a frame arrived —
@@ -2102,10 +2102,10 @@ second time, in the same chapter.
 +        "drainOutbox",
 +        "drainDueDeliveries",
 +        "drainDisableNotifications",
-+        // Chapter 3.11 added this one, and chapter 3.10 should have.
++        // The connection-metering chapter added this one, and the quota chapter should have.
 +        // `drainQuotaNotifications` claims undelivered rows across every
-+        // environment, exactly as its three siblings above do, and 3.10
-+        // listed it in neither this rule nor `exempt.ts` — whose comment
++        // environment, exactly as its three siblings above do, and the quota
++        // chapter listed it in neither this rule nor `exempt.ts` — whose comment
 +        // says the two MUST AGREE.
 +        //
 +        // SAY WHAT THIS DOES NOT BUY. It protects a future DIRECT
@@ -2155,7 +2155,7 @@ second time, in the same chapter.
 +    // the SAME key, and the only way to check that is to read the key with neither
 +    // of their code.
 +    //
-+    // CORRECTED IN 3.12 (T069c). This comment used to say it was "the one TEST
++    // CORRECTED IN THE ISOLATION GAUNTLET (T069c). This comment used to say it was "the one TEST
 +    // allowed a raw client". Every test was allowed one, and had been since the
 +    // `**/*.itest.ts` block below was added — that block replaced this rule rather
 +    // than adding to it, which is the whole of R23. Its `ignores` entry here has
@@ -2185,7 +2185,7 @@ second time, in the same chapter.
 -            {
 -              name: "ioredis",
 -              message:
--                "The counter store lives in services/api/src/limits and services/gateway/src/limits.ts only (constitution I, chapter 3.8). Its keys are per environment; an unrestricted client is a cross-tenant read.",
+-                "The counter store lives in services/api/src/limits and services/gateway/src/limits.ts only (constitution I). Its keys are per environment; an unrestricted client is a cross-tenant read.",
 -            },
 -          ],
 -          patterns: [
@@ -2276,7 +2276,7 @@ second time, in the same chapter.
 +    },
 +  },
 +  {
-+    // THE SEAL ON `packages/outsider` (chapter 3.14, FR-030, FR-034, R12).
++    // THE SEAL ON `packages/outsider` (FR-030, FR-034, R12).
 +    //
 +    // That package holds one suite that behaves like a customer, and the claim it
 +    // makes — an integration built from published documentation alone — is worth
@@ -2335,9 +2335,9 @@ second time, in the same chapter.
 -                "drainOutbox",
 -                "drainDueDeliveries",
 -                "drainDisableNotifications",
--                // Chapter 3.11 added this one, and chapter 3.10 should have.
+-                // The connection-metering chapter added this one, and the quota chapter should have.
 -                // `drainQuotaNotifications` claims undelivered rows across every
--                // environment, exactly as its three siblings above do, and 3.10
+-                // environment, exactly as its three siblings above do, and the quota chapter
 -                // listed it in neither this rule nor `exempt.ts` — whose comment
 -                // says the two MUST AGREE.
 -                //
@@ -2514,13 +2514,13 @@ sentence and got it a feature late.
      // coverage is not attributable here anyway.
 -    exclude: ["**/node_modules/**", "packages/e2e/**"],
 +    //
-+    // AND `packages/outsider` FOR A DIFFERENT REASON, added in chapter 3.15's Phase 1.
++    // AND `packages/outsider` FOR A DIFFERENT REASON, added in the channel-control chapter's Phase 1.
 +    // That suite integrates against a platform it does not start: without
 +    // RELAY_API_URL, RELAY_WS_URL and RELAY_DEMO_CREDENTIAL it throws on purpose and
 +    // prints the five commands that would satisfy it. `pnpm coverage` sets none of
 +    // them, so it failed every coverage run — 8 tests skipped, one failed suite.
 +    //
-+    // Chapter 3.12 split the lanes so `pnpm test:integration` is
++    // The isolation gauntlet split the lanes so `pnpm test:integration` is
 +    // `turbo run test:integration --filter=!@relay/outsider`, and the exclusion went
 +    // into the script and NOT into this config. One lane learned it and the other did
 +    // not. `pnpm test:outsider` is the way in, and the CI `outsider` job is where it
@@ -2531,7 +2531,7 @@ sentence and got it a feature late.
 +      "packages/outsider/**",
 +    ],
      // Suites in one process would share a database in ways their authors did
-     // not design for — 3.3's outbox suite learned that the hard way.
+     // not design for — the outbox chapter's outbox suite learned that the hard way.
      fileParallelism: false,
 ```
 
@@ -2561,7 +2561,7 @@ folds these amendments into a CI chapter, this one folds with them.
    // compares response bodies and a publish is a second output channel.
    "services/api/src/fanout/fanout.itest.ts",
    "services/api/src/messages/history.itest.ts",
-+  // Chapter 3.19, and it is 3.18's argument in the other direction. The presence
++  // The presence chapter, and it is the fan-out chapter's argument in the other direction. The presence
 +  // fabric's receive half has two rejection paths — a body that is not JSON, and a
 +  // body that is JSON and not a transition — and neither can be reached through
 +  // `createPresence`, which only ever publishes payloads its own schema produced.
@@ -2570,7 +2570,7 @@ folds these amendments into a CI chapter, this one folds with them.
 +  //
 +  // A `publish` and nothing else: this file reads no key and composes none.
 +  "services/gateway/src/presence.itest.ts",
-+  // Chapter 3.20's, for that same reason and on THIS list rather than the `**/*.ts`
++  // The membership-revocation chapter's, for that same reason and on THIS list rather than the `**/*.ts`
 +  // block's `ignores` — which is where it was written first, and where an `.itest.ts`
 +  // entry does nothing. The `**/*.itest.ts` block below REPLACES the rule for every
 +  // integration test not on one of these two lists, so an exemption above it is
@@ -2582,10 +2582,10 @@ folds these amendments into a CI chapter, this one folds with them.
 +  // reachable through `createMembership`, which only delivers what it already
 +  // accepted. A `publish` and nothing else: no key read, no key composed.
 +  "services/gateway/src/membership.itest.ts",
-+  // Chapter 3.21, and the same case as the two above: the assertion is on Redis,
++  // The typing chapter, and the same case as the two above: the assertion is on Redis,
 +  // read with neither service's code. A publish count taken through this
 +  // chapter's own module would be satisfied by a module that does nothing —
-+  // chapter 3.18's warning, in a new place.
++  // The fan-out chapter's warning, in a new place.
 +  "services/gateway/src/typing.itest.ts",
  ];
  
@@ -2594,7 +2594,7 @@ folds these amendments into a CI chapter, this one folds with them.
        // already subscribed. The gateway's `fanout.ts` is on this list one line
        // up for the same reason; the api needs it too now that it publishes.
        "services/api/src/fanout/**",
-+      // Chapter 3.20, AND IT IS THE ENTRY ABOVE'S CASE RATHER THAN THE LIMITER'S.
++      // THE MEMBERSHIP-REVOCATION CHAPTER, AND IT IS THE ENTRY ABOVE'S CASE RATHER THAN THE LIMITER'S.
 +      // The membership publisher calls PUBLISH and nothing else, onto
 +      // `member:{channel_id}` and `member:{env}:{user}` — a subject is not
 +      // readable at all, only listened to by whoever is already subscribed, so
@@ -2606,7 +2606,7 @@ folds these amendments into a CI chapter, this one folds with them.
 +      // the way out, never read from a payload on the way in. The gateway's half
 +      // of this fabric IS the limiter's case, and its entry says so.
 +      "services/api/src/membership/**",
-+      // Chapter 3.19. THIS IS `limits.ts`'s CASE, NOT `fanout.ts`'s, and the
++      // THIS IS `limits.ts`'s CASE, NOT `fanout.ts`'s, and the
 +      // distinction is the rule's own reason. The entry above is justified by
 +      // "this client touches no keys" — a publish onto a channel UUID, and a
 +      // subject is not readable at all. Presence's client touches keys and they
@@ -2619,7 +2619,7 @@ folds these amendments into a CI chapter, this one folds with them.
 +      // environment id from a client, and no scan, `KEYS` or pattern read that
 +      // could reach a key belonging to another tenant.
 +      "services/gateway/src/presence.ts",
-+      // Chapter 3.20, AND IT IS THE FAN-OUT'S CASE RATHER THAN PRESENCE'S — the
++      // THE MEMBERSHIP-REVOCATION CHAPTER, AND IT IS THE FAN-OUT'S CASE RATHER THAN PRESENCE'S — the
 +      // opposite of what the entry above had to argue. This client SUBSCRIBES and
 +      // nothing else: no `SET`, no `EXISTS`, no key of any kind, because the
 +      // module's only command-shaped work is an HTTP re-read against the api.
@@ -2630,7 +2630,7 @@ folds these amendments into a CI chapter, this one folds with them.
 +      // the id is composed from the authenticated connection's own identity on the
 +      // way in. There is no path here that takes an environment id from a payload.
 +      "services/gateway/src/membership.ts",
-+      // Chapter 3.21, AND IT IS THE FAN-OUT'S CASE — the cleanest of the four, and
++      // THE TYPING CHAPTER, AND IT IS THE FAN-OUT'S CASE — the cleanest of the four, and
 +      // the only one of them that both publishes and subscribes. This client calls
 +      // PUBLISH and SUBSCRIBE and nothing else, onto `typing:{channel_id}` — a
 +      // channel UUID, not an environment-scoped key — and a subject is not readable
@@ -2642,7 +2642,7 @@ folds these amendments into a CI chapter, this one folds with them.
 +      // about to act on; it is never composed into a key, because this module
 +      // composes no keys.
 +      //
-+      // THE `.itest.ts` FILE IS NOT LISTED HERE. Chapter 3.20 put an `.itest.ts`
++      // THE `.itest.ts` FILE IS NOT LISTED HERE. THE MEMBERSHIP-REVOCATION CHAPTER put an `.itest.ts`
 +      // entry in this block's `ignores` and the later `**/*.itest.ts` block
 +      // silently overrode it. The typing suite's exemption lives in
 +      // `DRIVER_EXEMPT_TESTS` instead, which is the list that governs test files.
@@ -2672,7 +2672,7 @@ whose title claimed it, and one branch was deleted rather than covered.
            statements: 100,
          },
 +
-+        // CHAPTER 3.19's two, both at 100 on every metric, and the pin is
++        // The presence chapter's two, both at 100 on every metric, and the pin is
 +        // NFR-MNT-02's MUST rather than a preference: presence keys are
 +        // `presence:{env}:{user}`, so this is tenant-isolation code and the clause
 +        // asks 100% of its branches.
@@ -2720,7 +2720,7 @@ whose title claimed it, and one branch was deleted rather than covered.
 +          statements: 100,
 +        },
 +
-+        // ── CHAPTER 3.20'S FOUR NEW PRODUCTION FILES ───────────────────────
++        // ── THE MEMBERSHIP-REVOCATION CHAPTER'S FOUR NEW PRODUCTION FILES ──
 +        //
 +        // All four at 100 on every metric, and the pin is NFR-MNT-02's MUST rather
 +        // than a preference: membership decides who may hear what, so this is
@@ -2731,7 +2731,7 @@ whose title claimed it, and one branch was deleted rather than covered.
 +        // the `JSON.parse` catch, the `safeParse` rejection, an unsubscribe for a
 +        // channel never subscribed, a change arriving before `onChange` is wired,
 +        // `close()` with a timer armed, and a construction taking both defaults —
-+        // and drove each with a test in that phase. Chapter 3.19 met its equivalents
++        // and drove each with a test in that phase. The presence chapter met its equivalents
 +        // at close-out instead and paid for it with seven tests, a deleted branch and
 +        // a re-measured battery.
 +        //
@@ -2776,7 +2776,7 @@ whose title claimed it, and one branch was deleted rather than covered.
            lines: 100,
            statements: 100,
          },
-+        // CHAPTER 3.21. `packages/protocol/src/typing.ts` reached 100 on the
++        // `packages/protocol/src/typing.ts` reached 100 on the
 +        // first run — one function and no branches, which is what a subject
 +        // builder and a schema are.
 +        //
@@ -2833,9 +2833,9 @@ to construct an `ioredis` client at all.
 ```diff title="eslint.config.mjs"
 @@ -114,6 +114,14 @@ const DRIVER_EXEMPT_TESTS = [
    // chapter's own module would be satisfied by a module that does nothing —
-   // chapter 3.18's warning, in a new place.
+   // The fan-out chapter's warning, in a new place.
    "services/gateway/src/typing.itest.ts",
-+  // Chapter 3.22, and NOT for the reason the four above give. This file needs no
++  // The connection-cap chapter, and NOT for the reason the four above give. This file needs no
 +  // raw client to assert a publish — its subject is delivery, and it asserts on
 +  // the sockets. It needs one to CAUSE a membership change: `Membership` exposes
 +  // `onChange`, `subscribeChannel` and `watch` and no `publish`, because the api
@@ -2850,7 +2850,7 @@ to construct an `ioredis` client at all.
        // silently overrode it. The typing suite's exemption lives in
        // `DRIVER_EXEMPT_TESTS` instead, which is the list that governs test files.
        "services/gateway/src/typing.ts",
-+      // Chapter 3.22's connection registry, and its keys are the strongest case on
++      // The connection-cap chapter's connection registry, and its keys are the strongest case on
 +      // this list rather than the weakest. `conn:{env}:{user}:{slot}` puts the
 +      // environment FIRST, so Principle I is structural in the key itself: a
 +      // cross-tenant read would need a caller to hand this module another
@@ -2887,7 +2887,7 @@ default and the `??` inside it, neither reachable while the lane sets
            lines: 100,
            statements: 100,
          },
-+        // CHAPTER 3.22. `services/gateway/src/connections.ts` at 100 on all four,
++        // `services/gateway/src/connections.ts` at 100 on all four,
 +        // and it took three deletions to get there rather than three tests. The
 +        // first measurement read **96.15 / 82.60 / 100 / 97.67** with four arms
 +        // uncovered, and three of them were arms nothing could take:
@@ -2932,7 +2932,7 @@ reads as fully covered. Constitution VI's 100%-branch clause is stated in exactl
            statements: 97,
          },
  
-+        // CHAPTER 3.24. The attachment shape and the REST door's schemas, both at 100 on
++        // The attachment shape and the REST door's schemas, both at 100 on
 +        // all four metrics — which is why neither appears in the text reporter's table
 +        // and why this pin was written from `coverage-summary.json` instead.
 +        //
@@ -2956,7 +2956,7 @@ reads as fully covered. Constitution VI's 100%-branch clause is stated in exactl
 +          statements: 100,
 +        },
 +
-+        // The REST door, pinned for the first time because chapter 3.24 is the first to
++        // The REST door, pinned for the first time because the attachments chapter is the first to
 +        // find a defect in it: `editMessageBodySchema.text` was
 +        // `sendMessageBodySchema.shape.text`, so relaxing the send's floor for FR-019
 +        // relaxed the edit's, and an edit has no attachments field to restore it. Two
@@ -3072,7 +3072,7 @@ tombstone. They do not: the edit read the row, threw if it was deleted, and then
 +      // set — **a row one filter calls deleted and another calls alive**, and a
 +      // deletion that returned successfully undone by an edit already in flight.
 +      //
-+      // `gaps.md` 3.23-3 recorded the opposite — *"both interleavings end in a
++      // `gaps.md` the revisions chapter-3 recorded the opposite — *"both interleavings end in a
 +      // tombstone… there is no order of the two that leaves a message saying something
 +      // nobody wrote"* — and the test that item asked for is what disproved it: three
 +      // of five runs, and four incoherent rows left behind in the lane.
@@ -3102,20 +3102,20 @@ deterministically, because a race cannot be commanded and an assertion that one 
 flaky in one run of three.
 
 ```diff title="services/api/src/db/repository.itest.ts"
-@@ -1424,3 +1424,140 @@ describe("the read shapes that do NOT carry attachments (FR-009 (3.24))", () =>
+@@ -1424,3 +1424,140 @@ describe("the read shapes that do NOT carry attachments (FR-009)", () =>
      expect(Object.keys(rows[0]!).sort()).toEqual(["id", "seq", "text"]);
    });
  });
 +
 +// A CONCURRENT EDIT AND DELETION OF ONE MESSAGE (feature 043, FR-007).
 +//
-+// `gaps.md` 3.23-3 has carried this since chapter 3.23 built both writes. Neither takes
++// `gaps.md` the revisions chapter-3 has carried this since the revisions chapter built both writes. Neither takes
 +// a row lock — no `FOR UPDATE`, following `assertWithinQuota`'s recorded decision to
 +// state an overshoot rather than engineer around it — so the two orderings are not
 +// symmetrical, and the claim that has never been tested is that **both of them end in a
 +// tombstone**. Not the outcome: the claim.
 +//
-+// DO NOT START FROM `Promise.all` ON ONE CLIENT. Chapter 3.22 spent a phase learning
++// DO NOT START FROM `Promise.all` ON ONE CLIENT. The connection-cap chapter spent a phase learning
 +// that two operations issued on one connection serialise at the socket, so a test built
 +// that way proves the code cannot race by never letting it. The third case below uses
 +// TWO POOLS, which is what that chapter found it needed.
@@ -3264,12 +3264,12 @@ one cost 30.56 s on a lane with 5.39 s of headroom.
 +   * `services/api/src/main.ts` and `services/gateway/src/main.ts` were changed to
 +   * report correctly — both used to log the port they ASKED for, which is `0`.
 +   *
-+   * IT READS THE BUFFER `capture` ALREADY FILLS. `gaps.md` 3.22-6 counts eleven files
++   * IT READS THE BUFFER `capture` ALREADY FILLS. `gaps.md` the connection-cap chapter-6 counts eleven files
 +   * that spawn a child and six that discard its output entirely; this one captured it
 +   * and used it for a failure message only. Now it is load-bearing.
 +   *
 +   * The alternative was a fixed port, which collides always under contention, or a
-+   * random one from a band, which `session.itest.ts:133` draws and chapter 3.23
++   * random one from a band, which `session.itest.ts:133` draws and the revisions chapter
 +   * measured as self-colliding 2.96% of runs. Binding 0 cannot collide at all. */
 +  const boundPort = async (name: string, timeoutMs = 30_000): Promise<number> => {
 +    const deadline = Date.now() + timeoutMs;
@@ -3347,7 +3347,7 @@ one cost 30.56 s on a lane with 5.39 s of headroom.
 +      // listeners was still holding its port when the next suite booted — and the
 +      // next suite's health check passed against the dying predecessor, printed
 +      // `api up on …`, and then failed at its first real request with
-+      // `ECONNREFUSED`. **Ten of chapter 3.24's twenty-run battery failed exactly
++      // `ECONNREFUSED`. **Ten of the attachments chapter's twenty-run battery failed exactly
 +      // that way**, and the debt was not settled when a run ended: it was paid by
 +      // whatever booted next, in that run or the following one.
 +      //
@@ -3403,11 +3403,11 @@ file's.
 +    //
 +    // A durable is server-side state that outlives the process that made it, and this
 +    // suite named a fresh pair per run — `itest-expand-<8 hex>` and
-+    // `itest-deliver-<8 hex>` — and deleted neither. Chapter 3.24's close-out found
++    // `itest-deliver-<8 hex>` — and deleted neither. The attachments chapter's close-out found
 +    // **216 consumers on DELIVERIES**, 215 of them this file's, each holding a position
 +    // in a stream of 56,193 messages, and the twenty-run battery added 19 more.
 +    //
-+    // `services/api/src/consumer/consumer.itest.ts` has done this since chapter 3.4 and
++    // `services/api/src/consumer/consumer.itest.ts` has done this since the broker chapter and
 +    // its comment says why: *"without this, every run of this suite left another handful
 +    // behind on a shared broker, and `stream-info.mjs` found twelve of them the first
 +    // time it looked."* That chapter learned it at twelve. **The fix was written in the
@@ -3446,8 +3446,8 @@ measured — `12 failed | 5 passed` against a dead broker — not argued: resear
 -  type Connections,
  } from "./connections.js";
  
--// CHAPTER 3.22 — the slot registry.
-+// CHAPTER 3.22's slot registry — THE HALF THAT NEEDS NO BROKER (feature 043: FR-006,
+-// The slot registry.
++// The connection-cap chapter's slot registry — THE HALF THAT NEEDS NO BROKER (feature 043: FR-006,
 +// FR-006a, FR-024, FR-024a).
  //
 -// AGAINST A REAL REDIS, NOT A STUB, and that is the correctness argument rather
@@ -3462,10 +3462,10 @@ measured — `12 failed | 5 passed` against a dead broker — not argued: resear
 +// Redis. It is a `.test.ts`, so it runs in the lane chapter 2.1 built specifically to
 +// need no containers — the lane whose whole point is that `pnpm test` is honest on a
 +// laptop with nothing running. With the stack down it reported twelve failures that were
-+// correct behaviour, and `gaps.md` 3.23-9 has carried that since it was found by
++// correct behaviour, and `gaps.md` the revisions chapter-9 has carried that since it was found by
 +// accident.
  //
--// That is chapter 3.17's T047c one dimension over: a test that passes with half
+-// That is the sender chapter's T047c one dimension over: a test that passes with half
 -// its subject applied.
 +// **WHICH FIVE STAY WAS MEASURED, NOT ARGUED.** Run the original against a dead broker
 +// and it reports `12 failed | 5 passed`:
@@ -3519,7 +3519,7 @@ measured — `12 failed | 5 passed` against a dead broker — not argued: resear
 -    expect(second).toEqual({ kind: "claimed", slot: 1, held: 1 });
 -  });
 -
--  it("refuses when every slot is held, and says five (FR-001 (3.22))", async () => {
+-  it("refuses when every slot is held, and says five (FR-001)", async () => {
 -    for (let i = 0; i < MAX_CONNECTIONS_PER_USER; i += 1) {
 -      expect((await registry.claim(ENV, user, randomUUID())).kind).toBe("claimed");
 -    }
@@ -3530,7 +3530,7 @@ measured — `12 failed | 5 passed` against a dead broker — not argued: resear
 -    });
 -  });
 -
--  it("counts each environment separately for one user identifier (FR-012 (3.22))", async () => {
+-  it("counts each environment separately for one user identifier (FR-012)", async () => {
 -    const other = `env-${randomUUID()}`;
 -    for (let i = 0; i < MAX_CONNECTIONS_PER_USER; i += 1) {
 -      await registry.claim(ENV, user, randomUUID());
@@ -3540,7 +3540,7 @@ measured — `12 failed | 5 passed` against a dead broker — not argued: resear
 -
 -  // ---- ARM 3 and ARM 9: the renewal, and the re-claim --------------------
 -
--  it("renews a slot it still holds (FR-008 (3.22))", async () => {
+-  it("renews a slot it still holds (FR-008)", async () => {
 -    const id = randomUUID();
 -    const claimed = await registry.claim(ENV, user, id);
 -    if (claimed.kind !== "claimed") throw new Error("expected a slot");
@@ -3549,7 +3549,7 @@ measured — `12 failed | 5 passed` against a dead broker — not argued: resear
 -    });
 -  });
 -
--  it("re-claims when its slot is GONE and nothing else took it (FR-011b (3.22))", async () => {
+-  it("re-claims when its slot is GONE and nothing else took it (FR-011b)", async () => {
 -    // ARM 3 then ARM 9. A short-lived registry so the bound elapses inside a test
 -    // rather than in a minute: the boundMs option exists for exactly this, the way
 -    // `membership.ts`'s reread interval does — sixty seconds does not fit in a
@@ -3578,7 +3578,7 @@ measured — `12 failed | 5 passed` against a dead broker — not argued: resear
 +  const registryFor = () => createConnections({ url: REDIS, logger: silent });
 +  const userFor = () => `u-${randomUUID()}`;
  
--  it("refuses to renew a slot ANOTHER connection now holds (FR-011 (3.22))", async () => {
+-  it("refuses to renew a slot ANOTHER connection now holds (FR-011)", async () => {
 -    // ARM 4, and the one test in the chapter that catches `IFEQ` being replaced by
 -    // `XX`. `XX` tests existence and not ownership — measured on 8.10.0,
 -    // `SET k B XX` against a key holding `A` returns OK — so under `XX` this
@@ -3604,7 +3604,7 @@ measured — `12 failed | 5 passed` against a dead broker — not argued: resear
 -
 -  // ---- ARM 6, ARM 7 and ARM 8: the release ------------------------------
 -
--  it("frees a slot it holds, and the slot is reusable at once (FR-010 (3.22))", async () => {
+-  it("frees a slot it holds, and the slot is reusable at once (FR-010)", async () => {
 -    const id = randomUUID();
 -    const claimed = await registry.claim(ENV, user, id);
 -    if (claimed.kind !== "claimed") throw new Error("expected a slot");
@@ -3632,7 +3632,7 @@ measured — `12 failed | 5 passed` against a dead broker — not argued: resear
 -    expect(again.slot, "a released slot cost more than one place").toBeLessThanOrEqual(1);
 -  });
 -
--  it("claims a slot whose tombstone has NOT expired (FR-010 (3.22))", async () => {
+-  it("claims a slot whose tombstone has NOT expired (FR-010)", async () => {
 -    // A HALF-SECOND TOMBSTONE, so the window is a window rather than a coin flip.
 -    // With the shipped one-millisecond value this test would pass against the
 -    // broken walk about half the time, which is how the defect survived: two of six
@@ -3654,7 +3654,7 @@ measured — `12 failed | 5 passed` against a dead broker — not argued: resear
 -    await slow.close();
 -  });
 -
--  it("accepts a claim immediately after releaseAll frees all five (FR-011a (3.22))", async () => {
+-  it("accepts a claim immediately after releaseAll frees all five (FR-011a)", async () => {
 -    // THE CASE THAT WAS ACTUALLY BROKEN, and it is a deploy. One slot tombstoned is
 -    // one slot skipped; five tombstoned is a walk that finds nothing free and
 -    // reports `full` — so a client reconnecting to the new instance is refused with
@@ -3681,7 +3681,7 @@ measured — `12 failed | 5 passed` against a dead broker — not argued: resear
 -    await slow.close();
 -  });
 -
--  it("does NOT free a slot another connection now holds (FR-010 (3.22))", async () => {
+-  it("does NOT free a slot another connection now holds (FR-010)", async () => {
 -    // ARM 6, and the reason the release is conditional. Under a plain `DEL` this
 -    // would delete the new owner's key and hand out a place that is in use — the
 -    // same ownership hole `IFEQ` closed on the renewal, on the path that fix
@@ -3705,7 +3705,7 @@ measured — `12 failed | 5 passed` against a dead broker — not argued: resear
    it("does not throw for a slot the connection never held", async () => {
      // ARM 7, AND THE TITLE SAYS ONLY WHAT THE ASSERTION PROVES. It used to read
 @@ -248,31 +66,15 @@ describe("the slot registry", () => {
-     // 3.20's rule: a claim about an observable difference needs falsifying before
+     // The membership-revocation chapter's rule: a claim about an observable difference needs falsifying before
      // the test is written.
      await expect(
 -      registry.release(ENV, user, randomUUID(), 3),
@@ -3713,7 +3713,7 @@ measured — `12 failed | 5 passed` against a dead broker — not argued: resear
      ).resolves.toBeUndefined();
    });
  
--  it("releases every slot this instance holds (FR-011a (3.22))", async () => {
+-  it("releases every slot this instance holds (FR-011a)", async () => {
 -    const held = [];
 -    for (let i = 0; i < 3; i += 1) {
 -      const id = randomUUID();
@@ -3780,7 +3780,7 @@ measured — `12 failed | 5 passed` against a dead broker — not argued: resear
 -    }
 -  });
 -
-   it("states the maximum in exactly one place (FR-002 (3.22))", async () => {
+   it("states the maximum in exactly one place (FR-002)", async () => {
      // The requirement is about DRIFT, not about the value. `policy.ts` derived
      // `connect: 3_000` from "ten thousand divided by five" and shipped a third
 ```
@@ -3799,7 +3799,7 @@ The twelve that arrived, unchanged in behaviour.
 +// `.test.ts` and runs in the lane chapter 2.1 built to need no containers; these twelve
 +// talk to a real Redis, so with the stack down they reported failures that were correct
 +// behaviour and made the lane's exit code answer "does this work HERE, today" instead of
-+// "does this work without infrastructure". `gaps.md` 3.23-9 carried that from the day it
++// "does this work without infrastructure". `gaps.md` the revisions chapter-9 carried that from the day it
 +// was found by accident.
 +//
 +// WHICH TWELVE WAS MEASURED. `RELAY_REDIS_URL=redis://127.0.0.1:6399 vitest run
@@ -3809,7 +3809,7 @@ The twelve that arrived, unchanged in behaviour.
 +// unchanged and is why they moved rather than being rewritten: the design rests on what
 +// `SET … NX` and `SET … IFEQ` do. **A stubbed client would pass with a non-atomic
 +// implementation, with an `XX` renewal that hijacks, and with a `DEL` release that frees
-+// another connection's place** — all three of which chapter 3.22's analysis found and
++// another connection's place** — all three of which the connection-cap chapter's analysis found and
 +// corrected, and it would also pass against a server with no `IFEQ` at all.
 +
 +describe("the slot registry, against a real broker", () => {
@@ -3842,7 +3842,7 @@ The twelve that arrived, unchanged in behaviour.
 +    expect(second).toEqual({ kind: "claimed", slot: 1, held: 1 });
 +  });
 +
-+  it("refuses when every slot is held, and says five (FR-001 (3.22))", async () => {
++  it("refuses when every slot is held, and says five (FR-001)", async () => {
 +    for (let i = 0; i < MAX_CONNECTIONS_PER_USER; i += 1) {
 +      expect((await registry.claim(ENV, user, randomUUID())).kind).toBe("claimed");
 +    }
@@ -3853,7 +3853,7 @@ The twelve that arrived, unchanged in behaviour.
 +    });
 +  });
 +
-+  it("counts each environment separately for one user identifier (FR-012 (3.22))", async () => {
++  it("counts each environment separately for one user identifier (FR-012)", async () => {
 +    const other = `env-${randomUUID()}`;
 +    for (let i = 0; i < MAX_CONNECTIONS_PER_USER; i += 1) {
 +      await registry.claim(ENV, user, randomUUID());
@@ -3863,7 +3863,7 @@ The twelve that arrived, unchanged in behaviour.
 +
 +  // ---- ARM 3 and ARM 9: the renewal, and the re-claim --------------------
 +
-+  it("renews a slot it still holds (FR-008 (3.22))", async () => {
++  it("renews a slot it still holds (FR-008)", async () => {
 +    const id = randomUUID();
 +    const claimed = await registry.claim(ENV, user, id);
 +    if (claimed.kind !== "claimed") throw new Error("expected a slot");
@@ -3872,7 +3872,7 @@ The twelve that arrived, unchanged in behaviour.
 +    });
 +  });
 +
-+  it("re-claims when its slot is GONE and nothing else took it (FR-011b (3.22))", async () => {
++  it("re-claims when its slot is GONE and nothing else took it (FR-011b)", async () => {
 +    // ARM 3 then ARM 9. A short-lived registry so the bound elapses inside a test
 +    // rather than in a minute: the boundMs option exists for exactly this, the way
 +    // `membership.ts`'s reread interval does — sixty seconds does not fit in a
@@ -3895,7 +3895,7 @@ The twelve that arrived, unchanged in behaviour.
 +
 +  // ---- ARM 4 and ARM 10: the hijack, and the cap genuinely full ----------
 +
-+  it("refuses to renew a slot ANOTHER connection now holds (FR-011 (3.22))", async () => {
++  it("refuses to renew a slot ANOTHER connection now holds (FR-011)", async () => {
 +    // ARM 4, and the one test in the chapter that catches `IFEQ` being replaced by
 +    // `XX`. `XX` tests existence and not ownership — measured on 8.10.0,
 +    // `SET k B XX` against a key holding `A` returns OK — so under `XX` this
@@ -3921,7 +3921,7 @@ The twelve that arrived, unchanged in behaviour.
 +
 +  // ---- ARM 6, ARM 7 and ARM 8: the release ------------------------------
 +
-+  it("frees a slot it holds, and the slot is reusable at once (FR-010 (3.22))", async () => {
++  it("frees a slot it holds, and the slot is reusable at once (FR-010)", async () => {
 +    const id = randomUUID();
 +    const claimed = await registry.claim(ENV, user, id);
 +    if (claimed.kind !== "claimed") throw new Error("expected a slot");
@@ -3949,7 +3949,7 @@ The twelve that arrived, unchanged in behaviour.
 +    expect(again.slot, "a released slot cost more than one place").toBeLessThanOrEqual(1);
 +  });
 +
-+  it("claims a slot whose tombstone has NOT expired (FR-010 (3.22))", async () => {
++  it("claims a slot whose tombstone has NOT expired (FR-010)", async () => {
 +    // A HALF-SECOND TOMBSTONE, so the window is a window rather than a coin flip.
 +    // With the shipped one-millisecond value this test would pass against the
 +    // broken walk about half the time, which is how the defect survived: two of six
@@ -3971,7 +3971,7 @@ The twelve that arrived, unchanged in behaviour.
 +    await slow.close();
 +  });
 +
-+  it("accepts a claim immediately after releaseAll frees all five (FR-011a (3.22))", async () => {
++  it("accepts a claim immediately after releaseAll frees all five (FR-011a)", async () => {
 +    // THE CASE THAT WAS ACTUALLY BROKEN, and it is a deploy. One slot tombstoned is
 +    // one slot skipped; five tombstoned is a walk that finds nothing free and
 +    // reports `full` — so a client reconnecting to the new instance is refused with
@@ -3998,7 +3998,7 @@ The twelve that arrived, unchanged in behaviour.
 +    await slow.close();
 +  });
 +
-+  it("does NOT free a slot another connection now holds (FR-010 (3.22))", async () => {
++  it("does NOT free a slot another connection now holds (FR-010)", async () => {
 +    // ARM 6, and the reason the release is conditional. Under a plain `DEL` this
 +    // would delete the new owner's key and hand out a place that is in use — the
 +    // same ownership hole `IFEQ` closed on the renewal, on the path that fix
@@ -4019,7 +4019,7 @@ The twelve that arrived, unchanged in behaviour.
 +    await brief.close();
 +  });
 +
-+  it("releases every slot this instance holds (FR-011a (3.22))", async () => {
++  it("releases every slot this instance holds (FR-011a)", async () => {
 +    const held = [];
 +    for (let i = 0; i < 3; i += 1) {
 +      const id = randomUUID();
@@ -4263,7 +4263,7 @@ than unlikely, so the counter goes with the band.
 +      PORT: "0",
        // Neither relay: this suite asserts on rows and on frames, and a
        // background loop draining the tables another file is asserting on turns
-       // two unrelated suites into a race (chapters 3.3 and 3.8).
+       // two unrelated suites into a race (the outbox chapter and the rate-limit chapter).
 @@ -106,6 +151,7 @@ async function startApi(): Promise<{ url: string; stop: () => void }> {
      },
      stdio: ["ignore", "pipe", "pipe"],
@@ -4412,7 +4412,7 @@ address, because the assertion is that the retry schedule survived in the DATABA
 -      PORT: String(port),
 +      PORT: pinned,
        RELAY_INTERNAL_CREDENTIAL: credential,
-       // Chapter 3.3's finding 4, for the third time: this suite drives the relay
+       // The outbox chapter's finding 4, for the third time: this suite drives the relay
        // explicitly, so a background copy draining the same table would race it.
 @@ -371,11 +414,11 @@ describe("the dispatcher", () => {
      // bite is a back-to-back run whose previous child still holds the port, and
@@ -4607,7 +4607,7 @@ must differ. A number cannot drag a floor along with it.**
 + * NOT IN `attachments.ts`, whose six exports are all about attachments. A message-text
 + * bound on that shelf is the drift this constant exists to remove.
 + *
-+ * A CONSTANT IS SAFE TO SHARE WHERE A SCHEMA WAS NOT. Chapter 3.24 found
++ * A CONSTANT IS SAFE TO SHARE WHERE A SCHEMA WAS NOT. The attachments chapter found
 + * `editMessageBodySchema.text` defined as `sendMessageBodySchema.shape.text`, so relaxing
 + * the send's `.min(1)` silently relaxed the edit's — and an edit has no attachments to
 + * justify empty text. The maximum is common to all four sites; the FLOOR is what must
@@ -4678,7 +4678,7 @@ shares only the maximum.
 @@ -15,7 +16,7 @@ export const sendMessageBodySchema = z
       * refinement below rather than disappearing. An attachments-only message is a
       * photograph with no caption, and it stores `text = ""` rather than a null so
-      * chapter 3.23's tombstone predicate — `text === null` — is untouched. */
+      * The revisions chapter's tombstone predicate — `text === null` — is untouched. */
 -    text: z.string().max(8000),
 +    text: z.string().max(MESSAGE_TEXT_MAX),
      metadata: z.record(z.string(), z.unknown()).optional(),
@@ -4686,7 +4686,7 @@ shares only the maximum.
      // time (FR-SDK-06), optional because server-originated messages may not
 @@ -53,10 +54,18 @@ export type SendMessageBody = z.infer<typeof sendMessageBodySchema>;
  
- /** The edit body (chapter 3.23, FR-001).
+ /** The edit body (FR-001).
   *
 - * THE SAME BOUNDS AS THE SEND BODY'S `text`, and the same reason: FR-MSG-01 fixes them
 - * for a message and an edited message is still a message. Written as a reference to that
@@ -4697,12 +4697,12 @@ shares only the maximum.
 + * edited message is still a message, so both import `MESSAGE_TEXT_MAX` and neither
 + * spells it.
 + *
-+ * THE FLOORS DIVERGED IN CHAPTER 3.24 AND MUST STAY DIVERGED. This paragraph used to say
++ * THE FLOORS DIVERGED IN THE ATTACHMENTS CHAPTER AND MUST STAY DIVERGED. This paragraph used to say
 + * the field was "written as a reference to that shape" — it was
 + * `sendMessageBodySchema.shape.text` — and that is what broke: FR-019 removed the send's
 + * `.min(1)` so an attachments-only message could carry empty text, and the edit's floor
 + * went with it silently, because the types are identical either way. An edit has no
-+ * attachments field to justify empty text. 3.24 separated them into two literals; this
++ * attachments field to justify empty text. The attachments chapter separated them into two literals; this
 + * feature shares the number they agree on and leaves the rule they do not.
   *
   * ONE FIELD, AND THE ABSENCES ARE DECISIONS:
@@ -4714,7 +4714,7 @@ shares only the maximum.
 -  text: z.string().min(1).max(8000),
 +  /** THE MAXIMUM IS SHARED; THE FLOOR IS NOT, AND THAT IS THE WHOLE POINT (FR-008).
 +   *
-+   * Chapter 3.24 found this field defined as `sendMessageBodySchema.shape.text`, so
++   * The attachments chapter found this field defined as `sendMessageBodySchema.shape.text`, so
 +   * relaxing the send's `.min(1)` for attachments-only messages silently relaxed the
 +   * edit's too — and an edit has no attachments field to restore its floor. The compiler
 +   * could not see it: the types are identical either way.
@@ -4750,7 +4750,7 @@ anything durable cannot impose a rule its writer did not have.
  // garbage is worse than no schema — it certifies garbage.
  
  const message = {
-@@ -277,6 +283,53 @@ describe("the frame union's membership (chapter 3.21)", () => {
+@@ -277,6 +283,53 @@ describe("the frame union's membership", () => {
      );
      expect(
        parseFrame({ type: "typing.send", payload: { channel: "c1" } }).success,
@@ -4786,7 +4786,7 @@ anything durable cannot impose a rule its writer did not have.
 +
 +  it("does NOT bound the outbound message, and that is deliberate", () => {
 +    // `messageSchema` is what the server EMITS, read off rows the platform already
-+    // stored. Chapter 3.24's `outboxEventSchema` defect is the argument: a reader of
++    // stored. The attachments chapter's `outboxEventSchema` defect is the argument: a reader of
 +    // anything durable cannot impose a rule its writer did not have. Every stored row
 +    // came through a bounded door, so the bound buys nothing here and would turn a
 +    // hypothetical long row into an undeliverable one.
@@ -4840,7 +4840,7 @@ accepting different things for the same column.
 + * store a scheme the customer's own client executes when it renders the avatar — an
 + * `<img src>` or an `<a href>` built from a value we accepted.
 + *
-+ * `attachments.ts` already said this in chapter 3.24 — *"A URL validator that accepts
++ * `attachments.ts` already said this in the attachments chapter — *"A URL validator that accepts
 + * `javascript:alert(1)` is not a scheme rule"* — and the avatar field, which is older,
 + * never got the same treatment. One schema fragment, consumed twice below, because
 + * `upsertUserEntrySchema`'s own comment already promises the two routes "cannot drift
@@ -4872,7 +4872,7 @@ accepting different things for the same column.
 -  avatar_url: z.string().url().max(2048).nullable().optional(),
 +  avatar_url: avatarUrl.nullable().optional(),
    metadata: userMetadataSchema.optional(),
-   /** A bot's description, editable here (chapter 3.17, FR-004).
+   /** A bot's description, editable here (FR-004).
     *
 @@ -89,7 +126,7 @@ export const upsertUserEntrySchema = z
    .strictObject({
@@ -4881,7 +4881,7 @@ accepting different things for the same column.
 -    avatar_url: z.string().url().max(2048).nullable().optional(),
 +    avatar_url: avatarUrl.nullable().optional(),
      metadata: userMetadataSchema.optional(),
-     /** What kind of thing this user is (chapter 3.17, FR-USR-07).
+     /** What kind of thing this user is (FR-USR-07).
       *
 ```
 
@@ -4984,7 +4984,7 @@ the message text, both of which were right the whole time while the body said
 +   * understood them perfectly and declined.
 +   *
 +   * SIX CODES, NOT FIVE. The plan said one per bare throw; validating the event-type set
-+   * (FR-016) adds a refusal that did not exist to be counted. Chapter 3.24's plan
++   * (FR-016) adds a refusal that did not exist to be counted. The attachments chapter's plan
 +   * expected one new code and shipped two, and `codes.test.ts`'s exact-count assertion is
 +   * what caught it — so the count moves deliberately here rather than being discovered
 +   * there.
@@ -5019,7 +5019,7 @@ And the count that makes the sixth a decision.
 
 ```diff title="packages/protocol/src/codes.test.ts"
 @@ -77,7 +77,12 @@ describe("the registry is the whole vocabulary (FR-024)", () => {
-     // its plan did not expect. **One pinned place, not the four chapter 3.22's close code
+     // its plan did not expect. **One pinned place, not the four the connection-cap chapter's close code
      // moved** — that chapter's task predicted two and found four, so this one counted
      // before editing: this assertion is the only place in the file that names a total.
 -    expect(Object.keys(ERROR_CODES)).toHaveLength(21);
@@ -5031,7 +5031,7 @@ And the count that makes the sixth a decision.
 +    expect(Object.keys(ERROR_CODES)).toHaveLength(27);
    });
  
-   it("names the non-author refusal separately from the generic 403 (chapter 3.23)", () => {
+   it("names the non-author refusal separately from the generic 403", () => {
 ```
 
 The five throws, and the event-type check beside them.
@@ -5098,7 +5098,7 @@ The five throws, and the event-type check beside them.
  
 +  /** FR-016. Validate against the DECLARED eight, not the emitted five.
 +   *
-+   * THE REVIEW AND `gaps.md` 3.23-1 BOTH RECOMMEND `OUTBOX_EVENT_TYPES`, AND BOTH ARE
++   * THE REVIEW AND `gaps.md` the revisions chapter-1 BOTH RECOMMEND `OUTBOX_EVENT_TYPES`, AND BOTH ARE
 +   * WRONG. That array holds the five types the platform emits; FR-WHK-02 declares eight.
 +   * Measured before this was written: **741 stored subscriptions name
 +   * `channel.created`**, which is declared and not yet built. Comparing against the
@@ -5167,7 +5167,7 @@ declared, published, unbuilt. Comparing against the emitted set would refuse all
   * which is what a typecheck catches and an integration lane does not. */
 -/** THE ARRAY IS THE SOURCE AND THE TYPE IS DERIVED, so the set has a size a test can
 - * read. A bare union has no runtime form: "the union has exactly three members" is
-- * unassertable, and chapter 3.19's `codes.test.ts` earned its keep precisely by
+- * unassertable, and the presence chapter's `codes.test.ts` earned its keep precisely by
 - * asserting an exact set and an exact count — which is what makes a new member a
 - * decision rather than an accident. `as const` plus `(typeof …)[number]` costs one
 - * line and buys that. */
@@ -5177,7 +5177,7 @@ declared, published, unbuilt. Comparing against the emitted set would refuse all
 + * FR-016).
 + *
 + * TWO LISTS THAT MUST AGREE AND ARE MAINTAINED SEPARATELY IS THE DEFECT. `gaps.md`
-+ * 3.23-4 records it about `targets.ts`, and `eslint.config.mjs`'s own comment says *MUST
++ * The revisions chapter-4 records it about `targets.ts`, and `eslint.config.mjs`'s own comment says *MUST
 + * AGREE* with nothing comparing them. The declared eight and the emitted five were
 + * exactly that pair: FR-WHK-02 names eight, this array named five, and the only thing
 + * connecting them was somebody remembering.
@@ -5189,12 +5189,12 @@ declared, published, unbuilt. Comparing against the emitted set would refuse all
 + *
 + * THE THREE FALSE ONES ARE NOT OVERSIGHTS. `channel.created`, `user.connected` and
 + * `user.disconnected` are declared by FR-WHK-02 and unbuilt, and **741 stored
-+ * subscriptions name `channel.created`**. The review and `gaps.md` 3.23-1 both recommend
++ * subscriptions name `channel.created`**. The review and `gaps.md` the revisions chapter-1 both recommend
 + * validating subscriptions against the EMITTED set; doing that would refuse those rows,
 + * and those customers made no mistake. */
 +export const WEBHOOK_EVENT_TYPES = {
 +  "message.created": { emitted: true },
-   // CHAPTER 3.23's TWO, spelled as FR-WHK-02 spells them because a customer's
+   // The revisions chapter's TWO, spelled as FR-WHK-02 spells them because a customer's
    // subscription filters on these exact strings.
 -  //
 -  // BROUGHT FORWARD FROM PHASE 9, and the reason is ADR-06 rather than convenience.
@@ -5242,7 +5242,7 @@ declared, published, unbuilt. Comparing against the emitted set would refuse all
 +
 +/** THE ARRAY IS STILL THE RUNTIME FORM, so the set has a size a test can read. A bare
 + * union has no runtime form: "the union has exactly five members" is unassertable, and
-+ * chapter 3.19's `codes.test.ts` earned its keep by asserting an exact set and an exact
++ * The presence chapter's `codes.test.ts` earned its keep by asserting an exact set and an exact
 + * count — which is what makes a new member a decision rather than an accident. */
 +export const OUTBOX_EVENT_TYPES = (
 +  Object.keys(WEBHOOK_EVENT_TYPES) as WebhookEventType[]
@@ -5450,7 +5450,7 @@ after shipping and tell every client to repair every channel once.
 +      .notNull()
 +      .default(0),
      archivedAt: timestamp("archived_at", { withTimezone: true }),
-     // WHEN THIS CHANNEL LAST TOOK A MESSAGE (chapter 3.15, FR-014).
+     // WHEN THIS CHANNEL LAST TOOK A MESSAGE (FR-014).
      //
 ```
 
@@ -5476,7 +5476,7 @@ passes with that defect in place.
 +  /** The channels a user belongs to, each with its revision count (feature 044, FR-014).
 +   *
 +   * ONE QUERY, NOT TWO. The count could have come from a second call, and giving each
-+   * caller its own is the two-lists-that-must-agree defect `gaps.md` 3.23-4 records about
++   * caller its own is the two-lists-that-must-agree defect `gaps.md` the revisions chapter-4 records about
 +   * `targets.ts` — two things that must match, maintained separately, with nothing
 +   * comparing them. The join costs nothing: `members` is already reached and `channels` is
 +   * one hop from it on a primary key.
@@ -5509,7 +5509,7 @@ passes with that defect in place.
 -    return rows.map((r) => r.channel_id);
    }
  
-   /** Upsert a user by external id, updating the profile fields present (chapter 3.15,
+   /** Upsert a user by external id, updating the profile fields present (
 @@ -4565,6 +4586,25 @@ export class Repository {
        if (!updated) throw new MessageDeletedError(messageId);
        const editedAt = updated.editedAt!;
@@ -5597,7 +5597,7 @@ And the caller that wants ids alone maps them off, so one query stands behind bo
 The tests, including the one that asserts a send moves nothing.
 
 ```diff title="services/api/src/db/repository.itest.ts"
-@@ -1437,6 +1437,106 @@ describe("the read shapes that do NOT carry attachments (FR-009 (3.24))", () =>
+@@ -1437,6 +1437,106 @@ describe("the read shapes that do NOT carry attachments (FR-009)", () =>
  // that two operations issued on one connection serialise at the socket, so a test built
  // that way proves the code cannot race by never letting it. The third case below uses
  // TWO POOLS, which is what that chapter found it needed.
@@ -5838,14 +5838,14 @@ built before this feature still satisfies it, and the gateway then reports every
 +   * The keys here are the ids above.
 +   *
 +   * `revisionCountSchema` IMPORTED, NOT RESPELLED. The same shape appears on the ack, and two
-+   * records that must agree and are maintained separately is the defect `gaps.md` 3.23-4
++   * records that must agree and are maintained separately is the defect `gaps.md` the revisions chapter-4
 +   * records about `targets.ts` — one file apart in this case.
 +   *
 +   * `.default({})` FOR THE DEPLOY WINDOW, following `banned` below: an api built before this
 +   * feature still satisfies the schema during a rolling deploy, and the gateway then reports
 +   * every channel at zero, which is today's behaviour. */
 +  channel_revisions: revisionCountSchema.default({}),
-   /** Chapter 3.15, FR-031. Whether this user is banned in this environment.
+   /** FR-031. Whether this user is banned in this environment.
     *
     * IT RIDES THIS RESPONSE FOR THE REASON THE LIMITS DO: the gateway has no database and
     * must not gain one, `banned_at` is a column in Postgres, and the api is the only
@@ -5886,7 +5886,7 @@ repaired rather than relaxed.
 -    payload: { user: "u1", cursor: { c1: 42 }, resume_ok: true, truncated: [] },
 +    // Feature 044: `revisions` is REQUIRED here, and this specimen went red the moment it
 +    // was added — which is the point. The ack is a frame the platform BUILDS, so required
-+    // is what makes every construction site name it. Chapter 3.24's inverse case is the
++    // is what makes every construction site name it. The attachments chapter's inverse case is the
 +    // one to keep straight: a reader of anything durable cannot require a field its writer
 +    // did not have, and `outboxEventSchema` learned that the expensive way.
 +    payload: {
@@ -6004,7 +6004,7 @@ measured at, that cost is the one this feature cannot pay.
      return {
        environment_id: principal.environmentId,
        user: principal.userExternalId,
-       // Chapter 3.15, FR-031. THE ROW IS ALREADY IN HAND — `getUserByExternalId` above
+       // FR-031. THE ROW IS ALREADY IN HAND — `getUserByExternalId` above
        // reads it for the channel list — so carrying the ban costs one field and no query.
        // The gateway refuses the socket; this route only reports the fact, because the
        // gateway has no database and the column is in Postgres.
@@ -6061,7 +6061,7 @@ resuming every client from a plausible wrong place.
 +       * connect. The gateway puts it on the ack and does nothing else with it — it never
 +       * learns what a client holds, so it cannot be wrong about it. */
 +      channelRevisions: Record<string, number>;
-       /** Chapter 3.8. The environment's two socket allowances, read from
+       /** The environment's two socket allowances, read from
         * Postgres by the api and carried on the same response — the gateway has
         * no database client and R12 spent its whole argument on keeping it that
         * way. */
@@ -6151,13 +6151,13 @@ it the counts anyway is what lets its NEXT reconnect compare.
 +    channelRevisions: Record<string, number>,
      url: string,
      sendLimit: number,
-     /** Chapter 3.22. The id the cap claimed a place with, so the connection and
+     /** The id the cap claimed a place with, so the connection and
       * its slot agree — FR-011's "exactly one place for its lifetime". Absent when
       * no `connections` module is wired, which is every fixture that does not opt
       * in and the reason the cap is not enforced there. */
 @@ -923,12 +934,13 @@ export function attachSessions({
        socket,
-       // Chapter 3.2: memberships arrived with the identity, from the session
+       // Memberships arrived with the identity, from the session
        // call at the door. There is no second lookup to fail here — the api is
        // still the only source of membership (ADR-05), it just answers both
        // questions at once, and a failure now closes the socket before it opens.
@@ -6243,7 +6243,7 @@ about it — the same argument chapter 3.15 made when `banned` was added to this
 @@ -51,12 +51,16 @@ function stubApi(overrides: Partial<ApiClient> = {}): ApiClient {
              environment_id: "env-1",
              user: "tuan",
-             // Chapter 3.15: the api now reports whether the user is banned, and a stub
+             // The api now reports whether the user is banned, and a stub
              // that does not say is a stub that has not thought about it.
              banned: false,
              channel_ids: [CHANNEL],
@@ -6251,16 +6251,16 @@ about it — the same argument chapter 3.15 made when `banned` was added to this
 +            // none, so every channel reports zero — the pre-feature behaviour, and what a
 +            // client that stores the counts will compare against next time.
 +            channel_revisions: {},
-             // Chapter 3.8. The limits ride the session response because the
+             // The limits ride the session response because the
              // gateway has no database to read them from — so the stub supplies
              // them, exactly as the api would. Generous by default: every test
              // above this line is about something else.
              limits: { connect: 3_000, send: 600 },
            }
-@@ -986,12 +990,16 @@ describe("the socket's limits (chapter 3.8)", () => {
+@@ -986,12 +990,16 @@ describe("the socket's limits", () => {
            environment_id: "env-1",
            user: "tuan",
-           // Chapter 3.15: the api now reports whether the user is banned, and a stub
+           // The api now reports whether the user is banned, and a stub
            // that does not say is a stub that has not thought about it.
            banned: false,
            channel_ids: [CHANNEL],
@@ -6274,10 +6274,10 @@ about it — the same argument chapter 3.15 made when `banned` was added to this
        undefined,
        undefined,
        undefined,
-@@ -1022,12 +1030,16 @@ describe("the socket's limits (chapter 3.8)", () => {
+@@ -1022,12 +1030,16 @@ describe("the socket's limits", () => {
            environment_id: "env-1",
            user: "tuan",
-           // Chapter 3.15: the api now reports whether the user is banned, and a stub
+           // The api now reports whether the user is banned, and a stub
            // that does not say is a stub that has not thought about it.
            banned: false,
            channel_ids: [CHANNEL],
@@ -6301,7 +6301,7 @@ about it — the same argument chapter 3.15 made when `banned` was added to this
        session: async () => ({
          environment_id: "env-1",
          user: "tuan",
-         // Chapter 3.15: the api now reports whether the user is banned, and a stub
+         // The api now reports whether the user is banned, and a stub
          // that does not say is a stub that has not thought about it.
          banned: false,
          channel_ids: [CHANNEL],
@@ -6309,7 +6309,7 @@ about it — the same argument chapter 3.15 made when `banned` was added to this
 +        // none, so every channel reports zero — the pre-feature behaviour, and what a
 +        // client that stores the counts will compare against next time.
 +        channel_revisions: {},
-         // Chapter 3.8: the limits ride the session response now. Generous, and
+         // The limits ride the session response now. Generous, and
          // beside the point of every test in this file.
          limits: { connect: 3_000, send: 600 },
        }),
@@ -6326,7 +6326,7 @@ about it — the same argument chapter 3.15 made when `banned` was added to this
        session: async () => ({
          environment_id: "env-1",
          user: "tuan",
-         // Chapter 3.15: the api now reports whether the user is banned, and a stub
+         // The api now reports whether the user is banned, and a stub
          // that does not say is a stub that has not thought about it.
          banned: false,
          channel_ids: [CHANNEL],
@@ -6334,7 +6334,7 @@ about it — the same argument chapter 3.15 made when `banned` was added to this
 +        // none, so every channel reports zero — the pre-feature behaviour, and what a
 +        // client that stores the counts will compare against next time.
 +        channel_revisions: {},
-         // Chapter 3.8: the limits ride the session response now. Generous, and
+         // The limits ride the session response now. Generous, and
          // beside the point of every test in this file.
          limits: { connect: 3_000, send: 600 },
        }),
@@ -6351,7 +6351,7 @@ about it — the same argument chapter 3.15 made when `banned` was added to this
        session: async () => ({
          environment_id: "env-1",
          user: "tuan",
-         // Chapter 3.15: the api now reports whether the user is banned, and a stub
+         // The api now reports whether the user is banned, and a stub
          // that does not say is a stub that has not thought about it.
          banned: false,
          channel_ids: [CHANNEL],
@@ -6359,7 +6359,7 @@ about it — the same argument chapter 3.15 made when `banned` was added to this
 +        // none, so every channel reports zero — the pre-feature behaviour, and what a
 +        // client that stores the counts will compare against next time.
 +        channel_revisions: {},
-         // Chapter 3.8: the limits ride the session response now. Generous, and
+         // The limits ride the session response now. Generous, and
          // beside the point of every test in this file.
          limits: { connect: 3_000, send: 600 },
        }),
@@ -6376,7 +6376,7 @@ about it — the same argument chapter 3.15 made when `banned` was added to this
        session: async () => ({
          environment_id: "env-1",
          user: "tuan",
-         // Chapter 3.15: the api now reports whether the user is banned, and a stub
+         // The api now reports whether the user is banned, and a stub
          // that does not say is a stub that has not thought about it.
          banned: false,
          channel_ids: [CHANNEL],
@@ -6384,7 +6384,7 @@ about it — the same argument chapter 3.15 made when `banned` was added to this
 +        // none, so every channel reports zero — the pre-feature behaviour, and what a
 +        // client that stores the counts will compare against next time.
 +        channel_revisions: {},
-         // Chapter 3.8: the limits ride the session response now. Generous, and
+         // The limits ride the session response now. Generous, and
          // beside the point of every test in this file.
          limits: { connect: 3_000, send: 600 },
        }),
@@ -6401,7 +6401,7 @@ about it — the same argument chapter 3.15 made when `banned` was added to this
        session: async () => ({
          environment_id: "env-1",
          user: "tuan",
-         // Chapter 3.15: the api now reports whether the user is banned, and a stub
+         // The api now reports whether the user is banned, and a stub
          // that does not say is a stub that has not thought about it.
          banned: false,
          channel_ids: [CHANNEL],
@@ -6409,7 +6409,7 @@ about it — the same argument chapter 3.15 made when `banned` was added to this
 +        // none, so every channel reports zero — the pre-feature behaviour, and what a
 +        // client that stores the counts will compare against next time.
 +        channel_revisions: {},
-         // Chapter 3.8: the limits ride the session response now. Generous, and
+         // The limits ride the session response now. Generous, and
          // beside the point of every test in this file.
          limits: { connect: 3_000, send: 600 },
        }),
@@ -6423,7 +6423,7 @@ about it — the same argument chapter 3.15 made when `banned` was added to this
     * **THE ABSENCE IS THE ASSERTION.** A resume that carried `message.updated` for a
     * message the client is receiving for the first time would be telling it that
     * something it has never seen has changed. */
-   it("chapter 3.23: replays an edited message as message.created with its current text, and no message.updated", async () => {
+   it("replays an edited message as message.created with its current text, and no message.updated", async () => {
      harness = await boot({
        session: async () => ({
          environment_id: "env-1",
@@ -6451,7 +6451,7 @@ about it — the same argument chapter 3.15 made when `banned` was added to this
        session: async () => ({
          environment_id: "env-1",
          user: "tuan",
-         // Chapter 3.15: the api now reports whether the user is banned, and a stub
+         // The api now reports whether the user is banned, and a stub
          // that does not say is a stub that has not thought about it.
          banned: false,
          channel_ids: [CHANNEL],
@@ -6459,7 +6459,7 @@ about it — the same argument chapter 3.15 made when `banned` was added to this
 +        // none, so every channel reports zero — the pre-feature behaviour, and what a
 +        // client that stores the counts will compare against next time.
 +        channel_revisions: {},
-         // Chapter 3.8: the limits ride the session response now. Generous, and
+         // The limits ride the session response now. Generous, and
          // beside the point of every test in this file.
          limits: { connect: 3_000, send: 600 },
        }),
@@ -6604,17 +6604,17 @@ about it — the same argument chapter 3.15 made when `banned` was added to this
 +  });
 +});
 +
- // ── chapter 3.18: two instances, one fabric (US2) ───────────────────────────
+ // ── two instances, one fabric (US2) ───────────────────────────
  //
  // `boot()` IS UNTOUCHED. It is called six times above and each call builds its
  // own `createFanout` and its own server, so two calls already give two gateway
  // instances sharing one Redis — which is precisely what SC-002 needs. Changing
  // the fixture to "support" that would have changed six passing tests to prove
- // nothing new (3.17's T040b, the fifth such incident in two features).
+ // nothing new (the sender chapter's T040b, the fifth such incident in two features).
  //
  // WHAT THIS PROVES AND WHAT IT DOES NOT. The api here is a stub, as everywhere
  // in this file: the gateway has no database (ADR-05) and these suites are about
-@@ -471,20 +623,24 @@ describe("two instances on one fabric (chapter 3.18)", () => {
+@@ -471,20 +623,24 @@ describe("two instances on one fabric", () => {
      sockets.push(socket);
      return record(socket);
    };
@@ -6635,7 +6635,7 @@ about it — the same argument chapter 3.15 made when `banned` was added to this
      sendMessage: async () => {
        throw new Error("not used");
      },
-     // Chapter 3.20. The same list `session` answers with, so the backstop confirms
+     // The same list `session` answers with, so the backstop confirms
      // what the connect already established and changes nothing.
      memberships: async () => channels,
    });
@@ -6698,7 +6698,7 @@ still green. Chapter 3.23 made the identical repair to this identical pair of bu
 -      return { type, payload: { user, cursor: {}, resume_ok: true, truncated: [] } };
 +      // Feature 044 added a required `revisions` to this payload, and a sample missing
 +      // it is refused for its SHAPE a phase before the direction check — see the
-+      // `message.deleted` note below, which is chapter 3.23 making the same repair.
++      // `message.deleted` note below, which is the revisions chapter making the same repair.
 +      return {
 +        type,
 +        payload: { user, cursor: {}, resume_ok: true, truncated: [], revisions: {} },
@@ -6708,7 +6708,7 @@ still green. Chapter 3.23 made the identical repair to this identical pair of bu
      case "message.created":
      case "message.updated":
        return { type, payload: message };
-     // CHAPTER 3.23 SPLIT THIS CASE OFF. `message.deleted` shared the `Message` above
+     // The revisions chapter SPLIT THIS CASE OFF. `message.deleted` shared the `Message` above
 ```
 
 ### The close-out pass, and the two tests it changed
@@ -6979,7 +6979,7 @@ mode this class of threshold has and the reason the probe is worth running every
 +          statements: 83,
 +        },
 +
-         // The dispatcher's two decision-bearing files (chapter 3.5). `expand.ts`
+         // The dispatcher's two decision-bearing files. `expand.ts`
          // decides whether a redelivered event produces a second set of webhooks
          // — constitution VI names idempotency explicitly — and `deliver.ts`
          // holds the post-then-report ordering that chooses a duplicate over a
