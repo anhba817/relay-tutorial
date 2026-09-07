@@ -1,0 +1,506 @@
+import { Why, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figWhatMaskedWhat } from "./figures";
+
+export const metadata = {
+  title: "Milestone: the isolation gauntlet — Building Relay",
+  description:
+    "Has it ever caught anything? The gauntlet gets a verdict, the instruments that had never produced output get tests of their own, and what the suite does not cover is written down rather than implied.",
+  alternates: {
+    canonical: "/part-3/chapter-25/milestone-the-isolation-gauntlet",
+    languages: {
+      en: "/part-3/chapter-25/milestone-the-isolation-gauntlet",
+      vi: "/vi/part-3/chapter-25/milestone-the-isolation-gauntlet",
+    },
+  },
+};
+
+<ChapterHeader id="3.25" />
+## Has it ever caught anything?
+
+A suite that has never failed is an untested test. Three deliberate
+reintroductions, and the first one is the reason this section is worth reading.
+
+**Reintroduction 1.** Drop `environment_id` from `listMessages`' scoping helper —
+a repository SELECT on the history read path. Run the gauntlet. **Twenty-one of
+twenty-one passed.**
+
+<Figure caption="The first reintroduction changed nothing observable. `channelExists` is scoped and runs first, so the unscoped query below it was never reached — the suite is sensitive to the outermost check on a path and blind to an inner one a live outer check masks." code={figWhatMaskedWhat} />
+
+That is not a defect in the reintroduction and it was not reshaped until it failed.
+It is a fact about the suite's range, and it went into the chapter rather than into
+a second attempt: `GET /v1/channels/:channelId/messages` calls `channelExists`
+first — chapter 2.8's fix for the two doors disagreeing — and that read is scoped.
+A foreign id is refused there and `listMessages` is never reached.
+
+With both checks dropped, two assertions fired:
+
+```
+× read: a foreign resource answers as an absent one > GET /v1/channels/:channelId/messages
+  "status 200 (foreign) vs 404 (absent)"
+  "body {"messages":[{"id":"0e6c372a-…","user":"v-nom4bg-user",
+   "text":"v-nom4bg says something"…}]} (foreign) vs
+   {"code":"not_found","message":"channel not found"…} (absent)"
+```
+
+**Reintroduction 2** is where the write shape earned its keep. Drop
+`environment_id` from one `UPDATE` — `setEndpointEnabled`'s — and leave every read
+scoped:
+
+```
+× write: a foreign identifier changes nothing > POST /v1/webhooks/:id/disable
+  expected true to be false        (verdict.stateChanged)
+```
+
+`differences` stayed **empty**. The endpoint answered 404 to both halves of the
+pair, because the read after the update is still scoped — so the response was
+indistinguishable and the write went through anyway. A suite comparing only
+responses passes this.
+
+**Reintroduction 3** taught the shape of the fault rather than confirming a guess.
+The task said "change one endpoint's 404 to a 403" — and doing that at the route
+level moves *both* halves of the pair to 403, which the oracle cannot see by
+construction. To make them differ, the code has to learn something the tenant scope
+hides:
+
+```ts
+// services/api/src/webhooks/webhooks.service.ts — DELIBERATELY UNTITLED.
+// The fence chain replays every titled fence onto the repository, and this code
+// was reverted the moment it was measured. A title here would put a
+// reintroduction into the canonical tree, which is the one thing FR-015 forbids.
+if (!row) {
+  // T066's REINTRODUCTION — reverted immediately after measuring.
+  if (await this.repo.anyEndpointExists(id)) {
+    throw new ForbiddenException("that endpoint belongs to another environment");
+  }
+  throw new NotFoundException("no such webhook endpoint");
+}
+```
+
+```
+"status 403 (foreign) vs 404 (absent)"
+```
+
+Breaking indistinguishability requires an unscoped read. That is a more useful
+sentence than "the suite caught a 403", and it came out of the reintroduction going
+differently than planned.
+
+<Why title="What three reintroductions measure, and what they do not">
+
+Three faults chosen by the author of the suite that catches them measure
+sensitivity to three faults. They are not coverage of the class, and the first
+attempt is the proof: it was picked as an obvious leak and was not one, for a reason
+nobody had written down.
+
+What they do establish, precisely: a dropped scope on the outermost read of a path
+is caught by the pair; a dropped scope on a write is caught by the state comparison
+alone, with responses still identical; and a leak of existence is caught by the
+pair and requires an unscoped read to create.
+
+What stays unmeasured is in the suite's own header — timing, a leaked platform
+credential, the four dispatch routes' reach, message wisdom beyond equality, and
+anything not routed through the HTTP router.
+
+</Why>
+
+Every reintroduction was reverted with `git checkout` against a committed tree,
+which is the practice this project writes down and the reason the first one cost
+five minutes instead of an afternoon.
+
+## The instruments had never produced output
+
+Coverage put a number on something that reads as a paradox. Three of this
+chapter's new files sat well below the rest, and every uncovered arm was in code
+that only runs when the platform is broken.
+
+`attack.ts` measured 61% branches because **every assertion in the gauntlet asserts
+that `differences` is empty** — so the code that builds a difference string runs
+only when something has leaked. `targets.ts` measured 50% because a real Nest
+application has exactly one router shape, so the fallbacks for the others are
+unreachable there. `catalogue.ts` measured 87.5% because the arm that returns
+`null` — the unclassified table — cannot execute against a database that has no
+unclassified table, which is the state the check exists to keep.
+
+That is this chapter's own argument one layer down: an instrument that has never
+produced output has never had its output checked.
+
+```ts title="services/api/src/isolation/attack.test.ts"
+import { describe, expect, it } from "vitest";
+
+import { comparePair, rowsOf } from "./attack";
+
+// The oracle's REPORTING arm, which a passing gauntlet cannot reach.
+//
+// Every assertion in `gauntlet.itest.ts` asserts that `differences` is empty, so
+// the code that builds a difference string only ever runs when the platform is
+// broken. That is the same problem Phase 7's reintroductions solve for the suite
+// as a whole, one layer down: an instrument that has never produced output has
+// never had its output checked.
+
+const answer = (status: number, body: unknown) => ({ status, body });
+
+describe("comparing a foreign answer against an absent one", () => {
+  it("reports nothing when both agree", () => {
+    expect(comparePair(answer(404, { code: "not_found" }), answer(404, { code: "not_found" }))).toEqual(
+      [],
+    );
+  });
+
+  it("ignores request_id, which differs on every request by design", () => {
+    expect(
+      comparePair(
+        answer(404, { code: "not_found", request_id: "a" }),
+        answer(404, { code: "not_found", request_id: "b" }),
+      ),
+    ).toEqual([]);
+  });
+
+  it("names the statuses when they differ", () => {
+    const [first] = comparePair(answer(403, {}), answer(404, {}));
+    expect(first).toBe("status 403 (foreign) vs 404 (absent)");
+  });
+
+  it("names both bodies when they differ", () => {
+    const differences = comparePair(answer(404, { code: "forbidden" }), answer(404, { code: "not_found" }));
+    expect(differences).toHaveLength(1);
+    expect(differences[0]).toContain("forbidden");
+    expect(differences[0]).toContain("not_found");
+  });
+
+  it("reports both when both differ", () => {
+    expect(comparePair(answer(200, { messages: [1] }), answer(404, { code: "not_found" }))).toHaveLength(
+      2,
+    );
+  });
+
+  it("compares a non-object body without throwing", () => {
+    // `withoutRequestId` returns a non-object unchanged, and an html error page or
+    // an empty string is a real answer a misconfigured route can give.
+    expect(comparePair(answer(502, "bad gateway"), answer(404, ""))).toHaveLength(2);
+  });
+});
+
+describe("counting the rows in a list answer", () => {
+  it("reads a bare array", () => {
+    expect(rowsOf([1, 2, 3])).toEqual([1, 2, 3]);
+  });
+
+  it("reads a paginated envelope", () => {
+    expect(rowsOf({ data: [1, 2], next_cursor: "x" })).toEqual([1, 2]);
+  });
+
+  it("returns nothing for a shape it does not recognise", () => {
+    // The arm that matters. Zero rows from an unknown shape looks exactly like
+    // zero rows from a correctly-scoped list, and only one of those is a pass.
+    expect(rowsOf({ code: "not_found" })).toEqual([]);
+    expect(rowsOf(null)).toEqual([]);
+    expect(rowsOf("an html error page")).toEqual([]);
+    expect(rowsOf({ data: "not an array" })).toEqual([]);
+  });
+});
+```
+
+```ts title="services/api/src/isolation/targets.test.ts"
+import { describe, expect, it } from "vitest";
+
+import { deriveTargets } from "./targets";
+
+// THE DERIVATION'S SHAPE-HANDLING, driven with fakes.
+//
+// `targets.itest.ts` runs `deriveTargets` against a real Nest application, which
+// is the assertion that matters — and a real application has exactly one router
+// shape, so the fallbacks for the others are unreachable there. Express 4 exposed
+// `_router`, Express 5 exposes `router`, and a future adapter may expose neither;
+// the branch that reports `none` is the one a reader of a failure most needs to be
+// working, because it is what turns "no routes found" into "no router found".
+
+const route = (path: string, methods: Record<string, boolean>) => ({ route: { path, methods } });
+
+describe("deriving targets from whatever the adapter exposes", () => {
+  it("reads Express 5's `router`", () => {
+    const result = deriveTargets({
+      router: { stack: [route("/v1/x", { get: true })] },
+    });
+    expect(result.property).toBe("router");
+    expect(result.targets).toEqual([{ method: "GET", path: "/v1/x" }]);
+  });
+
+  it("falls back to Express 4's `_router`", () => {
+    const result = deriveTargets({
+      _router: { stack: [route("/v1/y", { post: true })] },
+    });
+    expect(result.property).toBe("_router");
+    expect(result.targets).toEqual([{ method: "POST", path: "/v1/y" }]);
+  });
+
+  it("says `none` rather than pretending the surface is empty", () => {
+    // The distinction the suite depends on: an empty target list from a found
+    // router is a clean surface, and an empty list from no router at all is a
+    // broken derivation. Only this field tells them apart.
+    const result = deriveTargets({});
+    expect(result.property).toBe("none");
+    expect(result.targets).toEqual([]);
+  });
+
+  it("counts middleware layers, which have no route", () => {
+    const result = deriveTargets({
+      router: { stack: [{}, {}, route("/v1/z", { delete: true })] },
+    });
+    expect(result.middlewareLayers).toBe(2);
+    expect(result.targets).toEqual([{ method: "DELETE", path: "/v1/z" }]);
+  });
+
+  it("takes only the verbs a layer actually answers", () => {
+    // Express marks every verb on the layer and flags the live ones. Treating the
+    // keys as the answer would invent a target per HTTP verb per route.
+    const result = deriveTargets({
+      router: { stack: [route("/v1/w", { get: true, post: false, put: false })] },
+    });
+    expect(result.targets).toEqual([{ method: "GET", path: "/v1/w" }]);
+  });
+
+  it("handles a layer with a route but no methods, and one with no path", () => {
+    const result = deriveTargets({
+      router: { stack: [{ route: { path: "/v1/none" } }, { route: { methods: { get: true } } }] },
+    });
+    expect(result.targets).toEqual([{ method: "GET", path: "" }]);
+  });
+});
+```
+
+```ts title="services/api/src/db/catalogue.test.ts"
+import { describe, expect, it } from "vitest";
+
+import { classifyRow, SPINE_TABLES } from "./catalogue";
+
+// The classification's four arms, driven with rows made up here rather than with
+// rows a database happens to hold (FR-040).
+//
+// The one that matters is `null`. It executes only when somebody adds a table with
+// no tenant path — which is the state `tenant-scope.itest.ts` exists to prevent —
+// so against a healthy database it is the one arm nothing can reach. T042 proved it
+// fires by creating a scratch table by hand; this proves it without a database and
+// without a hand.
+
+const row = (over: Partial<Parameters<typeof classifyRow>[0]>) => ({
+  table_name: "made_up",
+  has_environment_id: false,
+  fk_targets: null,
+  ...over,
+});
+
+describe("a table's tenant path", () => {
+  it("is direct when it carries environment_id", () => {
+    expect(classifyRow(row({ has_environment_id: true }))).toEqual({
+      table: "made_up",
+      path: "direct",
+      via: [],
+    });
+  });
+
+  it("is a hop when a foreign key reaches a direct table", () => {
+    expect(classifyRow(row({ fk_targets: ["channels", "users"] }))).toEqual({
+      table: "made_up",
+      path: "hop",
+      via: ["channels", "users"],
+    });
+  });
+
+  it("prefers direct over hop when a table has both", () => {
+    // The ordering the function's own comment argues for: a spine table that
+    // gains `environment_id` should report `direct` so its SPINE entry becomes
+    // visibly wrong rather than quietly ignored.
+    const both = classifyRow(row({ has_environment_id: true, fk_targets: ["channels"] }));
+    expect(both.path).toBe("direct");
+  });
+
+  it("is spine for a listed table, and carries its reason", () => {
+    const result = classifyRow(row({ table_name: "organisations" }));
+    expect(result.path).toBe("spine");
+    expect(result.reason).toBeTruthy();
+  });
+
+  it("IS NULL for a table with no path at all", () => {
+    expect(classifyRow(row({ table_name: "t042_scratch" }))).toEqual({
+      table: "t042_scratch",
+      path: null,
+      via: [],
+    });
+  });
+
+  it("gives every spine table a reason", () => {
+    for (const name of SPINE_TABLES) {
+      expect(classifyRow(row({ table_name: name })).reason, name).toBeTruthy();
+    }
+  });
+});
+```
+
+```ts title="services/api/src/isolation/compare.test.ts"
+import { describe, expect, it } from "vitest";
+
+import { withoutRequestId } from "./compare";
+
+// The oracle's own tests. Pure — no database, no HTTP — because the thing being
+// checked is one comparison rule, and a rule that needs a stack to test is a rule
+// nobody re-reads.
+
+describe("withoutRequestId", () => {
+  it("makes two bodies differing only in request_id equal", () => {
+    const foreign = {
+      code: "not_found",
+      message: "channel not found",
+      docs_url: "https://relay.example/docs/errors/not_found",
+      request_id: "req_aaa",
+    };
+    const absent = { ...foreign, request_id: "req_bbb" };
+    expect(withoutRequestId(foreign)).toEqual(withoutRequestId(absent));
+  });
+
+  it("leaves two bodies differing in message unequal", () => {
+    // The case that matters: `messages.service.ts` keeps a CONSTANT message for
+    // exactly this reason — echoing the id back would make the foreign answer
+    // differ from the absent one, and "different" is itself a disclosure.
+    const foreign = { code: "not_found", message: "channel abc not found", request_id: "req_a" };
+    const absent = { code: "not_found", message: "channel not found", request_id: "req_b" };
+    expect(withoutRequestId(foreign)).not.toEqual(withoutRequestId(absent));
+  });
+
+  it("leaves two bodies differing in code unequal", () => {
+    const forbidden = { code: "forbidden", message: "no", request_id: "req_a" };
+    const missing = { code: "not_found", message: "no", request_id: "req_b" };
+    expect(withoutRequestId(forbidden)).not.toEqual(withoutRequestId(missing));
+  });
+
+  it("passes a non-object body through untouched", () => {
+    // A 204 has no body and a proxy may hand back a string. Neither is an error
+    // envelope, and neither should throw on the way to a comparison.
+    expect(withoutRequestId(null)).toBeNull();
+    expect(withoutRequestId("gateway timeout")).toBe("gateway timeout");
+    expect(withoutRequestId(undefined)).toBeUndefined();
+  });
+
+  it("does not mutate its argument", () => {
+    const body = { code: "not_found", request_id: "req_a" };
+    withoutRequestId(body);
+    expect(body.request_id).toBe("req_a");
+  });
+});
+```
+
+Closing them meant separating the decision from the transport in three places —
+`classifyRow` from the catalogue query, `comparePair` and `rowsOf` from the HTTP
+call. All three reached 100% branches afterwards, and the separation is the finding
+rather than the number.
+
+Two arms stay uncovered and are named rather than chased: `send`'s empty-body arm
+and `credentialAttack`'s mint-failure arm, both of which need an HTTP fake in a
+file whose subject is real HTTP.
+
+## What the suite does not cover
+
+The suite says so itself, at the top of the file a reader meets first:
+
+```ts title="services/api/src/isolation/gauntlet.itest.ts (excerpt)"
+// TIMING. A foreign id answering in 3 ms and an absent id in 30 ms is a disclosure
+// this suite cannot see. Measuring that stably in CI is a different discipline and
+// is not attempted here; the chapter names it as unaddressed rather than implying
+// it is covered.
+//
+// A LEAKED PLATFORM CREDENTIAL. FR-044 narrowed which routes each internal service
+// may call, and that is all it did. There is no rotation, and `service` is
+// self-reported by which variable matched — so the change shrinks the blast radius
+// of a leak and does not make one survivable.
+//
+// MESSAGE CONTENT BEYOND EQUALITY. The pair proves the two answers match. It does
+// not prove that what they say is wise: a constant message leaking a schema detail
+// would pass every assertion below.
+```
+
+The eleven are still there, and one of them got sharper rather than being left
+alone. `repository.itest.ts`'s membership assertion read `false` for three
+different refusals — the channel is not yours, the user is not yours, and you asked
+twice. Conflating the first two is the property; conflating the third with them is
+a bug waiting for an endpoint:
+
+```diff title="services/api/src/db/repository.itest.ts"
+@@ -60,19 +60,38 @@ describe("tenant isolation is structural (FR-TEN-05)", () => {
+   it("membership writes with foreign ids affect zero rows", async () => {
+     const user = await repoA.getUserByExternalId("tuan");
+     const channel = await repoA.getChannelByExternalId("support");
+-    expect(await repoA.addMember(channel!.id, user!.id)).toBe(true);
+-    // B holds A's REAL ids — and still cannot write or read through them.
+-    expect(await repoB.addMember(channel!.id, user!.id)).toBe(false);
++    expect(await repoA.addMember(channel!.id, user!.id)).toBe("added");
++    // Asked twice is a SUCCESS and not a failure, and telling those apart is
++    // what the isolation gauntlet changed here: the endpoint over this call has to be
++    // idempotent, and a unique violation reached the wire as `internal_error`.
++    expect(await repoA.addMember(channel!.id, user!.id)).toBe("already_a_member");
++    // B holds A's REAL ids — and still cannot write or read through them. The
++    // answer is `not_found`, which is also what B gets for ids that exist
++    // nowhere: three refusals, one word, on purpose.
++    expect(await repoB.addMember(channel!.id, user!.id)).toBe("not_found");
+     expect(await repoB.listMembers(channel!.id)).toEqual([]);
+     expect(await repoB.channelsForUser(user!.id)).toEqual([]);
+     expect(await repoA.listMembers(channel!.id)).toEqual([user!.id]);
+   });
+ 
+   it("uniqueness is per-tenant (DR-02): both tenants may own the same external_id", async () => {
+-    await expect(
+-      repoB.createUser("tuan", "A different Tuan"),
+-    ).resolves.toBeTruthy();
+-    await expect(repoA.createUser("tuan", "Duplicate in A")).rejects.toThrow();
++    // B's own Tuan is a DIFFERENT row. That is the per-tenant half.
++    const inB = await repoB.createUser("tuan", "A different Tuan");
++    const inA = await repoA.getUserByExternalId("tuan");
++    expect(inB.id).not.toBe(inA!.id);
++
++    // THE OBSERVATION CHANGED IN THE ISOLATION GAUNTLET AND THE PROPERTY DID NOT. This
++    // used to assert that a repeat within one tenant REJECTS, which observed the
++    // unique index by watching it raise. `createUser` is now idempotent — the
++    // members endpoint creates a user on first membership, so a repeated request
++    // would otherwise have answered `internal_error` — and the index is what
++    // makes that work rather than something that got removed. So the assertion
++    // is now that a repeat returns THE SAME ROW: still one user per tenant per
++    // external id, observed through the outcome instead of through an exception.
++    const again = await repoA.createUser("tuan", "Duplicate in A");
++    expect(again.id).toBe(inA!.id);
++    // And the existing display name wins: a second call is not an update.
++    expect(again.display_name).toBe(inA!.display_name);
+   });
+ });
+ 
+```
+
+The endpoint that needed the distinction is chapter 3.13's. The isolation half of
+it belongs here, because `not_found` covering both foreign cases is the property
+FR-TEN-05 asks for and it is now written down as a word rather than as a boolean
+somebody has to interpret.
+
+A defence trusted past its range is worse than none, and this is the difference
+between this suite and the eleven assertions it joins. The eleven are still there,
+still passing, counted before and after — the gauntlet adds to the isolation
+surface rather than relocating it off the code the coverage run measures.
+
+<Checkpoint>
+
+- `pnpm test:integration` — 407 tests, ten tasks, green
+- `gauntlet targets: 24 derived, 21 attacked, 3 exempt`
+- `tenant paths: 22 base tables — 12 direct, 2 hop, 8 spine`
+- the gauntlet: 21 tests, including three that prove the attacker works
+- the socket gauntlet: 19 tests, four verbs and ten frames
+- three reintroductions, two red on the first attempt, all three reverted
+
+</Checkpoint>
+
+<ForwardRef part="chapters 3.13 and 3.14">
+
+The two endpoints this chapter's suite found — `POST /v1/channels` and
+`POST /v1/channels/:channelId/members` — and the instruments that verify the
+verifiers are chapter 3.13. The error vocabulary, the sealed outsider and the
+Phase 2 exit criterion's verdict are chapter 3.14.
+
+</ForwardRef>
+
+<ChapterFooter id="3.25" />

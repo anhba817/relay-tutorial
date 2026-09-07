@@ -343,7 +343,23 @@ export const series: Part[] = [
       },
       {
         id: "3.4",
-        path: "/part-3/chapter-04/the-outbox",
+        path: "/part-3/chapter-04/the-isolation-harness",
+        title: "The isolation harness",
+        status: "published",
+        // Divided out of the milestone because eight files it creates are edited by
+        // 25 later chapter-edits, and the reorder put every one of them before the
+        // file existed. The harness has to precede its editors; the verdict does not.
+        readerProduces:
+          "A cross-tenant suite whose target list derives itself from the running router, four attack shapes over 24 routes, a structural check that every table has a tenant path, and the socket surface attacked from the protocol's own frame union",
+        sourceDoc: "docs/04-srs.md, docs/05-sad.md",
+        readerMinutes: 67,
+        titleVi: "Cửa ải cô lập tenant",
+        readerProducesVi:
+          "Một bộ kiểm thử cross-tenant tự suy ra danh sách mục tiêu từ router đang chạy, bốn dạng tấn công trên 24 route, một kiểm tra cấu trúc rằng mọi bảng đều có đường về tenant, và tầng socket bị tấn công từ chính frame union của protocol",
+      },
+      {
+        id: "3.5",
+        path: "/part-3/chapter-05/the-outbox",
         title: "The outbox",
         status: "published",
         translatedIn: ["vi"],
@@ -356,8 +372,8 @@ export const series: Part[] = [
           "Transactional outbox + relay (ADR-06); crash-in-the-gap test",
       },
       {
-        id: "3.5",
-        path: "/part-3/chapter-05/jetstream-and-the-first-consumer",
+        id: "3.6",
+        path: "/part-3/chapter-06/jetstream-and-the-first-consumer",
         title: "JetStream and the first consumer",
         status: "published",
         translatedIn: ["vi"],
@@ -370,8 +386,8 @@ export const series: Part[] = [
           "Cấu hình stream; subject grammar dùng chung; durable pull consumer tự dedupe",
       },
       {
-        id: "3.6",
-        path: "/part-3/chapter-06/commit-and-publish-are-two-instants",
+        id: "3.7",
+        path: "/part-3/chapter-07/commit-and-publish-are-two-instants",
         title: "Commit and publish are two instants",
         status: "published",
         translatedIn: ["vi"],
@@ -390,8 +406,8 @@ export const series: Part[] = [
           "Khép lại lỗi trùng lặp khi resume: một high-water mark sống lâu hơn buffer",
       },
       {
-        id: "3.7",
-        path: "/part-3/chapter-07/the-endpoints-and-the-instruments",
+        id: "3.8",
+        path: "/part-3/chapter-08/the-endpoints-and-the-instruments",
         title: "The endpoints and the instruments",
         status: "published",
         // Split out of 3.12 on a measurement, not a feeling: the two chapters'
@@ -408,8 +424,8 @@ export const series: Part[] = [
           "Hai endpoint công khai mà Part 3 cần và chưa ai xây, tính đẳng xâm (idempotent) do unique index bảo đảm chứ không phải do bộ nhớ ứng dụng, mọi lỗi validation lần đầu tiên gọi tên field của nó, guard thao tác toàn cục canh chín bảng thay vì năm, và độ phủ nhánh của tầng repository được trả lời bằng một con số",
       },
       {
-        id: "3.8",
-        path: "/part-3/chapter-08/the-channel-a-customer-controls",
+        id: "3.9",
+        path: "/part-3/chapter-09/the-channel-a-customer-controls",
         title: "The channel a customer controls",
         status: "published",
         // Was going to be 3.13 until the split took that number, and the deferred
@@ -425,8 +441,8 @@ export const series: Part[] = [
           "Một loại kênh private thực sự quyết định điều gì đó ở cả bốn cửa vào, xoá thành viên và phân quyền, lưu trữ kênh để từ chối gửi tin mà không tiết lộ kênh có tồn tại, và một gauntlet tấn công chính tenant của bạn",
       },
       {
-        id: "3.9",
-        path: "/part-3/chapter-09/what-a-user-sees",
+        id: "3.10",
+        path: "/part-3/chapter-10/what-a-user-sees",
         title: "What a user sees",
         status: "published",
         // The other half of the deferred surface. Its centre is a measurement that
@@ -441,8 +457,8 @@ export const series: Part[] = [
           "Danh sách channel phân trang bằng cursor và xếp theo hoạt động, số tin chưa đọc suy ra từ chính sequence mà đường ghi vẫn duy trì, profile người dùng được tạo ngầm ở lần xác thực đầu tiên, một người dùng đã xoá mà tin nhắn vẫn còn, và một lệnh ban có hiệu lực cả ở cửa vào lẫn trên đường gửi",
       },
       {
-        id: "3.10",
-        path: "/part-3/chapter-10/the-sender-a-message-never-had",
+        id: "3.11",
+        path: "/part-3/chapter-11/the-sender-a-message-never-had",
         title: "The sender a message never had",
         status: "published",
         // The requirement was already in the SRS — FR-MSG-13, P2, since v1 — and
@@ -458,8 +474,8 @@ export const series: Part[] = [
           "Bot user mang theo một description mà cơ sở dữ liệu bắt buộc phải có, một người gửi bắt buộc trên mọi tin nhắn và được chính trình biên dịch bảo đảm thay vì một bài test, một application credential chỉ được nói với danh nghĩa phần mềm chứ không phải bất kỳ con người nào, những lời từ chối không hé ra ai đang tồn tại, và một bot vẫn được tính tiền như active user nhưng được miễn khỏi cái ngưỡng vốn từ chối tin gửi",
       },
       {
-        id: "3.11",
-        path: "/part-3/chapter-11/the-message-that-never-arrived",
+        id: "3.12",
+        path: "/part-3/chapter-12/the-message-that-never-arrived",
         title: "The message that never arrived",
         status: "published",
         // The architecture drew this edge before the api existed — `05-sad.md`'s
@@ -477,8 +493,8 @@ export const series: Part[] = [
           "Một tin nhắn gửi qua REST tới được socket đang mở, một thứ tự phải tách theo transport vì response của một request handler CHÍNH LÀ acknowledgement của nó, một publisher sống sót qua broker đã chết trong 2 ms ở nơi client của gateway treo vô hạn, và một điều khoản P1 được đo là chưa thoả mãn rồi ghi lại thay vì bị thu hẹp",
       },
       {
-        id: "3.12",
-        path: "/part-3/chapter-12/who-is-allowed-to-see-it",
+        id: "3.13",
+        path: "/part-3/chapter-13/who-is-allowed-to-see-it",
         title: "Presence, and who is allowed to see it",
         status: "published",
         // `sourceDoc` is the SAD rather than the SRS for chapter 3.18's reason: no
@@ -500,8 +516,8 @@ export const series: Part[] = [
         translatedIn: ["vi"],
       },
       {
-        id: "3.13",
-        path: "/part-3/chapter-13/the-membership-that-changed",
+        id: "3.14",
+        path: "/part-3/chapter-14/the-membership-that-changed",
         title: "The membership that changed under a live socket",
         status: "published",
         // `sourceDoc` is the SAD, and for a stronger reason than 3.18's and 3.19's:
@@ -519,8 +535,8 @@ export const series: Part[] = [
         translatedIn: ["vi"],
       },
       {
-        id: "3.14",
-        path: "/part-3/chapter-14/the-frame-nobody-may-send",
+        id: "3.15",
+        path: "/part-3/chapter-15/the-frame-nobody-may-send",
         title: "The frame nobody may send",
         status: "published",
         // `sourceDoc` is the SAD, and this chapter adds TWO records rather than
@@ -539,8 +555,8 @@ export const series: Part[] = [
         translatedIn: ["vi"],
       },
       {
-        id: "3.15",
-        path: "/part-3/chapter-15/the-sixth-connection",
+        id: "3.16",
+        path: "/part-3/chapter-16/the-sixth-connection",
         title: "The sixth connection, and where the count lives",
         status: "published",
         // `sourceDoc` is the SAD, and this chapter CONTRADICTS a row of it.
@@ -558,8 +574,8 @@ export const series: Part[] = [
         translatedIn: ["vi"],
       },
       {
-        id: "3.16",
-        path: "/part-3/chapter-16/the-words-somebody-wants-back",
+        id: "3.17",
+        path: "/part-3/chapter-17/the-words-somebody-wants-back",
         title: "The words somebody wants back",
         status: "published",
         // `sourceDoc` is the SAD, and this chapter builds a table that document
@@ -579,8 +595,8 @@ export const series: Part[] = [
         translatedIn: ["vi"],
       },
       {
-        id: "3.17",
-        path: "/part-3/chapter-17/the-message-that-is-not-only-text",
+        id: "3.18",
+        path: "/part-3/chapter-18/the-message-that-is-not-only-text",
         title: "The message that is not only text",
         status: "published",
         // `sourceDoc` is the SAD, whose §6.1 declares `attachments JSONB` and
@@ -598,8 +614,8 @@ export const series: Part[] = [
         translatedIn: ["vi"],
       },
       {
-        id: "3.18",
-        path: "/part-3/chapter-18/webhooks-that-survive-the-customer",
+        id: "3.19",
+        path: "/part-3/chapter-19/webhooks-that-survive-the-customer",
         title: "Webhooks that survive the customer",
         status: "published",
         translatedIn: ["vi"],
@@ -615,8 +631,8 @@ export const series: Part[] = [
           "Một dispatcher service: ký HMAC, lịch retry theo thời điểm tới hạn, dead letter",
       },
       {
-        id: "3.19",
-        path: "/part-3/chapter-19/when-to-stop-trying",
+        id: "3.20",
+        path: "/part-3/chapter-20/when-to-stop-trying",
         title: "When to stop trying",
         status: "published",
         translatedIn: ["vi"],
@@ -632,8 +648,8 @@ export const series: Part[] = [
           "Bản ghi lần thử trên stream analytics, và auto-disable từ hai trigger",
       },
       {
-        id: "3.20",
-        path: "/part-3/chapter-20/the-email-nobody-was-sending",
+        id: "3.21",
+        path: "/part-3/chapter-21/the-email-nobody-was-sending",
         title: "The email nobody was sending",
         status: "published",
         translatedIn: ["vi"],
@@ -651,8 +667,8 @@ export const series: Part[] = [
           "Mẫu outbox lần thứ ba, trên một cột mà chương 3.6 đã viết sẵn — và Mailpit, vì chỉ thư đã nhận mới chứng minh được email không mang bí mật nào",
       },
       {
-        id: "3.21",
-        path: "/part-3/chapter-21/limits-you-can-see-coming",
+        id: "3.22",
+        path: "/part-3/chapter-22/limits-you-can-see-coming",
         title: "Limits you can see coming",
         status: "published",
         translatedIn: ["vi"],
@@ -670,8 +686,8 @@ export const series: Part[] = [
           "Bộ đếm request theo từng environment, các header trên mọi response, và hai bộ giới hạn hỏng theo hai hướng ngược nhau",
       },
       {
-        id: "3.22",
-        path: "/part-3/chapter-22/quotas-and-what-they-cost",
+        id: "3.23",
+        path: "/part-3/chapter-23/quotas-and-what-they-cost",
         title: "Quotas and what they cost",
         status: "published",
         // The half of FR-RTL that is money rather than traffic: monthly usage
@@ -688,8 +704,8 @@ export const series: Part[] = [
           "Quota theo tháng, hạn mức chi tiêu, và cách suy giảm chỉ chặn gửi mà không ảnh hưởng history",
       },
       {
-        id: "3.23",
-        path: "/part-3/chapter-23/counting-a-connection",
+        id: "3.24",
+        path: "/part-3/chapter-24/counting-a-connection",
         title: "Counting a connection",
         status: "published",
         // The third dimension FR-RTL-05 names, and the only one the api cannot
@@ -708,8 +724,8 @@ export const series: Part[] = [
           "Connection-minutes được đo từ một service không sở hữu bảng nào, một cú crash tính thiếu trong một giới hạn đã biết thay vì tính thừa mãi mãi, và close code 4008 lần đầu được gửi kể từ khi chương 1.3 khai báo nó",
       },
       {
-        id: "3.24",
-        path: "/part-3/chapter-24/milestone-the-isolation-gauntlet",
+        id: "3.25",
+        path: "/part-3/chapter-25/milestone-the-isolation-gauntlet",
         title: "Milestone: the isolation gauntlet",
         status: "published",
         // The suite constitution I has required since it was written. What the
@@ -723,16 +739,16 @@ export const series: Part[] = [
         // an estimate of 37 and split three ways. 80 for 3,381 prose words and 19
         // fenced files, measured against 3.11's 100 for 3,316 words and 21.
         readerProduces:
-          "A cross-tenant suite whose target list derives itself from the running router, four attack shapes over 24 routes, a structural check that every table has a tenant path, the socket surface attacked from the protocol's own frame union, and three deliberate reintroductions — one of which stayed green and taught the suite's range",
+          "Three deliberate reintroductions — one of which stayed green and taught the suite's range — and tests for the instruments that had never produced output",
         sourceDoc: "docs/04-srs.md, docs/05-sad.md",
-        readerMinutes: 80,
+        readerMinutes: 13,
         titleVi: "Cột mốc: cửa ải cô lập tenant",
         readerProducesVi:
-          "Một bộ kiểm thử cross-tenant tự suy ra danh sách mục tiêu từ router đang chạy, bốn dạng tấn công trên 24 route, một kiểm tra cấu trúc rằng mọi bảng đều có đường về tenant, tầng socket bị tấn công từ chính frame union của protocol, và ba lần cố ý tái tạo lỗi — một lần vẫn xanh và dạy ta giới hạn của bộ kiểm thử",
+          "Ba lần cố ý tái tạo lỗi — một lần vẫn xanh và dạy ta giới hạn của bộ kiểm thử",
       },
       {
-        id: "3.25",
-        path: "/part-3/chapter-25/errors-that-resolve-and-an-outsider",
+        id: "3.26",
+        path: "/part-3/chapter-26/errors-that-resolve-and-an-outsider",
         title: "Milestone: an outsider integrates",
         status: "published",
         // The milestone name lives here rather than on the gauntlet, because the
