@@ -327,7 +327,23 @@ export const series: Part[] = [
       },
       {
         id: "3.3",
-        path: "/part-3/chapter-03/the-outbox",
+        path: "/part-3/chapter-03/errors-that-resolve",
+        title: "Errors that resolve",
+        status: "published",
+        // Split out of the milestone on the boundary its own prose already had:
+        // every fence above `## The outsider` is the error vocabulary and every
+        // fence below it is the sealed package. 14 titled fences here, 7 there.
+        readerProduces:
+          "Thirteen error codes with one registry and one URL rule, and a docs_url that resolves against the published site",
+        sourceDoc: "docs/04-srs.md, docs/08-error-reference.md",
+        readerMinutes: 49,
+        titleVi: "Lỗi có trang để xem",
+        readerProducesVi:
+          "Mười ba error code với một registry và một luật URL duy nhất, và một docs_url resolve được vào tài liệu đã xuất bản",
+      },
+      {
+        id: "3.4",
+        path: "/part-3/chapter-04/the-outbox",
         title: "The outbox",
         status: "published",
         translatedIn: ["vi"],
@@ -340,8 +356,8 @@ export const series: Part[] = [
           "Transactional outbox + relay (ADR-06); crash-in-the-gap test",
       },
       {
-        id: "3.4",
-        path: "/part-3/chapter-04/jetstream-and-the-first-consumer",
+        id: "3.5",
+        path: "/part-3/chapter-05/jetstream-and-the-first-consumer",
         title: "JetStream and the first consumer",
         status: "published",
         translatedIn: ["vi"],
@@ -354,42 +370,8 @@ export const series: Part[] = [
           "Cấu hình stream; subject grammar dùng chung; durable pull consumer tự dedupe",
       },
       {
-        id: "3.5",
-        path: "/part-3/chapter-05/webhooks-that-survive-the-customer",
-        title: "Webhooks that survive the customer",
-        status: "published",
-        translatedIn: ["vi"],
-        // NOT auto-disable. FR-WHK-07 and FR-WHK-06's attempt log are deferred
-        // to a later chapter, and a summary that promised them would be
-        // advertising something the chapter does not build.
-        readerProduces:
-          "A dispatcher service: HMAC signing, a due-time retry schedule, dead letters",
-        sourceDoc: "docs/04-srs.md",
-        readerMinutes: 100,
-        titleVi: "Webhook sống sót qua phía khách hàng",
-        readerProducesVi:
-          "Một dispatcher service: ký HMAC, lịch retry theo thời điểm tới hạn, dead letter",
-      },
-      {
         id: "3.6",
-        path: "/part-3/chapter-06/when-to-stop-trying",
-        title: "When to stop trying",
-        status: "published",
-        translatedIn: ["vi"],
-        // Split out of 3.5 while 3.5 was being written. Auto-disable needs the
-        // attempt log to be defensible — switching off a paying customer's
-        // endpoint is a decision somebody has to explain afterwards.
-        readerProduces:
-          "Attempt records on an analytics stream, and auto-disable from two triggers",
-        sourceDoc: "docs/04-srs.md",
-        readerMinutes: 80,
-        titleVi: "Khi nào thì thôi cố",
-        readerProducesVi:
-          "Bản ghi lần thử trên stream analytics, và auto-disable từ hai trigger",
-      },
-      {
-        id: "3.7",
-        path: "/part-3/chapter-07/commit-and-publish-are-two-instants",
+        path: "/part-3/chapter-06/commit-and-publish-are-two-instants",
         title: "Commit and publish are two instants",
         status: "published",
         translatedIn: ["vi"],
@@ -408,107 +390,8 @@ export const series: Part[] = [
           "Khép lại lỗi trùng lặp khi resume: một high-water mark sống lâu hơn buffer",
       },
       {
-        id: "3.8",
-        path: "/part-3/chapter-08/limits-you-can-see-coming",
-        title: "Limits you can see coming",
-        status: "published",
-        translatedIn: ["vi"],
-        // Split from the original "Limits and quotas" entry. A rate limit is
-        // ephemeral and may be lost, so Redis is the right store and failing open
-        // is the right default; a quota is money and must be durable. One chapter
-        // teaching both would teach one storage decision as though it covered
-        // both. Quotas also need metering that arrives with Part 4.
-        readerProduces:
-          "Per-environment request counters, the headers on every response, and two limiters that fail in opposite directions",
-        sourceDoc: "docs/04-srs.md",
-        readerMinutes: 90,
-        titleVi: "Những giới hạn bạn thấy trước",
-        readerProducesVi:
-          "Bộ đếm request theo từng environment, các header trên mọi response, và hai bộ giới hạn hỏng theo hai hướng ngược nhau",
-      },
-      {
-        id: "3.9",
-        path: "/part-3/chapter-09/the-email-nobody-was-sending",
-        title: "The email nobody was sending",
-        status: "published",
-        translatedIn: ["vi"],
-        // Split out of 3.8 at its size gate, with the number in hand: the
-        // limiter half alone measured 4,700 prose words against a 2,000-4,000
-        // bound, and the transport's prose would have taken the chapter past
-        // anything the series has published. The CODE ships under `part3-ch8`
-        // either way — this chapter explains it and fences it.
-        readerProduces:
-          "The outbox pattern a third time, over a column chapter 3.6 already wrote — and Mailpit, because only a received message can prove an email carries no secret",
-        sourceDoc: "docs/04-srs.md, docs/03-journey-map.md",
-        readerMinutes: 60,
-        titleVi: "Email chẳng ai gửi",
-        readerProducesVi:
-          "Mẫu outbox lần thứ ba, trên một cột mà chương 3.6 đã viết sẵn — và Mailpit, vì chỉ thư đã nhận mới chứng minh được email không mang bí mật nào",
-      },
-      {
-        id: "3.10",
-        path: "/part-3/chapter-10/quotas-and-what-they-cost",
-        title: "Quotas and what they cost",
-        status: "published",
-        // The half of FR-RTL that is money rather than traffic: monthly usage
-        // quotas, the hard cap that suspends and the soft threshold that only
-        // alerts, and the 50/80/100% email. FR-RTL-06 is a purchasing
-        // requirement, not a technical one — unbounded cost exposure is David's
-        // principal objection at the diligence phase.
-        readerProduces:
-          "Monthly quotas, spending caps, and degradation that rejects sends without touching history",
-        sourceDoc: "docs/04-srs.md",
-        readerMinutes: 90,
-        titleVi: "Quota và cái giá của nó",
-        readerProducesVi:
-          "Quota theo tháng, hạn mức chi tiêu, và cách suy giảm chỉ chặn gửi mà không ảnh hưởng history",
-      },
-      {
-        id: "3.11",
-        path: "/part-3/chapter-11/counting-a-connection",
-        title: "Counting a connection",
-        status: "published",
-        // The third dimension FR-RTL-05 names, and the only one the api cannot
-        // compute from its own tables. Messages and active users are already
-        // rows; a connection-minute is a duration nothing records, so the
-        // gateway has to account for it periodically — and the gateway owns no
-        // tables. Split out of 3.10 rather than deferred vaguely: 3.10 covers
-        // the two dimensions that need no new writer, this one covers the
-        // dimension that needs one.
-        readerProduces:
-          "Connection-minutes metered from a service that owns no tables, a crash that under-bills by a bounded amount rather than over-billing for ever, and close code 4008 emitted for the first time since chapter 1.3 declared it",
-        sourceDoc: "docs/04-srs.md, docs/05-sad.md",
-        readerMinutes: 90,
-        titleVi: "Đếm một kết nối",
-        readerProducesVi:
-          "Connection-minutes được đo từ một service không sở hữu bảng nào, một cú crash tính thiếu trong một giới hạn đã biết thay vì tính thừa mãi mãi, và close code 4008 lần đầu được gửi kể từ khi chương 1.3 khai báo nó",
-      },
-      {
-        id: "3.12",
-        path: "/part-3/chapter-12/milestone-the-isolation-gauntlet",
-        title: "Milestone: the isolation gauntlet",
-        status: "published",
-        // The suite constitution I has required since it was written. What the
-        // repository had instead was eleven assertions in eight files and nothing
-        // that knew which endpoints had been attacked and which had merely never
-        // been thought about.
-        //
-        // `readerMinutes` came down from 100. That figure was set when this
-        // chapter was planned to carry two public endpoints, thirteen error codes
-        // and a sealed integration as well; the surface measured 61 files against
-        // an estimate of 37 and split three ways. 80 for 3,381 prose words and 19
-        // fenced files, measured against 3.11's 100 for 3,316 words and 21.
-        readerProduces:
-          "A cross-tenant suite whose target list derives itself from the running router, four attack shapes over 24 routes, a structural check that every table has a tenant path, the socket surface attacked from the protocol's own frame union, and three deliberate reintroductions — one of which stayed green and taught the suite's range",
-        sourceDoc: "docs/04-srs.md, docs/05-sad.md",
-        readerMinutes: 80,
-        titleVi: "Cột mốc: cửa ải cô lập tenant",
-        readerProducesVi:
-          "Một bộ kiểm thử cross-tenant tự suy ra danh sách mục tiêu từ router đang chạy, bốn dạng tấn công trên 24 route, một kiểm tra cấu trúc rằng mọi bảng đều có đường về tenant, tầng socket bị tấn công từ chính frame union của protocol, và ba lần cố ý tái tạo lỗi — một lần vẫn xanh và dạy ta giới hạn của bộ kiểm thử",
-      },
-      {
-        id: "3.13",
-        path: "/part-3/chapter-13/the-endpoints-and-the-instruments",
+        id: "3.7",
+        path: "/part-3/chapter-07/the-endpoints-and-the-instruments",
         title: "The endpoints and the instruments",
         status: "published",
         // Split out of 3.12 on a measurement, not a feeling: the two chapters'
@@ -525,23 +408,8 @@ export const series: Part[] = [
           "Hai endpoint công khai mà Part 3 cần và chưa ai xây, tính đẳng xâm (idempotent) do unique index bảo đảm chứ không phải do bộ nhớ ứng dụng, mọi lỗi validation lần đầu tiên gọi tên field của nó, guard thao tác toàn cục canh chín bảng thay vì năm, và độ phủ nhánh của tầng repository được trả lời bằng một con số",
       },
       {
-        id: "3.14",
-        path: "/part-3/chapter-14/errors-that-resolve-and-an-outsider",
-        title: "Milestone: errors that resolve, and an outsider",
-        status: "published",
-        // The milestone name lives here rather than on 3.12, because the Phase 2
-        // exit criterion is what this chapter gives a verdict on.
-        readerProduces:
-          "Thirteen error codes with one registry and one URL rule, a docs_url that resolves against the published site, a sealed integration package mechanically unable to import workspace code, and a verdict on the SRS Phase 2 exit criterion with what was measured and what was assumed",
-        sourceDoc: "docs/04-srs.md, docs/08-error-reference.md",
-        readerMinutes: 80,
-        titleVi: "Cột mốc: lỗi có trang để xem, và một người ngoài",
-        readerProducesVi:
-          "Mười ba error code với một registry và một luật URL duy nhất, một docs_url resolve được vào tài liệu đã xuất bản, một package tích hợp bị niêm phong về mặt cơ chế nên không thể import code trong workspace, và một phán quyết cho tiêu chí ra khỏi Phase 2 của SRS kèm những gì đã đo và những gì chỉ được giả định",
-      },
-      {
-        id: "3.15",
-        path: "/part-3/chapter-15/the-channel-a-customer-controls",
+        id: "3.8",
+        path: "/part-3/chapter-08/the-channel-a-customer-controls",
         title: "The channel a customer controls",
         status: "published",
         // Was going to be 3.13 until the split took that number, and the deferred
@@ -557,8 +425,8 @@ export const series: Part[] = [
           "Một loại kênh private thực sự quyết định điều gì đó ở cả bốn cửa vào, xoá thành viên và phân quyền, lưu trữ kênh để từ chối gửi tin mà không tiết lộ kênh có tồn tại, và một gauntlet tấn công chính tenant của bạn",
       },
       {
-        id: "3.16",
-        path: "/part-3/chapter-16/what-a-user-sees",
+        id: "3.9",
+        path: "/part-3/chapter-09/what-a-user-sees",
         title: "What a user sees",
         status: "published",
         // The other half of the deferred surface. Its centre is a measurement that
@@ -573,8 +441,8 @@ export const series: Part[] = [
           "Danh sách channel phân trang bằng cursor và xếp theo hoạt động, số tin chưa đọc suy ra từ chính sequence mà đường ghi vẫn duy trì, profile người dùng được tạo ngầm ở lần xác thực đầu tiên, một người dùng đã xoá mà tin nhắn vẫn còn, và một lệnh ban có hiệu lực cả ở cửa vào lẫn trên đường gửi",
       },
       {
-        id: "3.17",
-        path: "/part-3/chapter-17/the-sender-a-message-never-had",
+        id: "3.10",
+        path: "/part-3/chapter-10/the-sender-a-message-never-had",
         title: "The sender a message never had",
         status: "published",
         // The requirement was already in the SRS — FR-MSG-13, P2, since v1 — and
@@ -590,8 +458,8 @@ export const series: Part[] = [
           "Bot user mang theo một description mà cơ sở dữ liệu bắt buộc phải có, một người gửi bắt buộc trên mọi tin nhắn và được chính trình biên dịch bảo đảm thay vì một bài test, một application credential chỉ được nói với danh nghĩa phần mềm chứ không phải bất kỳ con người nào, những lời từ chối không hé ra ai đang tồn tại, và một bot vẫn được tính tiền như active user nhưng được miễn khỏi cái ngưỡng vốn từ chối tin gửi",
       },
       {
-        id: "3.18",
-        path: "/part-3/chapter-18/the-message-that-never-arrived",
+        id: "3.11",
+        path: "/part-3/chapter-11/the-message-that-never-arrived",
         title: "The message that never arrived",
         status: "published",
         // The architecture drew this edge before the api existed — `05-sad.md`'s
@@ -609,8 +477,8 @@ export const series: Part[] = [
           "Một tin nhắn gửi qua REST tới được socket đang mở, một thứ tự phải tách theo transport vì response của một request handler CHÍNH LÀ acknowledgement của nó, một publisher sống sót qua broker đã chết trong 2 ms ở nơi client của gateway treo vô hạn, và một điều khoản P1 được đo là chưa thoả mãn rồi ghi lại thay vì bị thu hẹp",
       },
       {
-        id: "3.19",
-        path: "/part-3/chapter-19/who-is-allowed-to-see-it",
+        id: "3.12",
+        path: "/part-3/chapter-12/who-is-allowed-to-see-it",
         title: "Presence, and who is allowed to see it",
         status: "published",
         // `sourceDoc` is the SAD rather than the SRS for chapter 3.18's reason: no
@@ -632,8 +500,8 @@ export const series: Part[] = [
         translatedIn: ["vi"],
       },
       {
-        id: "3.20",
-        path: "/part-3/chapter-20/the-membership-that-changed",
+        id: "3.13",
+        path: "/part-3/chapter-13/the-membership-that-changed",
         title: "The membership that changed under a live socket",
         status: "published",
         // `sourceDoc` is the SAD, and for a stronger reason than 3.18's and 3.19's:
@@ -651,8 +519,8 @@ export const series: Part[] = [
         translatedIn: ["vi"],
       },
       {
-        id: "3.21",
-        path: "/part-3/chapter-21/the-frame-nobody-may-send",
+        id: "3.14",
+        path: "/part-3/chapter-14/the-frame-nobody-may-send",
         title: "The frame nobody may send",
         status: "published",
         // `sourceDoc` is the SAD, and this chapter adds TWO records rather than
@@ -671,8 +539,8 @@ export const series: Part[] = [
         translatedIn: ["vi"],
       },
       {
-        id: "3.22",
-        path: "/part-3/chapter-22/the-sixth-connection",
+        id: "3.15",
+        path: "/part-3/chapter-15/the-sixth-connection",
         title: "The sixth connection, and where the count lives",
         status: "published",
         // `sourceDoc` is the SAD, and this chapter CONTRADICTS a row of it.
@@ -690,8 +558,8 @@ export const series: Part[] = [
         translatedIn: ["vi"],
       },
       {
-        id: "3.23",
-        path: "/part-3/chapter-23/the-words-somebody-wants-back",
+        id: "3.16",
+        path: "/part-3/chapter-16/the-words-somebody-wants-back",
         title: "The words somebody wants back",
         status: "published",
         // `sourceDoc` is the SAD, and this chapter builds a table that document
@@ -711,8 +579,8 @@ export const series: Part[] = [
         translatedIn: ["vi"],
       },
       {
-        id: "3.24",
-        path: "/part-3/chapter-24/the-message-that-is-not-only-text",
+        id: "3.17",
+        path: "/part-3/chapter-17/the-message-that-is-not-only-text",
         title: "The message that is not only text",
         status: "published",
         // `sourceDoc` is the SAD, whose §6.1 declares `attachments JSONB` and
@@ -728,6 +596,155 @@ export const series: Part[] = [
         readerProducesVi:
           "Nửa external-URL của FR-MSG-11 được dựng: một tin nhắn mang attachment, giới hạn mười phần tử và 2.048 ký tự, bị từ chối trừ khi scheme là http hoặc https. Nửa media_id được hoãn tới §4.14 và bị từ chối đích danh, bằng một mã lỗi riêng.",
         translatedIn: ["vi"],
+      },
+      {
+        id: "3.18",
+        path: "/part-3/chapter-18/webhooks-that-survive-the-customer",
+        title: "Webhooks that survive the customer",
+        status: "published",
+        translatedIn: ["vi"],
+        // NOT auto-disable. FR-WHK-07 and FR-WHK-06's attempt log are deferred
+        // to a later chapter, and a summary that promised them would be
+        // advertising something the chapter does not build.
+        readerProduces:
+          "A dispatcher service: HMAC signing, a due-time retry schedule, dead letters",
+        sourceDoc: "docs/04-srs.md",
+        readerMinutes: 100,
+        titleVi: "Webhook sống sót qua phía khách hàng",
+        readerProducesVi:
+          "Một dispatcher service: ký HMAC, lịch retry theo thời điểm tới hạn, dead letter",
+      },
+      {
+        id: "3.19",
+        path: "/part-3/chapter-19/when-to-stop-trying",
+        title: "When to stop trying",
+        status: "published",
+        translatedIn: ["vi"],
+        // Split out of 3.5 while 3.5 was being written. Auto-disable needs the
+        // attempt log to be defensible — switching off a paying customer's
+        // endpoint is a decision somebody has to explain afterwards.
+        readerProduces:
+          "Attempt records on an analytics stream, and auto-disable from two triggers",
+        sourceDoc: "docs/04-srs.md",
+        readerMinutes: 80,
+        titleVi: "Khi nào thì thôi cố",
+        readerProducesVi:
+          "Bản ghi lần thử trên stream analytics, và auto-disable từ hai trigger",
+      },
+      {
+        id: "3.20",
+        path: "/part-3/chapter-20/the-email-nobody-was-sending",
+        title: "The email nobody was sending",
+        status: "published",
+        translatedIn: ["vi"],
+        // Split out of 3.8 at its size gate, with the number in hand: the
+        // limiter half alone measured 4,700 prose words against a 2,000-4,000
+        // bound, and the transport's prose would have taken the chapter past
+        // anything the series has published. The CODE ships under `part3-ch8`
+        // either way — this chapter explains it and fences it.
+        readerProduces:
+          "The outbox pattern a third time, over a column chapter 3.6 already wrote — and Mailpit, because only a received message can prove an email carries no secret",
+        sourceDoc: "docs/04-srs.md, docs/03-journey-map.md",
+        readerMinutes: 60,
+        titleVi: "Email chẳng ai gửi",
+        readerProducesVi:
+          "Mẫu outbox lần thứ ba, trên một cột mà chương 3.6 đã viết sẵn — và Mailpit, vì chỉ thư đã nhận mới chứng minh được email không mang bí mật nào",
+      },
+      {
+        id: "3.21",
+        path: "/part-3/chapter-21/limits-you-can-see-coming",
+        title: "Limits you can see coming",
+        status: "published",
+        translatedIn: ["vi"],
+        // Split from the original "Limits and quotas" entry. A rate limit is
+        // ephemeral and may be lost, so Redis is the right store and failing open
+        // is the right default; a quota is money and must be durable. One chapter
+        // teaching both would teach one storage decision as though it covered
+        // both. Quotas also need metering that arrives with Part 4.
+        readerProduces:
+          "Per-environment request counters, the headers on every response, and two limiters that fail in opposite directions",
+        sourceDoc: "docs/04-srs.md",
+        readerMinutes: 90,
+        titleVi: "Những giới hạn bạn thấy trước",
+        readerProducesVi:
+          "Bộ đếm request theo từng environment, các header trên mọi response, và hai bộ giới hạn hỏng theo hai hướng ngược nhau",
+      },
+      {
+        id: "3.22",
+        path: "/part-3/chapter-22/quotas-and-what-they-cost",
+        title: "Quotas and what they cost",
+        status: "published",
+        // The half of FR-RTL that is money rather than traffic: monthly usage
+        // quotas, the hard cap that suspends and the soft threshold that only
+        // alerts, and the 50/80/100% email. FR-RTL-06 is a purchasing
+        // requirement, not a technical one — unbounded cost exposure is David's
+        // principal objection at the diligence phase.
+        readerProduces:
+          "Monthly quotas, spending caps, and degradation that rejects sends without touching history",
+        sourceDoc: "docs/04-srs.md",
+        readerMinutes: 90,
+        titleVi: "Quota và cái giá của nó",
+        readerProducesVi:
+          "Quota theo tháng, hạn mức chi tiêu, và cách suy giảm chỉ chặn gửi mà không ảnh hưởng history",
+      },
+      {
+        id: "3.23",
+        path: "/part-3/chapter-23/counting-a-connection",
+        title: "Counting a connection",
+        status: "published",
+        // The third dimension FR-RTL-05 names, and the only one the api cannot
+        // compute from its own tables. Messages and active users are already
+        // rows; a connection-minute is a duration nothing records, so the
+        // gateway has to account for it periodically — and the gateway owns no
+        // tables. Split out of 3.10 rather than deferred vaguely: 3.10 covers
+        // the two dimensions that need no new writer, this one covers the
+        // dimension that needs one.
+        readerProduces:
+          "Connection-minutes metered from a service that owns no tables, a crash that under-bills by a bounded amount rather than over-billing for ever, and close code 4008 emitted for the first time since chapter 1.3 declared it",
+        sourceDoc: "docs/04-srs.md, docs/05-sad.md",
+        readerMinutes: 90,
+        titleVi: "Đếm một kết nối",
+        readerProducesVi:
+          "Connection-minutes được đo từ một service không sở hữu bảng nào, một cú crash tính thiếu trong một giới hạn đã biết thay vì tính thừa mãi mãi, và close code 4008 lần đầu được gửi kể từ khi chương 1.3 khai báo nó",
+      },
+      {
+        id: "3.24",
+        path: "/part-3/chapter-24/milestone-the-isolation-gauntlet",
+        title: "Milestone: the isolation gauntlet",
+        status: "published",
+        // The suite constitution I has required since it was written. What the
+        // repository had instead was eleven assertions in eight files and nothing
+        // that knew which endpoints had been attacked and which had merely never
+        // been thought about.
+        //
+        // `readerMinutes` came down from 100. That figure was set when this
+        // chapter was planned to carry two public endpoints, thirteen error codes
+        // and a sealed integration as well; the surface measured 61 files against
+        // an estimate of 37 and split three ways. 80 for 3,381 prose words and 19
+        // fenced files, measured against 3.11's 100 for 3,316 words and 21.
+        readerProduces:
+          "A cross-tenant suite whose target list derives itself from the running router, four attack shapes over 24 routes, a structural check that every table has a tenant path, the socket surface attacked from the protocol's own frame union, and three deliberate reintroductions — one of which stayed green and taught the suite's range",
+        sourceDoc: "docs/04-srs.md, docs/05-sad.md",
+        readerMinutes: 80,
+        titleVi: "Cột mốc: cửa ải cô lập tenant",
+        readerProducesVi:
+          "Một bộ kiểm thử cross-tenant tự suy ra danh sách mục tiêu từ router đang chạy, bốn dạng tấn công trên 24 route, một kiểm tra cấu trúc rằng mọi bảng đều có đường về tenant, tầng socket bị tấn công từ chính frame union của protocol, và ba lần cố ý tái tạo lỗi — một lần vẫn xanh và dạy ta giới hạn của bộ kiểm thử",
+      },
+      {
+        id: "3.25",
+        path: "/part-3/chapter-25/errors-that-resolve-and-an-outsider",
+        title: "Milestone: an outsider integrates",
+        status: "published",
+        // The milestone name lives here rather than on the gauntlet, because the
+        // Phase 2 exit criterion is what this chapter gives a verdict on. The slug
+        // keeps both halves' names because it is a published URL.
+        readerProduces:
+          "A sealed integration package mechanically unable to import workspace code, and a verdict on the SRS Phase 2 exit criterion with what was measured and what was assumed",
+        sourceDoc: "docs/04-srs.md",
+        readerMinutes: 31,
+        titleVi: "Cột mốc: một người ngoài tích hợp",
+        readerProducesVi:
+          "Một package tích hợp bị niêm phong về mặt cơ chế nên không thể import code trong workspace, và một phán quyết cho tiêu chí ra khỏi Phase 2 của SRS kèm những gì đã đo và những gì chỉ được giả định",
       },
     ],
   },
