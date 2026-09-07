@@ -6986,3 +6986,104 @@ mode this class of threshold has and the reason the probe is worth running every
          // silent loss. Pinned here because they measured 0% and 87.5% when the
          // service arrived, which is exactly what research R12 warned a new
 ```
+
+## Task ids do not belong in test titles
+
+A task id names a step in one feature's plan. The plan is finished; the test is not. Six months
+on, `T052` names nothing a reader can look up — and a test title is the one piece of a test that
+shows up **detached from its file**, in a CI summary with no repository to grep. That is what
+separates a title from a comment: somebody reading the comment already has the file open.
+
+Seven such ids survived across four suites, left by chapters whose audits reached only the files
+they were touching. They are removed here, and each replacement says what the title already
+proved rather than pointing at a plan.
+
+**One of them could not be removed on its own.** `fanout.itest.ts` carried a comment fifty lines
+above the test reading *"Raw is kept because T018 asserts on the exact key set"* — a reference
+pointing AT the title by its id. Deleting the id from the title alone would have left a comment
+citing something no longer findable. Fix the file that describes the thing and the one that
+refers to it, or the second is worse off than before.
+
+**And one was printing to standard output.** `membership.itest.ts` logged
+`[T066] request-return to notice: … ms`, which lands in CI output with no file, no line and no
+way back. That is the title problem in its purest form.
+
+```diff title="services/api/src/channels/channels.itest.ts"
+@@ -174,13 +174,13 @@ describe("the public channel surface", () => {
+       expect(body.members.every((m) => m.status === "added")).toBe(true);
+       // The users did not exist a moment ago. FR-CHN-04: membership creates them.
+       expect(await repo.getUserByExternalId("tuan")).not.toBeNull();
+       expect((await repo.listMembers(channelId)).length).toBe(2);
+     });
+ 
+-    it("says already_a_member on a repeat, and is not a 500 (T052)", async () => {
++    it("says already_a_member on a repeat, and is not a 500", async () => {
+       const res = await addMembers(channelId, { user_ids: ["tuan"] });
+       expect(res.status).toBe(200);
+       const body = (await res.json()) as { members: { status: string }[] };
+       expect(body.members[0]?.status).toBe("already_a_member");
+       // Before this chapter `members`' primary key raised a unique violation here
+       // and `ProtocolErrorFilter` rendered it as `internal_error` — a 500 for a
+@@ -707,13 +707,13 @@ describe("the public channel surface", () => {
+       expect(absent.status).toBe(foreign.status);
+       const a = withoutRequestId(await absent.json());
+       const b = withoutRequestId(await foreign.json());
+       expect(a).toEqual(b);
+     });
+ 
+-    it("does not change what a user has left unread (FR-022, T078)", async () => {
++    it("does not change what a user has left unread (FR-022)", async () => {
+       // The edge case the spec names, and this is where "the count is still true"
+       // gets a definition: archiving writes ONE column on `channels` and touches no
+       // message and no read position. So `last_sequence` is what it was, every read
+       // position is what it was, and the arithmetic between them is unchanged.
+       //
+       // Asserted on the sequence rather than on a count, because the count is phase
+```
+
+The isolation gauntlet's describe carried two ids at once, and the comment above it a third. What
+that comment is actually saying survives the edit intact: only two of the five platform routes
+name an environment alongside an identifier, so only those two can be told to act on one tenant
+while carrying something from another.
+
+```diff title="services/api/src/isolation/gauntlet.itest.ts"
+@@ -679,34 +679,34 @@ describe("the isolation gauntlet", () => {
+       // environment — this is the assertion that the scoping is real.
+       expect(body).not.toContain(tenants.victim.channelId);
+     });
+   });
+   // ── T031: the five platform routes, and what isolation means for them ──────
+   //
+-  // T031b, the comment the plan asked for: a platform credential is not
+-  // tenant-scoped and is not meant to be. The dispatcher serves every tenant, so
++  // A platform credential is not tenant-scoped and is not meant to be. The
++  // dispatcher serves every tenant, so
+   // its credential reaches every tenant's deliveries. FR-044 narrowed WHICH
+   // ROUTES each service may call and changed nothing about that reach.
+   //
+   // So the attack shape differs here, and the difference is worth stating
+   // exactly. Only TWO of the five platform routes name an environment alongside
+   // an identifier — `dispatch/expand` (`environment_id` beside `event_id`) and
+   // `usage/connections` (an environment per connection). Those two can be told
+   // to act on environment A while carrying something from B, and both are
+   // attacked: expand below, connections by `usage.itest.ts`'s
+-  // `connection_environment_conflict` assertion (T032).
++  // `connection_environment_conflict` assertion.
+   //
+   // The other three — `material`, `outcome`, `replay` — take one opaque
+   // identifier and DERIVE the environment from the row they find. There is no
+   // cross-environment request to make, because the caller never says which
+   // environment it means. That is not a hole this suite declines to test; it is
+   // the absence of the parameter that would make the attack expressible. What
+   // guards them is FR-044 and nothing else — which is why `material`, the one
+   // response in the platform that returns a decrypted customer secret, is the
+   // route to watch first if a platform credential ever leaks.
+-  describe("the platform routes (T031, T031b)", () => {
++  describe("the platform routes", () => {
+     const dispatcher = process.env["RELAY_INTERNAL_CREDENTIAL"] ?? "";
+ 
+     // Through the victim's OWN repository, which is both scoped and the only
+     // place the query engine is allowed to live (FR-043).
+     const victimDeliveries = () =>
+       tenants.victim.repo.countDeliveriesForEndpoint(tenants.victim.endpointId);
+```
