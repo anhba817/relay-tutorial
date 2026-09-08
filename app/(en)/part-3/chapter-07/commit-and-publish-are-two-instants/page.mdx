@@ -116,7 +116,10 @@ nobody drew the matrix.
 Here are the three tests this chapter adds:
 
 ```diff title="services/gateway/src/resume.itest.ts"
-@@ -192,4 +192,120 @@ describe("resume across a real fabric", () => {
+@@ -191,7 +191,123 @@ describe("resume across a real fabric", () => {
+     // the phase went back to normal 2.6 delivery.
+     await publishFromElsewhere(frame(44));
+     await settle(300);
      expect(created(frames)).toEqual([42, 44]);
      socket.close();
    });
@@ -275,7 +278,10 @@ during step 4, and its comment explains the off-by-one in detail. What was missi
 is the same comparison one step later:
 
 ```diff title="services/gateway/src/resume.ts"
-@@ -107,6 +107,51 @@ export function flushable(
+@@ -104,12 +104,57 @@ export function flushable(
+   buffer: Message[],
+   marks: Record<string, number>,
+ ): Message[] {
    return buffer.filter((frame) => frame.seq > (marks[frame.channel] ?? 0));
  }
  
@@ -327,6 +333,9 @@ is the same comparison one step later:
  /** A promise that resolves false instead of hanging forever. */
  export async function withDeadline(
    work: Promise<unknown>,
+   ms: number,
+ ): Promise<boolean> {
+   let timer: ReturnType<typeof setTimeout> | undefined;
 ```
 
 `suppressed` is `flushable`'s question asked of a live connection. `scopeMarks`
@@ -335,11 +344,14 @@ bounds what gets kept.
 The mark then needs somewhere to live, which is one field:
 
 ```diff title="services/gateway/src/registry.ts"
-@@ -29,6 +29,24 @@ export interface Connection {
+@@ -26,12 +26,30 @@ export interface Connection {
+    * field and nothing else — the resume machinery is invisible to it. */
+   phase: ResumePhase;
+   buffer: Message[];
    /** Set when the buffer hit its ceiling. The frames are gone, so the
     * client must be told to page history instead of trusting the stream. */
    overflowed: boolean;
-+  /** Per channel, the highest sequence this connection's backfill
++  /** Chapter 3.7. Per channel, the highest sequence this connection's backfill
 +   * delivered — kept for the connection's life so that a frame the fabric
 +   * announces AFTER the resume has finished can still be recognised as one the
 +   * client already holds.
@@ -360,13 +372,19 @@ The mark then needs somewhere to live, which is one field:
  }
  
  export class Registry {
+   private readonly byId = new Map<string, Connection>();
+ 
+   add(connection: Connection): void {
 ```
 
 And three call sites — set it on success, clear it on every degrade, consult it in
 delivery:
 
 ```diff title="services/gateway/src/session.ts"
-@@ -19,6 +19,8 @@ import {
+@@ -11,12 +11,14 @@ import type { Fanout } from "./fanout.js";
+ import { Registry, type Connection } from "./registry.js";
+ import {
+   MAX_BUFFERED_FRAMES,
    SUBSCRIBE_DEADLINE_MS,
    flushable,
    highWaterMarks,
@@ -375,11 +393,17 @@ delivery:
    parseCursors,
    scopeCursors,
    withDeadline,
-@@ -94,6 +96,13 @@ export function attachSessions({
+ } from "./resume.js";
+ 
+ // One session per socket (chapter 2.5). The order of operations here is the
+@@ -86,12 +88,19 @@ export function attachSessions({
+           connection.overflowed = true;
+           continue;
+         }
          connection.buffer.push(message);
          continue;
        }
-+      // A live connection is not necessarily a connection with
++      // Chapter 3.7. A live connection is not necessarily a connection with
 +      // nothing to remember: a frame at or below what its backfill already
 +      // delivered is one it has, however long ago the resume finished. Before
 +      // this, delivery consulted `phase` and nothing else, and the marks were
@@ -389,7 +413,13 @@ delivery:
        send(connection.socket, { type: "message.created", payload: message });
      }
    }
-@@ -161,6 +170,9 @@ export function attachSessions({
+   fanout?.onDelivery(deliver);
+   // noServer: the upgrade is handled by hand so the token can be checked
+   // BEFORE the handshake completes. Letting ws own the upgrade would mean
+@@ -153,12 +162,15 @@ export function attachSessions({
+       // questions at once, and a failure now closes the socket before it opens.
+       channelIds: new Set(channelIds),
+       missedPings: 0,
        phase: presented === undefined ? "live" : "buffering",
        buffer: [],
        overflowed: false,
@@ -399,7 +429,13 @@ delivery:
      };
  
      registry.add(connection);
-@@ -263,6 +275,11 @@ export function attachSessions({
+     // Subscriptions follow membership: the first local member of a channel
+     // makes this instance a subscriber, and the last one to leave releases
+     // it (reference-counted in the fabric).
+@@ -255,12 +267,17 @@ export function attachSessions({
+     /** Everything that cannot promise completeness ends up here: the client
+      * is told resume did not happen and which channels to page instead. The
+      * frames held so far are dropped on purpose — they would be an arbitrary
       * fragment of a stream the client is about to refetch in full. */
      const degrade = (reason: string): void => {
        connection.buffer = [];
@@ -411,7 +447,13 @@ delivery:
        connection.phase = "live";
        ack(connection, {
          cursor: cursors,
-@@ -337,6 +354,10 @@ export function attachSessions({
+         resume_ok: false,
+         truncated: [...connection.channelIds],
+       });
+@@ -329,12 +346,16 @@ export function attachSessions({
+       return;
+     }
+     for (const message of flushable(connection.buffer, marks)) {
        send(connection.socket, { type: "message.created", payload: message });
      }
      connection.buffer = [];
@@ -422,6 +464,9 @@ delivery:
      // Step 5.
      connection.phase = "live";
      logger.log("info", "resume.completed", {
+       connection_id: connection.id,
+       backfilled: Object.values(backfilled).reduce(
+         (n, page) => n + page.messages.length,
 ```
 
 <Figure caption="Step 5 previously discarded H. Now it keeps it." code={figWhereTheMarkLives} />
@@ -593,7 +638,10 @@ The predicate and the scoping are pure, so their tests need no socket, no broker
 and no clock:
 
 ```diff title="services/gateway/src/resume.test.ts"
-@@ -7,6 +7,8 @@ import {
+@@ -4,12 +4,14 @@ import type { Message } from "@relay/protocol";
+ 
+ import {
+   flushable,
    highWaterMarks,
    parseCursors,
    scopeCursors,
@@ -602,12 +650,18 @@ and no clock:
    withDeadline,
  } from "./resume.js";
  
-@@ -134,3 +136,85 @@ describe("withDeadline", () => {
+ // The resume theorem, held still (chapter 2.7). Everything here is a pure
+ // function precisely so the ordering argument can be tested without a
+ // socket, a broker, or a database — session.test.ts then proves the
+@@ -131,6 +133,88 @@ describe("withDeadline", () => {
+     // connection away.
+     expect(await withDeadline(Promise.reject(new Error("redis down")), 50)).toBe(
+       false,
      );
    });
  });
 +
-+// `flushable` decides what a resuming connection may hand over from
++// Chapter 3.7. `flushable` decides what a resuming connection may hand over from
 +// its buffer; `suppressed` decides what a LIVE connection must still refuse. The
 +// two comparisons are the same and the second one did not exist, which is the
 +// whole of the defect.
@@ -694,11 +748,14 @@ And the wiring — that `deliver()` consults the marks at all — is held agains
 stubbed fabric:
 
 ```diff title="services/gateway/src/session.test.ts"
-@@ -467,6 +467,73 @@ describe("the socket (chapter 2.5)", () => {
+@@ -466,12 +466,79 @@ describe("the socket (chapter 2.5)", () => {
+     const seqs = created(frames);
+     expect(seqs).toEqual([42, 43]); // complete…
+     expect(new Set(seqs).size).toBe(seqs.length); // …and exactly once
      socket.close();
    });
  
-+  it("a frame at the mark, arriving after the resume, is not delivered", async () => {
++  it("chapter 3.7: a frame at the mark, arriving after the resume, is not delivered", async () => {
 +    // The same property `resume.itest.ts` proves against a real broker, held here
 +    // against a stubbed one so it fails fast and without Redis. This is the wiring
 +    // rather than the predicate: that `deliver()` consults the marks at all.
@@ -725,7 +782,7 @@ stubbed fabric:
 +    socket.close();
 +  });
 +
-+  it("a frame above the mark, arriving after the resume, IS delivered", async () => {
++  it("chapter 3.7: a frame above the mark, arriving after the resume, IS delivered", async () => {
 +    // The half that stops a duplicate fix becoming a gap (FR-RTM-03 is one
 +    // property, not two: no gap AND no double).
 +    const fanout = stubFanout();
@@ -750,7 +807,7 @@ stubbed fabric:
 +    socket.close();
 +  });
 +
-+  it("a connection that never resumed suppresses nothing", async () => {
++  it("chapter 3.7: a connection that never resumed suppresses nothing", async () => {
 +    // A fresh connect presents no cursor, so it holds no marks and behaves
 +    // exactly as chapter 2.6 left it.
 +    const fanout = stubFanout();
@@ -768,16 +825,22 @@ stubbed fabric:
    it("stages the other interleaving: published during backfill, absent from it", async () => {
      // Same window, the other order: seq 43 committed AFTER the backfill
      // query's snapshot, so it exists ONLY in the buffer. This is the
+     // interleaving where backfill-then-subscribe loses the message.
+     const fanout = stubFanout();
+     harness = await boot(
 ```
 
 The ratchet moves up, and stops short of 100 on purpose:
 
 ```diff title="vitest.coverage.config.mts"
-@@ -116,8 +116,18 @@ export default defineConfig({
-           lines: 100,
-           statements: 100,
+@@ -75,14 +75,24 @@ export default defineConfig({
+         "services/api/src/db/repository.ts": {
+           branches: 85,
+           functions: 100,
+           lines: 98,
+           statements: 95,
          },
-+        // THE DEDUPLICATION CHAPTER RAISED THIS, 93 -> 95. The chapter added two pure functions
++        // CHAPTER 3.7 RAISED THIS, 93 -> 95. The chapter added two pure functions
 +        // to this file — the live-path suppression predicate and the scoping that
 +        // bounds the marks — and both are fully covered.
 +        //
@@ -793,6 +856,9 @@ The ratchet moves up, and stops short of 100 on purpose:
            functions: 100,
            lines: 100,
            statements: 100,
+         },
+         "services/api/src/auth/user-token.ts": {
+           branches: 96,
 ```
 
 ## The sabotage battery
@@ -848,6 +914,106 @@ This chapter's central design decision is *never retire the mark*. Before the
 battery, it had no test behind it.
 
 </Why>
+
+## A test riding a stream that keeps growing
+
+The lane found this one on run 11 of twenty, which is the only reason it is in this
+chapter and not in somebody's incident:
+
+```text title="run 11 of 20"
+expected [ …(2756) ] to include '<uuid>'
+```
+
+The consumer catch-up test publishes three events, then drains the stream until it sees
+them. It called `ENV()` three times to do it — and `ENV` mints a fresh uuid on every
+call, so the three events went to three different subjects and no filter could cover all
+three. With no filter, the durable starts at the head of a stream holding some thirteen
+thousand events from earlier chapters, and the drain loop had a fixed budget of 800
+polls to get through them.
+
+2,756 events drained, backlog still not cleared, assertion fails.
+
+<Trap>
+This is a test riding a **shared, growing resource** with a **fixed budget**. It passes
+on the day it is written and every day after until the resource outgrows the budget — and
+then it fails somewhere that looks nothing like its cause. The number 800 was never
+wrong; it was only ever large enough.
+</Trap>
+
+Scoping the consumer to one environment removes the race rather than raising the budget.
+The drain has nothing to drain, and the assertion is about exactly the three events the
+test published. The invariant it was written for is untouched: the stream holds messages
+whether or not anybody is reading, and the backlog waits.
+
+```diff title="services/api/src/consumer/consumer.itest.ts"
+@@ -424,29 +424,61 @@ describe("the consumer", () => {
+ 
+   it("invariant 9: a consumer stopped for N publishes receives all N on restart", async () => {
+     // What `limits` retention means: the stream holds messages whether or not
+     // anybody is reading. The backlog waits.
+     const durable = `itest-catchup-${Date.now()}`;
+     const seen: string[] = [];
+-    const runtime = runtimeFor(db, durable, async (e) => void seen.push(e.id));
++    // ONE environment for all three publishes, and the consumer filtered to it.
++    //
++    // This test used to call `ENV()` three times — and `ENV` mints a fresh uuid
++    // on every call, so the three events went to three different subjects and no
++    // filter could cover them. Without a filter the durable starts at the head of
++    // a stream holding ~13,000 events from earlier chapters, and the loop below
++    // had to drain all of them inside a fixed budget of 800 polls before the
++    // three under test were even reachable.
++    //
++    // Found on run 11 of chapter 3.7's twenty post-fix lane runs: `expected
++    // [ …(2756) ] to include '<uuid>'`. 2,756 events drained and the backlog
++    // still not cleared. It is the same shape as the sweep and the drain in
++    // `deliveries.itest.ts` — a test riding a shared, growing resource with a
++    // fixed budget, which passes until the resource outgrows the budget.
++    //
++    // Scoped, the drain below has nothing to drain and the assertion is about
++    // exactly the three events it published. The invariant is unchanged: the
++    // stream holds messages whether or not anybody is reading, and the backlog
++    // waits.
++    const environmentId = ENV();
++    const runtime = runtimeFor(
++      db,
++      durable,
++      async (e) => void seen.push(e.id),
++      silent,
++      environmentId,
++    );
+ 
+     // Get to the head of the stream first, so "everything published while away"
+-    // is measurable rather than lost in twelve thousand older events.
++    // is measurable rather than lost among older events.
+     for (let i = 0; i < 800; i++) {
+       const { handled, duplicates } = await runtime.pollOnce();
+       if (handled + duplicates === 0) break;
+     }
+     await runtime.stop();
+ 
+     const published = [
+-      await publish(ENV()),
+-      await publish(ENV()),
+-      await publish(ENV()),
++      await publish(environmentId),
++      await publish(environmentId),
++      await publish(environmentId),
+     ];
+ 
+-    const restarted = runtimeFor(db, durable, async (e) => void seen.push(e.id));
++    const restarted = runtimeFor(
++      db,
++      durable,
++      async (e) => void seen.push(e.id),
++      silent,
++      environmentId,
++    );
+     for (let i = 0; i < 100; i++) {
+       await restarted.pollOnce();
+       if (published.every((id) => seen.includes(id))) break;
+     }
+     await restarted.stop();
+```
 
 <Checkpoint>
 
