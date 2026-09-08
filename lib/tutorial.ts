@@ -350,12 +350,12 @@ export const series: Part[] = [
         // 25 later chapter-edits, and the reorder put every one of them before the
         // file existed. The harness has to precede its editors; the verdict does not.
         readerProduces:
-          "A cross-tenant suite whose target list derives itself from the running router, four attack shapes over 24 routes, a structural check that every table has a tenant path, and the socket surface attacked from the protocol's own frame union",
+          "A cross-tenant suite whose target list derives itself from the running router and fails on a route it has no decision about, three attack shapes that compare a pair rather than a status code, a structural check that every table has a path back to one tenant, and the socket surface attacked from the protocol's own frame union",
         sourceDoc: "docs/04-srs.md, docs/05-sad.md",
-        readerMinutes: 67,
+        readerMinutes: 55,
         titleVi: "Cửa ải cô lập tenant",
         readerProducesVi:
-          "Một bộ kiểm thử cross-tenant tự suy ra danh sách mục tiêu từ router đang chạy, bốn dạng tấn công trên 24 route, một kiểm tra cấu trúc rằng mọi bảng đều có đường về tenant, và tầng socket bị tấn công từ chính frame union của protocol",
+          "Một bộ kiểm thử cross-tenant tự suy ra danh sách mục tiêu từ router đang chạy và đỏ khi gặp route nó chưa có quyết định nào, ba dạng tấn công so sánh một CẶP phản hồi thay vì một mã trạng thái, một kiểm tra cấu trúc rằng mọi bảng đều có đường về tenant, và tầng socket bị tấn công từ chính frame union của protocol",
       },
       {
         id: "3.5",
