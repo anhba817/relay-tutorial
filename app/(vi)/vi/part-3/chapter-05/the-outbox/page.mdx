@@ -1,12 +1,9 @@
-import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
 import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
-import { Figure } from "@/components/tutorial/figure";
-import { figTheGap, figOutbox, figTwoGuarantees } from "./figures";
 
 export const metadata = {
   title: "Outbox — Building Relay",
   description:
-    "Mỗi state change nợ thế giới bên ngoài một event, và cách hiển nhiên để gửi event lại làm mất events trong một window không ai nhìn thấy. Chương này tái hiện loss đó bằng SIGKILL thật, rồi commit event cùng message để chuyện đó không thể xảy ra.",
+    "Bản dịch tiếng Việt của chương này đang được chuẩn bị. Toàn bộ mã nguồn bên dưới giữ nguyên như bản tiếng Anh.",
   alternates: {
     canonical: "/vi/part-3/chapter-05/the-outbox",
     languages: {
@@ -18,55 +15,16 @@ export const metadata = {
 
 <ChapterHeader id="3.5" locale="vi" />
 
-Platform bây giờ biết ai đang hỏi (3.2) và họ thuộc tenant nào (3.1). Thứ nó
-chưa làm được là nói cho người khác biết rằng có chuyện vừa xảy ra.
+> **Bản dịch đang được chuẩn bị.** Phần diễn giải của chương này chưa được dịch sang
+> tiếng Việt. Các khối mã bên dưới là bản gốc tiếng Anh và giống hệt bản tiếng Anh của
+> chương — bạn có thể gõ theo chúng ngay bây giờ. Bản dịch đầy đủ sẽ thay thế trang này.
 
-Webhooks cần điều đó. Analytics cũng vậy, live dashboard cũng vậy, và — ít tha
-thứ nhất — metering, thứ FR-ANL-06 yêu cầu phải khớp với operational data trong
-sai số 0.1%. Tất cả chúng là consumers của một thứ platform chưa produce:
-**một event cho mỗi state change**.
-
-Cách hiển nhiên để produce nó dài hai dòng, và sai. Không phải sai tinh vi,
-không phải sai ở scale — mà sai theo cách âm thầm làm mất data, vào một ngày
-đẹp trời, trên một máy đang healthy. Chương này bắt đầu bằng việc làm nó mất
-một event ngay trước mắt bạn.
-
-<SkipAhead locale="vi">
-
-Nếu bạn buộc phải đọc lướt: table `outbox` nhập vào schema — lần này được quote
-từ SAD §6.1 thay vì derived — với partial index trên unpublished rows. Event row
-được viết bên trong transaction viết message, chỉ trên inserted branch, nên một
-recognised idempotent retry không sinh event thứ hai. Một relay bên trong api
-drain nó bằng `SELECT … FOR UPDATE SKIP LOCKED`, publish tới JetStream, và mark
-rows là published *sau khi* broker acknowledge — nghĩa là delivery trở thành
-at-least-once, vĩnh viễn và cố ý. Ordering **không** được guarantee; `data.seq`
-mới là thứ order messages. Trạng thái cuối chương là tag **`part3-ch3`**.
-
-</SkipAhead>
-
-## Phiên bản hai dòng, và window bên trong nó
-
-Đây là toàn bộ bug, viết theo cách bất kỳ ai cũng sẽ viết đầu tiên:
+## The two-line version, and the window inside it
 
 ```ts title="the naive version (excerpt)"
 const message = await repo.sendMessage(channelId, body);   // commits
 await publisher.publish(eventFor(message));                // then publishes
 ```
-
-Không có gì trong hai dòng đó là cẩu thả. Chúng chạy đúng order — commit trước,
-nên không event nào mô tả một message đã rollback. Trong codebase thật sẽ có
-error handling quanh chúng. Chúng hoạt động.
-
-Chúng hoạt động *gần như* luôn luôn, và đó là vấn đề.
-
-<Figure
-  caption="Dual-write problem. Giữa commit và publish có một window nơi message đã tồn tại còn event thì chưa — và process chết ở đó không để lại gì nói rằng từng có một event bị nợ."
-  code={figTheGap}
-/>
-
-Chạy walk của chương trong mode đó và kill nó trong gap. Đây không phải thought
-experiment: script print một marker giữa commit và publish, và parent process
-gửi `SIGKILL` ngay khi marker xuất hiện.
 
 ```console
 $ naive, killed in the gap
@@ -78,77 +36,29 @@ MARKER kill-me-now
   [process killed with SIGKILL at the marker]
 ```
 
-Bây giờ nhìn vào thứ nằm trong database:
-
 ```text
 naive  env 0e9d99cb: messages=1 outbox=0
 ```
 
-Một message. Không event. **Và không error ở đâu cả** — không exception nào bị
-throw, không retry queue nào có entry, không log line nào nói có gì sai.
-Webhook của customer sẽ không bao giờ fire cho message đó. Meter sẽ lệch một,
-mãi mãi, và daily reconciliation của FR-ANL-06 sẽ raise alert mà không ai giải
-thích được vì không còn gì để giải thích.
+## What the fourth option costs
 
-Đó là thứ làm failure này khác với các failure Phần 2 đã xử lý. Một WebSocket
-frame bị drop có thể recover — chương 2.7 recover nó từ Postgres, vì Postgres
-vẫn biết. Ở đây Postgres cũng không biết. Evidence chết cùng process.
-
-<Why source="ADR-06 · FR-ANL-06 · NFR-REL-02" locale="vi">
-
-**Vì sao không publish trước, rồi commit?**
-
-Vì nó fail theo hướng ngược lại, và hướng ngược lại tệ hơn.
-
-Publish-before-commit biến lost events thành **phantom** events: broker mang
-`message.created` cho một message mà transaction sau đó rollback. Một webhook
-fire cho message không tồn tại. System của customer tạo record cho nó. Support
-nhận ticket về một message không ai tìm thấy.
-
-Mất một event là vấn đề internal — tệ, im lặng, của chúng ta. Invent ra một
-event là lời nói dối hướng *ra ngoài*, tới system của customer, rồi system đó
-sẽ sai theo những cách chúng ta không thể thấy hoặc fix. Khi phải chọn giữa hai
-failure modes, industry chọn cái internal, và ADR-06 record lựa chọn đó.
-
-Lựa chọn thứ ba là ngừng chọn giữa hai cái đó. Đó là việc outbox làm.
-
-</Why>
-
-## Cái giá của lựa chọn thứ tư
-
-ADR-06 cân bốn designs, và đáng nhìn vào design bị reject vì lý do
-*operational* thay vì correctness, vì đó là kiểu rejection series này đang cố
-dạy.
-
-**Change-data-capture** — tail write-ahead log của Postgres bằng thứ như
-Debezium rồi derive events từ đó — về mặt architecture là câu trả lời đúng nhất
-có sẵn. WAL *đã là* transactional event log; derive events từ nó nghĩa là event
-và state change không thể disagree, vì chúng là cùng bytes.
-
-Nó vẫn bị reject. Debezium nghĩa là chạy Kafka Connect hoặc equivalent, mapping
-schema sang events trong configuration, và coupling vào một WAL format không
-phải public API. Đó là một operational subsystem lớn hơn vấn đề nó giải, lại do
-một người vận hành (driver D8).
-
-Outbox khoảng năm mươi dòng: một `INSERT` bên trong transaction, và một loop
-làm `SELECT … FOR UPDATE SKIP LOCKED`, publish, rồi mark. Asymmetry đó — năm
-mươi dòng so với một subsystem — là toàn bộ argument, và ADR-06 gọi tên volume
-nơi argument ngừng đúng (~50k events/s, lúc đó team đã đủ lớn để chạy Debezium).
-
-## Table, được quote thay vì invent
-
-Lần đầu trong Phần 3, schema không phải derivation. SAD §6.1 define thẳng table
-này, nên chương có thể quote nó:
+## The table, quoted rather than invented
 
 ```diff title="services/api/src/db/schema.ts"
-@@ -1,5 +1,6 @@
+@@ -1,8 +1,9 @@
  import { sql } from "drizzle-orm";
  import {
 +  bigserial,
    bigint,
    check,
    index,
-@@ -20,9 +21,9 @@ import {
+   integer,
+   jsonb,
+   pgTable,
+@@ -17,15 +18,15 @@ import {
+ // The TS twin of SAD §6.1 (ADR-16). The schema now exists twice — once as
+ // the SAD's SQL truth, once here — and that drift risk is checked, not
+ // assumed away: drizzle-kit GENERATES the migration SQL from these
  // definitions, and the generated SQL is reviewed against §6.1 before the
  // runner applies it. The four tenant-bearing tables reproduce §6.1
  // column-for-column, constraints and DR citations included. Deliberately
@@ -157,16 +67,22 @@ này, nên chương có thể quote nó:
 -// partitioning (SAD growth note -> retention chapter).
 +// absent, with named arrivals: message_edits (edit chapter), emoji/media
 +// tables (their parts), messages partitioning (SAD growth note -> retention
-+// chapter). The outbox arrived in the outbox chapter and is at the bottom of this file.
++// chapter). The outbox arrived in 3.3 and is at the bottom of this file.
  
  // The tenancy hierarchy. Everything from here to `members`
  // below sits ABOVE the environment boundary: these rows say who owns a
-@@ -281,3 +282,46 @@ export const members = pgTable(
+ // platform account, and they are the only tables in this file without an
+ // environment_id. Everything below the boundary carries one and is scoped by
+ // the repository (constitution I).
+@@ -278,6 +279,49 @@ export const members = pgTable(
+   (t) => [
+     primaryKey({ columns: [t.channelId, t.userId] }),
+     // Hot-path index (SAD §6.3): the resume path's "which channels am I in".
      index("members_user_channel").on(t.userId, t.channelId),
    ],
  );
 +
-+// The outbox (ADR-06). For the first time in Part 3 this table is
++// The outbox (chapter 3.3, ADR-06). For the first time in Part 3 this table is
 +// QUOTED rather than derived: SAD §6.1 defines it column-for-column, so nothing
 +// about its shape is a chapter invention.
 +//
@@ -176,14 +92,14 @@ này, nên chương có thể quote nó:
 +// (FR-TEN-06); this one does not, because an outbox row is not tenant data — it
 +// is work the platform owes itself. The environment travels inside `subject`
 +// and `payload`, so a consumer can filter, but nothing reads this table on a
-+// tenant's behalf. Same family of exception as the credentials chapter's unscoped key lookup, and
++// tenant's behalf. Same family of exception as 3.2's unscoped key lookup, and
 +// recorded for the same reason.
 +//
 +// No status column. `published_at IS NULL` is the queue: a row is pending or it
 +// is done, and there is no third state to get stuck in.
 +//
 +// No attempts or last_error. Retry accounting belongs to webhook delivery
-+// (FR-WHK-03/06). This relay retries by not marking a row done.
++// (FR-WHK-03/06, chapter 3.5). This relay retries by not marking a row done.
 +export const outbox = pgTable(
 +  "outbox",
 +  {
@@ -196,7 +112,7 @@ này, nên chương có thể quote nó:
 +    publishedAt: timestamp("published_at", { withTimezone: true }),
 +  },
 +  (t) => [
-+    // DECISION: SAD §6.1 defines this table but no index for it.
++    // DECISION (chapter 3.3): SAD §6.1 defines this table but no index for it.
 +    // The relay's only query is "the oldest rows with published_at IS NULL",
 +    // and without an index that degrades into a full scan over a table which is
 +    // 99.9% published rows. The predicate is PARTIAL on purpose: the index
@@ -210,54 +126,8 @@ này, nên chương có thể quote nó:
 +);
 ```
 
-Ba sự vắng mặt đáng được gọi tên, vì mỗi cái là thứ bạn có thể expect.
-
-<Why source="FR-TEN-06 · constitution I · ADR-18" locale="vi">
-
-**Vì sao table này không có `environment_id`, khi mọi table khác dưới boundary
-đều phải có?**
-
-Vì một outbox row không phải tenant data. Nó là work platform nợ chính nó.
-
-Rule mà nó có vẻ phá là rule thật: FR-TEN-06 đặt `environment_id` trên mọi row
-bên dưới tenant boundary, repository constructor từ chối tồn tại nếu thiếu nó,
-và isolation suite của chương 2.1 attack column đó và không gì khác. Exception
-cho rule đó không phải thứ nên làm trong im lặng.
-
-Nhưng hãy nhìn ai đọc table này. Không phải request, không phải tenant, không
-phải code path nào customer reach được — chỉ relay, thứ drain events của mọi
-environment vì đó là bookkeeping riêng của platform. Scope nó nghĩa là hoặc một
-relay per environment (một loop per tenant, vô lý ngay từ tenant thứ hai), hoặc
-một scoped query rồi lập tức tự unscope, tức là tuân thủ rule trên chữ nghĩa và
-phá nó trên tinh thần.
-
-Environment vẫn đi theo — trong subject và payload — nên consumers filter theo
-nó và một foreign event address được tới đúng một tenant. Thứ biến mất là
-*ảo tưởng* rằng table này scoped.
-
-Đây là exception thứ hai kiểu này trong Phần 3, sau key lookup của 3.2, và cả
-hai đều được viết xuống trong schema ngay cạnh column bị thiếu. Một exception
-không giải thích cho isolation rule là cách isolation rules bị bào mòn: người
-tiếp theo thấy một table không có column, kết luận rule chỉ là advisory, rồi bỏ
-nó khỏi một table thật sự cần nó.
-
-</Why>
-
-**Không status column.** `published_at IS NULL` *chính là* queue. Một row hoặc
-pending hoặc done; không có state thứ ba để row mắc kẹt, và không có enum để năm
-sau thêm value thứ tư.
-
-**Không attempts counter, không last error, không dead-letter table.** Đó là
-retry accounting, nó thuộc về webhook delivery (FR-WHK-03, FR-WHK-06), và là
-của chương 3.5. Relay này retry bằng cách *không mark row là done*, việc đó
-không cần column nào cả.
-
-Thứ duy nhất §6.1 không define là index, nên phần đó là chapter decision và nói
-rõ trong schema. Nó là partial — chỉ cover rows relay đọc — đó là điều làm việc
-giữ published rows lại gần như không tốn gì.
-
 ```sql title="services/api/migrations/0004_outbox.sql"
--- The transactional outbox (ADR-06).
+-- Chapter 3.3 — the transactional outbox (ADR-06).
 --
 -- REVIEW DISPOSITION: drizzle-kit generated this file from schema.ts and it was
 -- read line by line before being applied (the ADR-16 workflow). Nothing was
@@ -275,7 +145,7 @@ giữ published rows lại gần như không tốn gì.
 --
 -- Deliberately absent: any status enum, attempts counter or last_error column.
 -- `published_at IS NULL` is the whole queue, and retry accounting belongs to
--- webhook delivery in the webhook dispatcher chapter.
+-- webhook delivery in chapter 3.5.
 
 CREATE TABLE "outbox" (
 	"id" bigserial PRIMARY KEY NOT NULL,
@@ -288,13 +158,13 @@ CREATE TABLE "outbox" (
 CREATE INDEX "outbox_unpublished" ON "outbox" USING btree ("created_at") WHERE "outbox"."published_at" IS NULL;
 ```
 
-## Event commit cùng message
-
-Đây là change fix bug. Nó là một `INSERT`, và toàn bộ sức mạnh của nó đến từ
-việc nó nằm ở phía nào của `COMMIT`.
+## The event commits with the message
 
 ```diff title="services/api/src/db/repository.ts"
-@@ -13,8 +13,10 @@ import {
+@@ -10,14 +10,16 @@ import {
+   environments,
+   humans,
+   members,
    memberships,
    messages,
    organisations,
@@ -305,12 +175,18 @@ việc nó nằm ở phía nào của `COMMIT`.
  import {
    mintApiKey,
    parseApiKeyCredential,
-@@ -218,6 +220,87 @@ export async function environmentSigningSecret(
+   prefixMatchesKind,
+   secretMatches,
+   type EnvironmentKind,
+@@ -215,12 +217,93 @@ export async function environmentSigningSecret(
+     })
+     .from(environments)
+     .where(eq(environments.id, environmentId));
    return row ?? null;
  }
  
 +// ---------------------------------------------------------------------------
-+// The outbox drain (ADR-06). Part of the ADMIN surface for the
++// The outbox drain (chapter 3.3, ADR-06). Part of the ADMIN surface for the
 +// same reason the credential lookup is: it runs on behalf of the platform
 +// rather than of a tenant, and it is deliberately NOT scoped by environment —
 +// one relay drains every environment's events, because an outbox row is work
@@ -393,7 +269,13 @@ việc nó nằm ở phía nào của `COMMIT`.
  /** What a signup produced — or found. `created` answers "was an organisation
   * created on this call?", NOT "was the identity new": a known human who owned
   * nothing gets `created: true`, because one really was created for them. */
-@@ -599,11 +682,18 @@ export class Repository {
+ export interface Provisioned {
+   organisation: { id: string; name: string };
+   application: { id: string; name: string };
+@@ -596,17 +679,24 @@ export class Repository {
+    * `duplicate: true` — FR-MSG-04's "201-equivalent semantics".
+    */
+   async sendMessage(
      channelId: string,
      {
        userId,
@@ -403,7 +285,7 @@ việc nó nằm ở phía nào của `COMMIT`.
        idempotencyKey,
      }: {
        userId?: string;
-+      /** The sender as a CONSUMER will see them. Threaded from the
++      /** Chapter 3.3: the sender as a CONSUMER will see them. Threaded from the
 +       * caller rather than looked up here — the internal route already holds it
 +       * (it is the token's subject), and an extra SELECT inside the write
 +       * transaction is a cost every message would pay forever. Absent on the
@@ -412,13 +294,19 @@ việc nó nằm ở phía nào của `COMMIT`.
        text: string;
        metadata?: unknown;
        idempotencyKey?: string;
-@@ -669,12 +759,46 @@ export class Repository {
+     },
+   ): Promise<MessageRow> {
+     return this.db.transaction(async (tx) => {
+@@ -666,18 +756,52 @@ export class Repository {
+       // The sequence is spent only by a message that actually landed.
+       await tx
+         .update(channels)
          .set({ lastSequence: seq })
          .where(eq(channels.id, channel.id));
  
 +      const createdAt = toIso(inserted[0]!.createdAt);
 +
-+      // THE EVENT COMMITS WITH THE MESSAGE (ADR-06).
++      // THE EVENT COMMITS WITH THE MESSAGE (chapter 3.3, ADR-06).
 +      //
 +      // This insert is inside the transaction that already guards the write, so
 +      // the two share a fate: no message without its event, no event without
@@ -460,24 +348,13 @@ việc nó nằm ở phía nào của `COMMIT`.
        };
      });
    }
+ 
+   /** Fetch a message by its idempotency key within a channel — the
+    * recovery leg of 2.3's duplicate-recognised path. The channel join
 ```
 
-Hai chi tiết trong đó quan trọng hơn vẻ ngoài của chúng.
-
-**Nó chỉ nằm trên inserted branch.** Chương 2.3 dạy write path nhận ra retry:
-present cùng idempotency key và bạn nhận lại original message, còn sequence
-không bị consume vì không có gì được viết. Event được viết trên branch đó nghĩa
-là client retry trên flaky link fire *hai* webhooks cho một message — đúng loại
-duplicate mà 2.3 tồn tại để ngăn, được reintroduce lên một layer. Có test cho
-việc đó, và đó là invariant tôi sẽ giữ nếu chỉ được giữ một cái.
-
-**Envelope được build complete, bên trong transaction.** Relay không thêm gì
-sau đó: không timestamp, không id, không field. Đó không phải tidiness — đó là
-thứ làm republished event byte-identical với attempt đầu tiên, tức là thứ khiến
-deduplication hoạt động được.
-
 ```ts title="services/api/src/outbox/event.ts"
-// The event envelope. Built in ONE place, complete, inside the
+// The event envelope (chapter 3.3). Built in ONE place, complete, inside the
 // transaction that caused it — so the relay is a mover of bytes and never an
 // author of them (ADR-04, research R7).
 //
@@ -517,7 +394,7 @@ export interface PendingEvent {
 
 /** `events.msg.created.{environment_id}` — the shape SAD §6.1's own comment
  * gives. The full subject taxonomy for FR-WHK-02's other seven types, and any
- * per-environment sharding, belongs to the broker chapter. */
+ * per-environment sharding, belongs to chapter 3.4. */
 export function subjectFor(type: string, environmentId: string): string {
   const leaf = type.replace(/^message\./, "msg.");
   return `events.${leaf}.${environmentId}`;
@@ -550,13 +427,6 @@ export function messageCreatedEvent({
 }
 ```
 
-<Figure
-  caption="Outbox. Event commit cùng message, nên hai thứ chung số phận; một relay riêng move rows tới broker và chỉ mark chúng sau khi broker acknowledge."
-  code={figOutbox}
-/>
-
-Bây giờ cùng cú kill đó, ở cùng chỗ đó, với phiên bản này:
-
 ```console
 $ outbox, killed in the gap
 environment                c0f83026-0e9b-4094-92e4-90ad5c7a7faf
@@ -571,22 +441,6 @@ MARKER kill-me-now
 outbox env c0f83026: messages=1 outbox=1 unpublished=1
 ```
 
-Event sống sót qua process lẽ ra sẽ publish nó. Không gì mất, không cần
-operator, và relay tiếp theo chạy sẽ gửi nó.
-
-<Trap locale="vi">
-
-Tôi viết test đó bằng một thrown exception trước — simulate crash, assert event
-sống sót. Nó pass ngay, và không chứng minh gì cả.
-
-Exception chạy error path của bạn. `finally` blocks chạy. Connection pools
-drain. Transactions rollback *cleanly*, đúng behavior đang được test và cũng
-đúng thứ crash thật không làm. Một test simulate crash bằng cách throw đang test
-cách code cư xử lịch sự, không phải durability của nó.
-
-Vì vậy crash là crash thật: một child process, và `SIGKILL` từ parent ngay khi
-child nói nó đang ở trong gap.
-
 ```ts title="services/api/src/outbox/outbox.itest.ts (excerpt)"
 child.stdout.on("data", (chunk: Buffer) => {
   out += chunk.toString();
@@ -597,14 +451,7 @@ child.stdout.on("data", (chunk: Buffer) => {
 });
 ```
 
-`SIGKILL`, không phải `process.exit()`, vì cùng lý do: process exit cooperative
-có cơ hội flush, và flush là thứ đang bị bác bỏ.
-
-</Trap>
-
-## Relay, và ordering quan trọng
-
-Loop nhỏ hơn argument dành cho nó:
+## The relay, and the ordering that matters
 
 ```ts title="services/api/src/outbox/relay.ts"
 import type { Logger } from "@relay/service-kit";
@@ -613,7 +460,7 @@ import type { Db } from "../db/client";
 import { drainOutbox } from "../db/repository";
 import { publishPending, type Publisher } from "./publisher";
 
-// The relay (ADR-06): the loop that moves committed events to the
+// The relay (chapter 3.3, ADR-06): the loop that moves committed events to the
 // broker. It owns no state of its own — its entire progress is visible in the
 // table it drains, which is what makes "promotable to its own deployment" true
 // rather than aspirational.
@@ -706,26 +553,7 @@ export function createRelay({
 }
 ```
 
-`FOR UPDATE SKIP LOCKED` là dòng cần nhìn. Hai api instances là deployment
-*bình thường* — service stateless và chạy hơn một bản — nên hai relays drain
-một table là normal case, không phải edge case. `SKIP LOCKED` khiến các
-competing drainers bước vòng qua rows mà nhau đã claim thay vì queue phía sau,
-nghĩa là horizontal scaling là property của query này chứ không phải của một
-leader election không ai muốn vận hành.
-
-Dòng còn lại là order của hai bước cuối: **publish, rồi mark**. Làm ngược lại
-và crash giữa hai bước sẽ lại làm mất event, tức cùng bug đội một cái mũ khác.
-Làm theo cách này nghĩa là crash ở giữa sẽ *republish* — row chưa từng được
-mark, nên pass tiếp theo gửi nó lần thứ hai.
-
-Đó là at-least-once, và nó là vĩnh viễn. Cách ADR-06 diễn đạt đáng được dùng:
-embraced, không phải mitigated.
-
-## At-least-once yêu cầu gì từ những người khác
-
-Duplicate phải được absorb ở đâu đó, và "đâu đó" là consumer. Mọi event mang
-một `id` sống sót qua republish, và consumer ignore nó thì broken bất kể relay
-này cẩn thận thế nào:
+## What at-least-once asks of everybody else
 
 ```json title="the event envelope (excerpt)"
 {
@@ -737,53 +565,9 @@ này cẩn thận thế nào:
 }
 ```
 
-Id đó được generate trong transaction và stored trong row, nên republish gửi
-*cùng* key thay vì một key mới. Nó cũng được đưa cho JetStream làm deduplication
-id của message, thứ collapse common case bên trong dedupe window của broker —
-nhưng window đó là convenience, không phải guarantee. Guarantee là field.
+## Why there are two paths now
 
-**Và đây là thứ có khả năng làm bạn đau sau này nhất: chương này không promise
-event ordering.** Hai relays publish concurrently có thể interleave. Một batch
-fail giữa chừng republish từ một điểm sớm hơn. Không có gì trong SRS yêu cầu
-ordered events, và build ordering guarantee vào một `SKIP LOCKED` drain nghĩa
-là từ bỏ property giúp nó scale.
-
-Thứ *có* ordered là messages trong một channel, theo `data.seq`, đúng như
-FR-MSG-03 và ADR-03 đã promise từ chương 2.2. Consumer cần order nên đọc field
-đó. Consumer infer order từ arrival cuối cùng sẽ sai, và ngày nó sai sẽ không
-trông giống bug trong consumer.
-
-## Vì sao bây giờ có hai paths
-
-Chương 2.6 đã build một cách để nói với máy khác rằng một message đã xảy ra:
-Redis pub/sub, một subject per channel. Hỏi vì sao chương này không dùng luôn
-nó là hoàn toàn hợp lý.
-
-<Figure
-  caption="Hai delivery paths, một cách cố ý. Live frames là at-most-once vì resume có thể recover chúng; durable events là at-least-once vì không còn gì khác recover được."
-  code={figTwoGuarantees}
-/>
-
-Chúng trả lời hai câu hỏi khác nhau. Redis pub/sub là **at-most-once** by design
-(ADR-07): nếu không gateway nào subscribed vào channel tại khoảnh khắc publish,
-frame biến mất, và điều đó ổn — client reconnect, present cursor, và backfill
-của chương 2.7 đưa cho nó mọi thứ đã miss từ Postgres. Chi phí của một live
-frame bị drop bị bound bởi resume.
-
-Event không có resume. Nếu một `message.created` không bao giờ reach webhook
-dispatcher, không customer system nào notice gap rồi hỏi xin nó; webhook đơn
-giản là không bao giờ fire và meter âm thầm sai. Vì vậy path này là
-**at-least-once**, durable, và chậm hơn — seconds thay vì milliseconds, vẫn nằm
-thoải mái trong budget 60 giây của FR-ANL-04.
-
-Cùng event, hai paths, hai guarantees, vì hậu quả của loss ở hai bên không như
-nhau.
-
-## Broker không được phép quan trọng
-
-Một event spine kéo write path chết cùng nó còn tệ hơn không có event spine. Vì
-vậy relay connect lazily, api start dù broker có reachable hay không, và publish
-failure để rows nguyên chỗ cũ.
+## The broker is not allowed to matter
 
 ```ts title="services/api/src/outbox/jetstream.publisher.ts"
 import {
@@ -794,7 +578,7 @@ import {
 
 import type { Publisher, PublishedMessage } from "./publisher";
 
-// The one adapter that knows what a broker is (ADR-02).
+// The one adapter that knows what a broker is (chapter 3.3, ADR-02).
 //
 // Everything upstream of this file speaks in subjects and payloads; swapping
 // JetStream for something else means writing another file like this one and
@@ -808,7 +592,7 @@ export const DEFAULT_NATS_URL = "nats://localhost:4222";
  * fire-and-forget, and the chapter's claim would be false at the last hop.
  *
  * The real design of the subject space — FR-WHK-02's full event-type list,
- * per-environment sharding, retention, replicas — belongs to the broker chapter along
+ * per-environment sharding, retention, replicas — belongs to chapter 3.4 along
  * with every consumer. */
 const STREAM = "EVENTS";
 const SUBJECTS = ["events.>"];
@@ -864,10 +648,6 @@ export function createJetStreamPublisher({
 }
 ```
 
-Failure matrix của SAD §7 đã claim behavior này — "broker down, events
-accumulate in Postgres, relay drains on recovery". Những claim như vậy đáng
-được chạy:
-
 ```console
 $ docker compose stop nats
 $ node scripts/dual-write-walk.mjs --mode=outbox --messages=3
@@ -882,41 +662,105 @@ events published           4
 outbox rows waiting        0
 ```
 
-Ba events đợi qua outage; event thứ tư đến sau outage; cả bốn publish mà không
-ai làm gì. Con số operator theo dõi là `count(*)` đó — outbox depth — và nó là
-signal duy nhất đáng alarm khi việc vận hành thứ này trở thành job của ai đó.
+## The check that refused this table
 
-## Những gì chương này cố ý để lại sau
+```text title="the structural check, on the first table added after it"
+these tables have no path to an environment: outbox. Add environment_id, add a
+foreign key to a table that has one, or add it to SPINE in db/catalogue.ts with
+a reason.
+```
 
-**Subject taxonomy, streams, và mọi consumer (3.4).** Chương này tạo một stream
-trên `events.>` vì publisher cần chỗ để publish và relay trỏ vào hư không không
-chứng minh được gì. Bảy event types còn lại của FR-WHK-02, per-environment
-sharding, retention, và durable pull consumer đầu tiên là của chương sau, và
-design chúng ở đây nghĩa là design chúng hai lần.
+```diff title="services/api/src/db/catalogue.ts"
+@@ -49,12 +49,29 @@ const SPINE: ReadonlyArray<readonly [string, string]> = [
+   ],
+   ["memberships", "joins humans to organisations, above the environment level"],
+   [
+     "schema_migrations",
+     "the migration ledger; it predates tenancy and belongs to the database",
+   ],
++  // THE FIRST TABLE THIS CHECK HAS ACTUALLY REFUSED, and it refused it correctly.
++  //
++  // An outbox row is not a tenant's record — it is work the platform owes itself. The
++  // environment travels inside `subject` and `payload`, so a consumer can filter, but
++  // nothing reads this table on a tenant's behalf and no request path joins it.
++  //
++  // THAT ARGUMENT IS ABOUT READS, AND IT DOES NOT COVER RETENTION. The payload is a
++  // full copy of the message, `text` included, and the relay marks rows published
++  // rather than deleting them. So a message deleted from `messages` still has its words
++  // in here, and nothing on this platform removes them. That is a real gap, it is not a
++  // tenancy gap, and it is recorded here rather than argued away — the chapter that owns
++  // per-environment retention owns the fix.
++  [
++    "outbox",
++    "work the platform owes itself rather than a tenant's record; the environment " +
++      "travels in `subject` and `payload` and no read path joins it",
++  ],
+ ];
+ 
+ /** The spine, for anyone who needs to state it rather than derive it. */
+ export const SPINE_TABLES: readonly string[] = SPINE.map(([t]) => t);
+ 
+ export interface CatalogueRow extends Record<string, unknown> {
+```
 
-**Webhook delivery, signing, retry tiers và dead-lettering (3.5).** Lý do table
-này không có column `attempts`.
+## The suites could not run alongside each other
 
-**Pruning.** ADR-06 gọi việc delete published rows là trivial, và đúng vậy —
-nhưng nó cần scheduler mà platform này chưa có, và invent một scheduler để
-delete rows hiện gần như không tốn gì (index là partial) sẽ là làm việc chỉ để
-có việc.
+```text title="the same error, from inside one package"
+duplicate key value violates unique constraint "pg_type_typname_nsp_index"
+duplicate key value violates unique constraint "pg_class_relname_nsp_index"
+```
 
-**Reconciliation job của FR-ANL-06.** Câu hỏi "làm sao ai đó biết nếu event bị
-missing?" bây giờ có câu trả lời — compare message counts với event counts, cả
-hai đều ở trong Postgres — nhưng job hỏi câu đó hằng ngày thuộc về analytics
-path trong Phần 4.
+```diff title="services/api/vitest.integration.config.mts"
+@@ -5,8 +5,20 @@ import { defineConfig } from "vitest/config";
+ // config is what `pnpm --filter @relay/api test:integration` runs against
+ // the compose Postgres. (.mts because this package compiles to CommonJS —
+ // a .ts config would be loaded as CJS, which vitest refuses.)
+ export default defineConfig({
+   test: {
+     include: ["src/**/*.itest.ts"],
++    // ONE FILE AT A TIME, BECAUSE THEY SHARE ONE DATABASE.
++    //
++    // Every suite here runs migrations before it starts. Vitest runs FILES in parallel
++    // by default, so several of them issue `CREATE TYPE` against the same schema at the
++    // same moment and Postgres answers `duplicate key value violates unique constraint
++    // "pg_type_typname_nsp_index"` — an error about its own catalogue, which reads like
++    // a driver fault and is not one.
++    //
++    // It only bites when a migration is PENDING. With the schema already applied every
++    // suite finds nothing to do and the race has no window, which is why serialising the
++    // turbo tasks was enough until this chapter added a table.
++    fileParallelism: false,
+   },
+ });
+```
 
-<ForwardRef part="Phần 3 và Phần 4" locale="vi">Event type duy nhất tồn tại ở
-đây, `message.created`, là event duy nhất platform hiện có thể produce: nó là
-public state change duy nhất có route. Bảy cái còn lại đến cùng features của
-chúng, và shape của envelope — năm fields, lần nào cũng giống nhau — là thứ làm
-việc thêm một event trở thành additive thay vì redesign.</ForwardRef>
+```diff title="services/gateway/vitest.integration.config.mts"
+@@ -4,8 +4,20 @@ import { defineConfig } from "vitest/config";
+ // established for the api: *.itest.ts is invisible to the Docker-free unit
+ // include, and this config is what `pnpm --filter @relay/gateway
+ // test:integration` runs against the compose Redis.
+ export default defineConfig({
+   test: {
+     include: ["src/**/*.itest.ts"],
++    // ONE FILE AT A TIME, BECAUSE THEY SHARE ONE DATABASE.
++    //
++    // Every suite here runs migrations before it starts. Vitest runs FILES in parallel
++    // by default, so several of them issue `CREATE TYPE` against the same schema at the
++    // same moment and Postgres answers `duplicate key value violates unique constraint
++    // "pg_type_typname_nsp_index"` — an error about its own catalogue, which reads like
++    // a driver fault and is not one.
++    //
++    // It only bites when a migration is PENDING. With the schema already applied every
++    // suite finds nothing to do and the race has no window, which is why serialising the
++    // turbo tasks was enough until this chapter added a table.
++    fileParallelism: false,
+   },
+ });
+```
 
-## Các tests, và thứ chúng giữ
+## What this chapter leaves for later, on purpose
 
-Mười hai invariants. Chín cái chạy against Postgres, hai cái pure, và một cái
-dựa trên crash test:
+## The tests, and what they hold
 
 ```console
 $ pnpm --filter @relay/api test:integration src/outbox/outbox.itest.ts
@@ -933,11 +777,6 @@ $ pnpm --filter @relay/api test:integration src/outbox/outbox.itest.ts
 ✓ a failing publisher leaves the row pending rather than losing it
 Tests  11 passed (11)
 ```
-
-Invariant 6 là cái bất thường: một test có job chứng minh phiên bản *broken*
-vẫn broken. Nếu naive walk một ngày nào đó ngừng làm mất event, argument của
-chương này đã âm thầm không còn đúng, và tôi muốn biết điều đó từ red test hơn
-là từ reader.
 
 ```ts title="services/api/src/outbox/outbox.itest.ts"
 import "reflect-metadata";
@@ -958,7 +797,7 @@ import { createJetStreamPublisher } from "./jetstream.publisher";
 import { createRelay } from "./relay";
 import type { Publisher, PublishedMessage } from "./publisher";
 
-// The outbox, against the real database. Invariants 1-4, 7-8 and
+// The outbox, against the real database (chapter 3.3). Invariants 1-4, 7-8 and
 // 11 live here; the crash cases (5, 6, 10) and the broker outage (9) are added
 // below, because both need a process to kill or a container to stop.
 //
@@ -1096,7 +935,7 @@ describe("the outbox", () => {
       userId: tuan.id,
       userExternalId: "tuan",
     });
-    // The key-authenticated public send is unattributed (the credentials chapter's recorded bound),
+    // The key-authenticated public send is unattributed (3.2's recorded bound),
     // which is a CONTENT difference, not a shape one.
     await repo.sendMessage(channelId, { text: "through REST" });
     const rows = (await unpublishedFor(db, env.id)).slice(before.length);
@@ -1409,9 +1248,6 @@ async function outboxDepthFor(db: Db, environmentId: string): Promise<number> {
 }
 ```
 
-Để check suite thật sự giữ được điều gì, move outbox insert ra ngoài transaction
-rồi chạy lại:
-
 ```text
 × invariant 1: a committed message leaves exactly one outbox row
 × invariant 3: a recognised idempotent retry adds no second event
@@ -1423,17 +1259,10 @@ rồi chạy lại:
 7 failed
 ```
 
-Bảy trên mười một. Một one-line change ở vị trí của một `INSERT` phá phần lớn
-claims của chương này — đó là mức sensitivity đúng cho một suite guard một
-durability property.
-
-## Phần còn lại của blast radius
-
-Lần này nhỏ. Event path được thêm vào thay vì retire một seam, nên những files
-các chương trước đã fence thay đổi theo cách vừa một màn hình:
+## The rest of the blast radius
 
 ```ts title="services/api/src/outbox/publisher.ts"
-// The port. ADR-06's quieter payoff is that the outbox is "the
+// The port (chapter 3.3). ADR-06's quieter payoff is that the outbox is "the
 // abstraction seam that makes ADR-02 reversible": every event originates in a
 // Postgres table with a subject and a payload, and *which broker* is a relay
 // configuration detail. That sentence is only true if the seam exists in the
@@ -1482,7 +1311,7 @@ import { createDb, createPool, type Db } from "../db/client";
 import { createJetStreamPublisher } from "./jetstream.publisher";
 import { createRelay, type Relay } from "./relay";
 
-// The relay's home. It lives INSIDE the api service because
+// The relay's home (chapter 3.3). It lives INSIDE the api service because
 // ADR-06 put it there — "a small loop inside the API service initially,
 // promotable to its own deployment if outbox depth alarms fire". Promoting it
 // would mean moving this file and nothing else: the loop reads a table and
@@ -1534,7 +1363,10 @@ export class OutboxModule {}
 ```
 
 ```diff title="services/api/src/app.module.ts"
-@@ -10,6 +10,7 @@ import { AuthenticateMiddleware } from "./auth/authenticate.middleware";
+@@ -7,23 +7,30 @@ import { APP_FILTER } from "@nestjs/core";
+ 
+ import { AuthModule } from "./auth/auth.module";
+ import { AuthenticateMiddleware } from "./auth/authenticate.middleware";
  import { HealthController } from "./health.controller";
  import { InternalModule } from "./internal/internal.module";
  import { MessagesModule } from "./messages/messages.module";
@@ -1542,7 +1374,10 @@ export class OutboxModule {}
  import { TenancyModule } from "./tenancy/tenancy.module";
  import { LOGGER, apiLogger } from "./logger";
  import { ProtocolErrorFilter } from "./protocol-error.filter";
-@@ -20,7 +21,13 @@ import { RequestContextMiddleware } from "./request-context.middleware";
+ import { RequestContextMiddleware } from "./request-context.middleware";
+ 
+ // The application described as a module graph — ADR-15's convention for the
+ // wide surface Phases 2-4 will grow. Registering the error filter as a
  // provider (APP_FILTER) instead of wiring it in main.ts means every entry
  // point — including tests — gets the same error envelope for free.
  @Module({
@@ -1557,10 +1392,16 @@ export class OutboxModule {}
    controllers: [HealthController],
    providers: [
      { provide: LOGGER, useFactory: apiLogger },
+     { provide: APP_FILTER, useClass: ProtocolErrorFilter },
+     RequestContextMiddleware,
+   ],
 ```
 
 ```diff title="services/api/src/main.ts"
-@@ -4,6 +4,7 @@ import { NestFactory } from "@nestjs/core";
+@@ -1,31 +1,39 @@
+ import "reflect-metadata";
+ 
+ import { NestFactory } from "@nestjs/core";
  import { createLogger } from "@relay/service-kit";
  
  import { AppModule } from "./app.module";
@@ -1568,25 +1409,47 @@ export class OutboxModule {}
  
  // Nest's own banner logger stays off: this workspace already decided what a
  // log line looks like (one JSON object, NFR-OBS-01), and the framework does
-@@ -12,6 +13,14 @@ async function bootstrap(): Promise<void> {
+ // not get a second opinion.
+ async function bootstrap(): Promise<void> {
    const app = await NestFactory.create(AppModule, { logger: false });
-   const port = Number(process.env.PORT ?? 4000);
-   await app.listen(port);
-+  // The relay starts AFTER the server is listening, and starting it cannot
-+  // fail: the publisher connects lazily, so an unreachable broker leaves events
-+  // accumulating in Postgres instead of preventing the api from serving writes
-+  // (research R9).
+   const requested = Number(process.env.PORT ?? 4000);
+   await app.listen(requested);
+   // THE PORT IT GOT, NOT THE PORT IT ASKED FOR.
+   //
+-  // `PORT=0` asks the operating system for any free port, which is what a test
+-  // spawning this service should do — a fixed port races whichever sibling suite also
+-  // binds one, and a previous run's child still holding it makes a health check succeed
+-  // against a service that has never heard of this run's data. Three unrelated-looking
+-  // assertions, one fixture.
++  // `PORT=0` asks the operating system for any free port, which is what a test spawning
++  // this service should do — a fixed port races whichever sibling suite also binds one,
++  // and a previous run's child still holding it makes a health check succeed against a
++  // service that has never heard of this run's data. Three unrelated-looking assertions,
++  // one fixture.
+   //
+   // But a parent can only use the number if this process reports it, and logging
+   // `requested` prints 0. So the bound address is read back and logged.
+   const address = app.getHttpServer().address() as { port?: number } | string | null;
+   const port =
+     typeof address === "object" && address !== null ? (address.port ?? requested) : requested;
++  // The relay starts AFTER the server is listening, and starting it cannot fail: the
++  // publisher connects lazily, so an unreachable broker leaves events accumulating in
++  // Postgres instead of preventing the api from serving writes (research R9).
 +  app.get(OutboxRelayService).start();
-+  // Nest calls onModuleDestroy on shutdown hooks; without this the relay's loop
-+  // would outlive the process's intent to stop.
++  // Nest calls onModuleDestroy on shutdown hooks; without this the relay's loop would
++  // outlive the process's intent to stop.
 +  app.enableShutdownHooks();
    createLogger("api").log("info", "listening", { port });
  }
  
+ void bootstrap();
 ```
 
 ```diff title="services/api/src/messages/messages.service.ts"
-@@ -29,16 +29,22 @@ export class MessagesService {
+@@ -26,22 +26,28 @@ import type { HistoryQuery, SendMessageBody } from "./messages.schema";
+ export class MessagesService {
+   constructor(private readonly repo: Repository) {}
+ 
    async send(
      channelId: string,
      body: SendMessageBody,
@@ -1594,10 +1457,10 @@ export class OutboxModule {}
 -     * has no authenticated user yet (its own chapter, Part 3); the
 -     * internal route always knows. */
 +    /** Chapter 2.6: who wrote it. Optional because a key-authenticated public
-+     * send is unattributed (the credentials chapter's recorded bound); the internal route always
++     * send is unattributed (3.2's recorded bound); the internal route always
 +     * knows. */
      userId?: string,
-+    /** The same person as a CONSUMER will see them. The event
++    /** Chapter 3.3: the same person as a CONSUMER will see them. The event
 +     * envelope carries external ids, and the internal route already holds this
 +     * one — it is the token's subject — so threading it costs nothing where a
 +     * lookup inside the write transaction would cost a query per message. */
@@ -1612,23 +1475,35 @@ export class OutboxModule {}
          ...(body.idempotency_key != null && {
            idempotencyKey: body.idempotency_key,
          }),
+       });
+     } catch (error) {
+       if (error instanceof ChannelNotFoundError) {
 ```
 
 ```diff title="services/api/src/internal/internal.controller.ts"
-@@ -75,6 +75,9 @@ export class InternalController {
+@@ -72,12 +72,15 @@ export class InternalController {
+       },
+       // Chapter 2.6: the sender is RESOLVED here and, until now, dropped
+       // here — every socket-written row had user_id NULL. Fan-out cannot
        // build a message.created frame without a sender, so the write path
        // finally records the one it already had in its hand.
        user.id,
-+      // The outbox chapter: and the external id travels too, because the event this
++      // Chapter 3.3: and the external id travels too, because the event this
 +      // write now emits is read by customers, who know users by that name.
 +      userExternalId,
      );
      // `user` is echoed as the EXTERNAL id: internal uuids are ours, and
      // the frame this becomes is client-facing.
+     return { ...message, user: userExternalId };
+   }
+ }
 ```
 
 ```diff title="services/api/package.json"
-@@ -20,6 +20,7 @@
+@@ -17,12 +17,13 @@
+     "@nestjs/core": "^11.1.28",
+     "@nestjs/platform-express": "^11.1.28",
+     "@relay/protocol": "workspace:*",
      "@relay/service-kit": "workspace:*",
      "drizzle-orm": "^0.45.2",
      "jose": "^6.2.7",
@@ -1636,10 +1511,37 @@ export class OutboxModule {}
      "pg": "^8.22.0",
      "reflect-metadata": "^0.2.2",
      "rxjs": "^7.8.2",
+     "zod": "^4.4.3"
+   },
+   "devDependencies": {
+```
+
+```diff title="services/gateway/src/session.itest.ts"
+@@ -112,13 +112,16 @@ async function startApi(): Promise<ApiUnderTest> {
+   const key = await seeder.createApiKey(db, {
+     environmentId: environment.id,
+   });
+ 
+   const port = Number(process.env.RELAY_SESSION_ITEST_API_PORT ?? 4123);
+   const child: ChildProcess = spawn("node", [join(dist, "main.js")], {
+-    env: { ...process.env, PORT: String(port) },
++    // Chapter 3.3: no outbox relay in this child. This suite is about the
++    // socket's credentials; a background loop draining a table that chapter
++    // 3.3's suite is asserting on turns two unrelated test files into a race.
++    env: { ...process.env, PORT: String(port), RELAY_OUTBOX_RELAY: "off" },
+     stdio: ["ignore", "pipe", "pipe"],
+   });
+   const url = `http://127.0.0.1:${port}`;
+   await waitForHealth(`${url}/healthz`);
+ 
+   return {
 ```
 
 ```diff title="services/gateway/package.json"
-@@ -17,6 +17,7 @@
+@@ -14,10 +14,11 @@
+     "@relay/service-kit": "workspace:*",
+     "ioredis": "^6.0.0",
+     "jose": "^6.2.7",
      "ws": "^8.21.1"
    },
    "devDependencies": {
@@ -1647,32 +1549,42 @@ export class OutboxModule {}
      "@types/ws": "^8.18.1",
      "tsx": "^4.23.1"
    }
+ }
 ```
 
 ```diff title="packages/e2e/src/harness.ts"
-@@ -330,7 +330,18 @@ export async function boot({ gateways = 2 } = {}): Promise<System> {
+@@ -327,13 +327,24 @@ export async function boot({ gateways = 2 } = {}): Promise<System> {
+     ...process.env,
+     ...forwarded(
+       "DATABASE_URL",
        "RELAY_POSTGRES_PORT",
        "RELAY_REDIS_URL",
        "RELAY_REDIS_PORT",
-+      // The api's relay needs the broker's address. Forwarded,
++      // Chapter 3.3: the api's relay needs the broker's address. Forwarded,
 +      // never composed here — a harness that invents a URL becomes a second
 +      // source of truth, which is exactly how this suite first failed.
 +      "RELAY_NATS_URL",
 +      "RELAY_NATS_PORT",
      ),
-+    // The api children run WITHOUT the outbox relay. This journey
++    // Chapter 3.3: the api children run WITHOUT the outbox relay. This journey
 +    // asserts message delivery, and a background loop draining the outbox while
-+    // The outbox chapter's own suite asserts on that same table is a race between two test
++    // 3.3's own suite asserts on that same table is a race between two test
 +    // files, not a property of the system. The relay has its own suite, which
 +    // drives it explicitly.
 +    RELAY_OUTBOX_RELAY: "off",
    };
  
    const apiPort = Number(process.env.RELAY_E2E_API_PORT ?? 4100);
+   children.push(
+     capture(
+       "api",
 ```
 
 ```diff title="turbo.json"
-@@ -18,13 +18,16 @@
+@@ -15,19 +15,22 @@
+     },
+     "test": {
+       "dependsOn": ["^build"],
        "inputs": ["$TURBO_DEFAULT$", "$TURBO_ROOT$/compose.yaml"]
      },
      "test:integration": {
@@ -1690,10 +1602,13 @@ export class OutboxModule {}
          "RELAY_E2E_API_PORT"
        ]
      },
+     "//#lint:root": {
+       "inputs": [
+         "**/*.{ts,mts,cts,mjs,js}",
 ```
 
 ```js title="scripts/dual-write-walk.mjs"
-// The the outbox chapter walk: the dual-write problem, and the fix, run side by side.
+// The chapter 3.3 walk: the dual-write problem, and the fix, run side by side.
 //
 //   node scripts/dual-write-walk.mjs --mode=naive
 //   node scripts/dual-write-walk.mjs --mode=outbox
@@ -1709,7 +1624,7 @@ export class OutboxModule {}
 // repeatable test rather than a story. Run by hand with nobody killing it, the
 // script simply carries on and reports what happened.
 //
-// DECISION: the naive publish-after-commit path lives HERE and in
+// DECISION (chapter 3.3): the naive publish-after-commit path lives HERE and in
 // no service. It is a teaching artifact, like split-brain.mjs — fenced, so it
 // cannot quietly stop compiling, and outside services/ so that nobody copying
 // the repository ships the bug (research R5).
@@ -1841,60 +1756,26 @@ if (MODE === "naive") {
 process.exit(0);
 ```
 
-Và một fix-forward, kiểu nợ khác mà một chương phải trả cho bạn. Signup suite
-của chương 3.1 assert rằng failed provisioning để *global* organisation count
-không đổi. Nó pass hai chương rồi fail ở đây với `expected 884 to be 883`, vì
-crash tests của 3.3 spawn child processes tự provision tenants của chúng trong
-lúc nó chạy. Count chưa bao giờ là evidence — assertion ngay dưới đó hai dòng,
-rằng không organisation nào tên `doomed org` sống sót, mới luôn là thứ gánh
-trọng lượng. Global count biến mất:
-
 ```diff title="services/api/src/tenancy/signup.itest.ts"
-@@ -152,9 +152,6 @@ describe("signup", () => {
-   });
- 
-   it("writes the full set or nothing when provisioning fails (invariant 1)", async () => {
--    const before = await db.execute(
--      `SELECT count(*)::int AS n FROM organisations`,
--    );
-     // Force a failure inside the transaction, after the organisation insert:
-     // an organisation name that is fine and a provider value the CHECK
-     // constraint refuses.
-@@ -165,14 +162,14 @@ describe("signup", () => {
-         organisationName: "doomed org",
-       }),
-     ).rejects.toThrow();
--    const after = await db.execute(
--      `SELECT count(*)::int AS n FROM organisations`,
--    );
--    // Nothing survived — no half-built tenant, which is the whole point of the
--    // single transaction.
--    expect((after.rows[0] as { n: number }).n).toBe(
--      (before.rows[0] as { n: number }).n,
--    );
-+    // REVISED by the outbox chapter: this used to count ALL organisations before and
-+    // after and assert the totals matched. That is a global assertion in a lane
-+    // where other suites create tenants concurrently — it passed for two
-+    // chapters and then failed with "expected 884 to be 883" the day the outbox chapter's
-+    // crash tests started spawning child processes that provision their own.
-+    // The precise assertion below was always the one carrying the weight: the
-+    // doomed organisation must not survive its transaction. A count of
-+    // everything was never evidence about this rollback.
-     const orphan = await db.execute(
-       `SELECT count(*)::int AS n FROM organisations WHERE name = 'doomed org'`,
-     );
+@@ -157,12 +157,17 @@ describe("signup", () => {
+     // This read `SELECT count(*) FROM organisations` before and after and asserted the
+     // two matched. That is a GLOBAL claim about a LOCAL operation: any other suite that
+     // provisions a tenant between the two reads breaks it, and the failure —
+     // `expected 452 to be 451` — says nothing about a neighbour. The isolation
+     // fixtures seed two tenants and did exactly that.
+     //
++    // THE OUTBOX CHAPTER WOULD HAVE FORCED THE SAME FIX. Its crash tests spawn child
++    // processes that provision their own tenants, which moves the same count from the
++    // same direction. Two unrelated chapters arriving at one defect is how you know the
++    // assertion was wrong rather than unlucky.
++    //
+     // What invariant 1 actually claims is that the failed transaction left NOTHING
+     // behind. That is a question about one organisation, and the test above already
+     // asks its questions that way.
+     await expect(
+       provisionOrganisation(db, {
+         provider: "not-a-provider",
 ```
-
-Change trong `turbo.json` đáng có một câu, vì đó là bug chương này tìm thấy chứ
-không phải bug nó gây ra. Hai suites bây giờ spawn child process từ
-`services/api/dist` — các socket cases của gateway từ 3.2 và crash test của
-chương này — và `nest build` xóa output directory trước khi rebuild. Integration
-task depended on `^build` (build của dependencies) nhưng không depends on
-`build` (build của chính nó), nên build của api có thể chạy *trong khi* tests
-của api đang đọc `dist`, và child chết với `ERR_MODULE_NOT_FOUND`. Nó đã latent
-từ 3.2 và chỉ surfaced khi suite thứ hai cần cùng các files đó.
-
-<Checkpoint tag="part3-ch3" locale="vi">
 
 ```bash
 docker compose up -d --wait postgres redis nats
@@ -1908,20 +1789,9 @@ RELAY_POSTGRES_PORT=15432 RELAY_REDIS_PORT=16379 RELAY_NATS_PORT=14222 \
   RELAY_NATS_URL="nats://localhost:14222" pnpm test:integration
 ```
 
-Expected: **120 unit tests**, **87 integration tests**, tất cả green — bao gồm
-journey của chương 2.8, không đổi.
-
-Rồi nhìn bug xảy ra, và sau đó không xảy ra:
-
 ```bash
 node scripts/dual-write-walk.mjs --mode=naive
 node scripts/dual-write-walk.mjs --mode=outbox
 ```
-
-Expected: cả hai publish khi không ai interrupt chúng. Kill bất kỳ run nào giữa
-dòng `MARKER` và publish — naive run để lại một message không có record rằng
-một event từng bị nợ; outbox run để lại một row đang chờ.
-
-</Checkpoint>
 
 <ChapterFooter id="3.5" locale="vi" />
