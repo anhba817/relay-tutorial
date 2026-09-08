@@ -1,12 +1,9 @@
-import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
 import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
-import { Figure } from "@/components/tutorial/figure";
-import { figWrongWay, figUnread, figKeyset, figDeletion } from "./figures";
 
 export const metadata = {
   title: "Những gì một người dùng thấy — Building Relay",
   description:
-    "Xếp channel của một user theo tin nhắn cuối tốn 0.87 ms trên test lane và 159 ms ở một triệu tin. Con số của lane sẽ chốt vấn đề theo hướng sai — và đó là hình dáng của mọi phép đo trong chương này.",
+    "Bản dịch tiếng Việt của chương này đang được chuẩn bị. Toàn bộ mã nguồn bên dưới giữ nguyên như bản tiếng Anh.",
   alternates: {
     canonical: "/vi/part-3/chapter-10/what-a-user-sees",
     languages: {
@@ -18,147 +15,147 @@ export const metadata = {
 
 <ChapterHeader id="3.10" locale="vi" />
 
-Một người dùng mở app. Trước khi một tin nhắn nào được render, client hỏi đúng một câu: tôi
-có những channel nào, channel nào có gì mới, và câu cuối cùng được nói là gì.
+> **Bản dịch đang được chuẩn bị.** Phần diễn giải của chương này chưa được dịch sang
+> tiếng Việt. Các khối mã bên dưới là bản gốc tiếng Anh và giống hệt bản tiếng Anh của
+> chương — bạn có thể gõ theo chúng ngay bây giờ. Bản dịch đầy đủ sẽ thay thế trang này.
 
-Ba field, một request. Chương này là những gì cần làm để trả lời chúng, và nó mở màn bằng
-một phép đo chỉ sai hướng.
+## 0.87 milliseconds, and the number was a lie
 
-## 0.87 milli-giây, và con số ấy là một lời nói dối
-
-"Hoạt động gần nhất lên trước" không cần cột mới nào. Mọi tin nhắn đều mang `created_at`, nên
-thứ tự là một phép tổng hợp:
 ```sql
 order by (select max(created_at) from messages where channel_id = c.id) desc
 ```
 
-Đo trên test lane, nơi environment lớn nhất có **579 tin nhắn trên 32 channel**: 1.942 ms,
-rồi 0.630, rồi 0.870. Dưới một milli-giây. Không migration, không cột phải backfill, không
-đường ghi nào phải sửa.
-
-Cùng câu query đó trên một database nháp với **2.000 channel và 1.000.000 tin nhắn**:
-159.737 ms, 158.103 ms, 158.842 ms — kèm một lần **quét tuần tự qua mọi tin nhắn trong
-environment, ở mỗi lần liệt kê.** Một `channels.last_activity_at` có index trả lời cùng câu
-hỏi trong 1.1 ms.
-
-<Figure caption="Cách nhau 145 lần, và khoảng cách còn giãn ra theo đúng con số mà một nền tảng chat chắc chắn sẽ tăng. Test lane không thấy được điều đó." code={figWrongWay} />
-
-Một triệu tin nhắn không phải con số lạ với một nền tảng chat — đó là năm đầu tiên của một
-khách hàng cỡ vừa. Và 0.87 ms của lane không *sai*: nó đo một database nhỏ đến mức quét tuần
-tự còn rẻ hơn tra index, điều vừa đúng vừa vô dụng.
-
-<Why source="docs/04-srs.md FR-CHN-08" locale="vi">
-
-Đây là phương pháp của cả chương, không phải một mẩu chuyện về một câu query. Mọi con số hiệu
-năng bên dưới đều được đo hai lần — một lần ở nơi test chạy, một lần ở quy mô mà test sẽ không
-bao giờ tới — bởi lane là dụng cụ gần tay nhất và ít đại diện nhất trong cả repository.
-
-</Why>
-
-Thế nên `channels.last_activity_at` ra đời, và đường ghi duy trì nó ngay trong câu lệnh vốn đã
-tăng sequence:
-```sql title="services/api/migrations/0011_activity_and_read_positions.sql"
--- Ordering a user's channels, and knowing what they have not read.
+```sql title="services/api/migrations/0007_user_surface.sql"
+-- Ordering a user's channels, knowing what they have not read, and a deleted user
+-- who is still an author.
 --
--- Two changes with one thing in common: both answer a question `last_sequence`
--- looks like it should answer and cannot.
+-- THREE COLUMNS AND A TABLE, IN ONE FILE, BECAUSE THEY BELONG TO ONE CHAPTER. The
+-- design that produced them split them across two migrations by SUBJECT — an
+-- activity-and-read-positions file and a roles-and-user-deletion file — and neither
+-- file belonged to one chapter. The previous chapter took `members.role` as `0006`
+-- and left the rest here, which is the whole of it: a migration's number should
+-- follow the chapter that introduces it.
+--
+-- The first two answer a question `last_sequence` looks like it should answer and
+-- cannot.
 --
 -- FR-CHN-08 wants a user's channels ordered by most recent activity.
--- `channels.last_sequence` is a per-channel monotonic counter, so two channels
--- both sitting at 50 say nothing about which took a message more recently. It
--- orders messages inside one channel and cannot order channels against each
--- other at all.
+-- `channels.last_sequence` is a per-channel monotonic counter, so two channels both
+-- sitting at 50 say nothing about which took a message more recently. It orders
+-- messages inside one channel and cannot order channels against each other at all.
 --
 -- THE ALTERNATIVE WAS MEASURED AND IT IS 145x WORSE. Ordering by
--- `max(messages.created_at)` per channel, at 2,000 channels and 1,000,000
--- messages with one member in every channel:
+-- `max(messages.created_at)` per channel, at 2,000 channels and 1,000,000 messages
+-- with one member in every channel:
 --
 --     aggregate over messages   159.737 ms  158.103 ms  158.842 ms
 --                               -> Seq Scan on messages, 1,000,000 rows,
 --                                  on every listing
 --     indexed column              1.102 ms    1.496 ms    2.210 ms
 --
--- AND THE TEST LANE SAYS THE OPPOSITE. Its busiest environment holds 579
--- messages, and the same aggregate answers in 0.870 ms there. Reporting that
--- number would have settled the question in favour of adding no column. The
--- cost grows with message volume, which is the one number a chat platform
--- guarantees will grow (research R4).
+-- AND THE TEST LANE SAYS THE OPPOSITE. Its busiest environment holds 579 messages,
+-- and the same aggregate answers in 0.870 ms there. Reporting that number would
+-- have settled the question in favour of adding no column. The cost grows with
+-- message volume, which is the one number a chat platform guarantees will grow
+-- (research R4).
 --
--- `now()` AS THE DEFAULT, AND A BACKFILL AFTER THIS FILE. Adding a column with
--- a constant default is fast — Postgres 11 and later store it in the catalogue
--- rather than rewriting the table. Setting every existing channel to its real
--- last activity is `max(messages.created_at)` per channel, which is the scan
--- above, so it does NOT belong in a migration: the workflow requires migrations
--- to be executable without downtime. It runs afterwards, in batches, as its own
--- step.
+-- `now()` AS THE DEFAULT, AND A BACKFILL AFTER THIS FILE. Adding a column with a
+-- constant default is fast — Postgres 11 and later store it in the catalogue rather
+-- than rewriting the table. Setting every existing channel to its real last activity
+-- is `max(messages.created_at)` per channel, which is the scan above, so it does NOT
+-- belong in a migration: the workflow requires migrations to be executable without
+-- downtime. It runs afterwards, in batches, as its own step.
 ALTER TABLE channels
     ADD COLUMN last_activity_at TIMESTAMPTZ NOT NULL DEFAULT now();
 --> statement-breakpoint
 
--- The listing's ordering (FR-013), environment first because every listing is
--- inside one and the planner then walks the timestamp backward from there.
+-- The listing's ordering (FR-013), environment first because every listing is inside
+-- one and the planner then walks the timestamp backward from there.
 CREATE INDEX channels_environment_last_activity
     ON channels USING btree (environment_id, last_activity_at DESC NULLS LAST);
 --> statement-breakpoint
 
--- FR-CHN-09's unread count needs to know how far a user has read, and nothing
--- in the schema recorded it. Verified before writing this: no `last_read`,
--- `read_at` or equivalent column in any table.
+-- FR-CHN-09's unread count needs to know how far a user has read, and nothing in the
+-- schema recorded it. Verified before writing this: no `last_read`, `read_at` or
+-- equivalent column in any table.
 --
 -- NO COUNTER COLUMN, and that is the whole design. Unread is
--- `greatest(channels.last_sequence - read_positions.sequence, 0)`, because the
--- write path already maintains `last_sequence` and chapter 2.2 made it the
--- sequencing authority. Three shapes measured for one page of 50 channels
--- against 1,000,000 messages:
+-- `greatest(channels.last_sequence - read_positions.sequence, 0)`, because the write
+-- path already maintains `last_sequence` and chapter 2.2 made it the sequencing
+-- authority. Three shapes measured for one page of 50 channels against 1,000,000
+-- messages:
 --
 --     count rows past the read position    9.807 ms  11.109 ms  13.431 ms
 --     a cached counter on the position      2.129 ms   1.928 ms   1.226 ms
 --     last_sequence - read position         1.122 ms   4.426 ms   4.497 ms
 --
 -- The cached counter is no faster and adds a value that can go stale. What the
--- subtraction accepts is that a tombstoned message still occupies a sequence,
--- so a deleted message counts as one unread; counting rows instead is 10x the
--- cost on the query a client runs to render its first screen (research R5,
--- FR-016).
+-- subtraction accepts is that a tombstoned message still occupies a sequence, so a
+-- deleted message counts as one unread; counting rows instead is 10x the cost on the
+-- query a client runs to render its first screen (research R5, FR-016).
 --
--- environment_id IS DENORMALISED, AND channel_id ALREADY DETERMINES IT. The
--- column is here because feature 030's guard watches tables that carry one, and
--- a table without it is a table the guard cannot refuse a cross-environment
--- delete on. `members` is the counter-example worth knowing: it has no
--- environment_id, so the catalogue classifies it as `hop` — reached through a
--- foreign key — and no trigger protects it. A read position is per-user state
--- that a tenant's own operations mutate, so it takes the stronger
--- classification and becomes the guard's tenth table.
+-- environment_id IS DENORMALISED, AND channel_id ALREADY DETERMINES IT. The column is
+-- here because the lane's guard watches tables that carry one, and a table without it
+-- is a table the guard cannot refuse a cross-environment delete on. `members` is the
+-- counter-example the previous chapter's migration names on its own constraint: it
+-- has no environment_id, so the catalogue classifies it as `hop` — reached through a
+-- foreign key — and no trigger protects it. A read position is per-user state that a
+-- tenant's own operations mutate, so it takes the stronger classification.
 --
--- NO id COLUMN. The primary key is (channel_id, user_id) because that is what a
--- read position is. The guard's refusal message interpolates a key, and the
--- channel-endpoints chapter installed `coalesce(to_jsonb(OLD) ->> 'id', to_jsonb(OLD)::text)` for
+-- AND THE GUARD ENTRY ARRIVES IN THIS SAME CHAPTER, not in a later audit. The rule
+-- the instruments chapter set is that a table joins `sentinel.sql`'s array, gains its
+-- bait, and gets its case in `guard.itest.ts` in the chapter that CREATES it —
+-- because a name in that array without bait behind it installs a trigger that can
+-- never match and reads, in every report, exactly like protection.
+--
+-- NO id COLUMN. The primary key is (channel_id, user_id) because that is what a read
+-- position is. The guard's refusal message interpolates a key, and the endpoints
+-- chapter installed `coalesce(to_jsonb(OLD) ->> 'id', to_jsonb(OLD)::text)` for
 -- exactly the tables that have no `id` to interpolate.
 CREATE TABLE read_positions (
     environment_id  UUID NOT NULL REFERENCES environments(id),
     channel_id      UUID NOT NULL REFERENCES channels(id),
     user_id         UUID NOT NULL REFERENCES users(id),
-    -- Advances forwards only. A write naming a lower sequence than the stored
-    -- one is accepted and changes nothing, so a client replaying an old
-    -- acknowledgement cannot move a user's unread count backwards. A value past
-    -- channels.last_sequence is refused (FR-018): a position nothing can reach
-    -- makes every later count wrong.
+    -- Advances forwards only. A write naming a lower sequence than the stored one is
+    -- accepted and changes nothing, so a client replaying an old acknowledgement
+    -- cannot move a user's unread count backwards. A value past
+    -- channels.last_sequence is refused (FR-018): a position nothing can reach makes
+    -- every later count wrong.
     sequence        BIGINT NOT NULL,
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT read_positions_channel_id_user_id_pk PRIMARY KEY (channel_id, user_id)
 );
+--> statement-breakpoint
+
+-- A DELETED USER KEEPS THEIR ROW, and this column is what says so.
+--
+-- This is in no SRS clause. It arrived from designing FR-USR-05's deletion path and
+-- finding nowhere to record the state. Three tables reference users(id) — messages,
+-- members, and read_positions above — and the clause asks that a deleted user's
+-- messages be preserved "as authored by a deleted user".
+--
+-- ON DELETE SET NULL WOULD SATISFY THE LETTER OF THAT AND BREAK DELIVERY.
+-- `backfill.controller`'s `toFrame` drops senderless rows because `messageSchema`
+-- requires `user`, so a NULL author makes a message invisible to every socket.
+-- "Authored by a deleted user" and "authored by nobody" are different states and only
+-- the first is deliverable. ON DELETE CASCADE deletes the messages the clause says to
+-- keep. A separate `deleted_users` table is a second identity space for one flag
+-- (research R7).
+--
+-- So deletion clears the profile fields, removes the memberships and read positions,
+-- sets this, and touches no messages.
+--
+-- (environment_id, external_id) STAYS UNIQUE, which is why presenting the same
+-- external id again reuses this row and clears this column (FR-030) rather than
+-- creating a second identity for one person.
+ALTER TABLE users
+    ADD COLUMN deleted_at TIMESTAMPTZ;
 ```
 
-Phần backfill là một script chứ không nằm trong migration, và đó là phép đo thứ hai.
-`ALTER TABLE … ADD COLUMN … NOT NULL DEFAULT now()` trả về ngay lập tức trên Postgres 11 trở
-lên — giá trị default là metadata, không phải một lần ghi lại bảng — nhưng một
-`SET last_activity_at = (select max(...))` trong cùng transaction sẽ khoá mọi dòng channel
-suốt thời gian phép tổng hợp chạy. Theo các con số ở trên, đó là 159 ms mỗi environment nhân
-với số environment đang có, tất cả trong khi đang giữ khoá `ACCESS EXCLUSIVE`.
 ```js title="scripts/backfill-channel-activity.mjs"
 // Set `channels.last_activity_at` to each channel's real last activity.
 //
-// T019 — and it is a SCRIPT and not part of migration 0011 for one
+// T019 — and it is a SCRIPT and not part of migration 0007 for one
 // reason: the constitution's workflow section requires migrations to be
 // "executable without downtime", and this is a scan.
 //
@@ -233,42 +230,35 @@ main()
   });
 ```
 
-## Con số chưa đọc mà không có counter
+## The count with no counter
 
-Client cần một con số cho mỗi channel: bao nhiêu tin nhắn đã tới mà user này chưa đọc. Cách
-hiện thực dễ thấy nhất là một counter — tăng khi gửi, reset khi đọc — và nó sai vì một lý do
-chẳng liên quan gì tới tốc độ.
-
-<Figure caption="Đường ghi vốn đã duy trì last_sequence. Phần còn lại chỉ là một phép trừ." code={figUnread} />
-
-`channels.last_sequence` đã là thẩm quyền về sequence từ chương 2.2, và đường ghi duy trì nó
-dưới khoá dòng channel. Nên con số này là phép tính trên hai giá trị vốn đã tồn tại, và nó
-**không có gì phải vô hiệu hoá, không có gì phải backfill**.
-
-Đo cho một trang 50 channel trên 1.000.000 tin nhắn:
-
-    đếm số dòng sau vị trí đã đọc      9.8 - 13.4 ms
-    một counter cache trên vị trí      1.2 -  2.1 ms
-    phép trừ                           1.1 -  4.5 ms
-
-**Counter không nhanh hơn.** Nó nằm trong khoảng nhiễu của phép trừ, và nó thêm vào một giá
-trị có thể lệch khỏi chính những tin nhắn nó đếm. Một con số cache bị lệch còn tệ hơn một con
-số chậm hơn nhưng không thể lệch.
-
-<Trap locale="vi">
-
-**Một read position chỉ được đi tiến, và phép chốt thuộc về SQL.**
-
-    sequence: sql`greatest(${readPositions.sequence}, excluded.sequence)`
-
-Một lần đọc-rồi-ghi sẽ làm mất giá trị cao hơn trong hai lần xác nhận song song, xen kẽ theo
-thứ tự nào cũng vậy. `greatest` trên conflict target thì không thể: một client phát lại một
-xác nhận cũ sau khi mạng chập chờn nhận về 200 mà không đổi gì — đúng hành vi mà hàng đợi retry
-của một client mobile sinh ra thường xuyên.
-
-</Trap>
 ```diff title="services/api/src/db/repository.ts"
-@@ -2152,6 +2152,28 @@
+@@ -1,19 +1,20 @@
+ import { randomUUID } from "node:crypto";
+ 
+-import { and, asc, desc, eq, gt, inArray, lt, sql, type SQL } from "drizzle-orm";
++import { and, asc, desc, eq, gt, inArray, isNull, lt, sql, type SQL } from "drizzle-orm";
+ 
+ import type { Db } from "./client";
+ import {
+   apiKeys,
+   applications,
+   channels,
+   consumedEvents,
+   environments,
+   humans,
+   members,
++  readPositions,
+   memberships,
+   messages,
+   organisations,
+   outbox,
+   users,
+ } from "./schema";
+@@ -558,12 +559,34 @@ export async function provisionOrganisation(
+ }
+ 
+ export interface UserRow {
    id: string;
    external_id: string;
    display_name: string | null;
@@ -297,7 +287,13 @@ của một client mobile sinh ra thường xuyên.
  }
  
  export interface ChannelRow {
-@@ -2222,6 +2244,19 @@
+   id: string;
+   external_id: string;
+   /** The column has been `"public" | "private"` with a CHECK constraint since
+@@ -628,12 +651,25 @@ export class ChannelArchivedError extends Error {
+   constructor(public readonly channelId: string) {
+     super(`channel archived: ${channelId}`);
+     this.name = "ChannelArchivedError";
    }
  }
  
@@ -317,7 +313,13 @@ của một client mobile sinh ra thường xuyên.
  /** Timestamps cross the wire as RFC 3339 strings (constitution: UTC,
   * millisecond precision) — the driver hands back a Date or a string
   * depending on the column and the query shape. */
-@@ -2553,7 +2588,18 @@
+ function toIso(value: Date | string): string {
+   return value instanceof Date ? value.toISOString() : String(value);
+ }
+@@ -658,13 +694,24 @@ export class Repository {
+         displayName: displayName ?? null,
+       })
+       .onConflictDoNothing({ target: [users.environmentId, users.externalId] })
        .returning({ id: users.id });
  
      if (inserted.length > 0) {
@@ -337,7 +339,13 @@ của một client mobile sinh ra thường xuyên.
      }
      const existing = await this.getUserByExternalId(externalId);
      if (existing === null) throw new Error(`user ${externalId} could not be created or read`);
-@@ -2569,6 +2615,10 @@
+     // The DISPLAY NAME OF THE EXISTING ROW WINS. A second call is not an update:
+     // FR-CHN-04 asks for membership, and quietly renaming a user because someone
+     // re-sent a member list would be a write nobody asked for.
+@@ -674,21 +721,40 @@ export class Repository {
+   async getUserByExternalId(externalId: string): Promise<UserRow | null> {
+     const rows = await this.db
+       .select({
          id: users.id,
          external_id: users.externalId,
          display_name: users.displayName,
@@ -348,7 +356,8 @@ của một client mobile sinh ra thường xuyên.
        })
        .from(users)
        .where(
-@@ -2577,12 +2627,27 @@
+         and(
+           eq(users.environmentId, this.environmentId),
            eq(users.externalId, externalId),
          ),
        );
@@ -362,7 +371,7 @@ của một client mobile sinh ra thường xuyên.
 +          display_name: row.display_name,
 +          avatar_url: row.avatar_url,
 +          // `as` AND NOT `?? {}`. The column is `notNull().default({})`, so the driver
-+          // never hands back null — and the isolation gauntlet removed `addMember`'s
++          // never hands back null — and the isolation harness removed `addMember`'s
 +          // `(inserted.rowCount ?? 0)` for exactly this reason: an arm nothing can take,
 +          // bought for nothing, in the one file constitution VI asks 100% of.
 +          metadata: row.metadata as Record<string, unknown>,
@@ -373,16 +382,92 @@ của một client mobile sinh ra thường xuyên.
  
    /** IDEMPOTENT ON THE CUSTOMER'S OWN IDENTIFIER (FR-017, FR-CHN-02).
     *
--   * This was a plain insert until the isolation gauntlet, which is fine for a fixture and
-+   * This was a plain insert until the channel-endpoints chapter, which is fine for a fixture and
+    * This was a plain insert until the endpoint over it, which is fine for a fixture and
     * cannot back an endpoint: a repeated `external_id` raises against
-    * `channels_environment_id_external_id_unique`, and `ProtocolErrorFilter`
-    * renders a unique violation as `internal_error`. The second call in an
-@@ -2953,6 +3018,506 @@
+@@ -921,31 +987,33 @@ export class Repository {
+   }
+ 
+   /** Remove members by user id, up to a hundred in one call, reporting each
+    * (FR-006, FR-007, FR-008).
+    *
+    * BULK, BECAUSE THE REQUIREMENT ALWAYS WAS. FR-006 says "up to 100 in one
+-   * request" and FR-007 says the result is reported per user — which is chapter
+-   * 3.13's `addMembers` shape in both halves. `contracts/membership.md` specified a
++   * request" and FR-007 says the result is reported per user — which is the
++   * endpoints chapter's `addMembers` shape in both halves. `contracts/membership.md` specified a
+    * single-user `DELETE …/members/:userExternalId` for ten analysis passes, having
+    * read "the shape the channel-endpoints chapter chose" as *named outcomes* and dropped *bulk*.
+    * Every pass compared requirements to tasks, both said "removal", and identifier
+    * coverage read 100% the whole time.
+    *
+    * NO MESSAGES ARE TOUCHED (FR-008). The removed user's messages stay in history
+    * attributed to them: `messages.user_id` still points at a row that still exists,
+    * and their socket stops receiving the channel on its next resume because the
+    * session is built from `members`.
+    *
+-   * NO READ POSITION TO REMOVE YET, AND THAT IS AN OBLIGATION AND NOT A GAP.
+-   * `read_positions` is per-member state keyed by `(channel_id, user_id)`, so
+-   * leaving a removed member's row would leave a non-member's position in a
+-   * per-member table. The table arrives in the next chapter, and the delete has to
+-   * arrive with it — this comment is here so that the chapter which creates the
+-   * table finds the requirement rather than deducing it. `channels.itest.ts` gets
+-   * the case in the same edit.
++   * THE READ POSITION GOES WITH THE MEMBERSHIP, and the previous chapter wrote this
++   * requirement down here rather than leaving it to be deduced. `read_positions` is
++   * per-member state keyed by `(channel_id, user_id)`, so leaving a removed member's
++   * row would leave a non-member's position in a per-member table.
++   *
++   * Adding the user back therefore starts their unread count at the channel's whole
++   * history, which is the same thing "no row means position zero" says for a new
++   * member — so the delete costs nothing a rejoin has to undo.
++   *
+    * SCOPED THROUGH THE CHANNEL, and the caller has already read it scoped. `members`
+    * carries no `environment_id` — the catalogue calls it a `hop` — so the join is
+    * what keeps a foreign channel's rows out of reach.
+    */
+   async removeMembers(
+     channelId: string,
+@@ -977,12 +1045,31 @@ export class Repository {
+                        AND c.environment_id = ${this.environmentId})`,
+         ),
+       )
+       .returning({ userId: members.userId });
+     const removed = new Set(deleted.map((r) => r.userId));
+ 
++    // SCOPED BY environment_id AND NOT BY THE CHANNEL JOIN, because this table
++    // carries one. `members` above needs the `EXISTS` over `channels` to stay inside
++    // a tenant; `read_positions` was given `environment_id` precisely so the guard
++    // could watch it, and the same column makes this predicate direct.
++    //
++    // EVERY id THE CALLER NAMED, not just the ones a membership was removed for. A
++    // user with a read position and no membership is the state this is cleaning up,
++    // and refusing to touch it because the membership was already gone would leave
++    // exactly the row the delete exists for.
++    await this.db
++      .delete(readPositions)
++      .where(
++        and(
++          eq(readPositions.channelId, channelId),
++          eq(readPositions.environmentId, this.environmentId),
++          inArray(readPositions.userId, userIds),
++        ),
++      );
++
+     for (const id of userIds) {
+       outcome.set(id, removed.has(id) ? "removed" : "not_a_member");
+     }
+     return outcome;
+   }
+ 
+@@ -1025,12 +1112,512 @@ export class Repository {
+           eq(users.environmentId, this.environmentId),
+         ),
+       );
      return rows.map((r) => r.channel_id);
    }
  
-+  /** Upsert a user by external id, updating the profile fields present (   * FR-025, FR-026).
++  /** Upsert a user by external id, updating the profile fields present (
++   * FR-025, FR-026).
 +   *
 +   * NOT `createUser`, AND THE DIFFERENCE IS THE POINT. `createUser` is deliberately not an
 +   * update: its comment says so — "the display name of the existing row wins; quietly
@@ -445,7 +530,7 @@ của một client mobile sinh ra thường xuyên.
 +    // THAT was absent — two statements for one impossible state (the winner of an
 +    // `ON CONFLICT` race having its row deleted between two statements of the same call,
 +    // which nothing in the api can do). `repository.ts` already carried two throws of
-+    // that class from the isolation gauntlet and its lines ratchet sat at 99; a third took the file
++    // that class from the isolation harness and its lines ratchet sat at 99; a third took the file
 +    // to 98.92 and the gate went red. The instrument was right: the second throw bought
 +    // nothing the first did not already say.
 +    //
@@ -715,8 +800,8 @@ của một client mobile sinh ra thường xuyên.
 +    return updated.length > 0;
 +  }
 +
-+  /** A user's channels, most recently active first, keyset-paginated
-+   * (the channel-control chapter, FR-013, FR-CHN-08).
++  /** A user's channels, most recently active first, keyset-paginated (chapter
++   * 3.15, FR-013, FR-CHN-08).
 +   *
 +   * `id` IS PART OF THE KEY AND NOT DECORATION. `last_activity_at` is not unique:
 +   * two channels can take a message in the same millisecond, and a keyset on a
@@ -884,10 +969,17 @@ của một client mobile sinh ra thường xuyên.
    /** The write path (chapters 2.2 + 2.3): sequence assignment under the
     * channel row lock (ADR-03), with idempotency enforcement via the
     * partial unique index (DR-03). The transaction IS the ordering
-@@ -2994,6 +3559,29 @@
-       // only one of them can be `now()`.
-       const period = periodOf(new Date());
- 
+    * guarantee: the lock serialises assignment per channel, and the ack
+    * that matters happens only after commit (FR-MSG-05).
+    *
+@@ -1058,12 +1645,36 @@ export class Repository {
+       text: string;
+       metadata?: unknown;
+       idempotencyKey?: string;
+     },
+   ): Promise<MessageRow> {
+     return this.db.transaction(async (tx) => {
++
 +      // ── THE BAN, FIRST, AND AHEAD OF THE CHANNEL READ (FR-031, FR-021a) ─────
 +      //
 +      // T072 left this slot and only Phase 15 can fill it, because until now nothing
@@ -914,7 +1006,13 @@ của một client mobile sinh ra thường xuyên.
        const [channel] = await tx
          .select({
            id: channels.id,
-@@ -3153,9 +3741,27 @@
+           lastSequence: channels.lastSequence,
+           // `channels.type` has been a `"public" | "private"` column
+           // with a CHECK since chapter 2.1 and nothing decided on it until now — it
+@@ -1186,15 +1797,33 @@ export class Repository {
+           )),
+           duplicate: true,
+         };
        }
  
        // The sequence is spent only by a message that actually landed.
@@ -943,76 +1041,23 @@ của một client mobile sinh ra thường xuyên.
          .where(eq(channels.id, channel.id));
  
        const createdAt = toIso(inserted[0]!.createdAt);
+ 
+       // THE EVENT COMMITS WITH THE MESSAGE (ADR-06).
+       //
 ```
 
-Có hai chỗ trong diff đó đáng đọc kỹ.
+## The plan, at four sizes
 
-**`greatest(…, 0)` là phòng vệ trước một bug, không phải một trạng thái tới được.** Một vị trí
-vượt quá `last_sequence` bị từ chối ngay khi ghi, và `last_sequence` không bao giờ đi ngược —
-nên phép chốt tồn tại cho một trạng thái mà platform khiến không thể dựng nên được. Nó không
-tốn gì và biến một số âm thành 0 thay vì thành một báo lỗi từ client. Cách duy nhất để phủ
-được nhánh ấy là cắm thẳng một vị trí vượt cuối vào database, và đó là việc
-`repository.itest.ts` làm — dụng cụ thứ ba trong series này chưa từng tạo ra output nào cho
-tới khi có một test được viết riêng để bắt nó lên tiếng.
-
-**`id` nằm trong keyset chứ không phải để trang trí.** `last_activity_at` không unique — hai
-channel có thể nhận tin trong cùng một milli-giây — và một keyset trên cột không unique thì
-hoặc bỏ sót một dòng hoặc trả lại một dòng hai lần ở mỗi biên trang có cặp trùng nằm vắt qua.
-Phép so sánh dòng của Postgres, `(a, b) < (x, y)`, cho đúng nghĩa từ vựng nghiêm ngặt "mọi thứ
-sau chính dòng này" mà cursor muốn nói, trong một vị từ duy nhất mà planner có thể lái index
-bằng nó.
-
-<Figure caption="Trang đầu là trang đắt nhất, ngược hẳn với phân trang bằng OFFSET" code={figKeyset} />
-
-## Kế hoạch truy vấn, ở bốn quy mô
-
-Tập membership lớn nhất của lane là **năm channel**. Nên phần liệt kê được đo theo đúng cách
-câu hỏi về thứ tự đã được đo, trên một environment tổng hợp rồi xoá đi sau đó:
-
-    số membership   trang đầu                  trang sâu
-      1.000        0.46 ms  top-N heapsort       —
-      5.000        2.22 ms  top-N heapsort     0.49 ms
-     20.000       10.62 ms  top-N heapsort     0.03 ms
-     50.000        9.06 ms  KHÔNG CÓ SORT      0.03 ms
-
-Không có quét tuần tự ở bất kỳ quy mô nào. Hai điều rơi ra từ đây còn giá trị hơn chính các
-con số.
-
-**Trang đầu là trang đắt nhất.** Vị từ keyset thu hẹp tập đầu vào, nên càng phân trang càng
-*rẻ* — 10.62 ms cho trang đầu của một user có 20.000 channel, 0.03 ms cho trang cuối. Với
-`OFFSET` thì cùng đường đi ấy càng về sau càng đắt. Sự bất đối xứng đó chính là lý lẽ cho
-keyset, nói bằng một con số thay vì bằng một nguyên tắc.
-
-**Và cái index chương này thêm vào không phải cái planner dùng — cho tới khi nó dùng.** Tới mốc
-20.000 membership, kế hoạch lái từ `members_user_channel`, join sang `channels` theo id, rồi
-sort. `channels_environment_last_activity` không được dùng. Ở 50.000 planner đổi sang một lần
-đi tuần tự có thứ tự song song trên index đó kèm một lần dò membership cho mỗi dòng, không còn
-node `Sort` nào — và nhanh hơn cả mốc 20.000. Index kiếm được chỗ của nó ở đúng quy mô mà đi
-qua các channel của environment theo thứ tự hoạt động rẻ hơn là sort tập membership của một
-user, và planner tự tìm ra điểm giao mà không cần ai chỉ.
-
-<SkipAhead locale="vi">
-
-Vậy chi phí của phần liệt kê tỉ lệ với **số membership mỗi user** và không bao giờ với số tin
-nhắn — đúng thứ mà cột này ra đời để làm.
-
-</SkipAhead>
 ```diff title="services/api/src/db/repository.itest.ts"
-@@ -62,7 +62,7 @@
-     const channel = await repoA.getChannelByExternalId("support");
-     expect(await repoA.addMember(channel!.id, user!.id)).toBe("added");
-     // Asked twice is a SUCCESS and not a failure, and telling those apart is
--    // what the isolation gauntlet changed here: the endpoint over this call has to be
-+    // what the channel-endpoints chapter changed here: the endpoint over this call has to be
-     // idempotent, and a unique violation reached the wire as `internal_error`.
-     expect(await repoA.addMember(channel!.id, user!.id)).toBe("already_a_member");
-     // B holds A's REAL ids — and still cannot write or read through them. The
-@@ -280,3 +280,222 @@
+@@ -277,6 +277,225 @@ describe("members_role_check names the channel's three (FR-011, R8)", () => {
+     const channel = await repoA.createChannel("role-at-insert", "public");
+     const user = await repoA.createUser("role-at-insert-user");
+     await repoA.addMember(channel.id, user.id, "owner");
      expect(await repoA.memberRole(channel.id, user.id)).toBe("owner");
    });
  });
 +
-+// ── T113: THE TIE AT A PAGE BOUNDARY (FR-013) ───────────────────
++// ── T113: THE TIE AT A PAGE BOUNDARY (FR-013) ─────────────────────────────────
 +//
 +// HERE AND NOT IN `users.itest.ts`, because constructing the tie takes a raw UPDATE:
 +// `last_activity_at` is written from the message's `created_at`, `now()` is the
@@ -1082,7 +1127,7 @@ nhắn — đúng thứ mà cột này ra đời để làm.
 +  });
 +});
 +
-+// ── THE TOMBSTONE, AND THE CLAMP (FR-016, FR-019) ───────────────
++// ── THE TOMBSTONE, AND THE CLAMP (FR-016, FR-019) ─────────────────────────────
 +//
 +// BOTH STATES ARE UNREACHABLE THROUGH THE API, for different reasons, and both are
 +// constructed here because this suite may hold raw SQL.
@@ -1147,7 +1192,7 @@ nhắn — đúng thứ mà cột này ra đời để làm.
 +    // `setReadPosition` REFUSES THIS, which is why the arm needs planting. The clamp is
 +    // defence against a bug — a position past `last_sequence` cannot be written and
 +    // `last_sequence` never goes backwards — so this is the only way the branch is ever
-+    // covered. The isolation gauntlet found three instruments that had never produced output for
++    // covered. The isolation harness found three instruments that had never produced output for
 +    // exactly this reason.
 +    expect(await repoA.setReadPosition(channel.id, user.id, 99)).toBeNull();
 +    await db.execute(
@@ -1161,7 +1206,7 @@ nhắn — đúng thứ mà cột này ra đời để làm.
 +  });
 +});
 +
-+// ── THE ARMS THE ROUTES CANNOT REACH (T174a, T174b) ─────────────
++// ── THE ARMS THE ROUTES CANNOT REACH (T174a, T174b) ───────────────────────────
 +//
 +// Every one of these is a repository function answering "no" to something its own route
 +// answers first. `deleteUser` on an id that does not exist, `updateUserProfile` on a
@@ -1231,6 +1276,7 @@ nhắn — đúng thứ mà cột này ra đời để làm.
 +  });
 +});
 ```
+
 ```ts title="services/api/src/users/users.schema.ts"
 import { z } from "zod";
 
@@ -1247,7 +1293,7 @@ import { z } from "zod";
  *
  * **THE BOUND TRACKS ROW CARDINALITY.** Measured on the test lane: 94,144 users against
  * 27,337 channels, and a user belongs to 1 channel on average while a channel holds 10
- * users. Users outnumber channels the broker chapter:1 here and the ratio only grows — a channel is a
+ * users. Users outnumber channels 3.4:1 here and the ratio only grows — a channel is a
  * conversation a customer creates deliberately, a user row appears for every end user who
  * ever authenticates, implicitly (FR-USR-02). At a million end users, 4 KB each is 4 GB of
  * jsonb that every profile read walks past.
@@ -1403,68 +1449,10 @@ export const readPositionBodySchema = z.strictObject({
 export type ReadPositionBody = z.infer<typeof readPositionBodySchema>;
 ```
 
-## Hai phép xấp xỉ, được nói ra
+## Two approximations, stated
 
-Cả hai đều là hệ quả của việc dùng sequence thay vì đếm, và cả hai đều thuộc loại điều mà một
-chương phải nói to lên, không thì người đọc sẽ phát hiện ra nó như một bug.
+## The user surface
 
-**Một tin nhắn đã xoá vẫn tính là một tin chưa đọc.** Một tombstone giữ nguyên sequence của nó
-— đó là điều SRS đòi ở việc xoá tin nhắn — nên nó giữ nguyên chỗ của mình trong phép tính. Đếm
-số dòng sau vị trí đã đọc thì sẽ khiến một tin nhắn bị xoá thôi được tính là chưa đọc, với chi
-phí gấp 10 lần trên đúng câu query mà client chạy để vẽ màn hình đầu tiên.
-
-Cùng luật đó quyết định `last_message` báo về cái gì: **dòng ở đúng `last_sequence`**, với
-`text: null` khi dòng đó là một tombstone, chứ không lần ngược về dòng cuối cùng còn text. Lần
-ngược ấy là một query thứ hai cho mỗi channel, và nó sẽ không nhất quán với con số nằm ngay
-bên cạnh.
-
-<Trap locale="vi">
-
-**Tombstone có người đọc mà không có người ghi.**
-
-`messages.deleted_at` và một `text` null đã nằm trong schema từ chương 2.1.
-`backfill.controller` truyền `text` đi thẳng, nên một giá trị null vốn đã ra tới đường truyền.
-**Không gì trong platform ghi vào một trong hai thứ đó** — không có route xoá tin nhắn, không
-có phương thức repository, không có gì. FR-MSG-08 chưa được hiện thực.
-
-Nên luật ở trên được đặc tả cho một trạng thái không route nào tạo ra được. Nó vẫn được hiện
-thực và kiểm thử, với tombstone ghi bằng SQL thô, để tới ngày chương của điều khoản ấy ship
-thì con số và phần xem trước đã khớp với nhau từ trước.
-
-Đây là ảnh phản chiếu của chính tính năng mà hai chương này thuộc về. Bốn cột có người ghi mà
-không có người đọc; tombstone có người đọc mà không có người ghi.
-
-</Trap>
-
-**Và tin nhắn của chính một user vẫn tính là chưa đọc cho tới khi họ xác nhận.** Spec đã giả
-định điều ngược lại — "tin nhắn của chính một user thì họ đã đọc" — còn kịch bản thì lỏng hơn
-và đúng: *liệu* nó có tính hay không là điều phải nói ra và kiểm thử. Đo được: nó có tính.
-Đường ghi không tự đẩy read position của chính người gửi.
-
-<Why source="specs/034-chapter-3-15/spec.md, giả định 4" locale="vi">
-
-Để nguyên như vậy, và lý do nằm ở chi phí của chỗ mà bản sửa sẽ phải đặt vào. Đẩy vị trí ở phía
-server là một câu lệnh thứ hai trên một table thứ hai, bên trong transaction gửi tin — operation
-tần suất cao nhất của platform, cho mọi tin nhắn có người gửi, mãi mãi. `last_activity_at` đi
-vào đúng câu lệnh vốn đã update `channels` chính là để tránh điều đó; một upsert read position
-thì không có câu lệnh nào để ghép vào.
-
-Client thì không phải trả gì cả: response của lần gửi vốn đã mang theo sequence nó vừa ghi. Và
-đường send REST công khai không gán người dùng nào, nên một lần đẩy ở phía server sẽ hoạt động
-với một số lần gửi và không hoạt động với số còn lại — phương án tệ nhất trong ba.
-
-**Phiên bản đầu của test đó đã che mất câu trả lời.** Nó gửi một tin, đặt read position bằng
-sequence của tin ấy, rồi khẳng định bằng 0 — xanh, trong khi chỉ chứng minh được rằng vị trí
-ghi được. Khẳng định đáng giá là khẳng định *trước* lần xác nhận, và nó chỉ được viết ra vì
-hành vi đã được đo thay vì được giả định.
-
-</Why>
-
-## Bề mặt người dùng
-
-Năm điều khoản SRS cần những route có chủ thể là một user, và không có controller nào cho user.
-Treo chúng lên channels controller sẽ đặt vòng đời của user phía sau một đường dẫn channel:
-`POST /v1/channels/users` là một câu chẳng nói về gì.
 ```ts title="services/api/src/users/users.module.ts"
 import { Module, Scope } from "@nestjs/common";
 import { REQUEST } from "@nestjs/core";
@@ -1504,8 +1492,12 @@ import type { RequestWithTenant } from "../messages/request-with-tenant";
 })
 export class UsersModule {}
 ```
+
 ```diff title="services/api/src/app.module.ts"
-@@ -11,6 +11,11 @@
+@@ -8,12 +8,17 @@ import { APP_FILTER } from "@nestjs/core";
+ import { AuthModule } from "./auth/auth.module";
+ import { AuthenticateMiddleware } from "./auth/authenticate.middleware";
+ import { HealthController } from "./health.controller";
  import { InternalModule } from "./internal/internal.module";
  import { MessagesModule } from "./messages/messages.module";
  import { ChannelsModule } from "./channels/channels.module";
@@ -1515,9 +1507,15 @@ export class UsersModule {}
 +// chapter fences it.
 +import { UsersModule } from "./users/users.module";
  import { ConsumerModule } from "./consumer/consumer.module";
- import { NotificationsModule } from "./notifications/notifications.module";
- import { QuotasModule } from "./quotas/quotas.module";
-@@ -32,6 +37,7 @@
+ import { OutboxModule } from "./outbox/outbox.module";
+ import { TenancyModule } from "./tenancy/tenancy.module";
+ import { LOGGER, apiLogger } from "./logger";
+ import { ProtocolErrorFilter } from "./protocol-error.filter";
+ import { RequestContextMiddleware } from "./request-context.middleware";
+@@ -24,12 +29,13 @@ import { RequestContextMiddleware } from "./request-context.middleware";
+ // point — including tests — gets the same error envelope for free.
+ @Module({
+   imports: [
      AuthModule,
      MessagesModule,
      ChannelsModule,
@@ -1525,22 +1523,11 @@ export class UsersModule {}
      InternalModule,
      TenancyModule,
      OutboxModule,
+     ConsumerModule,
+   ],
+   controllers: [HealthController],
 ```
 
-<Trap locale="vi">
-
-Hai dòng đăng ký đó nằm trong **không task nào cả**. Kế hoạch của tính năng gọi tên từng route,
-từng cột, từng test, và không chỗ nào nói "đăng ký module" — bởi `ChannelsModule` đã được đăng
-ký sẵn, và không ai đi suy lại một dòng vốn đã tồn tại cho người bên cạnh.
-
-Thiếu nó, `UsersModule` vẫn compile, vẫn export, không ai import, và **tám route không tồn
-tại**. Bảy requirement có task mà những task ấy không thể giao được.
-
-Tìm ra bằng cách hỏi chương nào fence từng file: `app.module.ts` nằm trong danh sách file tính
-năng này phải sửa và không nằm trong task nào. Không phát hiện critical nào của tính năng này
-với tới được bằng cách đọc kế hoạch đối chiếu với danh sách task.
-
-</Trap>
 ```ts title="services/api/src/users/users.service.ts"
 import { HttpStatus, Injectable, NotFoundException } from "@nestjs/common";
 
@@ -1772,6 +1759,7 @@ export class UsersService {
   }
 }
 ```
+
 ```ts title="services/api/src/users/users.controller.ts"
 import {
   Body,
@@ -1918,64 +1906,94 @@ export class UsersController {
 }
 ```
 
-Hai trong ba field của profile — `users.avatar_url` và `users.metadata` — đã nằm trong schema
-suốt hai mươi hai chương mà **không route nào ghi hay đọc một trong hai**. Đây chính là cặp
-route mà tiêu đề của tính năng nói về.
+## The deletion that keeps the row
 
-Ba trạng thái mà API phân biệt được, còn một endpoint chỉ biết "set" thì không:
-
-    field vắng mặt trong patch     giữ nguyên giá trị
-    field có mặt và bằng null      bị xoá trắng
-    một patch rỗng {}              200, không ghi gì, trả về profile hiện tại
-
-Trường hợp cuối không phát ra `UPDATE` nào cả. `exactOptionalPropertyTypes` là thứ làm cho
-"vắng mặt" và "null" khác nhau ở tầng type chứ không phải theo quy ước — sự khắt khe của chương
-1.4 kiếm được chỗ đứng của nó hai mươi bốn chương sau.
-
-**`avatar_url` được validate như một URL chứ không như một chuỗi.** Chưa có gì từng quyết định
-cái gì thuộc về cột đó, nên đây là thứ đầu tiên quyết định — và quyết định bây giờ rẻ hơn là
-sau khi một khách hàng đã lưu `"none"` vào một triệu dòng.
-
-**Và giới hạn 4 KB giờ đã có một lý do, không chỉ một điều khoản.** FR-USR-03 ghi 4 KB nơi
-FR-CHN-01 ghi 8 KB cho một channel. Cả hai đều nằm trong SRS, nên không cái nào bị thừa hưởng
-trong im lặng, nhưng "tài liệu ghi thế" không phải một lý lẽ. Đo trên test lane: **94.144 user
-so với 27.337 channel**, tỉ lệ 3,4:1 và còn tăng, vì một channel được tạo có chủ đích còn một
-dòng user thì xuất hiện với mọi người dùng cuối từng xác thực. Ở một triệu người dùng cuối, 4 KB
-mỗi người là 4 GB jsonb mà mọi lần đọc profile phải đi qua.
-
-## Lần xoá vẫn giữ lại dòng
-
-<Figure caption="Cái gì mất, cái gì còn, và cái frame lẽ ra đã biến mất" code={figDeletion} />
-
-FR-USR-05 đòi rằng xoá một user thì phải giữ "tin nhắn của họ, dưới danh nghĩa một user đã bị
-xoá". Cách đọc dễ thấy nhất là `ON DELETE SET NULL` trên `messages.user_id`: tin nhắn còn, danh
-tính mất.
-
-**Điều đó thoả mãn câu chữ và làm hỏng việc phát tin.** `toFrame` biến một dòng đã lưu thành một
-payload `message.created` *hoặc thành không gì cả*, và một trong hai loại dòng nó loại bỏ là
-dòng không có người gửi — `messageSchema.user` là `z.string().min(1)`, nên một tác giả null
-không thể là một frame. Set null cột đó sẽ giữ mọi tin nhắn trong storage và xoá chúng khỏi mọi
-client kết nối lại, âm thầm, dấu vết duy nhất là một khoảng trống trong sequence.
-
-Nên "được viết bởi một user đã xoá" và "không có ai viết" là hai trạng thái khác nhau, và chỉ
-một trong hai là điều khoản. Dòng user ở lại, với profile bị xoá trắng và một dấu xoá được đặt.
 ```diff title="services/gateway/src/isolation.itest.ts"
-@@ -126,6 +126,10 @@
-   waitFor: <T = Record<string, unknown>>(type: string, timeoutMs?: number) => Promise<T>;
-   frames: () => { type: string }[];
-   opened: () => Promise<void>;
+@@ -37,47 +37,108 @@ function declaredFrameTypes(): string[] {
+     const value = shape?.type?.value;
+     if (typeof value === "string") types.push(value);
+   }
+   return types;
+ }
+ 
+-async function closeCode(socket: WebSocket): Promise<number> {
+-  return new Promise((resolve, reject) => {
+-    socket.on("close", (code) => resolve(code));
+-    socket.on("error", () => undefined);
+-    setTimeout(() => reject(new Error("no close within 5s")), 5_000);
+-  });
++/** A SOCKET WITH A BUFFER, and the buffer is the point.
++ *
++ * The obvious shape — await `open`, then attach a `message` listener, then read —
++ * loses the handshake. `connection.ack` is sent the moment the upgrade completes,
++ * and awaiting `open` yields to the event loop first: the frame arrives with no
++ * listener attached and is gone. Every test in this file that waited for a second
++ * frame timed out at exactly 5000ms until the listener moved to construction time.
++ *
++ * So frames are collected from the instant the socket exists, and `waitFor` reads
++ * the buffer before it waits. */
++interface Reader {
++  socket: WebSocket;
++  waitFor: <T = Record<string, unknown>>(type: string, timeoutMs?: number) => Promise<T>;
++  frames: () => { type: string }[];
++  opened: () => Promise<void>;
 +  /** The close code, once it arrives (T151). Added because a refusal at
 +   * connect IS a close code — the frame is only the explanation — and asserting the
 +   * frame alone would pass whether the socket closed 4003, 4001 or not at all. */
 +  closedWith: (timeoutMs?: number) => Promise<number>;
  }
  
- function read(socket: WebSocket): Reader {
-@@ -160,7 +164,16 @@
-     }
-   };
+-async function firstFrame(socket: WebSocket, type: string): Promise<Record<string, unknown>> {
+-  return new Promise((resolve, reject) => {
+-    socket.on("message", (raw) => {
+-      const frame = JSON.parse(raw.toString()) as Record<string, unknown>;
+-      if (frame.type === type) resolve(frame);
+-    });
+-    socket.on("close", (code) => reject(new Error(`closed ${code}`)));
+-    setTimeout(() => reject(new Error(`no ${type} within 5s`)), 5_000);
++function read(socket: WebSocket): Reader {
++  const buffer: { type: string }[] = [];
++  let closed: number | null = null;
++  socket.on("message", (raw) => buffer.push(JSON.parse(raw.toString()) as { type: string }));
++  socket.on("close", (code) => {
++    closed = code;
+   });
+-}
++  socket.on("error", () => undefined);
++
++  const opened = () =>
++    new Promise<void>((resolve, reject) => {
++      if (socket.readyState === WebSocket.OPEN) return resolve();
++      socket.on("open", () => resolve());
++      socket.on("close", (code) => reject(new Error(`closed ${code} before opening`)));
++      setTimeout(() => reject(new Error("socket never opened")), 5_000);
++    });
  
--  return { socket, waitFor, frames: () => [...buffer], opened };
+-/** ABSENCE NEEDS A DEADLINE RATHER THAN A RACE. `firstFrame` resolves on the frame it
+- * is waiting for, which is the right shape for "this is refused" and no shape at all
+- * for "nothing was delivered". This buffers everything a socket receives so a test can
+- * wait a fixed window and then read what the buffer holds. */
+-function collect(socket: WebSocket): () => Record<string, unknown>[] {
+-  const frames: Record<string, unknown>[] = [];
+-  socket.on("message", (raw) => {
+-    frames.push(JSON.parse(raw.toString()) as Record<string, unknown>);
+-  });
+-  return () => [...frames];
++  const waitFor = async <T>(type: string, timeoutMs = 5_000): Promise<T> => {
++    const deadline = Date.now() + timeoutMs;
++    for (;;) {
++      const found = buffer.find((f) => f.type === type);
++      if (found) return found as T;
++      if (closed !== null) throw new Error(`closed ${closed} before a ${type} arrived`);
++      if (Date.now() > deadline) {
++        throw new Error(
++          `no ${type} within ${timeoutMs}ms — saw ${buffer.map((f) => f.type).join(", ") || "nothing"}`,
++        );
++      }
++      await new Promise((resolve) => setTimeout(resolve, 20));
++    }
++  };
++
 +  const closedWith = async (timeoutMs = 5_000): Promise<number> => {
 +    const deadline = Date.now() + timeoutMs;
 +    for (;;) {
@@ -1988,11 +2006,320 @@ một trong hai là điều khoản. Dòng user ở lại, với profile bị xo
 +  return { socket, waitFor, frames: () => [...buffer], opened, closedWith };
  }
  
- /** Absence needs a deadline rather than a race, so three of the four attacks below
-@@ -420,6 +433,194 @@
-     expect(client.frames().filter((f) => f.type === "message.created")).toEqual([]);
+ async function quiet(ms: number): Promise<void> {
+   await new Promise((resolve) => setTimeout(resolve, ms));
+ }
+ 
++/** OPEN AND BUFFER IN ONE STEP. Every socket in this file goes through here, because
++ * `read` has to attach its listener at construction time — the whole point of the
++ * buffer — and a `new WebSocket(…)` written inline is a socket whose handshake frame
++ * nobody is listening for. */
++/** EVERY SOCKET THIS FILE OPENS, so `afterAll` can close them.
++ *
++ * `server.close()` waits for its connections. A test that asserts a refusal has no
++ * reason to close the socket it was refused on, and fifteen tests leaving one open
++ * each made the teardown hook time out at 10s — with every test passing, which reads
++ * as a suite that works and a harness that does not. */
++const sockets: WebSocket[] = [];
++
++function connect(base: string, token: string, query = ""): Reader {
++  const socket = new WebSocket(`${base}/v1/ws?token=${token}${query}`);
++  sockets.push(socket);
++  return read(socket);
++}
++
++function closeAll(): void {
++  for (const socket of sockets) {
++    if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
++      socket.close();
++    }
++  }
++  sockets.length = 0;
++}
++
+ describe("the socket refuses another tenant's identifiers", () => {
+   let t: SocketTenants;
+   let server: Server;
+   let url: string;
+ 
+   beforeAll(async () => {
+@@ -91,54 +152,57 @@ describe("the socket refuses another tenant's identifiers", () => {
+     attachSessions({ server, api: createApiClient(t.apiUrl), logger: silent });
+     await new Promise<void>((resolve) => server.listen(0, resolve));
+     url = `ws://127.0.0.1:${(server.address() as AddressInfo).port}`;
+   }, 90_000);
+ 
+   afterAll(async () => {
++    // SOCKETS FIRST. `server.close()` waits for its connections, so a socket left
++    // open by a passing test is a teardown that hangs.
++    closeAll();
+     await new Promise<void>((resolve) => server?.close(() => resolve()));
+     t?.stop();
    });
  
+   it("derives the frame types from the protocol, and finds some", () => {
+     const types = declaredFrameTypes();
+     // An empty derivation is a broken derivation, not a small protocol.
+     expect(types.length).toBeGreaterThan(1);
+     expect(types).toContain("message.send");
+   });
+ 
+   it("a connection ack names nothing belonging to the other tenant", async () => {
+-    const socket = new WebSocket(`${url}/v1/ws?token=${t.attacker.token}`);
+-    const ack = await firstFrame(socket, "connection.ack");
++    const socket = connect(url, t.attacker.token);
++    const ack = await socket.waitFor("connection.ack");
+     const serialised = JSON.stringify(ack);
+     expect(serialised).not.toContain(t.victim.channelId);
+     expect(serialised).not.toContain(t.victim.environmentId);
+     expect(serialised).not.toContain(t.victim.userId);
+-    socket.close();
++    socket.socket.close();
+   }, 20_000);
+ 
+   it("message.send to the other tenant's channel is refused", async () => {
+-    const socket = new WebSocket(`${url}/v1/ws?token=${t.attacker.token}`);
+-    await firstFrame(socket, "connection.ack");
+-    socket.send(
++    const socket = connect(url, t.attacker.token);
++    await socket.waitFor("connection.ack");
++    socket.socket.send(
+       JSON.stringify({
+         type: "message.send",
+         payload: {
+           idem_key: randomUUID(),
+           channel: t.victim.channelId,
+           text: "from the attacker",
+         },
+       }),
+     );
+-    const error = await firstFrame(socket, "error");
++    const error = await socket.waitFor("error");
+     const payload = error.payload as { code?: string; message?: string };
+     // The refusal must not name what it refused. An error that echoes the channel id
+     // back tells the attacker the channel exists, which is the leak the HTTP gauntlet
+     // proves is absent on every route — the socket does not get an exemption.
+     expect(JSON.stringify(payload)).not.toContain(t.victim.channelId);
+     expect(payload.code).toBeTruthy();
+-    socket.close();
++    socket.socket.close();
+   }, 20_000);
+ 
+   it("every declared frame type that is not message.send is refused inbound", async () => {
+     // SCHEMA VALIDATION RUNS BEFORE THE TYPE CHECK, and that shapes what this can
+     // claim. A frame whose payload does not match its own schema is answered
+     // `invalid_frame` and never reaches the rule that says clients may not utter a
+@@ -147,29 +211,29 @@ describe("the socket refuses another tenant's identifiers", () => {
+     //
+     // So: every declared type must be refused SOMEHOW, and one well-formed server
+     // frame must be refused BY THE RULE.
+     const inboundOnly = declaredFrameTypes().filter((type) => type !== "message.send");
+     expect(inboundOnly.length).toBeGreaterThan(0);
+     for (const type of inboundOnly) {
+-      const socket = new WebSocket(`${url}/v1/ws?token=${t.attacker.token}`);
+-      await firstFrame(socket, "connection.ack");
+-      socket.send(JSON.stringify({ type, payload: {} }));
+-      const error = await firstFrame(socket, "error");
++      const socket = connect(url, t.attacker.token);
++      await socket.waitFor("connection.ack");
++      socket.socket.send(JSON.stringify({ type, payload: {} }));
++      const error = await socket.waitFor("error");
+       expect((error.payload as { code?: string }).code, `${type} was not refused`).toBeTruthy();
+-      socket.close();
++      socket.socket.close();
+     }
+ 
+     // `message.ack` carries `{ seq }`, which is the easiest valid server frame to
+     // build — so it is the one that proves the rule rather than the parser.
+-    const socket = new WebSocket(`${url}/v1/ws?token=${t.attacker.token}`);
+-    await firstFrame(socket, "connection.ack");
+-    socket.send(JSON.stringify({ type: "message.ack", payload: { seq: 1 } }));
+-    const error = await firstFrame(socket, "error");
++    const socket = connect(url, t.attacker.token);
++    await socket.waitFor("connection.ack");
++    socket.socket.send(JSON.stringify({ type: "message.ack", payload: { seq: 1 } }));
++    const error = await socket.waitFor("error");
+     expect((error.payload as { code?: string }).code).toBe("unknown_frame_type");
+     // A protocol violation closes the connection (EIR-WS-06's 4002).
+-    await expect(closeCode(socket)).resolves.toBe(4002);
++    await expect(socket.closedWith()).resolves.toBe(4002);
+   }, 60_000);
+ 
+   // ── THE SOCKET'S SEND INTO A PRIVATE CHANNEL OF ITS OWN TENANT ─────────────
+   //
+   // FR-001. Every attack above crosses a tenant boundary; this one
+   // does not. The attacker's own tenant holds a private channel they are not a
+@@ -186,36 +250,36 @@ describe("the socket refuses another tenant's identifiers", () => {
+     // refused; it does not say the refusal is indistinguishable from one for a
+     // channel that exists nowhere, and indistinguishability is the property SC-002
+     // asks for.
+     //
+     // ONE SOCKET FOR BOTH, because opening a second would let a difference in
+     // connection state stand in for a difference in the answer.
+-    const socket = new WebSocket(`${url}/v1/ws?token=${t.attacker.token}`);
+-    await firstFrame(socket, "connection.ack");
++    const socket = connect(url, t.attacker.token);
++    await socket.waitFor("connection.ack");
+ 
+     const text = `not a member ${randomUUID()}`;
+-    socket.send(
++    socket.socket.send(
+       JSON.stringify({
+         type: "message.send",
+         payload: { idem_key: randomUUID(), channel: t.attacker.privateChannelId, text },
+       }),
+     );
+-    const refused = await firstFrame(socket, "error");
++    const refused = await socket.waitFor("error");
+ 
+-    socket.send(
++    socket.socket.send(
+       JSON.stringify({
+         type: "message.send",
+         payload: {
+           idem_key: randomUUID(),
+           channel: "00000000-0000-4000-8000-000000000000",
+           text: `nowhere ${randomUUID()}`,
+         },
+       }),
+     );
+-    const absent = await firstFrame(socket, "error");
+-    socket.close();
++    const absent = await socket.waitFor("error");
++    socket.socket.close();
+ 
+     const refusedCode = (refused.payload as { code?: string }).code;
+     expect(refusedCode, "the private-channel send was not refused at all").toBeTruthy();
+     expect(refusedCode).toBe((absent.payload as { code?: string }).code);
+ 
+     // AND READ THE CHANNEL, rather than inferring its state from the refusal. A
+@@ -251,38 +315,34 @@ describe("the socket refuses another tenant's identifiers", () => {
+     // A CONTROL AND THE CASE, in that order, on one fixture. Asserting only that a
+     // removed member's cursor is refused would pass against a server that accepts no
+     // cursor at all — so the same token presents the same cursor twice, and the
+     // difference between the two acks is the whole assertion.
+     await t.attacker.say(`before removal ${randomUUID()}`);
+ 
+-    const asMember = new WebSocket(
+-      `${url}/v1/ws?token=${t.attacker.token}&cursor=${t.attacker.channelId}:0`,
+-    );
+-    const first = await firstFrame(asMember, "connection.ack");
++    const asMember = connect(url, t.attacker.token, `&cursor=${t.attacker.channelId}:0`);
++    const first = await asMember.waitFor("connection.ack");
+     const beforeCursor = (first.payload as { cursor?: Record<string, number> }).cursor ?? {};
+     expect(Object.keys(beforeCursor)).toContain(t.attacker.channelId);
+-    asMember.close();
++    asMember.socket.close();
+ 
+     // Through the PUBLIC ROUTE, so the test asserts the consequence of the API rather
+     // than of a direct write — a repository call would prove the session reads
+     // `members` and nothing about whether the endpoint gets there.
+     await t.attacker.removeSelf();
+ 
+-    const afterRemoval = new WebSocket(
+-      `${url}/v1/ws?token=${t.attacker.token}&cursor=${t.attacker.channelId}:0`,
+-    );
+-    const frames = collect(afterRemoval);
+-    const second = await firstFrame(afterRemoval, "connection.ack");
++    const afterRemoval = connect(url, t.attacker.token, `&cursor=${t.attacker.channelId}:0`);
++    const frames = afterRemoval.frames;
++    const second = await afterRemoval.waitFor("connection.ack");
+     const afterCursor = (second.payload as { cursor?: Record<string, number> }).cursor ?? {};
+     expect(Object.keys(afterCursor)).not.toContain(t.attacker.channelId);
+ 
+     // And nothing is backfilled from it either. The ack's cursor is what the server
+     // ACCEPTED; this is what it DELIVERED, and the two can disagree.
+     await quiet(1_000);
+     expect(frames().filter((f) => f.type === "message.created")).toEqual([]);
+-    afterRemoval.close();
++    afterRemoval.socket.close();
+ 
+     // PUT IT BACK. This test mutates state every later test in the file leans on,
+     // and the next one to need it failed on its control rather than on its subject.
+     await t.attacker.rejoinSelf();
+   });
+ 
+@@ -301,19 +361,17 @@ describe("the socket refuses another tenant's identifiers", () => {
+   // sentence this test exists to replace: archiving could plausibly have been
+   // implemented by removing memberships, and then a member would silently lose the
+   // channel from their session.
+   it("keeps an archived channel in the session and its cursor accepted", async () => {
+     await t.attacker.archiveOwnChannel();
+     try {
+-      const socket = new WebSocket(
+-        `${url}/v1/ws?token=${t.attacker.token}&cursor=${t.attacker.channelId}:0`,
+-      );
+-      const ack = await firstFrame(socket, "connection.ack");
++      const socket = connect(url, t.attacker.token, `&cursor=${t.attacker.channelId}:0`);
++      const ack = await socket.waitFor("connection.ack");
+       const cursor = (ack.payload as { cursor?: Record<string, number> }).cursor ?? {};
+       expect(Object.keys(cursor)).toContain(t.attacker.channelId);
+-      socket.close();
++      socket.socket.close();
+     } finally {
+       // IN A `finally`, BECAUSE THE TEST ABOVE LEARNED THIS THE OTHER WAY. It left a
+       // removed membership behind and the next test failed on its control rather
+       // than on its subject. An assertion that throws must still put the state back,
+       // or the diagnosis lands in a file that did nothing wrong.
+       await t.attacker.unarchiveOwnChannel();
+@@ -324,17 +382,15 @@ describe("the socket refuses another tenant's identifiers", () => {
+   it("a cursor naming the other tenant's channel backfills nothing", async () => {
+     // Something to backfill, planted before the socket opens — a resume that finds an
+     // empty channel proves nothing about whether it would have delivered.
+     const text = `before the resume ${randomUUID()}`;
+     await t.victim.say(text);
+ 
+-    const socket = new WebSocket(
+-      `${url}/v1/ws?token=${t.attacker.token}&cursor=${t.victim.channelId}:1`,
+-    );
+-    const frames = collect(socket);
+-    const ack = await firstFrame(socket, "connection.ack");
++    const socket = connect(url, t.attacker.token, `&cursor=${t.victim.channelId}:1`);
++    const frames = socket.frames;
++    const ack = await socket.waitFor("connection.ack");
+ 
+     // THE ACK ECHOES WHAT THE SERVER ACCEPTED, not what the client presented. A
+     // channel this token cannot see is not in it — and asserting on the echo is the
+     // cheap half, because a server that silently dropped the cursor and a server that
+     // honoured it both answer with an ack.
+     const cursor = (ack.payload as { cursor?: Record<string, number> }).cursor ?? {};
+@@ -345,70 +401,258 @@ describe("the socket refuses another tenant's identifiers", () => {
+     await quiet(1_000);
+     const delivered = frames().filter((f) => f.type === "message.created");
+     expect(delivered).toEqual([]);
+     // And the buffer is not empty for an unrelated reason — the ack is in it, so a
+     // collector that attached too late would fail here rather than pass vacuously.
+     expect(frames().some((f) => f.type === "connection.ack")).toBe(true);
+-    socket.close();
++    socket.socket.close();
+   });
+ 
+   it("a token minted by one tenant cannot open a session for the other", async () => {
+     // The attacker asks its OWN api for a token naming the victim's user. Either the
+     // mint refuses, or the session it opens must resolve nothing of the victim's.
+     const borrowed = await mintToken(
+       t.apiUrl,
+       t.attacker.credential,
+       t.victim.userExternalId,
+     ).catch(() => null); // refused at the mint is the stronger answer
+     if (borrowed === null) return;
+-    const socket = new WebSocket(`${url}/v1/ws?token=${borrowed}`);
++    const socket = connect(url, borrowed);
+     try {
+-      const ack = await firstFrame(socket, "connection.ack");
++      const ack = await socket.waitFor("connection.ack");
+       expect(JSON.stringify(ack)).not.toContain(t.victim.channelId);
+     } catch {
+       // A closed socket is a refusal, which is also correct.
+-      await expect(closeCode(socket)).resolves.toBeGreaterThan(0);
++      await expect(socket.closedWith()).resolves.toBeGreaterThan(0);
+     }
+-    socket.close();
++    socket.socket.close();
+   }, 20_000);
+ 
+   // ── THE SAME-TENANT NON-MEMBER, ON THE SOCKET (T087) ───────────────────────
++
 +  // ── T151, T153: THE BAN AT THE DOOR, AND WHAT IT DOES TO AN OPEN SOCKET ───
 +  //
 +  // FR-032 asks what a ban does to a connection that is ALREADY OPEN, and T153 named two
@@ -2016,9 +2343,9 @@ một trong hai là điều khoản. Dòng user ở lại, với profile bị xo
 +  // difference between "cannot speak" and "cannot listen", for a user the tenant has
 +  // already silenced.
 +  it("refuses a banned user at connect with 4003, not 4001", async () => {
-+    await tenants.attacker.banSelf();
++    await t.attacker.banSelf();
 +    try {
-+      const client = connect(tenants.attacker.token);
++      const client = connect(url, t.attacker.token);
 +      // The error frame arrives first, because a close reason is a short string.
 +      const err = await client.waitFor<{ payload: { code: string } }>("error");
 +      expect(err.payload.code).toBe("user_banned");
@@ -2027,15 +2354,15 @@ một trong hai là điều khoản. Dòng user ở lại, với profile bị xo
 +      // client round the re-authentication loop for ever.
 +      expect(closed).toBe(4003);
 +    } finally {
-+      await tenants.attacker.unbanSelf();
++      await t.attacker.unbanSelf();
 +    }
 +  });
 +
 +  it("stops an already-open socket from sending, and keeps delivering to it", async () => {
-+    const client = connect(tenants.victim.token);
++    const client = connect(url, t.victim.token);
 +    await client.waitFor("connection.ack");
 +
-+    await tenants.victim.banSelf();
++    await t.victim.banSelf();
 +    try {
 +      // SENDING STOPS. The frame is accepted by the gateway and refused by the api, so
 +      // the client is told rather than disconnected.
@@ -2044,7 +2371,7 @@ một trong hai là điều khoản. Dòng user ở lại, với profile bị xo
 +          type: "message.send",
 +          payload: {
 +            idem_key: randomUUID(),
-+            channel: tenants.victim.channelId,
++            channel: t.victim.channelId,
 +            text: "banned mid-connection",
 +          },
 +        }),
@@ -2057,7 +2384,7 @@ một trong hai là điều khoản. Dòng user ở lại, với profile bị xo
 +      // it, and the next reconnect is where the door closes.
 +      expect(client.socket.readyState).toBe(1);
 +    } finally {
-+      await tenants.victim.unbanSelf();
++      await t.victim.unbanSelf();
 +    }
 +  });
 +
@@ -2079,39 +2406,38 @@ một trong hai là điều khoản. Dòng user ở lại, với profile bị xo
 +  it("delivers a deleted user's message on resume, still attributed to them", async () => {
 +    // ITS OWN FIXTURE. The first version deleted the shared `victim`, which took that
 +    // tenant's membership with it and made the next test's profile PATCH answer 404 —
-+    // the same shared-fixture mutation Phase 7 hit twice.
++    // the same shared-fixture mutation the removal test hit.
 +    const { userExternalId, channelId, seq, witnessToken } =
-+      await tenants.victim.seedDeletable();
++      await t.victim.seedDeletable();
 +
-+    const deleted = await fetch(`${api.url}/v1/users/${userExternalId}`, {
++    const deleted = await fetch(`${t.apiUrl}/v1/users/${userExternalId}`, {
 +      method: "DELETE",
-+      headers: { authorization: `Bearer ${tenants.victim.credential}` },
++      headers: { authorization: `Bearer ${t.victim.credential}` },
 +    });
 +    expect(deleted.status).toBe(200);
 +
 +    // A REMAINING MEMBER RESUMES. The deletion took the doomed user's own membership, so
 +    // their session no longer carries the channel — and the case that matters is that the
 +    // message survives for everybody else.
-+    const client = connect(witnessToken, `&cursor=${channelId}:0`);
-+    const ack = await client.waitFor<{ payload: { cursor: Record<string, number> } }>(
-+      "connection.ack",
-+    );
-+    expect(Object.keys(ack.payload.cursor)).toContain(channelId);
++    const socket = connect(url, witnessToken, `&cursor=${channelId}:0`);
++    const ack = await socket.waitFor("connection.ack");
++    const cursor = (ack.payload as { cursor?: Record<string, number> }).cursor ?? {};
++    expect(Object.keys(cursor)).toContain(channelId);
 +
-+    const mine = await client.waitFor<{ payload: Record<string, unknown> }>(
-+      "message.created",
-+    );
++    const mine = await socket.waitFor("message.created");
 +    // THE FRAME ARRIVED, and its `user` is the deleted user's external id. Both halves
 +    // matter: absent means `toFrame` dropped the row, and a null `user` means
 +    // `messageSchema` would have refused it.
-+    expect(mine.payload["seq"]).toBe(seq);
-+    expect(mine.payload["user"]).toBe(userExternalId);
-+    expect(mine.payload["text"]).toBe("sent before the deletion");
++    expect((mine.payload as Record<string, unknown>)["seq"]).toBe(seq);
++    expect((mine.payload as Record<string, unknown>)["user"]).toBe(userExternalId);
++    const frame = mine.payload as Record<string, unknown>;
++    expect(frame["text"]).toBe("sent before the deletion");
++    socket.socket.close();
 +  });
 +
 +  // ── T134: THE PROFILE IS STORED AND THE WIRE DID NOT MOVE ─────────────────
 +  //
-+  // The channel-control chapter gives `users.display_name`, `users.avatar_url` and `users.metadata` a
++  // This chapter gives `users.display_name`, `users.avatar_url` and `users.metadata` a
 +  // route that writes them and a route that reads them. **None of that reaches a
 +  // socket.** `connection.ack` names who you are with a bare external id string, and
 +  // `messageSchema` carries `user` the same way — no display name, no avatar, no
@@ -2124,16 +2450,16 @@ một trong hai là điều khoản. Dòng user ở lại, với profile bị xo
 +  // THE MESSAGE HALF IS CHECKED AGAINST THE SCHEMA AND NOT AGAINST A LIVE FRAME, because
 +  // no `message.created` ever arrives in this suite: `say()` writes through the
 +  // repository, the api publishes to no fan-out, and nothing here drains the outbox.
-+  // The isolation gauntlet recorded that as its own finding — a REST-sent message reaches no socket,
++  // The isolation harness recorded that as its own finding — a REST-sent message reaches no socket,
 +  // ever — and `public-surface.itest.ts` is what pins it. Waiting for a frame here is a
 +  // 5-second timeout, which is how this test was written the first time.
 +  it("keeps the socket's identity a bare external id, whatever the profile holds", async () => {
 +    // A full profile written through the public route.
-+    const patched = await fetch(`${api.url}/v1/users/${tenants.victim.userExternalId}`, {
++    const patched = await fetch(`${t.apiUrl}/v1/users/${t.victim.userExternalId}`, {
 +      method: "PATCH",
 +      headers: {
 +        "content-type": "application/json",
-+        authorization: `Bearer ${tenants.victim.credential}`,
++        authorization: `Bearer ${t.victim.credential}`,
 +      },
 +      body: JSON.stringify({
 +        display_name: "A Name On The Wire",
@@ -2144,10 +2470,11 @@ một trong hai là điều khoản. Dòng user ở lại, với profile bị xo
 +    expect(patched.status).toBe(200);
 +
 +    // THE LIVE HALF: the handshake, after the profile exists.
-+    const client = connect(tenants.victim.token);
-+    const ack = await client.waitFor<{ payload: { user: unknown } }>("connection.ack");
-+    expect(typeof ack.payload.user).toBe("string");
-+    expect(ack.payload.user).toBe(tenants.victim.userExternalId);
++    const socket = connect(url, t.victim.token);
++    const ack = await socket.waitFor("connection.ack");
++    const identity = (ack.payload as { user?: unknown }).user;
++    expect(typeof identity).toBe("string");
++    expect(identity).toBe(t.victim.userExternalId);
 +
 +    // THE CONTRACT HALF: the frame union refuses an enriched identity. If somebody widens
 +    // `messageSchema.user` to an object, this stops failing — and that is the change this
@@ -2156,9 +2483,9 @@ một trong hai là điều khoản. Dòng user ở lại, với profile bị xo
 +      type: "message.created",
 +      payload: {
 +        id: randomUUID(),
-+        channel: tenants.victim.channelId,
++        channel: t.victim.channelId,
 +        seq: 1,
-+        user: { id: tenants.victim.userExternalId, display_name: "A Name On The Wire" },
++        user: { id: t.victim.userExternalId, display_name: "A Name On The Wire" },
 +        text: "hello",
 +        created_at: new Date().toISOString(),
 +      },
@@ -2170,21 +2497,68 @@ một trong hai là điều khoản. Dòng user ở lại, với profile bị xo
 +      type: "message.created",
 +      payload: {
 +        id: randomUUID(),
-+        channel: tenants.victim.channelId,
++        channel: t.victim.channelId,
 +        seq: 1,
-+        user: tenants.victim.userExternalId,
++        user: t.victim.userExternalId,
 +        text: "hello",
 +        created_at: new Date().toISOString(),
 +        avatar_url: "https://cdn.example.com/face.png",
 +      },
 +    });
 +    expect(bare.success).toBe(false);
++    socket.socket.close();
 +  });
 +
-   // ── THE SAME-TENANT NON-MEMBER, ON THE SOCKET (T087) ─────────
    //
-   // The protocol's frame union has exactly one inbound member — `message.send` —
+   // The protocol's frame union has exactly one inbound member — `message.send` — so
+   // there is no "subscribe" frame to attack: what a socket may see is decided at
+   // connect, from the session's channel list, and a cursor is the only thing a client
+   // gets to assert about it. So the socket's version of "a non-member reaches a
+   // private channel" is a cursor naming one.
+   //
+   // The tenant's own user is not a member of the tenant's own private channel —
+   // `seedSocketTenants` creates it and adds nobody — which makes this the same-tenant
+   // case rather than the cross-tenant one every other attack here uses.
+   it("a same-tenant non-member's cursor for a private channel is not accepted", async () => {
+-    const socket = new WebSocket(
+-      `${url}/v1/ws?token=${t.attacker.token}&cursor=${t.attacker.privateChannelId}:0`,
+-    );
+-    const frames = collect(socket);
+-    const ack = await firstFrame(socket, "connection.ack");
++    const socket = connect(url, t.attacker.token, `&cursor=${t.attacker.privateChannelId}:0`);
++    const frames = socket.frames;
++    const ack = await socket.waitFor("connection.ack");
+     const cursor = (ack.payload as { cursor?: Record<string, number> }).cursor ?? {};
+     expect(Object.keys(cursor)).not.toContain(t.attacker.privateChannelId);
+ 
+     // THE CONTROL IS THE REMOVAL TEST ABOVE: the same token's cursor for a channel it
+     // IS a member of gets accepted there. Without that pair, an empty cursor set here
+     // would pass whether the session was scoped or simply broken.
+     await quiet(1_000);
+     expect(frames().filter((f) => f.type === "message.created")).toEqual([]);
+-    socket.close();
++    socket.socket.close();
+   });
+ 
+   // ── T048: the subscribe ────────────────────────────────────────────────────
+   it("nothing from the other tenant's channel is delivered", async () => {
+-    const socket = new WebSocket(`${url}/v1/ws?token=${t.attacker.token}`);
+-    const frames = collect(socket);
+-    await firstFrame(socket, "connection.ack");
++    const socket = connect(url, t.attacker.token);
++    const frames = socket.frames;
++    await socket.waitFor("connection.ack");
+     await t.victim.say(`the victim speaks ${randomUUID()}`);
+     // A DEADLINE RATHER THAN A RACE, and longer than the others because this one is
+     // waiting on a fan-out that has to travel through Redis before it could arrive.
+     await quiet(1_500);
+     expect(frames().filter((f) => f.type === "message.created")).toEqual([]);
+-    socket.close();
++    socket.socket.close();
+   });
+ });
 ```
+
 ```ts title="services/api/src/users/users.itest.ts"
 import "reflect-metadata";
 
@@ -2195,13 +2569,11 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { AppModule } from "../app.module";
 import { createDb, createPool, type Db } from "../db/client";
 import { mintUserToken } from "../auth/user-token";
-import { periodOf } from "../quotas/period";
 import {
   createApiKey,
   createEnvironment,
   environmentSigningSecret,
   Repository,
-  usageFor,
 } from "../db/repository";
 
 // THE LISTING, END TO END (FR-013 to FR-015, FR-022, SC-007).
@@ -2227,12 +2599,10 @@ describe("a user's channel listing", () => {
   let notAMember: string;
   let publicNotAMember: string;
   let tokenFor: (subject: string) => Promise<string>;
-  let environmentId: string;
 
   beforeAll(async () => {
     db = createDb(createPool());
     const env = await createEnvironment(db, { name: "users-itest" });
-    environmentId = env.id;
     repo = new Repository(db, env.id);
     credential = (await createApiKey(db, { environmentId: env.id })).credential;
     member = await repo.createUser("lister", "A Lister");
@@ -2652,7 +3022,7 @@ describe("a user's channel listing", () => {
   it("takes a user token as well as an application credential", async () => {
     // The only route on this controller that does: a user records their own position.
     // Method-level `@Accepts` wins over the class-level one, which is the mechanism
-    // The isolation gauntlet built and this is the first route to rely on it.
+    // The isolation harness built and this is the first route to rely on it.
     const c = await repo.createChannel("own-token", "public");
     await repo.addMember(c.id, member.id);
     const one = await repo.sendMessage(c.id, { text: "one", userId: member.id });
@@ -2891,31 +3261,18 @@ describe("a user's channel listing", () => {
     expect(remaining).toBe(0);
   });
 
-  it("leaves usage_active_users rows alone (FR-029)", async () => {
-    // Billing history does not vanish with a profile: a customer who deleted a user in
-    // March still owes for March.
-    //
-    // THE ROW IS WRITTEN BY A SEND, not by a helper. `sendMessage` inserts into
-    // `usage_active_users` when the send is attributed — that is the only writer — so the
-    // fixture has to send. Read back through `usageFor`, which is the reader the billing
-    // surface uses, rather than a raw count this suite may not hold.
-    const billed = await repo.createUser("billed", "Billed");
-    const channel = await repo.createChannel("billing-witness", "public");
-    await repo.addMember(channel.id, billed.id);
-    await repo.sendMessage(channel.id, {
-      text: "counts toward the month",
-      userId: billed.id,
-      userExternalId: "billed",
-    });
-    const before = await usageFor(db, environmentId, periodOf(new Date()));
-    expect(before.activeUsers).toBeGreaterThan(0);
-
-    expect((await removeUser("billed")).status).toBe(200);
-
-    const after = await usageFor(db, environmentId, periodOf(new Date()));
-    expect(after.activeUsers).toBe(before.activeUsers);
-    expect(after.messagesSent).toBe(before.messagesSent);
-  });
+  // ── FR-029's HALF THAT WAITS FOR THE COUNTERS ──────────────────────────────
+  //
+  // "Billing history does not vanish with a profile": a customer who deleted a user
+  // in March still owes for March. The assertion is that `usage_active_users` is
+  // untouched by a deletion — and there is no `usage_active_users` yet. The usage
+  // counters arrive with quotas, in movement VII.
+  //
+  // WHAT THE DELETION ALREADY DOES IS WHAT MAKES THAT ASSERTION POSSIBLE LATER: it
+  // clears the profile fields, removes the memberships and read positions, sets
+  // `deleted_at`, and touches nothing else. A deletion written as a CASCADE would
+  // have to be unpicked when the counters arrive; this one does not, and the reason
+  // is recorded on the column rather than here.
 
   it("answers 200 on a second delete and 404 for a user who never existed", async () => {
     const twice = await repo.createUser("twice-deleted", "Twice");
@@ -3014,7 +3371,7 @@ describe("a user's channel listing", () => {
     const token = await tokenFor("bannable");
 
     // THE CONTROL FIRST. A refusal proves nothing unless the same call worked a moment
-    // ago — the isolation gauntlet's fourteen green tests are why this line exists.
+    // ago — the isolation harness's fourteen green tests are why this line exists.
     expect((await sendAs(channel.id, token, "before the ban")).status).toBe(201);
 
     expect((await ban("bannable")).status).toBe(200);
@@ -3104,20 +3461,17 @@ describe("a user's channel listing", () => {
 });
 ```
 
-## Một dòng user ở lần xác thực đầu tiên, việc chẳng ai làm
+## A user record on first authentication, which nothing did
 
-FR-USR-02 đã đòi từ khi SRS được viết rằng "một bản ghi user phải được tạo ngầm ở lần xác thực
-đầu tiên nếu nó chưa tồn tại". Không gì làm việc đó, và khoảng trống ấy có một triệu chứng chứ
-không phải một sự im lặng: mint một token cho một identifier chưa có dòng nào, gửi qua route
-nội bộ, và api trả lời
 ```json
 { "code": "invalid_request", "message": "unknown user" }
 ```
 
-400, và một thông điệp gọi tên người gọi trong khi nguyên nhân là chẳng ai tạo ra một dòng.
-Việc tạo ngầm tồn tại chính là để ngăn câu trả lời đó.
 ```diff title="services/api/src/auth/dev-token.controller.ts"
-@@ -12,7 +12,7 @@
+@@ -9,13 +9,13 @@ import {
+   Req,
+   UseGuards,
+ } from "@nestjs/common";
  import { z } from "zod";
  
  import type { Db } from "../db/client";
@@ -3126,11 +3480,17 @@ Việc tạo ngầm tồn tại chính là để ngăn câu trả lời đó.
  import { AUTH_DB } from "./authenticate.middleware";
  import { Accepts, CredentialGuard } from "./credential.guard";
  import type { RequestWithPrincipal } from "./principal";
-@@ -77,6 +77,31 @@
+ import { MAX_TOKEN_LIFETIME_SECONDS, mintUserToken } from "./user-token";
+ import { ZodValidationPipe } from "../messages/zod-validation.pipe";
+ 
+@@ -66,12 +66,37 @@ export class DevTokenController {
+     // production, and a 403 would invite someone to go looking for the
+     // permission that would unlock it.
+     if (environment.kind !== "development") {
        throw new NotFoundException("Cannot POST /auth/dev-token");
      }
  
-+    // ── THE USER ROW, CREATED IF ABSENT (FR-039a, FR-039b) ────
++    // ── THE USER ROW, CREATED IF ABSENT (FR-039a, FR-039b) ──────────────────
 +    //
 +    // FR-USR-02: "a user record shall be created implicitly on first
 +    // authentication if it does not exist." Nothing did it, and the gap had a
@@ -3158,27 +3518,18 @@ Việc tạo ngầm tồn tại chính là để ngăn câu trả lời đó.
      const { token, expiresAt } = await mintUserToken(environment.signingSecret, {
        user: body.user,
        environmentId: principal.environmentId,
+       ttlSeconds: body.ttl_seconds ?? DEFAULT_TTL_SECONDS,
+     });
+     // snake_case on the wire, camelCase inside — the same boundary rule every
 ```
 
-Phần hiện thực là một lần gọi `createUser` đẳng xâm (idempotent) của chương 3.13. Ba tính chất
-trông như miễn phí, và mỗi cái cần một test riêng:
-
-**Xác thực và membership hội tụ về một dòng, cái nào tới trước cũng vậy** — và display name còn
-nguyên, vì `createUser` không update.
-
-**Response không nói cái nào đã xảy ra.** Một status hay một field phân biệt "vừa tạo" với "đã
-có" sẽ là một cái máy đoán membership: mint token cho những external id đoán bừa rồi đọc câu
-trả lời để biết tenant có những id nào. Test so status và tập key của hai response, không so nội
-dung.
-
-**Một lần mint không thể dỡ một lệnh ban hay một lần xoá.** `createUser` không chạm cột nào trên
-một dòng đã tồn tại. Trường hợp đã xoá là trường hợp đáng nói: FR-030 nói xuất trình lại id thì
-dùng lại dòng cũ, và đúng thế — nhưng **dòng đó vẫn đang bị xoá.** `POST /v1/users` là server
-của khách hàng nói "user này trở lại rồi"; một lần mint chỉ nói "có ai đó vừa xin một token".
 ```diff title="services/api/src/auth/credentials.itest.ts"
-@@ -360,4 +360,129 @@
-       expect(JSON.stringify(body)).not.toContain(PLATFORM);
-     });
+@@ -351,7 +351,132 @@ describe("credentials", () => {
+     const channel = await repo.createChannel("signup-key", "public");
+     expect(
+       (await post({ text: "bootstrapped" }, first.apiKey!.secret, channel.id))
+         .status,
+     ).toBe(201);
    });
 +
 +  // ══ FR-USR-02: A USER ROW ON FIRST AUTHENTICATION ════════════
@@ -3308,28 +3659,19 @@ của khách hàng nói "user này trở lại rồi"; một lần mint chỉ n�
  });
 ```
 
-## Lệnh ban, và nó làm gì với một kết nối đang mở
+## The ban, and what it does to a connection already open
 
-FR-032 hỏi đúng câu đó, và bản đặc tả đưa ra hai câu trả lời — đóng ở nhịp heartbeat kế tiếp,
-hoặc đóng ngay — kèm nhận xét rằng chúng khác nhau ở chỗ gateway có phải được thông báo hay
-không.
-
-**Câu trả lời là không cái nào cả, và nó đã được dựng sẵn.** Một lần gửi qua socket đi qua
-`/internal/messages` của api, chính là đường repository mà check ban nằm ở đầu. Nên một socket
-bị ban mất khả năng gửi ngay khoảnh khắc lệnh ban có hiệu lực, và vẫn nhận tin cho tới khi nó
-đóng vì một lý do khác, bởi việc phát tin không hỏi api điều gì.
-
-Đó không phải một sự thoả hiệp bày ra cho chương này. Đó là hình dáng chương 3.2 đã chọn cho một
-token hết hạn, và comment nó để lại nói đúng điều ấy: *"socket vẫn đang mở và vẫn NHẬN, vì việc
-phát tin không hỏi api điều gì. Việc ghi thì có."*
 ```diff title="packages/protocol/src/internal.ts"
-@@ -137,6 +137,22 @@
+@@ -134,12 +134,28 @@ export const internalMembershipsResponseSchema = z.strictObject({
+  * `user` is the EXTERNAL id, as everywhere else on this contract: internal uuids
+  * are the api's business. */
+ export const internalSessionResponseSchema = z.strictObject({
    environment_id: z.string().min(1),
    user: z.string().min(1),
    channel_ids: z.array(z.string().min(1)),
 +  /** FR-031. Whether this user is banned in this environment.
 +   *
-+   * IT RIDES THIS RESPONSE FOR THE REASON THE LIMITS DO: the gateway has no database and
++   * IT RIDES THE RESPONSE THE GATEWAY ALREADY ASKS FOR: the gateway has no database and
 +   * must not gain one, `banned_at` is a column in Postgres, and the api is the only
 +   * service that reads Postgres. So the ban travels on the one call the gateway already
 +   * makes at connect — no new table reaches the gateway and no new round trip is added.
@@ -3343,29 +3685,44 @@ phát tin không hỏi api điều gì. Việc ghi thì có."*
 +   * which is the pre-chapter behaviour and the safe direction to be wrong in for one
 +   * deploy window. */
 +  banned: z.boolean().default(false),
-   /** The two limits the gateway enforces, resolved from the
-    * environment's policy with nulls already turned into defaults.
-    *
+ });
+ 
+ export type InternalSendRequest = z.infer<typeof internalSendRequestSchema>;
+ export type InternalSessionResponse = z.infer<
+   typeof internalSessionResponseSchema
+ >;
 ```
+
 ```diff title="services/gateway/src/auth.ts"
-@@ -50,7 +50,12 @@
-   /** The api answered, and the answer was "this environment has
-    * spent its month". Carries the api's own message, because the resume date is
-    * in it and a close reason string has nowhere to put one. */
--  | { outcome: "over_quota"; message: string };
-+  | { outcome: "over_quota"; message: string }
-+  /** FR-031. The api answered, the token is perfectly good, and the user
-+   * is banned in this environment. Its own outcome and its own close code (4003), not a
-+   * reuse of `refused`: 4001 means "your credential is bad", which a client acts on by
-+   * re-authenticating, and re-authenticating succeeds and connects to the same refusal. */
+@@ -26,25 +26,37 @@ export type { Identity } from "./api-client.js";
+  * way: 4001 tells a client its credential is wrong (retrying will not help),
+  * 1011 tells it we are broken (retrying will). 2.5 drew that line for the
+  * memberships lookup; moving verification here must not erase it. */
+ export type Authentication =
+   | { outcome: "ok"; identity: Identity; channelIds: string[] }
+   | { outcome: "refused" }
+-  | { outcome: "unavailable"; error: string };
++  | { outcome: "unavailable"; error: string }
++  /** FR-031. The api answered, the token is perfectly good, and the user is banned in
++   * this environment. Its own outcome and its own close code (4003), not a reuse of
++   * `refused`: 4001 means "your credential is bad", which a client acts on by
++   * re-authenticating — and re-authenticating succeeds and connects to the same
++   * refusal. A client that cannot tell those apart retries for ever. */
 +  | { outcome: "banned" };
  
  export async function authenticate(
    api: ApiClient,
-@@ -69,6 +74,10 @@
-     if ("quotaExceeded" in session) {
-       return { outcome: "over_quota", message: session.quotaExceeded };
-     }
+   token: string | null,
+ ): Promise<Authentication> {
+   if (token === null || token.length === 0) return { outcome: "refused" };
+   try {
+     const session = await api.session(token);
+     // The api answered, and the answer was "no". Every refusal — expired,
+     // malformed, mis-signed, for another environment, over-long — arrives here
+     // as one outcome, because the socket has one close code for all of them.
+     if (session === null) return { outcome: "refused" };
++    // A quota refusal is not a credential refusal: the token is perfectly good
++    // and the month is not.
 +    // A BAN IS NOT A CREDENTIAL REFUSAL EITHER. The api read `users.banned_at` and put a
 +    // boolean on this response; the gateway has no database and does not need one to
 +    // enforce it.
@@ -3373,26 +3730,36 @@ phát tin không hỏi api điều gì. Việc ghi thì có."*
      return {
        outcome: "ok",
        identity: {
+         environmentId: session.environment_id,
+         userExternalId: session.user,
+         // Carried, not trusted: the internal hop forwards this instead of
 ```
+
 ```diff title="services/gateway/src/session.ts"
-@@ -9,6 +9,7 @@
-   type ErrorCode,
-   type Frame,
-   type Message,
-+  isErrorCode,
- } from "@relay/protocol";
- import { newRequestId, type Logger } from "@relay/service-kit";
- import { WebSocketServer, type WebSocket } from "ws";
-@@ -91,7 +92,7 @@
-   socket.destroy();
- }
+@@ -1,10 +1,18 @@
+ import { randomUUID } from "node:crypto";
+ import type { IncomingMessage, Server } from "node:http";
  
--/** `ErrorCode`, not `string` (FR-025). Every code this function is
-+/** `ErrorCode`, not `string` (the error-registry chapter, FR-025). Every code this function is
-  * given becomes a `docs_url`, so a typo used to ship a link to a page that could
-  * not exist — and the gateway is the surface where nobody sees a 404 until a
-  * customer clicks it. Narrowing the parameter is what makes the registry the
-@@ -267,6 +268,23 @@
+-import { CLOSE_CODES, type ErrorCode, type Frame, type Message, docsUrl, frameSchema } from "@relay/protocol";
++import {
++  CLOSE_CODES,
++  docsUrl,
++  frameSchema,
++  type ErrorCode,
++  type Frame,
++  type Message,
++  isErrorCode,
++} from "@relay/protocol";
+ import type { Logger } from "@relay/service-kit";
+ import { WebSocketServer, type WebSocket } from "ws";
+ 
+ import { ApiError, type ApiClient } from "./api-client.js";
+ import { authenticate, type Identity } from "./auth.js";
+ import type { Fanout } from "./fanout.js";
+@@ -135,12 +143,32 @@ export function attachSessions({
+           ws.close(1011, "session lookup failed");
+           logger.log("error", "connection.session_failed", {
+             error: result.error,
            });
            return;
          }
@@ -3413,14 +3780,23 @@ phát tin không hỏi api điều gì. Việc ghi thì có."*
 +          logger.log("info", "connection.rejected", { reason: "user_banned" });
 +          return;
 +        }
-         if (result.outcome === "over_quota") {
-           // The connection-metering chapter, and this is the 4001 path's SHAPE for the 4001 path's
-           // REASON. The handshake completes so that a close code has a socket to
-@@ -660,6 +678,32 @@
++        // NO SEND LIMIT ARGUMENT YET. `authenticate` returns the limits with the
++        // session in movement VII, where the limiter is written; `open` takes four
++        // parameters until then rather than a fifth nothing can supply.
+         void open(ws, result.identity, result.channelIds, req.url ?? "/");
+       });
+     })();
+   });
+ 
+   async function open(
+@@ -443,12 +471,38 @@ export function attachSessions({
+           "unauthorized",
+           "the token this connection was opened with has expired; " +
+             "reconnect with a fresh one to send again",
          );
          return;
        }
-+      // ── THE API'S OWN REFUSAL, FORWARDED ────────────────────
++      // ── THE API'S OWN REFUSAL, FORWARDED ───────────────────────────────────
 +      //
 +      // A 4xx from the api is a fact about this request, and the api already named it:
 +      // `user_banned` for a banned sender, `channel_archived` for a closed channel,
@@ -3449,29 +3825,16 @@ phát tin không hỏi api điều gì. Việc ghi thì có."*
        sendError(connection.socket, "internal_error", "send failed");
      }
    }
+ 
+   const heartbeat = setInterval(() => {
+     for (const connection of registry.all()) {
 ```
 
-`banned` đi theo response của session vì lý do các rate limit cũng đi theo đó: gateway không có
-database và không được phép có một cái, và api là service duy nhất đọc Postgres. Dòng user vốn
-đã nằm trong tay — cùng lần đọc ấy dựng nên danh sách channel — nên lệnh ban tốn một field và
-không tốn query nào. Một boolean chứ không phải timestamp, vì câu hỏi của gateway là "socket này
-có được mở không", còn một cái ngày sẽ dụ nó tự quyết định chính sách.
-
-<Trap locale="vi">
-
-**`.default(false)` làm chín cái test stub thôi compile, và đó là kết quả đúng.**
-
-Field này optional trên đường truyền để một api build từ trước chương này vẫn thoả schema trong
-lúc deploy cuốn dần. Nhưng `.default()` làm field *sau khi parse* thành bắt buộc, nên mọi stub
-của `api.session` trong các suite của gateway đều vỡ. `.optional()` sẽ để tất cả chúng đi qua
-mà không phải sửa gì.
-
-Một stub không nói người dùng có bị ban hay không là một stub chưa nghĩ tới việc người dùng có
-bị ban hay không. Chín lần sửa là schema đặt ra chín câu hỏi.
-
-</Trap>
 ```diff title="packages/protocol/src/codes.ts"
-@@ -7,6 +7,18 @@
+@@ -4,12 +4,24 @@
+ // document-fixed (4001: EIR-WS-05; 4009: SAD §7); the other two classes are
+ // numbered here — chapter 1.3's recorded decision.
+ 
  export const CLOSE_CODES = {
    4001: "invalid or expired token",
    4002: "protocol violation",
@@ -3490,7 +3853,13 @@ bị ban hay không. Chín lần sửa là schema đặt ra chín câu hỏi.
    4008: "quota exhausted",
    4009: "server shutdown (drain)",
  } as const;
-@@ -133,6 +145,20 @@
+ 
+ export type CloseCode = keyof typeof CLOSE_CODES;
+ 
+@@ -98,12 +110,26 @@ export const ERROR_CODES = {
+   channel_member_limit_exceeded:
+     "this channel already holds the maximum number of members; remove one before adding another",
+ } as const;
  
  export type ErrorCode = keyof typeof ERROR_CODES;
  
@@ -3508,17 +3877,24 @@ bị ban hay không. Chín lần sửa là schema đặt ra chín câu hỏi.
 +  return Object.hasOwn(ERROR_CODES, value);
 +}
 +
- /** The published reference, and the one place the URL is built (FR-027,
-  * `contracts/errors.md` §2).
+ /** Where the published error reference lives, and THE ONE PLACE THE URL IS BUILT
+  * (FR-027, constitution V).
   *
+  * THE DEBT THIS CLOSES. `docs_url` has been in the error envelope since chapter 1.3
+  * and constitution V calls it a reachable-page promise. Three sites build it with a
+  * template literal against a host that does not resolve, and a fourth would have
 ```
+
 ```diff title="packages/protocol/src/codes.test.ts"
-@@ -7,9 +7,17 @@
+@@ -4,15 +4,23 @@ import { CLOSE_CODES, docsUrl, ERROR_CODES, ERROR_DOCS_BASE, type ErrorCode } fr
+ 
+ // The failure vocabulary stays coherent: EIR-WS-06's four classes are all
+ // present, exactly once, with distinct meanings — and error codes never
  // collide or go blank as chapters add to the registry.
  
  describe("close codes cover EIR-WS-06's four classes", () => {
 -  it("contains exactly 4001, 4002, 4008, 4009", () => {
-+  // AND ONE MORE THAN FOUR, SINCE THE CHANNEL-CONTROL CHAPTER. `4003` is a ban, which is none of
++  // AND ONE MORE THAN FOUR, SINCE THE PREVIOUS CHAPTER. `4003` is a ban, which is none of
 +  // EIR-WS-06's classes: the token verifies, names a real user and is in date, and the
 +  // user is refused anyway. Reusing 4001 would tell a client to re-authenticate, which
 +  // succeeds at minting a token and fails again at connect.
@@ -3533,42 +3909,16 @@ bị ban hay không. Chín lần sửa là schema đặt ra chín câu hỏi.
      ]);
    });
  
+   it("gives every code a distinct, non-empty meaning", () => {
+     const meanings = Object.values(CLOSE_CODES);
+     expect(new Set(meanings).size).toBe(meanings.length);
 ```
 
-**Một close code thứ năm, và chính cái test mới làm nó thành một quyết định.** `4003`, không
-phải dùng lại `4001`: token của một user bị ban vẫn verify được, vẫn gọi tên một user thật, vẫn
-còn hạn — nên đóng bằng "token không hợp lệ hoặc đã hết hạn" sẽ đẩy client vào vòng xác thực lại
-mãi mãi, đúng lý lẽ mà registry này vốn đã nêu ra cho việc có những code phân biệt nhau.
-
-`codes.test.ts` khẳng định **đúng tập hợp** và đã đỏ ngay ở bản build thêm `4003` vào. Một khẳng
-định về đúng-tập-hợp là loại duy nhất biến một close code mới thành có chủ đích; cập nhật nó
-chính là hành động quyết định.
-
-<Trap locale="vi">
-
-**Và gateway đã ném đi mọi refusal code trừ một cái.**
-
-Tìm ra vì test ban khẳng định `user_banned` trên một socket đang mở và nhận được
-`internal_error`. `ApiError` chỉ mang theo status, còn đường gửi qua socket chuyển tiếp 401 bằng
-tay rồi trả `internal_error` cho mọi thứ khác. Nên mọi lời từ chối mà api có thể dành cho một
-lần gửi qua socket đều tới nơi dưới dạng "send failed":
-
-    user_banned         mới có trong chương này
-    channel_archived    tới được từ một lần gửi qua socket kể từ chương 3.15
-    invalid_request     bất kỳ body nào api từ chối
-
-Chương 3.14 dựng mười ba code, một registry và một `docs_url` resolve được, để một client có thể
-phân biệt các lời từ chối — rồi một chặng nhảy ném hết đi. Một client được bảo `internal_error`
-sẽ thử lại; một client được bảo `user_banned` thì không.
-
-`ApiError` giờ mang theo cả envelope, đọc một cách phòng thủ vì một đường lỗi không được phép
-thay status của api bằng một exception JSON. Code chỉ được chuyển tiếp **khi là 4xx và chỉ khi
-registry định nghĩa nó** — một 5xx không phải việc của client, và một chuỗi không có trong
-registry đặt lên đường truyền sẽ phá chính cái registry.
-
-</Trap>
 ```diff title="services/gateway/src/api-client.ts"
-@@ -32,13 +32,34 @@
+@@ -26,19 +26,40 @@ import {
+  * good, which a client can act on by reconnecting, while a 500 means we are
+  * broken and it should not. `new Error("send failed")` could not tell them
+  * apart, so the socket answered both the same way. */
  export class ApiError extends Error {
    readonly status: number;
  
@@ -3604,7 +3954,13 @@ registry đặt lên đường truyền sẽ phá chính cái registry.
    }
  }
  
-@@ -107,7 +128,25 @@
+ export interface Identity {
+   environmentId: string;
+   userExternalId: string;
+@@ -79,13 +100,31 @@ export function createApiClient(baseUrl: string): ApiClient {
+ 
+   async function parse<T>(
+     res: Response,
      schema: { safeParse: (value: unknown) => { success: boolean; data?: T } },
      what: string,
    ): Promise<T> {
@@ -3631,9 +3987,16 @@ registry đặt lên đường truyền sẽ phá chính cái registry.
      const parsed = schema.safeParse(await res.json());
      if (!parsed.success || parsed.data === undefined) {
        throw new Error(`${what} returned a payload the contract does not allow`);
+     }
+     return parsed.data;
+   }
 ```
+
 ```diff title="services/api/src/internal/session.controller.ts"
-@@ -102,6 +102,15 @@
+@@ -59,10 +59,19 @@ export class SessionController {
+     // error: it is a user with no channels. The gateway's job is delivery, not
+     // identity forensics — 2.5's rule, and the reason a first connect from a
+     // brand-new user works before anything is seeded.
      return {
        environment_id: principal.environmentId,
        user: principal.userExternalId,
@@ -3647,15 +4010,37 @@ registry đặt lên đường truyền sẽ phá chính cái registry.
 +      // with no channels rather than an error — and a user with no row has no ban either.
 +      banned: user?.banned_at != null,
        channel_ids: user ? await this.repo.channelsForUser(user.id) : [],
-       limits: {
-         connect: policy.limits.connect,
+     };
+   }
+ }
 ```
+
 ```diff title="services/api/src/isolation/targets.ts"
-@@ -30,7 +30,22 @@
-  * request naming one environment with an identifier from another. A `write` shape
-  * alone cannot tell those apart, and an earlier draft of this chapter gave all
-  * eight the platform attack (research R5). */
--export type CredentialClass = "application" | "user" | "platform" | "none";
+@@ -15,22 +15,39 @@
+  *
+  * `credential` is the shape a foreign-identifier attack cannot express. `POST
+  * /auth/dev-token` accepts no tenant-owned identifier, so there is nothing to put in
+  * one — and it is tenant-scoped all the same, because the key it accepts resolves to
+  * exactly one environment. Filing it as `exempt` is how a route stops being attacked
+  * while looking accounted for. */
+-export type Shape = "read" | "write" | "credential" | "exempt";
++export type Shape = "read" | "write" | "credential" | "list" | "exempt";
+ 
+ /** Which credential class the route accepts, and therefore which attack applies.
+  *
+- * A `write` shape alone cannot tell these apart. A route taking an end-user token is
+- * already scoped to one environment, so the attack is a FOREIGN CREDENTIAL. A route
+- * taking an application key is scoped too, but by a different resolution — and a route
+- * that accepts either is attacked as both, which is why `either` is a class rather
+- * than a shrug. */
+-export type CredentialClass = "application" | "user" | "either" | "none";
++ * NOT IN `data-model.md` §2, and added here because T031 and T031a need it. The
++ * internal surface is two credential classes: three routes take an end-user token,
++ * which IS scoped to one environment, so a foreign credential is the attack; five
++ * take a platform credential, which carries no environment, so the attack is a
++ * request naming one environment with an identifier from another. A `write` shape
++ * alone cannot tell those apart, and an earlier draft of this chapter gave all
++ * eight the platform attack (research R5). */
 +/** And `"either"`, added by the channel-control chapter for the first route that genuinely takes both
 + * (FR-017's read position: a user records their own, and the tenant records one for the
 + * user it names). Recording it as `"user"` alone would understate which attacks apply —
@@ -3675,11 +4060,20 @@ registry đặt lên đường truyền sẽ phá chính cái registry.
  
  interface Classified {
    method: string;
-@@ -86,6 +101,76 @@
- 
-   // ── list ────────────────────────────────────────────────────────────────────
-   { method: "GET", path: "/v1/webhooks", accepts: "application", shape: "list" },
-+  // A `list` and not a `read`: the attack on a listing is that a
+   path: string;
+   accepts: CredentialClass;
+ }
+@@ -93,12 +110,87 @@ export const CLASSIFICATIONS: readonly Classification[] = [
+   {
+     method: "POST",
+     path: "/v1/channels/:channelId/messages",
+     accepts: "either",
+     shape: "write",
+   },
++  // ── list ────────────────────────────────────────────────────────────────────
++  //
++  // THE FOURTH SHAPE, AND THE FIRST ROUTE THAT NEEDS IT. A `list` and not a `read`:
++  // the attack on a listing is that a
 +  // foreign identifier returns somebody else's rows, and the refusal that matters is
 +  // an EMPTY page rather than an error — a 404 for a foreign user id is right here
 +  // because the user is named in the path, but the shape's own assertion is that no
@@ -3749,27 +4143,153 @@ registry đặt lên đường truyền sẽ phá chính cái registry.
 +    accepts: "either",
 +    shape: "write",
 +  },
++
++  // ── read ────────────────────────────────────────────────────────────────────
+   {
+     method: "GET",
+     path: "/v1/channels/:channelId/messages",
+     accepts: "either",
+     shape: "read",
+   },
+@@ -154,17 +246,30 @@ export function targetKey(t: { method: string; path: string }): string {
+   return `${t.method.toUpperCase()} ${t.path}`;
+ }
  
-   // ── read ────────────────────────────────────────────────────────────────────
-   { method: "GET", path: "/v1/webhooks/:id", accepts: "application", shape: "read" },
+ /** Counts, for the suite to print. Derived from the list rather than typed beside it,
+  * because a hand-maintained tally is the thing that goes stale first. */
+ export function shapeCounts(list: readonly Classification[]): Record<Shape, number> {
+-  // NO `list` SHAPE YET, and that is deliberate rather than an omission. Nothing this
+-  // api serves returns a collection, so a list attack would be a function with no
+-  // target — and a shape with no member is a vocabulary entry that drifts. The chapter
+-  // that adds the first list route adds the shape and the attack together.
+-  const counts: Record<Shape, number> = { read: 0, write: 0, credential: 0, exempt: 0 };
++  // THE `list` SHAPE ARRIVED WITH ITS FIRST ROUTE, WHICH IS WHAT THIS SAID WOULD
++  // HAPPEN. The note here used to read "no `list` shape yet, and that is deliberate
++  // rather than an omission … the chapter that adds the first list route adds the
++  // shape and the attack together." `GET /v1/users/:externalId/channels` is that
++  // route, and `listAttack` is that attack.
++  //
++  // AND THE TYPE IS WHY IT COULD NOT ARRIVE HALFWAY. `Record<Shape, number>` stopped
++  // compiling the moment `Shape` gained a member, naming this line — so a shape
++  // cannot be added to the vocabulary while the tally, and therefore the suite's own
++  // report, still counts four kinds. A hand-maintained tally would have printed
++  // four and been believed.
++  const counts: Record<Shape, number> = {
++    read: 0,
++    write: 0,
++    credential: 0,
++    list: 0,
++    exempt: 0,
++  };
+   for (const c of list) counts[c.shape]++;
+   return counts;
+ }
+ 
+ /** One routable endpoint, as the running application reports it. */
+ export interface DerivedTarget {
 ```
+
 ```diff title="services/api/src/isolation/targets.itest.ts"
-@@ -119,7 +119,7 @@
-     // The routes built so far. This assertion moves ONE line per phase, which is
-     // the point: a phase that adds a route and forgets to classify it fails the
-     // test above, and a phase that adds a route nobody planned fails this one.
--    const BUILT_SO_FAR = 6;
-+    const BUILT_SO_FAR = 14;
-     expect(derived.length).toBe(24 + BUILT_SO_FAR);
+@@ -88,18 +88,34 @@ describe("the gauntlet's target list derives from the running application", () =
+     ).map(targetKey);
+     expect(reasonless).toEqual([]);
    });
  
+   it("accounts for every derived target as attacked or exempt", () => {
+     const counts = shapeCounts(CLASSIFICATIONS);
+-    const attacked = counts.read + counts.write + counts.credential;
++    // EVERYTHING THAT IS NOT EXEMPT, DERIVED — not `read + write + credential`.
++    //
++    // `shapeCounts` returns `Record<Shape, number>`, so adding a shape stopped that
++    // function compiling and named the line. This sum is arithmetic over three
++    // properties, which no type checks: `list` arrived, the record grew, and the
++    // total silently stopped including it. `expected 17 to be 18` — a route
++    // classified, attacked, and counted as neither.
++    //
++    // The exemption is named because it is the one class that is deliberately not
++    // attacked. Everything else is, whatever it is called.
++    const attacked = Object.entries(counts)
++      .filter(([shape]) => shape !== "exempt")
++      .reduce((n, [, count]) => n + count, 0);
++    const breakdown = Object.entries(counts)
++      .filter(([, count]) => count > 0)
++      .map(([shape, count]) => `${shape} ${count}`)
++      .join(", ");
+     // A number nobody can see is a number nobody checks. Visible under
+     // `--reporter=verbose`; the assertion below is what gates the build either way.
+     console.log(
+-      `gauntlet targets: ${derived.length} derived, ${attacked} attacked, ${counts.exempt} exempt ` +
+-        `(read ${counts.read}, write ${counts.write}, credential ${counts.credential})`,
++      `gauntlet targets: ${derived.length} derived, ${attacked} attacked, ` +
++        `${counts.exempt} exempt (${breakdown})`,
+     );
+     expect(attacked + counts.exempt).toBe(derived.length);
+   });
+ 
+   // ── SC-014: EVERY ROUTE THIS CHAPTER ADDS, NAMED ──────────────────────────
+   //
+@@ -110,20 +126,34 @@ describe("the gauntlet's target list derives from the running application", () =
+   // which route was missing.
+   //
+   // Named, the failure says which. And the direction that matters is both: a route
+   // added and never classified fails the accounting test above; a route classified
+   // and never built fails this one, because the derivation reads the running
+   // router.
+-  it("derives exactly the six routes this chapter adds, and nothing else new", () => {
++  it("derives every route the last two chapters added, and nothing else new", () => {
++    // THE LIST GROWS BY CHAPTER AND THE ASSERTION DOES NOT MOVE. Each chapter that
++    // adds a route adds its key here, so a route added and never classified fails the
++    // accounting test above and a route classified and never built fails this one —
++    // the derivation reads the running router either way.
+     const ADDED = [
++      // The channel a customer controls.
+       "GET /v1/channels/:channelId",
+       "POST /v1/channels/:channelId/join",
+       "POST /v1/channels/:channelId/members/remove",
+       "PATCH /v1/channels/:channelId/members/:userExternalId",
+       "POST /v1/channels/:channelId/archive",
+       "DELETE /v1/channels/:channelId/archive",
++      // This chapter's, and the first `list` shape the classification has had.
++      "GET /v1/users/:externalId/channels",
++      "PUT /v1/users/:externalId/channels/:channelId/read",
++      "GET /v1/users/:externalId",
++      "PATCH /v1/users/:externalId",
++      "POST /v1/users",
++      "DELETE /v1/users/:externalId",
++      "POST /v1/users/:externalId/ban",
++      "DELETE /v1/users/:externalId/ban",
+     ];
+     const keys = derived.map(targetKey);
+     const missing = ADDED.filter((k) => !keys.includes(k));
+     expect(missing, `classified here and not on the router: ${missing.join(", ")}`)
+       .toEqual([]);
+   });
 ```
+
 ```diff title="services/api/src/isolation/gauntlet.itest.ts"
-@@ -384,6 +384,21 @@
+@@ -5,13 +5,13 @@ import { Test } from "@nestjs/testing";
+ import { afterAll, beforeAll, describe, expect, it } from "vitest";
+ 
+ import { AppModule } from "../app.module";
+ import { mintUserToken } from "../auth/user-token";
+ import { environmentSigningSecret } from "../db/repository";
+ import { createDb, createPool } from "../db/client";
+-import { credentialAttack, readAttack, writeAttack } from "./attack";
++import { credentialAttack, listAttack, readAttack, rowsOf, writeAttack } from "./attack";
+ import { withoutRequestId } from "./compare";
+ import {
+   nowhereId,
+   seedCollidingTenants,
+   seedSameTenant,
+   seedTwoTenants,
+@@ -316,12 +316,27 @@ describe("the isolation gauntlet", () => {
+       readonly [string, string, (channel: string) => string, unknown?]
+     > = [
+       ["read by id", "GET", (c) => `/v1/channels/${c}`],
        ["read history", "GET", (c) => `/v1/channels/${c}/messages?limit=10`],
        ["send", "POST", (c) => `/v1/channels/${c}/messages`, { text: "not mine" }],
        ["join", "POST", (c) => `/v1/channels/${c}/join`],
-+      // THE FIFTH VERB (SC-001a, the channel-control chapter's T121a). Its route is built in the
++      // THE FIFTH VERB (SC-001a, THE CHANNEL-CONTROL CHAPTER's T121a). Its route is built in the
 +      // unread-count phase rather than with the other four, so it joins the oracle
 +      // here — the verb list is the authority and the count of verbs is not written
 +      // down anywhere, which is the fix for a number that went three, then four,
@@ -3787,7 +4307,13 @@ registry đặt lên đường truyền sẽ phá chính cái registry.
      ];
  
      for (const [name, method, path, body] of verbs) {
-@@ -411,6 +426,54 @@
+       it(`${name}: the private channel answers as an id that exists nowhere`, async () => {
+         const refused = await asUser(same.stranger.token, method, path(same.privateChannelId), body);
+         const absent = await asUser(same.stranger.token, method, path(nowhereId()), body);
+@@ -343,12 +358,60 @@ describe("the isolation gauntlet", () => {
+         `/v1/channels/${same.privateChannelId}/messages?limit=100`,
+       );
+       const body = (await history.json()) as { messages: { text: string | null }[] };
        expect(body.messages.some((m) => m.text === "not mine")).toBe(false);
      });
  
@@ -3842,9 +4368,273 @@ registry đặt lên đường truyền sẽ phá chính cái registry.
      it("a PUBLIC channel of the same tenant is open to the same non-member (FR-004)", async () => {
        // The other half of what makes `channels.type` decide something. If both types
        // refused, the column would still be deciding nothing.
+       const res = await asUser(same.stranger.token, "GET", `/v1/channels/${same.publicChannelId}`);
+       expect(res.status).toBe(200);
+       expect(await res.json()).toMatchObject({ is_member: false });
+@@ -472,12 +535,256 @@ describe("the isolation gauntlet", () => {
+         expect(verdict.differences, verdict.differences.join("; ")).toEqual([]);
+         expect(verdict.stateChanged, "the victim's channel or members moved").toBe(false);
+       });
+     }
+   });
+ 
++  // ── the ban: a write whose effect is a refusal somewhere else ───────────────────
++  //
++  // A ban is the first state on this platform whose whole purpose is to change what a
++  // DIFFERENT request does. So the victim's state to read is not a row that looks
++  // different — it is `banned_at`, and the assertion is that the caller's ban did not
++  // land on somebody else's user.
++  //
++  // BOTH DIRECTIONS OF THE VERB, because an unban is a write too and the route pair is
++  // the same shape. A scoping bug that could ban across tenants can unban across them,
++  // and the second is worse: it removes a refusal the customer asked for.
++  for (const [verb, method] of [["ban", "POST"], ["unban", "DELETE"]] as const) {
++    it(`${verb}: a foreign user's banned_at does not move`, async () => {
++      attacked.add(`${method} /v1/users/:externalId/ban`);
++      // NO STATUS ASSERTION, AND THAT IS THIS CHAPTER'S DOING.
++      //
++      // These asserted 404 — the user is named in the path and there is no such user
++      // in the caller's environment — and got 200. A user row is created implicitly
++      // on first authentication now, so the credential attack above, which mints a
++      // token for the victim's external id with the attacker's key, CREATES that name
++      // in the attacker's environment. Nothing leaked: the row is the attacker's own,
++      // with a name the attacker chose, exactly like the bulk upsert.
++      //
++      // But it means a foreign identifier no longer reliably answers not-found on any
++      // user route, because presenting it may have created it. **The status stopped
++      // being a signal and the state comparison is the whole assertion** — which is
++      // what the pair was always supposed to be for.
++      const before = await t.victim.repo.getUserByExternalId(t.victim.userExternalId);
++      await fetch(
++        `${url}/v1/users/${t.victim.userExternalId}/ban`,
++        { method, headers: { authorization: `Bearer ${t.attacker.credential}` } },
++      );
++      const after = await t.victim.repo.getUserByExternalId(t.victim.userExternalId);
++      expect(after, `the victim's user row moved on ${verb}`).toEqual(before);
++      // AND SPECIFICALLY THE MARKER, named rather than left to the deep equality —
++      // a future field added to the row would make the comparison above fail for a
++      // reason that has nothing to do with a ban.
++      expect(after?.banned_at ?? null, `the victim was ${verb}ned across tenants`)
++        .toEqual(before?.banned_at ?? null);
++    });
++  }
++
++  // ── bulk upsert and deletion: A ROUTE THAT ECHOES ITS INPUT HAS NO PAIR ─────────
++  //
++  // Both of these were written as `writeAttack` and both failed, correctly:
++  //
++  //     body {"data":[{"external_id":"victim-…-user","status":"created",…}]}  (foreign)
++  //     vs   {"data":[{"external_id":"absent-0000…","status":"created",…}]}  (absent)
++  //
++  // The pair every other attack asserts — the foreign identifier and one that exists
++  // nowhere must be indistinguishable — cannot hold here, because the response
++  // ECHOES the identifier it was given. The two answers differ by construction, in
++  // the one field the request chose, and no amount of correct scoping changes that.
++  //
++  // THIS IS A THIRD DISTINCTION IN THE SHAPE TAXONOMY, after `list`. A `write` shape
++  // presumes a pair; a route whose body reflects its input can only be checked
++  // against the victim's state. `POST /v1/users` also takes its identifiers in the
++  // BODY rather than the path, so there is no foreign id in a URL to compare at all.
++  //
++  // So these two assert the half that carries the property: the victim's row, read
++  // before and after, through the victim's own repository.
++  it("POST /v1/users — a foreign external id creates in the caller's tenant only", async () => {
++    attacked.add("POST /v1/users");
++    const before = await t.victim.repo.getUserByExternalId(t.victim.userExternalId);
++    const res = await fetch(`${url}/v1/users`, {
++      method: "POST",
++      headers: {
++        "content-type": "application/json",
++        authorization: `Bearer ${t.attacker.credential}`,
++      },
++      body: JSON.stringify({ users: [{ external_id: t.victim.userExternalId }] }),
++    });
++    // A SUCCESS IS THE EXPECTED ANSWER, and that is the point. The id is a string in
++    // the caller's own namespace: two tenants may both have a user called `alice`,
++    // and `(environment_id, external_id)` is what keeps them apart. The upsert
++    // SHOULD succeed — in the attacker's environment.
++    expect(res.status).toBe(200);
++    const after = await t.victim.repo.getUserByExternalId(t.victim.userExternalId);
++    expect(after, "the victim's user row moved").toEqual(before);
++  });
++
++  it("DELETE /v1/users/:externalId — the same id in two tenants deletes one", async () => {
++    attacked.add("DELETE /v1/users/:externalId");
++    // THE COLLISION, MADE EXPLICIT AND OWNED BY THIS TEST. The first version presented
++    // the victim's id and expected a 404 — and got a 200, because the upsert test above
++    // had just created that id in the attacker's environment. A test that depends on a
++    // sibling's side effect is the shared-fixture mutation this suite keeps finding.
++    //
++    // So the collision is seeded here: both tenants hold a user with the SAME external
++    // id, which is legal — `(environment_id, external_id)` is the uniqueness — and the
++    // delete then has two candidate rows and must choose by credential. That is a
++    // stronger attack than a foreign id with no local twin, because a scoping bug and a
++    // correct answer are the same status code.
++    const shared = t.victim.userExternalId;
++    await t.attacker.repo.createUser(shared, "the attacker's own");
++
++    const before = await t.victim.repo.getUserByExternalId(shared);
++    const res = await fetch(`${url}/v1/users/${shared}`, {
++      method: "DELETE",
++      headers: { authorization: `Bearer ${t.attacker.credential}` },
++    });
++    expect(res.status).toBe(200);
++
++    // DELETION SETS `deleted_at` AND CLEARS THE PROFILE — the row stays. So its
++    // EXISTENCE proves nothing and the comparison has to be on the whole row.
++    const after = await t.victim.repo.getUserByExternalId(shared);
++    expect(after, "the victim's user row moved").toEqual(before);
++    expect(after?.deleted_at ?? null, "the victim's user was marked deleted").toBeNull();
++
++    // And the attacker's own row IS deleted, which is what makes the assertion above
++    // about scoping rather than about the delete failing altogether.
++    const mine = await t.attacker.repo.getUserByExternalId(shared);
++    expect(mine?.deleted_at ?? null, "the caller's own user was not deleted").not.toBeNull();
++  });
++
++  // ── the profile: a read pair and a write pair over the same path ────────────────
++  //
++  // Two routes on one path, and they take different attacks: `GET` is a read pair —
++  // the foreign external id and one that exists nowhere must be indistinguishable —
++  // and `PATCH` is a write, so the victim's own row has to be read back afterwards.
++  //
++  // THE VICTIM'S STATE IS THE PROFILE ITSELF, not a count. A PATCH that leaked
++  // through would show up as a display name the victim never set, which is the one
++  // thing a status code cannot report.
++  it("GET /v1/users/:externalId — a foreign profile answers as an absent one", async () => {
++    attacked.add("GET /v1/users/:externalId");
++    const verdict = await readAttack(
++      url,
++      t.attacker.credential,
++      { method: "GET", path: `/v1/users/${t.victim.userExternalId}` },
++      { method: "GET", path: `/v1/users/nobody-${ABSENT_UUID}` },
++    );
++    expect(verdict.differences, verdict.differences.join("; ")).toEqual([]);
++  });
++
++  it("PATCH /v1/users/:externalId — a foreign profile is not written", async () => {
++    attacked.add("PATCH /v1/users/:externalId");
++    const body = { display_name: "written by the attacker" };
++    const verdict = await writeAttack(
++      url,
++      t.attacker.credential,
++      { method: "PATCH", path: `/v1/users/${t.victim.userExternalId}`, body },
++      { method: "PATCH", path: `/v1/users/nobody-${ABSENT_UUID}`, body },
++      // Through the victim's own repository, scoped to its environment — the profile
++      // as the victim would read it.
++      () => t.victim.repo.getUserByExternalId(t.victim.userExternalId),
++    );
++    expect(verdict.differences, verdict.differences.join("; ")).toEqual([]);
++    expect(verdict.stateChanged, "the victim's profile moved").toBe(false);
++  });
++
++  // ── the read position: `either`, so it is attacked as both ──────────────────────
++  //
++  // The first route on the users controller that genuinely takes both credential
++  // classes — a user records their own position, and the tenant records one for the
++  // user it names — so `accepts: "either"` is a statement about which attacks apply
++  // rather than a shrug. Both do.
++  //
++  // AND THE VICTIM'S STATE IS ITS UNREAD COUNT, read through the listing. There is no
++  // getter for a read position, and adding one for a test would be a method the
++  // product does not need; the count is what the position is FOR, and a write that
++  // moved somebody else's position shows up there.
++  it("PUT .../channels/:channelId/read — a foreign channel changes no position", async () => {
++    attacked.add("PUT /v1/users/:externalId/channels/:channelId/read");
++    const verdict = await writeAttack(
++      url,
++      t.attacker.credential,
++      {
++        method: "PUT",
++        path: `/v1/users/${t.victim.userExternalId}/channels/${t.victim.channelId}/read`,
++        body: { sequence: 1 },
++      },
++      {
++        method: "PUT",
++        path: `/v1/users/${t.victim.userExternalId}/channels/${ABSENT_UUID}/read`,
++        body: { sequence: 1 },
++      },
++      () => t.victim.repo.listChannelsForUser(t.victim.userId, { limit: 50 }),
++    );
++    expect(verdict.differences, verdict.differences.join("; ")).toEqual([]);
++    expect(verdict.stateChanged, "the victim's unread count moved").toBe(false);
++  });
++
++  // ── list: the shape whose refusal is an EMPTY page ──────────────────────────────
++  //
++  // The first `list` target, and the first attack here that does NOT assert a pair.
++  // Every other one compares the foreign identifier against an id that exists
++  // nowhere and requires them indistinguishable. A listing cannot work that way:
++  // the user is named in the path, so a foreign external id is a 404 — correctly —
++  // while a user who exists and owns nothing is a 200 with no rows. Comparing those
++  // two says nothing at all.
++  //
++  // So the property is narrower and it is the one that matters: **no identifier
++  // belonging to another environment appears in any answer.**
++  describe("list: GET /v1/users/:externalId/channels", () => {
++    const FOREIGN = () => [
++      t.victim.channelId,
++      t.victim.channelExternalId,
++      t.victim.userId,
++      t.victim.messageId,
++    ];
++
++    it("answers a foreign external id as absent, and echoes none of its ids", async () => {
++      attacked.add("GET /v1/users/:externalId/channels");
++      const verdict = await listAttack(
++        url,
++        t.attacker.credential,
++        { method: "GET", path: `/v1/users/${t.victim.userExternalId}/channels` },
++        FOREIGN(),
++      );
++      // A 404 IS THE RIGHT ANSWER AND NOT THE ASSERTION. The user is in the path, so
++      // not-found is what a caller gets for anybody outside their environment — and
++      // a 404 that named the victim's channel in its body would still be a breach.
++      expect(verdict.leaked, `leaked: ${verdict.leaked.join(", ")}`).toEqual([]);
++      expect(verdict.count, "a refused listing returned rows").toBe(0);
++    });
++
++    it("answers its OWN user with its own rows, and none of the other tenant's", async () => {
++      // THE CONTROL, and without it the case above passes against a route that
++      // answers 404 for everybody. This is also the only place the `list` shape's
++      // real property can be observed: a 200 that has rows in it.
++      const verdict = await listAttack(
++        url,
++        t.attacker.credential,
++        { method: "GET", path: `/v1/users/${t.attacker.userExternalId}/channels` },
++        FOREIGN(),
++      );
++      expect(verdict.status).toBe(200);
++      expect(verdict.count, "the attacker's own listing came back empty").toBeGreaterThan(0);
++      expect(verdict.leaked, `leaked: ${verdict.leaked.join(", ")}`).toEqual([]);
++    });
++
++    it("recognised the response shape it counted", () => {
++      // `rowsOf` RETURNS AN EMPTY ARRAY FOR A SHAPE IT DOES NOT KNOW, and a count of
++      // zero from an unrecognised shape reads exactly like a count of zero from a
++      // correctly-scoped list. That is the one answer this block must never confuse
++      // with success, so the recogniser is asserted against both shapes it claims to
++      // handle and against one it does not.
++      expect(rowsOf([1, 2])).toHaveLength(2);
++      expect(rowsOf({ data: [1] })).toHaveLength(1);
++      expect(rowsOf({ items: [1, 2, 3] })).toEqual([]);
++      expect(rowsOf(null)).toEqual([]);
++    });
++  });
++
+   // ── and the suite accounts for itself ───────────────────────────────────────────
+   it("ran an attack for every route the classification says to attack", () => {
+     const shouldAttack = CLASSIFICATIONS.filter((c) => c.shape !== "exempt").map(targetKey);
+     const missing = shouldAttack.filter((k) => !attacked.has(k));
+     // A classification saying `write` with no attack written for it is the same hole
+     // as a route with no classification, one level up. Named, because the useful half
 ```
+
 ```diff title="services/api/src/messages/messages.service.ts"
-@@ -9,6 +9,7 @@
+@@ -4,12 +4,13 @@ import {
+   Injectable,
+   NotFoundException,
+ } from "@nestjs/common";
  
  import {
    ChannelArchivedError,
@@ -3852,7 +4642,13 @@ registry đặt lên đường truyền sẽ phá chính cái registry.
    ChannelNotFoundError,
    Repository,
    type MessageRow,
-@@ -61,6 +62,23 @@
+   type MessageWithSender,
+ } from "../db/repository";
+ import { protocolError } from "../protocol-error";
+@@ -56,12 +57,29 @@ export class MessagesService {
+         ...(userExternalId !== undefined && { userExternalId }),
+         ...(body.idempotency_key != null && {
+           idempotencyKey: body.idempotency_key,
          }),
        });
      } catch (error) {
@@ -3876,9 +4672,16 @@ registry đặt lên đường truyền sẽ phá chính cái registry.
        if (error instanceof ChannelArchivedError) {
          // 403 AND ITS OWN CODE (FR-021). Distinct from not-found, because the
          // channel is there and the caller can see it, and distinct from
+         // `user_banned`, because one lifts when somebody unarchives and the other
+         // when somebody unbans. A client that cannot tell them apart retries the
+         // wrong one for ever.
 ```
+
 ```diff title="services/gateway/src/isolation-fixtures.ts"
-@@ -60,6 +60,24 @@
+@@ -72,12 +72,30 @@ export interface SocketTenant {
+   privateHistory: () => Promise<string>;
+   /** Removes this tenant's user from its own channel via the public route. */
+   removeSelf: () => Promise<void>;
    rejoinSelf: () => Promise<void>;
    archiveOwnChannel: () => Promise<void>;
    unarchiveOwnChannel: () => Promise<void>;
@@ -3890,7 +4693,8 @@ registry đặt lên đường truyền sẽ phá chính cái registry.
 +   * later test's profile PATCH answer 404. Phase 7 hit the same class twice: a test that
 +   * mutates a shared fixture breaks whichever test runs after it, and the fix is a
 +   * fixture of its own rather than an ordering constraint nobody can see. */
-+  /** Ban and unban this tenant's own user through the public route (   * T153). */
++  /** Ban and unban this tenant's own user through the public route (
++   * T153). */
 +  banSelf: () => Promise<void>;
 +  unbanSelf: () => Promise<void>;
 +  seedDeletable: () => Promise<{
@@ -3902,19 +4706,25 @@ registry đặt lên đường truyền sẽ phá chính cái registry.
    /** A token for `userExternalId`, minted through the api's own dev-token route so
     * the signing secret never leaves the api — research R1's rule, and the reason
     * the gateway asks rather than verifies. */
-@@ -168,6 +186,39 @@
+   token: string;
+   /** Put a message in this tenant's channel, so a foreign subscriber has something
+    * it must not receive. */
+@@ -233,12 +251,45 @@ export async function seedSocketTenants(): Promise<SocketTenants> {
+         const res = await fetch(`${api.url}/v1/channels/${channel.id}/archive`, {
+           method: "POST",
+           headers: { authorization: `Bearer ${key.credential}` },
          });
          if (!res.ok) throw new Error(`archive for ${label}: ${res.status}`);
        },
 +      banSelf: async () => {
-+        const res = await fetch(`${apiUrl}/v1/users/${userExternalId}/ban`, {
++        const res = await fetch(`${api.url}/v1/users/${userExternalId}/ban`, {
 +          method: "POST",
 +          headers: { authorization: `Bearer ${key.credential}` },
 +        });
 +        if (!res.ok) throw new Error(`ban ${userExternalId}: ${res.status}`);
 +      },
 +      unbanSelf: async () => {
-+        const res = await fetch(`${apiUrl}/v1/users/${userExternalId}/ban`, {
++        const res = await fetch(`${api.url}/v1/users/${userExternalId}/ban`, {
 +          method: "DELETE",
 +          headers: { authorization: `Bearer ${key.credential}` },
 +        });
@@ -3936,132 +4746,64 @@ registry đặt lên đường truyền sẽ phá chính cái registry.
 +          userExternalId: `${label2}-doomed`,
 +          channelId: room.id,
 +          seq: sent.seq,
-+          witnessToken: await mintToken(apiUrl, key.credential, `${label2}-witness`),
++          witnessToken: await mintToken(api.url, key.credential, `${label2}-witness`),
 +        };
 +      },
        unarchiveOwnChannel: async () => {
-         const res = await fetch(`${apiUrl}/v1/channels/${channel.id}/archive`, {
+         const res = await fetch(`${api.url}/v1/channels/${channel.id}/archive`, {
            method: "DELETE",
-```
-```diff title="vitest.coverage.config.mts"
-@@ -36,7 +36,7 @@
-     hookTimeout: 60_000,
-     coverage: {
-       provider: "v8",
--      // `json` joins the other two for the isolation gauntlet's FR-040, which asks for every
-+      // `json` joins the other two for the channel-endpoints chapter's FR-040, which asks for every
-       // uncovered branch to be NAMED and not merely counted. `json-summary` carries
-       // totals and percentages; the per-branch locations are only in `coverage-final.json`.
-       // Found by trying to list the 25 uncovered arms in `repository.ts` and getting a
-@@ -120,8 +120,31 @@
-         // It now reads 90.71%, above where the chapter found it and below 91, so
-         // the pin stays at 90 rather than moving to a number the next chapter
-         // would have to earn back.
-+        //
-+        // THE CHANNEL-CONTROL CHAPTER RAISED IT, which is the first time this file's branch ratchet has
-+        // moved up. The feature added roughly 600 lines here — the membership check, the
-+        // visibility predicate, bulk removal, roles, archiving, the ban, the read
-+        // position, the listing with its unread arithmetic — and branches went
-+        // **89.51% → 92.11%**. The webhook dispatcher chapter's precedent was the opposite: six operations
-+        // on this file took branches 85.91% → 78.22% on the next run.
-+        //
-+        // PINNED AT 91 AND NOT 92, on the reasoning above. 92.11 clears 92 by a tenth,
-+        // which is the thin margin the isolation gauntlet declined to pin against; 91 locks in most
-+        // of the gain and leaves the next chapter more than a rounding error of room.
-+        //
-+        // WHAT IS STILL UNCOVERED, and every one is the same class the comment above
-+        // names: three `could not be created or read` throws — `createChannel`,
-+        // `createUser`, `upsertUser` — each the loser of an `ON CONFLICT` race finding no
-+        // row, which means the winner's row was deleted between two statements of one
-+        // call. Nothing in the api deletes from either table.
-+        //
-+        // A FOURTH ONE WAS REMOVED RATHER THAN NAMED. `upsertUser` first read the row,
-+        // threw if absent, updated it, read it back and threw again — two statements for
-+        // one impossible state. The third instance of that class took lines to 98.92% and
-+        // the gate went red against its pin of 99; the instrument was right, because the
-+        // second throw said nothing the first had not. One throw, and lines read 99.13%.
-         "services/api/src/db/repository.ts": {
--          branches: 90,
-+          branches: 91,
-           functions: 100,
-           lines: 99,
-           statements: 97,
-@@ -249,11 +272,69 @@
-         // from storage before any user is created. The one uncovered branch is the
-         // `not_found` outcome after a successful scoped read — the channel deleted
-         // between two statements of one call — which nothing in the api can do.
-+        //
-+        // THE CHANNEL-CONTROL CHAPTER RAISED THIS TOO, and T174d predicted the opposite. That task
-+        // expected `functions: 100` to go red on the first partially-covered new
-+        // function — the file gains read-by-id, join, archive, unarchive, bulk removal
-+        // and role-setting — and it did not, because every one of the six has a route
-+        // test in `channels.itest.ts` or the gauntlet. Measured 96.97 / 86.54 / 100 /
-+        // 96.97 against a pin of 94 / 75 / 100 / 94.
-+        //
-+        // The prediction was reasonable and the reason it failed is worth keeping: a new
-+        // method reached only through a child process would have done exactly what T174d
-+        // feared, which is what T174b checks for separately.
-         "services/api/src/channels/channels.service.ts": {
--          branches: 75,
-+          branches: 86,
-+          functions: 100,
-+          lines: 96,
-+          statements: 96,
-+        },
-+
-+        // ── THE CHANNEL-CONTROL CHAPTER'S USER SURFACE ─────────────────────────
-+        //
-+        // The controller and the schema at 100 on everything, and they earn it: the
-+        // controller is eight handlers that delegate, and the schema's every refusal path
-+        // is driven — including all THREE ways a cursor can be malformed, which needed
-+        // three tests because one refusal reaching the wire says nothing about whether
-+        // the other two paths work.
-+        "services/api/src/users/users.controller.ts": {
-+          branches: 100,
-+          functions: 100,
-+          lines: 100,
-+          statements: 100,
-+        },
-+        "services/api/src/users/users.schema.ts": {
-+          branches: 100,
-+          functions: 100,
-+          lines: 100,
-+          statements: 100,
-+        },
-+        // The service holds the decisions: which refusal a read position gets, whether a
-+        // user is alive, what a partial profile patch leaves alone. 97.62 / 90.91 / 100 /
-+        // 97.62 — the two uncovered statements are `requireUser`'s and `updateProfile`'s
-+        // 404 throws reached from a direction no route takes.
-+        "services/api/src/users/users.service.ts": {
-+          branches: 90,
-+          functions: 100,
-+          lines: 97,
-+          statements: 97,
-+        },
-+
-+        // A FLOOR, NOT AN ACHIEVEMENT. `messages.service.ts` measures 70.83 / 61.76 /
-+        // 100 / 70.83, and the six uncovered statements are all PRE-EXISTING: the quota
-+        // refusal and its rethrow and the history cursor's decode (chapter
-+        // 2.4). This feature's additions to the file — the ban mapping, the archive
-+        // mapping, the visibility predicate on the history path — are covered.
-+        //
-+        // Pinned anyway, because an unpinned file is a figure that can slide
-+        // (the connection-metering chapter's T033c) and this feature changed the file. A ratchet at 61 does not bless
-+        // 61; it forbids 60. Raising it is the next chapter's work, and the arms are named
-+        // here so that chapter knows what it is buying.
-+        "services/api/src/messages/messages.service.ts": {
-+          branches: 61,
-           functions: 100,
--          lines: 94,
--          statements: 94,
-+          lines: 70,
-+          statements: 70,
-         },
- 
-         "services/api/src/webhooks/disable.ts": {
+           headers: { authorization: `Bearer ${key.credential}` },
+         });
+         if (!res.ok) throw new Error(`unarchive for ${label}: ${res.status}`);
 ```
 
-Table thứ mười của guard cần mồi, và cái mồi cần một tính chất mà chín table kia không có.
+```diff title="vitest.coverage.config.mts"
+@@ -108,14 +108,42 @@ export default defineConfig({
+         //
+         // Reaching any of them from a test means corrupting the database first, and
+         // a test that does that is asserting on the corruption rather than on the
+         // guard. Measured at 97.74; pinned at 97, one point below, for the run-to-
+         // run swing this provider has (a function of forty on `session.ts` moved
+         // 87.80 -> 85.36 on identical code).
++        //
++        // ── THE USER SURFACE RAISED BRANCHES, 85 -> 90 ────────────────────────────
++        //
++        // The first time this file's branch ratchet has moved UP. The chapter added
++        // roughly six hundred lines here — the listing with its unread arithmetic, the
++        // read position that only moves forward, bulk upsert, the deletion that keeps
++        // the row, the ban — and branches measured **91.53%** against a pin of 85.
++        //
++        // PINNED AT 90 AND NOT 91. 91.53 clears 91 by half a point, which is inside
++        // the swing this provider has shown; 90 locks in most of the gain and leaves
++        // the next chapter more than a rounding error of room. A ratchet that has to
++        // be lowered next chapter teaches people to lower ratchets.
++        //
++        // AND LINES STAY AT 97 THOUGH THEY MEASURE 98.14, for the same reason and with
++        // the same arithmetic: 97.74 last chapter, 98.14 now, a 0.4 swing on code that
++        // did not change in between.
++        //
++        // WHAT IS STILL UNCOVERED, and each is the class the note above names — a
++        // throw for a state the surrounding code says cannot arise:
++        //
++        //   119   no such environment, in a mint whose caller already resolved it
++        //   805   a channel neither inserted nor readable: the loser of an ON
++        //         CONFLICT race finding no row, which needs the winner's row deleted
++        //         between two statements of one call, and nothing deletes channels
++        //   1899  an idempotency key that conflicted while its message is missing
++        //   2060  the private-channel arm of the history read, whose OTHER arm every
++        //         test takes — the one branch here that is reachable, and the chapter
++        //         that gives a user a history page is where it gets its case
+         "services/api/src/db/repository.ts": {
+-          branches: 85,
++          branches: 90,
+           functions: 100,
+           lines: 97,
+           statements: 95,
+         },
+         // THE DEDUPLICATION CHAPTER RAISED THIS, 93 -> 95. The chapter added two pure functions
+         // to this file — the live-path suppression predicate and the scoping that
+```
+
 ```sql title="packages/test-harness/src/sentinel.sql (excerpt)"
 -- TEN AS OF THE USER-SURFACE CHAPTER. `read_positions` carries `environment_id`, so it belongs
 -- here, and it has no `id` — which is what the message expression above was changed
@@ -4078,42 +4820,57 @@ BEGIN
     'webhook_endpoints',
 ```
 
-Một excerpt, và `fences/post-series.md` mang phần bổ sung — trình kiểm tra fence áp phụ lục *sau*
-mọi chương, nên một chương ở phía trên dòng của chính phần bổ sung của nó và không thể phát biểu
-một trạng thái mà phụ lục mới dựng nên. Chương 3.12 học điều đó từ chiều ngược lại, và tính năng
-này học nó từ chiều này: một chương cũng không thể làm thay việc của phụ lục. Cái diff
-`repository.ts` của nó đã chạm đúng trạng thái của repository, và thế là để lại cho hunk của
-phụ lục không còn gì để áp.
+## The fourth attack shape, and the two it turned out not to cover
 
-**`read_positions` không thể bị chiếm về mặt cấu tạo**, và đó là tính chất chín table kia không
-có. Không gì trong platform quét xoá read position xuyên environment — lần xoá hàng loạt duy nhất
-là lần mà việc xoá một user thực hiện, và nó chỉ trong phạm vi user đó — nên cái mồi không thể bị
-một operation toàn cục hợp pháp gom mất. Với `quota_notifications` thì mồi phải được cắm rất cẩn
-thận; ở đây chính cách truy cập của table đã làm việc đó.
-
-## Hai chương này tốn những gì, bằng số
-
-    số file            25 → 29 → 34 → 36 → 38 → 40 → 41 → 43
-    số lần sửa lại     tám, và sáu lần trong đó trước khi có một chữ prose nào
-    3.15               20 file được dạy, 2.947 chữ prose, 20 fence
-    3.16               26 file được dạy, 11 file nữa phải fence mà không dạy
-    lane               407 test → 550, và trung bình dịch từ 193,0 s → 193,55 s
-    hai mươi lần chạy  20/20 xanh, 192–197 s, lệch chuẩn 1,54 s
-
-**Tám lần sửa lại một con số, và mỗi lần đến từ một câu hỏi khác.** Danh sách điều khoản cho 25.
-Danh sách task cho 29. Hỏi chương nào fence từng file cho 34 — và tìm ra `app.module.ts`, dòng
-đăng ký không nằm trong task nào. Viết call graph của đường send ra cho 36. Đếm các đường dẫn mà
-task gọi tên, thay vì đọc con số tổng, cho 38. Hỏi `git diff` xem thực sự có gì đổi cho 40 — và
-tìm ra hai file không nằm trong ô nào cùng một file mà tính năng chẳng hề chạm. Việc hiện thực
-tìm ra một khiếm khuyết cho 41. Và hỏi `git diff` thêm một lần nữa ở cuối cho 43.
-
-**Lần sửa thứ tám là lần quan trọng, vì nó tách con số ấy thành hai.** Cái một chương *dạy* không
-phải cái nó phải *fence*. Mười một file ở đây đổi đúng một từ — một citation chương được sửa,
-không một dòng thực chất nào — và chuỗi fence không quan tâm vì sao một file đổi: trạng thái của
-một đường dẫn đã được nhận phải khớp với repository. Vậy là mười một fence không có chủ đề, mười
-trong số đó xuất hiện ở đây:
-```diff title="packages/outsider/vitest.integration.config.mts"
+```ts title="services/api/src/isolation/targets.ts (excerpt)"
+  // NO `list` SHAPE YET, and that is deliberate rather than an omission. Nothing this
+  // api serves returns a collection, so a list attack would be a function with no
+  // target — and a shape with no member is a vocabulary entry that drifts. The chapter
+  // that adds the first list route adds the shape and the attack together.
 ```
+
+```ts title="services/api/src/isolation/attack.ts (excerpt)"
+export interface ListVerdict {
+  status: number;
+  /** How many rows came back, however the endpoint chose to wrap them. */
+  count: number;
+  /** Any returned identifier that belongs to the other tenant. */
+  leaked: string[];
+  body: unknown;
+}
+```
+
+```
+body {"data":[{"external_id":"victim-…-user","status":"created",…}]}   (foreign)
+vs   {"data":[{"external_id":"absent-0000…","status":"created",…}]}   (absent)
+```
+
+```ts
+    const attacked = counts.read + counts.write + counts.credential;
+```
+
+## The 404 that stopped being a signal
+
+```
+AssertionError: expected 200 to be 404
+```
+
+## The guard's third table, and the message that needed it
+
+```
+record "old" has no field "id"
+```
+
+```sql title="packages/test-harness/src/sentinel.sql (excerpt)"
+  RAISE EXCEPTION
+    'global-operation guard: this statement modified sentinel row %.% (key %), which belongs to no test%',
+    TG_TABLE_SCHEMA, TG_TABLE_NAME,
+    COALESCE(to_jsonb(OLD) ->> 'id', to_jsonb(OLD)::text),
+    COALESCE(' — the bait planted by ' || who, '');
+```
+
+## What the two chapters cost, in numbers
+
 ```diff title="packages/service-kit/src/index.ts"
 @@ -56,7 +56,7 @@
    health: () => Record<string, unknown>;
@@ -4134,8 +4891,7 @@ trong số đó xuất hiện ở đây:
   * package with no dependencies can still emit a URL the registry owns. */
  export function serve(options: ServeOptions): Server {
 ```
-```diff title="scripts/seed-demo-tenant.mjs"
-```
+
 ```diff title="services/api/src/messages/zod-validation.pipe.ts"
 @@ -15,7 +15,7 @@
      const result = this.schema.safeParse(value);
@@ -4147,6 +4903,7 @@ trong số đó xuất hiện ở đây:
        // EIR-API-04's error shape has carried a `field` since chapter 1.3 and
        // `errorFrameSchema` declares it — and nothing in the api had ever set it.
 ```
+
 ```diff title="services/api/src/protocol-error.filter.ts"
 @@ -39,7 +39,7 @@
        typeof (response as { code?: unknown }).code === "string"
@@ -4158,6 +4915,7 @@ trong số đó xuất hiện ở đây:
      // `forbidden`, `not_found`, `internal_error` and the frame codes — and
      // `docs_url` is derived from the code, so each one shipped a link to a page
 ```
+
 ```diff title="services/api/src/protocol-error.ts"
 @@ -1,7 +1,7 @@
  import { HttpException } from "@nestjs/common";
@@ -4169,8 +4927,7 @@ trong số đó xuất hiện ở đây:
   * The credentials chapter introduced the convention that a thrower may name its code, because
   * `wrong_credential_type` is a distinction a status cannot carry. What it could not
 ```
-```diff title="services/dispatcher/src/dispatcher.itest.ts"
-```
+
 ```diff title="services/gateway/src/main.ts"
 @@ -28,7 +28,7 @@
      }),
@@ -4182,19 +4939,28 @@ trong số đó xuất hiện ở đây:
    });
    // The socket server rides the SAME listener as health — one port, two
 ```
+
 ```diff title="services/gateway/src/public-surface.itest.ts"
-@@ -213,7 +213,7 @@
+@@ -17,13 +17,13 @@ import { attachSessions } from "./session.js";
+ import { docsUrl } from "@relay/protocol";
  
-   // A MESSAGE SENT OVER THE PUBLIC REST API CANNOT REACH A SOCKET AT ALL, and
-   // that is the platform's behaviour rather than this test's shortcoming. Pinned
--  // here because the isolation gauntlet's exit criterion is that an outsider integrates on
-+  // here because the outsider milestone's exit criterion is that an outsider integrates on
-   // the documentation alone, and this is the sentence that documentation has to
-   // contain.
-   //
+ // THE EXIT CRITERION, REHEARSED IN THE LANE (FR-020, SC-015).
+ //
+ // A channel created over the public API, a member added over the public API, a
+ // message sent over the public API, and the socket delivering it to that member.
+-// The channel endpoints were built for exactly this path, and this is
++// The first two channel endpoints were built for exactly this path, and this is
+ // the test that the path joins up.
+ //
+ // NO REPOSITORY CALL FOR ANY OF IT, which is the whole point and is a narrower
+ // claim than it sounds. The environment and the API key still come through the
+ // build-output seam, because there is no public way to create either — that has
+ // been true since chapter 2.8 and is still true. Everything downstream of the
 ```
+
 ```diff title="services/gateway/src/resume.itest.ts"
-@@ -113,10 +113,13 @@
+@@ -114,12 +114,15 @@ describe("resume across a real fabric", () => {
+     // different fanout client on the same subject — publishes into the
      // window. Neither side coordinates; only the buffer saves this.
      harness = await boot({
        session: async () => ({
@@ -4204,11 +4970,13 @@ trong số đó xuất hiện ở đây:
 +        // that does not say is a stub that has not thought about it.
 +        banned: false,
          channel_ids: [CHANNEL],
-         // The limits ride the session response now. Generous, and
-         // beside the point of every test in this file.
-         limits: { connect: 3_000, send: 600 },
        }),
-@@ -147,10 +150,13 @@
+       backfill: async () => {
+         await publishFromElsewhere(frame(43));
+         await settle(150); // give Redis time to actually deliver it
+         return {
+@@ -145,12 +148,15 @@ describe("resume across a real fabric", () => {
+     // Committed after the backfill's snapshot: it exists ONLY in the buffer,
      // and the flush is the only reason the client ever sees it.
      harness = await boot({
        session: async () => ({
@@ -4218,11 +4986,13 @@ trong số đó xuất hiện ở đây:
 +        // that does not say is a stub that has not thought about it.
 +        banned: false,
          channel_ids: [CHANNEL],
-         // The limits ride the session response now. Generous, and
-         // beside the point of every test in this file.
-         limits: { connect: 3_000, send: 600 },
        }),
-@@ -175,10 +181,13 @@
+       backfill: async () => {
+         await publishFromElsewhere(frame(43));
+         await settle(150);
+         return { [CHANNEL]: { messages: [frame(42)], truncated: false } };
+@@ -170,12 +176,15 @@ describe("resume across a real fabric", () => {
+ 
    it("goes live after the flush, with no buffering left behind", async () => {
      harness = await boot({
        session: async () => ({
@@ -4232,11 +5002,13 @@ trong số đó xuất hiện ở đây:
 +        // that does not say is a stub that has not thought about it.
 +        banned: false,
          channel_ids: [CHANNEL],
-         // The limits ride the session response now. Generous, and
-         // beside the point of every test in this file.
-         limits: { connect: 3_000, send: 600 },
        }),
-@@ -221,10 +230,13 @@
+       backfill: async () => ({
+         [CHANNEL]: { messages: [frame(42)], truncated: false },
+       }),
+       sendMessage: async () => {
+@@ -213,12 +222,15 @@ describe("resume across a real fabric", () => {
+     //
      // One number different from the test above it. That is the whole bug.
      harness = await boot({
        session: async () => ({
@@ -4246,11 +5018,13 @@ trong số đó xuất hiện ở đây:
 +        // that does not say is a stub that has not thought about it.
 +        banned: false,
          channel_ids: [CHANNEL],
-         // The limits ride the session response now. Generous, and
-         // beside the point of every test in this file.
-         limits: { connect: 3_000, send: 600 },
        }),
-@@ -260,10 +272,13 @@
+       backfill: async () => ({
+         [CHANNEL]: { messages: [frame(42)], truncated: false },
+       }),
+       sendMessage: async () => {
+@@ -249,12 +261,15 @@ describe("resume across a real fabric", () => {
+     // retiring the mark once a higher sequence arrived — which would see the 43,
      // drop the mark, and then deliver the 42 (research R3).
      harness = await boot({
        session: async () => ({
@@ -4260,11 +5034,13 @@ trong số đó xuất hiện ở đây:
 +        // that does not say is a stub that has not thought about it.
 +        banned: false,
          channel_ids: [CHANNEL],
-         // The limits ride the session response now. Generous, and
-         // beside the point of every test in this file.
-         limits: { connect: 3_000, send: 600 },
        }),
-@@ -299,10 +314,13 @@
+       backfill: async () => ({
+         [CHANNEL]: { messages: [frame(42)], truncated: false },
+       }),
+       sendMessage: async () => {
+@@ -285,12 +300,15 @@ describe("resume across a real fabric", () => {
+     // would suppress messages the client never got — turning this chapter's
      // duplicate into a gap, which constitution II ranks worse.
      harness = await boot({
        session: async () => ({
@@ -4274,134 +5050,429 @@ trong số đó xuất hiện ở đây:
 +        // that does not say is a stub that has not thought about it.
 +        banned: false,
          channel_ids: [CHANNEL],
-         // The limits ride the session response now. Generous, and
-         // beside the point of every test in this file.
-         limits: { connect: 3_000, send: 600 },
        }),
+       backfill: async () => {
+         throw new Error("backfill unavailable");
+       },
+       sendMessage: async () => {
 ```
+
 ```diff title="services/gateway/src/session.test.ts"
-@@ -49,6 +49,9 @@
-         ? {
-             environment_id: "env-1",
-             user: "tuan",
+@@ -40,13 +40,20 @@ function stubApi(overrides: Partial<ApiClient> = {}): ApiClient {
+     // The api verifies tokens, so the stub is what decides which
+     // credential is good. That inversion is the point — the gateway holds no
+     // secret and cannot check a signature, so there is nothing left here to
+     // fake except the ANSWER.
+     session: async (token) =>
+       token === VALID_TOKEN
+-        ? { environment_id: "env-1", user: "tuan", channel_ids: [CHANNEL] }
++        ? {
++            environment_id: "env-1",
++            user: "tuan",
 +            // The api now reports whether the user is banned, and a stub
 +            // that does not say is a stub that has not thought about it.
 +            banned: false,
-             channel_ids: [CHANNEL],
-             // The limits ride the session response because the
-             // gateway has no database to read them from — so the stub supplies
-@@ -857,6 +860,9 @@
-         session: async () => ({
-           environment_id: "env-1",
-           user: "tuan",
-+          // The api now reports whether the user is banned, and a stub
-+          // that does not say is a stub that has not thought about it.
-+          banned: false,
-           channel_ids: [CHANNEL],
-           limits: { connect: 2, send: 600 },
-         }),
-@@ -890,6 +896,9 @@
-         session: async () => ({
-           environment_id: "env-1",
-           user: "tuan",
-+          // The api now reports whether the user is banned, and a stub
-+          // that does not say is a stub that has not thought about it.
-+          banned: false,
-           channel_ids: [CHANNEL],
-           limits: { connect: 3_000, send: configured },
-         }),
++            channel_ids: [CHANNEL],
++          }
+         : null,
+     backfill: async () => ({}),
+     sendMessage: async () => committed(42),
+     ...overrides,
+   };
+ }
 ```
 
-Một lần sửa, làm một lần, vì một lý do: tính năng trước được đặc tả là một chương và ship thành
-ba, nên 31 file trích "chương 3.12" cho những thay đổi mà 3.13 và 3.14 mới dạy. Hai mươi hai
-citation giờ gọi đúng tên chương; hai mươi lăm cái vẫn gọi 3.12, và gọi đúng.
-
-**File thứ mười một dạy cho luật ấy giới hạn của nó.** `eslint.config.mjs` mang citation của mình
-trên một dòng **được soạn bên trong `fences/post-series.md`**, như một dòng thêm vào trong một
-hunk của phụ lục — nên phụ lục mang bản sửa và chương này không fence gì cho file đó. Phép phân
-loại đã tìm ra hai mươi hai cái kia bỏ sót cái này, bởi nó tìm trong repository của platform còn
-dòng ấy sống trong repository của tutorial.
-
-<Trap locale="vi">
-
-**Bản phân loại mà các bản sửa ấy dựa vào được sinh ra bằng một lối tắt mà ghi chú của chính nó
-nói là đừng tin.** Nó khớp từng file có citation với trang fence file đó, gắn cờ một ngoại lệ, và
-ghi lại một phân bố.
-
-Câu trả lời của lối tắt ấy *dịch chuyển*: file-tới-trang phụ thuộc vào chương nào fence file gần
-nhất, và chương 3.15 đã fence lại mười một file trong số đó. Nên `fixtures.ts`, `compare.ts` và
-`targets.ts` trả lời "3.12" khi danh sách được lập và sẽ trả lời "3.15" hôm nay — vô nghĩa với
-một comment nói về cái oracle mà chương 3.12 dựng.
-
-Suy lại theo từng citation, đối chiếu với luật không dịch chuyển — *chương mà trang của nó dạy
-thay đổi đang được trích* — phân bố ra thành 25 / 9 / 13 nơi lối tắt nói 15 / 14 / 10.
-
-</Trap>
-
-## Cái cột không có ai đọc
-
-Chủ đề của tính năng này là bốn cột không ai đọc, cùng một cột thứ năm được một response body trả
-về trong khi không quyết định nào tra tới nó. Cả năm giờ đã có người đọc, và `channels.type` có
-quyết định đầu tiên của nó.
-
-Nó để lại **một** cột, và là cột của chính nó: `read_positions.updated_at`, được ghi bởi mọi lần
-ghi vị trí và không ai đọc. Một field audit không có người audit.
-
-Con số ấy đi từ ba, xuống hai, xuống một trong lúc đặc tả. `users.deleted_at` được lần xoá ghi
-vào và lần hồi sinh xoá đi mà không ai đọc, cho tới khi một lượt phân tích cho nó người đọc;
-`members.role` bị gọi là chết cho tới khi một lượt sau đó nhận ra phần liệt kê trả nó về — và
-*trả một cột về chính là đọc nó*, bản sửa làm phát biểu sắc hơn chứ không yếu đi. Điều trung thực
-còn lại để nói về `updated_at` là: lựa chọn của nó là một người đọc hoặc một migration xoá nó đi.
-
-Nên nó ở lại, và câu nói ra điều đó nằm ngay cạnh cột chứ không chỉ trong một tài liệu tổng
-kết — bởi một cột không ai chọn giữ và một cột có người chọn giữ trông y hệt nhau trong schema.
+## The column that has no reader
 
 ```diff title="services/api/src/db/schema.ts"
-@@ -437,6 +437,16 @@
-     // `channels.last_sequence` is refused (FR-018) — a position nothing can reach makes
-     // every later count wrong.
-     sequence: bigint("sequence", { mode: "number" }).notNull(),
-+    // WRITTEN BY EVERY POSITION WRITE AND READ BY NOTHING, and that is a decision rather
-+    // than an oversight (the user-surface chapter's `gaps.md` §5).
+@@ -197,12 +197,30 @@ export const users = pgTable(
+       .references(() => environments.id),
+     externalId: text("external_id").notNull(),
+     displayName: text("display_name"),
+     avatarUrl: text("avatar_url"),
+     metadata: jsonb("metadata").notNull().default({}),
+     bannedAt: timestamp("banned_at", { withTimezone: true }),
++    // A DELETED USER KEEPS THIS ROW (FR-USR-05, research R7).
 +    //
-+    // the channel-control chapter and the user-surface chapter exist because five columns had no reader, so leaving a sixth
-+    // behind needs a sentence or it becomes the next feature's finding. The two options
-+    // were a reader — an operations view answering "when did this user last catch up" —
-+    // or a migration dropping it. Kept, on the expectation that the reader arrives.
++    // This column is in no SRS clause. It arrived from designing the deletion path:
++    // `messages.user_id`, `members.user_id` and `read_positions.user_id` all
++    // reference `users.id`, and FR-USR-05 asks that a deleted user's messages be
++    // preserved "as authored by a deleted user".
 +    //
-+    // A column nobody chose to keep and a column somebody chose to keep look identical in
-+    // a schema. This comment is the only thing that tells them apart.
-     updatedAt: timestamp("updated_at", { withTimezone: true })
++    // `ON DELETE SET NULL` would satisfy the letter of that and break delivery.
++    // `backfill.controller`'s `toFrame` drops senderless rows because `messageSchema`
++    // requires `user`, so "authored by a deleted user" and "authored by nobody" are
++    // different states and only the first is deliverable. `ON DELETE CASCADE` deletes
++    // the messages the clause says to keep.
++    //
++    // So the row survives with its profile fields cleared, and this marker is what says
++    // the row is deleted. `(environment_id, external_id)` stays unique, which is why
++    // presenting the same external id again reuses this row and clears the marker
++    // (FR-030) rather than creating a second identity.
++    deletedAt: timestamp("deleted_at", { withTimezone: true }),
+   },
+   (t) => [
+     unique("users_environment_id_external_id_unique").on(
+       t.environmentId,
+       t.externalId,
+     ),
+@@ -221,19 +239,46 @@ export const channels = pgTable(
+     name: text("name"),
+     metadata: jsonb("metadata").notNull().default({}),
+     lastSequence: bigint("last_sequence", { mode: "number" })
        .notNull()
-       .defaultNow(),
+       .default(0), // ADR-03
+     archivedAt: timestamp("archived_at", { withTimezone: true }),
++    // WHEN THIS CHANNEL LAST TOOK A MESSAGE (FR-014).
++    //
++    // A denormalised value, and the 145× is why. FR-CHN-08 wants a user's channels
++    // ordered by most recent activity. `last_sequence` above cannot do it — it is a
++    // per-channel counter, so two channels both at 50 say nothing about which was
++    // active more recently. The alternative is `max(messages.created_at)` per channel,
++    // measured at 2,000 channels and 1,000,000 messages:
++    //
++    //     aggregate over messages    159 ms   → Seq Scan, every message, every listing
++    //     this column, indexed         1.1 ms
++    //
++    // The test lane answered the aggregate in 0.87 ms because its busiest environment
++    // holds 579 messages, which is the number that would have settled the question the
++    // wrong way (research R4).
++    //
++    // The write path already advances `last_sequence` in one statement; this moves with
++    // it, in the same transaction. Nothing else writes it: a member joining, a rename or
++    // an archive is not activity.
++    lastActivityAt: timestamp("last_activity_at", { withTimezone: true })
++      .notNull()
++      .defaultNow(),
+   },
+   (t) => [
+     unique("channels_environment_id_external_id_unique").on(
+       t.environmentId,
+       t.externalId,
+     ), // DR-02
+     check("channels_type_check", sql`${t.type} IN ('public','private')`),
++    // The listing's ordering, scoped first (FR-013). Environment leads because every
++    // listing is inside one and the planner can then walk the timestamp backward.
++    index("channels_environment_last_activity").on(
++      t.environmentId,
++      t.lastActivityAt.desc(),
++    ),
+   ],
+ );
+ 
+ export const messages = pgTable(
+   "messages",
+   {
+@@ -301,12 +346,69 @@ export const members = pgTable(
+     check("members_role_check", sql`${t.role} IN ('owner','moderator','member')`),
+     // Hot-path index (SAD §6.3): the resume path's "which channels am I in".
+     index("members_user_channel").on(t.userId, t.channelId),
+   ],
+ );
+ 
++// HOW FAR EACH USER HAS READ IN EACH CHANNEL (FR-017, research R6).
++//
++// The only entity in this chapter with no storage before it. Verified absent: no
++// `last_read`, `read_at` or equivalent column anywhere in this file.
++//
++// THE UNREAD COUNT NEEDS NO COUNTER. It is
++// `greatest(channels.last_sequence - sequence, 0)`, because the write path already
++// maintains `last_sequence` and chapter 2.2 made it the sequencing authority. Three
++// shapes measured on one page of 50 channels against 1,000,000 messages:
++//
++//     count rows past the position     9.8–13.4 ms
++//     a cached counter on the position  1.2– 2.1 ms
++//     last_sequence - this column       1.1– 4.5 ms
++//
++// The cached counter is no faster and adds a value that can go stale. The approximation
++// this accepts, and FR-016 asks for it to be stated: a tombstoned message still occupies
++// a sequence, so a deleted message counts as one unread. Counting rows instead is 10x the
++// cost on the query a client runs to render its first screen.
++//
++// `environment_id` IS DENORMALISED HERE, DELIBERATELY. `channel_id` already determines
++// it. The column exists because the lane's guard watches tables that carry one, and a
++// table without it is a table the guard cannot refuse a cross-environment delete on.
++// `members` above is the counter-example and the reason this is worth saying: it has no
++// `environment_id`, so `tenant-scope.itest.ts` classifies it as `hop` — reached through a
++// foreign key — and no trigger protects it. A read position is per-user state that a
++// tenant's own operations mutate, so it takes the stronger classification.
++//
++// NO `id` COLUMN, and the guard's refusal message is why that matters: it interpolates a
++// key, and the endpoints chapter installed
++// `coalesce(to_jsonb(OLD) ->> 'id', to_jsonb(OLD)::text)` for exactly this case.
++export const readPositions = pgTable(
++  "read_positions",
++  {
++    environmentId: uuid("environment_id")
++      .notNull()
++      .references(() => environments.id),
++    channelId: uuid("channel_id")
++      .notNull()
++      .references(() => channels.id),
++    userId: uuid("user_id")
++      .notNull()
++      .references(() => users.id),
++    // The last sequence this user has read. Advances forwards only: a write naming a
++    // lower value is accepted and changes nothing, so a client replaying an old
++    // acknowledgement cannot move the count backwards. A value past
++    // `channels.last_sequence` is refused (FR-018) — a position nothing can reach makes
++    // every later count wrong.
++    sequence: bigint("sequence", { mode: "number" }).notNull(),
++    updatedAt: timestamp("updated_at", { withTimezone: true })
++      .notNull()
++      .defaultNow(),
++  },
++  (t) => [
++    primaryKey({ columns: [t.channelId, t.userId] }),
++  ],
++);
++
+ // The outbox (ADR-06). For the first time in Part 3 this table is
+ // QUOTED rather than derived: SAD §6.1 defines it column-for-column, so nothing
+ // about its shape is a chapter invention.
+ //
+ // Three absences are deliberate and worth knowing about.
+ //
 ```
 
-**Số cột không có người đọc không về 0 ở cuối một tính năng nói về những cột không ai đọc.**
-Nó về một, một cách có chủ đích, và cái một đó là của chính chúng ta.
+## The chapter in full
 
-<Checkpoint locale="vi">
+```diff title="packages/test-harness/src/sentinel.sql"
+@@ -69,18 +69,30 @@ BEGIN
+   END IF;
+ 
+   SELECT owner INTO who FROM __sentinel_environments
+    WHERE environment_id = OLD.environment_id;
+ 
+   -- The message is a contract — see contracts/guard.md. Prefix, schema, table,
+-  -- row id, and the diagnosis. NO SUGGESTED FIX: the right scoped alternative
++  -- row key, and the diagnosis. NO SUGGESTED FIX: the right scoped alternative
+   -- depends on what the test meant, and a guess printed as advice is worse than
+   -- silence. That guidance belongs in the lint rule, which knows the call site.
++  --
++  -- `to_jsonb(OLD) ->> 'id'` AND NOT `OLD.id`, BECAUSE NOT EVERY GUARDED TABLE HAS
++  -- ONE. PL/pgSQL resolves `OLD.id` at RUNTIME against the row the trigger fired for,
++  -- so a table with no `id` raises `record "old" has no field "id"` — from inside the
++  -- refusal path, replacing the diagnosis with a message about the diagnosis.
++  --
++  -- Two tables carried an `id` when this was written and the third does not:
++  -- `read_positions` is keyed `(channel_id, user_id)` because that is what a read
++  -- position is. `to_jsonb` turns the row into a document first, so the lookup is a
++  -- key that may be absent rather than a field that must exist, and the whole row is
++  -- the fallback — which is more useful anyway for a table whose identity is a pair.
+   RAISE EXCEPTION
+-    'global-operation guard: this statement modified sentinel row %.% (id %), which belongs to no test%',
+-    TG_TABLE_SCHEMA, TG_TABLE_NAME, OLD.id,
++    'global-operation guard: this statement modified sentinel row %.% (key %), which belongs to no test%',
++    TG_TABLE_SCHEMA, TG_TABLE_NAME,
++    COALESCE(to_jsonb(OLD) ->> 'id', to_jsonb(OLD)::text),
+     COALESCE(' — the bait planted by ' || who, '');
+ END $$;
+ 
+ -- One trigger per table carrying environment_id, firing only for a sentinel's
+ -- rows. Not `outbox`: it has no environment_id because it is platform
+ -- bookkeeping, so its bait is protected by the reader mechanism only. A stated
+@@ -106,16 +118,31 @@ END $$;
+ -- clause. The rule is the column, not the intuition that a table "feels" tenant.
+ DO $$
+ DECLARE
+   t text;
+ BEGIN
+   FOREACH t IN ARRAY ARRAY[
+-    -- This chapter's two. Both carry `environment_id`, both hold bait planted by
+-    -- `sentinelFor`, and `guard.itest.ts` drives each one.
++    -- The instruments chapter's two. Both carry `environment_id`, both hold bait
++    -- planted by `sentinelFor`, and `guard.itest.ts` drives each one.
+     'channels',
+-    'users'
++    'users',
++    -- THIS CHAPTER'S, AND IT ARRIVES WITH THE TABLE. `read_positions` carries
++    -- `environment_id` although `channel_id` already determines it, precisely so this
++    -- trigger can exist — a table without the column is a table the guard cannot
++    -- refuse a cross-environment delete on.
++    --
++    -- AND IT HAS NO `id`, which is the case the refusal message was changed for: it
++    -- interpolates `coalesce(to_jsonb(OLD) ->> 'id', to_jsonb(OLD)::text)` rather than
++    -- `OLD.id`, so a table keyed on `(channel_id, user_id)` still names the row it
++    -- refused.
++    --
++    -- `members` REMAINS THE COUNTER-EXAMPLE. It is per-member state too and it is
++    -- deliberately absent: no `environment_id`, so the catalogue calls it `hop` and
++    -- `OLD.environment_id` would not compile in the WHEN clause above. The rule is the
++    -- column, not the intuition that a table feels tenant-scoped.
++    'read_positions'
+   ] LOOP
+     EXECUTE format('DROP TRIGGER IF EXISTS __sentinel_guard_%1$s ON %1$I', t);
+     EXECUTE format(
+       'CREATE TRIGGER __sentinel_guard_%1$s
+          BEFORE UPDATE OR DELETE ON %1$I FOR EACH ROW
+          WHEN (__is_sentinel(OLD.environment_id))
+```
 
-- `pnpm test:integration` — 550 test, 20/20 xanh, 192–197 s, trung bình 193,55 s
-- `pnpm coverage` — 920 test, mọi ratchet đạt; branch của `repository.ts` 89,51% → 92,11%
-- `pnpm check:fences` — 0 vấn đề, 211 file; `pnpm check:figures` — 200 figure
-- `gauntlet targets: 38 derived, 35 attacked, 3 exempt`, năm động từ trên một oracle
-- `tenant paths: 23 base tables — 13 direct, 2 hop, 8 spine`
-- mười hai điều khoản SRS đã giao, và một điều khoản bị chạm tới mà không requirement nào nhận
+```diff title="packages/test-harness/src/sentinel.ts"
+@@ -123,17 +123,19 @@ export const SENTINEL = {
+ export async function plant(
+   client: { query(sql: string, values?: unknown[]): Promise<unknown> },
+   s: Sentinel,
+ ): Promise<void> {
+   const q = (sql: string, values?: unknown[]) => client.query(sql, values);
+ 
+-  // Children before parents, so the deletes do not trip a foreign key. `channels`
+-  // before `users` is not arbitrary: chapter 9 adds a table keyed on both.
+-  await q(`DELETE FROM outbox   WHERE subject = $1`, [`${s.name}.bait`]);
+-  await q(`DELETE FROM channels WHERE environment_id = $1`, [s.environmentId]);
+-  await q(`DELETE FROM users    WHERE environment_id = $1`, [s.environmentId]);
++  // Children before parents, so the deletes do not trip a foreign key — and
++  // `read_positions` references BOTH `channels` and `users`, which is why the note
++  // the instruments chapter left here said the order was not arbitrary.
++  await q(`DELETE FROM outbox         WHERE subject = $1`, [`${s.name}.bait`]);
++  await q(`DELETE FROM read_positions WHERE environment_id = $1`, [s.environmentId]);
++  await q(`DELETE FROM channels       WHERE environment_id = $1`, [s.environmentId]);
++  await q(`DELETE FROM users          WHERE environment_id = $1`, [s.environmentId]);
+ 
+   // Register before inserting bait: the trigger's WHEN clause tests membership,
+   // so an unregistered sentinel is unguarded bait.
+   await q(
+     `INSERT INTO __sentinel_environments (environment_id, owner) VALUES ($1, $2)
+      ON CONFLICT (environment_id) DO UPDATE SET owner = EXCLUDED.owner`,
+@@ -182,12 +184,24 @@ export async function plant(
+   );
+   await q(
+     `INSERT INTO channels (id, environment_id, external_id, type, name)
+      VALUES ($1, $2, $3, 'private', $3) ON CONFLICT (id) DO NOTHING`,
+     [s.channelId, s.environmentId, s.name],
+   );
++  // THIS CHAPTER'S GUARD BAIT. `read_positions` joined the trigger array in
++  // `sentinel.sql`, and a name in that array with no row behind it installs a trigger
++  // that can never match — which reads, in every report, exactly like protection.
++  //
++  // It reuses the user and channel above rather than minting a third id: the row only
++  // has to EXIST for the WHEN clause to have something to test, and one keyed on a
++  // pair the sentinel already owns is one fewer id to clean up.
++  await q(
++    `INSERT INTO read_positions (environment_id, channel_id, user_id, sequence)
++     VALUES ($1, $2, $3, 0) ON CONFLICT (channel_id, user_id) DO NOTHING`,
++    [s.environmentId, s.channelId, s.userId],
++  );
+ 
+   // DRAIN BAIT: unpublished events. `outbox` carries no environment_id — it is
+   // platform bookkeeping — so the subject is what identifies these, and it is also
+   // why the trigger cannot guard them (data-model.md). The count is `BAIT_ROWS` and
+   // not one, because a single row cannot tell a batch that ignored its limit from
+   // one that honoured it.
+```
 
-</Checkpoint>
+```diff title="services/api/src/isolation/attack.ts"
+@@ -75,12 +75,71 @@ export function comparePair(foreign: Answer, absent: Answer): string[] {
+   const a = JSON.stringify(absent.body);
+   if (f !== a) differences.push(`body ${f} (foreign) vs ${a} (absent)`);
+   return differences;
+ }
+ 
+ /** A read of another tenant's resource must answer as a read of nothing. */
++/** A list's correct answer to "nothing of yours here" is an EMPTY RESULT, and that
++ * is why it needs a shape of its own.
++ *
++ * Every other attack here asserts a PAIR: the foreign identifier and one that exists
++ * nowhere must be indistinguishable. A listing breaks that, because the two are not
++ * supposed to be indistinguishable. `GET /v1/users/:externalId/channels` names the
++ * user in the path, so a foreign user id is a 404 — correctly — while a user who
++ * exists and owns nothing is a 200 with no rows. Comparing those two says nothing.
++ *
++ * What has to be true instead is narrower and harder: **no row belonging to another
++ * environment appears in any 200.** A status code cannot express that, so the verdict
++ * carries the rows and the identifiers that leaked into them.
++ */
++export interface ListVerdict {
++  status: number;
++  /** How many rows came back, however the endpoint chose to wrap them. */
++  count: number;
++  /** Any returned identifier that belongs to the other tenant. */
++  leaked: string[];
++  body: unknown;
++}
++
++/** THE ROWS IN A LIST RESPONSE, whatever shape it came in.
++ *
++ * Two shapes because the platform has one and a future route may have the other: a
++ * paginated route answers `{ data: [...] }` and a bare route answers an array.
++ * Exported and pure because only ONE arm can execute against the routes that exist
++ * today, and a count of zero from an unrecognised shape reads exactly like a count of
++ * zero from a correctly-scoped list — which is the one answer this suite must never
++ * confuse with success. `listAttack` therefore asserts the shape was recognised
++ * rather than trusting the count. */
++export function rowsOf(body: unknown): unknown[] {
++  if (Array.isArray(body)) return body;
++  const data = (body as { data?: unknown } | null)?.data;
++  if (Array.isArray(data)) return data;
++  return [];
++}
++
++export async function listAttack(
++  baseUrl: string,
++  credential: string,
++  req: AttackRequest,
++  foreignIds: readonly string[],
++): Promise<ListVerdict> {
++  const answer = await send(baseUrl, credential, req);
++  const rows = rowsOf(answer.body);
++  // SEARCHED IN THE SERIALISED BODY, not in the parsed rows. A leaked identifier can
++  // arrive somewhere the row shape does not reach — a cursor, an embedded object, an
++  // error message that echoes what was asked for — and the property is that the id
++  // does not appear AT ALL.
++  const serialised = JSON.stringify(answer.body ?? "");
++  return {
++    status: answer.status,
++    count: rows.length,
++    leaked: foreignIds.filter((id) => serialised.includes(id)),
++    body: answer.body,
++  };
++}
++
+ export async function readAttack(
+   baseUrl: string,
+   credential: string,
+   foreignReq: AttackRequest,
+   absentReq: AttackRequest,
+ ): Promise<Verdict> {
+```
 
-<ForwardRef part="Part 3 đóng lại" locale="vi">
+```diff title="services/api/src/channels/channels.controller.ts"
+@@ -187,14 +187,14 @@ export class ChannelsController {
+    *
+    * `@Accepts("user")` AT THE METHOD, overriding the class's `"application"`. This
+    * is the caller joining, not the tenant adding someone, so an application key has
+    * no business here — it carries no user to join. `credential.guard.ts` resolves
+    * `getAllAndOverride([handler, class])`, so the method wins.
+    *
+-   * Without this decorator every user's join would be a 403, which is the
+-   * isolation harness's FR-044 hole exactly: a credential mismatch that passed
++   * Without this decorator every user's join would be a 403, which is the isolation
++   * harness's FR-044 hole exactly: a credential mismatch that passed for a whole
+    * chapter and then turned nine of fifteen tests red.
+    */
+   @Post(":channelId/join")
+   @HttpCode(HttpStatus.OK)
+   @Accepts("user")
+   async join(
+```
 
-Part 3 kết thúc ở đây. Những gì nó để lại đều được viết xuống chứ không ngụ ý: outbox vẫn giữ nội
-dung tin nhắn mãi mãi và chương của FR-MOD-06 sở hữu phần prune; một tin nhắn gửi qua REST vẫn
-không tới được socket, và **chương 3.18 chính là chương thay đổi điều đó — dẫn FR-RTM-01 chứ
-không phải FR-RTM-05, vì điều khoản chưa được thoả mãn nói về việc chuyển phát, không phải
-về việc có những loại event nào**; `messages.deleted_at` có
-người đọc mà không có người ghi, đang chờ FR-MSG-08; và `read_positions.updated_at` là một cột
-tính năng này thêm vào mà không ai đọc.
-
-Bốn thứ còn mở, mỗi thứ có một người sở hữu. Part 4 là con đường dữ liệu thứ hai.
-
-</ForwardRef>
+```diff title="services/api/src/consumer/consumer.itest.ts"
+@@ -20,13 +20,13 @@ import { migrate } from "../db/migrate";
+ // The consumer, against a real broker and a real database.
+ //
+ // Every durable name here is unique per run. A durable consumer is a POSITION
+ // in a shared stream that already holds tens of thousands of events from earlier
+ // chapters — two runs sharing a name would inherit each other's progress, and
+ // the second would look mysteriously empty. This is the same lesson 2.6 learned
+-// about Redis subjects and the outbox chapter about its own: a shared store needs a
++// about Redis subjects and the outbox chapter about its own table: a shared store needs a
+ // per-run handle, because the isolation every other suite gets from a tenant
+ // column is not available here.
+ 
+ const silent: Logger = createLogger("consumer-itest", () => {});
+ 
+ const ENV = () => randomUUID();
+```
 
 <ChapterFooter id="3.10" locale="vi" />
