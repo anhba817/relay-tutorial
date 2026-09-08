@@ -84,7 +84,7 @@ faster), applying this chapter's configuration would have meant deleting the
 stream and everything in it. The cost of a default is not paid when you take it.
 
 ```diff title="services/api/src/outbox/jetstream.publisher.ts"
-@@ -1,5 +1,8 @@
+@@ -1,8 +1,11 @@
  import {
    connect,
 +  DiscardPolicy,
@@ -93,7 +93,13 @@ stream and everything in it. The cost of a default is not paid when you take it.
    type JetStreamClient,
    type NatsConnection,
  } from "nats";
-@@ -15,16 +18,82 @@ import type { Publisher, PublishedMessage } from "./publisher";
+ 
+ import type { Publisher, PublishedMessage } from "./publisher";
+ 
+@@ -12,22 +15,88 @@ import type { Publisher, PublishedMessage } from "./publisher";
+ // JetStream for something else means writing another file like this one and
+ // changing nothing that produces events. That is the reversibility ADR-06
+ // claims for the outbox, expressed as a module boundary rather than a promise.
  
  export const DEFAULT_NATS_URL = "nats://localhost:4222";
  
@@ -103,16 +109,16 @@ stream and everything in it. The cost of a default is not paid when you take it.
 +/** One stream over `events.>`, file-backed.
   *
 - * The real design of the subject space — FR-WHK-02's full event-type list,
-- * per-environment sharding, retention, replicas — belongs to the broker chapter along
+- * per-environment sharding, retention, replicas — belongs to chapter 3.4 along
 - * with every consumer. */
-+ * The outbox chapter created this with a name, its subjects and file storage, and left
++ * Chapter 3.3 created this with a name, its subjects and file storage, and left
 + * everything else at whatever NATS defaults to — which on a development broker
 + * meant no age limit, no size limit, and a two-minute duplicate window nobody
-+ * had chosen. The broker chapter makes every setting a decision (research R2).
++ * had chosen. Chapter 3.4 makes every setting a decision (research R2).
 + *
 + * Two of them can never be changed again, and both happen to be right:
 + * `retention` and `storage` are immutable on an existing stream (measured, R1).
-+ * Had the outbox chapter taken memory storage as a convenience, applying this configuration
++ * Had 3.3 taken memory storage as a convenience, applying this configuration
 + * would have meant deleting the stream and every event in it. */
  const STREAM = "EVENTS";
  const SUBJECTS = ["events.>"];
@@ -130,7 +136,7 @@ stream and everything in it. The cost of a default is not paid when you take it.
 + * into a number an operator can watch — and with `discard: old`, hitting it
 + * loses the OLDEST events rather than refusing new publishes. Refusing
 + * publishes would take the write path down with the event spine, which is the
-+ * inversion the outbox chapter's outbox exists to prevent. */
++ * inversion chapter 3.3's outbox exists to prevent. */
 +const MAX_BYTES = 1024 * 1024 * 1024;
 +
 +/** ADR-02 specifies R3 replication. The compose stack is a single node, so this
@@ -151,7 +157,7 @@ stream and everything in it. The cost of a default is not paid when you take it.
 + * carried through untouched — attempting to change `retention` or `storage` is
 + * an error the broker refuses rather than a difference it reconciles (R1).
 + *
-+ * `duplicate_window` is deliberately left where the outbox chapter found it. Raising it looks
++ * `duplicate_window` is deliberately left where 3.3 found it. Raising it looks
 + * like the fix for a republished event and is not: the outbox can republish
 + * hours after an outage, no window is a safe guess about the longest one, and a
 + * window measured in hours would hold that dedupe index in the broker's memory
@@ -182,7 +188,13 @@ stream and everything in it. The cost of a default is not paid when you take it.
  export function createJetStreamPublisher({
    url = process.env.RELAY_NATS_URL ?? DEFAULT_NATS_URL,
  }: { url?: string } = {}): Publisher {
-@@ -38,16 +107,7 @@ export function createJetStreamPublisher({
+   let connection: NatsConnection | null = null;
+   let js: JetStreamClient | null = null;
+ 
+@@ -35,22 +104,13 @@ export function createJetStreamPublisher({
+    * with the broker unreachable — a service that refuses to boot without its
+    * event spine has made the spine a dependency of the write path, which is the
+    * opposite of what an outbox is for (research R9). */
    async function client(): Promise<JetStreamClient> {
      if (js && connection && !connection.isClosed()) return js;
      const nc = await connect({ servers: url });
@@ -200,6 +212,9 @@ stream and everything in it. The cost of a default is not paid when you take it.
      connection = nc;
      js = nc.jetstream();
      return js;
+   }
+ 
+   return {
 ```
 
 Each number carries its reason in the code, where a reader is standing when they
@@ -250,15 +265,18 @@ position that never advances. So the grammar moves to `@relay/protocol`, the
 package whose entire job since chapter 1.3 has been the shapes both sides share.
 
 ```diff title="packages/protocol/src/internal.ts"
-@@ -82,6 +82,41 @@ export const internalBackfillResponseSchema = z.strictObject({
+@@ -79,12 +79,47 @@ export const internalBackfillResponseSchema = z.strictObject({
+       messages: z.array(messageSchema),
+       truncated: z.boolean(),
+     }),
    ),
  });
  
 +// ---------------------------------------------------------------------------
-+// Event subjects (ADR-02).
++// Event subjects (chapter 3.4, ADR-02).
 +//
 +// The grammar is `events.{domain}.{action}.{env}` — ADR-02's, verbatim. It lived
-+// inside the api's outbox module in the outbox chapter because nothing else needed it. A
++// inside the api's outbox module in 3.3 because nothing else needed it. A
 +// consumer needs it now, and the package whose whole job is the shapes both
 +// sides share is where a shape shared by both sides belongs (1.3's premise).
 +//
@@ -292,43 +310,58 @@ package whose entire job since chapter 1.3 has been the shapes both sides share.
  /** api → gateway: the channels this user may hear (FR-RTM-01). */
  export const internalMembershipsResponseSchema = z.strictObject({
    channel_ids: z.array(z.string().min(1)),
+ });
+ 
+ /** api → gateway: who the presented token belongs to, and what it
 ```
 
 The api keeps working because `event.ts` re-exports what it used to define. It
 also gains something it did not have, which matters more than the move:
 
 ```diff title="services/api/src/outbox/event.ts"
-@@ -1,3 +1,6 @@
+@@ -1,6 +1,9 @@
 +import { subjectFor } from "@relay/protocol";
 +import { z } from "zod";
 +
- // The event envelope. Built in ONE place, complete, inside the
+ // The event envelope (chapter 3.3). Built in ONE place, complete, inside the
  // transaction that caused it — so the relay is a mover of bytes and never an
  // author of them (ADR-04, research R7).
-@@ -36,13 +39,10 @@ export interface PendingEvent {
+ //
+ // Nothing in this file reads the clock or generates an id. Both arrive from the
+ // caller, which is what makes a republished event byte-identical to its first
+@@ -33,19 +36,16 @@ export interface OutboxEvent {
+ 
+ export interface PendingEvent {
+   subject: string;
    payload: OutboxEvent;
  }
  
 -/** `events.msg.created.{environment_id}` — the shape SAD §6.1's own comment
 - * gives. The full subject taxonomy for FR-WHK-02's other seven types, and any
-- * per-environment sharding, belongs to the broker chapter. */
+- * per-environment sharding, belongs to chapter 3.4. */
 -export function subjectFor(type: string, environmentId: string): string {
 -  const leaf = type.replace(/^message\./, "msg.");
 -  return `events.${leaf}.${environmentId}`;
 -}
-+// The subject grammar moved to @relay/protocol in the broker chapter, because a
++// The subject grammar moved to @relay/protocol in chapter 3.4, because a
 +// consumer needs it too and both sides must agree on it. Imported for use
-+// below and re-exported so the outbox chapter's callers keep working.
++// below and re-exported so 3.3's callers keep working.
 +export { subjectFor };
  
  export function messageCreatedEvent({
    eventId,
-@@ -69,3 +69,26 @@ export function messageCreatedEvent({
+   environmentId,
+   message,
+ }: {
+@@ -66,6 +66,29 @@ export function messageCreatedEvent({
+       environment_id: environmentId,
+       occurred_at: message.created_at,
+       data: message,
      },
    };
  }
 +
-+/** The envelope as a CONSUMER receives it.
++/** The envelope as a CONSUMER receives it (chapter 3.4).
 + *
 + * The producing side builds this object and knows it is well formed; the
 + * consuming side reads bytes off a broker and knows nothing. Chapter 2.5 made
@@ -467,31 +500,34 @@ The second delivery has to be recognised, and recognising it requires a memory
 that survives the process. That is a table.
 
 ```diff title="services/api/src/db/schema.ts"
-@@ -325,3 +325,37 @@ export const outbox = pgTable(
+@@ -322,6 +322,40 @@ export const outbox = pgTable(
+     // trivial; it still needs a scheduler this platform does not have).
+     index("outbox_unpublished")
+       .on(t.createdAt)
        .where(sql`${t.publishedAt} IS NULL`),
    ],
  );
 +
-+// The consumer's deduplication ledger.
++// The consumer's deduplication ledger (chapter 3.4).
 +//
-+// DECISION: no source document defines a table for this. SAD risk
++// DECISION (chapter 3.4): no source document defines a table for this. SAD risk
 +// R5 requires the BEHAVIOUR — "consumer template with dedup built in", so that
 +// "a future consumer forgets to dedupe → double webhooks / double metering"
 +// cannot happen — and leaves the shape open. This is therefore a chapter
-+// derivation, recorded here the way 2.1 recorded `members`, the credentials chapter recorded
-+// `api_keys` and the outbox chapter recorded the outbox's index.
++// derivation, recorded here the way 2.1 recorded `members`, 3.2 recorded
++// `api_keys` and 3.3 recorded the outbox's index.
 +//
 +// The PRIMARY KEY is the deduplication. Not a SELECT-then-INSERT: the insert
 +// itself is the check, so two instances fetching the same message concurrently
 +// cannot both decide they were first. 2.3 learned that on idempotency keys and
-+// The tenancy chapter learned it again on signup.
++// 3.1 learned it again on signup.
 +//
 +// Keyed per CONSUMER, not globally. The dispatcher and the ingester must each
 +// receive every event; one ledger shared between them would let whichever
 +// arrived first silence the other.
 +//
 +// No environment_id, for the reason the outbox has none: this is the platform's
-+// own bookkeeping rather than tenant data (constitution I, the outbox chapter's data model).
++// own bookkeeping rather than tenant data (constitution I, 3.3's data model).
 +// No event body either — recording that an event was handled needs none of a
 +// tenant's message text (NFR-SEC-06).
 +export const consumedEvents = pgTable(
@@ -521,7 +557,7 @@ three times now that the answer has been "let the database decide, in one
 statement."
 
 ```sql title="services/api/migrations/0005_consumed_events.sql"
--- The consumer deduplication ledger (SAD risk R5).
+-- Chapter 3.4 — the consumer deduplication ledger (SAD risk R5).
 --
 -- REVIEW DISPOSITION: drizzle-kit generated this from schema.ts and it was read
 -- line by line before being applied (the ADR-16 workflow). Nothing was
@@ -551,7 +587,10 @@ CREATE TABLE "consumed_events" (
 And the operation on it:
 
 ```diff title="services/api/src/db/repository.ts"
-@@ -7,6 +7,7 @@ import {
+@@ -4,12 +4,13 @@ import { and, asc, desc, eq, gt, lt, sql, type SQL } from "drizzle-orm";
+ 
+ import type { Db } from "./client";
+ import {
    apiKeys,
    applications,
    channels,
@@ -559,12 +598,18 @@ And the operation on it:
    environments,
    humans,
    members,
-@@ -301,6 +302,77 @@ export async function outboxDepth(db: Db): Promise<number> {
+   memberships,
+   messages,
+   organisations,
+@@ -298,12 +299,83 @@ export async function outboxDepth(db: Db): Promise<number> {
+   const result = (await db.execute(
+     sql`SELECT count(*)::int AS pending FROM outbox WHERE published_at IS NULL`,
+   )) as unknown as { rows: { pending: number }[] };
    return result.rows[0]?.pending ?? 0;
  }
  
 +// ---------------------------------------------------------------------------
-+// The consumer's deduplication ledger (SAD risk R5). Admin surface
++// The consumer's deduplication ledger (chapter 3.4, SAD risk R5). Admin surface
 +// for the same reason the outbox drain is: it runs on behalf of the platform
 +// rather than of a tenant, and one consumer reads every environment's events.
 +// ---------------------------------------------------------------------------
@@ -574,7 +619,7 @@ And the operation on it:
 +
 +/** Claim an event for a consumer and run its effect — **in one transaction**.
 + *
-+ * This is the shape the outbox chapter used for the outbox row and the message it
++ * This is the shape chapter 3.3 used for the outbox row and the message it
 + * describes, pointed the other way: the ledger row and the effect share a fate.
 + * A handler that throws rolls the claim back with it, so the redelivery finds no
 + * claim and runs again. Claiming outside the transaction would mean a failed
@@ -585,9 +630,9 @@ And the operation on it:
 + * The INSERT is the check. `ON CONFLICT DO NOTHING` with a `RETURNING` tells us
 + * whether this call won the row; a SELECT-then-INSERT would let two instances
 + * fetching the same message both believe they were first (2.3's lesson on
-+ * idempotency keys, the tenancy chapter's on signup).
++ * idempotency keys, 3.1's on signup).
 + *
-+ * **The limit of this, stated because the webhook dispatcher chapter will meet it**: the effect has
++ * **The limit of this, stated because chapter 3.5 will meet it**: the effect has
 + * to be transactional for the fate to be shared, which means it has to be in
 + * Postgres. A handler whose effect is an HTTP call to a customer cannot be
 + * rolled back, and no ledger makes it so. That consumer must choose which way to
@@ -637,6 +682,9 @@ And the operation on it:
  /** What a signup produced — or found. `created` answers "was an organisation
   * created on this call?", NOT "was the identity new": a known human who owned
   * nothing gets `created: true`, because one really was created for them. */
+ export interface Provisioned {
+   organisation: { id: string; name: string };
+   application: { id: string; name: string };
 ```
 
 <Why source="SAD risk R5 · ADR-06 · ADR-02">
@@ -675,7 +723,7 @@ impossible is to leave a handler nothing to forget:
 ```ts title="services/api/src/consumer/handler.ts"
 import type { OutboxEvent } from "../outbox/event";
 
-// What a handler is, and — more importantly — what it is not.
+// What a handler is, and — more importantly — what it is not (chapter 3.4).
 //
 // SAD risk R5: "a future consumer forgets to dedupe → double webhooks / double
 // metering", mitigated by a "consumer template with dedup built in". The way to
@@ -724,7 +772,7 @@ import { outboxEventSchema, type OutboxEvent } from "../outbox/event";
 import { DEFAULT_NATS_URL, ensureStream } from "../outbox/jetstream.publisher";
 import type { EventHandler } from "./handler";
 
-// The consumer runtime. Fetch, decide, acknowledge — and
+// The consumer runtime (chapter 3.4). Fetch, decide, acknowledge — and
 // deduplicate, so that a handler cannot forget to.
 //
 // SAD risk R5 is the whole reason this file exists rather than a page of
@@ -748,7 +796,7 @@ const ACK_WAIT_NS = 30 * 1_000_000_000;
 /** Bounded, because forever is not a retry policy. After this many attempts the
  * broker stops delivering and the message leaves the consumer's view entirely —
  * measured, not assumed (research R4). Nothing catches it. A dead-letter store
- * is FR-WHK-04's, in the webhook dispatcher chapter. */
+ * is FR-WHK-04's, in chapter 3.5. */
 const MAX_DELIVER = 5;
 
 /** Back-pressure: the broker stops handing out work when this much is
@@ -824,7 +872,7 @@ export function createConsumerRuntime({
   url?: string;
   batch?: number;
   /** Which subjects this consumer wants. The default is everything, which is
-   * what the recorder needs; a narrower filter is how the webhook dispatcher chapter's dispatcher
+   * what the recorder needs; a narrower filter is how chapter 3.5's dispatcher
    * will subscribe to the event types a customer asked for, and how a test
    * scopes itself to one environment's subject rather than replaying the whole
    * stream (contracts §consumer). */
@@ -997,13 +1045,13 @@ import type { Logger } from "@relay/service-kit";
 
 import type { EventHandler } from "./handler";
 
-// The first consumer — and it is a SCAFFOLD, with a named
+// The first consumer (chapter 3.4) — and it is a SCAFFOLD, with a named
 // retirement, not a feature.
 //
 // Every consumer the SAD names belongs to a later chapter: the webhook
-// dispatcher, the analytics ingester and the media worker (Part 4), the
+// dispatcher (3.5), the analytics ingester and the media worker (Part 4), the
 // dashboard's live stream (Part 5). Giving this one a job would mean either
-// stealing the webhook dispatcher chapter's subject or inventing product nobody asked for, and Principle
+// stealing 3.5's subject or inventing product nobody asked for, and Principle
 // VII forbids the second.
 //
 // So it does the smallest real thing: it observes that an event arrived. The
@@ -1013,7 +1061,7 @@ import type { EventHandler } from "./handler";
 // emptiness is the point: what makes the consumer correct is the runtime around
 // it, not the code inside it.
 //
-// RETIREMENT: the webhook dispatcher chapter replaces this with the webhook dispatcher, which is a
+// RETIREMENT: chapter 3.5 replaces this with the webhook dispatcher, which is a
 // handler with the same signature and a great deal more to do.
 export function createRecorder(logger: Logger): EventHandler {
   return async (event, context) => {
@@ -1090,7 +1138,7 @@ import { createLogger } from "@relay/service-kit";
 import { createRecorder } from "./recorder";
 import { createConsumerRuntime, type ConsumerRuntime } from "./runtime";
 
-// The consumer's home. It runs INSIDE the api service, and that
+// The consumer's home (chapter 3.4). It runs INSIDE the api service, and that
 // is a constraint rather than a convenience.
 //
 // Its deduplication ledger is a Postgres write, and ADR-04 makes the api the
@@ -1099,9 +1147,9 @@ import { createConsumerRuntime, type ConsumerRuntime } from "./runtime";
 // so it never touches the database. A consumer deployed as its own service
 // would be a second writer.
 //
-// So it sits here, exactly as the outbox chapter's outbox relay does under ADR-06's
+// So it sits here, exactly as chapter 3.3's outbox relay does under ADR-06's
 // "a small loop inside the API service initially, promotable to its own
-// deployment". What that costs is named rather than discovered: the webhook dispatcher chapter's
+// deployment". What that costs is named rather than discovered: chapter 3.5's
 // dispatcher IS meant to be its own service, and it will need either an
 // internal route for its ledger or an explicit ADR amendment (research R5).
 
@@ -1112,9 +1160,9 @@ export const EVENT_CONSUMER = "EVENT_CONSUMER";
  * each receiving everything (research R8). */
 export const RECORDER_DURABLE = "recorder";
 
-/** On by default: an event spine nobody reads is what the outbox chapter left behind.
+/** On by default: an event spine nobody reads is what chapter 3.3 left behind.
  * `RELAY_EVENT_CONSUMER=off` exists for suites that want a quiet database —
- * The outbox chapter learned the hard way that a background loop mutating a table two other
+ * 3.3 learned the hard way that a background loop mutating a table two other
  * test files assert on is a race between test files, not a property. */
 export function consumerEnabled(): boolean {
   return (process.env.RELAY_EVENT_CONSUMER ?? "on").toLowerCase() !== "off";
@@ -1170,7 +1218,10 @@ Starting it is two lines next to the relay's, and for the same reasons. The
 connection is lazy, so an unreachable broker leaves the api serving writes:
 
 ```diff title="services/api/src/main.ts"
-@@ -4,6 +4,7 @@ import { NestFactory } from "@nestjs/core";
+@@ -1,12 +1,13 @@
+ import "reflect-metadata";
+ 
+ import { NestFactory } from "@nestjs/core";
  import { createLogger } from "@relay/service-kit";
  
  import { AppModule } from "./app.module";
@@ -1178,21 +1229,36 @@ connection is lazy, so an unreachable broker leaves the api serving writes:
  import { OutboxRelayService } from "./outbox/outbox.module";
  
  // Nest's own banner logger stays off: this workspace already decided what a
-@@ -18,6 +19,10 @@ async function bootstrap(): Promise<void> {
-   // accumulating in Postgres instead of preventing the api from serving writes
-   // (research R9).
+ // log line looks like (one JSON object, NFR-OBS-01), and the framework does
+ // not get a second opinion.
+ async function bootstrap(): Promise<void> {
+@@ -27,13 +28,17 @@ async function bootstrap(): Promise<void> {
+   const port =
+     typeof address === "object" && address !== null ? (address.port ?? requested) : requested;
+   // The relay starts AFTER the server is listening, and starting it cannot fail: the
+   // publisher connects lazily, so an unreachable broker leaves events accumulating in
+   // Postgres instead of preventing the api from serving writes (research R9).
    app.get(OutboxRelayService).start();
-+  // And the first thing that reads what the relay publishes.
+-  // Nest calls onModuleDestroy on shutdown hooks; without this the relay's loop would
+-  // outlive the process's intent to stop.
++  // And the first thing that reads what the relay publishes (chapter 3.4).
 +  // Same placement, same reason, same lazy connection: an unreachable broker
 +  // leaves the api serving writes.
 +  app.get(EventConsumerService).start();
-   // Nest calls onModuleDestroy on shutdown hooks; without this the relay's loop
-   // would outlive the process's intent to stop.
++  // Nest calls onModuleDestroy on shutdown hooks; without this the relay's loop
++  // would outlive the process's intent to stop.
    app.enableShutdownHooks();
+   createLogger("api").log("info", "listening", { port });
+ }
+ 
+ void bootstrap();
 ```
 
 ```diff title="services/api/src/app.module.ts"
-@@ -10,6 +10,7 @@ import { AuthenticateMiddleware } from "./auth/authenticate.middleware";
+@@ -7,12 +7,13 @@ import { APP_FILTER } from "@nestjs/core";
+ 
+ import { AuthModule } from "./auth/auth.module";
+ import { AuthenticateMiddleware } from "./auth/authenticate.middleware";
  import { HealthController } from "./health.controller";
  import { InternalModule } from "./internal/internal.module";
  import { MessagesModule } from "./messages/messages.module";
@@ -1200,7 +1266,13 @@ connection is lazy, so an unreachable broker leaves the api serving writes:
  import { OutboxModule } from "./outbox/outbox.module";
  import { TenancyModule } from "./tenancy/tenancy.module";
  import { LOGGER, apiLogger } from "./logger";
-@@ -27,6 +28,7 @@ import { RequestContextMiddleware } from "./request-context.middleware";
+ import { ProtocolErrorFilter } from "./protocol-error.filter";
+ import { RequestContextMiddleware } from "./request-context.middleware";
+ 
+@@ -24,12 +25,13 @@ import { RequestContextMiddleware } from "./request-context.middleware";
+   imports: [
+     AuthModule,
+     MessagesModule,
      InternalModule,
      TenancyModule,
      OutboxModule,
@@ -1208,6 +1280,9 @@ connection is lazy, so an unreachable broker leaves the api serving writes:
    ],
    controllers: [HealthController],
    providers: [
+     { provide: LOGGER, useFactory: apiLogger },
+     { provide: APP_FILTER, useClass: ProtocolErrorFilter },
+     RequestContextMiddleware,
 ```
 
 ## The tests, and what they hold
@@ -1254,14 +1329,16 @@ import { claimEvent, timesHandled } from "../db/repository";
 import { ensureStream } from "../outbox/jetstream.publisher";
 import { createConsumerRuntime } from "./runtime";
 import type { EventHandler } from "./handler";
+import { DEFAULT_NATS_URL } from "../outbox/jetstream.publisher";
+import { migrate } from "../db/migrate";
 
-// The consumer, against a real broker and a real database.
+// The consumer, against a real broker and a real database (chapter 3.4).
 //
 // Every durable name here is unique per run. A durable consumer is a POSITION
 // in a shared stream that already holds tens of thousands of events from earlier
 // chapters — two runs sharing a name would inherit each other's progress, and
 // the second would look mysteriously empty. This is the same lesson 2.6 learned
-// about Redis subjects and the outbox chapter about the outbox table: a shared store needs a
+// about Redis subjects and 3.3 about the outbox table: a shared store needs a
 // per-run handle, because the isolation every other suite gets from a tenant
 // column is not available here.
 
@@ -1275,7 +1352,7 @@ async function publish(
   overrides: Record<string, unknown> = {},
 ): Promise<string> {
   const nc = await connect({
-    servers: process.env.RELAY_NATS_URL ?? "nats://localhost:4222",
+    servers: process.env.RELAY_NATS_URL ?? DEFAULT_NATS_URL,
   });
   const id = randomUUID();
   const payload = {
@@ -1307,7 +1384,7 @@ async function publish(
 /** Publish something that is not an event at all. */
 async function publishGarbage(environmentId: string): Promise<void> {
   const nc = await connect({
-    servers: process.env.RELAY_NATS_URL ?? "nats://localhost:4222",
+    servers: process.env.RELAY_NATS_URL ?? DEFAULT_NATS_URL,
   });
   await nc
     .jetstream()
@@ -1403,9 +1480,16 @@ describe("the consumer", () => {
   let db: Db;
 
   beforeAll(async () => {
-    db = createDb(createPool());
+    // MIGRATE BEFORE TOUCHING THE TABLE. This suite deleted from `consumed_events`
+    // without ever applying the schema, so it only passed when some other file had run
+    // first — an ordering dependency between test files, which is not a thing a test
+    // file can state. Serialising the lane made the order deterministic and this one
+    // came out first: `42P01 relation "consumed_events" does not exist`.
+    const pool = createPool();
+    await migrate(pool);
+    db = createDb(pool);
     const nc = await connect({
-      servers: process.env.RELAY_NATS_URL ?? "nats://localhost:4222",
+      servers: process.env.RELAY_NATS_URL ?? DEFAULT_NATS_URL,
     });
     await ensureStream(nc);
     await nc.drain();
@@ -1428,7 +1512,7 @@ describe("the consumer", () => {
     // ones its child processes named for themselves. Missing the second kind is
     // how the first count reached twelve.
     const nc = await connect({
-      servers: process.env.RELAY_NATS_URL ?? "nats://localhost:4222",
+      servers: process.env.RELAY_NATS_URL ?? DEFAULT_NATS_URL,
     });
     const jsm = await nc.jetstreamManager();
     for await (const info of jsm.consumers.list("EVENTS")) {
@@ -1441,7 +1525,7 @@ describe("the consumer", () => {
 
   it("invariant 1: the stream's settings read back exactly as configured", async () => {
     const nc = await connect({
-      servers: process.env.RELAY_NATS_URL ?? "nats://localhost:4222",
+      servers: process.env.RELAY_NATS_URL ?? DEFAULT_NATS_URL,
     });
     const info = await (await nc.jetstreamManager()).streams.info("EVENTS");
     const c = info.config;
@@ -1451,7 +1535,7 @@ describe("the consumer", () => {
     expect(c.max_age).toBe(7 * 24 * 60 * 60 * 1_000_000_000);
     expect(c.max_bytes).toBe(1024 * 1024 * 1024);
     expect(c.discard).toBe("old");
-    // Immutable once created, and both already right because the outbox chapter chose them.
+    // Immutable once created, and both already right because 3.3 chose them.
     expect(c.retention).toBe("limits");
     expect(c.storage).toBe("file");
     await nc.drain();
@@ -1459,7 +1543,7 @@ describe("the consumer", () => {
 
   it("invariant 2: applying the configuration twice is a no-op, not an error", async () => {
     const nc = await connect({
-      servers: process.env.RELAY_NATS_URL ?? "nats://localhost:4222",
+      servers: process.env.RELAY_NATS_URL ?? DEFAULT_NATS_URL,
     });
     const before = await (await nc.jetstreamManager()).streams.info("EVENTS");
     await ensureStream(nc);
@@ -1503,7 +1587,7 @@ describe("the consumer", () => {
     // and the ledger is what makes the redelivery safe.
     //
     // A real signal from the parent, not a thrown exception: an exception runs
-    // the error path, and a crash does not (research R7, the shape the outbox chapter used).
+    // the error path, and a crash does not (research R7, the shape 3.3 used).
     const { durable, eventId, environmentId } = await killInTheGap();
 
     // What the kill left behind: handled once, never acknowledged.
@@ -1725,7 +1809,7 @@ describe("the consumer", () => {
 The walk script the test kills is the same script a reader runs by hand:
 
 ```js title="scripts/consumer-walk.mjs"
-// The the broker chapter walk: a redelivery, made to happen on purpose.
+// The chapter 3.4 walk: a redelivery, made to happen on purpose.
 //
 //   node scripts/consumer-walk.mjs                     # consume normally
 //   node scripts/consumer-walk.mjs --kill-before-ack   # die in the gap
@@ -1839,7 +1923,7 @@ for (const message of await nextBatch()) {
   const event = JSON.parse(new TextDecoder().decode(message.data));
   show("delivered", `${event.id} attempt=${message.info.deliveryCount} redelivered=${message.redelivered}`);
 
-  // The claim and the effect commit together. After this line the
+  // The claim and the effect commit together (chapter 3.4). After this line the
   // work has HAPPENED, durably, and the broker still believes it has not.
   const result = await claimEvent(db, durable, event.id, async () => {});
   show("claim", result);
@@ -1877,7 +1961,7 @@ written is not the same as a configuration that was applied:
 
 ```js title="scripts/stream-info.mjs"
 // What the stream actually holds and how it is actually configured
-//. The chapter quotes the broker, not the config file — a
+// (chapter 3.4). The chapter quotes the broker, not the config file — a
 // configuration that was written is not the same as a configuration that was
 // applied, and the difference is exactly what this chapter is about.
 //
@@ -1938,7 +2022,10 @@ else exactly as it is, and three of the ten fail:
 Small, and every piece of it is about background loops in test lanes.
 
 ```diff title="turbo.json"
-@@ -28,6 +28,8 @@
+@@ -25,12 +25,14 @@
+         "RELAY_POSTGRES_PORT",
+         "RELAY_REDIS_URL",
+         "RELAY_REDIS_PORT",
          "RELAY_NATS_URL",
          "RELAY_NATS_PORT",
          "RELAY_OUTBOX_RELAY",
@@ -1947,21 +2034,30 @@ Small, and every piece of it is about background loops in test lanes.
          "RELAY_E2E_API_PORT"
        ]
      },
+     "//#lint:root": {
+       "inputs": [
+         "**/*.{ts,mts,cts,mjs,js}",
 ```
 
 ```diff title="packages/e2e/src/harness.ts"
-@@ -342,6 +342,11 @@ export async function boot({ gateways = 2 } = {}): Promise<System> {
+@@ -339,12 +339,17 @@ export async function boot({ gateways = 2 } = {}): Promise<System> {
+     // Chapter 3.3: the api children run WITHOUT the outbox relay. This journey
+     // asserts message delivery, and a background loop draining the outbox while
+     // 3.3's own suite asserts on that same table is a race between two test
      // files, not a property of the system. The relay has its own suite, which
      // drives it explicitly.
      RELAY_OUTBOX_RELAY: "off",
-+    // No event consumer in these children either, for the reason
++    // Chapter 3.4: no event consumer in these children either, for the reason
 +    // the line above exists — this journey asserts message delivery, and a
-+    // background consumer writing to a table the broker chapter's suite asserts on is a race
++    // background consumer writing to a table 3.4's suite asserts on is a race
 +    // between test files rather than a property of the system.
 +    RELAY_EVENT_CONSUMER: "off",
    };
  
    const apiPort = Number(process.env.RELAY_E2E_API_PORT ?? 4100);
+   children.push(
+     capture(
+       "api",
 ```
 
 `RELAY_EVENT_CONSUMER=off` exists for the same reason 3.3 added
@@ -1982,6 +2078,125 @@ coverage, and the project total from 78.07% to **79.01%**. The constitution's
 100% bar for ordering, idempotency and isolation code is still not met on that
 file, and this chapter does not pretend otherwise — it adds branches to that
 file and leaves the gap for a chapter that sets out to close it.
+
+## A second table, refused for a different reason
+
+The structural check went red again, and this is the useful part: not for the same reason
+as last chapter.
+
+```text title="the check, on the consumer's table"
+these tables have no path to an environment: consumed_events
+```
+
+The outbox holds a copy of tenant data and argues that nothing reads it on a tenant's
+behalf. `consumed_events` holds an event id and a timestamp. There is nothing in a row
+here to leak at all, which is a stronger answer and a different one — so it goes in the
+spine with its own words rather than sharing the outbox's:
+
+```diff title="services/api/src/db/catalogue.ts"
+@@ -61,12 +61,20 @@ const SPINE: ReadonlyArray<readonly [string, string]> = [
+   // THAT ARGUMENT IS ABOUT READS, AND IT DOES NOT COVER RETENTION. The payload is a
+   // full copy of the message, `text` included, and the relay marks rows published
+   // rather than deleting them. So a message deleted from `messages` still has its words
+   // in here, and nothing on this platform removes them. That is a real gap, it is not a
+   // tenancy gap, and it is recorded here rather than argued away — the chapter that owns
+   // per-environment retention owns the fix.
++  // SECOND IN A ROW, AND FOR A DIFFERENT REASON THAN THE OUTBOX'S. The outbox holds a
++  // copy of tenant data and argues that nothing reads it on a tenant's behalf. This
++  // holds no tenant data at all: an event id and the fact that it was handled. There is
++  // nothing in a row here to leak.
++  [
++    "consumed_events",
++    "consumer bookkeeping — an event id and a timestamp, holding no tenant data to leak",
++  ],
+   [
+     "outbox",
+     "work the platform owes itself rather than a tenant's record; the environment " +
+       "travels in `subject` and `payload` and no read path joins it",
+   ],
+ ];
+```
+
+Two chapters, two tables, two arguments. A pattern matching `%_events` would have
+absorbed both and taught neither.
+
+## The suite that depended on another suite
+
+Serialising the lane last chapter had a side effect nobody asked for: it made the file
+order deterministic, and this suite came out first.
+
+```text title="42P01"
+Failed query: DELETE FROM consumed_events WHERE consumer LIKE 'itest-%'
+relation "consumed_events" does not exist
+```
+
+It had never applied the schema. It deleted from a table it assumed somebody else had
+created — and while the order was arbitrary, somebody usually had.
+
+<Trap>
+An ordering dependency between test files is not something a test file can state. There
+is no syntax for "run me after that one", which means a suite either sets up what it
+needs or it is relying on luck it cannot describe. This one was relying on luck for two
+chapters.
+</Trap>
+
+```ts title="services/api/src/consumer/consumer.itest.ts (excerpt)"
+  beforeAll(async () => {
+    // MIGRATE BEFORE TOUCHING THE TABLE. This suite deleted from `consumed_events`
+    // without ever applying the schema, so it only passed when some other file had run
+    // first — an ordering dependency between test files, which is not a thing a test
+    // file can state. Serialising the lane made the order deterministic and this one
+    // came out first: `42P01 relation "consumed_events" does not exist`.
+    const pool = createPool();
+    await migrate(pool);
+    db = createDb(pool);
+    const nc = await connect({
+      servers: process.env.RELAY_NATS_URL ?? DEFAULT_NATS_URL,
+    });
+    await ensureStream(nc);
+    await nc.drain();
+  }, 60_000);
+```
+
+The same file also hardcoded the broker URL six times, and the outbox suite hardcoded it
+once more — as `nats://localhost:14222`, where every other site in the repository said
+`4222`. The production code has exported `DEFAULT_NATS_URL` since the last chapter; the
+tests simply were not using it.
+
+```diff title="services/api/src/outbox/outbox.itest.ts"
+@@ -12,12 +12,13 @@ import {
+   outboxDepth,
+   Repository,
+ } from "../db/repository";
+ import { createJetStreamPublisher } from "./jetstream.publisher";
+ import { createRelay } from "./relay";
+ import type { Publisher, PublishedMessage } from "./publisher";
++import { DEFAULT_NATS_URL } from "./jetstream.publisher";
+ 
+ // The outbox, against the real database (chapter 3.3). Invariants 1-4, 7-8 and
+ // 11 live here; the crash cases (5, 6, 10) and the broker outage (9) are added
+ // below, because both need a process to kill or a container to stop.
+ //
+ // The relay is driven by hand — `drainOnce()`, the same code path the loop runs
+@@ -338,13 +339,13 @@ describe("the outbox", () => {
+     await expect(downRelay.drainOnce()).rejects.toThrow();
+     expect(await outboxDepthFor(db, env.id)).toBe(backlog);
+     await down.close();
+ 
+     // The broker returns. Nobody intervenes; the same loop drains what piled up.
+     const up = createJetStreamPublisher({
+-      url: process.env.RELAY_NATS_URL ?? "nats://localhost:14222",
++      url: process.env.RELAY_NATS_URL ?? DEFAULT_NATS_URL,
+     });
+     const upRelay = createRelay({ db, publisher: up, logger: silent });
+     const drained = await drainUntilClear(upRelay, db, env.id);
+     expect(drained).toBeGreaterThanOrEqual(backlog);
+     expect(await outboxDepthFor(db, env.id)).toBe(0);
+     await up.close();
+```
+
+A default written down in seven places is seven chances to write it down differently, and
+this one took the seventh.
 
 ## What this chapter leaves for later, on purpose
 
