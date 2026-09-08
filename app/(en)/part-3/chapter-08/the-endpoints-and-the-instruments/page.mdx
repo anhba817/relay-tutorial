@@ -74,18 +74,15 @@ export const createChannelBodySchema = z.strictObject({
   // `public` AND NOTHING ELSE, and this is the chapter's sharpest edit (FR-047).
   //
   // `channels.type` has been a `"public" | "private"` column with a CHECK
-  // constraint since chapter 2.1, and NOTHING IN THE PLATFORM DECIDES ON IT. It is
-  // selected and returned by this endpoint, so it is read — and no conditional
-  // anywhere branches on it. The PUBLIC history and send routes check nothing, and
-  // `POST /internal/messages` resolves a user and checks nothing; `repository.backfill`
-  // and `session.controller` DO check membership, so "no membership check on any read
-  // path" would be wrong. So FR-CHN-05 — a P1 clause promising that a private channel
-  // is visible only to its members — is unimplemented.
+  // constraint since chapter 2.1, and NOTHING IN THE PLATFORM READS IT. History
+  // and send scope by `environment_id` alone; there is no membership check on any
+  // read path. So FR-CHN-05 — a P1 clause promising that a private channel is
+  // visible only to its members — is unimplemented.
   //
   // An endpoint accepting `private` would sell a guarantee the platform does not
   // keep, and it would do it in the chapter whose exit criterion is that an
   // outsider can integrate on the documentation alone. The enum is `public`
-  // today; FR-CHN-03's private half goes to the channel-control chapter with FR-CHN-05, where
+  // today; FR-CHN-03's private half goes to chapter 3.13 with FR-CHN-05, where
   // the read paths are made to honour it.
   type: z.enum(["public"]),
   name: z.string().min(1).max(255).optional(),
@@ -131,9 +128,7 @@ The service is thin, and the ordering inside it is the isolation property rather
 than a convenience:
 
 ```ts title="services/api/src/channels/channels.service.ts"
-import { HttpStatus, Injectable, NotFoundException } from "@nestjs/common";
-
-import { protocolError } from "../protocol-error";
+import { HttpException, HttpStatus, Injectable, NotFoundException } from "@nestjs/common";
 
 import { Repository, type ChannelRow } from "../db/repository";
 import { CHANNEL_MEMBER_LIMIT, type AddMembersBody, type CreateChannelBody } from "./channels.schema";
@@ -141,13 +136,14 @@ import { CHANNEL_MEMBER_LIMIT, type AddMembersBody, type CreateChannelBody } fro
 // THE TWO ENDPOINTS PART 3 NEEDED AND NOBODY HAD BUILT (FR-016 to FR-019).
 //
 // `packages/e2e/src/harness.ts` has said since chapter 2.8 that creating a channel
-// and adding a member is "Part 3's tenancy work". Part 3 ends at the isolation gauntlet, and this
+// and adding a member is "Part 3's tenancy work". Part 3 ends at 3.12, and this
 // chapter's exit criterion is that an outsider integrates on public documentation
 // alone — which was unreachable for a reason that had nothing to do with
 // documentation: there was no public way to make a channel to send a message to.
 //
 // This is the minimum that unblocks it. The rest of FR-CHN and all of FR-USR go to
-// 
+// chapter 3.13.
+
 export interface CreatedChannel {
   channel: ChannelRow;
   /** 201 or 200 at the controller. FR-CHN-02 says return the existing channel; it
@@ -200,10 +196,13 @@ export class ChannelsService {
     // exactly that.
     const existing = await this.repo.countMembers(channelId);
     if (existing + body.user_ids.length > CHANNEL_MEMBER_LIMIT) {
-      throw protocolError(
-        "channel_member_limit_exceeded",
-        `this channel holds ${existing} of ${CHANNEL_MEMBER_LIMIT} members; ` +
-          `adding ${body.user_ids.length} would exceed the limit`,
+      throw new HttpException(
+        {
+          code: "channel_member_limit_exceeded",
+          message:
+            `this channel holds ${existing} of ${CHANNEL_MEMBER_LIMIT} members; ` +
+            `adding ${body.user_ids.length} would exceed the limit`,
+        },
         HttpStatus.UNPROCESSABLE_ENTITY,
       );
     }
@@ -253,10 +252,10 @@ import type { AddMembersBody, CreateChannelBody } from "./channels.schema";
 // `@Accepts("application")` and not both classes: creating a channel and deciding
 // who is in it are server-side acts. An end-user token is minted for one person
 // (FR-AUT-10), and a person adding themselves to a channel is a product decision
-// this chapter is not making — the channel-control chapter owns the user-facing surface.
+// this chapter is not making — chapter 3.13 owns the user-facing surface.
 /** The one thing this controller needs from the response object.
  *
- * Declared rather than imported, which is the broker chapter's decision in
+ * Declared rather than imported, which is chapter 3.4's decision in
  * `signup.controller.ts` and its reason still holds: `@Res()` normally means
  * importing express's `Response` type, express 5 ships no types, and adding
  * `@types/express` for one method signature would move the api's dependency list
@@ -347,15 +346,24 @@ export class ChannelsModule {}
 ```
 
 ```diff title="services/api/src/app.module.ts"
-@@ -10,6 +10,7 @@ import { AuthenticateMiddleware } from "./auth/authenticate.middleware";
+@@ -7,12 +7,13 @@ import { APP_FILTER } from "@nestjs/core";
+ 
+ import { AuthModule } from "./auth/auth.module";
+ import { AuthenticateMiddleware } from "./auth/authenticate.middleware";
  import { HealthController } from "./health.controller";
  import { InternalModule } from "./internal/internal.module";
  import { MessagesModule } from "./messages/messages.module";
 +import { ChannelsModule } from "./channels/channels.module";
  import { ConsumerModule } from "./consumer/consumer.module";
- import { NotificationsModule } from "./notifications/notifications.module";
- import { QuotasModule } from "./quotas/quotas.module";
-@@ -30,6 +31,7 @@ import { RequestContextMiddleware } from "./request-context.middleware";
+ import { OutboxModule } from "./outbox/outbox.module";
+ import { TenancyModule } from "./tenancy/tenancy.module";
+ import { LOGGER, apiLogger } from "./logger";
+ import { ProtocolErrorFilter } from "./protocol-error.filter";
+ import { RequestContextMiddleware } from "./request-context.middleware";
+@@ -22,12 +23,13 @@ import { RequestContextMiddleware } from "./request-context.middleware";
+ // provider (APP_FILTER) instead of wiring it in main.ts means every entry
+ // point — including tests — gets the same error envelope for free.
+ @Module({
    imports: [
      AuthModule,
      MessagesModule,
@@ -363,6 +371,9 @@ export class ChannelsModule {}
      InternalModule,
      TenancyModule,
      OutboxModule,
+     ConsumerModule,
+   ],
+   controllers: [HealthController],
 ```
 
 ## Three functions that were fine as fixtures
@@ -378,9 +389,7 @@ unique violation, and `ProtocolErrorFilter` renders a unique violation as
 `internal_error`. A client adding a member who is already there got a 500.
 
 ```diff title="services/api/src/db/repository.ts"
-@@ -2190,20 +2190,32 @@ export interface UserRow {
-   id: string;
-   external_id: string;
+@@ -563,16 +563,28 @@ export interface UserRow {
    display_name: string | null;
  }
  
@@ -391,7 +400,7 @@ unique violation, and `ProtocolErrorFilter` renders a unique violation as
 +   * chapter 2.1. NOTHING READS IT: history and send scope by `environment_id`
 +   * alone and there is no membership check anywhere, so FR-CHN-05's private
 +   * guarantee is unimplemented. The public create endpoint accepts `public` only
-+   * (FR-047) — this type stays as the column is, because rows
++   * (chapter 3.12, FR-047) — this type stays as the column is, because rows
 +   * seeded before that endpoint existed can still say `private`. */
    type: "public" | "private";
    name: string | null;
@@ -409,27 +418,11 @@ unique violation, and `ProtocolErrorFilter` renders a unique violation as
    seq: number;
    text: string | null;
    created_at: string;
-   /** Chapter 2.3 (FR-MSG-04): true when a retry was recognised by the
-    * idempotency index and the ORIGINAL message was returned instead of
-@@ -2535,25 +2547,48 @@ export class Repository {
-       created_at: r.createdAt.toISOString(),
-       disabled_at: r.disabledAt?.toISOString() ?? null,
-       disabled_reason: r.disabledReason,
-       failure_run_started_at: r.failureRunStartedAt?.toISOString() ?? null,
-       failure_run_attempts: r.failureRunAttempts,
-     }));
-   }
+@@ -619,19 +631,32 @@ export class Repository {
+     private readonly db: Db,
+     private readonly environmentId: string,
+   ) {}
  
-+  /** IDEMPOTENT, for `createChannel`'s reason and found the same way
-+   * (the isolation gauntlet). This was a plain insert too, and the members endpoint creates a user
-+   * on first membership — so a second identical request would have raised against
-+   * `users_environment_id_external_id_unique` and answered `internal_error`. R14a
-+   * named `addMember` and `createChannel`; this is the third function on the same
-+   * request path and it had the same fault.
-+   *
-+   * Not a read-then-insert in the service, for the same reason as there:
-+   * concurrent first-membership adds of one user race, and Principle II requires
-+   * the unique index to be what enforces this rather than application memory. */
    async createUser(externalId: string, displayName?: string): Promise<UserRow> {
      const id = randomUUID();
 -    await this.db.insert(users).values({
@@ -465,11 +458,7 @@ unique violation, and `ProtocolErrorFilter` renders a unique violation as
      const rows = await this.db
        .select({
          id: users.id,
-         external_id: users.externalId,
-         display_name: users.displayName,
-@@ -2563,39 +2598,77 @@ export class Repository {
-         and(
-           eq(users.environmentId, this.environmentId),
+@@ -645,35 +670,73 @@ export class Repository {
            eq(users.externalId, externalId),
          ),
        );
@@ -478,7 +467,7 @@ unique violation, and `ProtocolErrorFilter` renders a unique violation as
  
 +  /** IDEMPOTENT ON THE CUSTOMER'S OWN IDENTIFIER (FR-017, FR-CHN-02).
 +   *
-+   * This was a plain insert until the isolation gauntlet, which is fine for a fixture and
++   * This was a plain insert until chapter 3.12, which is fine for a fixture and
 +   * cannot back an endpoint: a repeated `external_id` raises against
 +   * `channels_environment_id_external_id_unique`, and `ProtocolErrorFilter`
 +   * renders a unique violation as `internal_error`. The second call in an
@@ -552,11 +541,7 @@ unique violation, and `ProtocolErrorFilter` renders a unique violation as
          and(
            eq(channels.environmentId, this.environmentId),
            eq(channels.externalId, externalId),
-         ),
-       );
-@@ -2604,35 +2677,100 @@ export class Repository {
- 
-   async listChannels(): Promise<ChannelRow[]> {
+@@ -686,31 +749,71 @@ export class Repository {
      return this.db
        .select({
          id: channels.id,
@@ -579,7 +564,7 @@ unique violation, and `ProtocolErrorFilter` renders a unique violation as
 -    const result = await this.db.execute(
 +   * the wall like everything else.
 +   *
-+   * THREE OUTCOMES, NOT A BOOLEAN (R14a). Until then this returned
++   * THREE OUTCOMES, NOT A BOOLEAN (chapter 3.12, R14a). Until then this returned
 +   * `false` for all of: the channel is not yours, the user is not yours, and you
 +   * asked twice. Conflating the first two is right and is the whole point — a
 +   * foreign id must be indistinguishable from an absent one. Conflating the third
@@ -597,16 +582,10 @@ unique violation, and `ProtocolErrorFilter` renders a unique violation as
            WHERE c.id = ${channelId} AND c.environment_id = ${this.environmentId}
 -            AND u.id = ${userId} AND u.environment_id = ${this.environmentId}`,
 +            AND u.id = ${userId} AND u.environment_id = ${this.environmentId}
-+          ON CONFLICT (channel_id, user_id) DO NOTHING
-+          RETURNING channel_id`,
++          ON CONFLICT (channel_id, user_id) DO NOTHING`,
      );
 -    return (result.rowCount ?? 0) > 0;
-+    // `RETURNING` and `.rows.length`, not `rowCount ?? 0`. `rowCount` is typed
-+    // `number | null` by the driver and is never null for an INSERT, so the `??`
-+    // was a branch nothing could take — one uncovered arm in the file
-+    // constitution VI asks for 100% of, bought for nothing. A row that came back
-+    // is a row that was inserted.
-+    if (inserted.rows.length > 0) return "added";
++    if ((inserted.rowCount ?? 0) > 0) return "added";
 +
 +    const existing = await this.db
 +      .select({ userId: members.userId })
@@ -620,25 +599,6 @@ unique violation, and `ProtocolErrorFilter` renders a unique violation as
 +        ),
 +      );
 +    return existing.length > 0 ? "already_a_member" : "not_found";
-+  }
-+
-+  /** How many deliveries an endpoint holds, scoped. Added for the isolation gauntlet's
-+   * `expand` attack, which has to read the victim's side to prove nothing moved —
-+   * and it lives HERE rather than in the test because the restored lint ban
-+   * (R23, FR-043) puts the query engine in this directory and nowhere else. The
-+   * isolation suite is written to that constraint rather than exempted from it,
-+   * which is the whole point of restoring it in the same chapter. */
-+  async countDeliveriesForEndpoint(endpointId: string): Promise<number> {
-+    const rows = await this.db
-+      .select({ id: webhookDeliveries.id })
-+      .from(webhookDeliveries)
-+      .where(
-+        and(
-+          eq(webhookDeliveries.endpointId, endpointId),
-+          eq(webhookDeliveries.environmentId, this.environmentId),
-+        ),
-+      );
-+    return rows.length;
 +  }
 +
 +  /** How many members a channel holds, scoped — FR-CHN-07's ceiling is checked
@@ -658,8 +618,6 @@ unique violation, and `ProtocolErrorFilter` renders a unique violation as
      const rows = await this.db
        .select({ user_id: members.userId })
        .from(members)
-       .innerJoin(channels, eq(channels.id, members.channelId))
-       .where(
 ```
 
 <Why title="Why `ON CONFLICT` and not a read in the service">
@@ -690,14 +648,17 @@ That change reached one existing assertion, and what happened to it is worth mor
 than the change:
 
 ```diff title="packages/e2e/src/harness.ts"
-@@ -51,7 +51,33 @@ const forwarded = (...names: string[]): Record<string, string> =>
+@@ -48,13 +48,39 @@ const forwarded = (...names: string[]): Record<string, string> =>
+   );
+ 
+ /** DECISION (chapter 2.8): the suite seeds through the api's own repository
   * layer, imported from its build output. There is no admin API to create an
   * environment, a user or a channel yet — that is Part 3's tenancy work — and
   * inventing one for a test would be inventing product. The import is a
 - * test-only seam with a named retirement, like 2.3's `listMessagesRaw`. */
 + * test-only seam with a named retirement, like 2.3's `listMessagesRaw`.
 + *
-+ * REASSESSED IN the isolation gauntlet (T063a), and two of the three now have an API.
++ * REASSESSED IN CHAPTER 3.12 (T063a), and two of the three now have an API.
 + * `POST /v1/channels` and `POST /v1/channels/:channelId/members` are public, and
 + * the members route creates a user on first membership — so `createChannel`,
 + * `createUser` and `addMember` could all come off this seam today. The list it
@@ -721,10 +682,13 @@ than the change:
 + * rewrite four journeys in a chapter about isolation. `services/gateway/src/
 + * public-surface.itest.ts` makes the same claim where the coverage run does look,
 + * and `packages/outsider` makes the stronger one in a package that cannot import
-+ * this file at all. The migration is the channel-control chapter's, with the rest of FR-CHN. */
++ * this file at all. The migration is chapter 3.13's, with the rest of FR-CHN. */
  interface Seeder {
    createEnvironment: (
      db: unknown,
+     input: { name: string },
+   ) => Promise<{ id: string }>;
+   /** The suite needs a real credential now, and it mints one the
 ```
 
 The 2.8 seam is shorter by three. `createChannel`, `createUser` and `addMember`
@@ -753,7 +717,6 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { AppModule } from "../app.module";
 import { createDb, createPool, type Db } from "../db/client";
 import { createApiKey, createEnvironment, Repository } from "../db/repository";
-import { withoutRequestId } from "../isolation/compare";
 import { CHANNEL_MEMBER_LIMIT } from "./channels.schema";
 
 // THE TWO ENDPOINTS, END TO END (FR-016 to FR-019, FR-047, FR-048, SC-014).
@@ -917,8 +880,11 @@ describe("the public channel surface", () => {
       const foreign = await addMembers(foreignChannelId, { user_ids: ["intruder"] });
       const nowhere = await addMembers(absent, { user_ids: ["intruder"] });
       expect(foreign.status).toBe(nowhere.status);
-      expect(withoutRequestId(await foreign.json())).toEqual(
-        withoutRequestId(await nowhere.json()),
+      // COMPARED WHOLE. The envelope is `code`, `message` and `docs_url`, and all
+      // three must match for a foreign channel to be indistinguishable from an absent
+      // one. Nothing here is per-request yet, so nothing is excluded.
+      expect(await foreign.json()).toEqual(
+        await nowhere.json(),
       );
       // And the other tenant's channel gained nobody. Read through ITS OWN
       // repository — a repository scoped to the empty string is not a scope, it is
@@ -1004,19 +970,19 @@ import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
 
 import { createLogger, serve, type Logger } from "@relay/service-kit";
-import { docsUrl } from "@relay/protocol";
 import { WebSocket } from "ws";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { createApiClient } from "./api-client.js";
 import { createFanout, type Fanout } from "./fanout.js";
 import { attachSessions } from "./session.js";
+import { docsUrl } from "@relay/protocol";
 
 // THE EXIT CRITERION, REHEARSED IN THE LANE (FR-020, SC-015).
 //
 // A channel created over the public API, a member added over the public API, a
 // message sent over the public API, and the socket delivering it to that member.
-// The isolation gauntlet built the first two endpoints for exactly this path, and this is
+// Chapter 3.12 built the first two endpoints for exactly this path, and this is
 // the test that the path joins up.
 //
 // NO REPOSITORY CALL FOR ANY OF IT, which is the whole point and is a narrower
@@ -1054,13 +1020,13 @@ async function waitForHealth(url: string): Promise<void> {
   }
 }
 
-/** 5200-5400 — see the port map at the top of `limits.itest.ts`. A random high
- * port per run, for the reason `session.itest.ts` records: a previous run's child
- * still holding a fixed port answers the health check from a DIFFERENT
- * environment, and every token this run minted is then refused by an api that has
- * never heard of it. */
+/** 4800-5000: `session.itest.ts` holds 4400-4600, `isolation.itest.ts` 4600-4800
+ * and `limits.itest.ts` 4124. A random high port per run, for the reason
+ * `session.itest.ts` records — a previous run's child still holding a fixed port
+ * answers the health check from a DIFFERENT environment, and every token this run
+ * minted is then refused by an api that has never heard of it. */
 async function startApi(): Promise<{ url: string; credential: string; stop: () => void }> {
-  const port = 5200 + Math.floor(Math.random() * 200);
+  const port = 4800 + Math.floor(Math.random() * 200);
   const dist = join(REPO, "services", "api", "dist");
   if (!existsSync(join(dist, "main.js"))) {
     throw new Error("the api is not built — run `pnpm build` before this lane");
@@ -1209,7 +1175,7 @@ describe("a channel, a member and a message, all over the public API", () => {
 
   // A MESSAGE SENT OVER THE PUBLIC REST API CANNOT REACH A SOCKET AT ALL, and
   // that is the platform's behaviour rather than this test's shortcoming. Pinned
-  // here because the isolation gauntlet's exit criterion is that an outsider integrates on
+  // here because chapter 3.12's exit criterion is that an outsider integrates on
   // the documentation alone, and this is the sentence that documentation has to
   // contain.
   //
@@ -1698,6 +1664,312 @@ the feature's `baseline.txt` with what each one is.
 Five new files got pins, and three of them reached 100% only after the arms a
 PASSING suite cannot reach were separated out — which is chapter 3.12's argument
 about its own suite, one layer down.
+
+## The instruments found the endpoints first
+
+Registering the module is what told the suite there was something new to attack. Nobody
+edited a list:
+
+```text title="the build that added the module"
+gauntlet targets: 11 derived, 9 attacked... {
+  "unclassified": [
+    "POST /v1/channels",
+    "POST /v1/channels/:channelId/members"
+  ]
+}
+```
+
+Nine targets became eleven, and the suite failed naming both. That is the failure the
+derivation exists to produce — and the order matters more than the fix. **The
+classification changed in answer to the derivation; the derivation never changed in
+answer to the classification.** If a route ever disappears from that list without
+disappearing from the router, the same test says so.
+
+```diff title="services/api/src/isolation/targets.ts"
+@@ -100,12 +100,27 @@ export const CLASSIFICATIONS: readonly Classification[] = [
+     method: "GET",
+     path: "/v1/channels/:channelId/messages",
+     accepts: "either",
+     shape: "read",
+   },
+ 
++  // ── the two routes this chapter adds, and the ORDER MATTERS ────────────────────
++  //
++  // The derivation found them before this list did. `targets.itest.ts` went from 9
++  // targets to 11 and named both as unclassified, on the build that registered the
++  // module and before anything here mentioned them. That is the failure the derivation
++  // exists to produce, and the classification is what changed in answer to it — never
++  // the derivation.
++  { method: "POST", path: "/v1/channels", accepts: "application", shape: "write" },
++  {
++    method: "POST",
++    path: "/v1/channels/:channelId/members",
++    accepts: "application",
++    shape: "write",
++  },
++
+   // ── the internal surface: an end-user token, so a FOREIGN CREDENTIAL is the attack
+   { method: "POST", path: "/internal/messages", accepts: "user", shape: "write" },
+   { method: "POST", path: "/internal/backfill", accepts: "user", shape: "write" },
+   {
+     // NOT A `write`, AND THE DIFFERENCE IS THE WHOLE POINT OF HAVING SHAPES. This route
+     // takes no body and no path parameter: there is no identifier to forge, so a
+```
+
+Both are attacked in the chapter that adds them, and one of them needed a different
+question asking.
+
+<Why source="constitution I · FR-021">
+`POST /v1/channels` **carries no identifier to forge.** There is no channel id in the
+path and none in the body — only an `external_id` the caller chooses. So the property is
+not indistinguishability, it is **non-interference**: presenting the other tenant's own
+`external_id` must *succeed*, return a different channel, and leave theirs untouched. Two
+tenants may use the same customer-supplied id; that is the whole point of scoping it per
+environment.
+</Why>
+
+```diff title="services/api/src/isolation/gauntlet.itest.ts"
+@@ -178,12 +178,61 @@ describe("the isolation gauntlet", () => {
+     // Whatever it answers, nothing of the victim's may appear in it.
+     expect(serialised).not.toContain(t.victim.userId);
+     expect(serialised).not.toContain(t.victim.channelId);
+     expect(serialised).not.toContain(t.victim.environmentId);
+   });
+ 
++  // ── the two routes this chapter added ──────────────────────────────────────────
++  //
++  // A chapter that adds an endpoint attacks it in the same chapter. The derivation
++  // found these before the classification did: `targets.itest.ts` went from 9 targets
++  // to 11 and failed naming both as unclassified.
++  it("POST /v1/channels/:channelId/members — refuses, and adds nobody", async () => {
++    attacked.add("POST /v1/channels/:channelId/members");
++    const verdict = await writeAttack(
++      url,
++      t.attacker.credential,
++      {
++        method: "POST",
++        path: `/v1/channels/${t.victim.channelId}/members`,
++        body: { user_ids: ["intruder"] },
++      },
++      {
++        method: "POST",
++        path: `/v1/channels/${ABSENT_UUID}/members`,
++        body: { user_ids: ["intruder"] },
++      },
++      () => t.victim.repo.listMembers(t.victim.channelId),
++    );
++    expect(verdict.differences, verdict.differences.join("; ")).toEqual([]);
++    expect(verdict.stateChanged, "the victim gained a member").toBe(false);
++  });
++
++  it("POST /v1/channels — the other tenant's external_id is not interference", async () => {
++    attacked.add("POST /v1/channels");
++    // THIS ROUTE CARRIES NO IDENTIFIER TO FORGE, so the pair is not foreign-versus-
++    // absent. What a caller can present is the other tenant's own `external_id`, and
++    // the property is NON-INTERFERENCE rather than indistinguishability: the call must
++    // SUCCEED. Two tenants may use the same customer-supplied id — that is the whole
++    // point of scoping it per environment — and the victim's channel must be untouched.
++    const before = await t.victim.repo.getChannelByExternalId(t.victim.channelExternalId);
++    const res = await fetch(`${url}/v1/channels`, {
++      method: "POST",
++      headers: {
++        authorization: `Bearer ${t.attacker.credential}`,
++        "content-type": "application/json",
++      },
++      body: JSON.stringify({ external_id: t.victim.channelExternalId, type: "public" }),
++    });
++    expect([200, 201]).toContain(res.status);
++    const created = (await res.json()) as { id?: string };
++    expect(created.id).not.toBe(t.victim.channelId);
++    const after = await t.victim.repo.getChannelByExternalId(t.victim.channelExternalId);
++    expect(after?.id).toBe(before?.id);
++  });
++
+   // ── and the suite accounts for itself ───────────────────────────────────────────
+   it("ran an attack for every route the classification says to attack", () => {
+     const shouldAttack = CLASSIFICATIONS.filter((c) => c.shape !== "exempt").map(targetKey);
+     const missing = shouldAttack.filter((k) => !attacked.has(k));
+     // A classification saying `write` with no attack written for it is the same hole
+     // as a route with no classification, one level up. Named, because the useful half
+```
+
+## Every validation error names its field
+
+The endpoints arrive with bodies to reject, which makes this the chapter where a 400 stops
+being a shrug. The pipe reports which key failed, and the filter carries it out:
+
+```diff title="services/api/src/messages/zod-validation.pipe.ts"
+@@ -9,13 +9,31 @@ import type { ZodType } from "zod";
+ export class ZodValidationPipe<T> implements PipeTransform<unknown, T> {
+   constructor(private readonly schema: ZodType<T>) {}
+ 
+   transform(value: unknown): T {
+     const result = this.schema.safeParse(value);
+     if (!result.success) {
+-      throw new BadRequestException(
+-        result.error.issues[0]?.message ?? "invalid body",
+-      );
++      const issue = result.error.issues[0];
++      // WHICH FIELD, and chapter 3.12 is where that stopped being optional.
++      //
++      // EIR-API-04's error shape has carried a `field` since chapter 1.3 and
++      // `errorFrameSchema` declares it — and nothing in the api had ever set it.
++      // Every validation failure in twenty-two chapters said `Invalid input:
++      // expected "public"` and left the caller to work out which key that was
++      // about. This is the same habit as `request_id`, which was declared in 1.3
++      // and first sent in 3.8: a field in the contract that the code never filled.
++      //
++      // Named here rather than in the filter because only the pipe knows the
++      // path. Zod's `path` is an array — `["metadata", "blob"]` — and it joins
++      // with dots, which is what a developer reading their own request body sees.
++      // An empty path means the whole body failed (a non-object, say), and then
++      // there is no field to name and the key is omitted rather than sent empty.
++      const path = issue?.path.join(".");
++      throw new BadRequestException({
++        code: "invalid_request",
++        message: issue?.message ?? "invalid body",
++        ...(path !== undefined && path.length > 0 ? { field: path } : {}),
++      });
+     }
+     return result.data;
+   }
+ }
+```
+
+```diff title="services/api/src/protocol-error.filter.ts"
+@@ -55,12 +55,21 @@ export class ProtocolErrorFilter implements ExceptionFilter {
+           ? "unauthorized"
+           : status === 403
+             ? "forbidden"
+             : status === 404
+               ? "not_found"
+               : "internal_error";
++    // `field` travels the way `code` does — the thrower names it, because only the
++    // thrower knows it. Omitted rather than null when there is nothing to name: a key
++    // that is always present and usually empty teaches a client to ignore it.
++    const field =
++      typeof response === "object" &&
++      response !== null &&
++      typeof (response as { field?: unknown }).field === "string"
++        ? (response as { field: string }).field
++        : null;
+     const code: ErrorCode =
+       named !== null && named in ERROR_CODES ? (named as ErrorCode) : ladder;
+     const message =
+       exception instanceof HttpException
+         ? exception.message
+         : "unexpected internal error";
+@@ -68,10 +77,11 @@ export class ProtocolErrorFilter implements ExceptionFilter {
+     res.setHeader("content-type", "application/json");
+     res.end(
+       JSON.stringify({
+         code,
+         message,
+         docs_url: docsUrl(code),
++        ...(field !== null ? { field } : {}),
+       }),
+     );
+   }
+ }
+```
+
+`field` travels the way `code` does — the thrower names it, because only the thrower knows
+it. And it is **omitted rather than null** when there is nothing to name: a key that is
+always present and usually empty teaches a client to ignore it.
+
+One more code, and its name is not the obvious one:
+
+```diff title="packages/protocol/src/codes.ts"
+@@ -43,12 +43,26 @@ export const ERROR_CODES = {
+     "the request body, query or path failed validation; `field` names the first offending key",
+   forbidden: "the credential is valid and is not permitted to do this",
+   not_found:
+     "no such resource for this tenant — and DELIBERATELY the same answer as for a resource in another tenant (FR-TEN-05)",
+   internal_error:
+     "the platform failed in a way it did not anticipate; the request_id is what a support ticket needs",
++
++  // FR-CHN-07's ceiling: a channel holds at most 1,000 members and an add that would
++  // cross it is refused with 422 and this code.
++  //
++  // The SRS names this code in its own worked example for EIR-API-04, which is why it is
++  // spelled this way rather than `member_limit_exceeded` — the document got there first
++  // and an integrating developer will have read it.
++  //
++  // NOT `quota_exceeded`. That is a monthly, billable, resets-on-a-date refusal whose
++  // message promises a resume date; this is a structural limit on one channel that no
++  // amount of waiting changes. Same status, different fact, and a client that retries on
++  // the wrong one waits for ever.
++  channel_member_limit_exceeded:
++    "this channel already holds the maximum number of members; remove one before adding another",
+ } as const;
+ 
+ export type ErrorCode = keyof typeof ERROR_CODES;
+ 
+ /** Where the published error reference lives, and THE ONE PLACE THE URL IS BUILT
+  * (FR-027, constitution V).
+```
+
+<Trap>
+`channel_member_limit_exceeded` is **not** `quota_exceeded`. A quota is monthly, billable
+and resets on a date, and its message promises a resume date. This is a structural limit
+on one channel that no amount of waiting changes. Same status code, different fact — and a
+client that retries on the wrong one waits for ever.
+</Trap>
+
+```diff title="services/api/src/db/repository.itest.ts"
+@@ -57,25 +57,44 @@ describe("tenant isolation is structural (FR-TEN-05)", () => {
+     );
+   });
+ 
+   it("membership writes with foreign ids affect zero rows", async () => {
+     const user = await repoA.getUserByExternalId("tuan");
+     const channel = await repoA.getChannelByExternalId("support");
+-    expect(await repoA.addMember(channel!.id, user!.id)).toBe(true);
+-    // B holds A's REAL ids — and still cannot write or read through them.
+-    expect(await repoB.addMember(channel!.id, user!.id)).toBe(false);
++    expect(await repoA.addMember(channel!.id, user!.id)).toBe("added");
++    // Asked twice is a SUCCESS and not a failure, and telling those apart is
++    // what chapter 3.12 changed here: the endpoint over this call has to be
++    // idempotent, and a unique violation reached the wire as `internal_error`.
++    expect(await repoA.addMember(channel!.id, user!.id)).toBe("already_a_member");
++    // B holds A's REAL ids — and still cannot write or read through them. The
++    // answer is `not_found`, which is also what B gets for ids that exist
++    // nowhere: three refusals, one word, on purpose.
++    expect(await repoB.addMember(channel!.id, user!.id)).toBe("not_found");
+     expect(await repoB.listMembers(channel!.id)).toEqual([]);
+     expect(await repoB.channelsForUser(user!.id)).toEqual([]);
+     expect(await repoA.listMembers(channel!.id)).toEqual([user!.id]);
+   });
+ 
+   it("uniqueness is per-tenant (DR-02): both tenants may own the same external_id", async () => {
+-    await expect(
+-      repoB.createUser("tuan", "A different Tuan"),
+-    ).resolves.toBeTruthy();
+-    await expect(repoA.createUser("tuan", "Duplicate in A")).rejects.toThrow();
++    // B's own Tuan is a DIFFERENT row. That is the per-tenant half.
++    const inB = await repoB.createUser("tuan", "A different Tuan");
++    const inA = await repoA.getUserByExternalId("tuan");
++    expect(inB.id).not.toBe(inA!.id);
++
++    // THE OBSERVATION CHANGED IN CHAPTER 3.12 AND THE PROPERTY DID NOT. This
++    // used to assert that a repeat within one tenant REJECTS, which observed the
++    // unique index by watching it raise. `createUser` is now idempotent — the
++    // members endpoint creates a user on first membership, so a repeated request
++    // would otherwise have answered `internal_error` — and the index is what
++    // makes that work rather than something that got removed. So the assertion
++    // is now that a repeat returns THE SAME ROW: still one user per tenant per
++    // external id, observed through the outcome instead of through an exception.
++    const again = await repoA.createUser("tuan", "Duplicate in A");
++    expect(again.id).toBe(inA!.id);
++    // And the existing display name wins: a second call is not an update.
++    expect(again.display_name).toBe(inA!.display_name);
+   });
+ });
+ 
+ describe("sequence assignment is serialised per channel (ADR-03)", () => {
+   it("two concurrent sends never interleave", async () => {
+     const channel = await repoA.createChannel("ordering", "public");
+```
 
 <Checkpoint>
 
