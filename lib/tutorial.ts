@@ -334,12 +334,12 @@ export const series: Part[] = [
         // every fence above `## The outsider` is the error vocabulary and every
         // fence below it is the sealed package. 14 titled fences here, 7 there.
         readerProduces:
-          "Thirteen error codes with one registry and one URL rule, and a docs_url that resolves against the published site",
+          "An error registry that declares every code the platform can send, one place that builds the docs_url, and a typed thrower so a mistyped code stops compiling",
         sourceDoc: "docs/04-srs.md, docs/08-error-reference.md",
-        readerMinutes: 49,
+        readerMinutes: 30,
         titleVi: "Lỗi có trang để xem",
         readerProducesVi:
-          "Mười ba error code với một registry và một luật URL duy nhất, và một docs_url resolve được vào tài liệu đã xuất bản",
+          "Một registry khai báo mọi error code nền tảng có thể gửi, một chỗ duy nhất dựng docs_url, và một hàm ném lỗi có kiểu để code gõ sai không compile được",
       },
       {
         id: "3.4",
