@@ -242,7 +242,7 @@ export function createConnections({
     connectTimeout: 1_000,
   });
   // One `error` listener, because a client without one turns a connection error
-  // into an unhandled rejection that takes the process down. The fan-out chapter's R10
+  // into an unhandled rejection that takes the process down. the fan-out chapter's R10
   // found `createFanout` without one while both rate limiters had one and
   // explained why.
   client.on("error", (error: Error) => {
@@ -490,15 +490,24 @@ and it walks on.
 
 ## Where the refusal goes
 
-The cap is checked at the upgrade, after authentication — the environment and the user are
-not known before it — and after the establishment rate limiter, because a client hammering
-the door should meet the cheaper check first: the limiter is one `INCR` and this is a walk of
-up to five keys.
+The cap is checked at the upgrade, after authentication, because the environment and the user
+are not known before it.
+
+**In the published order it also came after an establishment rate limiter**, on the argument
+that a client hammering the door should meet the cheaper check first — one `INCR` against a
+walk of up to five keys. That limiter arrives with the limits chapter here, six after this one,
+so the cap is currently the first thing at the door that can refuse. The ordering argument is
+recorded rather than performed, and it is the limits chapter's to honour: **a limiter added
+after this cap belongs above it**, or every rejected flood pays for five key reads it did not
+need to.
 
 But the refusal does **not** happen there.
 
 ```diff title="services/gateway/src/session.ts"
-@@ -20,6 +20,11 @@ import { WebSocketServer, type WebSocket } from "ws";
+@@ -16,12 +16,17 @@ import {
+ } from "@relay/protocol";
+ import type { Logger } from "@relay/service-kit";
+ import { WebSocketServer, type WebSocket } from "ws";
  
  import { ApiError, type ApiClient } from "./api-client.js";
  import { authenticate, type Identity } from "./auth.js";
@@ -508,10 +517,16 @@ But the refusal does **not** happen there.
 +  type Connections,
 +} from "./connections.js";
  import type { Fanout } from "./fanout.js";
- import type { Decision, GatewayLimits } from "./limits.js";
- import { createMeter, METER_INTERVAL_MS, type Meter } from "./meter.js";
-@@ -235,6 +240,26 @@ export interface SessionServerOptions {
-    * headroom in the whole budget. That chapter's itest builds with 40 to test a
+ import { type Membership } from "./membership.js";
+ import { type Presence } from "./presence.js";
+ import { Registry, type Connection } from "./registry.js";
+ import { type Typing } from "./typing.js";
+ import {
+@@ -161,12 +166,32 @@ export interface SessionServerOptions {
+   /** Injectable for the reason the membership chapter's `rereadIntervalMs` is:
+    * **a test that waits out two real seconds pays them in the package that paces
+    * the lane**, which has about four seconds of headroom in the whole budget.
+    * That chapter's itest builds with 40 to test a
     * sixty-second backstop; this one builds with 40 and with 0. */
    renewalIntervalMs?: number;
 +  /** FR-RTM-09's five-connection cap.
@@ -537,17 +552,26 @@ But the refusal does **not** happen there.
  }
  
  // THE FOUR PRESENCE TIMINGS ARE NOT HERE, and an earlier draft of this chapter put
-@@ -262,12 +287,32 @@ export function attachSessions({
+ // them here. `fanout` and `presence` are INJECTED already built, and an injected thing
+ // carries its own configuration: a test that wants a hundred-millisecond grace period
+ // constructs `createPresence({ graceMs: 100, … })` and injects that, the way the
+@@ -185,14 +210,40 @@ export function attachSessions({
+   pingIntervalMs = PING_INTERVAL_MS,
+   resumeDeadlineMs = SUBSCRIBE_DEADLINE_MS,
+   presence,
    membership,
    typing,
    renewalIntervalMs = DEFAULT_RENEWAL_INTERVAL_MS,
+-}: SessionServerOptions): { registry: Registry; close: () => void } {
 +  connections,
 +  heartbeatMs = DEFAULT_HEARTBEAT_MS,
- }: SessionServerOptions): {
-   registry: Registry;
-   meter: Meter;
-   close: () => Promise<void>;
- } {
++}: SessionServerOptions): {
++  registry: Registry;
++  /** ASYNC AS OF THIS CHAPTER, and `releaseAll` below is the reason. Freeing the
++   * places this instance holds is a round trip to Redis that has to COMPLETE before
++   * `wss.close()`, or the deploy case the method exists for is a race it can lose. */
++  close: () => Promise<void>;
++} {
    const registry = new Registry();
 +  /** FR-011a. What this instance holds, so a shutdown can free it
 +   * all at once.
@@ -567,13 +591,19 @@ But the refusal does **not** happen there.
 +    string,
 +    { environmentId: string; user: string; connectionId: string; slot: number }
 +  >();
-   // A second timer beside the heartbeat, not a second job for it.
-   const meter: Meter = createMeter({
-     api,
-@@ -676,7 +721,75 @@ export function attachSessions({
-           return;
-         }
-       }
+ 
+   /** A frame arriving from the fabric — born on this instance or another,
+    * indistinguishable by design — becomes message.created for every local
+    * member of its channel. */
+   function deliver(channelId: string, message: Message): void {
+     for (const connection of registry.subscribersOf(channelId)) {
+@@ -551,13 +602,81 @@ export function attachSessions({
+     const token = url.searchParams.get("token");
+     void (async () => {
+       // The api verifies, and answers with the identity AND the
+       // memberships. This is the same one call the connect path already made —
+       // it just asks a better question than "what may this user hear".
+       const result = await authenticate(api, token);
 +      // T037. THE CAP IS CHECKED HERE, after `authenticate` and
 +      // after the establishment limiter, and both orderings are reasons rather
 +      // than habits. After authenticate because the environment and the user are
@@ -607,9 +637,9 @@ But the refusal does **not** happen there.
 +          // FR-016 and FR-016a. The connection is accepted with the cap
 +          // UNENFORCED, and this line is the only externally visible evidence of
 +          // that — from outside, an accepted connection looks identical whether
-+          // the cap was checked and satisfied or not checked at all.
-+          // The fan-out chapter's lesson: the assertion that carries the requirement is the log
-+          // line.
++          // the cap was checked and satisfied or not checked at all. The fan-out
++          // chapter's lesson: the assertion that carries the requirement is the
++          // log line.
 +          logger.log("error", "connection.cap_unenforced", {
 +            connection_id: pendingId,
 +            environment_id: result.identity.environmentId,
@@ -646,19 +676,34 @@ But the refusal does **not** happen there.
          if (result.outcome === "refused") {
            // 4001: "invalid or expired token" (EIR-WS-05). The close code is
            // the protocol package's, not a number invented here.
-@@ -738,6 +851,8 @@ export function attachSessions({
-           result.channelIds,
-           req.url ?? "/",
-           result.limits.send,
+           ws.close(4001, CLOSE_CODES[4001]);
+           logger.log("info", "connection.rejected", { reason: "bad_token" });
+           return;
+@@ -589,28 +708,41 @@ export function attachSessions({
+           logger.log("info", "connection.rejected", { reason: "user_banned" });
+           return;
+         }
+         // NO SEND LIMIT ARGUMENT YET. `authenticate` returns the limits with the
+         // session in movement VII, where the limiter is written; `open` takes four
+         // parameters until then rather than a fifth nothing can supply.
+-        void open(ws, result.identity, result.channelIds, req.url ?? "/");
++        void open(
++          ws,
++          result.identity,
++          result.channelIds,
++          req.url ?? "/",
 +          pendingId,
 +          claimed,
-         );
++        );
        });
      })();
-@@ -749,12 +864,18 @@ export function attachSessions({
+   });
+ 
+   async function open(
+     socket: WebSocket,
+     identity: Identity,
      channelIds: string[],
      url: string,
-     sendLimit: number,
 +    /** The id the cap claimed a place with, so the connection and
 +     * its slot agree — FR-011's "exactly one place for its lifetime". Absent when
 +     * no `connections` module is wired, which is every fixture that does not opt
@@ -675,7 +720,13 @@ But the refusal does **not** happen there.
        identity,
        socket,
        // Memberships arrived with the identity, from the session
-@@ -828,11 +949,22 @@ export function attachSessions({
+       // call at the door. There is no second lookup to fail here — the api is
+       // still the only source of membership (ADR-05), it just answers both
+       // questions at once, and a failure now closes the socket before it opens.
+@@ -671,29 +803,140 @@ export function attachSessions({
+     // and gets it three lines apart — see the note there.
+     void presence?.connected(
+       identity.environmentId,
        identity.userExternalId,
        connection.channelIds,
      );
@@ -698,7 +749,11 @@ But the refusal does **not** happen there.
      });
  
      // Listeners go on BEFORE the resume, not after the ack. A resume takes
-@@ -844,6 +976,89 @@ export function attachSessions({
+     // a round trip to the api, and a socket that dies inside that window
+     // must still be removed from the registry and release its subscriptions
+     // — otherwise a client that reconnects impatiently leaks an instance's
+     // worth of state per attempt.
+     socket.on("pong", () => {
        connection.missedPings = 0;
      });
      socket.on("message", (raw) => void handle(connection, raw.toString()));
@@ -786,12 +841,6 @@ But the refusal does **not** happen there.
 +    if (renewal !== undefined) renewal.unref();
 +
      socket.on("close", (code) => {
-       // The connection-metering chapter, and the ORDER MATTERS. The meter is told first, because
-       // the line below removes this connection from the registry the meter walks
-@@ -854,6 +1069,23 @@ export function attachSessions({
-       // Handing over totals rather than reporting them. This handler is already
-       // documented as the last place that should throw, and a mass disconnect
-       // would turn one event into a burst of HTTP requests.
 +      // T041. The timer first, then the place. An interval that
 +      // outlives its connection renews a slot nobody holds.
 +      //
@@ -809,13 +858,22 @@ But the refusal does **not** happen there.
 +          slot,
 +        );
 +      }
-       meter?.closed(connection, new Date());
        registry.remove(connection.id);
-       // THE PRESENCE CHAPTER, AND THIS HANDLER NOW CARRIES THREE ORDERING CONSTRAINTS, not
-@@ -1352,6 +1584,15 @@ export function attachSessions({
+       // THIS HANDLER NOW CARRIES TWO ORDERING CONSTRAINTS, not none. Presence is told
+       // AFTER `registry.remove`, because it asks whether this was the user's last
+       // connection on this instance and must not count the one that is leaving. The
+       // unsubscribes come last.
+       //
+@@ -1132,12 +1375,21 @@ export function attachSessions({
+       connection.socket.ping();
+     }
+   }, pingIntervalMs);
+ 
+   return {
+     registry,
+-    close: () => {
++    close: async () => {
        clearInterval(heartbeat);
-       meter.stop();
-       await meter.reportOnce(new Date());
 +      // FR-011a. Before `wss.close()`, because that call does not
 +      // close established sockets — so their own close handlers may never run and
 +      // this is the last chance to free their places. SC-013: after a deployment a
@@ -828,21 +886,29 @@ But the refusal does **not** happen there.
        wss.close();
      },
    };
+ }
 ```
 
 <Why>
-**Why complete a handshake in order to close it.** Chapter 3.11 settled this for the closest
-analogue and the sentence is worth repeating: *a browser cannot read the body of a failed
-upgrade*. Refusing at the HTTP seam gives the client a bare connection failure with no code
-and no message — indistinguishable from the gateway being down. Completing the upgrade and
-then closing with a code and an error frame is the only way the client learns which of the
-several reasons it was.
+**Why complete a handshake in order to close it.** *A browser cannot read the body of a failed
+upgrade.* Refusing at the HTTP seam gives the client a bare connection failure with no code and
+no message — indistinguishable from the gateway being down. Completing the upgrade and then
+closing with a code and an error frame is the only way the client learns which of the several
+reasons it was.
+
+This is the shape the bad-token refusal has used since the socket chapter, and EIR-WS-05 is why:
+a close code needs a socket to arrive on. **The connection cap is the first refusal since to
+need the same argument**, and the metering chapter will need it a third time for a quota — which
+is the point at which it stops being one route's decision and becomes the door's.
 </Why>
 
 ## A sixth close code, and why none of the five would do
 
 ```diff title="packages/protocol/src/codes.ts"
-@@ -19,6 +19,26 @@ export const CLOSE_CODES = {
+@@ -16,12 +16,33 @@ export const CLOSE_CODES = {
+   // "a client that cannot tell them apart retries the wrong one for ever".
+   //
+   // EIR-WS-06 names four classes to distinguish — authentication, quota, shutdown,
    // protocol violation — and a ban is none of them. Numbered here, the way chapter 1.3
    // numbered 4002 and 4008.
    4003: "banned in this environment",
@@ -864,34 +930,43 @@ several reasons it was.
 +  //
 +  // EIR-WS-06 names four classes to distinguish — authentication, quota, shutdown,
 +  // protocol violation — and a concurrency cap is none of them, exactly as a ban
-+  // was none of them. Numbered here, in the space chapters 1.3 and the channel-control chapter drew from.
++  // was none of them. Numbered here, in the space chapter 1.3 and the
++  // channel-control chapter drew from.
 +  4004: "connection limit reached",
    4008: "quota exhausted",
    4009: "server shutdown (drain)",
  } as const;
-@@ -159,6 +179,22 @@ export const ERROR_CODES = {
-   // state to reconcile — so it is refused rather than absorbed.
-   connection_environment_conflict:
-     "this connection was first reported for a different environment; a connection belongs to one environment for its whole life",
-+  // FR-RTM-09, and the socket's half of the connection cap: an error
-+  // frame carrying the limit and the count, sent immediately before close 4004.
-+  //
-+  // THE FIGURES GO IN THE MESSAGE, not in payload fields. `errorFrameSchema` is a
-+  // `z.strictObject` of `code`, `message`, `docs_url`, `request_id` and an optional
-+  // `field`, so two new fields would mean widening a shape every error frame shares
-+  // for one code's benefit. `quota_exceeded` above set the precedent — its message
-+  // names the dimension, the figures and the date — and the reference's Status line
-+  // is where the close code is recorded.
-+  //
-+  // NOT `rate_limited`, which is one word away in the register and means the
-+  // opposite thing. That code throttles a tenant's establishments per window and
-+  // its own message reads "too many connections; retry after the window resets".
-+  // Retrying is exactly what this code must not suggest.
-+  connection_limit_reached:
-+    "the user already holds the maximum concurrent connections; the message names the limit and the count, and the remedy is to close one and reconnect",
+ 
+ export type CloseCode = keyof typeof CLOSE_CODES;
+ 
+@@ -124,12 +145,27 @@ export const ERROR_CODES = {
+   // NOT `quota_exceeded`. That is a monthly, billable, resets-on-a-date refusal whose
+   // message promises a resume date; this is a structural limit on one channel that no
+   // amount of waiting changes. Same status, different fact, and a client that retries on
+   // the wrong one waits for ever.
+   channel_member_limit_exceeded:
+     "this channel already holds the maximum number of members; remove one before adding another",
++    // FR-RTM-09, and the socket's half of the connection cap: an error frame carrying
++    // the limit and the count, sent immediately before close 4004.
++    //
++    // THE FIGURES GO IN THE MESSAGE, not in payload fields. `errorFrameSchema` is a
++    // `z.strictObject` of `code`, `message`, `docs_url` and an optional `field`, so two
++    // new fields would mean widening a shape every error frame shares for one code's
++    // benefit — and the reference's Status line is where the close code is recorded.
++    //
++    // NOT `rate_limited`, which is one word away in the register and means the opposite
++    // thing. That code throttles a tenant's establishments per window and its own
++    // message reads "too many connections; retry after the window resets". Retrying is
++    // exactly what this code must not suggest: five connections are already open and
++    // the remedy is to close one, which no amount of waiting does.
++    connection_limit_reached:
++      "the user already holds the maximum concurrent connections; the message names the limit and the count, and the remedy is to close one and reconnect",
  } as const;
  
  export type ErrorCode = keyof typeof ERROR_CODES;
+ 
+ /** Whether a string the api sent is a code this registry defines.
+  *
 ```
 
 <Figure caption="Three refusals a client can meet at the door. Two are answered by waiting or by fetching something; the third is answered by giving something up." code={figThreeRefusals} />
@@ -908,7 +983,10 @@ a connection you already hold — and then to reconnect immediately, with no wai
 all, which is the observable difference between this and a rate limit.
 
 ```diff title="packages/protocol/src/codes.test.ts"
-@@ -15,9 +15,9 @@ describe("close codes cover EIR-WS-06's four classes", () => {
+@@ -12,15 +12,15 @@ describe("close codes cover EIR-WS-06's four classes", () => {
+   // user is refused anyway. Reusing 4001 would tell a client to re-authenticate, which
+   // succeeds at minting a token and fails again at connect.
+   //
    // THIS ASSERTION IS WHY THE NUMBER IS DELIBERATE. It failed on the build that added
    // 4003 — an exact-set assertion is the only kind that makes a new close code a decision
    // rather than an accident, and updating it is the act of making that decision.
@@ -920,24 +998,42 @@ all, which is the observable difference between this and a rate limit.
      ]);
    });
  
-@@ -59,7 +59,7 @@ describe("error codes stay unique and described", () => {
- // that is not in this object cannot be constructed anywhere in the platform without
- // failing the build. This suite checks the shape of the object those types rest on.
- describe("the registry is the whole vocabulary (FR-024)", () => {
--  it("holds seventeen codes", () => {
-+  it("holds eighteen codes", () => {
-     // A number, so adding one is a visible edit rather than a silent widening. The
-     // count is here and not in a comment because a comment does not fail.
-     //
-@@ -71,7 +71,7 @@ describe("the registry is the whole vocabulary (FR-024)", () => {
-     // failed on the build that added it** — "expected 16 but got 17", which is the
-     // third time this line has turned a new code into a decision instead of an
-     // accident. The connection-metering chapter's close-code set did the same for 4003.
--    expect(Object.keys(ERROR_CODES)).toHaveLength(17);
-+    expect(Object.keys(ERROR_CODES)).toHaveLength(18);
-   });
+   it("gives every code a distinct, non-empty meaning", () => {
+     const meanings = Object.values(CLOSE_CODES);
+     expect(new Set(meanings).size).toBe(meanings.length);
+@@ -131,6 +131,32 @@ describe("the docs URL is built in one place, with the code as the anchor", () =
  
-   it("contains the five the status ladder emits", () => {
+   it("gives every code a distinct URL", () => {
+     const urls = (Object.keys(ERROR_CODES) as ErrorCode[]).map(docsUrl);
+     expect(new Set(urls).size).toBe(urls.length);
+   });
+ });
++
++describe("the refusal this chapter's cap adds", () => {
++  // NAMED, NOT COUNTED, for the reason the channel block above gives.
++  //
++  // What matters about this one is that it is **not** `rate_limited`. The two sit one
++  // word apart in the register and mean opposite things: `rate_limited` throttles
++  // frames and says "slow down and retry", which is exactly what a client at the
++  // connection cap must not do — five sockets are already open and no amount of
++  // waiting closes one. The remedy is a client action, not a delay.
++  it("registers connection_limit_reached with a description a client can act on", () => {
++    expect(ERROR_CODES).toHaveProperty("connection_limit_reached");
++    expect(ERROR_CODES.connection_limit_reached).not.toBe("");
++  });
++
++  it("keeps it distinct from rate_limited, which is what it exists instead of", () => {
++    expect(ERROR_CODES.connection_limit_reached).not.toBe(ERROR_CODES.rate_limited);
++  });
++
++  it("names a remedy the client can perform rather than a delay to wait out", () => {
++    // THE ONE ASSERTION ABOUT THE WORDS, and it is the whole reason for a separate
++    // code. A message telling a capped client to retry sends it into a loop against a
++    // wall, which is the failure `codes.ts` has now argued against five times.
++    expect(ERROR_CODES.connection_limit_reached).toContain("close one");
++    expect(ERROR_CODES.rate_limited).toContain("retry");
++  });
++});
 ```
 
 <Trap>
@@ -988,7 +1084,7 @@ connection; nothing a client sees says whether five was checked. So the gateway 
 **Delete that error line and eighteen of the chapter's twenty integration tests stay green**
 — including the one that opens six connections against an unreachable registry, because six
 connections is what failing open means. From outside, *accepted with the cap unenforced* and
-*accepted because the user was under it* are the same event. Chapter 3.18 found this shape in
+*accepted because the user was under it* are the same event. The fan-out chapter found this shape in
 the fan-out, where `publish` swallows its errors and resolves, so "the send returned 201 while
 Redis was down" was equally true of a publisher that did nothing at all.
 </Trap>
@@ -1246,9 +1342,9 @@ describe("the slot registry", () => {
     // `resolves.toBeUndefined()` is a statement about the promise. The stronger
     // property is not observable through this module's own surface — a claim walks
     // from slot 0, so whatever an unconditional release did to slot 3 cannot be
-    // seen from here — and the ownership half of it is the test below.
-    // The membership-revocation chapter's rule: a claim about an observable difference needs falsifying before
-    // the test is written.
+    // seen from here — and the ownership half of it is the test below. The
+    // membership chapter's rule: a claim about an observable difference needs
+    // falsifying before the test is written.
     await expect(
       registry.release(ENV, user, randomUUID(), 3),
     ).resolves.toBeUndefined();
@@ -1285,7 +1381,7 @@ describe("the slot registry", () => {
     // `null` MEANS COULD NOT ASK, and the distinction is the requirement: FR-016
     // accepts the connection and logs that the cap was not enforced, which is a
     // different fact from a user being under the limit. Conflating them is what
-    // The fan-out chapter found in the fan-out — "the send returned 201 while Redis was
+    // the fan-out chapter found in the fan-out — "the send returned 201 while Redis was
     // down" is true of a publisher that does nothing at all.
     const lines: Record<string, unknown>[] = [];
     const gone = createConnections({
@@ -1487,8 +1583,8 @@ async function boot(options: {
    * opts in. */
   cap?: { boundMs?: number; heartbeatMs?: number; url?: string };
   /** FR-015's log line is the assertion that carries the requirement, so a test
-   * needs the lines. The fan-out chapter's finding: a publisher that does nothing satisfies "the
-   * send returned 201". */
+   * needs the lines. The fan-out chapter's finding: a publisher that does nothing
+   * satisfies "the send returned 201". */
   lines?: Record<string, unknown>[];
 }): Promise<Instance> {
   const environment = options.environment ?? ENVIRONMENT;
@@ -1522,7 +1618,6 @@ async function boot(options: {
     sendMessage: async () => {
       throw new Error("not used");
     },
-    reportUsage: async () => null,
   };
   const registry: Connections | undefined =
     options.cap === undefined
@@ -1865,7 +1960,7 @@ describe("every connection a person holds is a first-class recipient (US3)", () 
     // the registry, not present-and-broken.
     //
     // So the property is real and unobservable through this fixture, which is
-    // The membership-revocation chapter's lesson in its own words — a claim about an observable
+    // the membership-revocation chapter's lesson in its own words — a claim about an observable
     // difference needs falsifying before the test is written. What this test does
     // assert is narrower and still worth having: a surviving connection keeps
     // receiving after an earlier one is gone.
@@ -2102,7 +2197,7 @@ describe("the count survives the gateway it was counted on (US2)", () => {
   }, 40_000);
 
   it("keeps a heartbeating connection's slot across three bounds (FR-008, SC-006)", async () => {
-    // The presence chapter SHIPPED A PRESENCE BUG BY ARMING A CHECK AT EXACTLY ITS OWN
+    // THE PRESENCE CHAPTER SHIPPED A PRESENCE BUG BY ARMING A CHECK AT EXACTLY ITS OWN
     // GRACE PERIOD — two deadlines on one instant, reached by two clocks, and the
     // losing side stranded a user online for ever. This is the test that would
     // have caught the same mistake here: three renewals per bound, so two
@@ -2371,7 +2466,7 @@ describe("the count survives the gateway it was counted on (US2)", () => {
 // FR-016 chooses availability over the cap: a registry the gateway cannot reach
 // must not stop people connecting. The whole difficulty is that this decision is
 // INVISIBLE. An accepted connection is an accepted connection; nothing a client
-// sees says whether five was checked. The fan-out chapter found the general case — the
+// sees says whether five was checked. the fan-out chapter found the general case — the
 // fan-out's `publish` swallows its errors and resolves, so "the send returned 201
 // while Redis was down" is equally true of a publisher that does nothing at all.
 // The assertion that carries the requirement is the log line.
@@ -2507,74 +2602,104 @@ hijack test was the only one that catches `IFEQ` becoming `XX`; it catches two. 
 "before the bound" test's own comment had the argument backwards — dropping the TTL turns the
 *other* half red, and what this half catches is a cap that never really holds the places.
 
-**The race needed a test to be seen at all.** Replacing `SET NX` with a `GET` followed by a
-`SET` left all sixteen existing tests green. The obvious reading — the ordering is not
-observable, so assert the invariant instead — is a statement about the suite and not about
-the system. Twelve simultaneous connections across the two instances tell the two apart
-immediately: the atomic version admits five, the check-then-act version admits all twelve,
-six runs out of six.
+**The race needed a test to be seen at all**, and that claim was re-run rather than carried.
+Replacing `SET NX` with a `GET` followed by a `SET` — a check-then-act with the same intent and
+none of the atomicity — leaves **nineteen of the twenty tests green**. The one that fails is the
+one written for it:
+
+    × never admits a sixth under many simultaneous claims (FR-013)
+
+The obvious reading of nineteen greens — the ordering is not observable, so assert the invariant
+instead — is a statement about the suite and not about the system. Simultaneous connections
+across two instances tell the two implementations apart immediately: the atomic version admits
+five and the check-then-act version admits more, every run. **A property that only one test in
+twenty can see is a property that arrives with its test or not at all.**
 
 ## Wiring, and the test that asks whether anything was forgotten
 
 ```diff title="services/gateway/src/main.ts"
-@@ -7,6 +7,7 @@ import { createGatewayLimits } from "./limits.js";
+@@ -2,12 +2,13 @@ import { CLOSE_CODES, docsUrl, frameSchema } from "@relay/protocol";
+ import { createLogger, serve, type Logger } from "@relay/service-kit";
+ 
+ import { createApiClient } from "./api-client.js";
+ import { createFanout } from "./fanout.js";
  import { createMembership } from "./membership.js";
  import { createPresence } from "./presence.js";
- import { attachSessions } from "./session.js";
 +import { createConnections } from "./connections.js";
  import { createTyping } from "./typing.js";
+ import { attachSessions } from "./session.js";
  
  // The gateway — SAD §4.1: terminates WebSockets and never writes to the
-@@ -63,6 +64,7 @@ export function createServer(logger?: Logger) {
-   // from. `fanout.ts:33` states why they cannot be one client: a subscribed
-   // connection cannot issue ordinary commands, and PUBLISH is one.
+ // database (ADR-05). Chapter 1.4 stood up the HTTP half (health, request
+ // ids, structured logs); chapter 2.5 gives it the job it exists for, and
+@@ -51,27 +52,43 @@ export function createServer(logger?: Logger) {
+   const membership = createMembership({ logger: log });
+   // THE SIXTH AND SEVENTH REDIS CLIENTS, and this module needs two of its own — a
+   // publisher and a subscriber — because it is the first fabric this service both
+   // publishes to and consumes from. `fanout.ts` states why they cannot be one client:
+   // a subscribed connection cannot issue ordinary commands, and PUBLISH is one.
    const typing = createTyping({ logger: log });
++  // The connection registry's own client. Its keys put the environment id FIRST —
++  // `conn:{env}:{user}:{slot}` — so a cross-tenant read would need a caller to hand
++  // this module another environment's id, which the session layer takes from the
++  // api's verified identity and never from a payload.
 +  const connections = createConnections({ logger: log });
-   // THE FIRST SECRET THIS SERVICE HAS EVER HELD, and it is not a
-   // signing secret: the credentials chapter's claim that "the gateway holds no signing
-   // secret" is untouched, because this one verifies nothing and signs nothing.
-@@ -103,6 +105,18 @@ export function createServer(logger?: Logger) {
-     // a silent no-op. **The feature was inert in the product and green in every
-     // test**, because every test injects this option directly.
+   const sessions = attachSessions({
+     server,
+     api: createApiClient(process.env.RELAY_API_URL ?? DEFAULT_API_URL),
+     logger: log,
+     fanout,
+     presence,
+     membership,
      typing,
-+    // T042. **THIS LINE IS THE ONE the typing chapter FORGOT.** That
-+    // chapter built its module, awaited its `close()` in `shutdown()` — so lint
-+    // saw a used variable — and never passed it here. The feature was inert in
-+    // the product while 1,174 coverage tests and 174 gateway integration tests
-+    // were green, and `**/main.ts` is excluded from the ratchet so no number
-+    // could have shown it. `packages/outsider/src/integrate.itest.ts` is what
-+    // found it, and it is the only instrument that boots the shipped binary.
-+    //
-+    // Registering `close()` below is the OTHER half and neither substitutes for
-+    // the other: without this line the cap does nothing, without that one every
-+    // gateway leaks a Redis client.
++    // AND THIS LINE IS WHAT `main.test.ts` GUARDS. Without it the cap does nothing:
++    // `connections?.claim(...)` is an optional chain on `undefined`, so every socket
++    // is admitted and no number moves — `**/main.ts` is excluded from the coverage
++    // ratchet, so no figure could show it. Registering `close()` below is the other
++    // half and neither substitutes for the other: without this line the cap is inert,
++    // without that one every gateway leaks a Redis client.
 +    connections,
-     // Overridable so `meter.itest.ts` can drive a spawned gateway without
-     // waiting a real minute per assertion. The two tests there are the ones an
-     // in-process gateway cannot run — a signal has to arrive at a process — and
-@@ -128,6 +142,7 @@ export function createServer(logger?: Logger) {
-     await presence.close();
-     await membership.close();
-     await typing.close();
-+    await connections.close();
-   }
-   return Object.assign(server, { shutdown });
+   });
+   server.on("close", () => {
+-    sessions.close();
++    // `void`, LIKE ITS SIBLINGS. `sessions.close()` returns a promise as of the
++    // connection cap — it frees the places this instance holds before closing the
++    // socket server — and `server.on("close")` has nowhere to await one.
++    void sessions.close();
+     void fanout.close();
+     void presence.close();
+     void membership.close();
+     void typing.close();
++    void connections.close();
+   });
+   return server;
  }
+ 
+ if (import.meta.main) {
+   const requested = Number(process.env.PORT ?? 4001);
 ```
 
 ```diff title="services/gateway/src/main.test.ts"
-@@ -2,6 +2,10 @@ import type { AddressInfo } from "node:net";
+@@ -1,12 +1,14 @@
+ import { readFileSync } from "node:fs";
+-import { join } from "node:path";
++import { dirname, join } from "node:path";
++import { fileURLToPath } from "node:url";
+ import type { AddressInfo } from "node:net";
  import type { Server } from "node:http";
  
  import { CLOSE_CODES, frameSchema } from "@relay/protocol";
-+import { readFileSync } from "node:fs";
-+import { dirname, join } from "node:path";
-+import { fileURLToPath } from "node:url";
 +
  import { describe, expect, it } from "vitest";
  
  import { createLogger } from "@relay/service-kit";
-@@ -63,4 +67,48 @@ describe("gateway skeleton", () => {
+ 
+ import { createServer } from "./main.js";
+ 
+@@ -62,12 +64,63 @@ describe("gateway skeleton", () => {
+       expect(body.code).toBe("not_found");
+       expect(typeof body.docs_url).toBe("string");
+     } finally {
        server.close();
      }
    });
@@ -2596,6 +2721,9 @@ six runs out of six.
 +  // seven Redis clients is not something a unit test can observe without seven
 +  // servers. What it CAN observe is that every module the file builds is also
 +  // closed, which is the property that breaks when somebody adds an eighth.
++  // THE OTHER HALF OF THE PAIR BELOW, and neither substitutes for the other: a
++  // module that is built and never injected is inert, and one that is built and
++  // never closed leaks a Redis client per gateway. Same derivation, two properties.
 +  it("closes every module it builds", () => {
 +    const here = dirname(fileURLToPath(import.meta.url));
 +    const source = readFileSync(join(here, "main.ts"), "utf8");
@@ -2605,104 +2733,56 @@ six runs out of six.
 +    // TWO NAMED EXCEPTIONS, and named rather than pattern-excluded. `createLogger`
 +    // returns a writer with nothing to release and `createServer` is this file's
 +    // own export, not a module it owns. **The first version of this test had
-+    // neither and went red on the logger** — which is the check working: an
-+    // unknown member fails instead of being quietly skipped, and adding one to
-+    // this list is a decision somebody has to write down.
++    // neither and went red on the logger** — which is the check working: an unknown
++    // member fails instead of being quietly skipped, and adding one to this list is
++    // a decision somebody has to write down.
 +    const NOT_CLOSEABLE = ["logger", "server"];
 +    const closeable = built.filter((name) => !NOT_CLOSEABLE.includes(name ?? ""));
-+    // Six modules today: fanout, limits, presence, membership, typing,
-+    // connections. A seventh arriving without a `close()` turns this red instead
-+    // of leaking a client per gateway.
-+    expect(closeable).toHaveLength(6);
-+    const shutdown = source.slice(source.indexOf("async function shutdown"));
++    // A POSITIVE CONTROL RATHER THAN A COUNT. The published version of this test
++    // asserted `toHaveLength(6)`, which is a number every later chapter that adds a
++    // module has to edit — and a number edited on every change is a number nobody
++    // reads. The loop below is the assertion; this line only says the derivation
++    // found something to loop over.
++    expect(closeable.length, "no `const x = createY(` found in main.ts").toBeGreaterThan(1);
++    // DERIVED, NOT NAMED. The closing site is wherever this file registers one —
++    // `server.on("close", …)` here — and reading the whole source rather than a
++    // named function means a refactor that moves the calls cannot silently pass.
 +    for (const name of closeable) {
 +      expect(
-+        shutdown.includes(`await ${String(name)}.close()`),
-+        `${String(name)} is built but never closed in shutdown()`,
++        new RegExp(`(void |await )${String(name)}\\.close\\(\\)`).test(source),
++        `${String(name)} is built but never closed`,
 +      ).toBe(true);
 +    }
 +  });
  });
+ 
+ describe("every fabric createServer builds is injected", () => {
+   // A MODULE BUILT, CLOSED, AND NEVER PASSED IN IS INERT AND GREEN.
+   //
+   // `signalTyping` calls `typing?.publish(...)`. If `typing` never reaches
 ```
 
 <Why>
-**Why a test reads `main.ts` as text.** The previous chapter built a module, awaited its
-`close()`, and never passed it to `attachSessions` — 1,174 coverage tests and 174 gateway
-integration tests were green while the feature did not exist in the product, because every
-one of them injects the module directly. Coverage cannot see an omission: every line
-executed, and the defect was an argument that was not there. So one test parses the file and
-asserts that every `create*` module it builds is closed in `shutdown()`, with a two-name list
-of the exceptions written out rather than pattern-matched.
+
+**Why a test reads `main.ts` as text.** There are two ways to build a gateway module and ship
+nothing: never pass it to `attachSessions`, and never close it. The first makes the feature
+inert — an optional parameter left `undefined`, so every call on it is an optional chain that
+does nothing. The second leaks a Redis client per gateway. **Coverage cannot see either**: every
+line executes, and the defect is an argument that is not there.
+
+So `main.test.ts` parses the file and asserts both, over the same derivation — every `const x =
+createY(` it finds must appear inside the `attachSessions` call and must be closed. The
+exceptions are a two-name list written out rather than pattern-matched, and the first version of
+that test went red on the logger, which is the check working: an unknown member fails instead of
+being quietly skipped.
+
+**The published order paid for the first half.** The typing chapter built its module, awaited its
+`close()` so lint saw a variable in use, and never injected it — green everywhere, dead in the
+product, and found eleven chapters later by the only instrument that boots the shipped binary.
+This order wired it with the module and wrote the test, so the pair arrives before the second
+module that could repeat it.
+
 </Why>
-
-And the only check in this repository that talks to a built image rather than importing
-source:
-
-```diff title="packages/outsider/src/integrate.itest.ts"
-@@ -385,6 +385,62 @@ describe("integrating with Relay from the outside", () => {
-    * `docs/08-error-reference.md` tells a customer *"send `message.send` … Do not
-    * send events; receive them."* **Nothing had ever checked what happens when they
-    * do.** This is that correction in bytes rather than in prose. */
-+  it("holds five connections and is refused a sixth with 4004 (FR-RTM-09)", async () => {
-+    // T048. **THE ONLY INSTRUMENT THAT BOOTS THE SHIPPED BINARY**,
-+    // and the reason this task is a plan requirement rather than a polish item.
-+    //
-+    // The typing chapter built a module, awaited its `close()` so lint saw a used
-+    // variable, and never passed it to `attachSessions`. The feature was inert in
-+    // the product while 1,174 coverage tests and 174 gateway integration tests
-+    // were green — `**/main.ts` is excluded from the ratchet, so no number could
-+    // have shown it — and this file is what found it. A chapter that adds an
-+    // argument to `attachSessions` owes a test here.
-+    //
-+    // Nothing in this file is stubbed: the api and the gateway are the built
-+    // artifacts, the token came from the real dev-token endpoint, and the socket
-+    // is a browser `WebSocket`.
-+    const sockets: WebSocket[] = [];
-+    const openOne = async (): Promise<WebSocket> => {
-+      const socket = new WebSocket(`${ws}/v1/ws?token=${token}`);
-+      sockets.push(socket);
-+      socket.addEventListener("error", () => undefined);
-+      await new Promise<void>((resolve, reject) => {
-+        socket.addEventListener("open", () => resolve());
-+        socket.addEventListener("close", (event) =>
-+          reject(new Error(`closed ${(event as CloseEvent).code}`)),
-+        );
-+        setTimeout(() => reject(new Error(`no socket at ${ws} within 10s`)), 10_000);
-+      });
-+      return socket;
-+    };
-+
-+    try {
-+      for (let i = 0; i < 5; i += 1) await openOne();
-+
-+      const sixth = new WebSocket(`${ws}/v1/ws?token=${token}`);
-+      sockets.push(sixth);
-+      const frames: { type: string; payload?: { code?: string } }[] = [];
-+      sixth.addEventListener("message", (event) => {
-+        frames.push(JSON.parse(String(event.data)) as { type: string });
-+      });
-+      sixth.addEventListener("error", () => undefined);
-+      const code = await new Promise<number>((resolve, reject) => {
-+        sixth.addEventListener("close", (event) =>
-+          resolve((event as CloseEvent).code),
-+        );
-+        setTimeout(() => reject(new Error("the sixth was not closed within 10s")), 10_000);
-+      });
-+
-+      // The code a client branches on, and the frame that carries the detail.
-+      expect(code).toBe(4004);
-+      expect(frames.find((f) => f.type === "error")?.payload?.code).toBe(
-+        "connection_limit_reached",
-+      );
-+    } finally {
-+      for (const socket of sockets) socket.close();
-+    }
-+  }, 60_000);
-+
-   it("is refused with unknown_frame_type for a frame only the server may send", async () => {
-     const socket = new WebSocket(`${ws}/v1/ws?token=${token}`);
-     const frames: { type: string; payload?: { code?: string } }[] = [];
-```
 
 That test opens five connections through a real api, a real gateway and a browser
 `WebSocket`, and asserts the sixth is refused with 4004. Running it needed the images
@@ -2710,12 +2790,15 @@ rebuilt — without that it would have tested the previous chapter's code and pa
 wrong reason.
 
 ```diff title="services/gateway/src/presence.itest.ts"
-@@ -728,6 +728,17 @@ describe("presence: the grace period (FR-RTM-06)", () => {
+@@ -751,12 +751,23 @@ describe("presence: the grace period (FR-RTM-06)", () => {
+     expect(seen.frames.filter((f) => f.payload.state === "offline")).toHaveLength(1);
+   }, 30_000);
+ 
    // T045, and FR-RTM-09's five is enforced NOWHERE — `policy.ts:13` mentions it in a
    // comment and nothing counts — so the reference count is unbounded and two is the
    // easy case. Five connections, closed one at a time: nothing until the last.
 +  //
-+  // The connection-cap chapter BUILT THE CAP AND THE SENTENCE ABOVE IS STILL TRUE HERE, which is a
++  // THE CONNECTION-CAP CHAPTER BUILT THE CAP AND THE SENTENCE ABOVE IS STILL TRUE HERE, which is a
 +  // decision rather than an oversight. Every gateway module is an optional parameter
 +  // and this fixture passes no `connections`, so nothing counts in THIS file after
 +  // that chapter either. The cap lives where a fixture asks for it: the new
@@ -2728,6 +2811,9 @@ wrong reason.
    it("publishes nothing until the fifth of five connections closes", async () => {
      const who = takeSubject();
      const watcher = await arrive("linh");
+     const open = [];
+     for (let i = 0; i < 5; i += 1) open.push(await arrive(who, i % 2 ? a : b));
+     const seen = collect(watcher, "presence.changed", who);
 ```
 
 
@@ -2751,7 +2837,7 @@ const DRIVER_EXEMPT_TESTS = [
 reaches after every chapter of this series has run is 73 lines. `DRIVER_EXEMPT_TESTS` is not
 one of them — the whole list arrives from `fences/post-series.md`, which is applied after the
 last chapter. A hunk anchored on a line that does not exist yet matches zero times, so this
-chapter shows the lines and the appendix carries the change. Chapter 3.19 was the first to
+chapter shows the lines and the appendix carries the change. The presence chapter was the first to
 hit this and wrote the rule down; this is the second.
 </Why>
 
@@ -2768,7 +2854,7 @@ five reads is the wrong shape, and the sorted set comes back with the evidence i
 have today.
 
 <ForwardRef>
-Chapter 3.23 gives `message.updated` and `message.deleted` their first producers — the last
+The revisions chapter gives `message.updated` and `message.deleted` their first producers — the last
 two of FR-RTM-05's six kinds without one. They have been waiting on a surface that does not
 exist: there is no edit route and no delete route to announce. **What that chapter has to
 decide is what a deletion leaves behind** — FR-MSG-08 keeps the row, so the question is what
