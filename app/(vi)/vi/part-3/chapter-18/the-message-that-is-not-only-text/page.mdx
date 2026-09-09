@@ -1,9 +1,18 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
 import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import {
+  figAttachmentShape,
+  figThreeDoors,
+  figSixReadPaths,
+  figSocketDrops,
+  figTombstone,
+} from "./figures";
 
 export const metadata = {
   title: "Tin nhắn không chỉ có chữ — Building Relay",
   description:
-    "Bản dịch tiếng Việt của chương này đang được chuẩn bị. Toàn bộ mã nguồn bên dưới giữ nguyên như bản tiếng Anh.",
+    "Attachment. Cột này đã nằm trong schema từ chương 2.1, và chương này phần lớn nói về giá trị của một trường bắt buộc — cùng ba nơi mà compiler không thể nhìn tới.",
   alternates: {
     canonical: "/vi/part-3/chapter-18/the-message-that-is-not-only-text",
     languages: {
@@ -15,11 +24,28 @@ export const metadata = {
 
 <ChapterHeader id="3.18" locale="vi" />
 
-> **Bản dịch đang được chuẩn bị.** Phần diễn giải của chương này chưa được dịch sang
-> tiếng Việt. Các khối mã bên dưới là bản gốc tiếng Anh và giống hệt bản tiếng Anh của
-> chương — bạn có thể gõ theo chúng ngay bây giờ. Bản dịch đầy đủ sẽ thay thế trang này.
+Bảng `messages` đã có cột `attachments JSONB` từ chương 2.1. Chưa một dòng code nào từng
+ghi vào đó. FR-MSG-11 công bố hai cách để lấp đầy nó — một URL do bạn tự host, và một
+`media_id` trỏ tới thứ Relay host — và chương này xây dựng cách thứ nhất.
 
-## One decision before anything else
+Đó là một tính năng nhỏ với bán kính ảnh hưởng lớn, và phần thú vị không nằm ở tính năng.
+Nó nằm ở câu hỏi: làm sao tìm ra **mọi** chỗ mà một trường mới phải xuất hiện, khi trường
+đó là tuỳ chọn với hệ thống kiểu và bắt buộc với hợp đồng?
+
+## Một quyết định trước mọi thứ khác
+
+Để trường trên wire là **bắt buộc**, không phải tuỳ chọn.
+
+<Why title="Một trường tuỳ chọn là trường mà compiler sẽ không giúp bạn">
+
+`messageSchema` là thứ nền tảng công bố ra ngoài như một tin nhắn. Cho nó
+`attachments?: Attachment[]` thì mọi nơi khởi tạo vẫn biên dịch trót lọt: cả những chỗ bạn
+đã mở rộng, lẫn những chỗ bạn quên. Một tin nhắn dựng thiếu trường vẫn parse, vẫn được gửi
+đi, và cập bến client với attachment đơn giản là không tồn tại. Test xanh, dữ liệu mất
+lặng lẽ.
+
+Đổi thành `attachments: Attachment[]` và compiler thôi giữ phép lịch sự. Build package
+protocol trước, rồi typecheck hai service tiêu thụ nó:
 
 ```bash
 pnpm --filter @relay/protocol build
@@ -27,44 +53,184 @@ npx tsc -p services/api/tsconfig.json --noEmit
 npx tsc -p services/gateway/tsconfig.json --noEmit
 ```
 
-## What the compiler cannot see
+**33 lỗi.** Bốn trong code production, 29 rải khắp chín file test. Mỗi lỗi là một nơi
+payload tin nhắn được dựng lên, và danh sách đó không phải thứ bạn viết ra được bằng tay —
+một lượt phân tích trước đó đã thử, bằng grep, và đúng bốn trên bảy.
+
+</Why>
+
+<Trap title="Build không phải tuỳ chọn, và thất bại của nó là sự im lặng">
+
+`tsconfig.base.json` đặt `"noEmit": true`, nên `tsc -p` chỉ typecheck và không phát sinh gì
+cả. Config có emit là `tsconfig.build.json`. Api và gateway phân giải `@relay/protocol` qua
+`exports.types`, vốn trỏ vào `dist`.
+
+Nghĩa là mọi thay đổi trong `packages/protocol/src` đều **vô hình** với chúng cho tới khi
+package được build — và lệnh typecheck trả lời **"không có gì phải làm"** theo đúng thứ tự
+tự nhiên nhất. Không phải lỗi. Một lượt chạy sạch sẽ với zero finding, đọc y hệt như thành
+công.
+
+</Trap>
+
+## Những gì compiler không thể thấy
+
+Bốn chỗ production và 29 chỗ test là toàn bộ danh sách, và nó không phải toàn bộ vấn đề.
+Ba chỗ nữa lộ ra khi các suite chạy, và chúng có chung một nguyên nhân:
 
 ```ts
 messageSendSchema.parse(value)   //  (value: unknown) => MessageSend
 ```
 
-```
-typecheck     32   the sites a type can see — 4 production, 28 in tests
-unit lane     +3   fixtures and pinned key sets, all past parse(unknown)
-integration   +6   forged frames, published payloads, one more pin
-```
+`parse` nhận `unknown`. Một fixture đưa vào đó là vô hình với compiler bất kể schema đòi
+hỏi điều gì, và mọi thứ đi qua `JSON.stringify` trên đường lên subject cũng vậy. Ba chỗ lộ
+ra là: một frame giả mạo trong suite isolation, hai payload publish bằng tay trong test
+typing, và một key set đã ghim trong file so sánh payload fan-out của api với một literal.
 
-## The shape, and the arm that refuses
-
-```
-one arm    "Invalid discriminator value. Expected 'url'"
-two arms   "hosted media is not available yet — attach an http or https url instead"
-```
+Ba công cụ, theo thứ tự, và mỗi cái tìm ra thứ cái trước không thể:
 
 ```
-codes.ts                    the entry and its argument
-codes.test.ts               the exact count, 20 -> 21, plus three assertions
-docs/08-error-reference.md  a section with a cause and a client action
-content/docs/…              its mirror, machine-written
+typecheck     33   những nơi kiểu dữ liệu nhìn thấy — 4 production, 29 trong test
+unit lane     +3   fixture và key set đã ghim, tất cả lọt qua parse(unknown)
+integration   +6   frame giả mạo, payload publish tay, thêm một key set nữa
 ```
+
+Thứ tự không phải hình thức. Chạy unit lane trước typecheck sẽ cho thấy ba lỗi và giấu đi
+ba mươi ba; chạy integration trước sẽ cho thấy sáu và giấu phần còn lại. Mỗi lane là một
+bộ lọc có hình dạng riêng, và các hình dạng đó không lồng vào nhau.
+
+<Trap title="Một cảnh báo trong comment không được thứ gì thi hành">
+
+Suite isolation dựng một frame cố tình sai để chứng minh gateway từ chối nó vì **hướng đi**
+chứ không phải vì hình dạng. Chương 3.23 đã làm hỏng chính test đó theo cùng một cách, sửa
+nó, và viết lý do vào file — nêu đích danh cả hai file sẽ dính tiếp:
+
+> **CHƯƠNG 3.23 ĐÃ TÁCH TRƯỜNG HỢP NÀY RA.** … Frame giả mạo khi đó trượt ở khâu kiểm tra
+> HÌNH DẠNG và lời từ chối quay về là `invalid_frame` thay vì `unknown_frame_type`. … cùng
+> một phát hiện, ở file thứ hai trong hai file dựng frame giả mạo kiểu này, và
+> `session.itest.ts` là file còn lại.
+
+Cả hai file. Nêu tên trước. Và vẫn hỏng lần nữa bởi chương này, bởi vì hàm dựng frame trả
+về `unknown` và không một quy tắc nào viết trong comment với tới được nó.
+
+</Trap>
+
+## Hình dạng, và cái nhánh biết từ chối
+
+<Figure caption="Hai nhánh ngay từ phiên bản đầu. §4.14 thay phần thân của nhánh thứ hai, chứ không thêm discriminator về sau." code={figAttachmentShape} />
+
+FR-MSG-11 công bố `media_id` và chương này không xây nó. Hình dạng hiển nhiên là một nhánh
+bây giờ và nhánh thứ hai ở Part 4. Hình dạng hiển nhiên đó sai, và lý do nằm trong chính
+một câu của yêu cầu:
+
+> Lời từ chối PHẢI nói rằng hosted media chưa có, chứ không phải rằng trường đó không hợp
+> lệ, bởi vì `media_id` là một phần đã công bố của FR-MSG-11 và **một khách hàng đọc điều
+> khoản đó sẽ gửi nó.**
+
+Một union một nhánh từ chối `{"type": "media"}` bằng thông điệp discriminator của chính
+zod. Đo đạc trên phiên bản đã ghim thay vì phỏng đoán:
+
+```
+một nhánh    "Invalid discriminator value. Expected 'url'"
+hai nhánh    "hosted media is not available yet — attach an http or https url instead"
+```
+
+Câu đầu nói *trường này không hợp lệ*, đúng thứ duy nhất mà yêu cầu cấm. Nhánh thứ hai tồn
+tại ngay từ phiên bản đầu, parse hình dạng của nó để discriminator khớp, rồi mới từ chối —
+và gateway vốn đã chuyển tiếp thông điệp của nhánh trượt tới client socket, nên cả hai cánh
+cửa đều nhận được câu chữ ấy với giá của đúng một nhánh.
+
+<Why title="Từ chối trong controller là bất khả, và chính comment bên trên nó nói vậy">
+
+Nỗ lực đầu tiên kiểm tra request body ngay trong handler gửi tin và ném 422 ở đó. Nó trả về
+400, và comment viết bên trên chỗ kiểm tra ấy chứa sẵn lời bác bỏ chính nó:
+
+> pipe chạy trên tham số còn cái này chạy trong thân hàm, nên tới lúc luồng điều khiển tới
+> đây thì schema đã loại bỏ mọi nhánh media rồi
+
+`@Body(new ZodValidationPipe(...))` **ném exception**. Luồng điều khiển không bao giờ tới.
+Đoạn kiểm tra là code chết nằm dưới một comment giải thích vì sao nó chết.
+
+Câu trả lời còn tốt hơn cách chữa cháy: để schema tự đặt tên cho lời từ chối của mình.
+Nhánh media mang theo `params: { protocolCode: "media_not_available", status: 422 }`, và
+validation pipe tôn trọng nó. Một cơ chế, hai cánh cửa — REST nhận mã lỗi và status, socket
+nhận câu chữ.
+
+</Why>
+
+### Vì sao nó xứng đáng có mã lỗi riêng
+
+Lời từ chối lẽ ra có thể là `invalid_request`. Mã đó nghĩa là người gọi gửi thứ mà hợp đồng
+không cho phép — và `media_id` **nằm trong** hợp đồng. Một lập trình viên đọc FR-MSG-11,
+gửi đúng hình dạng nó công bố, rồi nhận `invalid_request` đang bị bảo đi kiểm tra lại đoạn
+JSON vốn đã đúng. Họ sẽ không tìm thấy gì, bởi chẳng có gì để tìm.
+
+Vậy nên: `media_not_available`, và **422 thay vì 400**. Request đúng dạng và được hiểu; thứ
+không làm được là chính điều nó yêu cầu. Sự phân biệt đó cũng là điều chương 2.8 đã vạch ra
+giữa 404 và 403, và nó tốn một mục mới trong registry lỗi:
+
+```
+codes.ts                    mục từ và lập luận cho nó
+codes.test.ts               con số chính xác, 20 -> 21, cùng ba assertion
+docs/08-error-reference.md  một mục có nguyên nhân và hành động cho client
+content/docs/…              bản sao, do máy sinh
+```
+
+Bốn chỗ, được dự đoán là bốn từ trước khi bắt tay vào việc. Cái gate đọc registry đã build
+đối chiếu với tài liệu tham chiếu đã xuất bản sẽ đỏ ngay khoảnh khắc mã lỗi tồn tại và giữ
+đỏ cho tới khi mục tham chiếu được viết — hai việc cách nhau một phase, có chủ đích, và
+được ghi lại để một gate đỏ ở khoảng giữa là lịch trình chứ không phải bất ngờ.
+
+<Trap title="Nội dung không đồng nghĩa với cấu trúc">
+
+Mục tham chiếu đã có nguyên nhân, hành động cho client, và chín trăm ký tự lập luận. Gate
+vẫn từ chối nó:
 
 ```
 check-error-codes: media_not_available does not say what a client should do
 ```
 
-## One rule, three doors
+Nó tìm đúng chuỗi ký tự `**What to do:**`. Lời khuyên đã ở đó, viết dưới dạng văn xuôi. Nửa
+phần máy đọc được thì không, và một tài liệu tham chiếu đã xuất bản chính là nơi mà "tôi đã
+nói rồi" và "định dạng nói điều đó" là hai tuyên bố khác nhau.
+
+</Trap>
+
+## Một quy tắc, ba cánh cửa
+
+<Figure caption="Một quy tắc viết vào một schema là quy tắc mà những cánh cửa còn lại không có." code={figThreeDoors} />
+
+Một tin nhắn giờ có thể không mang chữ nào, khi nó mang attachment. Cái sàn dịch chuyển chứ
+không biến mất: text được rỗng **chỉ khi** có ít nhất một attachment, và một lần gửi không
+có cả hai vẫn bị từ chối.
+
+Đó là một quy tắc về một **cặp** trường, và có ba schema cùng kiểm tra một lần gửi. Viết nó
+vào riêng schema body REST là đặt nó lên một cánh cửa — file đó chỉ được đúng một file khác
+import, và không bao giờ bởi đường socket.
+
+<Trap title="Nửa bị bỏ quên là lời từ chối">
+
+Nới lỏng giới hạn text là thứ khiến phần cho phép hoạt động. Rồi chẳng còn gì thi hành cái
+sàn nữa. Đặt quy tắc cặp lên hai trong ba schema thì yêu cầu vẫn được đáp ứng — frame parse
+được, api từ chối, client nhận lỗi — nhưng **tầng** thì sai:
 
 ```
-{ text: "", attachments: [] }     invalid_request    refused by the api
-eleven attachments                invalid_frame      refused by the gateway
+{ text: "", attachments: [] }     invalid_request    bị api từ chối
+mười một attachment               invalid_frame      bị gateway từ chối
 ```
 
-## The three places a socket send drops a field
+Một payload, hai quy tắc, hai tầng, hai mã lỗi, vì một lý do mà người gọi không thể nào
+khám phá ra. Giới hạn mười phần tử sống trên schema frame để gateway trả lời nó; quy tắc
+cặp giờ cũng vậy.
+
+</Trap>
+
+## Ba nơi một lần gửi qua socket đánh rơi trường
+
+<Figure caption="Ba điểm có tên, và không điểm nào báo lỗi." code={figSocketDrops} />
+
+Mọi test REST trong chương này đều xanh trước khi đường socket hoạt động. Cửa REST kiểm tra
+một body rồi trao một object có kiểu cho service. Đường socket có ba chỗ mà trường được gọi
+tên từng cái một, và một trường không được gọi tên thì đơn giản là biến mất:
 
 ```ts
 const { channel, text, idem_key } = frame.data.payload;   // 1
@@ -78,11 +244,120 @@ const { channel, text, idem_key } = frame.data.payload;   // 1
 await fanout?.publish({ id, channel, seq, user, text, created_at });   // 3
 ```
 
-## NULL and an empty list are different values
+Tin nhắn được commit. Client nhận ack. Không có lỗi ở bất kỳ đâu trong chuỗi đó, và test
+duy nhất nhìn thấy nó là test gửi qua socket rồi đọc lại chính hàng dữ liệu.
 
-## What a deletion leaves behind
+## NULL và một danh sách rỗng là hai giá trị khác nhau
 
-## What a required field is worth
+<Figure caption="Sáu hình dạng trả về một tin nhắn và chúng không đồng thuận. Ba mang attachment; ba không, và mỗi cái có lý do." code={figSixReadPaths} />
+
+Cột lưu `NULL` cho tin nhắn không có attachment. Mọi lượt đọc trả về `[]`. Đó là hai sự
+thật khác nhau và đúng **một** nơi chuyển đổi giữa chúng — hàm map trong `listMessages` —
+bởi đặt phép chuyển đổi vào từng nơi gọi sẽ cho nền tảng đúng bằng ấy câu trả lời như số
+nơi gọi.
+
+Gỡ đúng một `?? []` đó ra thì **ba** test đỏ, và đó là cách bạn biết quyết định sống ở đâu.
+
+<Why title="Vì sao sự phân biệt này đáng giữ">
+
+Sẽ đơn giản hơn nếu lưu `[]` và không bao giờ nghĩ tới `NULL` nữa. Có hai lý do để không
+làm vậy.
+
+Thứ nhất, chúng mang nghĩa khác nhau. Một hàng ghi trước chương này có `NULL` — chưa từng
+có gì được đính vào. Một hàng ghi sau, với mảng rỗng, sẽ nghĩa là người gọi đã gửi một danh
+sách và danh sách đó rỗng. Đó là hai sự kiện khác nhau, và một cột gộp chúng lại thì không
+thể được hỏi rằng cái nào đã xảy ra.
+
+Thứ hai là đường xoá. Attachment của một tombstone bị **gỡ liên kết**, và lệnh ghi làm việc
+đó đặt cột về `NULL` — đúng giá trị mà cột đã có trước khi bất cứ thứ gì được đính vào. Nếu
+`[]` là trạng thái rỗng, một lần xoá sẽ phải ghi `[]` và người đọc không còn phân biệt được
+*chưa từng có* với *đã có và bị gỡ đi* nếu không tra thêm `deleted_at`. Giữ `NULL` làm giá
+trị vắng mặt tốn một `??` ở một lượt đọc và đổi lại một cột tự nó trả lời được câu hỏi.
+
+</Why>
+
+### Chứng minh rằng các test có thể đỏ
+
+Bốn lượt phản nghiệm, và hai lượt **không** làm đúng điều được giao mới là hai lượt đáng
+giữ.
+
+**Dọn rỗng payload publish của gateway** và test giao tin socket-tới-socket đỏ — như dự
+kiến. Test REST-tới-socket vẫn **xanh**, điều mà nhiệm vụ không lường trước. Đó không phải
+lỗ hổng: payload fan-out của một lần gửi REST được dựng trong api còn của một lần gửi
+socket được dựng trong gateway, nên chúng là hai lần dựng của cùng một frame và thay đổi
+bên nào cũng vô hình với test của bên kia. Nửa xanh chính là bằng chứng.
+
+**Gỡ `?? []`** và ba test đỏ, không phải một như nhiệm vụ nêu tên.
+
+**Gỡ hẳn cột attachment khỏi lượt đọc history** và test isolation — cái khẳng định người
+ngoài không thấy gì — vẫn xanh. Điều đó đã được dự đoán, và đó chính là điểm mấu chốt:
+attachment không thêm bề mặt thứ hai nào **theo cấu trúc**, bởi phép kiểm tra khả kiến chạy
+như một cổng chặn trước lượt đọc. Không có hàng nào, nên không có cột nào, nên chẳng có gì
+để rò rỉ. Test giữ nguyên nhiệm vụ của nó — bảo vệ câu trả lời giống nhau đến từng byte —
+và thôi được ghi công cho một tuyên bố mà nó không thể nào làm sai.
+
+<Checkpoint>
+
+Một tin nhắn mang theo bức ảnh do người khác host. Mười là giới hạn và mười một là lời từ
+chối có gọi tên trường. `javascript:` bị từ chối ngay tại biên bởi một bộ parse URL chứ
+không phải phép so khớp tiền tố, bởi vì `z.url()` chấp nhận nó.
+
+</Checkpoint>
+
+## Một lần xoá để lại những gì
+
+<Figure caption="Một lần sửa thay chữ và mang theo attachment nó đã có. Một lần xoá gỡ liên kết chúng và sự kiện của nó không nói gì về chúng." code={figTombstone} />
+
+Một lần sửa không thay đổi attachment. FR-MSG-07 thay đổi *chữ* của tin nhắn, route sửa
+nhận một body đúng một trường, và bảng lịch sử nó ghi vào lưu đoạn chữ trước đó và không gì
+khác. Một test chứng minh database giữ nguyên chúng; một lượt phản nghiệm thêm `attachments`
+vào danh sách `SET` của lệnh `UPDATE` ấy xem test đỏ rồi gỡ ra lại.
+
+Vậy mà sự kiện `message.updated` vẫn phải mang chúng — bởi một consumer cần đúng một hình
+dạng cho lần tạo và lần sửa, và một sự kiện đánh rơi danh sách sẽ khiến một lần sửa trông
+như một tin nhắn vừa mất bức ảnh.
+
+<Why title="Một lượt đọc chẳng ai ngờ sẽ đổi, đã đổi">
+
+Kế hoạch nêu tên bốn hình dạng đọc sẽ không đổi và khẳng định điều đó. Thực tế là ba.
+
+Lượt đọc nội bộ của đường sửa là thứ duy nhất đang giữ attachment của tin nhắn vào đúng
+khoảnh khắc sự kiện được dựng. Nó không thay đổi chúng, không trả chúng về cho người gọi,
+và không thuộc bề mặt công khai — vậy mà vẫn phải select cột đó, bởi sự kiện trích dẫn nó
+không thể bịa ra thứ nó chưa từng đọc.
+
+Đó là hình hài của cả chương gói trong một đường đọc: một trường bắt buộc ở thượng nguồn ép
+một lượt đọc cách đó ba tầng, trong một phase mang tên thứ khác, vì một yêu cầu chưa bao
+giờ nhắc tới nó.
+
+</Why>
+
+Sự kiện xoá **hoàn toàn** không mang trường attachment. Không phải mang một trường rỗng.
+
+Frame công bố một lần xoá chưa bao giờ mang chữ, vì lý do chính comment của nó nêu ra: một
+payload có trường text là payload *có thể* mang theo những lời ai đó đã xin gỡ đi, và
+`null` là giá trị người ta có thể quên đặt. Hình dạng an toàn là hình dạng mà khoá đó không
+tồn tại.
+
+Một URL cũng dễ khôi phục y như một câu chữ. Người đã đính bức ảnh rồi xoá tin nhắn là
+người đã yêu cầu đường link ngừng đi lại, và một sự kiện mang `attachments: []` chỉ cách
+một lần refactor nữa là mang `attachments: [ … ]`. Nên payload xoá giữ nguyên năm khoá của
+nó, và test canh giữ điều đó so sánh một key set chính xác thay vì kiểm tra trường đó có
+undefined hay không — bởi một khoá vắng mặt và một giá trị undefined là cùng một thứ với
+phép kiểm tra truthiness và là hai thứ khác nhau với một hợp đồng.
+
+Có một trường hợp đối xứng ở chiều đi vào. Một lần gửi khôi phục tombstone bằng
+idempotency key cũ trả về đúng hàng gốc, mà giờ là một tombstone: `text: null`,
+`attachments: []`, và không publish gì cả. Cả hai chỗ publish đều được canh bằng
+`text !== null`, nên cái cổng mà chương 3.18 viết cho chữ mang luôn danh sách attachment
+theo mà không tốn thêm gì.
+
+## Một trường bắt buộc đáng giá bao nhiêu
+
+Ba mươi ba lỗi compiler, ba lỗi nữa từ unit lane, sáu lỗi nữa từ integration, và một lỗi từ
+một test mà chương trước đã viết vì một lý do hoàn toàn khác — một lần sửa với text rỗng,
+vốn là 400 suốt một chương và lặng lẽ thành 200 khi giới hạn text của lệnh gửi được nới.
+Schema sửa đã mượn giới hạn của schema gửi bằng tham chiếu:
 
 ```ts
 export const editMessageBodySchema = z.strictObject({
@@ -90,11 +365,47 @@ export const editMessageBodySchema = z.strictObject({
 });
 ```
 
-```ts
-const hasText = typeof value.text === "string" && value.text.length > 0;
-```
+Một lần sửa không có trường attachment, nên quy tắc cặp vốn dựng lại cái sàn cho lệnh gửi
+không thể dựng lại cái sàn cho lệnh sửa. Không gì trong kế hoạch dự đoán được nó, và
+compiler không thể thấy — kiểu dữ liệu giống hệt nhau ở cả hai phía.
 
-## The diff
+Hai schema tình cờ trùng nhau là một khiếm khuyết mà codebase này đã ghi lại hai lần. Dạng
+sắc bén hơn, mà chương này giành được: **hai schema buộc phải khác nhau thì không được chia
+sẻ một tham chiếu nào cả.**
+
+Và còn một cái nữa, lộ ra sau tất cả những thứ trên, bởi chính coverage lane mà phần close-out
+của chương này chạy.
+
+Cùng quy tắc ấy đã được áp lên `outboxEventSchema` — thứ mà platform không hề dựng ra. Nó là cái
+`consumer/runtime.ts` parse ra từ một durable queue, và một lần parse thất bại ở đó được trả lời
+bằng `message.term()`: dừng redelivery vĩnh viễn. Vào đúng lần deploy đưa chương này lên, mọi
+`message.created` còn nằm trên stream đều do binary chạy trước đó ghi, không hề có key
+`attachments`. Required ở đây nghĩa là bị huỷ.
+
+Sáu bài test trong `consumer.itest.ts` đỏ vì đúng chuyện đó, và chúng đỏ được là nhờ hai fixture
+không ai cập nhật vẫn còn viết đúng payload cũ. Mười một lượt analysis không tìm ra nó, và chính
+header của file đã nói lý do: suite của api chạy với `RELAY_EVENT_CONSUMER=off`, nên không có gì
+trong đó động tới consumer.
+
+Vậy nên quy tắc có một đường biên, và đường biên ấy đáng được nói sắc gọn như chính quy tắc.
+**Required là một khẳng định về thứ bạn ghi ra. Còn kẻ đọc bất cứ thứ gì bền vững — một queue,
+một cột, những byte do người khác ghi — thì không thể đòi một field mà người ghi nó chưa từng
+có.** `.default([])` cho hai nhánh event, còn interface phía producer vẫn giữ required, bởi hai
+câu ấy nói về hai chiều khác nhau.
+
+<ForwardRef>
+
+§4.14 mang tới hosted media: một upload slot, object storage, và nhánh `media_id` mà chương
+này từ chối. Khi nó ra mắt, `media_not_available` thôi được phát ra và mục của nó trong tài
+liệu tham chiếu lỗi cũng ra đi cùng.
+
+</ForwardRef>
+
+## Bản diff
+
+Tám file gánh phần lập luận bên trên, và chúng đến trước.
+
+Hình dạng này là mới, nên nó được nêu trọn vẹn thay vì như một thay đổi của thứ gì đó.
 
 ```ts title="packages/protocol/src/attachments.ts"
 import { z } from "zod";
@@ -135,8 +446,8 @@ export const MAX_ATTACHMENTS = 10;
 
 /** FR-023. FR-MSG-11 states no length, so this is the chapter's own bound and it takes
  * the platform's only precedent for a stored URL: `users.avatar_url`, capped at 2,048
- * since the user-surface chapter. A second number for the same kind of value would be
- * two limits a customer has to remember. */
+ * since the user-surface chapter. A second number for the same kind of value would be two limits a
+ * customer has to remember. */
 export const ATTACHMENT_URL_MAX = 2048;
 
 /** FR-004, and it is a list rather than a regex because the list is the requirement.
@@ -253,7 +564,7 @@ export function refineTextAndAttachments(
 ```
 
 ```diff title="packages/protocol/src/frames.ts"
-@@ -1,26 +1,51 @@
+@@ -1,5 +1,11 @@
  import { z } from "zod";
  
 +import {
@@ -265,11 +576,7 @@ export function refineTextAndAttachments(
  // The wire contract, one home (ADR-01). Every frame is a JSON object with a
  // `type` discriminator and a `payload` (EIR-WS-02). Schemas are the single
  // source of truth: every exported static type is inferred from its schema,
- // so the types and the validation cannot drift — there is no second
- // definition. Payloads are strict: unknown fields are rejected.
- 
- /** Per-channel resume cursor: { channel_id: highest seq seen } (ADR-03). */
- export const cursorSchema = z.record(z.string(), z.number().int().positive());
+@@ -11,13 +17,32 @@ export const cursorSchema = z.record(z.string(), z.number().int().positive());
  
  /** The message on the wire — derived from the SAD §6.1 `messages` columns.
   * Wire spellings follow SAD §5.1's own frame line (`channel`, `seq`).
@@ -303,13 +610,7 @@ export function refineTextAndAttachments(
    created_at: z.iso.datetime(), // UTC, RFC 3339 (constitution: timestamps)
  });
  
- /** Server → client on successful handshake (EIR-WS-03, SAD §5.2). Sent after
-  * backfill is fetched, so it can also carry the per-channel truncation list
-  * (FR-RTM-04) — channels where backfill exceeded 500 and the client must
-@@ -37,17 +62,35 @@ export const connectionAckSchema = z.strictObject({
- 
- /** Client → server send (SAD §5.1: `message.send {idem_key, channel, text}`).
-  * The idempotency key is client-supplied (FR-SDK-06), deduplicated
+@@ -40,11 +65,29 @@ export const connectionAckSchema = z.strictObject({
   * server-side within 24 h (FR-MSG-04). */
  export const messageSendSchema = z.strictObject({
    type: z.literal("message.send"),
@@ -344,13 +645,10 @@ export function refineTextAndAttachments(
  });
  
  /** Server → sender after commit — never before (SAD §5.1, FR-MSG-05). */
- export const messageAckSchema = z.strictObject({
-   type: z.literal("message.ack"),
-   payload: z.strictObject({
 ```
 
 ```diff title="packages/protocol/src/internal.ts"
-@@ -1,8 +1,14 @@
+@@ -1,5 +1,11 @@
  import { z } from "zod";
  
 +import {
@@ -362,13 +660,7 @@ export function refineTextAndAttachments(
  import { messageSchema } from "./frames.js";
  
  // The INTERNAL service contract (chapter 2.5) — distinct from the wire
- // contract above it. `frames.ts` is what a customer's client speaks;
- // this is what the gateway and the API service speak to each other over
- // the internal HTTP hop (ADR-05).
-@@ -11,17 +17,31 @@ import { messageSchema } from "./frames.js";
- // components on either side of a boundary, one definition between them.
- // The gateway derives its client types from these schemas AND parses
- // responses with them — an internal caller has no more right to assume a
+@@ -14,11 +20,25 @@ import { messageSchema } from "./frames.js";
  // payload's shape than an external one does.
  
  /** Gateway → api: forward the payload a `message.send` frame carried. */
@@ -399,13 +691,7 @@ export function refineTextAndAttachments(
  
  /** api → gateway: the committed message. `seq` is what the ack carries
   * (FR-MSG-05 — after the commit, never before). */
- export const internalSendResponseSchema = z.strictObject({
-   id: z.string().min(1),
-   channel_id: z.string().min(1),
-@@ -29,12 +49,28 @@ export const internalSendResponseSchema = z.strictObject({
-   /** The sender, as the api RECORDED it — not as the caller asserted it.
-    * Added in chapter 2.6: fan-out is the first feature that must name a
-    * sender, and a frame the live path invents would not match the frame
+@@ -32,6 +52,22 @@ export const internalSendResponseSchema = z.strictObject({
     * 2.7's resume path reads back out of Postgres. */
    user: z.string().min(1),
    text: z.string().nullable(),
@@ -428,13 +714,10 @@ export function refineTextAndAttachments(
    created_at: z.iso.datetime(),
    /** True when 2.3's idempotency index recognised a retry. The PUBLIC api
     * still hides this (a client cannot tell a retry from a first send);
-    * an internal caller needs it, because storage being idempotent does
-    * not make delivery idempotent — chapter 2.6's trap. */
-   duplicate: z.boolean().optional(),
 ```
 
 ```diff title="services/api/src/messages/messages.schema.ts"
-@@ -1,32 +1,56 @@
+@@ -1,29 +1,53 @@
 +import {
 +  attachmentSchema,
 +  MAX_ATTACHMENTS,
@@ -465,7 +748,7 @@ export function refineTextAndAttachments(
 +    /** `.min(1)` REMOVED in the attachments chapter (FR-019), and the floor moved to the
 +     * refinement below rather than disappearing. An attachments-only message is a
 +     * photograph with no caption, and it stores `text = ""` rather than a null so
-+     * the revisions chapter's tombstone predicate — `text === null` — is untouched. */
++     * The revisions chapter's tombstone predicate — `text === null` — is untouched. */
 +    text: z.string().max(8000),
 +    metadata: z.record(z.string(), z.unknown()).optional(),
 +    // Chapter 2.3 (FR-MSG-04): the client's idempotency key — minted at send
@@ -507,19 +790,13 @@ export function refineTextAndAttachments(
  
  export type SendMessageBody = z.infer<typeof sendMessageBodySchema>;
  
- /** The edit body (FR-001).
-  *
-  * THE SAME BOUNDS AS THE SEND BODY'S `text`, and the same reason: FR-MSG-01 fixes them
-@@ -44,14 +68,26 @@ export type SendMessageBody = z.infer<typeof sendMessageBodySchema>;
-  *                         separate capability nothing has asked for, and `strictObject`
-  *                         makes adding it a decision rather than an accident.
-  *   no `idempotency_key`  a retried edit sets the same text twice and appends a second
+@@ -47,8 +71,20 @@ export type SendMessageBody = z.infer<typeof sendMessageBodySchema>;
   *                         history row. FR-021 already says the platform does not compare
   *                         texts, so there is nothing here for a key to deduplicate that
   *                         the customer has not asked to happen. */
 +/** The edit body (FR-001). ITS OWN BOUND, AND NO LONGER THE SEND'S.
 + *
-+ * This read `sendMessageBodySchema.shape.text` until this chapter, which was correct
++ * This read `sendMessageBodySchema.shape.text` until the attachments chapter, which was correct
 + * while the two agreed. Then FR-019 removed `.min(1)` from the send so an
 + * attachments-only message could carry no caption — and the edit inherited the
 + * relaxation through this reference. **An edit has no attachments field**, so the pair
@@ -535,29 +812,19 @@ export function refineTextAndAttachments(
  });
  
  export type EditMessageBody = z.infer<typeof editMessageBodySchema>;
- 
- // The history query (chapter 2.4, FR-MSG-09): an opaque cursor, a
- // direction, and a page size capped at 200. `limit` CLAMPS rather than
 ```
 
 ```diff title="services/api/src/db/repository.ts"
-@@ -1,10 +1,12 @@
- import { randomUUID } from "node:crypto";
- 
- import { and, asc, desc, eq, gt, inArray, isNull, lt, sql, type SQL } from "drizzle-orm";
+@@ -13,6 +13,8 @@ import {
+   type SQL,
+ } from "drizzle-orm";
  
 +import type { Attachment } from "@relay/protocol";
 +
+ import { DEFAULT_LIMITS, type LimitedOperation } from "../limits/policy";
  import type { Db } from "./client";
  import {
-   apiKeys,
-   applications,
-   channels,
-   consumedEvents,
-@@ -623,12 +625,25 @@ export type AddMemberOutcome = "added" | "already_a_member" | "not_found";
- 
- export interface MessageRow {
-   id: string;
+@@ -2255,6 +2257,19 @@ export interface MessageRow {
    channel_id: string;
    seq: number;
    text: string | null;
@@ -577,13 +844,7 @@ export function refineTextAndAttachments(
    created_at: string;
    /** When it was last edited, or `null` (FR-003). Optional on this
     * interface rather than required, because the WRITE paths build a row that has never
-    * been edited and would each have to spell `edited_at: null`. The read paths fill it
-    * in; `EditedMessageRow` narrows it to a string. */
-   edited_at?: string | null;
-@@ -2010,12 +2025,13 @@ export class Repository {
-     channelId: string,
-     {
-       userId,
+@@ -3945,6 +3960,7 @@ export class Repository {
        userExternalId,
        text,
        metadata,
@@ -591,13 +852,7 @@ export function refineTextAndAttachments(
        idempotencyKey,
        senderMustBeBot = false,
      }: {
-       /** THE SENDER MUST BE A BOT (FR-007, T030, T032).
-        *
-        * A CONSTRAINT, NOT A CREDENTIAL CLASS. Research R5 says the repository must not
-@@ -2027,12 +2043,17 @@ export class Repository {
-        * documented sequence (`contracts/sending.md`) puts "may this credential send as
-        * that sender?" last, after the channel checks, so that a refusal naming a fact
-        * about a user cannot be provoked for a channel the caller could not otherwise
+@@ -3962,6 +3978,11 @@ export class Repository {
         * reach. Enforcing it in the service would put it FIRST — before the ban, the
         * visibility and the archive — and leak exactly what the ordering protects.
         * There is no way to be both last and outside this transaction. */
@@ -607,15 +862,9 @@ export function refineTextAndAttachments(
 +       * Every read converts NULL to `[]` on the way out (FR-007), once. */
 +      attachments?: Attachment[] | undefined;
        senderMustBeBot?: boolean;
-       /** REQUIRED SINCE THIS CHAPTER (FR-MSG-15, FR-006), and required is the whole
+       /** REQUIRED SINCE THE SENDER CHAPTER (FR-MSG-15, FR-006), and required is the whole
         * mechanism. SC-003 asks that no write path be able to produce a senderless
-        * message; a runtime check would be a test somebody has to remember, and this
-        * is a compile error. `exactOptionalPropertyTypes` means a caller cannot pass
-        * `undefined` here either — passing a `string | undefined` is named by the
-@@ -2228,12 +2249,20 @@ export class Repository {
-         id,
-         channelId: channel.id,
-         sequence: seq,
+@@ -4193,6 +4214,14 @@ export class Repository {
          userId: userId ?? null,
          text,
          metadata: metadata ?? {},
@@ -630,13 +879,7 @@ export function refineTextAndAttachments(
          idempotencyKey: idempotencyKey ?? null,
        });
  
-       // The conflict clause is attached ONLY when a key is present, and it
-       // names the partial index explicitly. A bare ON CONFLICT DO NOTHING
-       // would absorb every constraint on the table — including DR-01's
-@@ -2310,12 +2339,15 @@ export class Repository {
-         message: {
-           id,
-           channel_id: channel.id,
+@@ -4275,6 +4304,9 @@ export class Repository {
            seq,
            user: userExternalId ?? null,
            text,
@@ -646,13 +889,7 @@ export function refineTextAndAttachments(
            created_at: createdAt,
          },
        });
-       await tx.insert(outbox).values({
-         subject: event.subject,
-         payload: event.payload,
-@@ -2323,12 +2355,20 @@ export class Repository {
- 
-       return {
-         id,
+@@ -4399,6 +4431,14 @@ export class Repository {
          channel_id: channel.id,
          seq,
          text,
@@ -667,13 +904,7 @@ export function refineTextAndAttachments(
          created_at: createdAt,
        };
      });
-   }
- 
-   /** Change what a message says (FR-001, FR-002, FR-003, FR-004).
-@@ -2375,12 +2415,20 @@ export class Repository {
-         .select({
-           id: messages.id,
-           userId: messages.userId,
+@@ -4451,6 +4491,14 @@ export class Repository {
            text: messages.text,
            seq: messages.sequence,
            createdAt: messages.createdAt,
@@ -688,13 +919,7 @@ export function refineTextAndAttachments(
            // The author as a CONSUMER sees them, for the outbox event below. Joined
            // here rather than looked up after the write: this transaction already
            // reads the row, and `MessageCreatedData`'s boundary is that `user_id` does
-           // not cross it.
-           author: users.externalId,
-         })
-@@ -2458,12 +2506,16 @@ export class Repository {
-         message: {
-           id: row.id,
-           channel_id: channelId,
+@@ -4534,6 +4582,10 @@ export class Repository {
            seq: row.seq,
            user: row.author,
            text,
@@ -705,13 +930,7 @@ export function refineTextAndAttachments(
            created_at: toIso(row.createdAt),
          },
        });
-       await tx.insert(outbox).values({
-         subject: event.subject,
-         payload: event.payload,
-@@ -2471,12 +2523,16 @@ export class Repository {
- 
-       return {
-         id: row.id,
+@@ -4547,6 +4599,10 @@ export class Repository {
          channel_id: channelId,
          seq: row.seq,
          text,
@@ -722,13 +941,7 @@ export function refineTextAndAttachments(
          created_at: toIso(row.createdAt),
          edited_at: toIso(editedAt),
          prior_text: row.text,
-       };
-     });
-   }
-@@ -2597,12 +2653,16 @@ export class Repository {
-           deleted: {
-             id: row.id,
-             channel_id: channelId,
+@@ -4673,6 +4729,10 @@ export class Repository {
              seq: row.seq,
              text: null,
              created_at: toIso(row.createdAt),
@@ -739,13 +952,7 @@ export function refineTextAndAttachments(
              user: author,
              // THE INSTANT ALREADY ON THE ROW, not a fresh reading. FR-009 says a
              // repeated deletion changes nothing, and the timestamp is the column that
-             // would otherwise move.
-             //
-             // `?? toIso(row.createdAt)` COVERS A ROW THE LANE ACTUALLY HOLDS: a system
-@@ -2672,12 +2732,16 @@ export class Repository {
-         deleted: {
-           id: row.id,
-           channel_id: channelId,
+@@ -4748,6 +4808,10 @@ export class Repository {
            seq: row.seq,
            text: null,
            created_at: toIso(row.createdAt),
@@ -756,13 +963,7 @@ export function refineTextAndAttachments(
            user: author,
            // THE COMMITTED INSTANT, read back from the UPDATE. The outbox event above
            // quotes this same value, so a consumer and a socket client comparing the
-           // event with the frame see one timestamp rather than two readings of one
-           // clock a few milliseconds apart.
-           deleted_at: deletedAt,
-@@ -2757,12 +2821,17 @@ export class Repository {
-     const [row] = await tx
-       .select({
-         id: messages.id,
+@@ -5045,6 +5109,11 @@ export class Repository {
          channel_id: messages.channelId,
          seq: messages.sequence,
          text: messages.text,
@@ -774,13 +975,7 @@ export function refineTextAndAttachments(
          created_at: messages.createdAt,
        })
        .from(messages)
-       .innerJoin(channels, eq(channels.id, messages.channelId))
-       .where(
-         and(
-@@ -2775,13 +2844,21 @@ export class Repository {
-     // conflicted on the idempotency index, so the key is already there.
-     if (!row) {
-       throw new Error(
+@@ -5063,7 +5132,15 @@ export class Repository {
          `idempotency key ${idempotencyKey} conflicted but its message is missing — index inconsistency`,
        );
      }
@@ -797,13 +992,7 @@ export function refineTextAndAttachments(
    }
  
    /** Does this channel resolve IN THIS TENANT? (chapter 2.8.)
-    *
-    * The write path has asked since 2.2 — it needs the channel row to lock —
-    * so it answers a foreign id with a 404. The read path never asked: a
-@@ -2940,12 +3017,16 @@ export class Repository {
-     }
- 
-     const columns = {
+@@ -5228,6 +5305,10 @@ export class Repository {
        id: messages.id,
        channel_id: messages.channelId,
        seq: messages.sequence,
@@ -814,13 +1003,7 @@ export function refineTextAndAttachments(
        // The sender joins the read path in 2.7 (the IOU 2.6 wrote): resume
        // must emit frames identical to live ones, and a reader that gets a
        // different shape depending on which door it came through is a client
-       // bug waiting for a reconnect.
-       user: users.externalId,
-       text: messages.text,
-@@ -2998,12 +3079,20 @@ export class Repository {
-           .leftJoin(users, eq(users.id, messages.userId))
-           .where(scoped(gt(messages.sequence, afterSeq)))
-           .orderBy(asc(messages.sequence))
+@@ -5286,6 +5367,14 @@ export class Repository {
            .limit(limit));
      return rows.map((row) => ({
        ...row,
@@ -835,16 +1018,10 @@ export function refineTextAndAttachments(
        created_at: toIso(row.created_at),
        // `null`, NOT `undefined`, and the difference is what a test can see. An absent
        // key and a null one are the same value through `??` — the control test for this
-       // field was green before the field existed because its first draft used `??`.
-       edited_at: row.edited_at === null ? null : toIso(row.edited_at),
-     }));
 ```
 
 ```diff title="services/api/src/messages/messages.controller.ts"
-@@ -72,14 +72,21 @@ function publishContext(req: RequestWithPrincipal): {
-     requestId: req.requestId ?? "unknown",
-     environmentId: req.principal?.environmentId ?? "unknown",
-   };
+@@ -75,8 +75,15 @@ function publishContext(req: RequestWithPrincipal): {
  }
  
  // The api's first product endpoint (chapter 2.2). Validation is zod at the
@@ -852,23 +1029,17 @@ export function refineTextAndAttachments(
 -// and the WebSocket frame payload cannot drift (1.3's payoff, again).
 +// boundary, from the same schema family as @relay/protocol.
 +//
-+// THAT IS NOT THE SAME AS "CANNOT DRIFT", which this comment claimed until this
-+// chapter. They are two schemas validated at two controllers — this route
++// THAT IS NOT THE SAME AS "CANNOT DRIFT", which this comment claimed until
++// They are two schemas validated at two controllers — this route
 +// with `sendMessageBodySchema`, every socket send with
 +// `internalSendRequestSchema` — and they have drifted three times: `idem_key`
-+// against `idempotency_key`, the text bound, and FR-019b's pair rule, which this
-+// chapter had to be told to carry across. What keeps them together is a shared
++// against `idempotency_key`, the text bound, and FR-019b's pair rule, which
++// The attachments chapter had to be told to carry across. What keeps them together is a shared
 +// DEFINITION each applies, not a family resemblance.
  //
  // The credentials chapter swapped the guard. `EnvironmentContextGuard` resolved a tenant
  // from a header the caller asserted; `CredentialGuard` only asks whether the
- // principal the middleware already resolved is allowed here. Both classes are
- // accepted (FR-MSG-13 lets a server send on behalf of a bot user of its tenant, and
- // FR-AUT-10 does not reserve these routes) — and the sender chapter made that a DECLARATION
-@@ -239,23 +246,31 @@ export class MessagesController {
-           // `messageSchema` is a `z.strictObject` — publishing `channel_id`
-           // would deliver NOTHING while this route still answered 201.
-           channel: message.channel_id,
+@@ -242,6 +249,10 @@ export class MessagesController {
            seq: message.seq,
            user: actingExternalId,
            text: message.text,
@@ -879,11 +1050,7 @@ export function refineTextAndAttachments(
            created_at: message.created_at,
          },
          publishContext(req),
-       );
-     }
- 
-     return {
-       id: message.id,
+@@ -253,6 +264,10 @@ export class MessagesController {
        channel_id: message.channel_id,
        seq: message.seq,
        text: message.text,
@@ -894,13 +1061,7 @@ export function refineTextAndAttachments(
        created_at: message.created_at,
        // THE SENDER IT USED (FR-009a). A caller now required to name one
        // gets told which was recorded — and for a user token, which it inferred. The
-       // internal send has carried this since chapter 2.6; the public one answered five
-       // fields and left the caller to assume.
-       user: actingExternalId,
-@@ -337,12 +352,16 @@ export class MessagesController {
-           // `messageSchema` is a `z.strictObject`, so the wrong name delivers NOTHING
-           // while this route answers 200. The send path records the same trap.
-           channel: edited.channel_id,
+@@ -340,6 +355,10 @@ export class MessagesController {
            seq: edited.seq,
            user: actingExternalId,
            text: edited.text!,
@@ -911,13 +1072,7 @@ export function refineTextAndAttachments(
            created_at: edited.created_at,
          },
        },
-       publishContext(req),
-     );
- 
-@@ -354,12 +373,15 @@ export class MessagesController {
-     // formality.
-     return {
-       id: edited.id,
+@@ -357,6 +376,9 @@ export class MessagesController {
        channel_id: edited.channel_id,
        seq: edited.seq,
        text: edited.text,
@@ -927,68 +1082,46 @@ export function refineTextAndAttachments(
        created_at: edited.created_at,
        edited_at: edited.edited_at,
        user: actingExternalId,
-     };
-   }
 ```
 
 ```diff title="services/gateway/src/session.ts"
-@@ -113,19 +113,34 @@ function isInboundFrame(frame: Frame): frame is Extract<Frame, { type: InboundFr
- 
- function send(socket: WebSocket, frame: Frame): void {
-   socket.send(JSON.stringify(frame));
- }
- 
- /** EIR-API-04's envelope, wearing its WebSocket clothes. */
--function sendError(socket: WebSocket, code: ErrorCode, message: string): void {
-+function sendError(
-+  socket: WebSocket,
-+  code: ErrorCode,
-+  message: string,
+@@ -175,6 +175,15 @@ function sendError(
+   code: ErrorCode,
+   message: string,
+   requestId: string = newRequestId(),
 +  /** WHICH FIELD, on the socket door (FR-005).
 +   *
 +   * `errorFrameSchema` has published this key since chapter 1.3 and no gateway code path
-+   * had ever set it — the same habit `zod-validation.pipe.ts` ended for the api at the
-+   * channel-endpoints chapter, whose comment cites THIS schema while fixing only its own
-+   * side.
++   * had ever set it — the same habit `zod-validation.pipe.ts` ended for the api at
++   * The error-registry chapter, whose comment cites THIS schema while fixing only its own side.
 +   *
 +   * Omitted when there is no path, exactly as the pipe does: an empty path means the
 +   * whole frame failed and there is no field to name. */
 +  field?: string,
-+): void {
+ ): void {
    send(socket, {
      type: "error",
-     payload: {
-       code,
+@@ -183,6 +192,7 @@ function sendError(
        message,
        docs_url: docsUrl(code),
+       request_id: requestId,
 +      ...(field !== undefined && field.length > 0 ? { field } : {}),
      },
    });
  }
- 
- export interface SessionServerOptions {
-   server: Server;
-@@ -1286,12 +1301,15 @@ export function attachSessions({
-     const frame = frameSchema.safeParse(parsed);
-     if (!frame.success) {
-       sendError(
+@@ -1445,6 +1455,10 @@ export function attachSessions({
          connection.socket,
          "invalid_frame",
          frame.error.issues[0]?.message ?? "frame failed schema validation",
++        undefined,
 +        // The joined path, which is what a developer reading their own frame sees —
 +        // `payload.attachments.3.kind` rather than "somewhere in this frame".
 +        frame.error.issues[0]?.path.join("."),
        );
        return;
      }
-     if (!isInboundFrame(frame.data)) {
-       // Everything else in the union is server → client. A client uttering
-       // one is a protocol violation, not a malformed frame (EIR-WS-06).
-@@ -1310,17 +1328,22 @@ export function attachSessions({
-     // gateway, Redis, and whoever is subscribed.
-     if (frame.data.type === "typing.send") {
-       await signalTyping(connection, frame.data.payload.channel);
-       return;
+@@ -1509,11 +1523,16 @@ export function attachSessions({
+       }
      }
  
 -    const { channel, text, idem_key } = frame.data.payload;
@@ -1005,13 +1138,7 @@ export function refineTextAndAttachments(
          idempotency_key: idem_key,
        });
        const { seq } = committed;
-       // The ack carries the sequence the API committed — after the commit,
-       // never before (FR-MSG-05, unchanged since 2.2; the socket is a new
-       // door onto the same write path).
-@@ -1338,12 +1361,19 @@ export function attachSessions({
-         await fanout?.publish({
-           id: committed.id,
-           channel: committed.channel_id,
+@@ -1537,6 +1556,13 @@ export function attachSessions({
            seq: committed.seq,
            user: committed.user,
            text: committed.text,
@@ -1025,9 +1152,6 @@ export function refineTextAndAttachments(
            created_at: committed.created_at,
          });
        }
-     } catch (error) {
-       logger.log("error", "send.failed", {
-         connection_id: connection.id,
 ```
 
 ```diff title="services/api/src/outbox/event.ts"
@@ -1066,7 +1190,7 @@ export function refineTextAndAttachments(
  /** A DELETION as a consumer receives it (FR-019, FR-020).
   *
   * NO `text`, AND NO `text: null` EITHER. The frame `packages/protocol/src/frames.ts`
-@@ -298,12 +313,30 @@ export const outboxEventSchema = z.discriminatedUnion("type", [
+@@ -297,12 +312,30 @@ export const outboxEventSchema = z.discriminatedUnion("type", [
      data: z.strictObject({
        id: z.string().min(1),
        channel_id: z.string().min(1),
@@ -1097,7 +1221,7 @@ export function refineTextAndAttachments(
    // The union is exhaustive over `OUTBOX_EVENT_TYPES`, and this file's own
    // comment above says why that matters: `consumer/runtime.ts:163` answers a failed
    // parse with `message.term()`, which stops redelivery for good. A type added to the
-@@ -319,12 +352,30 @@ export const outboxEventSchema = z.discriminatedUnion("type", [
+@@ -318,12 +351,30 @@ export const outboxEventSchema = z.discriminatedUnion("type", [
      data: z.strictObject({
        id: z.string().min(1),
        channel_id: z.string().min(1),
@@ -1130,38 +1254,118 @@ export function refineTextAndAttachments(
      type: z.literal("message.deleted"),
 ```
 
-```diff title="packages/protocol/src/codes.test.ts"
-@@ -197,6 +197,23 @@ describe("the refusal this chapter's edit path adds", () => {
-     // THE WORDING IS THE CONTRACT: the remedy is to stop offering an edit, and the
-     // sentence has to say the history is unharmed or a client re-reads it as a loss.
-     expect(ERROR_CODES.message_deleted).toMatch(/deleted/);
-     expect(ERROR_CODES.message_deleted).toMatch(/history/);
+```diff title="packages/outsider/src/integrate.itest.ts"
+@@ -308,6 +308,74 @@ describe("integrating with Relay from the outside", () => {
+     socket.close();
    });
- });
+ 
++  /** T033. ATTACHMENTS THROUGH THE SHIPPED BINARY.
++   *
++   * This file is the only instrument in the repository that boots what customers run and
++   * drives it the way they do — Node's global `WebSocket`, no workspace import, the REST
++   * credential a customer's server holds. The revisions chapter's plan scheduled a title audit
++   * over this file and no task wrote to it; this chapter writes.
++   *
++   * TWO ATTACHMENTS AND THE ORDER, for the reason every other test in this chapter gives:
++   * one cannot show an order, and FR-006 says order holds on every path that returns a
++   * message. */
++  it("delivers two attachments to a socket, in order, sent over REST", async () => {
++    const socket = new WebSocket(`${ws}/v1/ws?token=${token}`);
++    const frames: { type: string; payload?: { text?: string; attachments?: { url?: string }[] } }[] =
++      [];
++    socket.addEventListener("message", (event) => {
++      frames.push(JSON.parse(String(event.data)) as { type: string });
++    });
++    socket.addEventListener("error", () => undefined);
++    await new Promise<void>((resolve, reject) => {
++      socket.addEventListener("open", () => resolve());
++      socket.addEventListener("close", (event) =>
++        reject(new Error(`closed ${(event as CloseEvent).code}`)),
++      );
++      setTimeout(() => reject(new Error(`no socket at ${ws} within 10s`)), 10_000);
++    });
 +
-+describe("the refusal this chapter's attachments add", () => {
-+  // NAMED, NOT COUNTED, for the reason the blocks above give — and this chapter is the
-+  // one that pays for it twice over: the count it replaced would have read a single
-+  // arithmetic edit where what happened is that a field the CONTRACT publishes got an
-+  // answer of its own.
-+  //
-+  // `invalid_request` IS THE WRONG ANSWER FOR `media_id`, and that is the whole
-+  // argument. Every other refusal in this pipe is about a body the contract does not
-+  // allow; `media_id` is in FR-MSG-11 and the caller made no mistake. A 400 saying
-+  // "invalid" tells them to fix a request that is already correct.
-+  it("names the unhosted-media refusal apart from a malformed request", () => {
++    const waitFor = async (predicate: (f: { type: string }) => boolean, what: string) => {
++      const deadline = Date.now() + 10_000;
++      for (;;) {
++        const found = frames.find(predicate);
++        if (found) return found;
++        if (Date.now() > deadline) {
++          throw new Error(`no ${what}; saw ${frames.map((f) => f.type).join(", ") || "nothing"}`);
++        }
++        await new Promise((r) => setTimeout(r, 50));
++      }
++    };
++    await waitFor((f) => f.type === "connection.ack", "connection.ack");
++
++    const text = `with pictures ${Date.now()}`;
++    const posted = await post(
++      `/v1/channels/${channelId}/messages`,
++      {
++        text,
++        user: "outside-bot",
++        idempotency_key: randomUUID(),
++        attachments: [
++          { type: "url", kind: "image", url: "https://example.test/outside-first.png" },
++          { type: "url", kind: "video", url: "https://example.test/outside-second.mp4" },
++        ],
++      },
++      credential,
++    );
++    expect(posted.status).toBe(201);
++
++    const delivered = (await waitFor(
++      (f) =>
++        f.type === "message.created" &&
++        (f as { payload?: { text?: string } }).payload?.text === text,
++      "message.created carrying the attachments",
++    )) as { payload: { attachments: { url?: string }[] } };
++    expect(delivered.payload.attachments.map((a) => a.url)).toEqual([
++      "https://example.test/outside-first.png",
++      "https://example.test/outside-second.mp4",
++    ]);
++    socket.close();
++  });
++
+   /** T100a — **the first `socket.send` in this file's history.**
+    *
+    * `grep -c "\.send(" packages/outsider/src/integrate.itest.ts` read **0** across
+```
+
+Hai mươi mốt file còn lại là cái giá của quyết định chứ không phải lập luận cho nó — mọi
+lần dựng payload tin nhắn mà compiler đã gọi tên, cộng với các test và những key set đã ghim
+đang giữ chúng. Chúng ở đây vì một chương thay đổi file có chain thì phải nói ra, chứ không
+phải vì người đọc phải nghiền ngẫm chúng.
+
+```diff title="packages/protocol/src/codes.test.ts"
+@@ -77,7 +77,7 @@ describe("the registry is the whole vocabulary (FR-024)", () => {
+     // its plan did not expect. **One pinned place, not the four the connection-cap chapter's close code
+     // moved** — that chapter's task predicted two and found four, so this one counted
+     // before editing: this assertion is the only place in the file that names a total.
+-    expect(Object.keys(ERROR_CODES)).toHaveLength(20);
++    expect(Object.keys(ERROR_CODES)).toHaveLength(21);
+   });
+ 
+   it("names the non-author refusal separately from the generic 403", () => {
+@@ -85,6 +85,14 @@ describe("the registry is the whole vocabulary (FR-024)", () => {
+     // one where the remedy differs, and here it differs absolutely: `forbidden`'s
+     // published remedy is a change of credential or of permission, and neither makes a
+     // message yours.
++    // The attachments chapter's one addition, and the three assertions a new code earns: it exists,
++    // it is not a synonym for the code somebody would otherwise reach for, and it says
++    // what it is about. `invalid_request` is the wrong answer for `media_id` because that
++    // field IS in the published contract.
 +    expect(ERROR_CODES).toHaveProperty("media_not_available");
 +    expect(ERROR_CODES.media_not_available).not.toBe(ERROR_CODES.invalid_request);
 +    expect(ERROR_CODES.media_not_available).toMatch(/media/);
-+  });
-+});
++
+     expect(ERROR_CODES).toHaveProperty("not_message_author");
+     expect(ERROR_CODES.not_message_author).not.toBe(ERROR_CODES.forbidden);
+     expect(ERROR_CODES.not_message_author).toMatch(/author/);
 ```
 
 ```diff title="packages/protocol/src/codes.ts"
-@@ -178,12 +178,37 @@ export const ERROR_CODES = {
-   // ONLY THE AUTHOR EVER SEES IT. `editMessage` checks authorship first, so a stranger
-   // is refused for not having written the message whether or not it still says
-   // anything — this code cannot tell anybody that a message they could not otherwise
+@@ -221,6 +221,30 @@ export const ERROR_CODES = {
    // see exists.
    message_deleted:
      "this message has been deleted; its text cannot be changed, and its history is unaffected",
@@ -1181,9 +1385,8 @@ export function refineTextAndAttachments(
 +   * be done is the thing it asks for. `ProtocolErrorFilter` derives a code from the
 +   * status for 400/401/403/404 and answers `internal_error` for everything else, so a
 +   * 422 MUST supply this code explicitly through `protocolError` — an unnamed 422 ships
-+   * a body calling itself an internal error. The webhook chapter has five of those still
-+   * open, on a service this tree has not built yet; this is the first 422 in the platform
-+   * that names its own code, and it names it because the schema raises it.
++   * a body calling itself an internal error, which is `gaps.md`'s five bare 422s in
++   * `webhooks.service.ts`, still open.
 +   *
 +   * §4.14 REPLACES THE ARM RATHER THAN THIS CODE. When hosted media ships, the
 +   * `{ type: "media" }` arm starts accepting and this entry describes a state the
@@ -1193,16 +1396,10 @@ export function refineTextAndAttachments(
    not_found:
      "no such resource for this tenant — and DELIBERATELY the same answer as for a resource in another tenant (FR-TEN-05)",
    internal_error:
-     "the platform failed in a way it did not anticipate; the request_id is what a support ticket needs",
- 
-   // FR-CHN-07's ceiling: a channel holds at most 1,000 members and an add that would
 ```
 
 ```diff title="packages/protocol/src/frames.test.ts"
-@@ -9,12 +9,17 @@ import { frameSchema, messageDeletedSchema, messageSchema, parseFrame } from "./
- const message = {
-   id: "m1",
-   channel: "c1",
+@@ -12,6 +12,11 @@ const message = {
    seq: 42,
    user: "u1",
    text: "hello",
@@ -1214,23 +1411,16 @@ export function refineTextAndAttachments(
    created_at: "2026-08-01T09:00:00.000Z",
  };
  
- const valid: Record<string, unknown> = {
-   "connection.ack": {
-     type: "connection.ack",
-@@ -151,12 +156,41 @@ describe("malformed frames reject", () => {
- // an exact count makes a new member a decision rather than an accident, and an
- // exact set makes it the RIGHT decision. The count alone would pass if somebody
- // swapped one member for another.
+@@ -159,6 +164,34 @@ describe("malformed frames reject", () => {
  // T015 and T016. THE EXACT KEY SET, on `codes.test.ts`'s precedent: an
  // exact set is what makes a payload change a decision rather than an accident, and the
  // only field that must NOT be there is the one this frame exists because it cannot fill.
 +describe("the message payload's exact key set (FR-022)", () => {
 +  it("names exactly seven, and attachments is one of them", () => {
-+    // SIX UNTIL THIS CHAPTER, and pinned here for the first time — the frame had no
++    // SIX UNTIL THE ATTACHMENTS CHAPTER, and pinned here for the first time — the frame had no
 +    // exact-set assertion at all, so `messageSchema` was the one published payload a
-+    // silent addition could reach. `codes.test.ts` has pinned its set since the
-+    // credentials chapter for the same reason: an exact set makes a change a decision
-+    // rather than an accident.
++    // silent addition could reach. `codes.test.ts` has pinned its set since the credentials chapter for the
++    // same reason: an exact set makes a change a decision rather than an accident.
 +    const parsed = messageSchema.parse(message);
 +    expect(Object.keys(parsed).sort()).toEqual([
 +      "attachments",
@@ -1256,13 +1446,7 @@ export function refineTextAndAttachments(
  describe("the deleted frame carries an identity and no text", () => {
    const tombstone = {
      id: message.id,
-     channel: message.channel,
-     seq: message.seq,
-     user: message.user,
-@@ -174,12 +208,25 @@ describe("the deleted frame carries an identity and no text", () => {
-       "id",
-       "seq",
-       "user",
+@@ -182,6 +215,19 @@ describe("the deleted frame carries an identity and no text", ()
      ]);
    });
  
@@ -1282,16 +1466,10 @@ export function refineTextAndAttachments(
    it("refuses a text field, because a deleted message has none", () => {
      // `z.strictObject`, so an extra key is an error rather than a silent drop. An empty
      // string would be worse than an error: a client could not tell a deleted message from
-     // one somebody sent blank.
-     const withText = messageDeletedSchema.safeParse({
-       type: "message.deleted",
 ```
 
 ```diff title="packages/protocol/src/index.ts"
-@@ -11,6 +11,7 @@ export * from "./codes.js";
- export * from "./internal.js";
- export * from "./fanout.js";
- export * from "./presence.js";
+@@ -14,3 +14,4 @@ export * from "./presence.js";
  export * from "./membership.js";
  export * from "./revision.js";
  export * from "./typing.js";
@@ -1299,10 +1477,7 @@ export function refineTextAndAttachments(
 ```
 
 ```diff title="packages/protocol/src/revision.test.ts"
-@@ -18,12 +18,17 @@ import { subjectForChannel } from "./fanout.js";
- const message = {
-   id: "m1",
-   channel: "c1",
+@@ -21,6 +21,11 @@ const message = {
    seq: 7,
    user: "tuan",
    text: "corrected",
@@ -1314,13 +1489,7 @@ export function refineTextAndAttachments(
    created_at: "2026-09-03T00:00:00.000Z",
  };
  
- const tombstone = {
-   id: "m1",
-   channel: "c1",
-@@ -62,12 +67,13 @@ describe("the revision subject (ADR-24)", () => {
- 
- describe("the revision fabric payload", () => {
-   it("takes an edit as a whole message", () => {
+@@ -65,6 +70,7 @@ describe("the revision fabric payload", () => {
      const parsed = revisionFabricSchema.parse({ kind: "updated", message });
      expect(parsed.kind).toBe("updated");
      expect(Object.keys(parsed.message).sort()).toEqual([
@@ -1328,16 +1497,10 @@ export function refineTextAndAttachments(
        "channel",
        "created_at",
        "id",
-       "seq",
-       "text",
-       "user",
 ```
 
 ```diff title="services/api/src/db/repository.itest.ts"
-@@ -1108,6 +1108,320 @@ describe("deleteMessage", () => {
-     ).rejects.toThrow(MessageNotFoundError);
-     await expect(
-       repoB.deleteMessage(there.id, sent.id, { userId: author.id }),
+@@ -1110,3 +1110,317 @@ describe("deleteMessage", () => {
      ).rejects.toThrow(MessageNotFoundError);
    });
  });
@@ -1658,10 +1821,7 @@ export function refineTextAndAttachments(
 ```
 
 ```diff title="services/api/src/fanout/publisher.test.ts"
-@@ -37,12 +37,13 @@ vi.mock("ioredis", () => ({
- const message = {
-   id: "m1",
-   channel: "c1",
+@@ -40,6 +40,7 @@ const message = {
    seq: 1,
    user: "outside-bot",
    text: "hello",
@@ -1669,13 +1829,7 @@ export function refineTextAndAttachments(
    created_at: "2026-08-27T00:00:00.000Z",
  };
  const context = { requestId: "req-1", environmentId: "env-1" };
- 
- const tombstone = {
-   id: "m1",
-@@ -83,12 +84,13 @@ describe("the api's fan-out publisher", () => {
-     // non-positive `seq` and a `created_at` that is not RFC 3339, in one line.
-     const { logger } = sink();
-     await createMessagePublisher({ logger }).publish(message, context);
+@@ -86,6 +87,7 @@ describe("the api's fan-out publisher", () => {
      const parsed = messageSchema.safeParse(JSON.parse(publishes[0]![1]));
      expect(parsed.success).toBe(true);
      expect(Object.keys(JSON.parse(publishes[0]![1])).sort()).toEqual([
@@ -1683,16 +1837,10 @@ export function refineTextAndAttachments(
        "channel",
        "created_at",
        "id",
-       "seq",
-       "text",
-       "user",
 ```
 
 ```diff title="services/api/src/internal/backfill.controller.ts"
-@@ -109,10 +109,19 @@ function toFrame(row: MessageWithSender, channelId: string): Message[] {
-     {
-       id: row.id,
-       channel: channelId,
+@@ -112,6 +112,15 @@ function toFrame(row: MessageWithSender, channelId: string): Message[] {
        seq: row.seq,
        user: row.user,
        text: row.text,
@@ -1708,14 +1856,10 @@ export function refineTextAndAttachments(
        created_at: row.created_at,
      },
    ];
- }
 ```
 
 ```diff title="services/api/src/internal/backfill.itest.ts"
-@@ -109,12 +109,47 @@ describe("POST /internal/backfill", () => {
-       seq: a.seq,
-       user: "tuan",
-       text: "B2, north ramp",
+@@ -112,6 +112,41 @@ describe("POST /internal/backfill", () => {
      });
    });
  
@@ -1757,16 +1901,10 @@ export function refineTextAndAttachments(
    it("excludes the cursor's own message — the anchor is exclusive", async () => {
      const a = await say(channelId, "already applied");
      const body = await parsed(await ask({ [channelId]: a.seq }));
-     expect(body.channels[channelId]!.messages.map((m) => m.seq)).not.toContain(
-       a.seq,
-     );
 ```
 
 ```diff title="services/api/src/internal/internal.controller.ts"
-@@ -63,12 +63,17 @@ export class InternalController {
-     const user = await this.repo.getUserByExternalId(userExternalId);
-     if (!user) throw new BadRequestException("unknown user");
-     const message = await this.messages.send(
+@@ -66,6 +66,11 @@ export class InternalController {
        body.channel_id,
        {
          text: body.text,
@@ -1778,30 +1916,10 @@ export function refineTextAndAttachments(
          ...(body.idempotency_key !== undefined && {
            idempotency_key: body.idempotency_key,
          }),
-       },
-       // Chapter 2.6: the sender is RESOLVED here and, until now, dropped
-       // here — every socket-written row had user_id NULL. Fan-out cannot
 ```
 
 ```diff title="services/api/src/messages/messages.itest.ts"
-@@ -7,12 +7,13 @@ import { randomUUID } from "node:crypto";
- 
- import { AppModule } from "../app.module";
- import { mintUserToken } from "../auth/user-token";
- import { environmentSigningSecret } from "../db/repository";
- import { createDb, createPool } from "../db/client";
- import { createApiKey, createEnvironment, Repository } from "../db/repository";
-+import { docsUrl } from "@relay/protocol";
- import { withoutRequestId } from "../isolation/compare";
- 
- // The endpoint path (chapter 2.2): guard → pipe → service → repository →
- // filter, over real HTTP against the compose Postgres. Its own environment,
- // minted here — no truncate, because tenant isolation means this suite and
- // the repository suite cannot see each other's rows (2.1's property, paying
-@@ -113,12 +114,281 @@ describe("POST /v1/channels/:channelId/messages", () => {
-     expect(res.status).toBe(400);
-     const body = (await res.json()) as Record<string, unknown>;
-     expect(body).toMatchObject({ code: "invalid_request" });
+@@ -120,6 +120,265 @@ describe("POST /v1/channels/:channelId/messages", () => {
      expect(typeof body.docs_url).toBe("string");
    });
  
@@ -1855,7 +1973,7 @@ export function refineTextAndAttachments(
 +    it("stores the same url twice, twice (FR-021)", async () => {
 +      // THE SPEC ASKED THIS AS AN OPEN QUESTION AND ANSWERED IT: two identical links are
 +      // two attachments, because the platform does not compare them — the same argument
-+      // the revisions chapter made for not comparing message texts to decide whether an edit
++      // The revisions chapter made for not comparing message texts to decide whether an edit
 +      // happened.
 +      const res = await send({
 +        text: "the same twice",
@@ -1906,19 +2024,11 @@ export function refineTextAndAttachments(
 +      // done is the thing it asks for.
 +      expect(res.status).toBe(422);
 +      const body = (await res.json()) as Record<string, unknown>;
-+      // THE BODY, NOT ONLY THE STATUS. A 422 is the easy half: `ProtocolErrorFilter`
-+      // derives a code from the status for 400, 401, 403 and 404 only, so every OTHER
-+      // status ships a body calling itself `internal_error` while the status line reads
-+      // correctly. A test that asserts the status and the message text passes through
-+      // exactly that — which is a finding the webhook chapter owns, on a suite this tree
-+      // does not have yet. What is asserted here instead is the code itself.
++      // THE BODY, NOT ONLY THE STATUS (T039a). `webhooks.itest.ts:90` asserts a 422 and
++      // its message text, and the five bare 422s behind it have been emitting
++      // `internal_error` for four chapters — a status assertion cannot see that.
 +      expect(body.code).toBe("media_not_available");
-+      // DERIVED, NOT SPELLED. `codes.test.ts` owns the URL RULE — one assertion, in the
-+      // package that builds the URL — and restating its shape here would be a second
-+      // copy of it in a route test, which is how the two drift. What this test is about
-+      // is that the envelope names THIS code: a 422 whose `docs_url` points at
-+      // `invalid_request` is the failure, not the separator.
-+      expect(body.docs_url).toBe(docsUrl("media_not_available"));
++      expect(body.docs_url).toMatch(/#media_not_available$/);
 +      expect(String(body.message)).toMatch(/hosted media is not available/i);
 +      // `attachments.0` AND NOT `attachments.0.type`. The refinement refuses the ARM, so
 +      // zod's path stops at the object — and that is the honest field: nothing is wrong
@@ -1979,9 +2089,9 @@ export function refineTextAndAttachments(
 +      const page = (await res.json()) as { messages: Array<Record<string, unknown>> };
 +      const read = page.messages.find((m) => m["seq"] === created.seq)!;
 +      // `toHaveProperty` AND NOT `toEqual([])`. An ABSENT key and a `[]` both satisfy
-+      // `expect(read.attachments).toEqual([])` when the value is undefined — the
-+      // revisions chapter shipped a control test that was green before its field existed
-+      // for exactly this reason. This assertion fails on an absent key.
++      // `expect(read.attachments).toEqual([])` when the value is undefined —
++      // the revisions chapter shipped a control test that was green before its field existed for exactly
++      // this reason. This assertion fails on an absent key.
 +      expect(read).toHaveProperty("attachments", []);
 +    });
 +
@@ -1989,9 +2099,9 @@ export function refineTextAndAttachments(
 +      // WHAT THIS DOES NOT PROVE, said here rather than left to be assumed: the attachment
 +      // adds no second surface BY CONSTRUCTION, not by this assertion. `channelVisibleTo`
 +      // runs as a gate before the read, so a non-member's answer contains no message and
-+      // therefore no attachment whatever the read path does with the column. The
-+      // revisions chapter's falsification proved this shape of test stays green when the
-+      // predicate is removed. T032b runs it again here and expects green.
++      // therefore no attachment whatever the read path does with the column.
++      // The revisions chapter's falsification proved this shape of test stays green when the predicate is
++      // removed. T032b runs it again here and expects green.
 +      // THE PRIVATE CHANNEL OF THE SAME TENANT, which the suite already mints — and it is
 +      // the only case the channel-control chapter's `channelVisibleTo` alone answers, per the revisions chapter's
 +      // falsification. A foreign tenant is refused by the tenant scope one layer earlier.
@@ -2009,8 +2119,7 @@ export function refineTextAndAttachments(
 +        { headers: { authorization: `Bearer ${outsiderKey}` } },
 +      );
 +      expect(hidden.status).toBe(missing.status);
-+      // BYTE-IDENTICAL BUT FOR `request_id`, the same strip the isolation harness's
-+      // oracle uses
++      // BYTE-IDENTICAL BUT FOR `request_id`, the same strip the isolation gauntlet's oracle uses
 +      // and the same one at :435 above: it names the request rather than the resource, so
 +      // it differs by construction. Comparing raw bodies makes every such test fail for a
 +      // reason that is not the finding — which is how this one failed first.
@@ -2046,8 +2155,7 @@ export function refineTextAndAttachments(
 +      const body = (await res.json()) as Record<string, unknown>;
 +      expect(body.code).toBe("invalid_request");
 +      // NOT ABSENT. A refusal that says "Invalid input" and no field leaves the caller to
-+      // work out which key it was about — the error-registry chapter's whole subject,
-+      // and the reason
++      // work out which key it was about — the error-registry chapter's whole subject, and the reason
 +      // this assertion is on the field rather than the status.
 +      expect(body.field).toBe("text");
 +    });
@@ -2077,13 +2185,7 @@ export function refineTextAndAttachments(
    it("answers a foreign channel's HISTORY with that same 404 (chapter 2.8)", async () => {
      // The milestone suite found the two doors disagreeing: POST said 404 for
      // a channel this tenant cannot see, GET said 200 with an empty page. An
-     // empty page leaks nothing, but it leaves a client unable to tell "no
-     // such conversation" from "nothing said yet" — and one resource should
-     // not answer two ways depending on the verb.
-@@ -501,21 +771,30 @@ describe("PATCH /v1/channels/:channelId/messages/:messageId", () => {
- 
-   afterAll(async () => {
-     await app.close();
+@@ -512,15 +771,24 @@ describe("PATCH /v1/channels/:channelId/messages/:messageId", ()
    });
  
    /** A message by `author`, sent with their own token so the row carries them. */
@@ -2111,13 +2213,7 @@ export function refineTextAndAttachments(
    };
  
    const patch = (
-     messageId: string,
-     body: unknown,
-     auth: string,
-@@ -1001,12 +1280,133 @@ describe("PATCH /v1/channels/:channelId/messages/:messageId", () => {
-     // above.
-     const rows = (await history()).messages.filter((m) => m["id"] === sent.id);
-     expect(rows[0]!["text"]).toBe("something to aim at");
+@@ -1012,6 +1280,127 @@ describe("PATCH /v1/channels/:channelId/messages/:messageId", ()
      expect(rows[0]!["edited_at"]).toBeNull();
    });
  
@@ -2190,7 +2286,7 @@ export function refineTextAndAttachments(
 +    });
 +
 +    it("says nothing about attachments in the edit history (FR-016)", async () => {
-+      // `message_edits` HAS THREE COLUMNS AND THE SAD PUBLISHES THREE. THE REVISIONS CHAPTER built
++      // `message_edits` HAS THREE COLUMNS AND THE SAD PUBLISHES THREE. The revisions chapter built
 +      // that table to a published DDL, and an attachment column would be a fourth nobody
 +      // published — so the edit history records what the text WAS and says nothing about
 +      // what was attached, because nothing about that changed.
@@ -2245,16 +2341,10 @@ export function refineTextAndAttachments(
    it("an empty text is a 400 through the protocol envelope (FR-001)", async () => {
      const sent = await sendAsAuthor("something");
      const res = await patch(sent.id, { text: "" }, await tokenFor("author"));
-     expect(res.status).toBe(400);
-     const body = (await res.json()) as Record<string, unknown>;
-     expect(body["code"]).toBe("invalid_request");
 ```
 
 ```diff title="services/api/src/messages/messages.service.ts"
-@@ -72,12 +72,16 @@ export class MessagesService {
-       if (userId === undefined) {
-         throw new Error("a message must name its sender (FR-MSG-15, FR-008)");
-       }
+@@ -77,6 +77,10 @@ export class MessagesService {
        return await this.repo.sendMessage(channelId, {
          text: body.text,
          metadata: body.metadata,
@@ -2265,43 +2355,10 @@ export function refineTextAndAttachments(
          userId,
          senderMustBeBot,
          ...(userExternalId !== undefined && { userExternalId }),
-         ...(body.idempotency_key != null && {
-           idempotencyKey: body.idempotency_key,
-         }),
 ```
 
 ```diff title="services/api/src/messages/zod-validation.pipe.ts"
-@@ -1,14 +1,22 @@
--import { BadRequestException, type PipeTransform } from "@nestjs/common";
-+import type { PipeTransform } from "@nestjs/common";
- import type { ZodType } from "zod";
- 
-+import { protocolError } from "../protocol-error";
-+
- // Boundary validation (chapter 2.2). safeParse, never parse: a throw
- // from deep inside a library is not an error shape anyone can rely on.
--// The BadRequestException carries the message; 1.4's ProtocolErrorFilter
--// turns it into the EIR-API-04 envelope on the way out — one error shape,
--// one home, unchanged since the skeleton.
-+//
-+// THROUGH `protocolError` AND NOT `BadRequestException`, and that switch is owed to the
-+// errors chapter rather than to this one. That chapter built the typed thrower and
-+// rewired `session.ts` and the filter to it; this pipe kept the untyped exception, and
-+// nothing noticed because both produce the same 400 envelope. What forced it here is a
-+// code that is NOT 400: `media_not_available` cannot travel as a `BadRequestException`
-+// at all, so the one call site that never needed typing is the one that now proves it.
-+// 1.4's ProtocolErrorFilter still turns the throw into the EIR-API-04 envelope on the
-+// way out — one error shape, one home, unchanged since the skeleton.
- export class ZodValidationPipe<T> implements PipeTransform<unknown, T> {
-   constructor(private readonly schema: ZodType<T>) {}
- 
-   transform(value: unknown): T {
-     const result = this.schema.safeParse(value);
-     if (!result.success) {
-@@ -24,16 +32,46 @@ export class ZodValidationPipe<T> implements PipeTransform<unknown, T> {
-       //
-       // Named here rather than in the filter because only the pipe knows the
-       // path. Zod's `path` is an array — `["metadata", "blob"]` — and it joins
+@@ -29,7 +29,36 @@ export class ZodValidationPipe<T> implements PipeTransform<unknown, T> {
        // with dots, which is what a developer reading their own request body sees.
        // An empty path means the whole body failed (a non-object, say), and then
        // there is no field to name and the key is omitted rather than sent empty.
@@ -2327,11 +2384,6 @@ export function refineTextAndAttachments(
 +              | undefined)
 +          : undefined;
        const path = issue?.path.join(".");
--      throw new BadRequestException({
--        code: "invalid_request",
--        message: issue?.message ?? "invalid body",
--        ...(path !== undefined && path.length > 0 ? { field: path } : {}),
--      });
 +      if (named?.protocolCode !== undefined) {
 +        throw protocolError(
 +          named.protocolCode as Parameters<typeof protocolError>[0],
@@ -2340,23 +2392,13 @@ export function refineTextAndAttachments(
 +          ...(path !== undefined && path.length > 0 ? ([path] as const) : ([] as const)),
 +        );
 +      }
-+      throw protocolError(
-+        "invalid_request",
-+        issue?.message ?? "invalid body",
-+        400,
-+        path !== undefined && path.length > 0 ? path : undefined,
-+      );
-     }
-     return result.data;
-   }
- }
+       throw protocolError(
+         "invalid_request",
+         issue?.message ?? "invalid body",
 ```
 
 ```diff title="services/gateway/src/connections.itest.ts"
-@@ -327,12 +327,13 @@ describe("every connection a person holds is a first-class recipient (US3)", ()
-     await fanout.publish({
-       id: randomUUID(),
-       channel,
+@@ -331,6 +331,7 @@ describe("every connection a person holds is a first-class recipient (US3)", ()
        seq: 3,
        user,
        text: `after the refusal ${randomUUID()}`,
@@ -2364,13 +2406,7 @@ export function refineTextAndAttachments(
        created_at: new Date(0).toISOString(),
      });
      for (const [i, r] of five.entries()) {
-       await untilCount(r, "message.created", 1);
-       expect(count(r, "message.created"), `on ${String(i)}`).toBe(1);
-     }
-@@ -403,12 +404,13 @@ describe("every connection a person holds is a first-class recipient (US3)", ()
-     await fanout.publish({
-       id: randomUUID(),
-       channel,
+@@ -407,6 +408,7 @@ describe("every connection a person holds is a first-class recipient (US3)", ()
        seq: 1,
        user,
        text,
@@ -2378,13 +2414,7 @@ export function refineTextAndAttachments(
        created_at: new Date(0).toISOString(),
      });
  
-     await untilCount(a, "message.created", 1);
-     await untilCount(b, "message.created", 1);
-     // Settle, so a duplicate has time to arrive and be counted. Asserting a
-@@ -498,12 +500,13 @@ describe("every connection a person holds is a first-class recipient (US3)", ()
-     await fanout.publish({
-       id: randomUUID(),
-       channel,
+@@ -502,6 +504,7 @@ describe("every connection a person holds is a first-class recipient (US3)", ()
        seq: 2,
        user,
        text: `after b is gone ${randomUUID()}`,
@@ -2392,13 +2422,7 @@ export function refineTextAndAttachments(
        created_at: new Date(0).toISOString(),
      });
  
-     await untilCount(b, "message.created", 1);
-     expect(count(b, "message.created")).toBe(1);
-     await fanout.close();
-@@ -884,12 +887,13 @@ describe("the count survives the gateway it was counted on (US2)", () => {
-     await fanout.publish({
-       id: randomUUID(),
-       channel,
+@@ -888,6 +891,7 @@ describe("the count survives the gateway it was counted on (US2)", () => {
        seq: 4,
        user,
        text: `after the re-claim ${randomUUID()}`,
@@ -2406,16 +2430,10 @@ export function refineTextAndAttachments(
        created_at: new Date(0).toISOString(),
      });
      await untilCount(live, "message.created", 1);
-     expect(live.socket.readyState).toBe(WebSocket.OPEN);
-     expect(live.frames.filter((f) => f.type === "error")).toEqual([]);
-     await fanout.close();
 ```
 
 ```diff title="services/gateway/src/fanout.itest.ts"
-@@ -33,12 +33,13 @@ function messageOn(channel: string, seq: number): Message {
-   return {
-     id: `00000000-0000-0000-0000-${String(seq).padStart(12, "0")}`,
-     channel,
+@@ -36,6 +36,7 @@ function messageOn(channel: string, seq: number): Message {
      seq,
      user: "linh",
      text: `message ${seq}`,
@@ -2423,13 +2441,7 @@ export function refineTextAndAttachments(
      created_at: new Date().toISOString(),
    };
  }
- 
- /** Redis pub/sub is fire-and-forget, so a test cannot poll a queue — it
-  * waits for the callback, with a deadline. A failure here is a real
-@@ -250,12 +251,13 @@ describe("fan-out across instances", () => {
-         channel: CHANNEL,
-         seq: 13,
-         user: "linh",
+@@ -253,6 +254,7 @@ describe("fan-out across instances", () => {
          deleted_at: new Date().toISOString(),
          // @ts-expect-error the point of the test: a key the schema forbids
          text: "",
@@ -2437,16 +2449,10 @@ export function refineTextAndAttachments(
        },
      });
      await expect(nextRevision(g2, 300)).rejects.toThrow("deadline");
- 
-     // …and a well-formed one on the same subject still arrives, so the silence above was
-     // the schema and not a dead subscription.
 ```
 
 ```diff title="services/gateway/src/isolation.itest.ts"
-@@ -777,12 +777,16 @@ function sample(type: string, channel: string, user: string): unknown {
-   const message = {
-     id: randomUUID(),
-     channel,
+@@ -752,6 +752,10 @@ function sample(type: string, channel: string, user: string): unknown {
      seq: 1,
      user,
      text: "forged",
@@ -2457,16 +2463,10 @@ export function refineTextAndAttachments(
      created_at: new Date().toISOString(),
    };
    switch (type) {
-     case "connection.ack":
-       return { type, payload: { user, cursor: {}, resume_ok: true, truncated: [] } };
-     case "message.ack":
 ```
 
 ```diff title="services/gateway/src/presence.itest.ts"
-@@ -1339,12 +1339,13 @@ describe("presence: no durability, and the whole log vocabulary", () => {
-     await raw.publish({
-       id: randomUUID(),
-       channel: api.channelIds[0] as string,
+@@ -1316,6 +1316,7 @@ describe("presence: no durability, and the whole log vocabulary", () => {
        seq: 1,
        user: who,
        text: "not a presence payload",
@@ -2474,16 +2474,10 @@ export function refineTextAndAttachments(
        created_at: new Date().toISOString(),
      });
      await quiet(500);
-     await raw.close();
- 
-     // The message subject is not the presence subject, so this proves the reverse of
 ```
 
 ```diff title="services/gateway/src/resume.itest.ts"
-@@ -35,12 +35,13 @@ function frame(seq: number): Message {
-   return {
-     id: `id-${seq}`,
-     channel: CHANNEL,
+@@ -38,6 +38,7 @@ function frame(seq: number): Message {
      seq,
      user: "dispatcher",
      text: `m${seq}`,
@@ -2491,15 +2485,10 @@ export function refineTextAndAttachments(
      created_at: "2026-08-04T00:00:00.000Z",
    };
  }
- 
- const VALID_TOKEN = "token-for-tuan";
 ```
 
 ```diff title="services/gateway/src/resume.test.ts"
-@@ -24,12 +24,13 @@ function frame(channel: string, seq: number): Message {
-   return {
-     id: `id-${seq}`,
-     channel,
+@@ -27,6 +27,7 @@ function frame(channel: string, seq: number): Message {
      seq,
      user: "tuan",
      text: `m${seq}`,
@@ -2507,13 +2496,7 @@ export function refineTextAndAttachments(
      created_at: "2026-08-04T00:00:00.000Z",
    };
  }
- 
- describe("parseCursors", () => {
-   it("distinguishes a fresh connect from a resume with nothing new", () => {
-@@ -145,12 +146,13 @@ describe("suppressed", () => {
-   const at = (channel: string, seq: number): Message => ({
-     id: `id-${seq}`,
-     channel,
+@@ -148,6 +149,7 @@ describe("suppressed", () => {
      seq,
      user: "dispatcher",
      text: `m${seq}`,
@@ -2521,16 +2504,10 @@ export function refineTextAndAttachments(
      created_at: "2026-08-19T00:00:00.000Z",
    });
  
-   it("suppresses a frame at the mark", () => {
-     // `<=`, not `<`: the mark IS a sequence the backfill delivered.
-     expect(suppressed({ a: 42 }, at("a", 42))).toBe(true);
 ```
 
 ```diff title="services/gateway/src/session.test.ts"
-@@ -29,12 +29,13 @@ function committed(seq: number): InternalSendResponse {
-   return {
-     id: "00000000-0000-0000-0000-000000000001",
-     channel_id: "11111111-1111-1111-1111-111111111111",
+@@ -34,6 +34,7 @@ function committed(seq: number): InternalSendResponse {
      seq,
      user: "tuan",
      text: "hello",
@@ -2538,13 +2515,7 @@ export function refineTextAndAttachments(
      created_at: new Date().toISOString(),
    };
  }
- 
- function stubApi(overrides: Partial<ApiClient> = {}): ApiClient {
-   return {
-@@ -71,12 +72,13 @@ function frame(seq: number, channel = CHANNEL): Message {
-   return {
-     id: `id-${seq}`,
-     channel,
+@@ -85,6 +86,7 @@ function frame(seq: number, channel = CHANNEL): Message {
      seq,
      user: "dispatcher",
      text: `m${seq}`,
@@ -2552,13 +2523,7 @@ export function refineTextAndAttachments(
      created_at: "2026-08-04T00:00:00.000Z",
    };
  }
- 
- /** The one credential the stubbed api recognises. */
- const VALID_TOKEN = "token-for-tuan";
-@@ -366,12 +368,13 @@ describe("the socket (chapter 2.5)", () => {
-           // idem_key is REQUIRED by the wire contract (2.3): every socket
-           // send is retryable by construction, which is exactly why the
-           // republish rule below matters.
+@@ -404,6 +406,7 @@ describe("the socket (chapter 2.5)", () => {
            idem_key: "k-0",
            channel: "11111111-1111-1111-1111-111111111111",
            text: "hello",
@@ -2566,13 +2531,7 @@ export function refineTextAndAttachments(
          },
        }),
      );
-     await nextFrame(socket, "message.ack");
-     // The published frame is the WIRE shape, not the internal response:
-     // `channel`, not `channel_id`, and a sender that came back from the
-@@ -380,12 +383,13 @@ describe("the socket (chapter 2.5)", () => {
-       {
-         id: "00000000-0000-0000-0000-000000000001",
-         channel: "11111111-1111-1111-1111-111111111111",
+@@ -418,6 +421,7 @@ describe("the socket (chapter 2.5)", () => {
          seq: 42,
          user: "tuan",
          text: "hello",
@@ -2580,13 +2539,7 @@ export function refineTextAndAttachments(
          created_at: expect.any(String),
        },
      ]);
-     socket.close();
-   });
- 
-@@ -406,12 +410,13 @@ describe("the socket (chapter 2.5)", () => {
-     socket.send(
-       JSON.stringify({
-         type: "message.send",
+@@ -444,6 +448,7 @@ describe("the socket (chapter 2.5)", () => {
          payload: {
            channel: "11111111-1111-1111-1111-111111111111",
            text: "hello",
@@ -2594,16 +2547,10 @@ export function refineTextAndAttachments(
            idem_key: "k-1",
          },
        }),
-     );
-     // The sender is still acked — the retry SUCCEEDED, and FR-MSG-04 says
-     // it looks like a first send.
 ```
 
 ```diff title="services/gateway/src/typing.itest.ts"
-@@ -905,12 +905,16 @@ describe("a typing signal on its way out", () => {
-             {
-               id: randomUUID(),
-               channel,
+@@ -957,6 +957,10 @@ describe("a typing signal on its way out", () => {
                seq: 9,
                user: "tuan",
                text: "backfilled",
@@ -2614,13 +2561,7 @@ export function refineTextAndAttachments(
                created_at: new Date(0).toISOString(),
              },
            ],
-           truncated: false,
-         },
-       },
-@@ -1175,12 +1179,16 @@ describe("a typing signal on its way out", () => {
-       JSON.stringify({
-         id: randomUUID(),
-         channel,
+@@ -1227,6 +1231,10 @@ describe("a typing signal on its way out", () => {
          seq: 4_242,
          user: "tuan",
          text: "one message",
@@ -2631,9 +2572,6 @@ export function refineTextAndAttachments(
          created_at: new Date(0).toISOString(),
        }),
      );
-     await publisher.publish(
-       subjectForPresence(channel),
-       JSON.stringify({
 ```
 
 <ChapterFooter id="3.18" locale="vi" />
