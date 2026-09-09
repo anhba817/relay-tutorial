@@ -585,6 +585,517 @@ Five sends over REST and five `message.send` frames leave the shared `send` buck
 at **10** and `rest` at **5**. Two separate counters read 5 and 5 and pass every
 other test in the suite.
 
+```ts title="services/gateway/src/limits.itest.ts"
+import { spawn, type ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
+import type { Server } from "node:http";
+import type { AddressInfo } from "node:net";
+import { fileURLToPath } from "node:url";
+
+import { docsUrl } from "@relay/protocol";
+import { createLogger, serve, type Logger } from "@relay/service-kit";
+import { Redis } from "ioredis";
+import { WebSocket } from "ws";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+
+import { createApiClient } from "./api-client.js";
+import { createGatewayLimits, type GatewayLimits } from "./limits.js";
+import { attachSessions } from "./session.js";
+
+// The claim no single-process test can make: that the api and the
+// gateway increment ONE counter.
+//
+// Everything else about the limits is provable cheaper. The arithmetic is pure
+// and unit-tested; the socket's two refusals are unit-tested with a stub
+// counter; the api's headers are covered by its own integration suite. What
+// none of those can show is the property the whole design rests on — a socket
+// send and a REST send spend the same budget, because the budget lives in Redis
+// and neither process can see the other's memory. A test that stubs the store
+// would pass with two separate counters.
+//
+//   docker compose up -d --wait postgres redis
+//   pnpm build
+//   RELAY_POSTGRES_PORT=… RELAY_REDIS_PORT=… \
+//     pnpm --filter @relay/gateway test:integration
+//
+// The api runs as a CHILD PROCESS for the reason session.itest.ts gives: the
+// gateway is not allowed to know how the api is built (ADR-05), and importing
+// it would make that dependency real in order to deny it.
+
+const silent: Logger = createLogger("gateway", () => {});
+const REDIS_URL = `redis://localhost:${process.env.RELAY_REDIS_PORT ?? "6379"}`;
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const REPO = join(HERE, "..", "..", "..");
+const require_ = createRequire(import.meta.url);
+
+interface Seeded {
+  environmentId: string;
+  credential: string;
+  channelId: string;
+}
+
+interface ApiUnderTest extends Seeded {
+  url: string;
+  /** Configure this environment's policy. Plain SQL through the api's pool: the
+   * columns are three nullable integers and there is no admin API for them yet,
+   * so inventing one for a test would be inventing product. */
+  setLimits: (limits: {
+    rest?: number | null;
+    send?: number | null;
+    connect?: number | null;
+  }) => Promise<void>;
+  stop: () => void;
+}
+
+async function waitForHealth(url: string): Promise<void> {
+  const deadline = Date.now() + 30_000;
+  for (;;) {
+    try {
+      if ((await fetch(url)).ok) return;
+    } catch {
+      // not up yet
+    }
+    if (Date.now() > deadline) throw new Error("api never became healthy");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
+async function startApi(): Promise<ApiUnderTest> {
+  const dist = join(REPO, "services", "api", "dist");
+  if (!existsSync(join(dist, "main.js"))) {
+    throw new Error(
+      "the api is not built — run `pnpm build` before this lane " +
+        "(the suite talks to the real service, not a stub)",
+    );
+  }
+  const client = require_(join(dist, "db", "client.js")) as {
+    createDb: (pool: unknown) => unknown;
+    createPool: () => Pool;
+  };
+  const seeder = require_(join(dist, "db", "repository.js")) as {
+    createEnvironment: (
+      db: unknown,
+      input: { name: string },
+    ) => Promise<{ id: string }>;
+    createApiKey: (
+      db: unknown,
+      input: { environmentId: string },
+    ) => Promise<{ credential: string }>;
+    Repository: new (
+      db: unknown,
+      environmentId: string,
+    ) => {
+      createUser: (externalId: string, name?: string) => Promise<{ id: string }>;
+      createChannel: (
+        externalId: string,
+        type: string,
+      ) => Promise<{ id: string }>;
+      addMember: (channelId: string, userId: string) => Promise<boolean>;
+      upsertUser: (
+        externalId: string,
+        profile: { display_name?: string; kind?: string; description?: string },
+      ) => Promise<{ user: { id: string } }>;
+    };
+  };
+  const pool = client.createPool();
+  const db = client.createDb(pool);
+
+  const environment = await seeder.createEnvironment(db, {
+    name: `limits-itest-${randomUUID().slice(0, 8)}`,
+  });
+  const repo = new seeder.Repository(db, environment.id);
+  const user = await repo.createUser("tuan", "Tuan");
+  const channel = await repo.createChannel("fleet", "public");
+  await repo.addMember(channel.id, user.id);
+  // AND A BOT FOR THE REST HALF. The socket half sends as `tuan` through a user
+  // token; the REST half presents an APPLICATION credential, which carries no user
+  // of its own — so it must name a sender and that sender must be a BOT. A person
+  // named by a key is 403, an unknown name 400, and neither is a 429.
+  //
+  // Seeded here rather than per send, because this file's whole subject is how many
+  // requests fit under one limit: an extra call per send would move every number in
+  // it and leave the assertions passing for the wrong reason. No channel membership
+  // — measured, not assumed: the suite is green without it.
+  await repo.upsertUser("meter", {
+    display_name: "Meter",
+    kind: "bot",
+    description: "spends this suite's REST budget",
+  });
+  const key = await seeder.createApiKey(db, { environmentId: environment.id });
+
+  // `PORT: "0"` AND THE PORT READ OFF THE CHILD'S OWN LOG LINE, which is what the
+  // three sibling suites in this directory already do. Published's version of this
+  // file hand-allocated `RELAY_LIMITS_ITEST_API_PORT ?? 4124`, and a hand-maintained
+  // port table is the failure that cannot be checked: 4124 sits inside the band this
+  // chapter would have claimed, and NATS runs on 4222 inside the same band. The
+  // failure is silent in both directions — the child cannot bind, and the health
+  // check gets its answer from whatever DOES hold the port.
+  const child: ChildProcess = spawn("node", [join(dist, "main.js")], {
+    env: {
+      ...process.env,
+      PORT: "0",
+      RELAY_OUTBOX_RELAY: "off",
+      // Nor the notification relay: this suite counts requests, and a background
+      // loop sending mail is one more thing that can make a count wander.
+      RELAY_NOTIFICATION_RELAY: "off",
+      RELAY_REDIS_URL: REDIS_URL,
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const port = await new Promise<number>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("api never reported a port")), 30_000);
+    let buffered = "";
+    child.stdout?.on("data", (chunk: Buffer) => {
+      buffered += chunk.toString();
+      for (const line of buffered.split("\n")) {
+        if (!line.trim()) continue;
+        try {
+          const parsed = JSON.parse(line) as { msg?: string; port?: number };
+          if (parsed.msg === "listening" && typeof parsed.port === "number") {
+            clearTimeout(timer);
+            resolve(parsed.port);
+            return;
+          }
+        } catch {
+          /* a partial line; the next chunk completes it */
+        }
+      }
+    });
+    child.on("exit", (code) => {
+      clearTimeout(timer);
+      reject(new Error(`api exited before listening (code ${String(code)})`));
+    });
+  });
+  const url = `http://127.0.0.1:${port}`;
+  await waitForHealth(`${url}/healthz`);
+
+  return {
+    url,
+    environmentId: environment.id,
+    credential: key.credential,
+    channelId: channel.id,
+    setLimits: async ({ rest = null, send = null, connect = null }) => {
+      await pool.query(
+        "UPDATE environments SET rest_limit_per_minute = $2, " +
+          "send_limit_per_minute = $3, connect_limit_per_minute = $4 " +
+          "WHERE id = $1",
+        [environment.id, rest, send, connect],
+      );
+    },
+    stop: () => {
+      child.kill();
+      void pool.end();
+    },
+  };
+}
+
+interface Pool {
+  query: (text: string, values?: unknown[]) => Promise<unknown>;
+  end: () => Promise<void>;
+}
+
+function firstFrame(socket: WebSocket, type: string): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    socket.on("message", (raw) => {
+      const frame = JSON.parse(raw.toString()) as { type: string };
+      if (frame.type === type) resolve(frame);
+    });
+    socket.on("close", (code) => reject(new Error(`closed ${code}`)));
+    setTimeout(() => reject(new Error(`no ${type} within 5s`)), 5_000);
+  });
+}
+
+describe("one counter, two services", () => {
+  let api: ApiUnderTest;
+  let server: Server;
+  let limits: GatewayLimits;
+  let redis: Redis;
+  let url: string;
+  const sockets: WebSocket[] = [];
+
+  /** The key the api and the gateway are both supposed to be incrementing.
+   * Spelled out here rather than imported, because a test that computed it with
+   * the code under test would agree with a wrong answer. */
+  const key = (operation: string) =>
+    `rl:${api.environmentId}:${operation}:` +
+    `${Math.floor(Date.now() / 60_000) * 60_000}`;
+
+  const count = async (operation: string): Promise<number> =>
+    Number((await redis.get(key(operation))) ?? 0);
+
+  const mintToken = async (user = "tuan") => {
+    const res = await fetch(`${api.url}/auth/dev-token`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${api.credential}`,
+      },
+      body: JSON.stringify({ user, ttl_seconds: 3600 }),
+    });
+    if (!res.ok) throw new Error(`dev-token: ${res.status}`);
+    return ((await res.json()) as { token: string }).token;
+  };
+
+  const connect = async (token: string) => {
+    const socket = new WebSocket(`${url}/v1/ws?token=${token}`);
+    sockets.push(socket);
+    await firstFrame(socket, "connection.ack");
+    return socket;
+  };
+
+  const frameSend = async (socket: WebSocket, text: string) => {
+    socket.send(
+      JSON.stringify({
+        type: "message.send",
+        payload: { channel: api.channelId, text, idem_key: randomUUID() },
+      }),
+    );
+  };
+
+  const restSend = (text: string) =>
+    fetch(`${api.url}/v1/channels/${api.channelId}/messages`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${api.credential}`,
+        "idempotency-key": randomUUID(),
+      },
+      body: JSON.stringify({ text, user: "meter" }),
+    });
+
+  beforeAll(async () => {
+    api = await startApi();
+    limits = createGatewayLimits(REDIS_URL);
+    redis = new Redis(REDIS_URL);
+    server = serve({
+      service: "gateway",
+      health: () => ({}),
+      logger: silent,
+      // REQUIRED IN THIS TREE. The error-registry chapter made `serve` take the
+      // not-found link from `docsUrl` rather than spelling it, and it is upstream of
+      // this chapter here where it was downstream in the published order.
+      notFoundDocsUrl: docsUrl("not_found"),
+    });
+    attachSessions({
+      server,
+      api: createApiClient(api.url),
+      logger: silent,
+      limits,
+    });
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+    url = `ws://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  }, 60_000);
+
+  afterEach(async () => {
+    for (const socket of sockets.splice(0)) socket.close();
+    // Every test starts from an empty bucket and the documented defaults.
+    // Otherwise the first test's traffic is the second test's head start, and
+    // the window is a minute long.
+    await redis.del(key("rest"), key("send"), key("connect"));
+    await api.setLimits({});
+  });
+
+  afterAll(async () => {
+    server.close();
+    await limits.close();
+    redis.disconnect();
+    api.stop();
+  });
+
+  it("counts a socket send ONCE, against the api's own key (FR-RTL-01)", async () => {
+    // Not twice — the gateway's internal call to `/v1/... ` is exempt BY ROUTE,
+    // so the frame is counted by the gateway and not again when its HTTP hop
+    // lands. And not zero times, which is what an exemption applied one layer
+    // too broadly would produce.
+    //
+    // FR-RTL-01 is the clause: the limit is PER TENANT, and the gateway's hop is
+    // the platform's own traffic on the tenant's behalf. (An id sweep put
+    // `FR-WHK-05` here — *"webhook delivery shall be asynchronous"* — which is a
+    // real clause about something else entirely. A mechanical substitution that
+    // has no id to map to picks the nearest one it does have.)
+    const socket = await connect(await mintToken());
+    const before = await count("send");
+    await frameSend(socket, "one");
+    await firstFrame(socket, "message.ack");
+    expect(await count("send")).toBe(before + 1);
+  });
+
+  it("spends ONE budget across both transports (FR-RTL-01, research R11)", async () => {
+    // Five over REST and five over the socket. If the two services were
+    // counting separately this would read 5 and 5.
+    const socket = await connect(await mintToken());
+    for (let i = 0; i < 5; i += 1) {
+      const res = await restSend(`rest-${i}`);
+      expect(res.status).toBe(201);
+    }
+    for (let i = 0; i < 5; i += 1) {
+      await frameSend(socket, `frame-${i}`);
+      await firstFrame(socket, "message.ack");
+    }
+    expect(await count("send")).toBe(10);
+    // The REQUEST budget saw only the five REST calls: a frame is not an HTTP
+    // request, and the gateway's hop to the api does not count as one either.
+    // THE ASYMMETRY IS THE WHOLE TEST, and only two transports can show it: on one
+    // transport alone the two counters move together, and a limiter counting
+    // requests is indistinguishable from one counting messages (FR-RTL-01).
+    expect(await count("rest")).toBe(5);
+  });
+
+  it("reports the budget with FEWER remaining, not the one that was asked about", async () => {
+    // Two budgets, one set of headers. A client that saw only the request
+    // budget would be told it had 595 left while the send budget it is actually
+    // spending had 590 — an answer that is true and useless.
+    await api.setLimits({ rest: 100, send: 20 });
+    const socket = await connect(await mintToken());
+    for (let i = 0; i < 5; i += 1) {
+      await frameSend(socket, `frame-${i}`);
+      await firstFrame(socket, "message.ack");
+    }
+    const res = await restSend("rest-after-frames");
+    expect(res.status).toBe(201);
+    // send: 5 frames + this one = 6 of 20, so 14 left. rest: 1 of 100, 99 left.
+    expect(res.headers.get("x-ratelimit-limit")).toBe("20");
+    expect(res.headers.get("x-ratelimit-remaining")).toBe("14");
+  });
+
+  it("names the limit that was reached when it refuses (FR-RTL-01)", async () => {
+    await api.setLimits({ rest: 100, send: 2 });
+    await restSend("one");
+    await restSend("two");
+    const refused = await restSend("three");
+    expect(refused.status).toBe(429);
+    const body = (await refused.json()) as { code: string; message: string };
+    expect(body.code).toBe("rate_limited");
+    // "you are rate limited" leaves a developer guessing which dial to turn.
+    // The wording names the UNIT rather than the column: "too many messages"
+    // says slow down, "too many requests" says batch. This traffic was three
+    // sends against a send limit of two, so it has to be the first.
+    expect(body.message).toMatch(/too many messages/);
+    expect(body.message).not.toMatch(/too many requests/);
+  });
+
+  it("lets the gateway through an environment that is at its REST limit (FR-RTL-01)", async () => {
+    // The exemption cannot key off the principal: the gateway forwards the END
+    // USER's token, so its session and send calls resolve to `kind: "user"`
+    // exactly like customer traffic. A rule that exempted only the platform
+    // credential would refuse them — and the socket would go down for a REST
+    // budget it never spends (research R17).
+    await api.setLimits({ rest: 1 });
+    expect((await restSend("the one allowed request")).status).toBe(201);
+    expect((await restSend("over")).status).toBe(429);
+
+    // The environment is over its REST limit. The socket still opens…
+    const socket = await connect(await mintToken());
+    // …and still sends, because a frame spends the SEND budget and the
+    // gateway's hop to the api spends nothing.
+    await frameSend(socket, "through the closed door");
+    expect(await firstFrame(socket, "message.ack")).toMatchObject({
+      type: "message.ack",
+    });
+  });
+});
+```
+
+The api child takes `PORT=0` and the suite reads the port off the child's own
+`listening` line. A hand-allocated port cannot be checked: the number this chapter
+would have claimed sits in the same band as the broker the lane runs, and the failure
+is silent in both directions — the child cannot bind, and the health check gets its
+answer from whatever does hold the port.
+
+The ninth client also has to be *passed in*, and one line of `main.ts` is the whole
+of that:
+
+```diff title="services/gateway/src/main.test.ts"
+@@ -139,29 +139,57 @@ describe("every fabric createServer builds is injected", () => {
+   // a property of the text — every module built above the call appears inside it.
+   const SOURCE = readFileSync(
+     join(import.meta.dirname, "main.ts"),
+     "utf8",
+   );
+ 
+-  /** `const x = createY({` — the fabrics, derived rather than listed, so a fifth
+-   * arrives here without anyone remembering. */
++  /** `const x = createY(` — the fabrics, derived rather than listed, so a sixth
++   * arrives here without anyone remembering.
++   *
++   * TWO CHANGES, AND THE FIRST ONE MISSED A MODULE. The pattern required an OBJECT
++   * ARGUMENT — `create[A-Z]\w*\(\{` — and the counter store takes none:
++   * `createGatewayLimits()` reads its url from the environment. So the ninth Redis
++   * client in this file was invisible to the check written to make exactly that
++   * impossible, and it was invisible in the direction that passes. Measured: the old
++   * pattern derives five names, the new one six.
++   *
++   * SCOPED TO `createServer`'S BODY, which is what this describe's title always
++   * claimed. Dropping the `{` widens the match to `createLogger` and `createServer`
++   * in the `import.meta.main` block below the function — neither a fabric, both
++   * `const x = createY(`. Slicing to the text between the function and the call it
++   * has to appear in is the honest boundary; an exclusion list would be the thing
++   * this file exists instead of. */
+   function built(): string[] {
+-    return [...SOURCE.matchAll(/\bconst (\w+) = create[A-Z]\w*\(\{/g)].map((m) => m[1]!);
++    const start = SOURCE.indexOf("export function createServer");
++    const end = SOURCE.indexOf("attachSessions({", start);
++    return [...SOURCE.slice(start, end).matchAll(/\bconst (\w+) = create[A-Z]\w*\(/g)]
++      .map((m) => m[1]!);
+   }
+ 
+   /** The object literal `attachSessions` is called with. */
+   function injected(): string {
+     const open = SOURCE.indexOf("attachSessions({");
+     const close = SOURCE.indexOf("\n  });", open);
+     return SOURCE.slice(open, close);
+   }
+ 
+   it("derives the fabrics and the call, and finds both", () => {
+     // THE POSITIVE CONTROL. Every assertion below is about which names are missing,
+     // and a derivation that found nothing satisfies all of them.
+-    expect(built().length, "no `const x = createY({` found in main.ts").toBeGreaterThan(1);
++    expect(built().length, "no `const x = createY(` found in main.ts").toBeGreaterThan(1);
++    // AND THE COUNT, because "more than one" was satisfied by a pattern that found
++    // five of six. A number here goes red when a fabric is added without a thought
++    // about this file, which is the moment to have it.
++    expect(built(), "the fabrics createServer builds").toEqual([
++      "fanout",
++      "presence",
++      "membership",
++      "typing",
++      "connections",
++      "limits",
++    ]);
+     expect(injected(), "no attachSessions call found").toContain("server,");
+   });
+ 
+   it("passes each one into attachSessions", () => {
+     const call = injected();
+     const missing = built().filter(
+```
+
+<Trap title="The check against an uninjected module could not see this one">
+
+That file derives the fabrics from `main.ts`'s text rather than listing them, so a
+sixth arrives without anyone remembering. Its pattern was
+`const x = createY({` — a call with an **object argument**. `createGatewayLimits()`
+takes none; it reads its url from the environment. So the module this chapter adds
+was outside the check written to make exactly this impossible, and outside it in
+the direction that passes: delete `limits,` from the `attachSessions` call and the
+suite stayed green while every socket went unlimited.
+
+The positive control did not help either. It asserted `built().length > 1`, and
+five names satisfy that as easily as six. **"More than one" is a control against a
+parse that found nothing; it is not a control against a parse that found most.** It
+is an assertion on the list by name now.
+
+Widening the pattern has its own trap, which is why the fix is scoped to
+`createServer`'s body: dropping the `{` also matches `createLogger` and
+`createServer` below the function, and both of those happen to satisfy the
+injection test — so the widened check would have passed for the wrong reason.
+
+</Trap>
+
 <Trap title="There is no batch send, and that is why FR-RTL-01 was rewritten">
 
 An earlier draft justified two budgets by imagining a request carrying several
@@ -1999,6 +2510,332 @@ export function createGatewayLimits(
 }
 ```
 
+
+The store's lifecycle is a module for one reason: an `ioredis` client holds the
+event loop open, and every long-lived resource in this api closes through
+`OnModuleDestroy`. Without the hook the suites would hang **after their assertions
+pass** — green tests and a lane that never returns, which is the worst shape
+available.
+
+```ts title="services/api/src/limits/limits.module.ts"
+import { Inject, Injectable, Module, type OnModuleDestroy } from "@nestjs/common";
+
+import { createDb, createPool, type Db } from "../db/client";
+import { apiLogger, LOGGER } from "../logger";
+import { createCounterStore, type CounterStore } from "./store";
+
+// The counter store's home.
+//
+// It is a module for one reason: the client has to be closed. Every long-lived
+// resource in this api closes through `OnModuleDestroy` — the outbox relay, the
+// delivery relay, the event consumer — `main.ts` enables shutdown hooks, and
+// every api integration suite ends `await app.close()`.
+//
+// An ioredis client holds the event loop open. Without the hook the suites would
+// HANG AFTER THEIR ASSERTIONS PASS, which is the worst shape available: green
+// tests and a lane that never returns, in a project that has spent three chapters
+// clearing one (research R20).
+
+export const COUNTER_STORE = "COUNTER_STORE";
+/** The limiter's own pool. Its own rather than the auth middleware's, because a
+ * middleware that had to be handed another middleware's connection would couple
+ * two things that only share a request. */
+export const LIMITS_DB = "LIMITS_DB";
+
+@Injectable()
+export class CounterStoreLifecycle implements OnModuleDestroy {
+  constructor(@Inject(COUNTER_STORE) private readonly store: CounterStore) {}
+
+  async onModuleDestroy(): Promise<void> {
+    await this.store.close();
+  }
+}
+
+@Module({
+  providers: [
+    { provide: COUNTER_STORE, useFactory: (): CounterStore => createCounterStore() },
+    { provide: LIMITS_DB, useFactory: (): Db => createDb(createPool()) },
+    // Exported so the auth limiter can be constructed inside `AuthModule`, which
+    // imports this one. `AppModule` provides the same token for everything else;
+    // the factory is shared so both are the same kind of logger, and the DI
+    // bargain ADR-15 buys — a test swaps the sink by overriding one provider —
+    // holds in both places.
+    { provide: LOGGER, useFactory: apiLogger },
+    CounterStoreLifecycle,
+  ],
+  exports: [COUNTER_STORE, LIMITS_DB, LOGGER],
+})
+export class LimitsModule {}
+```
+
+And the three pure files get pure tests: no clock, no store, no framework, so a
+branch they miss is a case nobody thought of rather than one nobody could reach.
+
+```ts title="services/api/src/limits/bucket.test.ts"
+import { describe, expect, it } from "vitest";
+
+import { remaining, resetAt, windowStart } from "./bucket";
+
+// The fixed-window arithmetic (research R1). Pure: no store, no
+// clock of its own — every function takes the instant it should reason about,
+// which is what lets a boundary be tested rather than waited for.
+
+const MINUTE = 60_000;
+
+describe("windowStart", () => {
+  it("floors an instant to the window it belongs to", () => {
+    expect(windowStart(90_000, MINUTE)).toBe(60_000);
+    expect(windowStart(60_000, MINUTE)).toBe(60_000);
+    expect(windowStart(59_999, MINUTE)).toBe(0);
+  });
+
+  it("is the key's own suffix, which is why nothing stores a reset time", () => {
+    // Two instances computing this from the same clock agree without talking.
+    // A stored reset time is a value they could disagree about — the clock-skew
+    // edge case, closed by construction rather than by agreement.
+    expect(windowStart(119_999, MINUTE)).toBe(windowStart(60_000, MINUTE));
+  });
+});
+
+describe("resetAt", () => {
+  it("is the end of the current window, not a refill curve", () => {
+    // The deciding reason for a fixed window over a token bucket (R1):
+    // `X-RateLimit-Reset` has to name one moment, and this is it.
+    expect(resetAt(90_000, MINUTE)).toBe(120_000);
+  });
+
+  it("never lands in the past", () => {
+    for (const now of [0, 1, 59_999, 60_000, 60_001]) {
+      expect(resetAt(now, MINUTE)).toBeGreaterThan(now - 1);
+    }
+  });
+});
+
+describe("remaining", () => {
+  it("counts down from the limit as the count rises", () => {
+    expect(remaining(1, 600)).toBe(599);
+    expect(remaining(600, 600)).toBe(0);
+  });
+
+  it("A COUNTER THAT HAS NEVER BEEN WRITTEN returns a full allowance", () => {
+    // The `INCR`-returns-1 path, which is also where `EXPIRE` is set. A brand-new
+    // environment's first request must not look like an exhausted one.
+    expect(remaining(1, 600)).toBe(599);
+    expect(remaining(0, 600)).toBe(600);
+  });
+
+  it("A LIMIT LOWERED MID-WINDOW yields zero, never a negative", () => {
+    // An operator drops an environment from 600 to 2 while 40 requests are
+    // already counted. `Remaining: -38` is a number a client would parse and act
+    // on; zero is the truth.
+    expect(remaining(40, 2)).toBe(0);
+  });
+
+  it("is zero at the limit, so a refusal reports zero rather than one", () => {
+    expect(remaining(600, 600)).toBe(0);
+    expect(remaining(601, 600)).toBe(0);
+  });
+});
+
+describe("the boundary burst, which is the cost of a fixed window", () => {
+  it("permits up to twice the limit across one window edge", () => {
+    // R1 accepted this rather than hiding it: 600 in the last instant of one
+    // window and 600 in the first instant of the next is 1,200 inside two
+    // minutes. Asserted so the chapter's claim is a test rather than a comment.
+    const limit = 600;
+    const firstWindow = windowStart(59_999, MINUTE);
+    const secondWindow = windowStart(60_000, MINUTE);
+    expect(firstWindow).not.toBe(secondWindow);
+    expect(remaining(limit, limit) + limit).toBe(limit);
+    // Two distinct keys, each allowing `limit`, one millisecond apart.
+    expect(remaining(1, limit)).toBe(limit - 1);
+  });
+});
+```
+
+```ts title="services/api/src/limits/policy.test.ts"
+import { afterEach, describe, expect, it } from "vitest";
+
+import {
+  DEFAULT_AUTH_FAILURES_PER_MINUTE,
+  DEFAULT_LIMITS,
+  WINDOW_MS,
+  authFailureThreshold,
+} from "./policy";
+
+// The numbers, and what happens when someone fat-fingers the one that is
+// configurable.
+
+describe("authFailureThreshold", () => {
+  const previous = process.env["RELAY_AUTH_FAILURES_PER_MINUTE"];
+  afterEach(() => {
+    if (previous === undefined) delete process.env["RELAY_AUTH_FAILURES_PER_MINUTE"];
+    else process.env["RELAY_AUTH_FAILURES_PER_MINUTE"] = previous;
+  });
+
+  const withEnv = (value: string) => {
+    process.env["RELAY_AUTH_FAILURES_PER_MINUTE"] = value;
+    return authFailureThreshold();
+  };
+
+  it("uses the documented default when nothing is set", () => {
+    delete process.env["RELAY_AUTH_FAILURES_PER_MINUTE"];
+    expect(authFailureThreshold()).toBe(DEFAULT_AUTH_FAILURES_PER_MINUTE);
+  });
+
+  it("honours a configured threshold", () => {
+    expect(withEnv("3")).toBe(3);
+  });
+
+  it("FALLS BACK TO THE DEFAULT for anything that is not a positive number", () => {
+    // The failure mode this is protecting against is not exotic. `parseInt`
+    // returns NaN for "ten" and 0 for "0", and either would be silently
+    // catastrophic in a different direction: NaN makes every comparison false,
+    // so the limiter never triggers; 0 makes it trigger on the first failed
+    // auth, locking out an address that mistyped a password once.
+    //
+    // A misconfigured security control that fails silently is worse than one
+    // that is absent, because nobody looks for it.
+    for (const bad of ["ten", "", "0", "-1", "NaN"]) {
+      expect(withEnv(bad)).toBe(DEFAULT_AUTH_FAILURES_PER_MINUTE);
+    }
+  });
+});
+
+describe("the defaults themselves", () => {
+  it("are the numbers the chapter derived, not round ones", () => {
+    // Pinned so a change has to be deliberate. Each was re-derived against
+    // NFR-SCL and NFR-PRF (research R26); the chapter states the derivation and
+    // this asserts the result.
+    expect(DEFAULT_LIMITS).toEqual({ rest: 600, send: 600, connect: 3_000 });
+    expect(DEFAULT_AUTH_FAILURES_PER_MINUTE).toBe(10);
+    // One minute, because every limit above is stated per minute and a window
+    // that did not match the unit would need a second number to explain it.
+    expect(WINDOW_MS).toBe(60_000);
+  });
+});
+```
+
+```ts title="services/api/src/limits/fallback.test.ts"
+import { describe, expect, it } from "vitest";
+
+import { createFallbackCounter } from "./fallback";
+
+// The in-process counter the auth limiter falls back to when Redis is gone
+// (research R3). Pure apart from the map it owns; every call takes
+// the instant it should reason about.
+
+const MINUTE = 60_000;
+
+describe("the fallback counter", () => {
+  it("counts per key within a window", () => {
+    const c = createFallbackCounter({ windowMs: MINUTE, maxKeys: 100 });
+    expect(c.increment("1.2.3.4", 0)).toBe(1);
+    expect(c.increment("1.2.3.4", 10)).toBe(2);
+    expect(c.increment("5.6.7.8", 10)).toBe(1);
+  });
+
+  it("starts again in the next window", () => {
+    const c = createFallbackCounter({ windowMs: MINUTE, maxKeys: 100 });
+    expect(c.increment("1.2.3.4", 0)).toBe(1);
+    expect(c.increment("1.2.3.4", 59_999)).toBe(2);
+    expect(c.increment("1.2.3.4", 60_000)).toBe(1);
+  });
+
+  it("STOPS ADMITTING NEW KEYS at the cap rather than evicting", () => {
+    // The decision research R3 spent its argument on. An eviction policy on a map
+    // keyed by attacker-controlled input is a policy the attacker drives: fill
+    // the map, evict the entry that was counting them, start again.
+    //
+    // Refusing new keys degrades to "addresses we are already tracking stay
+    // tracked", which is the safe direction — and the whole reason this
+    // structure is written down rather than being an implementation detail.
+    const c = createFallbackCounter({ windowMs: MINUTE, maxKeys: 2 });
+    expect(c.increment("a", 0)).toBe(1);
+    expect(c.increment("b", 0)).toBe(1);
+
+    // Third key: not admitted, and says so.
+    expect(c.increment("c", 0)).toBeNull();
+
+    // The two already tracked keep counting.
+    expect(c.increment("a", 0)).toBe(2);
+    expect(c.increment("b", 0)).toBe(2);
+  });
+
+  it("admits a new key again once a window turns over", () => {
+    // The cap is on live keys, not on keys ever seen. A window boundary clears
+    // expired entries, so an outage lasting hours does not permanently refuse to
+    // count anybody new.
+    const c = createFallbackCounter({ windowMs: MINUTE, maxKeys: 1 });
+    expect(c.increment("a", 0)).toBe(1);
+    expect(c.increment("b", 0)).toBeNull();
+    expect(c.increment("b", 60_000)).toBe(1);
+  });
+
+  it("peeks without counting, because a check must not be its own failure", () => {
+    // `isOverThreshold` runs on every request that presents a credential,
+    // including the valid ones. A check that also wrote would push an address
+    // over on its own questions.
+    const c = createFallbackCounter({ windowMs: MINUTE, maxKeys: 100 });
+    c.increment("1.2.3.4", 0);
+    c.increment("1.2.3.4", 0);
+
+    expect(c.peek("1.2.3.4", 0)).toBe(2);
+    expect(c.peek("1.2.3.4", 0)).toBe(2);
+    expect(c.peek("never-seen", 0)).toBe(0);
+  });
+
+  it("peeks zero once the window has turned over", () => {
+    const c = createFallbackCounter({ windowMs: MINUTE, maxKeys: 100 });
+    c.increment("1.2.3.4", 0);
+    expect(c.peek("1.2.3.4", 0)).toBe(1);
+    expect(c.peek("1.2.3.4", 60_000)).toBe(0);
+  });
+
+  it("never grows past the cap, however many keys arrive", () => {
+    // The memory bound is the point: an unbounded map keyed by source address is
+    // a memory-exhaustion vector, so a fallback that closed a brute-force hole
+    // would have opened a worse one.
+    const c = createFallbackCounter({ windowMs: MINUTE, maxKeys: 3 });
+    for (let i = 0; i < 1_000; i++) c.increment(`ip-${i}`, 0);
+    expect(c.size()).toBe(3);
+  });
+});
+
+describe("peek at the cap", () => {
+  it("REPORTS AN UNKNOWN KEY AS UNKNOWN, not as zero, once the map is full", () => {
+    // The other side of "stop admitting rather than evict". `increment` refuses
+    // to add a key past the cap; `peek` has to answer honestly about one it
+    // therefore never learned. Returning 0 would mean "this address has failed
+    // no auths", which for the auth limiter is the wrong direction — the whole
+    // point of R3 is that this counter does not fail open. `null` says "I do
+    // not know", and the caller decides.
+    const counter = createFallbackCounter({ windowMs: MINUTE, maxKeys: 2 });
+    counter.increment("ip-1", 0);
+    counter.increment("ip-2", 0);
+    expect(counter.peek("ip-1", 0)).toBe(1);
+    expect(counter.peek("ip-3", 0)).toBeNull();
+  });
+
+  it("reports an unknown key as zero while there is still room", () => {
+    // Under the cap, "I have never seen this address" and "this address has
+    // failed nothing" are the same statement.
+    const counter = createFallbackCounter({ windowMs: MINUTE, maxKeys: 2 });
+    counter.increment("ip-1", 0);
+    expect(counter.peek("ip-3", 0)).toBe(0);
+  });
+
+  it("forgets a count from a previous window without being swept", () => {
+    const counter = createFallbackCounter({ windowMs: MINUTE, maxKeys: 2 });
+    counter.increment("ip-1", 0);
+    expect(counter.peek("ip-1", MINUTE)).toBe(0);
+  });
+});
+```
+
+`fallback.ts` earns the strictest reading of constitution VI available: it is what
+the AUTH limiter degrades to, and an unmeasured branch in it is a hole in the thing
+this chapter is about.
 
 ### The vocabulary, finally spoken
 
