@@ -341,14 +341,17 @@ environment may have — several active at once is the feature, not an oversight
 because that is what rotation without downtime means.
 
 ```diff title="services/api/src/db/schema.ts"
-@@ -132,6 +132,52 @@ export const environments = pgTable(
+@@ -129,12 +129,58 @@ export const environments = pgTable(
+     // above, this unique index IS that rule: two legal kinds, one row each.
+     // No trigger, no counting query, nothing to lose a race to.
+     unique("environments_application_kind_unique").on(t.applicationId, t.kind),
    ],
  );
  
 +// DECISION: the SRS states the requirements this table serves
 +// (FR-AUT-01…05, NFR-SEC-02) but no source document defines a key table —
 +// SAD §6.1 does not have one. Its shape is a chapter derivation, recorded here
-+// the way 2.1 recorded `members` and the tenancy chapter recorded the tenancy containers.
++// the way 2.1 recorded `members` and 3.1 recorded the tenancy containers.
 +//
 +// It sits BELOW the environment boundary, so it carries an environment_id like
 +// every other table down here. The credential is two parts: `public_id` is an
@@ -394,6 +397,9 @@ because that is what rotation without downtime means.
  export const users = pgTable(
    "users",
    {
+     id: uuid("id").primaryKey(),
+     environmentId: uuid("environment_id")
+       .notNull()
 ```
 
 ```sql title="services/api/migrations/0003_api_keys.sql"
@@ -449,7 +455,10 @@ exactly once. FR-DSH-01 wants a development key on the first screen after
 signup; this is where that key comes from.
 
 ```diff title="services/api/src/db/repository.ts"
-@@ -4,6 +4,7 @@ import { and, asc, desc, eq, gt, lt, sql, type SQL } from "drizzle-orm";
+@@ -1,22 +1,30 @@
+ import { randomUUID } from "node:crypto";
+ 
+ import { and, asc, desc, eq, gt, lt, sql, type SQL } from "drizzle-orm";
  
  import type { Db } from "./client";
  import {
@@ -457,7 +466,10 @@ signup; this is where that key comes from.
    applications,
    channels,
    environments,
-@@ -14,6 +15,13 @@ import {
+   humans,
+   members,
+   memberships,
+   messages,
    organisations,
    users,
  } from "./schema";
@@ -471,7 +483,13 @@ signup; this is where that key comes from.
  
  // The repository layer — the ONE place data access lives (ADR-04's single
  // writer, constitution I). Two surfaces with a bright line between them:
-@@ -69,6 +77,147 @@ export async function createEnvironment(
+ //
+ //   createEnvironment / provisionOrganisation — the ADMIN surface. These
+ //   create tenants, so they are the only operations here that are not
+@@ -66,21 +74,168 @@ export async function createEnvironment(
+     sql`INSERT INTO environments (id, application_id, kind, signing_secret)
+         VALUES (${environmentId}, ${applicationId}, ${kind}, ${randomUUID()})`,
+   );
    return { id: environmentId, kind };
  }
  
@@ -619,7 +637,9 @@ signup; this is where that key comes from.
  /** What a signup produced — or found. `created` answers "was an organisation
   * created on this call?", NOT "was the identity new": a known human who owned
   * nothing gets `created: true`, because one really was created for them. */
-@@ -78,6 +227,12 @@ export interface Provisioned {
+ export interface Provisioned {
+   organisation: { id: string; name: string };
+   application: { id: string; name: string };
    environment: { id: string; kind: Environment["kind"] };
    human: { id: string; provider: string; provider_account_id: string };
    created: boolean;
@@ -632,7 +652,13 @@ signup; this is where that key comes from.
  }
  
  /** Signup (FR-TEN-01/02). The admin surface's second entrance:
-@@ -229,12 +384,20 @@ export async function provisionOrganisation(
+  * it mints a tenant, so like createEnvironment it carries no tenant scope —
+  * it is the operation that creates one.
+  *
+@@ -226,18 +381,26 @@ export async function provisionOrganisation(
+     await tx.insert(memberships).values({
+       organisationId,
+       humanId: human.id,
        role: "owner", // FR-TEN-07's vocabulary; management of it is later
      });
  
@@ -653,6 +679,9 @@ signup; this is where that key comes from.
      };
    });
  }
+ 
+ export interface UserRow {
+   id: string;
 ```
 
 The walk from the tenancy chapter now shows what it hands over, and — more usefully — what it
@@ -706,7 +735,7 @@ import { SignJWT, decodeJwt, jwtVerify } from "jose";
 // End-user tokens (FR-AUT-06/07/08). HS256 over the
 // environment's own signing secret, verified by `jose` rather than by hand.
 //
-// WHY a dependency here, when the tenancy chapter went out of its way to add none: hand-rolled
+// WHY a dependency here, when 3.1 went out of its way to add none: hand-rolled
 // HS256 is thirty lines and three classic vulnerabilities — accepting whatever
 // algorithm the token names, forgetting to check `exp`, and comparing
 // signatures with `===`. A convenience is worth typing around; security code is
@@ -933,65 +962,100 @@ export class SessionController {
 
 And the gateway's door becomes a phone call:
 
-```ts title="services/gateway/src/auth.ts"
-import type { ApiClient, Identity } from "./api-client.js";
-
-// The door (chapter 2.5, rebuilt by the credentials chapter). Tokens are still checked BEFORE the
-// handshake completes — an unauthenticated socket never reaches session code —
-// but the gateway no longer does the checking.
-//
-// WHAT CHANGED, and why it is a narrowing rather than a complication: 2.5's
-// gateway verified tokens itself, with HS256 over a shared development secret.
-// Real tokens are signed with the ENVIRONMENT'S OWN secret, and that secret
-// lives in Postgres — which ADR-05 says this service may never touch. The two
-// ways out were to ship every environment's signing secret to the gateway, or to
-// ask the service that owns them. Shipping the secret means a tenant-scoped
-// secret inside a process that deliberately holds no tenant state, plus a
-// rotation story; asking costs one HTTP call the connect path was ALREADY making
-// for memberships (research R1).
-//
-// So the round-trip count is unchanged: the memberships lookup became a session
-// lookup that answers identity and memberships together. The gateway holds no
-// signing secret after this chapter.
-
-export type { Identity } from "./api-client.js";
-
-/** Three outcomes, not two. A refused token and an unreachable api both fail to
- * open a socket, but they are not the same event and must not close the same
- * way: 4001 tells a client its credential is wrong (retrying will not help),
- * 1011 tells it we are broken (retrying will). 2.5 drew that line for the
- * memberships lookup; moving verification here must not erase it. */
-export type Authentication =
-  | { outcome: "ok"; identity: Identity; channelIds: string[] }
-  | { outcome: "refused" }
-  | { outcome: "unavailable"; error: string };
-
-export async function authenticate(
-  api: ApiClient,
-  token: string | null,
-): Promise<Authentication> {
-  if (token === null || token.length === 0) return { outcome: "refused" };
-  try {
-    const session = await api.session(token);
-    // The api answered, and the answer was "no". Every refusal — expired,
-    // malformed, mis-signed, for another environment, over-long — arrives here
-    // as one outcome, because the socket has one close code for all of them.
-    if (session === null) return { outcome: "refused" };
-    return {
-      outcome: "ok",
-      identity: {
-        environmentId: session.environment_id,
-        userExternalId: session.user,
-        // Carried, not trusted: the internal hop forwards this instead of
-        // asserting an identity the gateway invented.
-        token,
-      },
-      channelIds: session.channel_ids,
-    };
-  } catch (error) {
-    return { outcome: "unavailable", error: String(error) };
-  }
-}
+```diff title="services/gateway/src/auth.ts"
+@@ -1,42 +1,58 @@
+-import { jwtVerify } from "jose";
++import type { ApiClient, Identity } from "./api-client.js";
+ 
+-// The door (chapter 2.5). Tokens are verified BEFORE the upgrade
+-// completes — an unauthenticated socket never reaches session code.
++// The door (chapter 2.5, rebuilt by 3.2). Tokens are still checked BEFORE the
++// handshake completes — an unauthenticated socket never reaches session code —
++// but the gateway no longer does the checking.
+ //
+-// DECISION (chapter 2.5): real tokens are minted by Part 3 (the dev-token
+-// endpoint is FR-AUT-09; per-environment signing secrets live in the
+-// environments table). Until then, dev tokens are HS256 over
+-// RELAY_DEV_JWT_SECRET with claims { sub: user external_id,
+-// env: environment_id } — a seam Part 3 replaces without touching the
+-// session code behind it.
++// WHAT CHANGED, and why it is a narrowing rather than a complication: 2.5's
++// gateway verified tokens itself, with HS256 over a shared development secret.
++// Real tokens are signed with the ENVIRONMENT'S OWN secret, and that secret
++// lives in Postgres — which ADR-05 says this service may never touch. The two
++// ways out were to ship every environment's signing secret to the gateway, or to
++// ask the service that owns them. Shipping the secret means a tenant-scoped
++// secret inside a process that deliberately holds no tenant state, plus a
++// rotation story; asking costs one HTTP call the connect path was ALREADY making
++// for memberships (research R1).
++//
++// So the round-trip count is unchanged: the memberships lookup became a session
++// lookup that answers identity and memberships together. The gateway holds no
++// signing secret after this chapter.
+ 
+-export const DEV_JWT_SECRET = process.env.RELAY_DEV_JWT_SECRET ?? "dev-secret";
++export type { Identity } from "./api-client.js";
+ 
+-export interface Identity {
+-  userExternalId: string;
+-  environmentId: string;
+-}
++/** Three outcomes, not two. A refused token and an unreachable api both fail to
++ * open a socket, but they are not the same event and must not close the same
++ * way: 4001 tells a client its credential is wrong (retrying will not help),
++ * 1011 tells it we are broken (retrying will). 2.5 drew that line for the
++ * memberships lookup; moving verification here must not erase it. */
++export type Authentication =
++  | { outcome: "ok"; identity: Identity; channelIds: string[] }
++  | { outcome: "refused" }
++  | { outcome: "unavailable"; error: string };
+ 
+-export async function verifyToken(token: string): Promise<Identity | null> {
++export async function authenticate(
++  api: ApiClient,
++  token: string | null,
++): Promise<Authentication> {
++  if (token === null || token.length === 0) return { outcome: "refused" };
+   try {
+-    const { payload } = await jwtVerify(
+-      token,
+-      new TextEncoder().encode(DEV_JWT_SECRET),
+-    );
+-    // Non-EMPTY strings: `typeof x === "string"` happily accepts "", and an
+-    // empty environment claim would open a session scoped to no tenant —
+-    // which constitution I says must be unrepresentable, not merely
+-    // unlikely. Found by the test below, not by reading the code.
+-    if (
+-      typeof payload.sub !== "string" ||
+-      payload.sub.length === 0 ||
+-      typeof payload.env !== "string" ||
+-      payload.env.length === 0
+-    ) {
+-      return null;
+-    }
+-    return { userExternalId: payload.sub, environmentId: payload.env };
+-  } catch {
+-    return null;
++    const session = await api.session(token);
++    // The api answered, and the answer was "no". Every refusal — expired,
++    // malformed, mis-signed, for another environment, over-long — arrives here
++    // as one outcome, because the socket has one close code for all of them.
++    if (session === null) return { outcome: "refused" };
++    return {
++      outcome: "ok",
++      identity: {
++        environmentId: session.environment_id,
++        userExternalId: session.user,
++        // Carried, not trusted: the internal hop forwards this instead of
++        // asserting an identity the gateway invented.
++        token,
++      },
++      channelIds: session.channel_ids,
++    };
++  } catch (error) {
++    return { outcome: "unavailable", error: String(error) };
+   }
+ }
 ```
 
 Note what that type says. Three outcomes, not two — because moving verification
@@ -1401,65 +1465,99 @@ away.
 
 The file that started it all goes with them:
 
-```text title="services/api/src/messages/environment-context.guard.ts (deleted)"
-Retired by the credentials chapter. It resolved a tenant from a header any caller could
-type — the dev-mode seam 2.2 introduced with a named expiry date. Nothing
-replaces it one-for-one: the middleware resolves a principal from a verified
-credential, and CredentialGuard keeps only the question a guard can answer.
+```diff title="services/api/src/messages/environment-context.guard.ts (deleted)"
+deleted file mode 100644
+@@ -1,28 +0,0 @@
+-import {
+-  type CanActivate,
+-  type ExecutionContext,
+-  Injectable,
+-  UnauthorizedException,
+-} from "@nestjs/common";
+-
+-// DECISION (chapter 2.2): real credentials arrive with Part 3 (API keys
+-// in 3.2, tenancy in 3.1). Until then, public routes name their tenant
+-// via the X-Relay-Environment header — a dev-mode seam, load-bearing for
+-// exactly as long as it takes Part 3 to replace it. The guard resolves
+-// the header; the request-scoped Repository below it is what makes the
+-// scoping real (constitution I).
+-@Injectable()
+-export class EnvironmentContextGuard implements CanActivate {
+-  canActivate(context: ExecutionContext): boolean {
+-    const req = context.switchToHttp().getRequest<{
+-      headers: Record<string, string | undefined>;
+-      environmentId?: string;
+-    }>();
+-    const environmentId = req.headers["x-relay-environment"];
+-    if (!environmentId) {
+-      throw new UnauthorizedException("missing X-Relay-Environment");
+-    }
+-    req.environmentId = environmentId;
+-    return true;
+-  }
+-}
 ```
 
 And the factory 2.2 wrote reads a principal where it used to read a header. It
 is the one-line swap that chapter promised, and the reason it stayed one line is
 that the seam was named and isolated from the day it was introduced:
 
-```ts title="services/api/src/messages/messages.module.ts"
-import { Module, Scope } from "@nestjs/common";
-import { REQUEST } from "@nestjs/core";
-
-import { AuthModule } from "../auth/auth.module";
-import { createDb, createPool, type Db } from "../db/client";
-import type { RequestWithTenant } from "./request-with-tenant";
-import { Repository } from "../db/repository";
-import { MessagesController } from "./messages.controller";
-import { MessagesService } from "./messages.service";
-
-// The repository stays the plain 2.1 class — the framework's job is only
-// to construct it per request with the authenticated tenant (ADR-15's
-// scope note: guards authenticate, the data layer isolates).
-@Module({
-  imports: [AuthModule],
-  controllers: [MessagesController],
-  providers: [
-    {
-      provide: "DB",
-      useFactory: (): Db => createDb(createPool()),
-      scope: Scope.DEFAULT,
-    },
-    {
-      provide: Repository,
-      scope: Scope.REQUEST,
-      inject: ["DB", REQUEST],
-      useFactory: (db: Db, req: RequestWithTenant) =>
-        // The FACTORY reads the PRINCIPAL, not the guard's leftovers: Nest
-        // resolves request-scoped providers BEFORE the enhancer chain
-        // runs, so anything a guard stashes on the request is invisible
-        // here. Middleware runs earlier still, which is why the credentials chapter
-        // authenticates there (research R5, measured in T004).
-        //
-        // The credentials chapter changed WHERE the environment comes from and nothing
-        // else about this line. It used to be an environment header — a
-        // header any caller could type. It is now the environment resolved
-        // from a verified credential, so a request cannot name a tenant it
-        // has not proved it may act for. The empty-string fallback is the
-        // same as 2.2's: no principal means no scope, and the guard below
-        // turns that into a 401 before any handler runs.
-        new Repository(db, req.principal?.environmentId ?? ""),
-    },
-    MessagesService,
-  ],
-  exports: [Repository, MessagesService],
-})
-export class MessagesModule {}
+```diff title="services/api/src/messages/messages.module.ts"
+@@ -1,39 +1,47 @@
+ import { Module, Scope } from "@nestjs/common";
+ import { REQUEST } from "@nestjs/core";
+ 
++import { AuthModule } from "../auth/auth.module";
+ import { createDb, createPool, type Db } from "../db/client";
+ import type { RequestWithTenant } from "./request-with-tenant";
+ import { Repository } from "../db/repository";
+-import { EnvironmentContextGuard } from "./environment-context.guard";
+ import { MessagesController } from "./messages.controller";
+ import { MessagesService } from "./messages.service";
+ 
+ // The repository stays the plain 2.1 class — the framework's job is only
+ // to construct it per request with the authenticated tenant (ADR-15's
+ // scope note: guards authenticate, the data layer isolates).
+ @Module({
++  imports: [AuthModule],
+   controllers: [MessagesController],
+   providers: [
+     {
+       provide: "DB",
+       useFactory: (): Db => createDb(createPool()),
+       scope: Scope.DEFAULT,
+     },
+     {
+       provide: Repository,
+       scope: Scope.REQUEST,
+       inject: ["DB", REQUEST],
+       useFactory: (db: Db, req: RequestWithTenant) =>
+-        // The FACTORY reads the header, not the guard's leftovers: Nest
++        // The FACTORY reads the PRINCIPAL, not the guard's leftovers: Nest
+         // resolves request-scoped providers BEFORE the enhancer chain
+         // runs, so anything a guard stashes on the request is invisible
+-        // here. The guard still rejects tenant-less requests (401); the
+-        // factory is what scopes the layer.
+-        new Repository(db, req.headers["x-relay-environment"] ?? ""),
++        // here. Middleware runs earlier still, which is why chapter 3.2
++        // authenticates there (research R5, measured in T004).
++        //
++        // The credentials chapter changed WHERE the environment comes from and nothing
++        // else about this line. It used to be an environment header — a
++        // header any caller could type. It is now the environment resolved
++        // from a verified credential, so a request cannot name a tenant it
++        // has not proved it may act for. The empty-string fallback is the
++        // same as 2.2's: no principal means no scope, and the guard below
++        // turns that into a 401 before any handler runs.
++        new Repository(db, req.principal?.environmentId ?? ""),
+     },
+     MessagesService,
+-    EnvironmentContextGuard,
+   ],
+-  exports: [Repository, MessagesService, EnvironmentContextGuard],
++  exports: [Repository, MessagesService],
+ })
+ export class MessagesModule {}
 ```
 
 ## What this chapter leaves for later, on purpose
@@ -1895,7 +1993,10 @@ one thing rather than twenty-nine — this is the cost of a seam, paid in full, 
 the day it was retired.
 
 ```diff title="packages/protocol/src/codes.ts"
-@@ -21,6 +21,13 @@ export const ERROR_CODES = {
+@@ -18,9 +18,16 @@ export type CloseCode = keyof typeof CLOSE_CODES;
+ // their chapters; uniqueness is test-enforced from day one.
+ export const ERROR_CODES = {
+   invalid_frame: "the frame failed schema validation",
    unknown_frame_type: "the type discriminator names no known frame",
    unauthorized: "the connection is not authorized for this action",
    rate_limited: "too many frames; slow down and retry",
@@ -1912,11 +2013,14 @@ the day it was retired.
 ```
 
 ```diff title="packages/protocol/src/internal.ts"
-@@ -87,7 +87,27 @@ export const internalMembershipsResponseSchema = z.strictObject({
+@@ -84,13 +84,33 @@ export const internalBackfillResponseSchema = z.strictObject({
+ 
+ /** api → gateway: the channels this user may hear (FR-RTM-01). */
+ export const internalMembershipsResponseSchema = z.strictObject({
    channel_ids: z.array(z.string().min(1)),
  });
  
-+/** api → gateway: who the presented token belongs to, and what it
++/** api → gateway, chapter 3.2: who the presented token belongs to, and what it
 + * may hear — in ONE answer.
 + *
 + * This replaces the memberships response above rather than joining it. The
@@ -1940,10 +2044,16 @@ the day it was retired.
  export type InternalSendResponse = z.infer<typeof internalSendResponseSchema>;
  export type InternalMembershipsResponse = z.infer<
    typeof internalMembershipsResponseSchema
+ >;
+ export type InternalBackfillRequest = z.infer<
+   typeof internalBackfillRequestSchema
 ```
 
 ```diff title="services/api/package.json"
-@@ -19,6 +19,7 @@
+@@ -16,12 +16,13 @@
+     "@nestjs/common": "^11.1.28",
+     "@nestjs/core": "^11.1.28",
+     "@nestjs/platform-express": "^11.1.28",
      "@relay/protocol": "workspace:*",
      "@relay/service-kit": "workspace:*",
      "drizzle-orm": "^0.45.2",
@@ -1951,10 +2061,16 @@ the day it was retired.
      "pg": "^8.22.0",
      "reflect-metadata": "^0.2.2",
      "rxjs": "^7.8.2",
+     "zod": "^4.4.3"
+   },
+   "devDependencies": {
 ```
 
 ```diff title="services/api/src/app.module.ts"
-@@ -5,6 +5,8 @@ import {
+@@ -2,12 +2,14 @@ import {
+   Module,
+   type MiddlewareConsumer,
+   type NestModule,
  } from "@nestjs/common";
  import { APP_FILTER } from "@nestjs/core";
  
@@ -1963,7 +2079,13 @@ the day it was retired.
  import { HealthController } from "./health.controller";
  import { InternalModule } from "./internal/internal.module";
  import { MessagesModule } from "./messages/messages.module";
-@@ -18,7 +20,7 @@ import { RequestContextMiddleware } from "./request-context.middleware";
+ import { TenancyModule } from "./tenancy/tenancy.module";
+ import { LOGGER, apiLogger } from "./logger";
+ import { ProtocolErrorFilter } from "./protocol-error.filter";
+@@ -15,19 +17,25 @@ import { RequestContextMiddleware } from "./request-context.middleware";
+ 
+ // The application described as a module graph — ADR-15's convention for the
+ // wide surface Phases 2-4 will grow. Registering the error filter as a
  // provider (APP_FILTER) instead of wiring it in main.ts means every entry
  // point — including tests — gets the same error envelope for free.
  @Module({
@@ -1972,7 +2094,9 @@ the day it was retired.
    controllers: [HealthController],
    providers: [
      { provide: LOGGER, useFactory: apiLogger },
-@@ -28,6 +30,12 @@ import { RequestContextMiddleware } from "./request-context.middleware";
+     { provide: APP_FILTER, useClass: ProtocolErrorFilter },
+     RequestContextMiddleware,
+   ],
  })
  export class AppModule implements NestModule {
    configure(consumer: MiddlewareConsumer): void {
@@ -2018,7 +2142,10 @@ export class AuthModule {}
 ```
 
 ```diff title="services/api/src/protocol-error.filter.ts"
-@@ -21,14 +21,33 @@ export class ProtocolErrorFilter implements ExceptionFilter {
+@@ -18,20 +18,39 @@ export class ProtocolErrorFilter implements ExceptionFilter {
+     const res = host.switchToHttp().getResponse<ServerResponse>();
+     const status =
+       exception instanceof HttpException ? exception.getStatus() : 500;
      // REST error codes by status (chapter 2.2 widened this: a 400 that
      // calls itself "internal_error" is a lie the client cannot act on).
      // The registry stays here until an API chapter owns a REST one.
@@ -2056,10 +2183,16 @@ export class AuthModule {}
      const message =
        exception instanceof HttpException
          ? exception.message
+         : "unexpected internal error";
+     res.statusCode = status;
+     res.setHeader("content-type", "application/json");
 ```
 
 ```diff title="services/api/src/messages/messages.controller.ts"
-@@ -8,7 +8,7 @@ import {
+@@ -5,27 +5,33 @@ import {
+   Param,
+   Post,
+   Query,
    UseGuards,
  } from "@nestjs/common";
  
@@ -2068,7 +2201,12 @@ export class AuthModule {}
  import { MessagesService } from "./messages.service";
  import { historyQuerySchema, sendMessageBodySchema } from "./messages.schema";
  // `import type` is required, not stylistic: with isolatedModules and
-@@ -21,8 +21,14 @@ import { ZodValidationPipe } from "./zod-validation.pipe";
+ // emitDecoratorMetadata on (ADR-15's trade-off, chapter 1.4), a type used
+ // in a decorated signature must be imported as a type or TS1272 refuses
+ // to compile it.
+ import type { HistoryQuery, SendMessageBody } from "./messages.schema";
+ import { ZodValidationPipe } from "./zod-validation.pipe";
+ 
  // The api's first product endpoint (chapter 2.2). Validation is zod at the
  // boundary — the same schema family as @relay/protocol, so the REST body
  // and the WebSocket frame payload cannot drift (1.3's payoff, again).
@@ -2084,115 +2222,130 @@ export class AuthModule {}
  export class MessagesController {
    constructor(private readonly messages: MessagesService) {}
  
+   @Post()
+   async send(
+     @Param("channelId") channelId: string,
 ```
 
-```ts title="services/api/src/internal/internal.controller.ts"
-import {
-  BadRequestException,
-  Body,
-  Controller,
-  Post,
-  Req,
-  UseGuards,
-} from "@nestjs/common";
-
-import { Accepts, CredentialGuard } from "../auth/credential.guard";
-import type { RequestWithPrincipal } from "../auth/principal";
-import { MessagesService } from "../messages/messages.service";
-import { Repository } from "../db/repository";
-import {
-  internalSendRequestSchema,
-  type InternalSendRequest,
-} from "@relay/protocol";
-
-import { ZodValidationPipe } from "../messages/zod-validation.pipe";
-
-/** The connected user, from the token the gateway forwarded. The guard has
- * already refused anything that is not a user principal, so this narrowing is
- * about the type system rather than about trust. */
-function principalUser(req: RequestWithPrincipal): string {
-  const principal = req.principal;
-  if (principal?.kind !== "user") {
-    throw new BadRequestException("internal routes act for an end user");
-  }
-  return principal.userExternalId;
-}
-
-// The internal surface (chapter 2.5): the routes the gateway calls on a
-// connected user's behalf. They reuse the SAME service methods as the
-// public routes — the write path has one implementation (ADR-04), and the
-// socket is a new door onto it, not a second path.
-//
-// DECISION (chapter 2.5, narrowed by the credentials chapter): these routes are still
-// network-internal, and there is still no service-to-service credential between
-// the gateway and the api — that remains Part 3 hardening. What changed is what
-// they trust. The gateway used to ASSERT identity in two headers it invented
-// from a token it verified locally; it now forwards the END USER'S OWN token,
-// and the api resolves the identity itself. The seam got narrower, not wider:
-// the gateway can no longer claim to be somebody it cannot present a token for.
-@Controller("internal")
-// The end user's token, not a key: these routes exist to act for a connected
-// person, and a route that also accepted an application credential would let a
-// key act as any user without saying which (research R6).
-@Accepts("user")
-@UseGuards(CredentialGuard)
-export class InternalController {
-  constructor(
-    private readonly repo: Repository,
-    private readonly messages: MessagesService,
-  ) {}
-
-  @Post("messages")
-  async send(
-    @Body(new ZodValidationPipe(internalSendRequestSchema))
-    body: InternalSendRequest,
-    @Req() req: RequestWithPrincipal,
-  ) {
-    const userExternalId = principalUser(req);
-    const user = await this.repo.getUserByExternalId(userExternalId);
-    if (!user) throw new BadRequestException("unknown user");
-    const message = await this.messages.send(
-      body.channel_id,
-      {
-        text: body.text,
-        ...(body.idempotency_key !== undefined && {
-          idempotency_key: body.idempotency_key,
-        }),
-      },
-      // Chapter 2.6: the sender is RESOLVED here and, until now, dropped
-      // here — every socket-written row had user_id NULL. Fan-out cannot
-      // build a message.created frame without a sender, so the write path
-      // finally records the one it already had in its hand.
-      user.id,
-    );
-    // `user` is echoed as the EXTERNAL id: internal uuids are ours, and
-    // the frame this becomes is client-facing.
-    return { ...message, user: userExternalId };
-  }
-}
+```diff title="services/api/src/internal/internal.controller.ts"
+@@ -1,62 +1,68 @@
+ import {
+   BadRequestException,
+   Body,
+   Controller,
+-  Get,
+-  Headers,
+   Post,
++  Req,
+   UseGuards,
+ } from "@nestjs/common";
+ 
+-import { EnvironmentContextGuard } from "../messages/environment-context.guard";
++import { Accepts, CredentialGuard } from "../auth/credential.guard";
++import type { RequestWithPrincipal } from "../auth/principal";
+ import { MessagesService } from "../messages/messages.service";
+ import { Repository } from "../db/repository";
+ import {
+   internalSendRequestSchema,
+   type InternalSendRequest,
+ } from "@relay/protocol";
+ 
+ import { ZodValidationPipe } from "../messages/zod-validation.pipe";
+ 
++/** The connected user, from the token the gateway forwarded. The guard has
++ * already refused anything that is not a user principal, so this narrowing is
++ * about the type system rather than about trust. */
++function principalUser(req: RequestWithPrincipal): string {
++  const principal = req.principal;
++  if (principal?.kind !== "user") {
++    throw new BadRequestException("internal routes act for an end user");
++  }
++  return principal.userExternalId;
++}
++
+ // The internal surface (chapter 2.5): the routes the gateway calls on a
+ // connected user's behalf. They reuse the SAME service methods as the
+ // public routes — the write path has one implementation (ADR-04), and the
+ // socket is a new door onto it, not a second path.
+ //
+-// DECISION (chapter 2.5): these routes are network-internal and
+-// unauthenticated between services at this stage; the gateway's forwarded
+-// identity headers are trusted. Service-to-service credentials are Part 3
+-// hardening, and this controller is the whole seam.
++// DECISION (chapter 2.5, narrowed by 3.2): these routes are still
++// network-internal, and there is still no service-to-service credential between
++// the gateway and the api — that remains Part 3 hardening. What changed is what
++// they trust. The gateway used to ASSERT identity in two headers it invented
++// from a token it verified locally; it now forwards the END USER'S OWN token,
++// and the api resolves the identity itself. The seam got narrower, not wider:
++// the gateway can no longer claim to be somebody it cannot present a token for.
+ @Controller("internal")
+-@UseGuards(EnvironmentContextGuard)
++// The end user's token, not a key: these routes exist to act for a connected
++// person, and a route that also accepted an application credential would let a
++// key act as any user without saying which (research R6).
++@Accepts("user")
++@UseGuards(CredentialGuard)
+ export class InternalController {
+   constructor(
+     private readonly repo: Repository,
+     private readonly messages: MessagesService,
+   ) {}
+ 
+-  /** Which channels may this user hear? The gateway caches the answer on
+-   * the session; membership.changed frames invalidate it (FR-RTM-05). */
+-  @Get("memberships")
+-  async memberships(@Headers("x-relay-user") userExternalId?: string) {
+-    if (!userExternalId) throw new BadRequestException("missing x-relay-user");
+-    const user = await this.repo.getUserByExternalId(userExternalId);
+-    // An unknown user is not an error — it is a user with no channels. The
+-    // gateway's job is delivery, not identity forensics.
+-    if (!user) return { channel_ids: [] };
+-    return { channel_ids: await this.repo.channelsForUser(user.id) };
+-  }
+-
+   @Post("messages")
+   async send(
+     @Body(new ZodValidationPipe(internalSendRequestSchema))
+     body: InternalSendRequest,
+-    @Headers("x-relay-user") userExternalId?: string,
++    @Req() req: RequestWithPrincipal,
+   ) {
+-    if (!userExternalId) throw new BadRequestException("missing x-relay-user");
++    const userExternalId = principalUser(req);
+     const user = await this.repo.getUserByExternalId(userExternalId);
+     if (!user) throw new BadRequestException("unknown user");
+     const message = await this.messages.send(
+       body.channel_id,
+       {
+         text: body.text,
 ```
 
-```ts title="services/api/src/internal/internal.module.ts"
-import { Module } from "@nestjs/common";
-
-import { MessagesModule } from "../messages/messages.module";
-import { AuthModule } from "../auth/auth.module";
-import { BackfillController } from "./backfill.controller";
-import { InternalController } from "./internal.controller";
-import { SessionController } from "./session.controller";
-
-// The internal routes reuse MessagesModule's providers wholesale — the
-// request-scoped Repository, the guard, the service. One write path, two
-// doors (ADR-04/05).
-@Module({
-  imports: [MessagesModule, AuthModule],
-  controllers: [InternalController, BackfillController, SessionController],
-})
-export class InternalModule {}
+```diff title="services/api/src/internal/internal.module.ts"
+@@ -1,14 +1,16 @@
+ import { Module } from "@nestjs/common";
+ 
+ import { MessagesModule } from "../messages/messages.module";
++import { AuthModule } from "../auth/auth.module";
+ import { BackfillController } from "./backfill.controller";
+ import { InternalController } from "./internal.controller";
++import { SessionController } from "./session.controller";
+ 
+ // The internal routes reuse MessagesModule's providers wholesale — the
+ // request-scoped Repository, the guard, the service. One write path, two
+ // doors (ADR-04/05).
+ @Module({
+-  imports: [MessagesModule],
+-  controllers: [InternalController, BackfillController],
++  imports: [MessagesModule, AuthModule],
++  controllers: [InternalController, BackfillController, SessionController],
+ })
+ export class InternalModule {}
 ```
 
 ```diff title="services/api/src/internal/backfill.controller.ts"
-@@ -2,8 +2,8 @@ import {
+@@ -1,24 +1,25 @@
+ import {
    BadRequestException,
    Body,
    Controller,
@@ -2202,7 +2355,11 @@ export class InternalModule {}
    UseGuards,
  } from "@nestjs/common";
  
-@@ -15,7 +15,8 @@ import {
+ import {
+   BACKFILL_LIMIT,
+   internalBackfillRequestSchema,
+   type InternalBackfillRequest,
+   type InternalBackfillResponse,
    type Message,
  } from "@relay/protocol";
  
@@ -2212,7 +2369,13 @@ export class InternalModule {}
  import { Repository, type MessageWithSender } from "../db/repository";
  import { ZodValidationPipe } from "../messages/zod-validation.pipe";
  
-@@ -29,7 +30,10 @@ import { ZodValidationPipe } from "../messages/zod-validation.pipe";
+ // The api's half of resume (chapter 2.7): everything the client has not
+ // applied yet, per channel, capped. It is a READ behind a POST, because the
+ // request carries a map — cursors in a query string would be a length limit
+@@ -26,24 +27,30 @@ import { ZodValidationPipe } from "../messages/zod-validation.pipe";
+ // once per connect.
+ //
+ // The controller's real job is SHAPE: the repository returns rows, the
  // gateway needs frames, and this is the boundary where one becomes the
  // other (the same division of labour 2.6 settled for the public send).
  @Controller("internal")
@@ -2224,7 +2387,7 @@ export class InternalModule {}
  export class BackfillController {
    constructor(private readonly repo: Repository) {}
  
-@@ -37,10 +41,13 @@ export class BackfillController {
+   @Post("backfill")
    async backfill(
      @Body(new ZodValidationPipe(internalBackfillRequestSchema))
      body: InternalBackfillRequest,
@@ -2241,21 +2404,33 @@ export class InternalModule {}
      // An unknown user resumes nothing — the same answer memberships gives,
      // for the same reason: delivery is not identity forensics.
      if (!user) return { channels: {} };
+ 
+     const pages = await this.repo.backfill(
+       user.id,
 ```
 
 ```diff title="services/api/src/tenancy/signup.controller.ts"
-@@ -35,7 +35,9 @@ import {
+@@ -32,13 +32,15 @@ import {
+ // EnvironmentContextGuard every other controller carries (2.2). The guard is
+ // applied per controller, so a pre-tenant route simply does not use it, and
+ // the seam it guards is untouched by this chapter (3.2 retires it).
  //
  // What these routes do NOT do: issue a session. A session is a credential,
  // credentials are the credentials chapter's subject, and the dashboard that would consume one is
 -// Part 5. The callback reports what it created and stops there.
-+// Part 5. The callback reports what it created — and, from the credentials chapter, hands over the
++// Part 5. The callback reports what it created — and, from 3.2, hands over the
 +// environment's first API key, because with no session nothing else could
 +// bootstrap one (research R8).
  
  /** The two things this controller needs from the response object.
   *
-@@ -127,6 +129,18 @@ export class SignupController {
+  * `@Res()` puts a handler in Nest's library-specific mode, which normally
+  * means importing express's `Response` type — and express 5 ships no types, so
+  * that would mean adding `@types/express` for two method signatures. Declaring
+@@ -124,10 +126,22 @@ export class SignupController {
+     });
+ 
+     return {
        organisation: result.organisation,
        application: result.application,
        environment: result.environment,
@@ -2274,10 +2449,11 @@ export class InternalModule {}
        created: result.created,
      };
    }
+ }
 ```
 
 ```diff title="services/gateway/src/api-client.ts"
-@@ -1,11 +1,12 @@
+@@ -1,14 +1,15 @@
  import {
    internalBackfillResponseSchema,
 -  internalMembershipsResponseSchema,
@@ -2291,7 +2467,13 @@ export class InternalModule {}
  } from "@relay/protocol";
  
  // The gateway's only road to state (chapter 2.5, ADR-05): internal HTTP to
-@@ -20,13 +21,39 @@ import {
+ // the api service. Not a database client — a client of the service that
+ // owns the database.
+ //
+@@ -17,19 +18,45 @@ import {
+ // with, so the two sides cannot drift (ADR-01's payoff, applied to the
+ // internal hop). And responses are PARSED, not assumed: an internal caller
+ // has no more right to trust a payload's shape than an external one does —
  // the day the api changes a field name, this fails loudly here instead of
  // producing an `undefined` seq in an ack three layers away.
  
@@ -2332,7 +2514,13 @@ export class InternalModule {}
    /** Resume backfill (chapter 2.7): everything past the cursors, per
     * channel, already shaped as wire frames. */
    backfill(
-@@ -40,10 +67,14 @@ export interface ApiClient {
+     identity: Identity,
+     cursors: Record<string, number>,
+   ): Promise<InternalBackfillResponse["channels"]>;
+@@ -37,42 +64,49 @@ export interface ApiClient {
+     identity: Identity,
+     body: InternalSendRequest,
+   ): Promise<InternalSendResponse>;
  }
  
  export function createApiClient(baseUrl: string): ApiClient {
@@ -2349,7 +2537,7 @@ export class InternalModule {}
    });
  
    async function parse<T>(
-@@ -51,7 +82,7 @@ export function createApiClient(baseUrl: string): ApiClient {
+     res: Response,
      schema: { safeParse: (value: unknown) => { success: boolean; data?: T } },
      what: string,
    ): Promise<T> {
@@ -2358,7 +2546,8 @@ export class InternalModule {}
      const parsed = schema.safeParse(await res.json());
      if (!parsed.success || parsed.data === undefined) {
        throw new Error(`${what} returned a payload the contract does not allow`);
-@@ -60,16 +91,19 @@ export function createApiClient(baseUrl: string): ApiClient {
+     }
+     return parsed.data;
    }
  
    return {
@@ -2387,10 +2576,16 @@ export class InternalModule {}
      },
      async backfill(identity, cursors) {
        const res = await fetch(`${baseUrl}/internal/backfill`, {
+         method: "POST",
+         headers: headers(identity),
+         body: JSON.stringify({ cursors } satisfies InternalBackfillRequest),
 ```
 
 ```diff title="services/gateway/src/session.ts"
-@@ -10,8 +10,8 @@ import {
+@@ -7,14 +7,14 @@ import {
+   type Frame,
+   type Message,
+ } from "@relay/protocol";
  import type { Logger } from "@relay/service-kit";
  import { WebSocketServer, type WebSocket } from "ws";
  
@@ -2401,7 +2596,13 @@ export class InternalModule {}
  import type { Fanout } from "./fanout.js";
  import { Registry, type Connection } from "./registry.js";
  import {
-@@ -112,16 +112,29 @@ export function attachSessions({
+   MAX_BUFFERED_FRAMES,
+   SUBSCRIBE_DEADLINE_MS,
+   flushable,
+@@ -109,58 +109,62 @@ export function attachSessions({
+     if (url.pathname !== "/v1/ws") {
+       socket.destroy();
+       return;
      }
      const token = url.searchParams.get("token");
      void (async () => {
@@ -2434,7 +2635,7 @@ export class InternalModule {}
        });
      })();
    });
-@@ -129,6 +142,7 @@ export function attachSessions({
+ 
    async function open(
      socket: WebSocket,
      identity: Identity,
@@ -2442,7 +2643,9 @@ export class InternalModule {}
      url: string,
    ): Promise<void> {
      // Cursors are read BEFORE anything else, because their presence decides
-@@ -138,26 +152,16 @@ export function attachSessions({
+     // whether this connection is born buffering or born live.
+     const presented = parseCursors(url);
+     const connection: Connection = {
        id: randomUUID(),
        identity,
        socket,
@@ -2474,7 +2677,13 @@ export class InternalModule {}
  
      registry.add(connection);
      // Subscriptions follow membership: the first local member of a channel
-@@ -410,6 +414,22 @@ export function attachSessions({
+     // makes this instance a subscriber, and the last one to leave releases
+     // it (reference-counted in the fabric).
+     const subscribing = Promise.all(
+@@ -407,12 +411,28 @@ export function attachSessions({
+       }
+     } catch (error) {
+       logger.log("error", "send.failed", {
          connection_id: connection.id,
          error: String(error),
        });
@@ -2497,10 +2706,16 @@ export class InternalModule {}
        sendError(connection.socket, "internal_error", "send failed");
      }
    }
+ 
+   const heartbeat = setInterval(() => {
+     for (const connection of registry.all()) {
 ```
 
 ```diff title="services/api/src/messages/messages.itest.ts"
-@@ -6,7 +6,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
+@@ -3,32 +3,37 @@ import "reflect-metadata";
+ import { Test } from "@nestjs/testing";
+ import type { INestApplication } from "@nestjs/common";
+ import { afterAll, beforeAll, describe, expect, it } from "vitest";
  
  import { AppModule } from "../app.module";
  import { createDb, createPool } from "../db/client";
@@ -2509,7 +2724,10 @@ export class InternalModule {}
  
  // The endpoint path (chapter 2.2): guard → pipe → service → repository →
  // filter, over real HTTP against the compose Postgres. Its own environment,
-@@ -17,6 +17,10 @@ describe("POST /v1/channels/:channelId/messages", () => {
+ // minted here — no truncate, because tenant isolation means this suite and
+ // the repository suite cannot see each other's rows (2.1's property, paying
+ // for itself in the test lane).
+ describe("POST /v1/channels/:channelId/messages", () => {
    let app: INestApplication;
    let url: string;
    let env: { id: string };
@@ -2520,7 +2738,9 @@ export class InternalModule {}
    let channelId: string;
    let foreignChannelId: string;
  
-@@ -26,6 +30,7 @@ describe("POST /v1/channels/:channelId/messages", () => {
+   beforeAll(async () => {
+     const db = createDb(createPool());
+     env = await createEnvironment(db, { name: "messages-itest" });
      channelId = (
        await new Repository(db, env.id).createChannel("general", "public")
      ).id;
@@ -2528,7 +2748,13 @@ export class InternalModule {}
      const other = await createEnvironment(db, { name: "messages-itest-other" });
      foreignChannelId = (
        await new Repository(db, other.id).createChannel("theirs", "public")
-@@ -41,12 +46,12 @@ describe("POST /v1/channels/:channelId/messages", () => {
+     ).id;
+     app = (
+       await Test.createTestingModule({ imports: [AppModule] }).compile()
+@@ -38,18 +43,18 @@ describe("POST /v1/channels/:channelId/messages", () => {
+   });
+ 
+   afterAll(async () => {
      await app.close();
    });
  
@@ -2543,7 +2769,13 @@ export class InternalModule {}
        },
        body: JSON.stringify(body),
      });
-@@ -75,11 +80,11 @@ describe("POST /v1/channels/:channelId/messages", () => {
+ 
+   it("returns 201 with an ascending sequence", async () => {
+     const first = await send({ text: "hello" });
+@@ -72,17 +77,17 @@ describe("POST /v1/channels/:channelId/messages", () => {
+     // a channel this tenant cannot see, GET said 200 with an empty page. An
+     // empty page leaks nothing, but it leaves a client unable to tell "no
+     // such conversation" from "nothing said yet" — and one resource should
      // not answer two ways depending on the verb.
      const foreign = await fetch(
        `${url}/v1/channels/${foreignChannelId}/messages?limit=10`,
@@ -2557,10 +2789,15 @@ export class InternalModule {}
      );
      expect(foreign.status).toBe(404);
      expect(missing.status).toBe(404);
+     expect(await foreign.json()).toEqual(await missing.json());
+   });
 ```
 
 ```diff title="services/api/src/internal/internal.itest.ts"
-@@ -5,13 +5,18 @@ import type { INestApplication } from "@nestjs/common";
+@@ -2,19 +2,24 @@ import "reflect-metadata";
+ 
+ import { Test } from "@nestjs/testing";
+ import type { INestApplication } from "@nestjs/common";
  import { afterAll, beforeAll, describe, expect, it } from "vitest";
  
  import {
@@ -2581,7 +2818,13 @@ export class InternalModule {}
  
  // The internal boundary, tested as a CONTRACT (chapter 2.6). 2.5 built these
  // routes and verified them only through the gateway's tests, where the api
-@@ -28,6 +33,10 @@ describe("the internal surface", () => {
+ // was a stub — which means nothing checked that the real api emits what the
+ // shared schema demands. The gateway parses these bodies at runtime and
+ // refuses what does not fit, so an unnoticed drift here becomes a failed
+@@ -25,41 +30,54 @@ import { createEnvironment, Repository } from "../db/repository";
+ // deploy together.
+ describe("the internal surface", () => {
+   let app: INestApplication;
    let url: string;
    let env: { id: string };
    let channelId: string;
@@ -2592,7 +2835,8 @@ export class InternalModule {}
  
    beforeAll(async () => {
      const db = createDb(createPool());
-@@ -36,6 +45,16 @@ describe("the internal surface", () => {
+     env = await createEnvironment(db, { name: "internal-itest" });
+     const repo = new Repository(db, env.id);
      const user = await repo.createUser("tuan", "Tuan");
      channelId = (await repo.createChannel("fleet", "public")).id;
      await repo.addMember(channelId, user.id);
@@ -2609,7 +2853,11 @@ export class InternalModule {}
      app = (
        await Test.createTestingModule({ imports: [AppModule] }).compile()
      ).createNestApplication({ logger: false });
-@@ -47,16 +66,15 @@ describe("the internal surface", () => {
+     await app.listen(0);
+     url = await app.getUrl();
+   });
+ 
+   afterAll(async () => {
      await app.close();
    });
  
@@ -2630,7 +2878,13 @@ export class InternalModule {}
        body: JSON.stringify(body),
      });
  
-@@ -96,7 +114,7 @@ describe("the internal surface", () => {
+   it("emits a send response the shared contract accepts", async () => {
+     const res = await send({ channel_id: channelId, text: "which entrance?" });
+     expect(res.status).toBe(201);
+@@ -93,36 +111,55 @@ describe("the internal surface", () => {
+   it("persists the sender on the row, not just in the response", async () => {
+     const res = internalSendResponseSchema.parse(
+       await (await send({ channel_id: channelId, text: "north ramp" })).json(),
      );
      const history = await fetch(
        `${url}/v1/channels/${channelId}/messages?limit=50`,
@@ -2639,7 +2893,8 @@ export class InternalModule {}
      );
      const page = (await history.json()) as { messages: { id: string }[] };
      // History does not expose `user` yet — 2.7's resume path is where the
-@@ -105,24 +123,43 @@ describe("the internal surface", () => {
+     // read side catches up. What this asserts is that the message exists
+     // and the write did not fail silently while claiming a sender.
      expect(page.messages.some((m) => m.id === res.id)).toBe(true);
    });
  
@@ -2695,7 +2950,10 @@ export class InternalModule {}
 ```
 
 ```diff title="services/api/src/internal/backfill.itest.ts"
-@@ -12,7 +12,12 @@ import {
+@@ -9,13 +9,18 @@ import {
+   internalBackfillResponseSchema,
+   MAX_RESUME_CHANNELS,
+ } from "@relay/protocol";
  
  import { AppModule } from "../app.module";
  import { createDb, createPool } from "../db/client";
@@ -2709,7 +2967,13 @@ export class InternalModule {}
  
  // The api's half of resume (chapter 2.7), against the compose Postgres. The
  // gateway's suites prove the ORDERING; this one proves the read: everything
-@@ -27,6 +32,9 @@ describe("POST /internal/backfill", () => {
+ // past the cursor, capped honestly, scoped to membership as it stands now.
+ 
+ describe("POST /internal/backfill", () => {
+@@ -24,12 +29,15 @@ describe("POST /internal/backfill", () => {
+   let env: { id: string };
+   let repo: Repository;
+   let channelId: string;
    let quietChannelId: string;
    let leftChannelId: string;
    let tuan: { id: string };
@@ -2719,7 +2983,13 @@ export class InternalModule {}
  
    beforeAll(async () => {
      const db = createDb(createPool());
-@@ -44,6 +52,16 @@ describe("POST /internal/backfill", () => {
+     env = await createEnvironment(db, { name: "backfill-itest" });
+     repo = new Repository(db, env.id);
+     tuan = await repo.createUser("tuan", "Tuan");
+@@ -41,30 +49,39 @@ describe("POST /internal/backfill", () => {
+       await repo.addMember(id, tuan.id);
+       await repo.addMember(id, dispatcher.id);
+     }
      // Tuan is NOT a member of leftChannelId — the "removed while offline"
      // case, which is indistinguishable from "never joined" by design.
      await repo.addMember(leftChannelId, dispatcher.id);
@@ -2736,7 +3006,11 @@ export class InternalModule {}
      app = (
        await Test.createTestingModule({ imports: [AppModule] }).compile()
      ).createNestApplication({ logger: false });
-@@ -55,13 +73,12 @@ describe("POST /internal/backfill", () => {
+     await app.listen(0);
+     url = await app.getUrl();
+   }, 60_000);
+ 
+   afterAll(async () => {
      await app.close();
    });
  
@@ -2752,10 +3026,16 @@ export class InternalModule {}
        },
        body: JSON.stringify({ cursors }),
      });
+ 
+   const parsed = async (res: Response) =>
+     internalBackfillResponseSchema.parse(await res.json());
 ```
 
 ```diff title="services/api/src/tenancy/signup.itest.ts"
-@@ -283,11 +283,11 @@ describe("signup", () => {
+@@ -280,17 +280,17 @@ describe("signup", () => {
+       const text = await res.text();
+       expect(text).not.toContain("organisation");
+     }
      const before = await db.execute(
        `SELECT count(*)::int AS n FROM organisations`,
      );
@@ -2772,15 +3052,23 @@ export class InternalModule {}
      const after = await db.execute(
        `SELECT count(*)::int AS n FROM organisations`,
      );
+     expect((after.rows[0] as { n: number }).n).toBe(
+       (before.rows[0] as { n: number }).n,
+     );
 ```
 
 ```diff title="services/gateway/src/session.test.ts"
-@@ -1,4 +1,3 @@
+@@ -1,20 +1,18 @@
 -import { SignJWT } from "jose";
  import { WebSocket } from "ws";
  import { afterEach, describe, expect, it } from "vitest";
  import type { Server } from "node:http";
-@@ -11,7 +10,6 @@ import type { Frame } from "@relay/protocol";
+ import type { AddressInfo } from "node:net";
+ 
+ import { createLogger, type Logger } from "@relay/service-kit";
+ import { serve } from "@relay/service-kit";
+ import type { Frame } from "@relay/protocol";
+ 
  import type { InternalSendResponse, Message } from "@relay/protocol";
  
  import type { ApiClient } from "./api-client.js";
@@ -2788,7 +3076,13 @@ export class InternalModule {}
  import type { Fanout } from "./fanout.js";
  import { attachSessions } from "./session.js";
  
-@@ -38,7 +36,14 @@ function committed(seq: number): InternalSendResponse {
+ // The door, the frames, and the liveness clock — all provable without a
+ // database, because the gateway has no database (ADR-05). The api is a
+ // stub here for exactly that reason: if these tests needed Postgres, the
+@@ -35,13 +33,20 @@ function committed(seq: number): InternalSendResponse {
+     created_at: new Date().toISOString(),
+   };
+ }
  
  function stubApi(overrides: Partial<ApiClient> = {}): ApiClient {
    return {
@@ -2804,7 +3098,13 @@ export class InternalModule {}
      backfill: async () => ({}),
      sendMessage: async () => committed(42),
      ...overrides,
-@@ -59,11 +64,22 @@ function frame(seq: number, channel = CHANNEL): Message {
+   };
+ }
+ 
+@@ -56,17 +61,28 @@ function frame(seq: number, channel = CHANNEL): Message {
+     user: "dispatcher",
+     text: `m${seq}`,
+     created_at: "2026-08-04T00:00:00.000Z",
    };
  }
  
@@ -2831,7 +3131,13 @@ export class InternalModule {}
  }
  
  interface Harness {
-@@ -190,6 +206,23 @@ describe("the socket (chapter 2.5)", () => {
+   url: string;
+   close: () => Promise<void>;
+ }
+@@ -187,12 +203,29 @@ describe("the socket (chapter 2.5)", () => {
+     for (const bad of ["", "not-a-jwt", await token({ env: "" })]) {
+       const socket = new WebSocket(`${harness.url}?token=${bad}`);
+       expect(await closeCode(socket)).toBe(4001);
      }
    });
  
@@ -2855,7 +3161,13 @@ export class InternalModule {}
    it("forwards message.send to the api and acks the committed sequence", async () => {
      const sent: unknown[] = [];
      harness = await boot(
-@@ -210,10 +243,16 @@ describe("the socket (chapter 2.5)", () => {
+       stubApi({
+         sendMessage: async (identity, body) => {
+           sent.push({ identity, body });
+@@ -207,16 +240,22 @@ describe("the socket (chapter 2.5)", () => {
+         type: "message.send",
+         payload: { idem_key: "k1", channel: "c1", text: "hello" },
+       }),
      );
      const ack = await nextFrame(socket, "message.ack");
      expect(ack).toMatchObject({ type: "message.ack", payload: { seq: 7 } });
@@ -2874,17 +3186,21 @@ export class InternalModule {}
          body: { channel_id: "c1", text: "hello", idempotency_key: "k1" },
        },
      ]);
+     socket.close();
+   });
 ```
 
 ```diff title="services/gateway/src/resume.itest.ts"
-@@ -1,6 +1,5 @@
+@@ -1,19 +1,17 @@
  import { randomUUID } from "node:crypto";
  
 -import { SignJWT } from "jose";
  import { WebSocket } from "ws";
  import { afterEach, describe, expect, it } from "vitest";
  import type { Server } from "node:http";
-@@ -10,7 +9,6 @@ import { createLogger, serve, type Logger } from "@relay/service-kit";
+ import type { AddressInfo } from "node:net";
+ 
+ import { createLogger, serve, type Logger } from "@relay/service-kit";
  import type { Frame, Message } from "@relay/protocol";
  
  import type { ApiClient } from "./api-client.js";
@@ -2892,7 +3208,13 @@ export class InternalModule {}
  import { createFanout } from "./fanout.js";
  import { attachSessions } from "./session.js";
  
-@@ -43,13 +41,16 @@ function frame(seq: number): Message {
+ // Chapter 2.7's race, run against a REAL broker. The unit suite proves the
+ // ordering with a stub whose timing the test controls; this file proves it
+ // with Redis in the middle, where the publish is a network round trip on
+@@ -40,19 +38,22 @@ function frame(seq: number): Message {
+     user: "dispatcher",
+     text: `m${seq}`,
+     created_at: "2026-08-04T00:00:00.000Z",
    };
  }
  
@@ -2913,7 +3235,13 @@ export class InternalModule {}
  interface Harness {
    url: string;
    close: () => Promise<void>;
-@@ -111,7 +112,11 @@ describe("resume across a real fabric", () => {
+ }
+ 
+ async function boot(api: ApiClient): Promise<Harness> {
+@@ -108,13 +109,17 @@ describe("resume across a real fabric", () => {
+ 
+   it("loses nothing and repeats nothing when a frame is published mid-backfill", async () => {
+     // The backfill leg is deliberately slow, and a DIFFERENT process — a
      // different fanout client on the same subject — publishes into the
      // window. Neither side coordinates; only the buffer saves this.
      harness = await boot({
@@ -2926,7 +3254,13 @@ export class InternalModule {}
        backfill: async () => {
          await publishFromElsewhere(frame(43));
          await settle(150); // give Redis time to actually deliver it
-@@ -138,7 +143,11 @@ describe("resume across a real fabric", () => {
+         return {
+           [CHANNEL]: { messages: [frame(42), frame(43)], truncated: false },
+         };
+@@ -135,13 +140,17 @@ describe("resume across a real fabric", () => {
+   });
+ 
+   it("delivers a mid-backfill frame that the backfill did not contain", async () => {
      // Committed after the backfill's snapshot: it exists ONLY in the buffer,
      // and the flush is the only reason the client ever sees it.
      harness = await boot({
@@ -2939,7 +3273,13 @@ export class InternalModule {}
        backfill: async () => {
          await publishFromElsewhere(frame(43));
          await settle(150);
-@@ -159,7 +168,11 @@ describe("resume across a real fabric", () => {
+         return { [CHANNEL]: { messages: [frame(42)], truncated: false } };
+       },
+       sendMessage: async () => {
+@@ -156,13 +165,17 @@ describe("resume across a real fabric", () => {
+     expect(created(frames)).toEqual([42, 43]);
+     socket.close();
+   });
  
    it("goes live after the flush, with no buffering left behind", async () => {
      harness = await boot({
@@ -2952,10 +3292,16 @@ export class InternalModule {}
        backfill: async () => ({
          [CHANNEL]: { messages: [frame(42)], truncated: false },
        }),
+       sendMessage: async () => {
+         throw new Error("not used");
+       },
 ```
 
 ```diff title="packages/e2e/src/harness.ts"
-@@ -5,7 +5,6 @@ import { createRequire } from "node:module";
+@@ -2,13 +2,12 @@ import { spawn, type ChildProcess } from "node:child_process";
+ import { randomUUID } from "node:crypto";
+ import { existsSync } from "node:fs";
+ import { createRequire } from "node:module";
  import { dirname, join } from "node:path";
  import { fileURLToPath } from "node:url";
  
@@ -2963,7 +3309,13 @@ export class InternalModule {}
  import { WebSocket } from "ws";
  
  import type { Frame, Message } from "@relay/protocol";
-@@ -32,8 +31,6 @@ const HERE = dirname(fileURLToPath(import.meta.url));
+ 
+ // The system harness (chapter 2.8): boots the api and N gateway instances as
+ // CHILD PROCESSES against the compose stores, wires a minimal client per
+@@ -29,14 +28,12 @@ import type { Frame, Message } from "@relay/protocol";
+ // reuses this exact scenario.
+ 
+ const HERE = dirname(fileURLToPath(import.meta.url));
  const REPO = join(HERE, "..", "..", "..");
  const require_ = createRequire(import.meta.url);
  
@@ -2972,7 +3324,13 @@ export class InternalModule {}
  /** Store coordinates are FORWARDED, never invented. Each service already has
   * a default (2.1's `DEFAULT_DATABASE_URL`, 2.6's `DEFAULT_REDIS_URL`), and a
   * harness that composes its own URL from a port variable becomes a second
-@@ -60,6 +57,14 @@ interface Seeder {
+  * source of truth — one that can hand a child process an address the parent
+  * would never have used itself. That is precisely how this suite first
+  * failed: turbo runs tasks in strict env mode, the port variable was
+@@ -57,12 +54,20 @@ const forwarded = (...names: string[]): Record<string, string> =>
+  * test-only seam with a named retirement, like 2.3's `listMessagesRaw`. */
+ interface Seeder {
+   createEnvironment: (
      db: unknown,
      input: { name: string },
    ) => Promise<{ id: string }>;
@@ -2987,7 +3345,13 @@ export class InternalModule {}
    Repository: new (
      db: unknown,
      environmentId: string,
-@@ -276,6 +281,9 @@ export interface System {
+   ) => {
+     createUser: (
+       externalId: string,
+@@ -273,12 +278,15 @@ export interface System {
+   apiUrl: string;
+   log: string[];
+   /** The services' own logs, for when an assertion is not the whole story. */
    serviceOutput: () => string;
    seedConversation: () => Promise<{
      environmentId: string;
@@ -2997,7 +3361,13 @@ export class InternalModule {}
      channel: string;
      dispatcher: Client;
      tuan: Client;
-@@ -323,7 +331,6 @@ export async function boot({ gateways = 2 } = {}): Promise<System> {
+   }>;
+   seedForeignTenant: () => Promise<{ channel: string; text: string }>;
+   client: (name: string, environmentId: string) => Promise<Client>;
+@@ -320,13 +328,12 @@ export async function boot({ gateways = 2 } = {}): Promise<System> {
+     ...forwarded(
+       "DATABASE_URL",
+       "RELAY_POSTGRES_PORT",
        "RELAY_REDIS_URL",
        "RELAY_REDIS_PORT",
      ),
@@ -3005,7 +3375,13 @@ export class InternalModule {}
    };
  
    const apiPort = Number(process.env.RELAY_E2E_API_PORT ?? 4100);
-@@ -367,11 +374,33 @@ export async function boot({ gateways = 2 } = {}): Promise<System> {
+   children.push(
+     capture(
+       "api",
+@@ -364,17 +371,39 @@ export async function boot({ gateways = 2 } = {}): Promise<System> {
+       name: `e2e-${label}-${randomUUID().slice(0, 8)}`,
+     });
+     environments.push(created.id);
      return new seeder.Repository(db, created.id);
    };
  
@@ -3044,7 +3420,13 @@ export class InternalModule {}
  
    let primaryEnvironment = "";
  
-@@ -391,6 +420,8 @@ export async function boot({ gateways = 2 } = {}): Promise<System> {
+   return {
+     gateways: urls,
+     apiUrl,
+@@ -388,12 +417,14 @@ export async function boot({ gateways = 2 } = {}): Promise<System> {
+       const channel = await repo.createChannel("fleet", "public");
+       await repo.addMember(channel.id, dispatcherUser.id);
+       await repo.addMember(channel.id, tuanUser.id);
        say(`seeded one channel with two members in ${primaryEnvironment}`);
        return {
          environmentId: primaryEnvironment,
@@ -3053,10 +3435,16 @@ export class InternalModule {}
          channel: channel.id,
          dispatcher: new Client(
            "dispatcher",
+           await token(primaryEnvironment, "dispatcher"),
+           say,
+         ),
 ```
 
 ```diff title="packages/e2e/src/tuan.itest.ts"
-@@ -33,7 +33,7 @@ const sorted = (seqs: number[]): number[] => [...seqs].sort((a, b) => a - b);
+@@ -30,24 +30,24 @@ const isStrictlyAscending = (seqs: number[]): boolean =>
+ 
+ const sorted = (seqs: number[]): number[] => [...seqs].sort((a, b) => a - b);
+ 
  describe("journey 4 — the message that survives the tunnel", () => {
    let system: System;
    let channel: string;
@@ -3065,7 +3453,10 @@ export class InternalModule {}
    let dispatcher: Client;
    let tuan: Client;
    let foreign: { channel: string; text: string };
-@@ -44,7 +44,7 @@ describe("journey 4 — the message that survives the tunnel", () => {
+   /** Where Tuan's frame log stood when he came back — everything after this
+    * index arrived through the resume. */
+   let afterResume = 0;
+ 
    beforeAll(async () => {
      system = await boot({ gateways: 2 });
      const seeded = await system.seedConversation(); // 2.1
@@ -3074,7 +3465,13 @@ export class InternalModule {}
      foreign = await system.seedForeignTenant();
  
      // ── stage 1: type and send ───────────────────────────────────────────
-@@ -199,12 +199,14 @@ describe("journey 4 — the message that survives the tunnel", () => {
+     // Two personas, two INSTANCES. 2.6 exists because a single-instance
+     // arrangement is blind to a whole class of bug (CON-02: any gateway
+     // must serve any socket).
+@@ -196,29 +196,31 @@ describe("journey 4 — the message that survives the tunnel", () => {
+     // correctness is asserted, so the suite seeds a second tenant with
+     // traffic and confirms it stayed invisible.
+     const everything = JSON.stringify(tuan.frames);
      expect(everything).not.toContain(foreign.text);
      expect(everything).not.toContain(foreign.channel);
  
@@ -3082,7 +3479,7 @@ export class InternalModule {}
 +    // And through the REST door, with this tenant's CREDENTIAL: a foreign
      // channel is a 404, indistinguishable from one that does not exist
 -    // (FR-TEN-05).
-+    // (FR-TEN-05). The credentials chapter changed what proves the tenant here — a key
++    // (FR-TEN-05). THE CREDENTIALS CHAPTER changed what proves the tenant here — a key
 +    // this environment was issued, rather than a header naming it — and the
 +    // assertion is deliberately unchanged.
      const res = await fetch(
@@ -3092,7 +3489,10 @@ export class InternalModule {}
      );
      expect(res.status).toBe(404);
    });
-@@ -215,7 +217,7 @@ describe("journey 4 — the message that survives the tunnel", () => {
+ 
+   it("agrees with history — the read path tells the same story (FR-MSG-09)", async () => {
+     // The live path and the read path are two doors onto one truth (2.4).
+     // If they disagree, one of them is lying, and the suite would rather
      // know now.
      const res = await fetch(
        `${system.apiUrl}/v1/channels/${channel}/messages?limit=50&direction=newer`,
@@ -3101,10 +3501,14 @@ export class InternalModule {}
      );
      expect(res.status).toBe(200);
      const body = (await res.json()) as { messages: Message[] };
+     expect(body.messages.map((m) => m.seq)).toEqual(
+       sorted(seqsOf(tuan.timeline(channel))),
+     );
 ```
 
 ```diff title="scripts/ws-walk.mjs"
-@@ -2,17 +2,16 @@
+@@ -1,36 +1,50 @@
+ // The chapter 2.5 walk, as a script (so the transcript in the chapter is
  // reproducible rather than decorative). Seeds a user, channel and
  // membership, mints a dev token, connects, sends, and retries with the
  // SAME idempotency key so 2.3's recovery leg shows through the socket.
@@ -3123,7 +3527,8 @@ export class InternalModule {}
  
  const db = createDb(createPool());
  const env = await createEnvironment(db, { name: `ws-walk-${Date.now()}` });
-@@ -21,13 +20,28 @@ const user = await repo.createUser("tuan", "Tuan");
+ const repo = new Repository(db, env.id);
+ const user = await repo.createUser("tuan", "Tuan");
  const channel = await repo.createChannel("fleet", "public");
  await repo.addMember(channel.id, user.id);
  
@@ -3157,10 +3562,15 @@ export class InternalModule {}
  const frame = {
    type: "message.send",
    payload: {
+     idem_key: "walk-key-1",
+     channel: channel.id,
+     text: "B2, north ramp",
 ```
 
 ```diff title="scripts/split-brain.mjs"
-@@ -3,18 +3,17 @@
+@@ -1,38 +1,49 @@
+ // The chapter 2.6 demonstration: two gateway instances, two users, one
+ // channel. Run it BEFORE fanout.ts exists (or with Redis stopped) to see
  // the conversation split in half, and again after to see it whole. The
  // script does not assert which outcome is correct — it REPORTS what the
  // far side heard, so the same command tells you the truth in both states.
@@ -3180,7 +3590,10 @@ export class InternalModule {}
  
  const db = createDb(createPool());
  const env = await createEnvironment(db, { name: `split-${Date.now()}` });
-@@ -25,11 +24,23 @@ const channel = await repo.createChannel("fleet", "public");
+ const repo = new Repository(db, env.id);
+ const dispatcher = await repo.createUser("dispatcher", "Dispatcher");
+ const driver = await repo.createUser("tuan", "Tuan");
+ const channel = await repo.createChannel("fleet", "public");
  await repo.addMember(channel.id, dispatcher.id);
  await repo.addMember(channel.id, driver.id);
  
@@ -3209,10 +3622,16 @@ export class InternalModule {}
  
  const heard = [];
  
+ function connect(url, who, sub) {
+   return new Promise((resolve) => {
+     const socket = new WebSocket(`${url}/v1/ws?token=${sub}`);
 ```
 
 ```diff title="scripts/tunnel-walk.mjs"
-@@ -10,17 +10,16 @@
+@@ -7,23 +7,22 @@
+ // Phase 2 is FR-RTM-04's ceiling: a channel that ran away while the client
+ // was gone, where the honest answer is "page history instead."
+ //
  //   node services/api/dist/main.js &
  //   (cd services/gateway && PORT=4001 pnpm exec tsx src/main.ts &)
  //   node scripts/tunnel-walk.mjs
@@ -3231,7 +3650,13 @@ export class InternalModule {}
  const BACKFILL_LIMIT = 500;
  
  const db = createDb(createPool());
-@@ -35,11 +34,23 @@ for (const c of [channel, flood]) {
+ const env = await createEnvironment(db, { name: `tunnel-${Date.now()}` });
+ const repo = new Repository(db, env.id);
+ const tuan = await repo.createUser("tuan", "Tuan");
+@@ -32,17 +31,29 @@ const channel = await repo.createChannel("fleet", "public");
+ const flood = await repo.createChannel("flood", "public");
+ for (const c of [channel, flood]) {
+   await repo.addMember(c.id, tuan.id);
    await repo.addMember(c.id, dispatcher.id);
  }
  
@@ -3260,10 +3685,16 @@ export class InternalModule {}
  
  /** Connect and report every frame, keeping a cursor the way a client would:
   * the highest sequence it has actually applied, per channel. */
+ async function connect(label, sub, cursors = {}, quiet = false) {
+   const query = Object.entries(cursors)
+     .map(([id, seq]) => `&cursor=${id}:${seq}`)
 ```
 
 ```diff title="scripts/signup-walk.mjs"
-@@ -57,6 +57,12 @@ async function signUp(label) {
+@@ -54,12 +54,18 @@ async function signUp(label) {
+   console.log(`${label} → GET /auth/github/callback`);
+   console.log(`    ${res.status} created=${body.created}`);
+   console.log(`    organisation ${body.organisation?.id}`);
    console.log(`    application  ${body.application?.id}`);
    console.log(
      `    environment  ${body.environment?.id} (${body.environment?.kind})\n`,
@@ -3276,10 +3707,13 @@ export class InternalModule {}
    );
    return body;
  }
+ 
+ const first = await signUp("first authentication ");
+ const second = await signUp("second authentication");
 ```
 
 ```js title="scripts/credential-walk.mjs"
-// The the credentials chapter walk, as a script (so the transcript in the chapter is
+// The credentials chapter walk, as a script (so the transcript in the chapter is
 // reproducible rather than decorative).
 //
 // It follows the path a reader actually takes: mint a key, send with it, turn
@@ -3390,7 +3824,10 @@ process.exit(0);
 ```
 
 ```diff title="turbo.json"
-@@ -25,7 +25,6 @@
+@@ -22,13 +22,12 @@
+       "cache": false,
+       "env": [
+         "DATABASE_URL",
          "RELAY_POSTGRES_PORT",
          "RELAY_REDIS_URL",
          "RELAY_REDIS_PORT",
@@ -3398,6 +3835,9 @@ process.exit(0);
          "RELAY_E2E_API_PORT"
        ]
      },
+     "//#lint:root": {
+       "inputs": [
+         "**/*.{ts,mts,cts,mjs,js}",
 ```
 
 <Checkpoint tag="part3-ch2">
