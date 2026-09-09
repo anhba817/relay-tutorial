@@ -418,18 +418,55 @@ in the same transaction, and nothing periodic exists.
 ```
 
 <Why title="Why this is worth a section">
-The previous feature in this repository existed entirely because global operations
-in tests kept producing a fault that passed alone and failed in company — twelve
-occurrences across eight chapters. It built a Postgres trigger to catch them, an
-exemption list, and a lint rule.
+The instruments chapter exists because global operations in tests kept producing a
+fault that passed alone and failed in company. It built a Postgres trigger to catch
+them, an exemption list, and a lint rule.
 
-The first chapter written afterwards turns out not to need a global operation at
-all. Running the whole integration lane against a freshly baited database
-produces fifteen refusals from that trigger and **not one of them names a quota
-table**; every one is older residue on `webhook_endpoints`. No file joined the
-exemption list. The instrument changed the design rather than only the tests,
-which is the outcome its own success criteria hoped for and could not measure.
+This chapter turns out not to need a global operation at all, and that is worth more
+than it sounds — because this chapter also puts **three new tables under that
+trigger**. `usage_periods`, `usage_active_users` and `quota_notifications` all carry
+`environment_id`, so all three join the guard's array as they are created, each with
+a bait row and a case. A periodic sweep would now meet a trigger this chapter armed
+itself.
+
+It never gets the chance. Nothing here writes across tenants, so nothing joins the
+drain-exemption list. **The instrument changed the design rather than only the
+tests**, which is the outcome its own success criteria hoped for and could not
+measure — and the sharper version of that is this: the chapter that would have had
+to ask for the exemption is the chapter that widened what the exemption is for.
 </Why>
+
+<Trap title="The bait had to be planted already delivered, and this time it bit">
+Arming the trigger over `quota_notifications` has a consequence the two earlier
+outbox tables also had, and it arrives harder here.
+
+The harness plants a sentinel row in every guarded table, once per test file, so an
+unscoped `UPDATE` or `DELETE` in somebody's suite meets a trigger rather than
+nothing. But `drainQuotaNotifications` claims on `delivered_at IS NULL` — so a bait
+row planted undelivered is claimed by every quota relay in the lane, on a connection
+carrying no exemption. The trigger refuses the update, and the transaction is
+poisoned:
+
+```
+Failed query: UPDATE quota_notifications SET delivered_at = now(), last_error = NULL
+25P02 in_failed_sql_transaction
+```
+
+Six tests red, and the message names neither the bait nor the guard.
+
+The rule this settles has now been measured four times: **bait may be claimable only
+where draining it is database work.** A sweep or a publish qualifies. Anything that
+does per-row I/O — a mail send, an HTTP delivery — does not, and its bait is planted
+in a state the drain will not claim. The two webhook tables conceded this for
+latency; this one concedes it for correctness.
+
+One more line matters. The bait's insert uses `ON CONFLICT (id) DO UPDATE`, not
+`DO NOTHING`. A sentinel's ids are derived from its owner, so the row's id is the
+same on every run for ever — with `DO NOTHING` the state it was *first* planted with
+is the state it keeps, and a lane that ran the fixture once before this was fixed
+holds an undelivered bait row no later run can repair. Here the row's **state** is
+part of the fixture's contract, not merely its existence.
+</Trap>
 
 ## Running out, without going down
 
@@ -637,7 +674,11 @@ one, which is what the specification asked for in the first place.
 - Emails at 50%, 80% and 100%, at most one each per quota per period, enforced by
   a unique constraint
 - The outbox pattern for the fourth time, in `quota_notifications`
-- No periodic job, no global operation, and no new entry in the exemption list
+- Three tables under the global-operation guard, each with a bait row and a case
+- No periodic job, no global operation, and no new entry in the DRAIN exemption
+  list — the two the driver rule gains are the quota suites, which write and read
+  the roll-up tables directly because going through the repository would mean
+  asserting a function against itself
 </Checkpoint>
 
 <ForwardRef>
