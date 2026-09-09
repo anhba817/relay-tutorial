@@ -20,7 +20,7 @@ export const metadata = {
 
 Somebody sends a message with a typo in it. Somebody sends a message to the wrong channel.
 Somebody sends a message they immediately regret. Every chat product answers all three, and
-Relay has answered none of them for twenty-two chapters — while carrying, the whole time,
+Relay has answered none of them for sixteen chapters — while carrying, the whole time,
 almost everything it needed to.
 
 `messages.edited_at` has been in the schema since chapter 2.1. So has `deleted_at`, so has a
@@ -63,7 +63,10 @@ what arrives; making it looser to accommodate a different frame is a promise nob
 on.
 
 ```diff title="packages/protocol/src/frames.ts"
-@@ -69,9 +69,41 @@ export const messageUpdatedSchema = z.strictObject({
+@@ -66,15 +66,47 @@ export const messageCreatedSchema = z.strictObject({
+ 
+ export const messageUpdatedSchema = z.strictObject({
+   type: z.literal("message.updated"),
    payload: messageSchema,
  });
  
@@ -86,7 +89,7 @@ on.
 + * indistinguishable on the wire, and the platform would be asserting something false rather
 + * than declining to say it. */
 +/** NAMED SEPARATELY so the fabric can import it instead of reaching into
-+ * `messageDeletedSchema.shape.payload`. The revisions chapter's fifth subject grammar carries this
++ * `messageDeletedSchema.shape.payload`. the revisions chapter's fifth subject grammar carries this
 + * exact shape, and one declaration is what stops the two drifting. */
 +export const messageDeletedPayloadSchema = z.strictObject({
 +  id: z.string().min(1),
@@ -106,7 +109,13 @@ on.
  });
  
  export const membershipChangedSchema = z.strictObject({
-@@ -169,6 +201,10 @@ export const frameSchema = z.discriminatedUnion("type", [
+   type: z.literal("membership.changed"),
+   payload: z.strictObject({
+     channel: z.string().min(1),
+@@ -154,12 +186,16 @@ export const frameSchema = z.discriminatedUnion("type", [
+   errorFrameSchema,
+ ]);
+ 
  // The static types ARE the schemas — z.infer, never a hand-written twin.
  export type Cursor = z.infer<typeof cursorSchema>;
  export type Message = z.infer<typeof messageSchema>;
@@ -117,6 +126,9 @@ on.
  export type ConnectionAck = z.infer<typeof connectionAckSchema>;
  export type MessageSend = z.infer<typeof messageSendSchema>;
  export type MessageAck = z.infer<typeof messageAckSchema>;
+ export type Frame = z.infer<typeof frameSchema>;
+ 
+ /** Parse anything the wire delivers. Hostile input is an expected value, not
 ```
 
 <Trap>
@@ -130,8 +142,9 @@ extra key silently, which is the same outcome with none of the noise.
 
 Between gateway instances, a frame crosses Redis pub/sub on a subject. There are four
 grammars, and each arrived with a chapter that argued for it: `chan:{channel_id}` in 2.6,
-`presence:{channel_id}` in 3.19, `member:{channel_id}` and `member:{env}:{user}` in 3.20,
-`typing:{channel_id}` in 3.21.
+`presence:{channel_id}` in the presence chapter, `member:{channel_id}` and
+`member:{env}:{user}` in the membership-revocation chapter, and `typing:{channel_id}` in the
+typing chapter.
 
 `chan:` carries a `Message`. `packages/protocol/src/fanout.ts` says so in its own words —
 *"the fan-out has always carried a wire frame's payload rather than a shape of its own"* — and
@@ -228,7 +241,7 @@ own. The gateway holds **one** Redis subscriber for both `chan:` and `revision:`
 gateway would be a second place that knows this grammar, which is the thing the rule forbids.
 
 ```diff title="services/gateway/src/fanout.ts"
-@@ -1,6 +1,10 @@
+@@ -1,9 +1,13 @@
  import {
    messageCreatedSchema,
    subjectForChannel,
@@ -239,7 +252,13 @@ gateway would be a second place that knows this grammar, which is the thing the 
    type Message,
  } from "@relay/protocol";
  import type { Logger } from "@relay/service-kit";
-@@ -45,6 +49,18 @@ export interface Fanout {
+ // A NAMED import, not a default: ioredis is CommonJS, the gateway is ESM,
+ // and without esModuleInterop a default import of a CJS module hands you
+ // the module.exports namespace — which is not constructable. TypeScript
+@@ -42,12 +46,24 @@ export interface Fanout {
+    * time — the fabric knows how to receive, the sessions know who to
+    * hand it to. */
+   onDelivery(handler: (channelId: string, message: Message) => void): void;
    /** Publish a committed message to its channel's subject. A failure here
     * costs delivery latency, never durability. */
    publish(message: Message): Promise<void>;
@@ -249,8 +268,8 @@ gateway would be a second place that knows this grammar, which is the thing the 
 +   * A SECOND CALLBACK ON THE SAME MODULE, not a second module. The revision subject's
 +   * subscription lifetime is IDENTICAL to the message subject's: the same channels, the
 +   * same reference counts, subscribed and dropped at the same moments. A module of its own
-+   * would duplicate that counting and add two more Redis clients to a service the typing chapter
-+   * took to eight. */
++   * would duplicate that counting and add two more Redis clients to a service the typing
++   * chapter took to eight. */
 +  onRevision(handler: (channelId: string, revision: RevisionFabric) => void): void;
 +  /** Publish an edit or a deletion to its channel's revision subject. Same failure
 +   * contract as `publish`: delivery latency, never durability. */
@@ -258,7 +277,13 @@ gateway would be a second place that knows this grammar, which is the thing the 
    subscribe(channelId: string): Promise<void>;
    unsubscribe(channelId: string): Promise<void>;
    close(): Promise<void>;
-@@ -60,6 +76,7 @@ export function createFanout({
+ }
+ 
+ export interface FanoutOptions {
+@@ -57,12 +73,13 @@ export interface FanoutOptions {
+ 
+ export function createFanout({
+   url = process.env.RELAY_REDIS_URL ?? DEFAULT_REDIS_URL,
    logger,
  }: FanoutOptions): Fanout {
    let deliver: (channelId: string, message: Message) => void = () => {};
@@ -266,7 +291,13 @@ gateway would be a second place that knows this grammar, which is the thing the 
    const publisher = new Redis(url);
    const subscriber = new Redis(url);
    // Reference-counted, because two users of the same channel on one
-@@ -74,6 +91,18 @@ export function createFanout({
+   // instance must not unsubscribe each other.
+   const counts = new Map<string, number>();
+ 
+@@ -71,12 +88,24 @@ export function createFanout({
+     try {
+       parsed = JSON.parse(raw);
+     } catch {
        logger.log("error", "fanout.unparsable", { subject });
        return;
      }
@@ -285,7 +316,13 @@ gateway would be a second place that knows this grammar, which is the thing the 
      // The fabric is inside the trust boundary, and frames are STILL
      // validated: "inside" is one compromised dependency away from
      // "outside", and a malformed payload must not reach a client.
-@@ -89,6 +118,25 @@ export function createFanout({
+     const message = messageCreatedSchema.shape.payload.safeParse(parsed);
+     if (!message.success) {
+       logger.log("error", "fanout.invalid_payload", { subject });
+@@ -86,12 +115,31 @@ export function createFanout({
+   });
+ 
+   return {
      onDelivery(handler) {
        deliver = handler;
      },
@@ -311,7 +348,13 @@ gateway would be a second place that knows this grammar, which is the thing the 
      async publish(message) {
        try {
          await publisher.publish(
-@@ -107,13 +155,25 @@ export function createFanout({
+           subjectForChannel(message.channel),
+           JSON.stringify(message),
+         );
+@@ -104,19 +152,31 @@ export function createFanout({
+         });
+       }
+     },
      async subscribe(channelId) {
        const next = (counts.get(channelId) ?? 0) + 1;
        counts.set(channelId, next);
@@ -339,6 +382,9 @@ gateway would be a second place that knows this grammar, which is the thing the 
        } else {
          counts.set(channelId, next);
        }
+     },
+     async close() {
+       subscriber.disconnect();
 ```
 
 Both subjects are subscribed under **one** reference count. They are co-extensive by
@@ -347,7 +393,10 @@ revisions, and dropping one without the other leaves edits arriving for a channe
 listening to — or worse, the reverse.
 
 ```diff title="services/gateway/src/session.ts"
-@@ -10,6 +10,7 @@ import {
+@@ -6,12 +6,13 @@ import {
+   CLOSE_CODES,
+   docsUrl,
+   frameSchema,
    type ErrorCode,
    type Frame,
    type Message,
@@ -355,7 +404,13 @@ listening to — or worse, the reverse.
    type TypingFabric,
    isErrorCode,
    type MembershipFabric,
-@@ -349,6 +350,38 @@ export function attachSessions({
+   type PresenceFabric,
+ } from "@relay/protocol";
+ import type { Logger } from "@relay/service-kit";
+@@ -267,12 +268,44 @@ export function attachSessions({
+       if (suppressed(connection.marks, message)) continue;
+       send(connection.socket, { type: "message.created", payload: message });
+     }
    }
    fanout?.onDelivery(deliver);
  
@@ -394,6 +449,9 @@ listening to — or worse, the reverse.
    /** A typing signal arriving from its own fabric (T043).
     *
     * **DO NOT COPY `deliverPresence` BELOW, WHICH IS DELIBERATELY UNFILTERED.**
+    * That function walks `subscribersOf` and sends to everyone, so a user sees
+    * their own presence transition — the membership-revocation chapter confirmed it from the other
+    * side, counting two frames where a watcher correctly sees their own arrival.
 ```
 
 That is the change ADR-24 exists for, and it is three lines. The kind comes off the payload
@@ -423,7 +481,10 @@ permission."*
 retry acquires it. A developer sent to look for a permissions setting will not find one.
 
 ```diff title="packages/protocol/src/codes.ts"
-@@ -170,6 +170,57 @@ export const ERROR_CODES = {
+@@ -127,12 +127,63 @@ export const ERROR_CODES = {
+   //
+   // Registering them is what makes the ladder typable. Annotated `ErrorCode`, a code
+   // that is not here stops compiling instead of reaching a customer as a dead link.
    invalid_request:
      "the request body, query or path failed validation; `field` names the first offending key",
    forbidden: "the credential is valid and is not permitted to do this",
@@ -481,6 +542,9 @@ retry acquires it. A developer sent to look for a permissions setting will not f
    not_found:
      "no such resource for this tenant — and DELIBERATELY the same answer as for a resource in another tenant (FR-TEN-05)",
    internal_error:
+     "the platform failed in a way it did not anticipate; the request_id is what a support ticket needs",
+ 
+   // FR-CHN-07's ceiling: a channel holds at most 1,000 members and an add that would
 ```
 
 The second code was not in the plan. Editing a message that is already a tombstone has to be
@@ -503,7 +567,7 @@ ways depending on the verb.*
 
 `docs/05-sad.md:435` has held this DDL since the first draft:
 
-```sql title="services/api/migrations/0014_message_edits.sql"
+```sql title="services/api/migrations/0009_message_edits.sql"
 -- What a message used to say.
 --
 -- PUBLISHED IN SAD §6.1 SINCE THE SAD WAS WRITTEN, and `schema.ts`'s absence
@@ -513,13 +577,13 @@ ways depending on the verb.*
 -- It was not: three columns and a composite key.
 --
 -- HAND-WRITTEN, AND drizzle-kit's OUTPUT WAS DISCARDED. `drizzle-kit generate`
--- produced `0008_message_edits.sql` — a number already taken by
--- `0008_limit_policy.sql` — containing six whole CREATE TABLEs and fourteen
--- ALTERs replayed from migrations 0008 through 0013. Its snapshot sits at 0007
--- while this directory sits at 0013, because those six were hand-written too.
--- Applied to any database that has run them, the generated file fails on
--- `CREATE TABLE "quota_notifications"`. This is the review ADR-16 requires
--- doing its job: generation is a draft, the file is the artifact.
+-- produced `0006_wise_lyja.sql` — a number already taken by
+-- `0006_member_roles.sql` — containing two whole CREATE TABLEs, twelve ALTERs
+-- and an index replayed from migrations 0006 through 0008. Its snapshot sits at
+-- 0005 while this directory sits at 0008, because those three were hand-written
+-- too. Applied to any database that has run them, the generated file fails on
+-- `CREATE TABLE "read_positions"`. This is the review ADR-16 requires doing its
+-- job: generation is a draft, the file is the artifact.
 --
 -- WHAT THE COMPOSITE KEY COSTS. Two edits to one message at the same timestamp
 -- collide rather than both being stored. Postgres holds microseconds, so that
@@ -537,7 +601,7 @@ ways depending on the verb.*
 -- shape of thing: rows about a message, not rows about a tenant.
 --
 -- NO id COLUMN. The primary key is (message_id, edited_at) because that is what
--- an edit is. The channel-endpoints chapter installed
+-- an edit is. the channel-endpoints chapter installed
 -- `coalesce(to_jsonb(OLD) ->> 'id', to_jsonb(OLD)::text)` in the guard's
 -- refusal message for exactly the tables that have no `id` to interpolate.
 CREATE TABLE message_edits (
@@ -572,12 +636,12 @@ supersedes it, and this chapter has no evidence to supersede it with.
 
 <Trap>
 **Generate the migration; do not apply it.** `drizzle-kit generate` produced
-`0008_message_edits.sql` — a number `0008_limit_policy.sql` has held since chapter 3.9 —
-containing this table and then six whole `CREATE TABLE`s and fourteen `ALTER TABLE`s replayed
-from migrations 0008 through 0013. Its snapshot sits at 0007 while the directory sits at 0013,
-because those six were hand-written too.
+`0006_wise_lyja.sql` — a number `0006_member_roles.sql` has held since the channel-control
+chapter — containing this table and then one more whole `CREATE TABLE`, twelve `ALTER TABLE`s
+and an index, replayed from migrations 0006 through 0008. Its snapshot sits at 0005 while the
+directory sits at 0008, because those three were hand-written too.
 
-Applied to any database that has run them, it fails on `CREATE TABLE "quota_notifications"`.
+Applied to any database that has run them, it fails on `CREATE TABLE "read_positions"`.
 ADR-16 requires the generated SQL to be reviewed against §6.1 before the runner applies it,
 and that review is the only reason this never ran. **The generation is a draft; the file is
 the artifact.**
@@ -607,9 +671,12 @@ existed until now. `message_edits` is two links out: it references `messages`, w
 references `channels`, which carries the column.
 
 ```diff title="services/api/src/db/catalogue.ts"
-@@ -20,14 +20,18 @@ import type { Db } from "./client";
- // catalogue query written inline in the test would need an exemption for as long
- // as it lived.
+@@ -14,20 +14,24 @@ import type { Db } from "./client";
+ // to catch.
+ //
+ // It lives here rather than in the test that calls it because this directory is the only
+ // place the lint ban permits `drizzle-orm` (constitution I, ADR-16). A catalogue query
+ // written inline in the test would need an exemption for as long as it lived.
  
 -/** How a row in this table is traced back to one environment. */
 +/** How a row in this table is traced back to one environment. `hop` means
@@ -628,7 +695,13 @@ references `channels`, which carries the column.
    via: string[];
    /** For `spine`: why it has no tenant column. */
    reason?: string;
-@@ -114,7 +118,7 @@ export interface CatalogueRow extends Record<string, unknown> {
+ }
+ 
+ // THE SPINE, AS A LIST WITH A REASON EACH AND NOT A PATTERN.
+@@ -90,39 +94,82 @@ export interface CatalogueRow extends Record<string, unknown> {
+ 
+ /** Every base table in `public`, each classified into exactly one of the three paths —
+  * or into none, which is the answer that fails a build. */
  export async function classifyTables(db: Db): Promise<TableClassification[]> {
    const rows = (
      await db.execute<CatalogueRow>(sql`
@@ -637,7 +710,8 @@ references `channels`, which carries the column.
          SELECT table_name
          FROM information_schema.tables
          WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
-@@ -123,6 +127,52 @@ export async function classifyTables(db: Db): Promise<TableClassification[]> {
+       ),
+       direct AS (
          SELECT table_name
          FROM information_schema.columns
          WHERE table_schema = 'public' AND column_name = 'environment_id'
@@ -645,6 +719,12 @@ references `channels`, which carries the column.
 +      -- EVERY FOREIGN KEY IN public, AS AN EDGE LIST. Split out of the
 +      -- correlated subquery it used to live in, because reachability needs to
 +      -- walk it more than once.
++      --
++      -- ::text is load-bearing, AND IT MOVED UP HERE WITH THE CAST. information_schema
++      -- columns are sql_identifier, and node-pg has no parser for an array of them: the
++      -- row arrives as the literal string {channels,users} and iterating it yields a
++      -- brace, which is how this was found rather than reasoned about. (No backticks in
++      -- this comment: it is inside a template literal.)
 +      fk AS (
 +        SELECT DISTINCT tc.table_name::text AS src, ccu.table_name::text AS dst
 +        FROM information_schema.table_constraints tc
@@ -690,10 +770,12 @@ references `channels`, which carries the column.
        )
        SELECT
          b.table_name,
-@@ -133,15 +183,10 @@ export async function classifyTables(db: Db): Promise<TableClassification[]> {
-           -- the row arrives as the literal string {channels,users} and
-           -- iterating it yields a brace, which is how this was found.
-           -- (No backticks in here: this is inside a template literal.)
+         (b.table_name IN (SELECT table_name FROM direct)) AS has_environment_id,
+         (
+-          -- ::text is load-bearing. information_schema columns are sql_identifier,
+-          -- and node-pg has no parser for an array of them: the row arrives as the
+-          -- literal string {channels,users} and iterating it yields a brace, which
+-          -- is how this was found rather than reasoned about.
 -          SELECT array_agg(DISTINCT ccu.table_name::text)
 -          FROM information_schema.table_constraints tc
 -          JOIN information_schema.constraint_column_usage ccu
@@ -710,6 +792,8 @@ references `channels`, which carries the column.
          ) AS fk_targets
        FROM base b
        ORDER BY b.table_name
+     `)
+   ).rows;
 ```
 
 This is the failure mode this repository keeps paying for — a pattern matching the examples in
@@ -717,11 +801,29 @@ front of it rather than the set the rule names — arriving in the check that ha
 highest-yield instrument in the whole tree.
 
 <Trap>
-**"This is not a weakening" is a claim, so falsify it.** Two temporary tables against the live
-database: one with no foreign key at all, and one whose only chain leads into the spine
-(`→ organisations →` nothing). Both still fail totality, both named in the message. Reachability
-reports the **direct** tables a chain arrives at, never the intermediate ones, so the invariant
-the test already asserted — every entry in `via` is itself `direct` — holds unchanged.
+**"This is not a weakening" is a claim, so falsify it.** Two tables inside a transaction that
+rolls back, against the live database: one with no foreign key at all, and one whose only
+chain leads into the spine (`→ organisations →` nothing).
+
+```text
+ members            | f | {channels,users}
+ message_edits      | f | {channels,users}
+ probe_into_spine   | f |
+ probe_orphan       | f |
+```
+
+Both probes come back with no targets and both fail totality, named in the message. And
+`message_edits` reads `{channels,users}` — the **direct** tables its chain arrives at, never
+`messages`, the one it passes through.
+
+**That last line is where the invariant had to be written rather than assumed.** The obvious
+assertion, *every entry in `via` is itself `direct`*, cannot fail: `fk_targets` filters on
+`direct` in SQL, so it is true by construction whenever the filter is there at all — and it
+would have passed against the one-hop query too. What the test asserts instead is that
+`message_edits` reads `channels, users` and **does not contain `messages`**. Drop the filter
+and the walk starts reporting the tables it passed through, six of them here, while every
+other test in the file stays green: *"a hop has some target"* is more true with intermediates
+in the list, not less.
 </Trap>
 
 ## The edit
@@ -731,7 +833,10 @@ appended in another can crash between them, and what survives is a message whose
 nobody has.
 
 ```diff title="services/api/src/db/repository.ts"
-@@ -23,6 +23,7 @@ import {
+@@ -8,20 +8,26 @@ import {
+   applications,
+   channels,
+   consumedEvents,
    environments,
    humans,
    members,
@@ -739,9 +844,9 @@ nobody has.
    readPositions,
    memberships,
    messages,
-@@ -38,7 +39,12 @@ import {
-   webhookDisableNotifications,
-   webhookEndpoints,
+   organisations,
+   outbox,
+   users,
  } from "./schema";
 -import { membershipEvent, messageCreatedEvent } from "../outbox/event";
 +import {
@@ -750,10 +855,16 @@ nobody has.
 +  messageDeletedEvent,
 +  messageUpdatedEvent,
 +} from "../outbox/event";
- import { capsFor, type Caps } from "../quotas/config";
- import { thresholdsCrossed } from "../quotas/policy";
- import { creditFor, highWaterMark } from "../quotas/credit";
-@@ -2250,12 +2256,33 @@ export interface MessageRow {
+ import {
+   mintApiKey,
+   parseApiKeyCredential,
+   prefixMatchesKind,
+   secretMatches,
+   type EnvironmentKind,
+@@ -618,18 +624,39 @@ export type AddMemberOutcome = "added" | "already_a_member" | "not_found";
+ export interface MessageRow {
+   id: string;
+   channel_id: string;
    seq: number;
    text: string | null;
    created_at: string;
@@ -787,7 +898,13 @@ nobody has.
  /** A message as the READ paths return it (chapter 2.7). The sender is the
   * external id — the identifier a client knows — and it is nullable for two
   * honest reasons: the column has been nullable since 2.1 (system messages
-@@ -2311,6 +2338,55 @@ export class SenderNotPermittedError extends Error {
+  * have no author), and every row written through the socket before 2.6's
+  * fix has no author recorded. A caller that needs to build a wire frame
+  * has to decide what to do with those; the layer does not decide for it. */
+@@ -679,12 +706,61 @@ export class SenderNotPermittedError extends Error {
+   constructor(readonly userId: string) {
+     super("an application credential may send only as a bot user");
+     this.name = "SenderNotPermittedError";
    }
  }
  
@@ -843,19 +960,35 @@ nobody has.
  export class UserBannedError extends Error {
    constructor(public readonly userId: string) {
      super(`user banned: ${userId}`);
-@@ -3996,8 +4072,9 @@ export class Repository {
+     this.name = "UserBannedError";
+   }
+ }
+@@ -2054,16 +2130,17 @@ export class Repository {
+       //     userId absent     the TENANT is sending through an application key.
+       //                       It acts for the customer, carries no user, and sees
+       //                       private channels (FR-005).
        //
        // And that gate is only honest because the channel-control chapter made the public route
        // supply a user. It called `messages.send(channelId, body)` with none, and
 -      // `MessagesController` declares no `@Accepts` — so the guard falls back to
 -      // `EITHER` and a user token was accepted there. A check gated on a parameter
+-      // no caller fills in is a check that never fires, and this one did not, on
+-      // the only send path a customer's own client uses.
 +      // `MessagesController` declared no `@Accepts` at the time — so the guard fell
-+      // back to `EITHER` and a user token was accepted there. The sender chapter declared it;
-+      // the third of three copies of this sentence, all corrected in the revisions chapter. A check gated on a parameter
-       // no caller fills in is a check that never fires, and this one did not, on
-       // the only send path a customer's own client uses.
++      // back to `EITHER` and a user token was accepted there. the sender chapter declared it;
++      // the third of three copies of this sentence, all corrected in the revisions chapter. A
++      // check gated on a parameter no caller fills in is a check that never fires, and
++      // this one did not, on the only send path a customer's own client uses.
        //
-@@ -4327,6 +4404,420 @@ export class Repository {
+       // `ChannelNotFoundError` AND NOT A 403. SC-002 requires the answer for a
+       // private channel the caller cannot see to be byte-identical to a channel
+       // that does not exist — same status, same body but for `request_id` — and
+       // send is one of the verbs it covers. A `403 not_a_member` here would
+       // announce that the channel exists, which is the leak FR-003 forbids and
+@@ -2251,12 +2328,426 @@ export class Repository {
+         text,
+         created_at: createdAt,
+       };
      });
    }
  
@@ -1028,7 +1161,7 @@ nobody has.
 +   *
 +   * NO AUDIT LOG ROW, though SAD §342's diagram shows one beside the outbox insert.
 +   * There is no `audit_log` table in §6.1 or in `schema.ts`, and inventing one is a
-+   * feature with a retention policy rather than a line in this method. The revisions chapter's
++   * feature with a retention policy rather than a line in this method. the revisions chapter's
 +   * `gaps.md` item 2 draws that boundary: `metadata.deleted_by` records WHAT KIND of
 +   * principal deleted the message, and which credential it presented is the audit
 +   * log's question. */
@@ -1119,7 +1252,7 @@ nobody has.
 +      // `text === null` IS THE TEST, not `deletedAt !== null`. Both are set together by
 +      // this method, but the lane holds rows where only `text` is null — system
 +      // messages have had no text since chapter 2.1 — and `text` is the column every
-+      // read path already branches on. The channel-control chapter's planted tombstone sets both.
++      // read path already branches on. the channel-control chapter's planted tombstone sets both.
 +      if (row.text === null) {
 +        return {
 +          deleted: {
@@ -1273,10 +1406,16 @@ nobody has.
 +    return rows.length > 0;
 +  }
 +
-   /** Refuse the send if a hard cap is already met (FR-RTL-08).
-    *
-    * Reads the caps and the usage in ONE query, in the transaction that is about to
-@@ -4744,6 +5235,19 @@ export class Repository {
+   /** Fetch a message by its idempotency key within a channel — the
+    * recovery leg of 2.3's duplicate-recognised path. The channel join
+    * carries the tenant scope: every query in this layer answers only for
+    * its own environment, private helpers included (constitution I). */
+   private async getMessageByIdempotencyKey(
+     tx: Db,
+@@ -2456,12 +2947,25 @@ export class Repository {
+       // must emit frames identical to live ones, and a reader that gets a
+       // different shape depending on which door it came through is a client
+       // bug waiting for a reconnect.
        user: users.externalId,
        text: messages.text,
        created_at: messages.createdAt,
@@ -1296,7 +1435,13 @@ nobody has.
      };
      const scoped = (extra?: SQL) =>
        and(
-@@ -4780,7 +5284,14 @@ export class Repository {
+         eq(messages.channelId, channelId),
+         eq(channels.environmentId, this.environmentId),
+         ...(extra ? [extra] : []),
+@@ -2492,13 +2996,20 @@ export class Repository {
+           // inner join here would make those rows vanish from history —
+           // silent data loss dressed up as a query.
+           .leftJoin(users, eq(users.id, messages.userId))
            .where(scoped(gt(messages.sequence, afterSeq)))
            .orderBy(asc(messages.sequence))
            .limit(limit));
@@ -1312,6 +1457,9 @@ nobody has.
    }
  
    /** Resume backfill (chapter 2.7, FR-RTM-03): for each cursor, everything
+    * the client has not applied yet — capped, with an honest truncation
+    * signal per channel (FR-RTM-04).
+    *
 ```
 
 What is **not** in the `SET` list is FR-002 written as code. `sequence`, `channelId`, `userId`
@@ -1322,7 +1470,8 @@ that the values are unchanged; a thing not done leaves no trace to assert on. Th
 lives in the shape of the statement.
 
 ```diff title="services/api/src/messages/messages.controller.ts"
-@@ -2,9 +2,13 @@ import {
+@@ -1,13 +1,17 @@
+ import {
    BadRequestException,
    Body,
    Controller,
@@ -1336,7 +1485,13 @@ lives in the shape of the statement.
    Post,
    Query,
    Req,
-@@ -18,12 +22,16 @@ import {
+   UseGuards,
+ } from "@nestjs/common";
+ 
+@@ -15,18 +19,22 @@ import { Accepts, CredentialGuard } from "../auth/credential.guard";
+ import { Repository } from "../db/repository";
+ import { MessagesService } from "./messages.service";
+ import {
    MESSAGE_PUBLISHER,
    type MessagePublisher,
  } from "../fanout/publisher";
@@ -1355,14 +1510,20 @@ lives in the shape of the statement.
  import type { RequestWithPrincipal } from "../auth/principal";
  import { ZodValidationPipe } from "./zod-validation.pipe";
  
-@@ -44,6 +52,28 @@ function actingUser(req: RequestWithPrincipal): string | undefined {
+ /** The end user this request acts for, or `undefined` when the tenant is acting.
+  *
+  * SOFT, unlike `internal.controller.ts`'s `principalUser`, which throws. These two
+@@ -41,12 +49,34 @@ import { ZodValidationPipe } from "./zod-validation.pipe";
+  * until this one, the clause was cited by the code that did the opposite of it. The clause is now narrowed to a bot user of
+  * that tenant, and the sender comes from the body (`user`), resolved below. */
+ function actingUser(req: RequestWithPrincipal): string | undefined {
    return req.principal?.kind === "user" ? req.principal.userExternalId : undefined;
  }
  
 +/** The two fields every publish here has to carry (NFR-OBS-01, NFR-OBS-06).
 + *
-+ * ONE FUNCTION AND NOT THREE COPIES, and the coverage ratchet is what asked.
-+ * The revisions chapter added two more publish sites to this file, each with its own
++ * ONE FUNCTION AND NOT THREE COPIES, and the coverage ratchet is what asked. This
++ * chapter added two more publish sites to this file, each with its own
 + * `req.requestId ?? "unknown"` and `req.principal?.environmentId ?? "unknown"` — six
 + * uncovered branch arms where there had been two, all of them the same two arms written
 + * three times. Collapsing them does not make the arms reachable; it stops the count
@@ -1384,7 +1545,13 @@ lives in the shape of the statement.
  // The api's first product endpoint (chapter 2.2). Validation is zod at the
  // boundary — the same schema family as @relay/protocol, so the REST body
  // and the WebSocket frame payload cannot drift (1.3's payoff, again).
-@@ -86,8 +116,14 @@ export class MessagesController {
+ //
+ // The credentials chapter swapped the guard. `EnvironmentContextGuard` resolved a tenant
+ // from a header the caller asserted; `CredentialGuard` only asks whether the
+@@ -83,14 +113,20 @@ export class MessagesController {
+   ) {
+     // WHO IS SENDING, resolved here (FR-001, T031a).
+     //
      // This route called `this.messages.send(channelId, body)` with no user for
      // twenty-three chapters, and the membership check in `sendMessage` is gated on
      // `userId` being present — so the check could not fire on the only send path a
@@ -1393,15 +1560,21 @@ lives in the shape of the statement.
 +    // customer's own client calls. `MessagesController` declared no `@Accepts` at the
 +    // time, so the guard fell back to `EITHER` and a user token was accepted here.
 +    //
-+    // PAST TENSE SINCE THE SENDER CHAPTER, and it took until the revisions chapter to say so. That chapter
-+    // added `@Accepts("application", "user")` at :64 — twenty-five lines above this
-+    // sentence — and left three copies of the sentence describing its absence, here, in
-+    // `messages.itest.ts:161` and in `repository.ts:3999`. Nothing compares a comment
++    // PAST TENSE SINCE THE SENDER CHAPTER, and it took until this one to say so. That
++    // chapter added `@Accepts("application", "user")` at :94 — twenty-eight lines above
++    // this sentence — and left three copies of the sentence describing its absence, here,
++    // in `messages.itest.ts:153` and in `repository.ts:2136`. Nothing compares a comment
 +    // with the decorator it describes, and the chapter's own task named one of the three.
      //
      // A LOOKUP PER SEND, and it is the same one the internal route already pays.
      // `sendMessage`'s own comment explains why the id is threaded rather than
-@@ -208,10 +244,7 @@ export class MessagesController {
+     // resolved inside the write transaction: a SELECT in there is a cost every
+     // message pays forever. Outside it, once, is what `internal.controller.ts`
+     // does at line 63.
+@@ -205,16 +241,13 @@ export class MessagesController {
+           channel: message.channel_id,
+           seq: message.seq,
+           user: actingExternalId,
            text: message.text,
            created_at: message.created_at,
          },
@@ -1413,7 +1586,13 @@ lives in the shape of the statement.
        );
      }
  
-@@ -229,6 +262,233 @@ export class MessagesController {
+     return {
+       id: message.id,
+       channel_id: message.channel_id,
+@@ -226,12 +259,240 @@ export class MessagesController {
+       // internal send has carried this since chapter 2.6; the public one answered five
+       // fields and left the caller to assume.
+       user: actingExternalId,
      };
    }
  
@@ -1463,7 +1642,7 @@ lives in the shape of the statement.
 +    }
 +    const edited = await this.messages.edit(channelId, messageId, body, user.id);
 +
-+    // ── the live fan-out (FR-005, ADR-24) ──────────────────────
++    // ── the live fan-out (FR-005, ADR-24) ─────────────────────────────────────
 +    //
 +    // AFTER THE COMMIT, BEFORE THE RESPONSE, for the reason the send path states at
 +    // :199: a request handler has one channel and the response IS the ack, so anything
@@ -1526,7 +1705,8 @@ lives in the shape of the statement.
 +   * irrespective of author (FR-012), and an end user may delete their own (FR-013).
 +   *
 +   * **An inherited declaration and an absent one look identical in the source**, which
-+   * is the thing `credential.guard.ts:31` argues about and the isolation gauntlet paid for. So
++   * is the thing `credential.guard.ts:56` argues about and the isolation harness paid
++   * for. So
 +   * `targets.ts` carries `accepts: "either"` for this path — an existing value, used by
 +   * the read-position route — and the entry is where a reader can see that both classes
 +   * are intended here rather than merely tolerated.
@@ -1571,7 +1751,7 @@ lives in the shape of the statement.
 +      },
 +    );
 +
-+    // ── the live fan-out (FR-007, FR-009, ADR-24) ──────────────
++    // ── the live fan-out (FR-007, FR-009, ADR-24) ────────────────────────────
 +    //
 +    // GUARDED ON `alreadyDeleted`, which is this route's version of the send path's
 +    // `!duplicate`. Both exist for the same failure: a client retrying on a flaky link
@@ -1647,6 +1827,9 @@ lives in the shape of the statement.
    @Get()
    async history(
      @Param("channelId") channelId: string,
+     @Query(new ZodValidationPipe(historyQuerySchema)) query: HistoryQuery,
+     @Req() req: RequestWithPrincipal,
+   ) {
 ```
 
 Three routes, three different answers to *who may call this*, and all three are **declarations**
@@ -1747,8 +1930,9 @@ IMAP      CONDSTORE/QRESYNC puts a MODSEQ beside the sequence, so a client asks
 Relay is already the first shape. Both alternatives add a per-channel counter, and this
 chapter chose to write the bound down rather than add one — into ADR-07, whose loss argument
 rests on *"the client's cursor + sequence-gap detection recovers anything missed"* and has now
-been narrowed twice: once by chapter 3.20 for a payload with no sequence, and once here for a
-payload whose sequence belongs to a message the client already holds.
+been narrowed twice: once by the membership-revocation chapter for a payload with no
+sequence, and once here for a payload whose sequence belongs to a message the client already
+holds.
 </Why>
 
 ## What the instruments caught
@@ -1759,11 +1943,14 @@ It did, twice — once naming a route declared before it was written, which is t
 that catches a rename.
 
 ```diff title="services/api/src/isolation/targets.ts"
-@@ -180,9 +180,44 @@ export const CLASSIFICATIONS: readonly Classification[] = [
-     accepts: "application",
+@@ -191,12 +191,61 @@ export const CLASSIFICATIONS: readonly Classification[] = [
+   {
+     method: "GET",
+     path: "/v1/channels/:channelId/messages",
+     accepts: "either",
      shape: "read",
    },
-+  // The revisions chapter's EDIT HISTORY (T033h, FR-023, FR-023a). `accepts: "application"`
++  // THE REVISIONS CHAPTER'S EDIT HISTORY (T033h, FR-023, FR-023a). `accepts: "application"`
 +  // because the route carries a method-level `@Accepts("application")` that narrows the
 +  // controller's class-level `("application", "user")` — FR-MOD-01 names the audience,
 +  // and nothing in the SRS asks for an end-user surface on what a message used to say.
@@ -1780,19 +1967,25 @@ that catches a rename.
 +    accepts: "application",
 +    shape: "read",
 +  },
- 
-   // ── write, public ───────────────────────────────────────────────────────────
-   { method: "POST", path: "/v1/channels/:channelId/messages", accepts: "application", shape: "write" },
-+  // The revisions chapter's EDIT (T030a, FR-001, FR-013a). `accepts: "user"` because the method
++  // THE REVISIONS CHAPTER'S EDIT (T030a, FR-001, FR-013a). `accepts: "user"` because the method
 +  // declares `@Accepts("user")`: FR-MOD-02 grants a tenant key deletion of any message
 +  // and is silent on editing, and silence is read as absence of permission.
++  //
++  // NOT FILED UNDER THE PUBLIC MESSAGE SURFACE ABOVE, which is `either` and attacked as
++  // both classes. This route takes one class, so a second entry there would send the
++  // gauntlet at it with a credential the guard refuses at the door.
 +  //
 +  // THE CONTROLLER'S PARAMETER NAME, NOT THE CONTRACT'S. `:messageId` is what the
 +  // router registers; the derivation compares literal path strings, so an entry copied
 +  // from `contracts/edit-and-delete.md` would match no target — the note at the join
 +  // route above records the same trap being paid for once already.
-+  { method: "PATCH", path: "/v1/channels/:channelId/messages/:messageId", accepts: "user", shape: "write" },
-+  // The revisions chapter's DELETION (T041a, FR-006, FR-012, FR-013). `accepts: "either"` — an
++  {
++    method: "PATCH",
++    path: "/v1/channels/:channelId/messages/:messageId",
++    accepts: "user",
++    shape: "write",
++  },
++  // THE REVISIONS CHAPTER'S DELETION (T041a, FR-006, FR-012, FR-013). `accepts: "either"` — an
 +  // existing value, used by the read-position route above — because the author OR a
 +  // tenant key may delete (FR-MOD-02), which is the class-level declaration this route
 +  // correctly inherits rather than overrides.
@@ -1800,50 +1993,284 @@ that catches a rename.
 +  // **THIS ENTRY IS WHERE AN INHERITED DECLARATION BECOMES VISIBLE.** In the controller
 +  // an inherited `@Accepts` and a forgotten one read identically; here the intent is
 +  // written down, so a later reader can tell that both classes are meant.
-+  { method: "DELETE", path: "/v1/channels/:channelId/messages/:messageId", accepts: "either", shape: "write" },
-   // The isolation gauntlet's two new routes, and the order they were added in is the point.
-   // The derivation found them first: `targets.itest.ts` went from 22 to 24 and
-   // named them as unclassified, on the build that registered the module and
++  {
++    method: "DELETE",
++    path: "/v1/channels/:channelId/messages/:messageId",
++    accepts: "either",
++    shape: "write",
++  },
+ 
+   // ── the two routes this chapter adds, and the ORDER MATTERS ────────────────────
+   //
+   // The derivation found them before this list did. `targets.itest.ts` went from 9
+   // targets to 11 and named both as unclassified, on the build that registered the
+   // module and before anything here mentioned them. That is the failure the derivation
 ```
 
 ```diff title="services/api/src/isolation/targets.itest.ts"
-@@ -123,11 +123,17 @@ describe("the gauntlet's target list derives from the running application", () =
-   // in the repository on the strength of five previous occasions; this is the
-   // sixth, and the first where the route being added was a REVIVAL of one the
-   // classification list had never carried.
-+  //
-+  // **AND AGAIN IN THE REVISIONS CHAPTER, IN BOTH DIRECTIONS AT ONCE.** That chapter declared its two
-+  // routes in `targets.ts` before writing the second one, so one run named
-+  // `GET …/:messageId/edits` as an entry matching no derived target — the direction
-+  // that catches a rename — while the counts named the one that did exist. Two routes
-+  // in this phase, and the deletion's arrives in the next.
-   it("has grown from the isolation gauntlet's 24 by exactly the routes since", () => {
-     // This assertion moves ONE line per phase, which is the point: a phase that
-     // adds a route and forgets to classify it fails the test above, and a phase
-     // that adds a route nobody planned fails this one.
--    const BUILT_SO_FAR = 15;
-+    const BUILT_SO_FAR = 18;
-     expect(derived.length).toBe(24 + BUILT_SO_FAR);
+@@ -148,12 +148,19 @@ describe("the gauntlet's target list derives from the running application", () =
+       "GET /v1/users/:externalId",
+       "PATCH /v1/users/:externalId",
+       "POST /v1/users",
+       "DELETE /v1/users/:externalId",
+       "POST /v1/users/:externalId/ban",
+       "DELETE /v1/users/:externalId/ban",
++      // THE REVISIONS CHAPTER, AND IT CAUGHT ITS OWN MISTAKE IN BOTH DIRECTIONS AT
++      // ONCE. Both keys went into `targets.ts` before the second route was written, so
++      // one run named `GET …/:messageId/edits` as an entry matching no derived target —
++      // the direction a rename breaks — while the accounting test above named the other.
++      "GET /v1/channels/:channelId/messages/:messageId/edits",
++      "PATCH /v1/channels/:channelId/messages/:messageId",
++      "DELETE /v1/channels/:channelId/messages/:messageId",
+     ];
+     const keys = derived.map(targetKey);
+     const missing = ADDED.filter((k) => !keys.includes(k));
+     expect(missing, `classified here and not on the router: ${missing.join(", ")}`)
+       .toEqual([]);
+   });
+```
+
+And then a third time, from an instrument this book did not have when the classification list
+was first written. `targets.itest.ts` asks whether every route on the router is classified.
+`gauntlet.itest.ts` asks the other direction — whether every route the classification says to
+attack was actually attacked — and it named all three of this chapter's by path:
+
+```text
+AssertionError: classified but never attacked:
+GET /v1/channels/:channelId/messages/:messageId/edits,
+PATCH /v1/channels/:channelId/messages/:messageId,
+DELETE /v1/channels/:channelId/messages/:messageId
+```
+
+A `write` classification with no attack written for it is the same hole as an unclassified
+route, one level up: the list says a credential can reach this path with somebody else's
+identifier in it, and nobody ever tried. The three attacks that answer it differ in exactly
+one thing — **the credential** — which is the whole reason `accepts` is a field on the
+classification rather than a comment. The edit takes a user token, the history an application
+credential, the deletion either. Attacking one with the wrong class is refused at the door,
+and the route is then recorded as isolated without its handler ever running.
+
+```diff title="services/api/src/isolation/gauntlet.itest.ts"
+@@ -5,13 +5,20 @@ import { Test } from "@nestjs/testing";
+ import { afterAll, beforeAll, describe, expect, it } from "vitest";
+ 
+ import { AppModule } from "../app.module";
+ import { mintUserToken } from "../auth/user-token";
+ import { environmentSigningSecret, Repository } from "../db/repository";
+ import { createDb, createPool } from "../db/client";
+-import { credentialAttack, listAttack, readAttack, rowsOf, writeAttack } from "./attack";
++import {
++  credentialAttack,
++  listAttack,
++  readAttack,
++  rowsOf,
++  send,
++  writeAttack,
++} from "./attack";
+ import { withoutRequestId } from "./compare";
+ import {
+   nowhereId,
+   seedCollidingTenants,
+   seedSameTenant,
+   seedTwoTenants,
+@@ -137,12 +144,129 @@ describe("the isolation gauntlet", () => {
+     expect(verdict.foreign.status).toBe(404);
+     // THE STATE READ IS THE POINT: a 404 that completed the write is the case no
+     // status code reveals.
+     expect(verdict.stateChanged, "the victim's messages moved").toBe(false);
    });
  
++  // ── the revisions chapter's three routes ────────────────────────────────────────
++  //
++  // WRITTEN BECAUSE THE ACCOUNTING TEST AT THE BOTTOM OF THIS FILE ASKED FOR THEM. The
++  // classification went in with the routes; the attacks did not, and the run that
++  // followed named all three by path. That is the direction published Part 3 never
++  // checked — a `write` classification with no attack written for it is the same hole as
++  // an unclassified route, one level up.
++  //
++  // AND THE CREDENTIAL DIFFERS PER ROUTE, which is the whole reason `accepts` is on the
++  // classification: the edit takes a user token only, the history an application
++  // credential only, the deletion either. Attacking one with the wrong class would be
++  // refused at the door and recorded as isolated without the handler ever running.
++  it("GET .../messages/:messageId/edits — a foreign message's history reads as an absent one", async () => {
++    attacked.add("GET /v1/channels/:channelId/messages/:messageId/edits");
++    const verdict = await readAttack(
++      url,
++      t.attacker.credential,
++      {
++        method: "GET",
++        path: `/v1/channels/${t.victim.channelId}/messages/${t.victim.messageId}/edits`,
++      },
++      {
++        method: "GET",
++        path: `/v1/channels/${ABSENT_UUID}/messages/${ABSENT_UUID}/edits`,
++      },
++    );
++    expect(verdict.differences, verdict.differences.join("; ")).toEqual([]);
++    // THE REFUSAL IS THE TENANCY ONE, and without this the pair agrees on any shared
++    // answer — including the `@Accepts("application")` guard's 403, which is what a key
++    // swapped for a token here would produce on BOTH halves.
++    expect(verdict.foreign.status).toBe(404);
++    // AND THE PRIOR TEXT IS NOT IN THE BODY. FR-023a makes this the one route whose
++    // 200 carries what a message USED to say, so an id-shaped comparison is not enough.
++    expect(JSON.stringify(verdict.foreign.body)).not.toContain("victim");
++  });
++
++  it("PATCH .../messages/:messageId — a foreign message is not edited, and says so like an absent one", async () => {
++    attacked.add("PATCH /v1/channels/:channelId/messages/:messageId");
++    const verdict = await writeAttack(
++      url,
++      // A USER TOKEN, because `@Accepts("user")` is on the method: FR-MOD-02 grants a
++      // tenant key deletion and is silent on editing. The attacker's token names the
++      // attacker's OWN user, minted in `beforeAll` — the forged identifier is the
++      // channel and the message, not the caller.
++      attackerToken,
++      {
++        method: "PATCH",
++        path: `/v1/channels/${t.victim.channelId}/messages/${t.victim.messageId}`,
++        body: { text: "rewritten by the attacker" },
++      },
++      {
++        method: "PATCH",
++        path: `/v1/channels/${ABSENT_UUID}/messages/${ABSENT_UUID}`,
++        body: { text: "rewritten by the attacker" },
++      },
++      () => t.victim.repo.listMessages(t.victim.channelId, { limit: 50 }),
++    );
++    expect(verdict.differences, verdict.differences.join("; ")).toEqual([]);
++    expect(verdict.foreign.status).toBe(404);
++    // THE STATE READ IS WHAT A STATUS CANNOT SAY. The listing carries `text` and
++    // `edited_at`, so a 404 that completed the edit shows up here and nowhere else.
++    expect(verdict.stateChanged, "the victim's message text or edited_at moved").toBe(false);
++  });
++
++  it("DELETE .../messages/:messageId — a foreign message is not tombstoned", async () => {
++    attacked.add("DELETE /v1/channels/:channelId/messages/:messageId");
++    const verdict = await writeAttack(
++      url,
++      // A KEY, and this route inherits `@Accepts("application", "user")` from the class
++      // rather than narrowing it, so the application half is the one attacked here — a
++      // key may delete anybody's message WITHIN ITS OWN TENANT (FR-MOD-02), which is
++      // precisely the permission that makes the tenancy boundary the only thing
++      // standing between this credential and the victim's message.
++      t.attacker.credential,
++      {
++        method: "DELETE",
++        path: `/v1/channels/${t.victim.channelId}/messages/${t.victim.messageId}`,
++      },
++      {
++        method: "DELETE",
++        path: `/v1/channels/${ABSENT_UUID}/messages/${ABSENT_UUID}`,
++      },
++      () => t.victim.repo.listMessages(t.victim.channelId, { limit: 50 }),
++    );
++    expect(verdict.differences, verdict.differences.join("; ")).toEqual([]);
++    expect(verdict.foreign.status).toBe(404);
++    // A DELETION IS THE ONE WRITE WHOSE SUCCESS LOOKS LIKE ITS REFUSAL from outside:
++    // the route answers 204 with no body, so `stateChanged` is the entire assertion
++    // that the tombstone was not written.
++    expect(verdict.stateChanged, "the victim's message became a tombstone").toBe(false);
++  });
++
++  it("the three of them refuse the victim's message id inside the ATTACKER'S OWN channel", async () => {
++    // THE SHAPE ONLY A NESTED ROUTE HAS, and the pair attacks above cannot express it:
++    // they forge BOTH identifiers, so a route that checked only the channel would pass
++    // them. Here the channel is the attacker's, legitimately visible, and the message
++    // id is the victim's — which is the request a broken `messageExistsIn` answers.
++    const before = await t.victim.repo.listMessages(t.victim.channelId, { limit: 50 });
++    const own = `/v1/channels/${t.attacker.channelId}/messages/${t.victim.messageId}`;
++
++    for (const [label, req, credential] of [
++      ["history", { method: "GET", path: `${own}/edits` }, t.attacker.credential],
++      ["edit", { method: "PATCH", path: own, body: { text: "reached" } }, attackerToken],
++      ["deletion", { method: "DELETE", path: own }, t.attacker.credential],
++    ] as const) {
++      const answer = await send(url, credential, req);
++      expect(answer.status, `${label} accepted a foreign message id`).toBe(404);
++      expect(
++        JSON.stringify(answer.body ?? ""),
++        `${label} echoed the victim's message id`,
++      ).not.toContain(t.victim.messageId);
++    }
++
++    const after = await t.victim.repo.listMessages(t.victim.channelId, { limit: 50 });
++    expect(JSON.stringify(after), "the victim's message moved").toBe(JSON.stringify(before));
++  });
++
+   it("POST /internal/messages — a foreign channel_id refuses, and writes nothing", async () => {
+     attacked.add("POST /internal/messages");
+     const verdict = await writeAttack(
+       url,
+       attackerToken,
+       {
+```
+
+<Why title="Why a fourth test, when three routes need three attacks">
+Every helper in `attack.ts` forges **both** identifiers — another tenant's channel *and* a
+message id that exists nowhere — and compares the two answers. A nested route can satisfy that
+pair while checking only the outer identifier, so the fourth case presents the attacker's OWN
+channel, legitimately visible, with the victim's message id inside it.
+
+It was falsified by dropping the channel and environment predicates from
+`repository.messageExistsIn`. The history route then answered **200 to a cross-tenant read**,
+and the other forty-four attacks in the file stayed green.
+
+The edit and the deletion were not reachable that way, which is the half the probe did not
+show and is worth saying: `editMessage` and `deleteMessage` each join the channel and the
+environment inside their own transaction, so an unscoped existence check cannot be used
+against a write. One read-only hole, found by the test that also covers the two writes that
+were already closed.
+</Why>
+
+```diff title="services/api/src/isolation/attack.ts"
+@@ -36,13 +36,18 @@ export interface Answer {
+ export interface Verdict {
+   differences: string[];
+   foreign: Answer;
+   absent: Answer;
+ }
+ 
+-async function send(
++/** EXPORTED FOR THE ATTACK NO PAIR CAN EXPRESS. Every helper below forges BOTH
++ * identifiers, which a nested route can satisfy while checking only the outer one — so
++ * the revisions chapter's three routes are also attacked with the attacker's OWN
++ * channel and the victim's message id, and that request is neither a pair nor a list.
++ * One caller, one reason, rather than a fourth helper for a single shape. */
++export async function send(
+   baseUrl: string,
+   credential: string,
+   req: AttackRequest,
+ ): Promise<Answer> {
+   const res = await fetch(`${baseUrl}${req.path}`, {
+     method: req.method,
 ```
 
 ```diff title="services/api/src/db/schema.ts"
-@@ -23,9 +23,10 @@ import {
+@@ -18,15 +18,17 @@ import {
+ // The TS twin of SAD §6.1 (ADR-16). The schema now exists twice — once as
+ // the SAD's SQL truth, once here — and that drift risk is checked, not
+ // assumed away: drizzle-kit GENERATES the migration SQL from these
  // definitions, and the generated SQL is reviewed against §6.1 before the
  // runner applies it. The four tenant-bearing tables reproduce §6.1
  // column-for-column, constraints and DR citations included. Deliberately
 -// absent, with named arrivals: message_edits (edit chapter), emoji/media
 -// tables (their parts), messages partitioning (SAD growth note -> retention
--// chapter). The outbox arrived in the outbox chapter and is at the bottom of this file.
+-// chapter). The outbox arrives with the chapter of that name and is at the bottom of this file.
 +// absent, with named arrivals: emoji/media tables (their parts), messages
-+// partitioning (SAD growth note -> retention chapter). The outbox arrived in
-+// The outbox chapter and is at the bottom of this file. `message_edits` ARRIVED IN THE REVISIONS CHAPTER and
-+// is below `messages` — the list above said "edit chapter" and this is it.
++// partitioning (SAD growth note -> retention chapter). The outbox arrives with the
++// chapter of that name and is at the bottom of this file. `message_edits` ARRIVES WITH
++// THE REVISIONS CHAPTER and is below `messages` — the list above said "edit chapter"
++// and this is it.
  
  // The tenancy hierarchy. Everything from here to `members`
  // below sits ABOVE the environment boundary: these rows say who owns a
-@@ -396,6 +397,47 @@ export const messages = pgTable(
+ // platform account, and they are the only tables in this file without an
+ // environment_id. Everything below the boundary carries one and is scoped by
+ // the repository (constitution I).
+@@ -353,12 +355,53 @@ export const messages = pgTable(
+     // constraint above already supplies that ordering, and Postgres walks
+     // it backward for newest-first pages. Chapter 2.4 measured it and
+     // migration 0001 dropped the redundant twin (SAD §6.3, amended).
    ],
  );
  
@@ -1891,10 +2318,16 @@ that catches a rename.
  // DECISION (chapter 2.1): the docs/07 row and SAD §6.3's hot-path index
  // both reference a members table that §6.1 never defines. This shape is
  // anchored to that index; membership roles arrive with the channel
+ // semantics chapters.
+ export const members = pgTable(
+   "members",
 ```
 
 ```diff title="services/api/src/messages/messages.schema.ts"
-@@ -27,6 +27,32 @@ export const sendMessageBodySchema = z.strictObject({
+@@ -24,12 +24,38 @@ export const sendMessageBodySchema = z.strictObject({
+    * took an internal uuid here would be the only one that did not. */
+   user: z.string().min(1).max(255).optional(),
+ });
  
  export type SendMessageBody = z.infer<typeof sendMessageBodySchema>;
  
@@ -1927,10 +2360,16 @@ that catches a rename.
  // The history query (chapter 2.4, FR-MSG-09): an opaque cursor, a
  // direction, and a page size capped at 200. `limit` CLAMPS rather than
  // rejects — a client asking for 500 gets 200 and a next_cursor, because
+ // caps exist to protect the server and a clamp does that just as well
+ // while leaving the client's loop logic alone.
+ export const historyQuerySchema = z.strictObject({
 ```
 
 ```diff title="services/api/src/messages/messages.service.ts"
-@@ -11,6 +11,10 @@ import {
+@@ -6,20 +6,24 @@ import {
+ } from "@nestjs/common";
+ 
+ import {
    ChannelArchivedError,
    UserBannedError,
    ChannelNotFoundError,
@@ -1941,16 +2380,22 @@ that catches a rename.
    Repository,
    type MessageRow,
    type MessageWithSender,
-@@ -18,7 +22,7 @@ import {
+   SenderNotPermittedError,
  } from "../db/repository";
- import { QuotaExceededError } from "../quotas/quota.error";
+ import { protocolError } from "../protocol-error";
  import { decodeCursor, encodeCursor } from "./cursor";
 -import type { HistoryQuery, SendMessageBody } from "./messages.schema";
 +import type { EditMessageBody, HistoryQuery, SendMessageBody } from "./messages.schema";
  
  // The thin layer between HTTP and the repository (chapters 2.2 + 2.3). It
  // owns two things: turning the layer's domain error into the wire's 404,
-@@ -169,6 +173,137 @@ export class MessagesService {
+ // and carrying the write path's inputs down to the repository.
+ //
+ // AMENDED in chapter 2.6: `duplicate` used to be erased here, which made
+@@ -134,12 +138,143 @@ export class MessagesService {
+         throw new NotFoundException("channel not found");
+       }
+       throw error;
      }
    }
  
@@ -2088,10 +2533,16 @@ that catches a rename.
    /** A page of history (chapter 2.4). The cursor is opaque coming in and
     * going out; the service is the only place that knows it encodes a
     * sequence. A cursor we did not mint is a 400, never a silent reset to
+    * the top — serving the wrong page quietly is worse than refusing. */
+   async history(
+     channelId: string,
 ```
 
 ```diff title="services/api/src/outbox/event.ts"
-@@ -22,6 +22,26 @@ export interface MessageCreatedData {
+@@ -19,12 +19,32 @@ export interface MessageCreatedData {
+   seq: number;
+   user: string | null;
+   text: string | null;
    created_at: string;
  }
  
@@ -2118,7 +2569,13 @@ that catches a rename.
  /** A membership change as a CONSUMER receives it (FR-WHK-02).
   *
   * `user` IS THE EXTERNAL ID and the type says so, because the repository methods
-@@ -54,6 +74,18 @@ export interface MembershipChangedData {
+  * that build this event hold only `users.id`. `MessageCreatedData` above fixes the
+  * boundary — "Consumers are customers: they get external ids and the field names the
+  * REST surface uses. `user_id` does not cross this boundary" — and the message path
+@@ -51,12 +71,24 @@ export interface MembershipChangedData {
+  * unassertable, and the presence chapter's `codes.test.ts` earned its keep precisely by
+  * asserting an exact set and an exact count — which is what makes a new member a
+  * decision rather than an accident. `as const` plus `(typeof …)[number]` costs one
   * line and buys that. */
  export const OUTBOX_EVENT_TYPES = [
    "message.created",
@@ -2137,7 +2594,13 @@ that catches a rename.
    "channel.member_added",
    "channel.member_removed",
  ] as const;
-@@ -69,7 +101,7 @@ export interface OutboxEvent {
+ 
+ export type OutboxEventType = (typeof OUTBOX_EVENT_TYPES)[number];
+ 
+@@ -66,13 +98,13 @@ export interface OutboxEvent {
+   /** FR-WHK-02's name for this event, spelled as that requirement spells it. */
+   type: OutboxEventType;
+   environment_id: string;
    /** When the state change happened — the message's own timestamp, not the
     * moment this object was constructed. */
    occurred_at: string;
@@ -2146,7 +2609,13 @@ that catches a rename.
  }
  
  export interface PendingEvent {
-@@ -108,6 +140,76 @@ export function messageCreatedEvent({
+   subject: string;
+   payload: OutboxEvent;
+ }
+@@ -105,12 +137,82 @@ export function messageCreatedEvent({
+       occurred_at: message.created_at,
+       data: message,
+     },
    };
  }
  
@@ -2188,7 +2657,8 @@ that catches a rename.
 +  };
 +}
 +
-+/** A deletion, built inside the transaction that wrote the tombstone ( * FR-019, FR-020).
++/** A deletion, built inside the transaction that wrote the tombstone (
++ * FR-019, FR-020).
 + *
 + * ITS OWN PAYLOAD TYPE, and `MessageDeletedData`'s docstring argues why the text is
 + * absent rather than null. This function cannot put a text on the wire because it has
@@ -2222,7 +2692,13 @@ that catches a rename.
  /** A membership change, built inside the transaction that wrote the row.
   *
   * `occurred_at` ARRIVES FROM THE CALLER, like `messageCreatedEvent`'s, and for the
-@@ -201,6 +303,41 @@ export const outboxEventSchema = z.discriminatedUnion("type", [
+  * same reason: a republished event must be byte-identical to its first attempt, so
+  * nothing here reads the clock.
+  *
+@@ -199,12 +301,47 @@ export const outboxEventSchema = z.discriminatedUnion("type", [
+       seq: z.number().int().positive(),
+       user: z.string().nullable(),
+       text: z.string().nullable(),
        created_at: z.iso.datetime(),
      }),
    }),
@@ -2264,10 +2740,13 @@ that catches a rename.
    z.strictObject({
      ...envelope,
      type: z.literal("channel.member_added"),
+     data: z.strictObject({
+       channel_id: z.string().min(1),
+       // NOT nullable, unlike the message's `user`. A message can have no sender
 ```
 
 ```diff title="services/api/src/fanout/publisher.ts"
-@@ -1,4 +1,9 @@
+@@ -1,7 +1,12 @@
 -import { subjectForChannel, type Message } from "@relay/protocol";
 +import {
 +  subjectForChannel,
@@ -2278,7 +2757,13 @@ that catches a rename.
  import type { Logger } from "@relay/service-kit";
  // A NAMED import: ioredis is CommonJS and this service is ESM.
  import { Redis } from "ioredis";
-@@ -45,6 +50,11 @@ export interface MessagePublisher {
+ 
+ /** The api's half of the live fan-out (FR-004).
+  *
+@@ -43,12 +48,17 @@ export const MESSAGE_PUBLISHER = "MESSAGE_PUBLISHER";
+ 
+ export interface MessagePublisher {
+   /** Publish a committed message to its channel's subject. NEVER REJECTS —
     * delivery is allowed to fail, because the row is already durable and 2.7's
     * resume will find it (ADR-07, constitution IV). */
    publish(message: Message, context: PublishContext): Promise<void>;
@@ -2290,7 +2775,13 @@ that catches a rename.
    close(): Promise<void>;
  }
  
-@@ -109,6 +119,29 @@ export function createMessagePublisher({
+ /** What the failure has to be findable by. NFR-OBS-01 wants a request id and a
+  * tenant id in every structured log, and NFR-OBS-06 wants five-minute
+  * traceability from the former. The gateway's equivalent line carries neither,
+@@ -112,12 +122,35 @@ export function createMessagePublisher({
+   // this chapter records rather than inherits.
+   redis.on("error", () => {});
+ 
    let downUntil = 0;
  
    return {
@@ -2320,18 +2811,24 @@ that catches a rename.
      async publish(message, context) {
        // A known-down store is not retried on the request path. The first
        // failure opens a window; while it is open every call returns
+       // immediately, which is the same outcome the caller already handles.
+       if (now() < downUntil) return;
+       try {
 ```
 
 ```diff title="services/api/src/internal/backfill.controller.ts"
-@@ -80,9 +80,24 @@ export class BackfillController {
+@@ -77,15 +77,30 @@ export class BackfillController {
+  * Two kinds of row cannot be a `message.created` payload, and both are
+  * honest gaps rather than bugs to paper over:
+  *
   *   - **No sender.** Every row written through the socket before 2.6's fix
   *     has `user_id` NULL. There is no truthful value to invent, and the
   *     wire contract requires one.
 - *   - **No text.** A tombstone (FR-MSG-08) is not a creation. When deletes
 - *     arrive in Part 4 they get `message.deleted`, and resume will carry
 - *     that frame instead.
-+ *   - **No text.** A tombstone (FR-MSG-08) is not a creation. Deletes arrived in
-+ *     The revisions chapter and they do get `message.deleted` — **and resume does NOT carry
++ *   - **No text.** A tombstone (FR-MSG-08) is not a creation. Deletes arrive with
++ *     this chapter and they do get `message.deleted` — **and resume does NOT carry
 + *     that frame.** This sentence promised it would, and it was written before the
 + *     decision existed.
 + *
@@ -2351,10 +2848,16 @@ that catches a rename.
   *
   * The client is not left guessing: sequence numbers are contiguous per
   * channel, so a skipped row shows up as a gap the SDK detects and repairs
+  * through 2.4's history endpoint (FR-RTM-03's safety net, one layer down).
+  */
+ function toFrame(row: MessageWithSender, channelId: string): Message[] {
 ```
 
 ```diff title="packages/protocol/src/index.ts"
-@@ -12,4 +12,5 @@ export * from "./internal.js";
+@@ -9,7 +9,8 @@
+ export * from "./frames.js";
+ export * from "./codes.js";
+ export * from "./internal.js";
  export * from "./fanout.js";
  export * from "./presence.js";
  export * from "./membership.js";
@@ -2363,35 +2866,57 @@ that catches a rename.
 ```
 
 ```diff title="packages/protocol/src/codes.test.ts"
-@@ -71,7 +71,23 @@ describe("the registry is the whole vocabulary (FR-024)", () => {
-     // failed on the build that added it** — "expected 16 but got 17", which is the
-     // third time this line has turned a new code into a decision instead of an
-     // accident. The connection-metering chapter's close-code set did the same for 4003.
--    expect(Object.keys(ERROR_CODES)).toHaveLength(18);
-+    //
-+    // Eighteen until the revisions chapter added `not_message_author`, the fourth time, and then
-+    // `message_deleted` during that chapter's implementation — TWO in one chapter, which
-+    // its plan did not expect. **One pinned place, not the four the connection-cap chapter's close code
-+    // moved** — that chapter's task predicted two and found four, so this one counted
-+    // before editing: this assertion is the only place in the file that names a total.
-+    expect(Object.keys(ERROR_CODES)).toHaveLength(20);
-+  });
+@@ -157,6 +157,46 @@ describe("the refusal this chapter's cap adds", () => {
+     // code. A message telling a capped client to retry sends it into a loop against a
+     // wall, which is the failure `codes.ts` has now argued against five times.
+     expect(ERROR_CODES.connection_limit_reached).toContain("close one");
+     expect(ERROR_CODES.rate_limited).toContain("retry");
+   });
+ });
 +
++describe("the refusal this chapter's edit path adds", () => {
++  // NAMED, NOT COUNTED, for the reason the blocks above give.
++  //
++  // FR-022. The registry's own rule is that a specific code beats the generic one
++  // where the remedy differs, and here it differs absolutely: `forbidden`'s published
++  // remedy is a change of credential or of permission, and **neither makes a message
++  // yours**. A client told `forbidden` asks an administrator for a role; a client told
++  // `not_message_author` stops asking.
 +  it("names the non-author refusal separately from the generic 403", () => {
-+    // FR-022. The registry's own rule is that a specific code beats the generic
-+    // one where the remedy differs, and here it differs absolutely: `forbidden`'s
-+    // published remedy is a change of credential or of permission, and neither makes a
-+    // message yours.
 +    expect(ERROR_CODES).toHaveProperty("not_message_author");
 +    expect(ERROR_CODES.not_message_author).not.toBe(ERROR_CODES.forbidden);
 +    expect(ERROR_CODES.not_message_author).toMatch(/author/);
-   });
- 
-   it("contains the five the status ladder emits", () => {
++  });
++
++  // A SECOND CODE IN ONE CHAPTER, which the plan did not expect — and the count that
++  // used to sit at the top of this file is exactly what would have caught it as an
++  // arithmetic edit rather than as a decision. Named instead: what makes
++  // `message_deleted` a code of its own is that a client acts on it, and the three it
++  // could have reused all misdirect that action.
++  //
++  //   not_message_author   false. The author of a tombstone IS its author, and the
++  //                        client goes looking for a permission problem.
++  //   not_found            a lie with a witness — FR-011 keeps a deleted message in
++  //                        history, so the client holds the thing it is told is absent.
++  //   forbidden            the same objection as above: no credential un-deletes.
++  //
++  // `codes.ts` argues the fourth candidate, a bare 409, which is about the filter
++  // rather than about the client.
++  it("names a deleted message's refusal apart from every refusal about the caller", () => {
++    expect(ERROR_CODES).toHaveProperty("message_deleted");
++    for (const other of ["not_message_author", "not_found", "forbidden"] as const) {
++      expect(ERROR_CODES.message_deleted).not.toBe(ERROR_CODES[other]);
++    }
++    // THE WORDING IS THE CONTRACT: the remedy is to stop offering an edit, and the
++    // sentence has to say the history is unharmed or a client re-reads it as a loss.
++    expect(ERROR_CODES.message_deleted).toMatch(/deleted/);
++    expect(ERROR_CODES.message_deleted).toMatch(/history/);
++  });
++});
 ```
 
 ```diff title="packages/protocol/src/frames.test.ts"
-@@ -1,6 +1,6 @@
+@@ -1,9 +1,9 @@
  import { describe, expect, it } from "vitest";
  
 -import { frameSchema, parseFrame } from "./frames.js";
@@ -2399,7 +2924,13 @@ that catches a rename.
  
  // The contract must bite: for every frame, one specimen that parses and a
  // table of malformed near-misses that MUST reject. A schema that accepts
-@@ -27,7 +27,20 @@ const valid: Record<string, unknown> = {
+ // garbage is worse than no schema — it certifies garbage.
+ 
+ const message = {
+@@ -24,13 +24,26 @@ const valid: Record<string, unknown> = {
+     type: "message.send",
+     payload: { idem_key: "k-1", channel: "c1", text: "hi" },
+   },
    "message.ack": { type: "message.ack", payload: { seq: 43 } },
    "message.created": { type: "message.created", payload: message },
    "message.updated": { type: "message.updated", payload: message },
@@ -2421,7 +2952,13 @@ that catches a rename.
    "membership.changed": {
      type: "membership.changed",
      payload: { channel: "c1", user: "u2", change: "added" },
-@@ -143,6 +156,56 @@ describe("malformed frames reject", () => {
+   },
+   "presence.changed": {
+     type: "presence.changed",
+@@ -135,12 +148,62 @@ describe("malformed frames reject", () => {
+ });
+ 
+ // T014. THE COUNT AND THE SET, both asserted, on `codes.test.ts`'s precedent:
  // an exact count makes a new member a decision rather than an accident, and an
  // exact set makes it the RIGHT decision. The count alone would pass if somebody
  // swapped one member for another.
@@ -2478,6 +3015,9 @@ that catches a rename.
  describe("the frame union's membership", () => {
    const members = frameSchema.options.map((o) => o.shape.type.value);
  
+   it("has eleven members", () => {
+     expect(members).toHaveLength(11);
+   });
 ```
 
 ```ts title="packages/protocol/src/revision.test.ts"
@@ -2593,7 +3133,7 @@ describe("the revision fabric payload", () => {
 ```
 
 ```diff title="services/api/src/fanout/publisher.test.ts"
-@@ -1,5 +1,10 @@
+@@ -1,8 +1,13 @@
  import { createLogger, type Logger } from "@relay/service-kit";
 -import { messageSchema, subjectForChannel } from "@relay/protocol";
 +import {
@@ -2605,7 +3145,13 @@ describe("the revision fabric payload", () => {
  import { beforeEach, describe, expect, it, vi } from "vitest";
  
  import { createMessagePublisher } from "./publisher";
-@@ -39,6 +44,14 @@ const message = {
+ 
+ // A fake at the ioredis seam. The publisher's contract is "never rejects", so a
+ // test that only checks it resolved cannot tell a swallowed failure from a
+@@ -36,12 +41,20 @@ const message = {
+   user: "outside-bot",
+   text: "hello",
+   created_at: "2026-08-27T00:00:00.000Z",
  };
  const context = { requestId: "req-1", environmentId: "env-1" };
  
@@ -2620,12 +3166,18 @@ describe("the revision fabric payload", () => {
  function sink(): { lines: Record<string, unknown>[]; logger: Logger } {
    const lines: Record<string, unknown>[] = [];
    const logger = createLogger("publisher-test", (line) =>
-@@ -126,6 +139,61 @@ describe("the api's fan-out publisher", () => {
+     lines.push(JSON.parse(line) as Record<string, unknown>),
+   );
+   return { lines, logger };
+@@ -122,12 +135,67 @@ describe("the api's fan-out publisher", () => {
+ 
+     clock += 2; // 5_001 ms after the failure — the window has closed
+     await p.publish(message, context);
      expect(lines).toHaveLength(2);
    });
  
 +  it("publishes a revision to the revision subject, not the channel's", async () => {
-+    // THE SUBJECT IS THE ASSERTION. A `publishRevision` that reached
++    // T018h. THE SUBJECT IS THE ASSERTION. A `publishRevision` that reached
 +    // for `subjectForChannel` would deliver an edit to a subscriber that parses arrivals
 +    // as `Message` — and the `updated` arm IS a `Message`, so it would be accepted and
 +    // shown to every member as a brand new message.
@@ -2682,10 +3234,13 @@ describe("the revision fabric payload", () => {
    it("survives an ioredis `error` event instead of dying on it", () => {
      // R10, and the reason this listener exists at all. Without one, ioredis
      // emits `error` on an EventEmitter with no listener and Node turns that
+     // into an unhandled exception — the api would die for the thing it is built
+     // to survive. `createFanout` in the gateway has no such listener.
+     const { lines, logger } = sink();
 ```
 
 ```diff title="services/api/src/db/repository.itest.ts"
-@@ -1,9 +1,18 @@
+@@ -1,12 +1,21 @@
 +import { randomUUID } from "node:crypto";
 +
  import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -2705,9 +3260,15 @@ describe("the revision fabric payload", () => {
  
  // The isolation suite: attack the repository with FOREIGN tenant ids and
  // prove the leak inexpressible (FR-TEN-05, NFR-SEC-09, constitution I).
-@@ -409,16 +418,26 @@ describe("the listing's keyset survives a shared last_activity_at
+ // Requires the compose Postgres — this file is *.itest.ts precisely so the
+ // Docker-free unit lane never collects it.
  
- // ── THE TOMBSTONE, AND THE CLAMP (FR-016, FR-019) ───────────────
+@@ -406,22 +415,32 @@ describe("the listing's keyset survives a shared last_activity_at", () => {
+     expect(tied.map((r) => r.id)).toEqual(expected);
+   });
+ });
+ 
+ // ── THE TOMBSTONE, AND THE CLAMP (FR-016, FR-019) ─────────────────────────────
  //
 -// BOTH STATES ARE UNREACHABLE THROUGH THE API, for different reasons, and both are
 -// constructed here because this suite may hold raw SQL.
@@ -2718,7 +3279,7 @@ describe("the revision fabric payload", () => {
 +// reached the wire, and **nothing in the platform wrote either**. The comment here said
 +// so, in the present tense.
 +//
-+// **The revisions chapter BUILT THE WRITER** (`repository.deleteMessage`, FR-006), so the
++// **THE REVISIONS CHAPTER BUILT THE WRITER** (`repository.deleteMessage`, FR-006), so the
 +// sentence stopped being true — the class of decay this repository keeps paying for, and
 +// the reason `specs/041-chapter-3-23/check-prose.py` fails on the old wording. What that
 +// chapter did NOT do is rewrite these tests to use the writer: a hand-planted fixture and
@@ -2736,16 +3297,22 @@ describe("the revision fabric payload", () => {
 +// The clamp's fixture below is still genuinely unreachable through the API.
 +//
 +// The listing's rule was implemented and tested here before its writer existed, which
-+// The channel-control chapter said was so that "the day FR-MSG-08's chapter ships, the count and the preview
-+// already agree." They did.
++// the channel-control chapter said was so that "the day FR-MSG-08's chapter ships, the
++// count and the preview already agree." They did.
  describe("the listing's tombstone rule and its clamp", () => {
    it("reports a tombstoned last message with a null text, and still counts it", async () => {
      const user = await repoA.createUser("tomb-reader", "Tomb Reader");
-@@ -449,6 +468,72 @@ describe("the listing's tombstone rule and its clamp", () => {
+     const channel = await repoA.createChannel("tombstoned", "public");
+     await repoA.addMember(channel.id, user.id);
+     await repoA.sendMessage(channel.id, { text: "kept", userId: user.id });
+@@ -446,12 +465,78 @@ describe("the listing's tombstone rule and its clamp", () => {
+     // place in the arithmetic. Counting rows instead would make a deleted message stop
+     // being unread, at 10x the cost on the query a client runs to render its first
+     // screen.
      expect(row.unread).toBe(2);
    });
  
-+  // ── T009: THE READER, TESTED BEFORE THE WRITER EXISTS ────────
++  // ── T009: THE READER, TESTED BEFORE THE WRITER EXISTS ───────────────────────
 +  //
 +  // FR-011 and SC-003. The history read must return a tombstone in its
 +  // original position so a client sees no gap in the ordering.
@@ -2814,7 +3381,13 @@ describe("the revision fabric payload", () => {
    it("reports null for a channel that has never had a message", async () => {
      const user = await repoA.createUser("empty-reader", "Empty Reader");
      const channel = await repoA.createChannel("never-used", "public");
-@@ -581,3 +666,447 @@ describe("the repository's own refusals", () => {
+     await repoA.addMember(channel.id, user.id);
+     const { rows } = await repoA.listChannelsForUser(user.id, { limit: 10 });
+     const row = rows.find((r) => r.external_id === "never-used")!;
+@@ -579,6 +664,450 @@ describe("the repository's own refusals", () => {
+     const { rows } = await repoA.listChannelsForUser(reader.id, { limit: 10 });
+     const row = rows.find((r) => r.external_id === "arm-unattributed")!;
+     expect(row.last_message?.text).toBe("from the tenant, not a user");
      expect(row.last_message?.user).toBeNull();
    });
  });
@@ -2934,9 +3507,9 @@ describe("the revision fabric payload", () => {
 +  });
 +
 +  it("an edit on a row with no author is refused (FR-018)", async () => {
-+    // PLANTED WITH RAW SQL, because no write path can produce one any more —
-+    // the sender chapter made `userId` required — and 121,250 of them exist in the lane, written
-+    // before chapter 2.6 recorded a sender.
++    // PLANTED WITH RAW SQL, because no write path can produce one any more — the sender
++    // chapter made `userId` required — and 19,965 of them exist in the lane out of
++    // 125,076, written before chapter 2.6 recorded a sender.
 +    const author = await repoA.createUser("t036-author", "Author");
 +    const channel = await repoA.createChannel("t036", "public");
 +    await repoA.addMember(channel.id, author.id);
@@ -3051,7 +3624,7 @@ describe("the revision fabric payload", () => {
 +
 +  it("keeps the sequence, author and created_at; drops text and attachments (FR-006)", async () => {
 +    // THE COLUMNS ARE `docs/05-sad.md:342`'s, and this is the first tombstone the
-+    // PLATFORM writes. The channel-control chapter's suite plants one by hand a few describes above,
++    // PLATFORM writes. the channel-control chapter's suite plants one by hand a few describes above,
 +    // and the two agree column for column — which is what makes that chapter's reader
 +    // tests evidence about this chapter's writer.
 +    const author = await repoA.createUser("t040-author", "Author");
@@ -3265,19 +3838,30 @@ describe("the revision fabric payload", () => {
 ```
 
 ```diff title="services/api/src/messages/messages.itest.ts"
-@@ -158,8 +158,9 @@ describe("POST /v1/channels/:channelId/messages", () => {
+@@ -146,15 +146,16 @@ describe("POST /v1/channels/:channelId/messages", () => {
+ 
+   // ── THE ROUTE A CUSTOMER'S CLIENT ACTUALLY CALLS (FR-001) ─────────────────────
+   //
+   // The membership check lives in `repository.sendMessage` and is gated on `userId`
    // being present. `repository.itest.ts` proves the check EXISTS by driving that
    // function directly with a user id. Only these tests prove it FIRES, because for
-   // twenty-three chapters this controller called `messages.send(channelId, body)`
+-  // twenty-three chapters this controller called `messages.send(channelId, body)`
 -  // with no user at all — and `MessagesController` declares no `@Accepts`, so the
 -  // guard falls back to `EITHER` and a user token is accepted here.
++  // seventeen chapters this controller called `messages.send(channelId, body)`
 +  // with no user at all — and `MessagesController` declared no `@Accepts` at the time,
-+  // so the guard fell back to `EITHER` and a user token was accepted here. The sender chapter
-+  // declared it; this sentence went on describing its absence until the revisions chapter.
++  // so the guard fell back to `EITHER` and a user token was accepted here. The sender
++  // chapter declared it; this sentence went on describing its absence until this one.
    //
    // So the repository test passed while the route it protects was open. A repository
    // test proves a check exists; only a route test proves it fires.
-@@ -445,3 +446,578 @@ describe("POST /v1/channels/:channelId/messages", () => {
+   describe("a private channel over the public route (FR-001, SC-002)", () => {
+   
+   // ══ THE SENDER (US2) ══════════════════════════════════════════
+@@ -434,6 +435,581 @@ describe("POST /v1/channels/:channelId/messages", () => {
+       const token = await tokenFor("never-seen-before");
+       const refused = await sendAs(token, privateChannelId);
+       expect(refused.status).toBe(400);
      });
    });
  });
@@ -3859,7 +4443,10 @@ describe("the revision fabric payload", () => {
 ```
 
 ```diff title="services/api/src/internal/backfill.itest.ts"
-@@ -200,6 +200,156 @@ describe("POST /internal/backfill", () => {
+@@ -197,12 +197,162 @@ describe("POST /internal/backfill", () => {
+     expect(page.messages.map((m) => m.seq)).toEqual([withAuthor.seq]);
+     // The gap is visible to the client as a missing sequence number — which
+     // is precisely the signal the SDK repairs through 2.4's history endpoint.
      expect(page.messages.map((m) => m.seq)).not.toContain(anonymous.seq);
    });
  
@@ -4016,88 +4603,84 @@ describe("the revision fabric payload", () => {
    it("refuses a cursor map big enough to turn one connect into a scan storm", async () => {
      const cursors: Record<string, number> = {};
      for (let i = 0; i <= MAX_RESUME_CHANNELS; i++) {
+       cursors[`channel-${i}`] = 1;
+     }
+     expect((await ask(cursors)).status).toBe(400);
 ```
 
 ```diff title="services/api/src/isolation/tenant-scope.itest.ts"
-@@ -93,6 +93,13 @@ describe("every table has a path to one tenant", () => {
-     // `users`. The rule is existence, not uniqueness; an earlier draft of
-     // data-model.md said "exactly one foreign key", which would have classified
-     // neither and failed totality on both.
+@@ -83,7 +83,30 @@ describe("every table has a path to one tenant", () => {
+     // A hop with no target is a hop in name only, and the query that produced it
+     // would have to be wrong for this to happen — which is why it is asserted.
+     for (const t of hop) {
+       expect(t.via.length, `${t.table} is a hop to nowhere`).toBeGreaterThan(0);
+     }
+   });
++
++  it("reads the direct tables a chain arrives at, not the ones it passes through", () => {
++    // THE REACH BECAME TRANSITIVE IN THIS CHAPTER, and this test is the half of it that
++    // NOTHING ABOVE CAN SEE. `message_edits` is the first table two links away — it
++    // references `messages`, which references `channels`, which carries the column — and
++    // the one-hop query classified it as having no tenant at all.
 +    //
-+    // The revisions chapter MADE THE REACH TRANSITIVE and this assertion is why the
-+    // change is safe to make: `via` holds the DIRECT tables a chain arrives at,
-+    // never the intermediate ones, so `message_edits` reads `channels, users`
-+    // through `messages` rather than reading `messages`. Falsified twice
-+    // against a live database — an orphan table and a table whose only chain
-+    // leads into the spine both still fail totality (baseline.txt).
-     const hops = tables.filter((t) => t.path === "hop");
-     for (const hop of hops) {
-       expect(hop.via.length, `${hop.table} is a hop with no target`).toBeGreaterThan(0);
++    // Reverting the walk to one hop turns three tests red, this one included, so the
++    // transitive half is well covered. THE SECOND EXPECTATION IS THE ONE THAT STANDS
++    // ALONE: drop the `IN (SELECT table_name FROM direct)` filter from `fk_targets` and
++    // the walk starts reporting the tables it passed THROUGH — six of them here — and
++    // every other test in this file stays green, because "a hop has some target" is truer
++    // with intermediates in the list, not less true.
++    //
++    // A `via` naming `messages` would be the catalogue reporting its own intermediate
++    // step, and `tenant-scope`'s whole claim is that `via` names tables a repository can
++    // scope by. Asserting "every via is itself direct" would not catch it: the SQL filter
++    // makes that true by construction whenever the filter is there at all.
++    const edits = tables.find((t) => t.table === "message_edits");
++    expect(edits?.path).toBe("hop");
++    expect(edits?.via).not.toContain("messages");
++    expect([...(edits?.via ?? [])].sort()).toEqual(["channels", "users"]);
++  });
+ });
 ```
 
-```diff title="services/api/src/webhooks/deliveries.itest.ts"
-@@ -120,6 +120,48 @@ describe("expansion", () => {
-     expect(await timesHandled(db, DISPATCHER, e.eventId)).toBe(1);
-   });
- 
-+  it("a subscriber to the two new message events is told about an edit and a deletion (FR-019, SC-011)", async () => {
-+    // **`seedEndpoint` IS PARAMETERISED AND EVERY EXISTING CALL SITE PASSES
-+    // `["message.created"]`.** A test that forgot to pass the new types would seed an
-+    // endpoint subscribed to creations, receive nothing, and read as though the
-+    // expansion were broken — so the types are passed explicitly and the negative
-+    // control below is what proves the filter is doing the work.
-+    const scratch = await createEnvironment(db, { name: "deliveries-itest-3-23" });
-+    const scratchRepo = new Repository(db, scratch.id);
-+    const secret = encryptSecret(mintSigningSecret());
-+
-+    const both = await scratchRepo.createEndpoint({
-+      url: "https://example.test/edits-and-deletions",
-+      eventTypes: ["message.updated", "message.deleted"],
-+      secretCiphertext: secret,
-+    });
-+    // SUBSCRIBED TO CREATIONS ONLY. FR-WHK-02 spells four separate names rather than one
-+    // `message.*` with a discriminator precisely so this endpoint hears nothing below —
-+    // and that is the half a test with one endpoint cannot show.
-+    const creationsOnly = await scratchRepo.createEndpoint({
-+      url: "https://example.test/creations-only",
-+      eventTypes: ["message.created"],
-+      secretCiphertext: secret,
-+    });
-+
-+    for (const type of ["message.updated", "message.deleted"] as const) {
-+      const e = {
-+        eventId: randomUUID(),
-+        environmentId: scratch.id,
-+        type,
-+        payload: { id: randomUUID(), type },
-+      };
-+      const result = await expandEventToDeliveries(db, e);
-+      expect(result.duplicate, type).toBe(false);
-+      // ONE ROW, NOT TWO. The subscriber to both types gets it; the creations-only
-+      // endpoint does not.
-+      expect(result.created, type).toBe(1);
-+      const rows = await scratchRepo.listDeliveriesForEvent(e.eventId);
-+      expect(rows.map((r) => r.endpoint_id), type).toEqual([both.id]);
-+      expect(rows.map((r) => r.endpoint_id), type).not.toContain(creationsOnly.id);
-+    }
-+  });
-+
-   it("invariant 8: a disabled or deleted endpoint receives nothing", async () => {
-     const scratch = await createEnvironment(db, { name: "deliveries-itest-off" });
-     const scratchRepo = new Repository(db, scratch.id);
-```
+<ForwardRef>
+**And the endpoint half of FR-019 is owed to the webhook chapter.** The two outbox rows are
+this chapter's — `messages.itest.ts` above asserts that every edit writes one and that a
+repeated deletion writes none — but an outbox row is not a delivery. What decides whether a
+customer hears about an edit is the EXPANSION: `expandEventToDeliveries` matches an event's
+type against each endpoint's subscribed list, and FR-WHK-02 spells `message.updated` and
+`message.deleted` as separate names rather than one `message.*` precisely so an endpoint can
+take one and not the other.
+
+Nothing here can show that, because no endpoint exists to subscribe yet. The test that will
+seeds two — one subscribed to both new types, one to creations only — and its whole force is
+the second one hearing nothing. It carries a trap worth reading before writing it:
+`seedEndpoint` is parameterised and every existing call site passes `["message.created"]`, so
+a test that forgets the argument gets silence from a creations-only endpoint and reads as
+though the expansion were broken rather than as though the test were.
+</ForwardRef>
 
 ```diff title="services/gateway/src/session.test.ts"
-@@ -6,7 +6,7 @@ import type { AddressInfo } from "node:net";
+@@ -1,14 +1,15 @@
+ import { WebSocket } from "ws";
+ import { afterEach, describe, expect, it } from "vitest";
++import { readFile } from "node:fs/promises";
+ import type { Server } from "node:http";
+ import type { AddressInfo } from "node:net";
  
  import { createLogger, type Logger } from "@relay/service-kit";
  import { serve } from "@relay/service-kit";
--import { CLOSE_CODES, type Frame,
-+import { CLOSE_CODES, type Frame, type RevisionFabric,
-   docsUrl,
- } from "@relay/protocol";
+-import type { Frame } from "@relay/protocol";
++import type { Frame, RevisionFabric } from "@relay/protocol";
  
-@@ -123,10 +123,17 @@ function stubFanout(): Fanout & {
+ import type { InternalSendResponse, Message } from "@relay/protocol";
+ 
+ import type { ApiClient } from "./api-client.js";
+ import type { Fanout } from "./fanout.js";
+ import { attachSessions, INBOUND_FRAME_TYPES } from "./session.js";
+@@ -108,31 +109,51 @@ function stubFanout(): Fanout & {
+   subjects: string[];
+   /** Inject a live frame at a moment the test chooses. This is how the
+    * flagship race gets reproduced deterministically instead of hopefully:
     * the api stub calls it from inside the backfill, so "a message published
     * during the backfill window" is a line of code, not a stress loop. */
    emit: (message: Message) => void;
@@ -4115,7 +4698,12 @@ describe("the revision fabric payload", () => {
    return {
      published,
      subjects,
-@@ -139,9 +146,22 @@ function stubFanout(): Fanout & {
+     // Honest about the fabric's one rule: a frame published to a subject
+     // this instance has not subscribed to does NOT arrive. Without that,
+     // the stub would silently paper over the gap variant of the race.
+     emit: (message) => {
+       if (subjects.includes(message.channel)) deliver(message.channel, message);
+     },
      onDelivery: (handler) => {
        deliver = handler;
      },
@@ -4138,11 +4726,17 @@ describe("the revision fabric payload", () => {
      subscribe: async (channelId) => {
        subjects.push(channelId);
      },
-@@ -609,6 +629,101 @@ describe("the socket (chapter 2.5)", () => {
+     unsubscribe: async () => {},
+     close: async () => {},
+   };
+@@ -570,12 +591,107 @@ describe("the socket (chapter 2.5)", () => {
+     await nextFrame(socket, "connection.ack");
+     await settle();
+     expect(created(frames)).toEqual([42, 43]);
      socket.close();
    });
  
-+  // ── the revision fabric reaches a socket ─────────────────
++  // ── the revision fabric reaches a socket ──────────────────────────────────
 +  //
 +  // ADR-24's whole point, tested at the seam where it would be invisible: the KIND now
 +  // comes from the payload. Before this chapter `session.ts` stamped `message.created` at
@@ -4240,27 +4834,33 @@ describe("the revision fabric payload", () => {
    it("forwards per-channel truncation so the client pages history instead (FR-RTM-04)", async () => {
      const fanout = stubFanout();
      harness = await boot(
-@@ -988,6 +1103,55 @@ describe("the socket's limits", () => {
-     expect(CLOSE_CODES[4008]).toBeDefined();
-     expect(CLOSE_CODES[4009]).toBeDefined();
+       stubApi({
+         backfill: async () => ({
+           [CHANNEL]: { messages: [frame(42)], truncated: true },
+@@ -688,12 +804,63 @@ describe("the socket (chapter 2.5)", () => {
+     // resume work, and a channel the caller is not in is not a question.
+     expect(seen).toEqual({ [CHANNEL]: 41 });
+     socket.close();
    });
-+
-+  /** T049a, SC-008 — FR-RTM-05's SIX KINDS ALL HAVE A PRODUCER.
+ });
+ 
++describe("FR-RTM-05's six event kinds, each with a producer in this service", () => {
++  /** SC-008 — FR-RTM-05 NAMES SIX KINDS AND UNTIL THIS CHAPTER TWO HAD NO PRODUCER.
 +   *
 +   * *"The system shall emit real-time events for message creation, edit, deletion,
-+   * membership change, presence change, and typing."* Six, and until this chapter two
-+   * of them had no producer anywhere in the platform.
++   * membership change, presence change, and typing."* Six, and the edit and the deletion
++   * were the two the platform could not send.
 +   *
 +   * **READ AS TEXT, because nothing else can see a producer.** A zod union knows its
 +   * members and knows nothing about what emits them; coverage sees a line execute and
 +   * cannot see a line that was never written. `main.test.ts` established this shape in
-+   * It parses `main.ts` and asserts every module it builds is closed —
-+   * and CLAUDE.md records why it had to: the defect that chapter shipped was an
-+   * ARGUMENT THAT WAS NOT THERE, and every line around it executed.
++   * the connection-cap chapter — it parses `main.ts` and asserts every fabric it builds
++   * is injected — and the reason it had to is that the defect that chapter shipped was
++   * an ARGUMENT THAT WAS NOT THERE, with every line around it executing.
 +   *
 +   * **THE FIRST DRAFT PUT THIS IN `packages/protocol/src/frames.test.ts`**, where it
 +   * cannot be written: that file tests schemas, and `grep` for "producer" in it returns
-+   * nothing. Analysis pass 2 created the task and pass 3 found it unimplementable.
++   * nothing.
 +   *
 +   * THE SIX ARE WRITTEN OUT AND AN UNKNOWN MEMBER FAILS. A loop over some derived list
 +   * would pass on a list that had quietly lost a member, which is the failure mode this
@@ -4293,13 +4893,20 @@ describe("the revision fabric payload", () => {
 +    // the negative case has to be a real frame nothing here emits.
 +    expect(source).not.toMatch(/type:\s*"message.forged"/);
 +  });
- });
++});
++
+ describe("INBOUND_FRAME_TYPES", () => {
+   it("has exactly two members", () => {
+     expect(INBOUND_FRAME_TYPES.size).toBe(2);
+   });
  
- // T038. THE INBOUND SET, ASSERTED BY SIZE AND BY MEMBERSHIP.
+   it("is exactly message.send and typing.send", () => {
 ```
 
 ```diff title="services/gateway/src/fanout.itest.ts"
-@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
+@@ -1,12 +1,12 @@
+ import { randomUUID } from "node:crypto";
+ 
  import { afterAll, beforeAll, describe, expect, it } from "vitest";
  
  import { createLogger } from "@relay/service-kit";
@@ -4308,7 +4915,13 @@ describe("the revision fabric payload", () => {
  
  import { createFanout, type Fanout } from "./fanout.js";
  
-@@ -62,14 +62,44 @@ function nextDelivery(
+ // Chapter 2.6's real test: the one behaviour a single-process test CANNOT
+ // show. Two fabric clients stand in for two gateway instances — same code,
+ // same Redis, no knowledge of each other. If a message published by one
+@@ -59,20 +59,50 @@ function nextDelivery(
+         reject(new Error("no delivery within the deadline"));
+       }
+     }, 10);
    });
  }
  
@@ -4355,7 +4968,13 @@ describe("the revision fabric payload", () => {
  }
  
  describe("fan-out across instances", () => {
-@@ -146,6 +176,96 @@ describe("fan-out across instances", () => {
+   let g1: ReturnType<typeof instance>;
+   let g2: ReturnType<typeof instance>;
+ 
+@@ -143,12 +173,102 @@ describe("fan-out across instances", () => {
+       setTimeout(resolve, 100);
+     });
+     await expect(nextDelivery(g2, 300)).rejects.toThrow("deadline");
      await raw.fanout.close();
    });
  
@@ -4449,19 +5068,25 @@ describe("the revision fabric payload", () => {
 +    await g2.fanout.unsubscribe(CHANNEL);
 +  });
 +
-   // THE SUBJECT GRAMMAR'S TEST MOVED IN the fan-out chapter, to
+   // THE SUBJECT GRAMMAR'S TEST MOVED IN THE FAN-OUT CHAPTER, to
    // `packages/protocol/src/fanout.test.ts`, along with `subjectFor` itself. It
    // was a pure string assertion sitting in a suite that needs a running Redis;
+   // it needed neither. What stays here is everything that genuinely needs the
+   // fabric — two clients, a real subject, and a delivery.
+ });
 ```
 
 ```diff title="services/gateway/src/isolation.itest.ts"
-@@ -761,8 +761,27 @@ function sample(type: string, channel: string, user: string): unknown {
+@@ -786,14 +786,33 @@ function sample(type: string, channel: string, user: string): unknown {
+     case "connection.ack":
+       return { type, payload: { user, cursor: {}, resume_ok: true, truncated: [] } };
+     case "message.ack":
        return { type, payload: { seq: 1 } };
      case "message.created":
      case "message.updated":
 -    case "message.deleted":
        return { type, payload: message };
-+    // The revisions chapter SPLIT THIS CASE OFF. `message.deleted` shared the `Message` above
++    // THE REVISIONS CHAPTER SPLIT THIS CASE OFF. `message.deleted` shared the `Message` above
 +    // until this chapter gave the frame a payload with no text and a `deleted_at`. The
 +    // forged frame then failed the SHAPE check and the refusal came back
 +    // `invalid_frame` instead of `unknown_frame_type`.
@@ -4484,10 +5109,16 @@ describe("the revision fabric payload", () => {
      case "membership.changed":
        return { type, payload: { channel, user, change: "added" } };
      case "presence.changed":
+       return { type, payload: { user, state: "online" } };
+     case "typing":
+       return { type, payload: { channel, user } };
 ```
 
 ```diff title="services/gateway/src/resume.itest.ts"
-@@ -338,6 +338,65 @@ describe("resume across a real fabric", () => {
+@@ -311,12 +311,71 @@ describe("resume across a real fabric", () => {
+     await settle(300);
+ 
+     expect(created(frames)).toEqual([42, 43]);
      socket.close();
    });
  
@@ -4553,10 +5184,16 @@ describe("the revision fabric payload", () => {
    it("suppresses nothing when the resume degraded", async () => {
      // A degraded resume tells the client to page history for every channel, so the
      // backfill it received is a fragment or nothing at all. A mark taken from it
+     // would suppress messages the client never got — turning this chapter's
+     // duplicate into a gap, which constitution II ranks worse.
+     harness = await boot({
 ```
 
 ```diff title="services/gateway/src/public-surface.itest.ts"
-@@ -31,6 +31,14 @@ import { attachSessions } from "./session.js";
+@@ -28,12 +28,20 @@ import { docsUrl } from "@relay/protocol";
+ // build-output seam, because there is no public way to create either — that has
+ // been true since chapter 2.8 and is still true. Everything downstream of the
+ // credential is public HTTP: `POST /v1/channels`, `POST
  // /v1/channels/:id/members`, `POST /auth/dev-token`, `POST
  // /v1/channels/:id/messages`, and `ws://…/v1/ws`.
  //
@@ -4571,156 +5208,81 @@ describe("the revision fabric payload", () => {
  // `packages/outsider` will make the stronger version of this claim in Phase 10 —
  // a package mechanically forbidden from importing workspace code at all. This one
  // runs where the coverage lane can see it.
-```
-
-```diff title="packages/outsider/src/integrate.itest.ts"
-@@ -473,6 +473,116 @@ describe("integrating with Relay from the outside", () => {
-     expect(await closed).toBe(4002);
-   });
  
-+  /** An edit, over the shipped binary, seen on somebody else's socket.
-+   *
-+   * **WRITTEN BECAUSE THIS FILE IS THE ONLY THING THAT BOOTS THE PRODUCT.** CLAUDE.md
-+   * records what that bought: the typing chapter built a module, awaited its `close()`, never
-+   * passed it to `attachSessions`, and shipped it inert past 1,174 coverage tests and
-+   * 174 gateway integration tests. This file found it. The rule it left behind — a
-+   * chapter that adds an argument to `attachSessions` owes an outsider test — applies
-+   * here for the same reason one level out: the revisions chapter adds a second Redis subject, a second
-+   * callback on the fan-out and a second frame kind, and every in-workspace test of
-+   * that path uses a stub fan-out or the `ws` package this file refuses to import.
-+   *
-+   * **NO TASK CREATED THIS TEST.** T090 lists this file among "eleven files this
-+   * chapter adds tests to" and nothing in the plan added one; the audit task was
-+   * scheduled over work no task did. `baseline.txt` records it.
-+   *
-+   * What it proves that nothing else does: the api's `publishRevision` reaches a real
-+   * Redis, on the subject ADR-24 took, and a real gateway process routes it by prefix
-+   * to a real socket as `message.updated` — not as `message.created`, which is the
-+   * failure the whole ADR exists to prevent and which no shape check can see, because
-+   * the updated arm's payload IS a `Message`. */
-+  it("edits a message over REST, and a member's socket hears message.updated exactly once, with no second creation", async () => {
-+    const minted = await post(
-+      "/auth/dev-token",
-+      { user: "watcher", ttl_seconds: 3600 },
-+      credential,
-+    );
-+    expect(minted.status).toBe(200);
-+    const token = minted.body["token"] as string;
-+    // The watcher has to be a member to be delivered to — the channel is public, so
-+    // this is about subscription rather than permission.
-+    const joined = await post(
-+      `/v1/channels/${channelId}/members`,
-+      // `user_ids`, and it takes a LIST. The first draft posted `{ user: "watcher" }`
-+      // and got a 400 — `addMembersBodySchema` is a `strictObject` over
-+      // `user_ids: [...]`, and the entry may be a bare identifier or an object with a
-+      // role. An outsider test guessing a body shape is the whole reason this file
-+      // exists; two earlier tests in it were written twice for the same reason.
-+      { user_ids: ["watcher"] },
-+      credential,
-+    );
-+    expect([200, 201]).toContain(joined.status);
-+
-+    const socket = new WebSocket(`${ws}/v1/ws?token=${token}`);
-+    const frames: Array<{ type: string; payload?: Record<string, unknown> }> = [];
-+    socket.addEventListener("message", (event) => {
-+      frames.push(JSON.parse(String(event.data)) as { type: string });
-+    });
-+    socket.addEventListener("error", () => undefined);
-+    const waitFor = async (
-+      predicate: (f: { type: string; payload?: Record<string, unknown> }) => boolean,
-+      what: string,
-+    ) => {
-+      const deadline = Date.now() + 10_000;
-+      for (;;) {
-+        const found = frames.find(predicate);
-+        if (found) return found;
-+        if (Date.now() > deadline) {
-+          throw new Error(
-+            `no ${what}; saw ${frames.map((f) => f.type).join(", ") || "nothing"}`,
-+          );
-+        }
-+        await new Promise((r) => setTimeout(r, 50));
-+      }
-+    };
-+    await waitFor((f) => f.type === "connection.ack", "connection.ack");
-+
-+    // SENT BY THE WATCHER'S OWN TOKEN, because only an author may edit (FR-013) and
-+    // the edit route accepts no application credential at all (FR-013a). So the send
-+    // uses the token too — a POST with a user token is attributed to its subject and
-+    // must not name a `user` in the body.
-+    const before = `outsider edit ${Date.now()}`;
-+    const posted = await fetch(`${api}/v1/channels/${channelId}/messages`, {
-+      method: "POST",
-+      headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
-+      body: JSON.stringify({ text: before }),
-+    });
-+    expect(posted.status).toBe(201);
-+    const sent = (await posted.json()) as { id: string; seq: number };
-+    await waitFor(
-+      (f) => f.type === "message.created" && f.payload?.["text"] === before,
-+      "message.created for the text just sent",
-+    );
-+
-+    const after = `${before} (corrected)`;
-+    const edited = await fetch(
-+      `${api}/v1/channels/${channelId}/messages/${sent.id}`,
-+      {
-+        method: "PATCH",
-+        headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
-+        body: JSON.stringify({ text: after }),
-+      },
-+    );
-+    expect(edited.status).toBe(200);
-+
-+    const frame = await waitFor(
-+      (f) => f.type === "message.updated" && f.payload?.["text"] === after,
-+      "message.updated for the corrected text",
-+    );
-+    // THE SEQUENCE IS THE ONE IT HAD (FR-002), on the wire and not only in the row.
-+    expect(frame.payload?.["seq"]).toBe(sent.seq);
-+    expect(frame.payload?.["id"]).toBe(sent.id);
-+    // AND NO SECOND CREATION. This is the assertion ADR-24 is for: route the revision
-+    // to the old callback and the edit arrives as `message.created`, indistinguishable
-+    // from a new message to every client. Counting is what sees it — a `waitFor` that
-+    // resolves on the first match cannot.
-+    expect(frames.filter((f) => f.type === "message.created")).toHaveLength(1);
-+    expect(frames.filter((f) => f.type === "message.updated")).toHaveLength(1);
-+    socket.close();
-+  });
-+
-   it("cannot see another tenant's channel, and cannot tell it apart from an absent one", async () => {
-     // The documented isolation property, exercised the only way an outsider can:
-     // with an id that is well formed and is not theirs. The reference says both
+ const silent: Logger = createLogger("gateway", () => {});
+ const HERE = dirname(fileURLToPath(import.meta.url));
 ```
 
-The coverage ratchet fired last, on `messages.controller.ts`, and its answer was to delete two
+<ForwardRef>
+**The outsider suite's half of this is owed forward.** `packages/outsider/src/integrate.itest.ts`
+walks the edit and its history from outside the monorepo — Node's global `WebSocket`, no
+workspace import — and that file does not exist yet in this order: it arrives with the sealed
+outsider at the end of Part 3. What it will assert is the one claim nothing above can make,
+that a client written against the published reference alone can edit a message and read what
+it used to say.
+
+The 110 lines are not lost. They are recorded against that chapter, with the trap their own
+comment names: the suite's route inventory is *what this test calls*, not an inventory of the
+public surface, and a task in this chapter read it the other way and scheduled an edit that
+was never needed. The inventory lives in `services/api/src/isolation/targets.ts`, where a
+check derives it from the running application instead of restating it in prose.
+</ForwardRef>
+
+The coverage ratchet fired last, on `messages.controller.ts`. Its answer was to delete two
 things rather than test them: a `?? "unknown"` on the deletion frame's author, which was
 unreachable **and** would have put that word on the wire as somebody's name, and three copies
-of the same two context fallbacks, one per publish site. Branches finished above where the
-chapter found them, so the pin went up.
+of the same two context fallbacks, one per publish site.
+
+**Then one test did the rest, and it was measured rather than reasoned about.** Skipping that
+one test and running the whole battery again reads **91.83 / 85.71 / 100 / 93.75** with three
+uncovered statements — the 400 each of the three new handlers raises when the token's subject
+has no user row. With it: **97.95 / 92.85 / 100 / 97.91**, one statement left. So the test is
+worth +6.12 statements, +7.14 branches and +4.16 lines, and it is what clears the inherited
+floors.
+
+Branches finished at 92.85 against an inherited 87, so that pin goes **up** to 92. Lines come
+**down** from 100 to 97, and the statement still uncovered is named rather than counted: the
+narrowing throw in `edit`, which fires when a request reaches that handler with no user
+subject. `@Accepts("user")` on the method means the guard has already refused every credential
+that could produce it — so it is unreachable while the decorator is there, and it is there to
+be loud if somebody removes it. A `!` would restore 100% by moving the assumption somewhere a
+decorator change cannot invalidate, which is the trade this file declines to make.
+
+`repository.ts` moved the other way and its pin was left alone: 92.66 when the sender chapter
+pinned it at 92, **92.97 here**, with four routes' worth of new methods in between. A ratchet
+that follows every upward reading is a ratchet somebody has to lower later.
 
 ```diff title="vitest.coverage.config.mts"
-@@ -422,11 +422,49 @@ export default defineConfig({
+@@ -214,17 +214,69 @@ export default defineConfig({
+         // was just written from a request whose schema requires `text`. So the false
+         // side cannot be reached from here. The ratchet has removed unreachable code
+         // three times in this repository; this one stays, because `messageSchema` types
          // `text` as non-nullable and a null would publish a frame the delivery side
          // drops silently. A guard against a state the type system forbids is cheap; the
          // alternative is a silent drop.
-+        // THE REVISIONS CHAPTER MOVED THIS FILE IN BOTH DIRECTIONS, and the branch number is the
-+        // one worth reading. The chapter added two routes to it — an edit and a deletion,
-+        // each resolving a caller, each publishing — and the first measurement after that
-+        // was **91.66 / 78.84 / 100 / 93.61** against pins of 96 / 87 / 100 / 100. Three
-+        // of four red.
 +        //
-+        // WHAT WAS TESTED, and it was the largest part: every one of those routes throws
-+        // a 400 when the token's subject has no user row, and nothing exercised it. The
-+        // send path had had that test since the channel-control chapter; the two new routes and the
-+        // history route beside them did not. One test covering all three took lines to
-+        // 97.87 and branches to 84.61.
++        // THIS CHAPTER MOVED THIS FILE IN BOTH DIRECTIONS, and the LINES number is the one
++        // that had to come down. The chapter added two routes to it — an edit and a
++        // deletion, each resolving a caller, each publishing — against inherited pins of
++        // 96 statements / 87 branches / 100 functions / 100 lines.
++        //
++        // MEASURED, WITH THE DELETIONS BELOW ALREADY MADE AND THE NARROWING TEST HELD
++        // BACK: **91.83 / 85.71 / 100 / 93.75**, three uncovered statements at lines 297,
++        // 303 and 401. Statements and lines both red.
++        //
++        // WHAT WAS TESTED, and it was the largest part: every one of those routes throws a
++        // 400 when the token's subject has no user row, and nothing exercised it. The send
++        // path had had that test since the channel-control chapter; the two new routes and
++        // the history route beside them did not. **One test covering all three is worth
++        // +6.12 statements, +7.14 branches and +4.16 lines**, and it clears 303 and 401 —
++        // measured by skipping that one test and running the battery again, rather than by
++        // reasoning about which lines it touches.
 +        //
 +        // WHAT WAS REMOVED RATHER THAN TESTED, which is the ratchet's preferred outcome
 +        // and the fifth time it has produced one:
 +        //
 +        //   - `deleted.user ?? "unknown"` on the deletion frame. `deleteMessage` refuses
-+        //     a senderless row (FR-018 of the revisions chapter) before it can return, so the arm was
++        //     a senderless row (FR-018) before it can return, so the arm was
 +        //     unreachable — AND the value it would have produced was a lie: the word
 +        //     "unknown" on the wire as somebody's name. The narrowing moved to the
 +        //     repository, where the foreign-key argument for it lives.
@@ -4731,17 +5293,25 @@ chapter found them, so the pin went up.
 +        //     `unknown` is findable where one saying `undefined` reads like a broken
 +        //     logger — but the count stops growing with every route that publishes.
 +        //
-+        // Branches finished at **92.85, above the 87 this chapter inherited**, so the pin
-+        // goes UP to 92 — 0.85 of headroom, the same margin the sender chapter left on
-+        // `repository.ts` at 92.59.
++        // FINAL: **97.95 / 92.85 / 100 / 97.91**. Branches finished ABOVE the 87 this
++        // chapter inherited, so that pin goes UP to 92 — 0.85 of headroom, which is the
++        // margin `repository.ts` above was pinned with (92 against a measured 92.66) and
++        // for the same reason: a floor at the reading itself goes red on the next run for
++        // no change to the code.
 +        //
-+        // LINES DROP FROM 100 TO 97, and the one uncovered statement is named: the
-+        // narrowing throw in `edit`, which fires when a request reaches that handler with
-+        // no user subject. `@Accepts("user")` on the method means the guard has already
-+        // refused every credential that could produce it, so it is unreachable while that
-+        // decorator is there — and it is there to be loud if somebody removes it. A `!`
-+        // would restore 100% by moving the assumption somewhere a decorator change
-+        // cannot invalidate, which is the trade this file declines to make.
++        // AND `repository.ts` MOVED UP RATHER THAN DOWN, which is worth one line because
++        // it is the file this chapter added the most code to: 92.66 when the sender chapter
++        // pinned it, **92.97 measured here**, with four routes' worth of new methods in
++        // between. Its pin is left at 92 — the headroom widened on its own, and a ratchet
++        // that follows every upward reading is a ratchet somebody has to lower later.
++        //
++        // LINES DROP FROM 100 TO 97, and the one statement still uncovered is named: line
++        // 297, the narrowing throw in `edit`, which fires when a request reaches that
++        // handler with no user subject. `@Accepts("user")` on the method means the guard
++        // has already refused every credential that could produce it, so it is unreachable
++        // while that decorator is there — and it is there to be loud if somebody removes
++        // it. A `!` would restore 100% by moving the assumption somewhere a decorator
++        // change cannot invalidate, which is the trade this file declines to make.
          "services/api/src/messages/messages.controller.ts": {
 -          branches: 87,
 +          branches: 92,
@@ -4752,20 +5322,33 @@ chapter found them, so the pin went up.
 +          statements: 97,
          },
  
-         "services/api/src/webhooks/disable.ts": {
+         // THE PRESENCE CHAPTER'S TWO, both at 100 on every metric, and the pin is
+         // NFR-MNT-02's MUST rather than a preference: presence keys are
+         // `presence:{env}:{user}`, so this is tenant-isolation code and the clause asks
+         // 100% of its branches.
 ```
 
-<Checkpoint>
-The outsider suite is the only check in this repository that boots the shipped binary and
-speaks to it the way a customer would — Node's global `WebSocket`, no workspace import. It
-found chapter 3.21's worst defect: a module built, its `close()` awaited, and never passed to
-`attachSessions`, inert past 1,174 coverage tests.
+<Checkpoint title="Three files changed here and are not fenced, which is a decision each time">
 
-**No task in this chapter's plan wrote a test there**, and the audit task at the end lists that
-file among the ones this chapter adds tests to. An audit was scheduled over work nobody did.
-The test edits a message over REST and asserts a member's socket hears `message.updated` with
-the original sequence, exactly once, and **no second `message.created`** — which is the whole
-of ADR-24, checked against a real Redis and a real gateway process.
+**`services/gateway/src/session.itest.ts`** is where ADR-24 is actually proved, and it is one
+of the thirteen files this book excerpts rather than chains — so no fence in any chapter holds
+its whole text and nothing compares it byte for byte. Two tests were added: an edit over REST
+reaching every member's socket as `message.updated` with the original sequence, **exactly
+once and with no second `message.created`**, and a deletion arriving with no `text` key at all
+where a second deletion sends nothing. Both run against a real Redis and a real gateway
+process, which is the only place the fabric, the api and the socket are in the same sentence.
+
+**`services/api/src/outbox/event.test.ts`** gained eight tests and no fence. They are the
+consumer's half: both types spelled as FR-WHK-02 spells them, the edit's payload identical to
+a creation's, the deletion carrying no `text` key, the edit's own instant rather than the
+message's `created_at`, and — the one that matters most — a deletion carrying a text refused
+through the consumer's schema. That last one is the reader's side of the required/optional
+argument this book has now paid for twice.
+
+**`services/api/src/fanout/fanout.itest.ts`** changed by one line: a `publishRevision` stub on
+a no-op publisher, added because widening the interface broke every fake that did not
+implement it. The typecheck is what said so, and a one-line stub is not worth a diff.
+
 </Checkpoint>
 
 ## Where the requirements stand
