@@ -1,12 +1,9 @@
-import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
 import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
-import { Figure } from "@/components/tutorial/figure";
-import { figThePatternStops, figTheSchedule, figWhereItRuns } from "./figures";
 
 export const metadata = {
   title: "Webhook sống sót trước hệ thống của khách hàng — Building Relay",
   description:
-    "Handler ở chương 3.4 chỉ ghi một dòng log rồi gọi đó là effect. Chương này trao cho nó một effect thực sự — một HTTP request tới cỗ máy không thuộc quyền kiểm soát của chúng ta — và chứng kiến pattern từng bảo đảm tính đúng đắn của chương 3.4 không còn áp dụng được ở hai nơi.",
+    "Bản dịch tiếng Việt của chương này đang được chuẩn bị. Toàn bộ mã nguồn bên dưới giữ nguyên như bản tiếng Anh.",
   alternates: {
     canonical: "/vi/part-3/chapter-19/webhooks-that-survive-the-customer",
     languages: {
@@ -18,7 +15,9 @@ export const metadata = {
 
 <ChapterHeader id="3.19" locale="vi" />
 
-Đây là toàn bộ handler của chương 3.4:
+> **Bản dịch đang được chuẩn bị.** Phần diễn giải của chương này chưa được dịch sang
+> tiếng Việt. Các khối mã bên dưới là bản gốc tiếng Anh và giống hệt bản tiếng Anh của
+> chương — bạn có thể gõ theo chúng ngay bây giờ. Bản dịch đầy đủ sẽ thay thế trang này.
 
 ```ts title="services/api/src/consumer/handler.ts (excerpt)"
 export async function handleEvent(event: EventEnvelope, logger: Logger) {
@@ -26,47 +25,7 @@ export async function handleEvent(event: EventEnvelope, logger: Logger) {
 }
 ```
 
-Khi ấy nó được gọi là scaffold, và từ này được lựa chọn rất cẩn thận. Mọi
-guarantee mà chương 3.4 chứng minh — claim event, chạy effect, commit cả hai cùng
-lúc để một cú crash rollback claim cùng với công việc — đều được chứng minh trên
-một effect chỉ ghi một dòng ra standard output.
-
-Chương này thay nó bằng một effect nằm trên cỗ máy của người khác.
-
-Chỉ một thay đổi ấy đã khiến pattern không còn áp dụng được ở hai nơi riêng biệt,
-và không trường hợp nào là bug cần sửa. Effect không thể tham gia transaction
-của claim nữa vì nó xảy ra trên một server không thuộc quyền kiểm soát của chúng
-ta. Claim cũng không còn do chính đoạn code thực hiện công việc tạo ra, bởi
-Constitution IV dành riêng quyền ghi PostgreSQL cho API service — còn component
-gửi request lại không phải API.
-
-<SkipAhead locale="vi">
-
-Nếu buộc phải đọc lướt: webhook endpoint được lưu cùng một signing secret dùng
-**envelope encryption** (AES-256-GCM) và có thể rotate. Cả current secret lẫn
-previous secret đều hợp lệ trong window 24 giờ để khách hàng rotate secret mà
-không cần deploy đồng bộ. Request được ký bằng HMAC-SHA256 trên canonical string
-`v1:{timestamp}:{raw body}` — **đúng các raw byte được truyền đi**, tuyệt đối
-không phải object đã parse rồi serialize lại. Mỗi event được expand thành một
-row `webhook_deliveries` cho từng endpoint phù hợp, và các row được ghi **bên
-trong** claim transaction của chương 3.4; vì vậy một event được redeliver không
-thể nhân đôi webhook của khách hàng. Retry schedule nằm trong column
-`next_attempt_at`, được một relay thứ hai trong API drain bằng chính loop
-`SELECT … FOR UPDATE SKIP LOCKED` của chương 3.3 với thêm một predicate. Phép đo
-cho thấy broker-held delay vẫn chiếm acknowledgement slot trong lúc chờ, khiến
-endpoint đã chết có thể bỏ đói endpoint khỏe mạnh. Hệ thống thực hiện bảy
-attempt (`now → 1s → 5s → 30s → 5min → 30min → 2h`), sau đó tạo dead letter và
-giữ lại trong bảy ngày. Dispatcher là một **deployable mới**, không ghi vào
-PostgreSQL và chỉ truy cập state qua internal HTTP seam. Last hop có guarantee
-**at-least-once** được công bố rõ ràng, với event id được trao cho khách hàng làm
-deduplication key. Trạng thái cuối chương mang tag **`part3-ch5`**.
-
-</SkipAhead>
-
-## Pattern không còn áp dụng được — ở hai nơi
-
-Lập luận về tính đúng đắn của chương 3.4 chỉ có một moving part. Claim và effect
-nằm trong cùng một transaction nên không hề có khoảng trống giữa chúng:
+## The pattern stops applying, twice
 
 ```ts title="services/api/src/consumer/runtime.ts (excerpt)"
 // The broker chapter: the claim and the effect commit together or not at all.
@@ -75,35 +34,6 @@ await claimEvent(db, CONSUMER, event.id, async () => {
 });
 ```
 
-Bây giờ hãy thử viết lại đoạn này với một HTTP request ở bên trong. Lệnh `await`
-ở giữa là một POST tới server của khách hàng. Request đã xảy ra trước thời điểm
-transaction commit, còn rollback transaction không thể thu hồi nó. Không cách
-sắp xếp nào biến hai operation này thành atomic, bởi một operation không thuộc
-quyền rollback của chúng ta.
-
-Vì vậy câu hỏi đã thay đổi. Khoảng trống không thể khép lại, nên chỉ còn một điều
-phải quyết định: **ta chấp nhận sai theo hướng nào**:
-
-| Thứ tự | Cái giá của một cú crash trong khoảng trống |
-|---|---|
-| claim, rồi post | webhook **mất lặng lẽ**. Khách hàng không bao giờ nhận được và không ai biết |
-| post, rồi claim | webhook **gửi hai lần**. Khách hàng nhận bản trùng và *có thể* nhận ra |
-
-<Figure caption="Khoảng trống không thể khép lại. Điều ta có thể chọn là cú crash sẽ rơi về phía nào." code={figThePatternStops} />
-
-Nền tảng chọn chấp nhận duplicate. Một mất mát không ai phát hiện được tệ hơn
-một duplicate mà recipient đã được cung cấp cách xử lý. Chương 3.3 đã dành trọn
-một chương để loại bỏ đúng loại failure đầu tiên khỏi publish path; đưa nó trở
-lại ở last hop — nơi khách hàng thực sự cảm nhận hậu quả — sẽ phá bỏ thành quả
-ấy ngay tại điểm quan trọng nhất.
-
-Quyết định ấy đi kèm một nghĩa vụ, và chính nghĩa vụ này khiến nó trở thành lựa
-chọn trung thực thay vì chỉ tiện lợi. **Nếu chọn at-least-once, bạn phải trao cho
-recipient phương tiện để deduplicate.** Event id nằm trong envelope, được ghi rõ
-trong documentation và giữ nguyên qua mọi attempt của cùng một delivery. Khách
-hàng lưu id rồi bỏ qua duplicate là hành vi đúng; nếu không làm vậy, họ đã được
-thông báo rõ mình đang lựa chọn điều gì.
-
 ```ts title="services/dispatcher/src/deliver.ts (excerpt)"
 //   claim BEFORE posting  → a crash in the gap loses the webhook silently.
 //   post BEFORE reporting → a crash in the gap re-posts. The customer receives
@@ -111,31 +41,7 @@ thông báo rõ mình đang lựa chọn điều gì.
 //                           the event id they deduplicate on.
 ```
 
-<Why locale="vi">
-
-Cả hai trường hợp đều là at-least-once, vì vậy cần nói chính xác guarantee thay
-đổi ở đâu. *Bên trong* nền tảng, ledger của chương 3.4 khiến việc handling trở
-thành once-in-effect: delivery là at-least-once, còn claim `consumed_events` hấp
-thụ duplicate. Ở hop của khách hàng, chúng ta không kiểm soát ledger nào nên
-duplicate thực sự đến nơi. Guarantee yếu đi không phải do thiết kế kém hơn, mà
-do boundary đã chuyển sang một cỗ máy không chạy code của chúng ta.
-
-</Why>
-
-## Endpoint và secret bắt buộc phải khôi phục được
-
-Một endpoint gồm URL, danh sách event type và một signing secret. Secret là
-column đáng chú ý, bởi đây là giá trị đầu tiên trong nền tảng **bắt buộc phải
-khôi phục được ở dạng plaintext**.
-
-Chương 3.2 lưu API key dưới dạng salted hash, và cách đó hoàn toàn phù hợp: key
-được trình ra để so sánh chứ không bao giờ cần tái tạo. Signing secret thì khác.
-Dispatcher phải dùng chính secret để tính HMAC ở mỗi attempt; một hash không thể
-dùng để ký.
-
-Vì vậy secret dùng envelope encryption chứ không phải hashing — đúng hai nhánh
-mà NFR-SEC-02 đã dự liệu: một cho credential cần so sánh và một cho secret cần
-được sử dụng:
+## The endpoint, and the secret we must be able to give back
 
 ```ts title="services/api/src/webhooks/secret.ts"
 import {
@@ -170,7 +76,7 @@ const ALGORITHM = "aes-256-gcm";
 const KEY_BYTES = 32;
 const IV_BYTES = 12; // 96 bits, the size GCM is specified for
 const TAG_BYTES = 16;
-const SECRET_BYTES = 32; // 256 bits, the budget the credentials chapter gave an API key secret
+const SECRET_BYTES = 32; // 256 bits, the budget the credentials chapter gave an API key
 
 /** The stored value is `iv | tag | ciphertext`, base64. One column, no schema
  * for the reader to decode, and no second place for the IV to drift out of sync
@@ -273,27 +179,7 @@ export function activeSigningSecrets(
   return [current, decryptSecret(endpoint.secretPreviousCiphertext)];
 }
 ```
-Hai chi tiết ở đây là những quyết định thiết kế, không đơn thuần là phần cơ khí.
 
-**Rotation window** là chi tiết thứ nhất. `activeSigningSecrets` trả về một secret
-trong điều kiện bình thường và *hai secret* trong vòng hai mươi tư giờ sau khi
-rotate; request mang một signature cho mỗi secret. Khi rotate secret, khách hàng
-phải cập nhật cả verifier lẫn configuration, và trong một system thực tế hai việc
-đó không bao giờ xảy ra đồng thời. Không có window, rotate đồng nghĩa với việc
-chủ động chọn ra một phút mà verification sẽ fail; có window, cả hai secret cùng
-hoạt động rồi secret cũ tự hết hạn.
-
-**Key resolution** là chi tiết thứ hai. Nó nhỏ hơn, nhưng repository này từng
-phải trả giá vì nó. `encryptionKey()` đọc environment ở mỗi lần gọi thay vì ngay
-lúc import. Một module throw ngay trong quá trình import sẽ làm sập toàn bộ
-service khi khởi động chỉ vì một feature mà phần lớn request không bao giờ dùng.
-Tệ hơn nữa, unit test cũng không thể kiểm tra chính error ấy vì test file không
-import nổi module mà nó muốn assert.
-
-<Trap locale="vi">
-
-Fallback cho development environment cố ý phát warning thật rõ và tuyệt đối
-không tồn tại trong production:
 ```ts title="services/api/src/webhooks/secret.ts (excerpt)"
 if (process.env.NODE_ENV === "production") {
   throw new Error(
@@ -301,27 +187,28 @@ if (process.env.NODE_ENV === "production") {
   );
 }
 ```
-Một default im lặng ở đây sẽ khiến production âm thầm encrypt signing secret của
-mọi khách hàng bằng một key được in ngay trong tutorial. Warning này chỉ buộc ta
-thêm đúng một environment variable khi deploy, đổi lại nó loại bỏ cả một nhóm
-incident tiềm ẩn.
 
-</Trap>
+## The migration, and the surface on top of it
 
-## Migration và API surface được xây trên đó
-
-Ba table xuất hiện cùng lúc, và migration được review trước khi chạy — kỷ luật mà
-chương 2.1 thiết lập sau khi một migration được generate tự động từng bị apply mà
-không ai đọc:
-```sql title="services/api/migrations/0006_webhooks.sql"
+```sql title="services/api/migrations/0010_webhooks.sql"
 -- Webhook endpoints, the delivery schedule, and dead letters.
+--
+-- NUMBERED 0010 AND GENERATED AS 0006, which is the drift `0009_message_edits.sql`
+-- describes from the other side. `drizzle-kit` numbers from its own snapshot count and
+-- this directory's snapshots stop at 0005, while five migrations after that were
+-- hand-written and got none — so generation offered `0006_webhooks.sql`, a number
+-- `0006_member_roles.sql` has held since the channel-control chapter. `migrate.ts` reads
+-- the DIRECTORY and sorts by filename, so a 0006 here would run before the four
+-- migrations it must follow. The snapshot keeps its own number because its LINEAGE is
+-- right — it is 0005 plus these three tables, table for table — and the journal entry
+-- names the file the runner runs rather than the one generation proposed.
 --
 -- REVIEW DISPOSITION: drizzle-kit generated this from schema.ts and it was read
 -- line by line before being applied (the ADR-16 workflow). Nothing was
 -- rewritten. Five things were checked rather than assumed:
 --
 --   * all three tables carry environment_id NOT NULL with a foreign key to
---     environments. Unlike the outbox chapter's outbox and the broker chapter's consumed_events, these are
+--     environments. Unlike the outbox chapter's and the broker chapter's consumed_events, these are
 --     tenant data, and the rule distinguishing the two cases is stated in
 --     schema.ts rather than left for the next chapter to infer;
 --   * webhook_deliveries has UNIQUE (event_id, endpoint_id). That constraint IS
@@ -330,7 +217,7 @@ không ai đọc:
 --     database rather than by care;
 --   * webhook_deliveries_due_idx is PARTIAL, on next_attempt_at WHERE state =
 --     'pending'. It covers the relay's only query and nothing else, so delivered
---     rows cost nothing to keep — the same shape as the outbox chapter's outbox index;
+--     rows cost nothing to keep — the same shape as the outbox chapter's index;
 --   * the state CHECK admits exactly pending / delivered / dead. There is no
 --     fourth state to get stuck in;
 --   * webhook_endpoints.deleted_at exists because DELETION IS SOFT. The foreign
@@ -388,14 +275,11 @@ CREATE INDEX "webhook_dead_letters_environment_idx" ON "webhook_dead_letters" US
 CREATE INDEX "webhook_deliveries_due_idx" ON "webhook_deliveries" USING btree ("next_attempt_at") WHERE "webhook_deliveries"."state" = 'pending';--> statement-breakpoint
 CREATE INDEX "webhook_endpoints_environment_idx" ON "webhook_endpoints" USING btree ("environment_id");
 ```
-Bề mặt quản trị là CRUD bình thường với ba quyết định nằm trong đó:
-```ts title="services/api/src/webhooks/webhooks.service.ts"
-import {
-  Injectable,
-  NotFoundException,
-  UnprocessableEntityException,
-} from "@nestjs/common";
 
+```ts title="services/api/src/webhooks/webhooks.service.ts"
+import { Injectable, NotFoundException } from "@nestjs/common";
+
+import { protocolError } from "../protocol-error";
 import { Repository, type WebhookEndpointRow } from "../db/repository";
 import { encryptSecret, mintSigningSecret } from "./secret";
 
@@ -448,8 +332,10 @@ export class WebhooksService {
 
     const existing = await this.repo.countEndpoints();
     if (existing >= MAX_ENDPOINTS_PER_ENVIRONMENT) {
-      throw new UnprocessableEntityException(
+      throw protocolError(
+        "webhook_endpoint_limit_reached",
         `an environment may have at most ${MAX_ENDPOINTS_PER_ENVIRONMENT} webhook endpoints; this one already has ${existing}`,
+        422,
       );
     }
 
@@ -500,44 +386,45 @@ export class WebhooksService {
     try {
       parsed = new URL(raw);
     } catch {
-      throw new UnprocessableEntityException("url must be a valid absolute URL");
+      throw protocolError(
+        "webhook_url_invalid",
+        "url must be a valid absolute URL",
+        422,
+        "url",
+      );
     }
     if (parsed.protocol !== "https:") {
-      throw new UnprocessableEntityException(
+      throw protocolError(
+        "webhook_url_insecure",
         "url must use https — a signature over a plaintext channel protects the body, not the reader",
+        422,
+        "url",
       );
     }
     const host = parsed.hostname;
     if (BLOCKED_HOSTS.test(host) || BLOCKED_RANGES.some((r) => r.test(host))) {
-      throw new UnprocessableEntityException(
+      throw protocolError(
+        "webhook_url_private_address",
         "url must not point at a loopback, link-local or private address",
+        422,
+        "url",
       );
     }
   }
 
   private assertEventTypes(types: string[]): void {
     if (!Array.isArray(types) || types.length === 0) {
-      throw new UnprocessableEntityException(
+      throw protocolError(
+        "webhook_event_types_empty",
         "event_types must list at least one event type",
+        422,
+        "event_types",
       );
     }
   }
 }
 ```
-**URL bắt buộc phải dùng HTTPS và không được trỏ vào internal network.** Nền tảng
-sẽ fetch endpoint thay mặt khách hàng từ bên trong chính network của mình — đúng
-định nghĩa của server-side request forgery nếu không kiểm tra URL trỏ tới đâu.
-Loopback, private range và link-local address đều bị từ chối bằng validation
-error mà khách hàng đọc được, thay vì một timeout không thể giải thích.
 
-**Năm endpoint cho mỗi environment.** Con số năm không có gì đặc biệt, nhưng
-"không giới hạn" cũng là một con số — và là con số sai. Expansion ghi một row
-cho mỗi endpoint phù hợp, nên một environment có mười nghìn endpoint sẽ biến một
-event thành mười nghìn row trong cùng một transaction.
-
-**Secret chỉ được trả về một lần duy nhất.** Đó là lúc tạo endpoint, và không bao
-giờ lặp lại — column lưu ciphertext, còn plaintext chỉ tồn tại trong khoảng thời
-gian response được serialize:
 ```ts title="services/api/src/webhooks/webhooks.controller.ts"
 import {
   Body,
@@ -651,7 +538,7 @@ export const DELIVERY_RELAY = "DELIVERY_RELAY";
  *
  * `RELAY_DELIVERY_RELAY=off` is the sibling of `RELAY_OUTBOX_RELAY=off`, and it
  * exists for the same reason: suites that assert on delivery rows would flap if
- * a background loop marked them dispatched mid-assertion. The outbox chapter's finding
+ * a background loop marked them dispatched mid-assertion. the outbox chapter's finding
  * 4 — a background daemon and a test lane do not share a table quietly — applies
  * again, and this time it is anticipated rather than discovered. */
 export function deliveryRelayEnabled(): boolean {
@@ -671,7 +558,8 @@ export class DeliveryRelayService implements OnModuleDestroy {
   }
 }
 
-// The same wiring chapter 2.2 established and the credentials chapter re-pointed: the repository is
+// The same wiring chapter 2.2 established and the credentials chapter re-pointed: the
+// repository is
 // the plain class, constructed per request with the environment the middleware
 // resolved from a verified credential. A request cannot name a tenant it has not
 // proved it may act for, and this module adds no new way to try.
@@ -710,10 +598,9 @@ export class DeliveryRelayService implements OnModuleDestroy {
 })
 export class WebhooksModule {}
 ```
-## Ký đúng thứ mình thực sự gửi đi
 
-Signature bao phủ một canonical string được dựng từ **raw byte của body** — chính
-xác các byte sẽ được truyền qua network:
+## Signing what you actually send
+
 ```ts title="services/dispatcher/src/signature.ts"
 import { createHmac } from "node:crypto";
 
@@ -785,55 +672,19 @@ export function signatureHeaders({
   };
 }
 ```
-Timestamp nằm bên trong dữ liệu được ký chứ không chỉ đặt cạnh signature; nhờ vậy
-một request bị bắt lại không thể bị replay vô thời hạn. Body được serialize
-**đúng một lần**, rồi cùng một string vừa được ký vừa được gửi. Đây không phải
-một optimization.
 
-<Trap locale="vi">
-
-**Nếu ký một representation nhưng gửi một representation khác, integration sẽ
-fail vì nguyên nhân gần như không thể nhìn thấy.** Đây là cách phổ biến nhất làm
-một webhook integration đang hoạt động bỗng hỏng, và biểu hiện của nó gần như
-không bao giờ giống nguyên nhân thực sự:
 ```js
 // Both of these are "the same JSON".
 const body = JSON.stringify(payload);
 const sig  = sign(JSON.stringify(JSON.parse(body)));   // ← a different string
 ```
-Trong Node và cùng một process, vòng lặp parse-rồi-stringify thường trả lại đúng
-các byte ban đầu — chính vì vậy bug này sống sót qua mọi test được viết bằng cùng
-ngôn ngữ với service. Nó chỉ lộ ra khi khách hàng verify bằng Go, khi một proxy
-normalize JSON, hoặc khi ai đó spread object sang object mới để thêm field.
 
-Ngay cả walk script của chương này ban đầu cũng mắc đúng bug ấy. Flag
-`--print-signing-material` ký payload object theo cách script dựng nó, trong khi
-nền tảng ký output từ `jsonb` — mà PostgreSQL không bảo toàn key order. Signature
-được in ra thuộc về một representation chưa bao giờ được gửi; chỉ khi chạy với
-endpoint thật ta mới phát hiện ra.
-
-</Trap>
-
-Test cho contract này được viết từ *documentation*, không dùng implementation
-của signer. Đây là cách duy nhất để test chứng minh điều nó tuyên bố:
 ```ts title="services/dispatcher/src/signature.test.ts (excerpt)"
 it("verifies against a verifier written from the documentation, not from the signer", () => {
 ```
-Một test gọi `signDelivery` hai lần rồi so sánh kết quả chỉ chứng minh function
-ấy deterministic. Nó không chứng minh khách hàng có verify được signature hay
-không — trong khi đó mới là property thực sự quan trọng.
 
-## Retry schedule nằm trong một column — và lý do đến từ phép đo
+## The schedule is a column, and the reason is a measurement
 
-Server của khách hàng đôi lúc sẽ ngừng hoạt động. Nền tảng retry theo schedule
-giãn dần rồi cuối cùng từ bỏ — requirements đã quy định phần đó. Câu hỏi đáng
-quan tâm là *trạng thái chờ* nằm ở đâu.
-
-Câu trả lời hiển nhiên là broker. NATS cho phép consumer nack một message kèm
-delay; broker giữ message và trả lại khi delay kết thúc. Không cần table mới,
-không cần loop mới. Chương 3.4 đã xây dựng sẵn consumer.
-
-Trước khi viết điều đó, chúng ta đã đo:
 ```text
 Q1  delayed redelivery survives a restart?
     NAKKED  delay_ms=90000  at 1786500140980   (process then exits)
@@ -843,33 +694,7 @@ Q2  do delayed messages hold the ack-pending budget?
     max_ack_pending=3; nak'd 3 with a 300 s delay; fetched afterwards: 0
     num_ack_pending=3  num_pending=2            YES — and that is the problem.
 ```
-Q1 pass hoàn toàn — delayed redelivery sống sót qua một lần process restart với
-sai số ba mili giây, tốt hơn mức thiết kế yêu cầu. Nếu chỉ xét Q1, broker-held
-delay là câu trả lời đúng.
 
-Q2 loại bỏ phương án đó. Một message đang chờ delay kết thúc **vẫn giữ
-acknowledgement slot**. Ba message đang chờ trên `max_ack_pending: 3` khiến hai
-message sẵn sàng khác không thể fetch được — không phải fetch chậm, mà hoàn toàn
-không thể fetch. Ở quy mô platform, endpoint chết trong hai giờ của một khách
-hàng sẽ chiếm delivery capacity vốn dành cho tất cả khách hàng khác; chính các
-endpoint khỏe mạnh lại ngừng được phục vụ. FR-WHK-05 yêu cầu endpoint của một
-khách hàng không được làm chậm delivery tới khách hàng khác, còn broker-held
-delay vi phạm requirement này ngay trong cấu trúc.
-
-<Why locale="vi">
-
-**Kế hoạch được làm lại thay vì chắp vá.** Kết quả đo xuất hiện sau khi thiết kế
-đã hoàn thành. Phản ứng trung thực trước phát hiện "cơ chế dự định sử dụng có một
-property vi phạm requirement" là lập kế hoạch lại, không phải thêm một ghi chú
-rồi tiếp tục. Research R1 và R13 ghi lại thay đổi cùng lý do.
-
-Giải pháp thay thế thậm chí còn nhỏ hơn. Trạng thái chờ trở thành column
-`next_attempt_at`, được loop relay của chương 3.3 drain với thêm đúng một
-predicate — một cơ chế reader đã hiểu rõ.
-
-</Why>
-
-Vì vậy chính delivery row *là* retry schedule:
 ```diff title="services/api/src/db/schema.ts"
 @@ -1,10 +1,11 @@
  import { sql } from "drizzle-orm";
@@ -883,7 +708,7 @@ Vì vậy chính delivery row *là* retry schedule:
    jsonb,
    pgTable,
    primaryKey,
-@@ -356,6 +357,159 @@ export const consumedEvents = pgTable(
+@@ -576,6 +577,167 @@ export const consumedEvents = pgTable(
      handledAt: timestamp("handled_at", { withTimezone: true })
        .notNull()
        .defaultNow(),
@@ -894,7 +719,7 @@ Vì vậy chính delivery row *là* retry schedule:
 +// ---------------------------------------------------------------------------
 +// Webhooks. Three tables, and all three carry `environment_id`.
 +//
-+// DECISION: the outbox chapter's `outbox` and the broker chapter's `consumed_events` each
++// DECISION: THE OUTBOX CHAPTER'S `outbox` and the broker chapter's `consumed_events` each
 +// omitted the tenant column and each recorded it as a deliberate exception. Two
 +// exceptions in consecutive chapters is a pattern, and a pattern without a
 +// stated rule is how a third chapter gets it wrong by resemblance. THE RULE: a
@@ -902,7 +727,15 @@ Vì vậy chính delivery row *là* retry schedule:
 +// the platform's own bookkeeping AND no tenant-visible content. An endpoint is
 +// customer configuration; a dead letter holds a payload that was being sent to a
 +// customer. Both fail the test on both halves, so both are scoped and both join
-+// The deduplication chapter's cross-tenant gauntlet as targets.
++// the cross-tenant gauntlet as targets.
++//
++// NAMED, NOT NUMBERED. This line used to say "chapter 3.7's cross-tenant
++// gauntlet". The gauntlet was 3.7 when that was written, became 3.8 when a chapter
++// was inserted ahead of it, and is now 3.9 after a second insertion — and the
++// comment was carried neither time. A chapter number in a source comment is a
++// reference that ages every time the plan changes, and this file is fenced
++// byte-exact into a published chapter, so correcting it costs a fence amendment.
++// The subject does not move; the ordinal does.
 +// ---------------------------------------------------------------------------
 +
 +// DECISION: no source document defines this table. FR-WHK-01 and
@@ -950,7 +783,7 @@ Vì vậy chính delivery row *là* retry schedule:
 +  (t) => [index("webhook_endpoints_environment_idx").on(t.environmentId)],
 +);
 +
-+// The retry schedule — and it is the outbox chapter's outbox with one more column.
++// The retry schedule — and it is the outbox chapter's with one more column.
 +//
 +// DECISION (research R1, MEASURED): the obvious implementation is
 +// to let the broker hold the delay between attempts. It was measured against a
@@ -1004,7 +837,7 @@ Vì vậy chính delivery row *là* retry schedule:
 +      sql`${t.state} IN ('pending','delivered','dead')`,
 +    ),
 +    // The relay's only query: pending rows that are due, oldest first. Partial,
-+    // for the reason the outbox chapter's outbox index is partial — it covers only what the
++    // for the reason the outbox chapter's index is partial — it covers only what the
 +    // relay reads, so delivered rows cost nothing to keep.
 +    index("webhook_deliveries_due_idx")
 +      .on(t.nextAttemptAt)
@@ -1044,17 +877,7 @@ Vì vậy chính delivery row *là* retry schedule:
 +  (t) => [index("webhook_dead_letters_environment_idx").on(t.environmentId)],
 +);
 ```
-<Figure caption="Delivery row chính là retry schedule. Không có gì ngủ trong broker; một delivery chưa tới hạn đơn giản là một row chưa được query nào chọn." code={figTheSchedule} />
 
-Partial index gói trọn lập luận về performance trong một dòng: drain query chỉ
-đọc các row `pending`, nên index chỉ chứa row `pending` sẽ luôn nhỏ, bất kể có
-bao nhiêu row `delivered` tích lại phía sau.
-
-Tier table nằm trong **API**, không phải dispatcher — thoạt nhìn có vẻ sai cho
-đến khi ta xét component nào đọc nó. `recordAttemptOutcome` tra cứu các tier để
-tính `next_attempt_at` tiếp theo. Đây là một database write nên Constitution IV
-đặt nó trong API. Đặt retry schedule trong dispatcher có vẻ tự nhiên nhưng lại
-sai vị trí:
 ```ts title="services/api/src/webhooks/schedule.ts"
 // The retry schedule (FR-WHK-03).
 //
@@ -1146,30 +969,12 @@ export function nextAttemptAt(attempt: number, from: Date = new Date()): Date | 
   return new Date(from.getTime() + delay);
 }
 ```
-## Expansion nằm bên trong claim
 
-Một event có thể khớp nhiều endpoint. Fan-out từ một thành nhiều là thời điểm
-duplicate trở nên đắt đỏ: nếu một event redelivered được expand lần nữa, mọi
-khách hàng phù hợp đều nhận thêm một webhook.
+## Expansion, inside the claim
 
-Kế hoạch ban đầu publish N message lên broker, mỗi delivery một message. Đây là
-một dual write: claim commit vào PostgreSQL rồi N lần publish tới NATS; một cú
-crash ở giữa sẽ khiến hai phía bất đồng. Thay vào đó, ghi N **row** sẽ đặt
-expansion vào claim transaction, nơi guarantee của chương 3.4 đã bao phủ sẵn:
 ```diff title="services/api/src/db/repository.ts"
-@@ -1,9 +1,9 @@
- import { randomUUID } from "node:crypto";
- 
--import { and, asc, desc, eq, gt, lt, sql, type SQL } from "drizzle-orm";
-+import { and, asc, desc, eq, gt, isNull, lt, sql, type SQL } from "drizzle-orm";
- 
- import type { Db } from "./client";
- import {
-   apiKeys,
-   applications,
-   channels,
-@@ -13,14 +13,19 @@ import {
-   members,
+@@ -17,19 +17,24 @@ import {
+   readPositions,
    memberships,
    messages,
    organisations,
@@ -1179,7 +984,12 @@ expansion vào claim transaction, nơi guarantee của chương 3.4 đã bao ph�
 +  webhookDeliveries,
 +  webhookEndpoints,
  } from "./schema";
- import { messageCreatedEvent } from "../outbox/event";
+ import {
+   membershipEvent,
+   messageCreatedEvent,
+   messageDeletedEvent,
+   messageUpdatedEvent,
+ } from "../outbox/event";
 +import { nextAttemptAt } from "../webhooks/schedule";
 +import { activeSigningSecrets } from "../webhooks/secret";
  import {
@@ -1188,7 +998,7 @@ expansion vào claim transaction, nơi guarantee của chương 3.4 đã bao ph�
    prefixMatchesKind,
    secretMatches,
    type EnvironmentKind,
-@@ -292,12 +297,393 @@ export async function drainOutbox(
+@@ -301,12 +306,393 @@ export async function drainOutbox(
      return published.length;
    });
  }
@@ -1582,7 +1392,7 @@ expansion vào claim transaction, nơi guarantee của chương 3.4 đã bao ph�
    )) as unknown as { rows: { pending: number }[] };
    return result.rows[0]?.pending ?? 0;
  }
-@@ -608,21 +994,257 @@ export class ChannelNotFoundError extends Error {
+@@ -784,12 +1170,57 @@ export class UserBannedError extends Error {
   * millisecond precision) — the driver hands back a Date or a string
   * depending on the column and the query shape. */
  function toIso(value: Date | string): string {
@@ -1620,7 +1430,7 @@ expansion vào claim transaction, nơi guarantee của chương 3.4 đã bao ph�
 +  /** Non-null once the relay has published it. Exposed because the drain is
 +   * GLOBAL — one dispatcher serves every environment — so a test that asserts on
 +   * what ITS call to the drain returned is asserting on which suite got there
-+   * first. The outbox chapter's finding 3, in its third chapter. */
++   * first. the outbox chapter's finding 3, in its third chapter. */
 +  dispatched_at: string | null;
 +}
 +
@@ -1640,8 +1450,12 @@ expansion vào claim transaction, nơi guarantee của chương 3.4 đã bao ph�
    // metadata. The guarantee still holds in the gateway and every package.
    constructor(
      private readonly db: Db,
-     private readonly environmentId: string,
-   ) {}
+@@ -807,12 +1238,203 @@ export class Repository {
+    * The id, not a widened operation: the environment still comes from a verified
+    * credential and never from a request body, which is constitution I's shape. */
+   get environment(): string {
+     return this.environmentId;
+   }
  
 +  // ---------------------------------------------------------------------
 +  // Webhook endpoints. Scoped like everything else on this class:
@@ -1782,7 +1596,7 @@ expansion vào claim transaction, nơi guarantee của chương 3.4 đã bao ph�
 +
 +  /** A tenant's dead letters, newest first. Scoped: a dead letter holds a
 +   * payload that was being sent to this customer, which is why the table carries
-+   * `environment_id` where the outbox chapter's outbox and the broker chapter's ledger did not. */
++   * `environment_id` where the outbox chapter's and the broker chapter's ledger did not. */
 +  async listDeadLetters(): Promise<WebhookDeadLetterRow[]> {
 +    const rows = await this.db
 +      .select({
@@ -1836,48 +1650,14 @@ expansion vào claim transaction, nơi guarantee của chương 3.4 đã bao ph�
 +
    async createUser(externalId: string, displayName?: string): Promise<UserRow> {
      const id = randomUUID();
-     await this.db.insert(users).values({
-       id,
-       environmentId: this.environmentId,
-       externalId,
+     const inserted = await this.db
+       .insert(users)
+       .values({
+         id,
 ```
-Cả số `created` lẫn flag `duplicate` đều được trả về và dispatcher log cả hai.
-Duplicate không phải error — đó là dấu hiệu claim đang hoạt động đúng. Khi thấy
-`duplicate=true` trong log, operator đang quan sát cơ chế vận hành chứ không phải
-một sự cố cần điều tra.
 
-<Why locale="vi">
+## Why the dispatcher is its own service
 
-**Subscription filtering diễn ra trong expansion, không phải delivery.** Endpoint
-không subscribe `message.created` sẽ không có row nào, thay vì tạo row rồi bỏ qua
-về sau. Một delivery row tồn tại nhưng không bao giờ được gửi tương đương với một
-retry schedule chứa no-op vĩnh viễn; operator nhìn vào table sẽ không thể phân
-biệt nó với công việc thực sự đang bị kẹt.
-
-</Why>
-
-## Vì sao dispatcher là service riêng
-
-Chương 3.3 thêm outbox relay, chương 3.4 thêm consumer runtime, và cả hai đều chạy
-**bên trong** API. Chương này bổ sung background worker thứ ba nhưng đặt nó trong
-một deployable mới. Sự khác biệt đó cần được giải thích; nếu không, nó chỉ là sở
-thích cá nhân.
-
-Lý do là đây là worker đầu tiên có effect không phải một database write.
-
-Relay đọc outbox rồi publish; consumer claim event rồi ghi row. Cả hai đều truy
-cập PostgreSQL, còn Constitution IV quy định API sở hữu các database write, nên
-chúng phải nằm cùng nơi với write operation. Effect của dispatcher là HTTP
-request tới server khách hàng. Dispatcher không cần quyền truy cập database;
-cấp quyền ấy cho nó sẽ tạo ra service thứ hai ghi PostgreSQL chỉ vì tiện lợi.
-
-<Figure caption="Ba service, một writer. Dispatcher chỉ truy cập state qua internal seam; nhờ vậy Constitution IV được bảo đảm bằng cấu trúc thay vì phụ thuộc vào một quy tắc con người phải nhớ." code={figWhereItRuns} />
-
-Điều service split này *mua được* là một property vốn chỉ có thể tranh luận bằng
-lý thuyết. Nếu dispatcher nằm trong API, câu "webhook không làm chậm end user"
-chỉ là khẳng định về event loop và connection pool — điều ta lập luận rồi hy
-vọng. Khi có process boundary, nó trở thành một khẳng định có thể kiểm chứng bằng
-cách không khởi động process ấy:
 ```ts title="packages/e2e/src/webhooks.itest.ts"
 import { createRequire } from "node:module";
 import { createServer, type Server } from "node:http";
@@ -2029,35 +1809,11 @@ describe("journey: webhooks never stand between the platform and its users", () 
   }, 60_000);
 });
 ```
-Dispatcher không được khởi động trong file này. Nó hoàn toàn không tồn tại trong
-suốt journey, còn platform được kỳ vọng không nhận thấy điều đó: message vẫn đến
-end user, trong khi endpoint của khách hàng không nhận được gì.
 
-Cái giá của service split cũng cần được nói rõ; một chương chỉ liệt kê lợi ích
-của quyết định do chính nó đưa ra thì chỉ là quảng cáo:
+## The seam, and the credential that crosses it
 
-- **Một network hop thay cho function call trước đây.** Mọi thay đổi state mà
-  dispatcher thực hiện đều cần một HTTP round trip tới API. Điều này tạo thêm
-  latency, một connection pool và một failure mode mới — API không thể truy cập —
-  cần được xử lý rõ ràng.
-- **Một credential mới phải được quản lý.** Trước đây platform chưa có
-  service-to-service authentication; giờ có thêm một secret cần quy trình rotate.
-- **Một deployable cần vận hành.** Thêm một image, một health check và thêm một
-  component có thể chết. Compose file lớn hơn, CI cũng vậy.
-- **Internal API trở thành một contract.** `/internal/dispatch` có hai consumer —
-  dispatcher và test — nên thay đổi nó đồng nghĩa phải thay đổi cả hai phía.
-
-Trade-off có đáng hay không phụ thuộc vào property nhận được. Ở đây, property ấy
-là isolation giữa server hỏng của một khách hàng và service phục vụ mọi khách
-hàng khác; nó đáng giá một network hop. Outbox relay không nhận được lợi ích đủ
-lớn như vậy, đó là lý do relay vẫn nằm trong API.
-
-## Internal seam và credential đi qua nó
-
-Dispatcher không được phép ghi PostgreSQL, vì vậy mọi state change đều phải đi
-qua API. Điều đó tạo ra một caller type mới và một principal type mới:
 ```diff title="services/api/src/auth/principal.ts"
-@@ -18,13 +18,46 @@ export interface ApplicationPrincipal {
+@@ -18,13 +18,47 @@ export interface ApplicationPrincipal {
  export interface UserPrincipal {
    kind: "user";
    environmentId: string;
@@ -2073,7 +1829,8 @@ qua API. Điều đó tạo ra một caller type mới và một principal type 
 + *
 + * THE SHORTCUT THAT WOULD HAVE WORKED AND BEEN WRONG: mint the dispatcher an API
 + * key. It would authenticate on the first try — and an `application` principal
-+ * is scoped to exactly ONE environment by construction (the tenancy chapter, the credentials chapter), so a
++ * is scoped to exactly ONE environment by construction (the tenancy and credentials
++ * chapters), so a
 + * dispatcher holding one either cannot serve other tenants or has been quietly
 + * granted cross-tenant reach through the credential type whose entire meaning is
 + * that it has none. Principle I is a correctness property, and that is the shape
@@ -2105,7 +1862,7 @@ qua API. Điều đó tạo ra một caller type mới và một principal type 
   * principal is optional at the type level for one honest reason: a request that
   * presented nothing has none, and pre-credential routes (signup) are reached
   * exactly that way. */
-@@ -34,13 +67,15 @@ export interface RequestWithPrincipal {
+@@ -38,13 +72,15 @@ export interface RequestWithPrincipal {
  }
  
  /** How a credential class is named to a human. Used by the wrong-credential
@@ -2123,22 +1880,7 @@ qua API. Điều đó tạo ra một caller type mới và một principal type 
   * forbids a credential in either. (The WebSocket upgrade is the one exception,
   * and it lives in the gateway where a browser gives no other choice.) */
 ```
-Hãy nhìn `environmentId?: undefined` trên platform principal. Đó không phải trang
-trí — đó là hệ thống kiểu được bắt phải thực thi hiến pháp I. Một platform
-credential với tới mọi environment, nên nó không có environment đơn lẻ nào để bị
-giới hạn vào, và bất kỳ đoạn code nào đọc `.environmentId` trên union principal giờ
-buộc phải xử lý trường hợp không có. Compiler tìm ra chỗ đầu tiên như vậy ngay lập
-tức, trong một controller viết từ ba chương trước.
 
-<Trap locale="vi">
-
-**Một credential với tới mọi environment thì tuyệt đối không được chấp nhận trên
-route công khai.** Nếu được, một caller cầm nó có thể đọc dữ liệu của bất kỳ tenant
-nào qua chính API thông thường — đó là một lỗ thủng xuyên tenant với một credential
-hợp lệ đứng ngay trước mặt, đúng cái hỏng hóc mà hiến pháp I sinh ra để ngăn.
-
-Middleware từ chối nó theo *loại* chứ không theo danh sách route, bởi danh sách
-route là thứ mà một route tương lai có thể quên có tên trong đó:
 ```diff title="services/api/src/auth/authenticate.middleware.ts"
 @@ -19,16 +19,49 @@ export const AUTH_DB = "AUTH_DB";
   *
@@ -2191,25 +1933,70 @@ route là thứ mà một route tương lai có thể quên có tên trong đó:
            kind: "application",
            environmentId: key.environmentId,
 ```
-Bài test cho chuyện này khởi đầu bằng việc đọc `RELAY_INTERNAL_CREDENTIAL` từ
-environment rồi return sớm khi không có — và CI thì chưa bao giờ set nó. Suốt vài
-lần build, cái assertion duy nhất đứng giữa một platform credential và một route
-công khai đã chẳng làm gì cả, mà vẫn báo thành công. Một security test tự bỏ qua
-chính mình còn tệ hơn không có test: nó trả lời một câu hỏi nó chưa từng đặt ra.
 
-</Trap>
-
-Cách sửa là thôi hỏi environment và bắt đầu quyết định:
 ```diff title="services/api/src/auth/credentials.itest.ts"
-@@ -330,7 +330,34 @@ describe("credentials", () => {
-     const channel = await repo.createChannel("signup-key", "public");
-     expect(
-       (await post({ text: "bootstrapped" }, first.apiKey!.secret, channel.id))
-         .status,
-     ).toBe(201);
+@@ -13,12 +13,13 @@ import {
+   createEnvironment,
+   environmentSigningSecret,
+   provisionOrganisation,
+   Repository,
+   revokeApiKey,
+ } from "../db/repository";
++import { parseApiKeyCredential } from "./api-key";
+ import { MAX_TOKEN_LIFETIME_SECONDS } from "./user-token";
+ 
+ // The refusals, over real HTTP against the compose Postgres.
+ // Invariants 1-7, 9 and 11 of contracts/credentials.md live here; 8 and 12 are
+ // pure and live in the unit lane; 10 needs a socket and lives in the gateway's
+ // session.itest.ts.
+@@ -367,13 +368,37 @@ describe("credentials", () => {
+       }
+     } finally {
+       (process.stdout as unknown as { write: typeof original }).write = original;
+     }
+ 
+     const haystack = captured.join("") + bodies.join("");
+-    const secret = key.credential.split("_").at(-1)!;
++    // PARSED WITH THE PRODUCT'S OWN PARSER, NOT SPLIT ON AN UNDERSCORE.
++    //
++    // `key.credential.split("_").at(-1)` was the secret only by luck, and MEASURED OVER
++    // 200,000 MINTS it is luck that runs out both ways. The secret is base64url of 32
++    // bytes and `_` IS IN THAT ALPHABET:
++    //
++    //   26.9% of credentials  the last segment is 20 characters or fewer — the test
++    //                         searched for a FRAGMENT and passed more easily than it
++    //                         should. A false negative, and the quiet half.
++    //   1.57%                 the segment is one character or none, and `not.toContain`
++    //                         on a single character fails against any haystack. That is
++    //                         the loud half, and it is what the battery hit: `expected
++    //                         '{"time":…' not to contain '0'`.
++    //
++    // `parseApiKeyCredential` is the function the guard itself uses to split a
++    // presented credential, so the needle is now the same substring the product calls
++    // the secret. A test that re-derives what the code under test already computes is
++    // a second definition, and the two can disagree.
++    const parsed = parseApiKeyCredential(key.credential);
++    expect(parsed, "the fixture minted something this api cannot parse").not.toBeNull();
++    const secret = parsed!.secret;
++    // AND THE NEEDLE IS CHECKED BEFORE IT IS USED. A short needle is found in any
++    // haystack, so `not.toContain` on one is a test that always fails — the inverse of
++    // the vacuous assertion this file is otherwise full of guards against.
++    expect(secret.length, "the needle is too short to mean anything").toBeGreaterThan(20);
+     expect(haystack).not.toContain(key.credential);
+     expect(haystack).not.toContain(secret);
+     expect(haystack).not.toContain(foreignKey.credential);
+     expect(haystack).not.toContain(token);
+     // The prefix alone is not a secret and may legitimately appear.
+   });
+@@ -536,7 +561,34 @@ describe("credentials", () => {
+       // that clears `deleted_at`, because that is a customer's server saying "this user
+       // is back" — a token mint says only "somebody asked for a token".
+       expect(after!.id).toBe(row.id);
+       expect(after!.deleted_at).not.toBeNull();
+     });
    });
 +
-+  // --- the third principal ----------------------------------
++  // --- this chapter: the third principal ----------------------------------
 +
 +  describe("the internal platform credential", () => {
 +    // SET, not read. This began as `process.env.RELAY_INTERNAL_CREDENTIAL` with
@@ -2237,10 +2024,7 @@ Cách sửa là thôi hỏi environment và bắt đầu quyết định:
 +  });
  });
 ```
-Compiler tự tìm ra hệ quả còn lại của principal mới. Một controller viết ở chương
-3.2 đọc `.environmentId` trên một principal mà giờ có thể là platform, và ngừng
-biên dịch ngay khoảnh khắc union đổi — đó chính là toàn bộ giá trị của việc biến
-sự phân biệt ấy thành một kiểu thay vì một quy ước:
+
 ```diff title="services/api/src/auth/dev-token.controller.ts"
 @@ -52,12 +52,20 @@ export class DevTokenController {
    @UseGuards(CredentialGuard)
@@ -2263,16 +2047,13 @@ sự phân biệt ấy thành một kiểu thay vì một quy ước:
      );
      if (!environment) throw new BadRequestException("unknown environment");
 ```
-Bản thân đường nối gồm ba thao tác, và chúng được định hình bởi những gì dispatcher
-*không được phép* làm, chứ không phải bởi những gì nó muốn. Nó không nở được event,
-nên nó hỏi. Nó không đọc được secret, nên nó hỏi. Nó không ghi được kết quả, nên nó
-báo cáo:
+
 ```diff title="packages/protocol/src/internal.ts"
-@@ -136,12 +136,124 @@ export const internalMembershipsResponseSchema = z.strictObject({
- export const internalSessionResponseSchema = z.strictObject({
-   environment_id: z.string().min(1),
-   user: z.string().min(1),
-   channel_ids: z.array(z.string().min(1)),
+@@ -188,12 +188,125 @@ export const internalSessionResponseSchema = z.strictObject({
+    * during a rolling deploy — the gateway then treats a missing field as "not banned",
+    * which is the pre-chapter behaviour and the safe direction to be wrong in for one
+    * deploy window. */
+   banned: z.boolean().default(false),
  });
  
 +/** The deliveries stream, and its subject grammar.
@@ -2317,7 +2098,8 @@ báo cáo:
 +  event_id: z.string().uuid(),
 +  environment_id: z.string().min(1),
 +  type: z.string().min(1),
-+  /** The envelope as it will be delivered, byte-identical to what the outbox chapter published.
++  /** The envelope as it will be delivered, byte-identical to what the outbox chapter
++   * published.
 +   * The dispatcher does not author payloads; it moves them. */
 +  payload: z.unknown(),
 +});
@@ -2394,9 +2176,7 @@ báo cáo:
  export type InternalSendResponse = z.infer<typeof internalSendResponseSchema>;
  export type InternalMembershipsResponse = z.infer<
 ```
-Cả hai phía cùng import các schema đó, và đó là thứ chặn hợp đồng trôi dạt:
-dispatcher không thể gửi một hình dạng mà api không parse nổi, bởi hình dạng ấy là
-một định nghĩa duy nhất chứ không phải hai bản hôm nay còn khớp nhau.
+
 ```ts title="services/api/src/internal/dispatch.controller.ts"
 import {
   Body,
@@ -2534,7 +2314,7 @@ export class DispatchController {
 ```
 
 ```diff title="services/api/src/internal/internal.module.ts"
-@@ -1,16 +1,38 @@
+@@ -1,24 +1,42 @@
 -import { Module } from "@nestjs/common";
 +import { Module, Scope } from "@nestjs/common";
  
@@ -2544,6 +2324,7 @@ export class DispatchController {
  import { BackfillController } from "./backfill.controller";
  import { InternalController } from "./internal.controller";
 +import { DispatchController } from "./dispatch.controller";
+ import { MembershipsController } from "./memberships.controller";
  import { SessionController } from "./session.controller";
  
  // The internal routes reuse MessagesModule's providers wholesale — the
@@ -2559,13 +2340,15 @@ export class DispatchController {
 +// reason 2.2 has nothing to do with.
  @Module({
    imports: [MessagesModule, AuthModule],
--  controllers: [InternalController, BackfillController, SessionController],
-+  controllers: [
-+    InternalController,
-+    BackfillController,
-+    SessionController,
+   controllers: [
+     InternalController,
+     BackfillController,
+     SessionController,
 +    DispatchController,
-+  ],
+     // REGISTERED HERE, and a controller nobody registers is a route that does not
+     // exist — which an analysis pass has found in this repository once already.
+     MembershipsController,
+   ],
 +  providers: [
 +    {
 +      provide: "DB",
@@ -2576,21 +2359,9 @@ export class DispatchController {
  })
  export class InternalModule {}
 ```
-<Trap locale="vi">
 
-`InternalModule` phải tự provide `"DB"` thay vì chỉ import module khác; provider
-thiếu này đã tiêu tốn trọn một buổi chiều. `MessagesModule` *provide* `"DB"` nhưng
-không *export* nó, nên module tưởng rằng mình truy cập được provider thực ra nhận
-zero provider. Nest chỉ báo runtime error tại route đầu tiên chạm database, thay
-vì wiring error khi khởi động. Unit lane tụt từ 156 test xuống 40 và hai suite
-fail hoàn toàn trước khi nguyên nhân lộ diện.
+## The relay, again
 
-</Trap>
-
-## Relay, một lần nữa
-
-Delivery relay chính là loop của chương 3.3 với thêm một predicate. Chỉ có vậy;
-việc không cần abstraction mới chứng minh chương 3.3 đã đặt seam đúng chỗ:
 ```ts title="services/api/src/webhooks/delivery-relay.ts"
 import {
   ALL_DELIVERIES_SUBJECT,
@@ -2611,7 +2382,7 @@ import type { Publisher } from "../outbox/publisher";
 
 // The second relay (research R13).
 //
-// This is the moment the outbox chapter's outbox stops being a thing that moves EVENTS
+// This is the moment the outbox chapter's stops being a thing that moves EVENTS
 // and becomes a shape: `SELECT … FOR UPDATE SKIP LOCKED`, publish, mark, for any
 // work the platform owes itself and must not lose. The second instance is what
 // makes it a pattern rather than a trick, and the reader has already built it.
@@ -2763,15 +2534,7 @@ export function createDeliveryRelay({
   };
 }
 ```
-`SELECT … FOR UPDATE SKIP LOCKED` vẫn làm công việc như ở chương 3.3: hai API
-instance cùng drain một table sẽ lấy các row khác nhau thay vì tranh chấp cùng
-một row. Phần mới là `next_attempt_at <= now()`. Row chưa đến hạn đơn giản không
-được chọn; nó không giữ hay chặn tài nguyên nào và chỉ tốn một index entry.
 
-Publisher của chương 3.3 chỉ cần thay đổi đúng một chỗ: điều chỉnh một assumption
-nhỏ chứ không thêm cơ chế mới. Publisher từng bảo đảm stream `EVENTS` tồn tại khi
-kết nối vì ở chương 3.3 đó là stream duy nhất. Stream thứ hai biến câu hỏi "cần
-bảo đảm stream nào tồn tại" thành một parameter:
 ```diff title="services/api/src/outbox/jetstream.publisher.ts"
 @@ -93,24 +93,33 @@ export async function ensureStream(nc: NatsConnection): Promise<void> {
    }
@@ -2810,13 +2573,9 @@ bảo đảm stream nào tồn tại" thành một parameter:
  
    return {
 ```
-Nếu thiếu parameter này, lần publish đầu tiên vào `deliveries.*` sẽ nhận `503` từ
-một broker chưa từng được cấu hình để tạo stream tương ứng.
 
-## Dispatcher
+## The dispatcher
 
-Hai consumer đảm nhiệm hai việc khác nhau. Consumer thứ nhất expand event thành
-delivery row; consumer thứ hai POST các delivery mà relay xác định đã đến hạn:
 ```ts title="services/dispatcher/src/main.ts"
 import {
   AckPolicy,
@@ -3069,7 +2828,7 @@ export function createDispatcher({
       // `msg.json()` THROWS on bytes that are not JSON, and a throw here would
       // land in drain()'s catch and be treated as "ask for the work back" — so
       // bytes that can never parse would be redelivered until the broker's
-      // attempt budget ran out. The broker chapter settled this: the same bytes fail the
+      // attempt budget ran out. the broker chapter settled this: the same bytes fail the
       // same way every time, so an unparseable payload is terminated on the FIRST
       // attempt. Decoding defensively is what keeps that promise here.
       let raw: unknown;
@@ -3137,32 +2896,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   }
 }
 ```
-Việc gom nhóm trong `drainByEndpoint` chính là tính chất cô lập, và nó mang tính
-cấu trúc chứ không phải một lựa chọn tinh chỉnh. FR-WHK-05 nói endpoint của một
-khách hàng không được làm chậm delivery tới khách hàng khác. Xử lý một batch từng
-message một thì điều đó sai ngay khoảnh khắc một endpoint treo, bởi mọi delivery
-xếp sau nó phải chờ hết một timeout chẳng liên quan gì tới mình. Gom theo endpoint
-rồi chạy các nhóm song song khiến tính chất ấy đúng ngay từ trong cấu trúc.
 
-Tuần tự hoá *bên trong* một endpoint cũng quan trọng, theo chiều ngược lại. Hai lần
-thử cùng lúc vào cùng một khách hàng sẽ để một retry vượt mặt chính lần thử mà nó
-đang retry — và một khách hàng có server vốn đã chật vật là người cuối cùng đáng bị
-trao thêm concurrency.
-
-<Trap locale="vi">
-
-**Một lần broker gửi lại không phải một lần retry của khách hàng, và nhập nhằng hai
-thứ đó là tiêu ngân sách này vào ngân sách kia.** `max_deliver: 10` trên consumer
-giới hạn số lần *broker* trả lại một job mà dispatcher hoàn toàn không xử lý được —
-một cú crash, hoặc một api không với tới. Bảy lần thử trong bảng tier giới hạn số
-lần *khách hàng* bị liên hệ. Chúng là hai con số khác nhau đếm hai thứ khác nhau,
-và code nói thẳng điều đó ở chỗ mà lẽ ra ai đó sẽ phải đoán.
-
-</Trap>
-
-Về phía dispatcher, expansion chỉ là một request và không gì khác. Nó không ghi
-được các dòng, nên toàn bộ công việc của nó là giải mã một event nó không tin và
-nhờ api làm phần việc:
 ```ts title="services/dispatcher/src/expand.ts"
 import type { Logger } from "@relay/service-kit";
 
@@ -3209,7 +2943,7 @@ export type ExpandOutcome = "expanded" | "duplicate" | "unparseable";
  *
  * `unparseable` is terminal and deliberately so — the same bytes fail the same
  * way every time, so retrying spends delivery attempts to reach a conclusion
- * that was available on the first. The broker chapter made the same call for the same
+ * that was available on the first. the broker chapter made the same call for the same
  * reason. */
 export async function expandOnce(
   api: ApiClient,
@@ -3241,13 +2975,7 @@ export async function expandOnce(
   return result.duplicate ? "duplicate" : "expanded";
 }
 ```
-Envelope được parse chứ không được tin, vì lý do của chương 2.5: một message nằm
-trong stream đủ lâu thì đã có thời gian để thôi khớp với đoạn code đang đọc nó. Và
-`unparseable` là chung cuộc — cùng những byte ấy sẽ hỏng theo đúng một kiểu ở mọi
-lần, nên retry là tiêu ngân sách thử của broker để đi tới một kết luận vốn đã có
-sẵn ngay từ lượt đầu.
 
-Client mang tất cả những thứ đó thì nhỏ, và nhỏ có chủ đích:
 ```ts title="services/dispatcher/src/api-client.ts"
 import {
   internalDeliveryMaterialSchema,
@@ -3348,8 +3076,7 @@ export function createApiClient(
   };
 }
 ```
-Bản thân một lần thử thì buồn tẻ có chủ đích, và đó mới là điểm mấu chốt — mọi thứ
-thú vị đã được quyết trước khi nó chạy:
+
 ```ts title="services/dispatcher/src/deliver.ts"
 import type { Logger } from "@relay/service-kit";
 
@@ -3482,16 +3209,9 @@ export async function deliverOnce(
   return { outcome: reported.outcome };
 }
 ```
-`deliverOnce` không bao giờ ném lỗi vì một thất bại của khách hàng. Một 500, một
-timeout và một kết nối bị từ chối đều là *đầu vào bình thường* của một hệ thống
-retry, và biến chúng thành exception nghĩa là caller không còn phân biệt được chúng
-với đúng một thất bại tuyệt đối không được hấp thụ: api không với tới. Cái đó thì
-ném, và message được để nguyên không acknowledge để công việc quay trở lại.
 
-## Dead letter
+## The dead letter
 
-Bảy lần thử không phải "cho tới khi thành công". Đó là một quyết định rằng có những
-delivery sẽ không bao giờ thành công, và nền tảng dừng lại thay vì retry mãi mãi:
 ```ts title="services/api/src/db/repository.ts (excerpt)"
     // Attempts exhausted. The dead letter and the state change commit together —
     // a delivery marked dead with no dead letter behind it would be a failure
@@ -3512,28 +3232,9 @@ delivery sẽ không bao giờ thành công, và nền tảng dừng lại thay 
       .where(eq(webhookDeliveries.id, delivery.id));
     return { outcome: "dead_lettered" as const, nextAttemptAt: null };
 ```
-Dead letter giữ lại payload và status cuối, bởi rồi khách hàng sẽ hỏi chuyện gì đã
-xảy ra và "nó hỏng" không phải một câu trả lời. Nó được giữ bảy ngày và **replay
-được** — và bản replay dùng lại đúng event id gốc, đó mới là chi tiết đáng kể. Một
-lần replay là chính event ấy được gửi lại, không phải một event mới, nên khách hàng
-đang deduplicate theo event id sẽ xử lý đúng mà không cần được dặn thêm gì.
 
-<Why locale="vi">
+## A walk that found a real bug
 
-**Vì sao không tự động tắt một endpoint đã hỏng nhiều ngày?** Nhật ký lần thử của
-FR-WHK-06 và auto-disable của FR-WHK-07 đều được hoãn sang một chương sau, và sự
-trì hoãn ấy là cố ý chứ không phải bỏ sót. Auto-disable là một quyết định chính
-sách với hệ quả khách hàng nhìn thấy được — nó ngừng giao webhook cho người đang
-trả tiền — và nó cần nhật ký lần thử để tự biện minh với khách hàng về sau. Ship cơ
-chế mà không có bằng chứng nghĩa là tắt endpoint rồi không giải thích nổi vì sao.
-
-</Why>
-
-## Một walk script tìm ra bug thực sự
-
-Mọi chương trong loạt bài này đều ship một script người đọc chạy được. Chương này
-ship hai: một endpoint cư xử tệ theo lệnh, và một walk đưa đúng một event đi trọn
-đường tới đó.
 ```js title="scripts/hostile-endpoint.mjs"
 // A customer's webhook endpoint, behaving badly on purpose.
 //
@@ -3716,17 +3417,9 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
   });
 }
 ```
-Endpoint tự verify chữ ký khi được đưa secret, và nó làm điều đó trong chừng mười
-lăm dòng với toàn bộ danh sách phụ thuộc là `node:crypto`. Đó chính là mục đích của
-nó: **nếu một chữ ký chỉ kiểm được bằng code của chính nền tảng, thì thứ ta công bố
-không phải một hợp đồng.** Cách để biết điều đó là viết phía khách hàng mà không
-nhìn phía mình.
 
-Walk tự spawn api của riêng nó, bởi dispatcher chạm tới state qua HTTP và phải có
-thứ gì đó ở đầu bên kia. Một walk bảo người đọc khởi động ba service trước là một
-walk không ai chạy:
 ```js title="scripts/webhook-walk.mjs"
-// The the webhook dispatcher chapter walk: one event, all the way to a customer's server.
+// The webhook dispatcher chapter walk: one event, all the way to a customer's server.
 //
 //   # in one terminal
 //   node scripts/hostile-endpoint.mjs --mode=ok
@@ -3822,7 +3515,8 @@ const db = createDb(pool);
 // consumer created afterwards would begin after the message this walk is about
 // and wait forever for something it had already missed. (Starting at `All`
 // instead is worse in a different way: the walk replays every event the stream
-// has ever held, which on a development machine is every test run since the outbox chapter.)
+// has ever held, which on a development machine is every test run since the outbox
+// chapter.)
 rule("0. the api and the dispatcher this walk drives");
 
 const api = spawn("node", [join(API_DIST, "main.js")], {
@@ -4107,7 +3801,7 @@ await stop();
 // work looks to a reader exactly like a script that hung.
 process.exit(0);
 ```
-Chạy walk với `--mode=fail` và nhìn lịch trình giãn ra:
+
 ```text
   tiers: now → 1s → 5s → 30s → 300s → 1800s → 7200s
   7 attempts, then the delivery is dead-lettered.
@@ -4122,7 +3816,7 @@ Chạy walk với `--mode=fail` và nhìn lịch trình giãn ra:
 dead letters               1
   d1d7012d                 attempts=7 last_status=500
 ```
-Chỉ có điều lần đầu tiên nó không làm thế. Nó làm thế này:
+
 ```text
   attempt 2                failed → pending
   attempt 2                failed → pending
@@ -4132,44 +3826,20 @@ Chỉ có điều lần đầu tiên nó không làm thế. Nó làm thế này:
 dead letters               0
 === endpoint attempts: 1 ===
 ```
-Một lần thử, rồi không gì nữa, mãi mãi.
 
-Nguyên nhân nằm ở nền tảng chứ không phải ở script. Delivery relay deduplicate các
-lần publish theo delivery id — mà một delivery id thì **giống hệt nhau qua cả bảy
-lần thử**. JetStream gộp mọi lần retry vào chính message của lần thử đầu tiên, bên
-trong cửa sổ trùng lặp của nó. Lệnh publish báo thành công. Không message nào tới
-được dispatcher. Và dòng dữ liệu vẫn giữ nguyên `dispatched_at` mà claim của nó đã
-đặt — thứ chỉ được xoá bởi một báo cáo kết quả, và báo cáo ấy thì không bao giờ tới.
-
-**Mọi webhook thất bại đã được retry đúng không lần nào, và toàn bộ lịch trình là
-không thể chạm tới.**
-
-<Trap locale="vi">
-
-Không gì bắt được nó, và lý do còn đáng giá hơn cả con bug. Suite delivery gọi thẳng
-query claim, không có broker nào trên đường. Suite của dispatcher dùng một *delivery
-mới toanh* cho mỗi trường hợp. Nên chưa bài test nào trong repository từng publish
-cùng một delivery hai lần — đúng cái tình huống mà mọi lần retry đều tạo ra.
-
-Bản sửa gọn một dòng, và lời chú thích bên cạnh còn dài hơn cả thay đổi, bởi thay
-đổi không phải phần thú vị:
 ```ts title="services/api/src/webhooks/delivery-relay.ts (excerpt)"
         // Per attempt, a republish after a crash is still recognisably the same
         // work, which is what the deduplication is for. A NEW attempt is
         // genuinely new work and has to be allowed to say so.
         id: `${row.id}:${row.attempt}`,
 ```
-</Trap>
 
-Bài test hồi quy chính là walk, được đem vào CI — và nó đã được xác nhận là *thất
-bại* trước khoá cũ rồi mới được giữ lại:
 ```ts title="services/dispatcher/src/dispatcher.itest.ts (excerpt)"
   it("invariant 10: a FAILED delivery is retried — the same row, a second attempt", async () => {
 ```
-## Các test suite thực sự bảo vệ điều gì
 
-Ba suite unit và ba suite integration tới cùng chương này. Nhóm unit thì rẻ và ghim
-chặt phần số học — bảng tier, vòng mã hoá, công thức chữ ký:
+## What the suites actually hold
+
 ```ts title="services/api/src/webhooks/schedule.test.ts"
 import { describe, expect, it } from "vitest";
 
@@ -4273,7 +3943,8 @@ describe("a signing secret must survive storage, not merely be recognisable", ()
   it("cannot be recovered from the credentials chapter's treatment of the other credential", () => {
     const secret = mintSigningSecret();
 
-    // Hashing is what the credentials chapter does to an API key, and it is one-way on purpose. The
+    // Hashing is what the credentials chapter does to an API key, and it is one-way on
+    // purpose. The
     // digest is not the secret and no amount of care turns it back into one, so
     // an implementation that reached for `hashSecret` here would compile, pass a
     // careless review, and be unable to sign anything.
@@ -4539,9 +4210,7 @@ describe("invariant 5: the trap, asserted rather than warned about", () => {
   });
 });
 ```
-Nhóm integration mới là nơi các bảo đảm thực sự sống, bởi mỗi bảo đảm trong đó đều
-nói về một thứ chỉ tồn tại khi một broker thật, một database thật và một server
-thật của khách hàng cùng nằm trong một câu chuyện:
+
 ```ts title="services/api/src/webhooks/deliveries.itest.ts"
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -4567,7 +4236,7 @@ import { encryptSecret, mintSigningSecret } from "./secret";
 //
 // Every environment is minted in this file — the drain is global, so a
 // per-environment assertion is the only kind that survives another suite
-// running beside it. The outbox chapter's finding 4 is the reason that sentence exists.
+// running beside it. the outbox chapter's finding 4 is the reason that sentence exists.
 
 const DISPATCHER = "dispatcher";
 
@@ -4659,6 +4328,54 @@ describe("expansion", () => {
     // Still claimed. An event with no subscribers is handled, not pending — or
     // every redelivery would re-ask the same question forever.
     expect(await timesHandled(db, DISPATCHER, e.eventId)).toBe(1);
+  });
+
+  it("a subscriber to the two message revision events is told about an edit and a deletion", async () => {
+    // OWED FORWARD FROM THE REVISIONS CHAPTER, which built the outbox rows and could
+    // not show the FILTER: no endpoint existed to subscribe. `messages.itest.ts` there
+    // asserts that every edit writes an outbox row and a repeated deletion writes none;
+    // an outbox row is not a delivery, and what decides whether a customer hears about
+    // an edit is this expansion.
+    //
+    // **`seedEndpoint` IS PARAMETERISED AND EVERY EXISTING CALL SITE PASSES
+    // `["message.created"]`.** A test that forgot to pass the new types would seed an
+    // endpoint subscribed to creations, receive nothing, and read as though the
+    // expansion were broken rather than as though the test were — so the types are
+    // passed explicitly and the negative control below is what proves the filter works.
+    const scratch = await createEnvironment(db, { name: "deliveries-itest-revisions" });
+    const scratchRepo = new Repository(db, scratch.id);
+    const secret = encryptSecret(mintSigningSecret());
+
+    const both = await scratchRepo.createEndpoint({
+      url: "https://example.test/edits-and-deletions",
+      eventTypes: ["message.updated", "message.deleted"],
+      secretCiphertext: secret,
+    });
+    // SUBSCRIBED TO CREATIONS ONLY. FR-WHK-02 spells the message events as separate
+    // names rather than one `message.*` with a discriminator precisely so this endpoint
+    // hears nothing below — and that is the half a test with one endpoint cannot show.
+    const creationsOnly = await scratchRepo.createEndpoint({
+      url: "https://example.test/creations-only",
+      eventTypes: ["message.created"],
+      secretCiphertext: secret,
+    });
+
+    for (const type of ["message.updated", "message.deleted"] as const) {
+      const e = {
+        eventId: randomUUID(),
+        environmentId: scratch.id,
+        type,
+        payload: { id: randomUUID(), type },
+      };
+      const result = await expandEventToDeliveries(db, e);
+      expect(result.duplicate, type).toBe(false);
+      // ONE ROW, NOT TWO. The subscriber to both types gets it; the creations-only
+      // endpoint does not.
+      expect(result.created, type).toBe(1);
+      const rows = await scratchRepo.listDeliveriesForEvent(e.eventId);
+      expect(rows.map((r) => r.endpoint_id), type).toEqual([both.id]);
+      expect(rows.map((r) => r.endpoint_id), type).not.toContain(creationsOnly.id);
+    }
   });
 
   it("invariant 8: a disabled or deleted endpoint receives nothing", async () => {
@@ -4821,12 +4538,42 @@ describe("the relay drains only what is due", () => {
    *
    * The drain is GLOBAL — one dispatcher serves every environment — so a test
    * that asserts on what its own call returned is really asserting that no other
-   * suite got there first. The outbox chapter's finding 3 met this twice; this is the
+   * suite got there first. the outbox chapter's finding 3 met this twice; this is the
    * third time, and the fix is the same one: assert the property, not the
    * observer. Whoever claims the row, a due delivery ends up dispatched and a
    * not-yet-due one does not. */
   const drainEverythingDue = async (): Promise<void> => {
-    await drainDueDeliveries(db, 500, async () => {});
+    await drainDueDeliveries(db, 50_000, async () => {});
+  };
+
+  /** The same drain, retried until a row this suite owns has settled.
+   *
+   * FOUND AT THE DEDUPLICATION CHAPTER'S POST-FIX MEASUREMENT, on run 2 of 20: "expected null
+   * not to be null" for a delivery that was unambiguously due. The comment above
+   * had the principle right and the implementation one call short.
+   *
+   * `drainDueDeliveries` claims `FOR UPDATE SKIP LOCKED`. When a suite running in
+   * a parallel worker holds this row inside its own open transaction, this call
+   * SKIPS it and returns having done nothing about it — and one call is then
+   * indistinguishable from "the relay declined to publish a due delivery", which
+   * is the failure this test is meant to report. Draining again once the other
+   * transaction has ended finds the row either already dispatched by that suite
+   * or free to claim here. Either outcome satisfies the invariant; neither is
+   * visible to a single call.
+   *
+   * Bounded rather than open-ended: if the property is genuinely false the row is
+   * never dispatched and this fails after the budget with the same message, one
+   * second later. */
+  const drainUntilSettled = async (delivery: {
+    id: string;
+    event_id: string;
+  }): Promise<void> => {
+    for (let attempt = 0; attempt < 10; attempt++) {
+      await drainEverythingDue();
+      const rows = await repo.listDeliveriesForEvent(delivery.event_id);
+      if (rows.find((r) => r.id === delivery.id)?.dispatched_at !== null) return;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
   };
 
   const stateOf = async (delivery: { id: string; event_id: string }) => {
@@ -4860,7 +4607,7 @@ describe("the relay drains only what is due", () => {
   it("invariant 10: publishes a delivery that is due", async () => {
     const delivery = await seed();
 
-    await drainEverythingDue();
+    await drainUntilSettled(delivery);
 
     expect((await stateOf(delivery)).dispatched_at).not.toBeNull();
   });
@@ -4902,7 +4649,7 @@ describe("the relay drains only what is due", () => {
     }
 
     const healthy = await seed();
-    await drainEverythingDue();
+    await drainUntilSettled(healthy);
 
     expect((await stateOf(healthy)).dispatched_at).not.toBeNull();
     for (const s of sleeping) {
@@ -4913,7 +4660,7 @@ describe("the relay drains only what is due", () => {
   it("invariant 9: a claimed delivery is not claimed twice", async () => {
     const delivery = await seed();
 
-    await drainEverythingDue();
+    await drainUntilSettled(delivery);
     const first = await stateOf(delivery);
     await drainEverythingDue();
     const second = await stateOf(delivery);
@@ -4941,7 +4688,7 @@ describe("the relay drains only what is due", () => {
 
     // Tier 2 is one second out.
     await new Promise((resolve) => setTimeout(resolve, 1_500));
-    await drainEverythingDue();
+    await drainUntilSettled(delivery);
 
     expect((await stateOf(delivery)).dispatched_at).not.toBeNull();
   });
@@ -5311,10 +5058,11 @@ import { subjectFor } from "@relay/protocol";
 import { ACK_WAIT_MS, createDispatcher, type Dispatcher } from "./main.js";
 
 // The dispatcher against a real api, a real broker and a real customer endpoint
-//. Invariant 7 lives here; 11, 13, 15 and 16 join it.
+// Invariant 7 lives here; 11, 13, 15 and 16 join it.
 //
 // The api runs as a CHILD PROCESS, not in-process — the same choice the
-// gateway's socket suite made in the credentials chapter and for the same reason. The dispatcher's
+// gateway's socket suite made in the credentials chapter and for the same reason. The
+// dispatcher's
 // whole point is that it reaches state over the internal seam rather than
 // through a database client, and a suite that imported the api's modules would
 // prove that over a function call instead of over HTTP.
@@ -6182,177 +5930,87 @@ describe("the dispatcher", () => {
   }, 60_000);
 });
 ```
-<Trap locale="vi">
 
-**Một deployable mới thoát khỏi thiết bị đo coverage mà chẳng ai gỡ nó ra cả.**
-Research R12 đã dự đoán điều này và nó xảy ra đúng như mô tả, chỉ khác ở chỗ tệ hơn
-dự đoán theo một hướng và tốt hơn theo một hướng khác.
-
-Tốt hơn: thiết bị đo không cần đổi gì cả. Glob của nó là `services/*/src/**`, nên
-dispatcher được đo ngay khoảnh khắc nó tồn tại, và không job CI nào phải thêm vào
-bởi mọi lệnh trong workflow vốn đã chạy ở gốc workspace.
-
-Tệ hơn: đọc nó thì thấy `expand.ts` đang ở mức **0%**. Chính suite của dispatcher
-lại đi tới expansion bằng cách gọi thẳng repository vào database, nên cái consumer
-giải mã một event, nhờ api nở nó ra, rồi quyết định ack-hay-terminate chưa từng một
-lần chạy dưới test.
-
-Còn `repository.ts` thì đi *xuống* — branch từ 86.30% còn 78.22%, rớt bốn ngưỡng
-cùng lúc. `deliveryMaterial` và `pendingDeliveryDepth` chỉ được dispatcher gọi, mà
-suite của dispatcher chạy api như một **process con**, và coverage của process con
-thì không quy về đâu được. Đúng cái hàm duy nhất trong nền tảng trả lại signing
-secret của khách hàng ở dạng plaintext, theo thước đo duy nhất mà hiến pháp nêu
-tên, là chưa được test.
-
-Ratchet được nâng lên sau đó, chứ không phải hạ xuống cho vừa code:
-```ts title="vitest.coverage.config.mts"
-import { defineConfig } from "vitest/config";
-import swc from "unplugin-swc";
-
-// Coverage, across BOTH lanes (feature 024).
-//
-// This config exists because constitution VI's bar cannot be measured one
-// package at a time. The code it names — message ordering, idempotency, tenant
-// isolation — lives in the api's repository layer, and most of it is reached
-// only by integration tests. A unit-only coverage run would report a
-// comfortable number about the wrong thing, which is worse than no number.
-//
-// So the include list is both `*.test.ts` and `*.itest.ts`, and running this
-// needs the compose stores up. That is the honest cost of measuring the thing
-// the constitution actually asks about.
-//
-// The SWC plugin is here for the same reason `services/api/vitest.config.mts`
-// has it: esbuild strips decorators without emitting metadata, and Nest's DI
-// would silently resolve nothing. It is harmless for the packages that use no
-// decorators.
-export default defineConfig({
-  test: {
-    include: [
-      "packages/*/src/**/*.test.ts",
-      "services/*/src/**/*.test.ts",
-      "packages/*/src/**/*.itest.ts",
-      "services/*/src/**/*.itest.ts",
-    ],
-    // The e2e journey spawns real services and is excluded on purpose: it
-    // measures the system, not any file's branches, and its child processes'
-    // coverage is not attributable here anyway.
-    exclude: ["**/node_modules/**", "packages/e2e/**"],
-    // Suites in one process would share a database in ways their authors did
-    // not design for — the outbox chapter's outbox suite learned that the hard way.
-    fileParallelism: false,
-    testTimeout: 60_000,
-    hookTimeout: 60_000,
-    coverage: {
-      provider: "v8",
-      reporter: ["text", "json-summary"],
-      include: ["packages/*/src/**/*.ts", "services/*/src/**/*.ts"],
-      exclude: [
-        "**/*.test.ts",
-        "**/*.itest.ts",
-        "**/dist/**",
-        "packages/e2e/**",
-        // Entry points and framework wiring: reached by running the service,
-        // not by asserting on it. Counting them measures how much of `main.ts`
-        // a test happened to touch, which is not what "business logic" means.
-        "**/main.ts",
-        "**/*.module.ts",
-      ],
-      thresholds: {
-        // Constitution VI, first clause: 70% of business logic. Set to what the
-        // constitution says, not to what the code achieves — a threshold tuned
-        // down to pass measures nothing. Currently met with room to spare
-        // (86.55% statements, 78.07% branches at the time of writing).
-        lines: 70,
-        functions: 70,
-        statements: 70,
-        branches: 70,
-
-        // Constitution VI, second clause: ordering, idempotency and tenant
-        // isolation MUST have 100% BRANCH coverage (NFR-MNT-02).
-        //
-        // They do not. `repository.ts` — which holds all three — measures
-        // 89.51%. These per-file numbers are therefore a RATCHET pinned at
-        // today's measurement, not the bar: they stop the figure sliding
-        // backwards while the gap is closed, and they are deliberately not the
-        // 100% the constitution asks for, because a threshold nothing can pass
-        // makes CI permanently red and teaches everyone to ignore it.
-        //
-        // The gap is recorded in specs/024-coverage-and-ci/notes.md with the
-        // uncovered branches named. Raising these to 100 is the work; this
-        // feature is the instrument that made the number sayable at all.
-        //
-        // THE WEBHOOK DISPATCHER CHAPTER RAISED THESE, and only after earning it. The webhook work
-        // added six operations to this file and the ratchet immediately went
-        // red — branches fell from 85.91% to 78.22%, because `deliveryMaterial`
-        // and `pendingDeliveryDepth` were called only by the dispatcher, whose
-        // suite runs the api as a CHILD PROCESS whose coverage is not
-        // attributable. The instrument was right and the code was not tested.
-        // Lowering the numbers to match would have been the whole point of a
-        // ratchet, thrown away; the tests in `webhooks/deliveries.itest.ts` were
-        // written instead, and these are the measurement that followed.
-        "services/api/src/db/repository.ts": {
-          branches: 89,
-          functions: 100,
-          lines: 98,
-          statements: 97,
-        },
-
-        // The dispatcher's two decision-bearing files. `expand.ts`
-        // decides whether a redelivered event produces a second set of webhooks
-        // — constitution VI names idempotency explicitly — and `deliver.ts`
-        // holds the post-then-report ordering that chooses a duplicate over a
-        // silent loss. Pinned here because they measured 0% and 87.5% when the
-        // service arrived, which is exactly what research R12 warned a new
-        // deployable would do to a green instrument.
-        "services/dispatcher/src/expand.ts": {
-          branches: 92,
-          functions: 100,
-          lines: 100,
-          statements: 92,
-        },
-        "services/dispatcher/src/deliver.ts": {
-          branches: 90,
-          functions: 100,
-          lines: 100,
-          statements: 100,
-        },
-        "services/gateway/src/resume.ts": {
-          branches: 93,
-          functions: 100,
-          lines: 100,
-          statements: 100,
-        },
-        "services/api/src/auth/user-token.ts": {
-          branches: 96,
-          functions: 100,
-          lines: 100,
-          statements: 96,
-        },
-      },
-    },
-  },
-  plugins: [
-    swc.vite({
-      module: { type: "es6" },
-      jsc: { transform: { legacyDecorator: true, decoratorMetadata: true } },
-    }),
-  ],
-});
+```diff title="vitest.coverage.config.mts"
+@@ -79,13 +79,13 @@ export default defineConfig({
+         branches: 70,
+ 
+         // Constitution VI, second clause: ordering, idempotency and tenant
+         // isolation MUST have 100% BRANCH coverage (NFR-MNT-02).
+         //
+         // They do not. `repository.ts` — which holds all three — measures
+-        // 85.91%. These per-file numbers are therefore a RATCHET pinned at
++        // 89.51%. These per-file numbers are therefore a RATCHET pinned at
+         // today's measurement, not the bar: they stop the figure sliding
+         // backwards while the gap is closed, and they are deliberately not the
+         // 100% the constitution asks for, because a threshold nothing can pass
+         // makes CI permanently red and teaches everyone to ignore it.
+         //
+         // The gap is recorded in specs/024-coverage-and-ci/notes.md with the
+@@ -160,12 +160,57 @@ export default defineConfig({
+           // against a measurement that was never their subject.
+           branches: 92,
+           functions: 100,
+           lines: 97,
+           statements: 95,
+         },
++        //
++        // THE WEBHOOK CHAPTER RAISED THESE IN THE PUBLISHED ORDER AND CANNOT HERE, which
++        // is worth one paragraph because the direction is the interesting part. There, the
++        // webhook work added six operations to this file and branches fell 85.91 -> 78.22
++        // — `deliveryMaterial` and `pendingDeliveryDepth` were called only by the
++        // dispatcher, whose suite runs the api as a CHILD PROCESS whose coverage is not
++        // attributable — and the answer was to write `webhooks/deliveries.itest.ts` rather
++        // than lower the pin. This order has already run the chapters that took this file
++        // to 92, so the same tests arrive against a HIGHER floor than they were written
++        // for. The pin stays where the later chapters put it; what the webhook tests buy
++        // here is that it does not move DOWN.
++        //
++        // The dispatcher's two decision-bearing files. `expand.ts`
++        // decides whether a redelivered event produces a second set of webhooks
++        // — constitution VI names idempotency explicitly — and `deliver.ts`
++        // holds the post-then-report ordering that chooses a duplicate over a
++        // silent loss. Pinned here because they measured 0% and 87.5% when the
++        // service arrived, which is exactly what research R12 warned a new
++        // deployable would do to a green instrument.
++        //
++        // MEASURED ON THIS TREE AT 1,038 TESTS ACROSS 68 FILES: `expand.ts`
++        // 92.3/92.3/100/100 and `deliver.ts` 100/90.9/100/100. Both pins hold as
++        // published wrote them.
++        //
++        // AND THE CHILD-PROCESS EFFECT IS VISIBLE IN THREE FILES NOBODY PINS, which is
++        // the same measurement read from the other end. `internal/dispatch.controller.ts`
++        // reads 9.09/0/20/11.11 and `webhooks/delivery-relay.ts` 28.12/25/22.22/31.03 —
++        // both are exercised almost entirely by `dispatcher.itest.ts`, which runs the api
++        // as a CHILD PROCESS whose coverage is not attributable to this lane. Pinning
++        // them would pin the harness rather than the code, and lowering the whole file's
++        // floor to match would be a ratchet describing a test topology. What was pinned
++        // instead is what a suite in THIS process can reach: the repository methods those
++        // two call, covered by `webhooks/deliveries.itest.ts`.
++        "services/dispatcher/src/expand.ts": {
++          branches: 92,
++          functions: 100,
++          lines: 100,
++          statements: 92,
++        },
++        "services/dispatcher/src/deliver.ts": {
++          branches: 90,
++          functions: 100,
++          lines: 100,
++          statements: 100,
++        },
+         // THE DEDUPLICATION CHAPTER RAISED THIS, 93 -> 95. The chapter added two pure functions
+         // to this file — the live-path suppression predicate and the scoping that
+         // bounds the marks — and both are fully covered.
+         //
+         // Not 100, and the missing branch is named rather than chased: it is
+         // `if (timer)` in chapter 2.7's `withDeadline`, whose falsy arm cannot be
 ```
-</Trap>
 
-## Ba service, ba container
+## Three services, three containers
 
-Dispatcher là thứ đầu tiên trong repository này buộc phải được *deploy* chứ không
-chỉ chạy, và điều đó hoá ra làm lộ ra một chuyện. Hai service đã chạy suốt tám
-chương mà không có lấy một container image nào, bởi `pnpm dev` luôn là đủ. Service
-thứ ba biến câu "thứ này thực sự ship ra sao" thành một câu hỏi không hoãn thêm
-được nữa.
-
-Nên cả ba cùng có Dockerfile trong một chương, và cái của api là cái đáng đọc — hai
-cái kia cùng hình dạng nhưng ít thứ hơn:
 ```dockerfile title="services/api/Dockerfile"
-# The api. The repository's containers arrive with the dispatcher:
+# The api (chapter 3.5). The repository's containers arrive with the dispatcher:
 # adding one image for the new service alone would have made the newest
 # deployable the only packaged one, which is a distinction nothing justifies.
 #
@@ -6402,26 +6060,7 @@ COPY --from=build /repo/services/api/migrations ./migrations
 USER node
 CMD ["node", "dist/main.js"]
 ```
-<Trap locale="vi">
 
-Hai thứ trong đó là sẹo.
-
-`pnpm exec turbo run build --filter=@relay/api` chứ không phải
-`pnpm --filter @relay/api build`: filter của pnpm chạy script trong một package và
-**không** build các workspace dependency mà nó cần. Bên trong container, nơi chẳng
-có gì được build sẵn, điều đó tạo ra mười bảy lỗi `TS2307 cannot find module` chỉ
-thẳng vào những package đang tồn tại. Filter của turbo hiểu đồ thị phụ thuộc và
-build `^build` trước.
-
-Và `pnpm deploy --legacy`: dưới pnpm 10, `deploy` từ chối chạy trong một workspace
-không có `inject-workspace-packages`, còn thông báo lỗi thì không hề nhắc tới cái cờ
-khiến nó chạy được.
-
-</Trap>
-
-Dispatcher là một workspace package mới, không framework và dùng ESM — ADR-15 buộc
-NestJS chỉ thuộc về api service, và một ứng dụng Nest thứ hai sẽ là chuyện chọn
-framework theo quán tính chứ không phải theo quyết định:
 ```json title="services/dispatcher/package.json"
 {
   "name": "@relay/dispatcher",
@@ -6447,8 +6086,7 @@ framework theo quán tính chứ không phải theo quyết định:
   }
 }
 ```
-Gateway cần thêm một thứ nữa mới containerise được — suốt thời gian qua nó chạy qua
-`tsx` và không hề có script build hay start của riêng mình:
+
 ```diff title="services/gateway/package.json"
 @@ -2,12 +2,14 @@
    "name": "@relay/gateway",
@@ -6466,10 +6104,9 @@ Gateway cần thêm một thứ nữa mới containerise được — suốt th�
    "dependencies": {
      "@relay/protocol": "workspace:*",
 ```
-Package mới gia nhập đồ thị build, một thay đổi gọn một dòng mà sẽ vô hình cho tới
-lúc có thứ gì đó không chịu rebuild:
+
 ```diff title="turbo.json"
-@@ -25,12 +25,15 @@
+@@ -41,12 +41,15 @@
          "RELAY_POSTGRES_PORT",
          "RELAY_REDIS_URL",
          "RELAY_REDIS_PORT",
@@ -6480,19 +6117,19 @@ lúc có thứ gì đó không chịu rebuild:
 +        "RELAY_INTERNAL_CREDENTIAL",
 +        "RELAY_WEBHOOK_SECRET_KEY",
          "RELAY_EVENT_CONSUMER",
-         "RELAY_NATS_REPLICAS",
-         "RELAY_E2E_API_PORT"
+         "RELAY_NATS_REPLICAS"
        ]
      },
      "//#lint:root": {
+       "inputs": [
 ```
 
 ```diff title="services/api/src/app.module.ts"
-@@ -9,12 +9,13 @@ import { AuthModule } from "./auth/auth.module";
- import { AuthenticateMiddleware } from "./auth/authenticate.middleware";
- import { HealthController } from "./health.controller";
- import { InternalModule } from "./internal/internal.module";
- import { MessagesModule } from "./messages/messages.module";
+@@ -15,12 +15,13 @@ import { ChannelsModule } from "./channels/channels.module";
+ // line the module is compiled, exported, imported by nothing, and none of the user
+ // routes exist. The file appeared in no task until an enumeration asked which
+ // chapter fences it.
+ import { UsersModule } from "./users/users.module";
  import { ConsumerModule } from "./consumer/consumer.module";
  import { OutboxModule } from "./outbox/outbox.module";
 +import { WebhooksModule } from "./webhooks/webhooks.module";
@@ -6502,9 +6139,9 @@ lúc có thứ gì đó không chịu rebuild:
  import { RequestContextMiddleware } from "./request-context.middleware";
  
  // The application described as a module graph — ADR-15's convention for the
-@@ -26,12 +27,13 @@ import { RequestContextMiddleware } from "./request-context.middleware";
-     AuthModule,
-     MessagesModule,
+@@ -34,12 +35,13 @@ import { RequestContextMiddleware } from "./request-context.middleware";
+     ChannelsModule,
+     UsersModule,
      InternalModule,
      TenancyModule,
      OutboxModule,
@@ -6533,12 +6170,12 @@ lúc có thứ gì đó không chịu rebuild:
  // not get a second opinion.
  async function bootstrap(): Promise<void> {
    const app = await NestFactory.create(AppModule, { logger: false });
-@@ -16,12 +17,16 @@ async function bootstrap(): Promise<void> {
-   await app.listen(port);
-   // The relay starts AFTER the server is listening, and starting it cannot
-   // fail: the publisher connects lazily, so an unreachable broker leaves events
-   // accumulating in Postgres instead of preventing the api from serving writes
-   // (research R9).
+@@ -28,12 +29,16 @@ async function bootstrap(): Promise<void> {
+   const port =
+     typeof address === "object" && address !== null ? (address.port ?? requested) : requested;
+   // The relay starts AFTER the server is listening, and starting it cannot fail: the
+   // publisher connects lazily, so an unreachable broker leaves events accumulating in
+   // Postgres instead of preventing the api from serving writes (research R9).
    app.get(OutboxRelayService).start();
 +  // And the second relay: the same loop over a different table,
 +  // publishing deliveries that have become due. Started here for the outbox chapter's reason —
@@ -6551,9 +6188,7 @@ lúc có thứ gì đó không chịu rebuild:
    // Nest calls onModuleDestroy on shutdown hooks; without this the relay's loop
    // would outlive the process's intent to stop.
 ```
-File compose có thêm ba service nấp sau một profile, nên `docker compose up -d
---wait` mặc định vẫn chỉ dựng bốn store và không gì khác — người đọc đi theo chương
-1.2 nhận đúng thứ chương đó đã hứa:
+
 ```diff title="compose.yaml"
 @@ -1,9 +1,16 @@
  # The whole local world, one command:  docker compose up -d --wait
@@ -6582,7 +6217,7 @@ File compose có thêm ba service nấp sau một profile, nên `docker compose 
        start_period: 15s
  
 +
-+  # --- the services -------------------------------------------------------
++  # --- the services (the webhook dispatcher chapter) -----------------------
 +  # Behind `--profile services`, for the reason above.
 +
 +  api:
@@ -6649,16 +6284,9 @@ File compose có thêm ba service nấp sau một profile, nên `docker compose 
    nats-data:
    clickhouse-data:
 ```
-Mục `extra_hosts` có mặt vì đúng một lý do. Một dispatcher bên trong container phân
-giải `127.0.0.1` thành loopback của chính container, nên một webhook endpoint đang
-chạy trên máy của lập trình viên là không với tới được. Không có dòng đó, bước "dừng
-dispatcher rồi nhìn backlog rút cạn" của quickstart không chạy được đúng như đã
-viết — endpoint sẽ chẳng nhận được gì, và màn trình diễn trông sẽ giống một cái bug
-của nền tảng.
 
-Harness end-to-end cũng cần khoá mã hoá, bởi nó spawn service thật:
 ```diff title="packages/e2e/src/harness.ts"
-@@ -332,24 +332,34 @@ export async function boot({ gateways = 2 } = {}): Promise<System> {
+@@ -387,24 +387,34 @@ export async function boot({ gateways = 2 } = {}): Promise<System> {
        "RELAY_REDIS_PORT",
        // The api's relay needs the broker's address. Forwarded,
        // never composed here — a harness that invents a URL becomes a second
@@ -6673,7 +6301,7 @@ Harness end-to-end cũng cần khoá mã hoá, bởi nó spawn service thật:
      ),
      // The api children run WITHOUT the outbox relay. This journey
      // asserts message delivery, and a background loop draining the outbox while
-     // The outbox chapter's own suite asserts on that same table is a race between two test
+     // the outbox chapter's own suite asserts on that same table is a race between two test
      // files, not a property of the system. The relay has its own suite, which
      // drives it explicitly.
      RELAY_OUTBOX_RELAY: "off",
@@ -6689,14 +6317,12 @@ Harness end-to-end cũng cần khoá mã hoá, bởi nó spawn service thật:
 +    RELAY_DELIVERY_RELAY: "off",
    };
  
-   const apiPort = Number(process.env.RELAY_E2E_API_PORT ?? 4100);
-   children.push(
-     capture(
-       "api",
+   // THE LAST FIXED PORT IN THE REPOSITORY, AND IT FAILED THE WAY THE OTHERS DID.
+   //
+   // This read `Number(process.env.RELAY_E2E_API_PORT ?? 4100)`, and the gateways took
+   // `apiPort + 1 + i` — a band derived from it. Run on its own the lane is green; run
 ```
-<Checkpoint locale="vi">
 
-Dựng store, build, migrate, rồi chạy walk với một endpoint khoẻ mạnh:
 ```console
 $ node scripts/hostile-endpoint.mjs --mode=ok --secret=hunter2 &
 $ node scripts/webhook-walk.mjs --secret=hunter2 --print-signing-material
@@ -6715,32 +6341,25 @@ expanded a second time     created=0 duplicate=true
 === 4. the dispatcher posts it, and reports back over the seam
   delivery bd9b677a        attempt=1 state=delivered
 ```
-Và ở phía endpoint:
+
 ```console
 MARKER received n=1 mode=ok
 MARKER signature n=1 VERIFIED
 MARKER answered n=1 status=200
 ```
-Rồi bảo nó verify một body đã bị serialise lại, và nhìn hợp đồng làm đúng việc của
-mình:
+
 ```console
 $ node scripts/hostile-endpoint.mjs --secret=hunter2 --reserialize
 MARKER signature n=1 FAILED (body re-serialised)
   ^ the data is identical and the signature does not match. Sign and
     verify the BYTES that were transmitted, never the object.
 ```
-Cả hai lane, và cổng coverage:
+
 ```console
 $ pnpm test && pnpm test:integration && pnpm coverage
- Tests  156 passed (156)
- Tests  149 passed (149)
- Tests  296 passed (296)
+ Tests  361 passed (361)     # 7 packages
+ Tests  686 passed (686)     # 5 packages
+ Tests  1038 passed (1038)   # 68 files, 338.6 s
 ```
-Giờ nền tảng đã giao webhook tới khách hàng, ký chúng để khách hàng chứng minh được
-chúng đến từ chúng ta, retry một endpoint đang hỏng theo lịch giãn dần, và bỏ cuộc
-theo một cách mà ai đó giải thích lại được về sau. Nó làm tất cả những điều đó từ
-một service không ghi nổi vào chính database của mình.
-
-</Checkpoint>
 
 <ChapterFooter id="3.19" locale="vi" />
