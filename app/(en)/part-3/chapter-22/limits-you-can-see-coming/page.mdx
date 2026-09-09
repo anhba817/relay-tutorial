@@ -201,7 +201,7 @@ rather than slept through.
 ## Policy: three columns, and null is not zero
 
 ```sql title="services/api/migrations/0012_limit_policy.sql"
--- Per-environment rate limit policy (FR-RTL-04, FR-RTL-04).
+-- Per-environment rate limit policy (FR-RTL-04).
 --
 -- NULLABLE, AND NULL IS NOT ZERO. A null column means "no override, use the
 -- documented default", resolved at read time. A zero means "refuse everything",
@@ -3560,9 +3560,185 @@ numbers are not repeated here.
 
 ### Configuration
 
+The stack gets the address, and the api gets a dependency on the service:
+
+```diff title="compose.yaml"
+@@ -75,13 +75,13 @@ services:
+ 
+   mailpit:
+     image: axllent/mailpit:v1.28
+     # An SMTP server that accepts everything and delivers nothing,
+     # with an HTTP API for reading what it caught.
+     #
+-    # WHY A CONTAINER RATHER THAN A FAKE. FR-021 says an email must not contain a
++    # WHY A CONTAINER RATHER THAN A FAKE. FR-WHK-07 says an email must not contain a
+     # signing secret, and the only artefact that can settle that is the message a
+     # server RECEIVED — a stub records what the sender passed, which is the same
+     # object the assertion would be reading, so a mailer that dropped the secret
+     # into a header the stub does not model would pass. Constitution VII asks a
+     # fifth container to justify itself; this is the justification (research R9).
+     #
+@@ -109,22 +109,33 @@ services:
+     build:
+       context: .
+       dockerfile: services/api/Dockerfile
+     environment:
+       DATABASE_URL: postgres://relay:relay@postgres:5432/relay
+       RELAY_NATS_URL: nats://nats:4222
++      # Container names, not localhost — the api's own default is
++      # `redis://localhost:6379`, which inside this container is not the Redis
++      # service. And the tenant limiter FAILS OPEN by design (SAD §6.3), so a
++      # missing address would not crash anything: the composed stack would serve
++      # every request unlimited while reporting a limit. The constitution
++      # requires the full stack to start with one command, and this is what makes
++      # that true rather than merely quiet (research R24).
++      #
++      # RELAY_SMTP_URL joins in the transport phase, with the container it names.
++      RELAY_REDIS_URL: redis://redis:6379
+       # Development values. Both are secrets in anything that is not a laptop,
+       # and the api refuses to start in production without the first.
+       RELAY_WEBHOOK_SECRET_KEY: ${RELAY_WEBHOOK_SECRET_KEY:-}
+       RELAY_INTERNAL_CREDENTIAL: ${RELAY_INTERNAL_CREDENTIAL:-rk_svc_local_development_credential_0000}
+       PORT: "4000"
+     ports:
+       - "${RELAY_API_PORT:-4000}:4000"
+     depends_on:
+       postgres: { condition: service_healthy }
+       nats: { condition: service_healthy }
++      redis: { condition: service_healthy }
+     healthcheck:
+       test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:4000/healthz"]
+       interval: 5s
+       timeout: 3s
+       retries: 5
+       start_period: 20s
+```
+
+Container names rather than `localhost`, because the api's own default —
+`redis://localhost:6379` — is not the Redis service from inside a container. And
+the tenant limiter fails open by design, so a missing address would not crash
+anything: the composed stack would serve every request unlimited while reporting a
+limit. The constitution requires `docker compose up` to bring the full stack up,
+and this is what makes that true rather than merely quiet.
+
 The `ioredis` restriction is the same shape chapter 2.4 gave `pg`: a store keyed
 per tenant gets one home, and an unrestricted client anywhere else is a
 cross-tenant read waiting to be written.
+
+**AND IT ARRIVES TWELVE FILES LATE, WHICH IS THE INTERESTING PART.** A rule
+normally lands before the code it governs. This one lands after: by the time the
+counter store exists, twelve files in this repository already import `ioredis` —
+the api's two publishers, five gateway modules, and five suites that need a client
+belonging to neither service. Every one of them has to be exempted **in the same
+commit that adds the rule**, or the rule reddens a chapter nobody is editing.
+
+<Trap title="A missing exemption is not a silent failure, and that is the only mercy here">
+
+The inverse — an exemption for a rule that does not exist yet — is silent. Add
+`services/api/src/fanout/**` to a rule with no members and nothing happens: eslint
+has no restriction to exempt anything from, the list grows by a dead entry, and the
+first sign of trouble is the day the rule arrives.
+
+That is why the exemptions are **not** one line reading "the gateway's Redis files".
+There are five different arguments among the twelve, and a blanket pattern erases
+all five:
+
+- **Three touch no key at all** — `chan:{channel_id}`, `member:{channel_id}`,
+  `typing:{channel_id}`. A pub/sub subject is not readable; it is only listened to
+  by whoever already subscribed. There is nothing there for a cross-tenant read to
+  reach.
+- **One composes keys and they carry the environment** — `presence:{env}:{user}`,
+  exactly the shape the restriction guards. Its argument is the limiter's own: every
+  key comes from the environment id on the authenticated connection, no path takes
+  one from a client, and there is no scan or pattern read.
+- **One puts the environment FIRST** — `conn:{env}:{user}:{slot}`. That is the
+  strongest case on the list rather than the weakest, because it is structural: a
+  cross-tenant read needs a caller to hand the module another environment's id, and
+  the session layer takes that from the api's verified identity.
+- **Four suites assert on what reaches the fabric**, so the oracle cannot be either
+  service's own client — a spy proves an object was asked to publish, not that a
+  frame arrived.
+- **One suite's raw client is the STIMULUS, not the oracle.** `Membership` exposes
+  `onChange`, `subscribeChannel` and `watch` and no `publish`, because the api
+  publishes and the gateway only ever subscribes. The test needs a client to *cause*
+  a membership change.
+
+Two entries are directory patterns and both are data-access LAYERS: `db/**` for the
+driver and `limits/**` for the counter store. Everything else is a path.
+
+</Trap>
+
+The exemption list's other half is the test that reads it:
+
+```diff title="packages/test-harness/src/driver-exempt.test.ts"
+@@ -12,12 +12,18 @@ import { describe, expect, it } from "vitest";
+ // that no longer needs one.
+ //
+ // There is no second list to compare against. What the list has to agree with is
+ // the TREE, which makes the assertion here read the config's own text — and the
+ // restricted module names are read out of the rule rather than restated, so
+ // adding a third restricted module does not need this file edited.
++//
++// AND THE THIRD ONE ARRIVED, WHICH TESTED THAT CLAIM. The rate-limit chapter
++// restricted `ioredis`; the two checks that read the module names off the rule
++// picked it up with no edit here, exactly as intended. The last check needed one,
++// because it is not about modules at all — it is about which entries may be
++// PATTERNS, and the counter store is a second data-access layer.
+ 
+ const ROOT = join(import.meta.dirname, "..", "..", "..");
+ const CONFIG = join(ROOT, "eslint.config.mjs");
+ 
+ function config(): string {
+   return readFileSync(CONFIG, "utf8");
+@@ -75,13 +81,13 @@ describe("the driver exemption is checked in both directions", () => {
+       );
+       expect(uses, `${path} is exempt from the driver rule and imports none of ${modules.join(", ")}`)
+         .not.toEqual([]);
+     }
+   });
+ 
+-  it("exempts the repository layer as a directory and everything else by path", () => {
++  it("exempts the two data-access layers as directories and everything else by path", () => {
+     const text = config();
+     // FOUND BY SCANNING BACK FROM THE RULE, NOT BY A WINDOW. This read `indexOf("ignores:
+     // [", indexOf("no-restricted-imports") - 2000)` and the 2000 was the whole check: the
+     // block grew by a comment, the real `ignores` fell 2,027 characters before the anchor
+     // — 27 outside the window — and the search silently found the NEXT one instead and
+     // reported `[]`. An empty list is a legitimate-looking answer, so nothing said broken.
+@@ -93,12 +99,19 @@ describe("the driver exemption is checked in both directions", () => {
+       (m) => m[1]!,
+     );
+     // THE POSITIVE CONTROL. Every assertion below is about which of these are globs, and
+     // a parse that found nothing would satisfy all of them.
+     expect(entries.length, "parsed no entries at all — this test is broken, not passing")
+       .toBeGreaterThan(0);
+-    // The directory pattern is legitimate — `services/api/src/db` IS the layer the
+-    // rule carves out. Any OTHER pattern would silently absorb the next file added
+-    // under it, which is the thing this list exists instead of.
+-    expect(entries.filter((g) => g.includes("*"))).toEqual(["services/api/src/db/**"]);
++    // TWO directory patterns and they are the two data-access LAYERS: `db/**` for the
++    // driver and the engine, `limits/**` for the counter store, each of them the thing
++    // the rule carves out rather than a file that happens to need it. Any other pattern
++    // would silently absorb the next file added under it, which is what this list
++    // exists instead of — and the rate-limit chapter arrived with twelve older Redis
++    // clients in the tree, every one of them listed by path above rather than swept up
++    // by `services/gateway/src/**`.
++    expect(entries.filter((g) => g.includes("*"))).toEqual([
++      "services/api/src/db/**",
++      "services/api/src/limits/**",
++    ]);
+   });
+ });
+```
+
+It asserts in both directions — every listed path must exist and must still import
+something the rule restricts — which is how a thirteenth Redis client cannot quietly
+inherit somebody else's exemption, and how a stale entry cannot sit there holding an
+exemption over a file that stopped needing one. **One assertion in it had to be
+amended, and that is the only kind of change this file should ever need**: it said
+exactly one entry may be a directory pattern, and there are two now. The two checks
+that read the restricted module names off the rule needed no edit at all, which is
+what they were written for.
 
 ```diff title="eslint.config.mjs"
 @@ -14,12 +14,23 @@ export default tseslint.config(
@@ -3763,27 +3939,11 @@ cross-tenant read waiting to be written.
 ```
 
 
-```diff title="services/api/package.json"
-@@ -19,8 +19,10 @@
-     "@relay/protocol": "workspace:*",
-     "@relay/service-kit": "workspace:*",
-     "drizzle-orm": "^0.45.2",
-+    "ioredis": "^6.0.0",
-     "jose": "^6.2.7",
-     "nats": "^2.29.3",
-+    "nodemailer": "^9.0.5",
-     "pg": "^8.22.0",
-     "reflect-metadata": "^0.2.2",
-     "rxjs": "^7.8.2",
-@@ -30,6 +32,7 @@
-     "@nestjs/cli": "^11.0.24",
-     "@nestjs/testing": "^11.1.28",
-     "@swc/core": "^1.15.47",
-+    "@types/nodemailer": "^8.0.1",
-     "@types/pg": "^8.20.3",
-     "drizzle-kit": "^0.31.10",
-     "unplugin-swc": "^1.5.9"
-```
+**AND NO NEW DEPENDENCY**, which is worth one line because the limiter is the
+chapter you would expect to add one. `ioredis` is already in `services/api/package.json`:
+the fan-out chapter put it there for the REST send path's publisher. The counter store
+reaches for the client the api already had, and the only thing this chapter adds to
+that file is nothing at all.
 
 
 ## What this chapter does not deliver
