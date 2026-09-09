@@ -3949,7 +3949,990 @@ connection rather than reading them again.
 
 ### What the suites hold
 
-Three of these are earlier chapters' suites, changed only because `request_id`
+The chapter's own suites first. The api's limiter is driven over real HTTP against
+the compose Postgres and Redis, and every send in it names a bot: an application
+credential carries no user of its own, so the sender is seeded once through the
+repository rather than per send — **this suite counts requests**, and an extra call
+per send moves every number in it while leaving the assertions green.
+
+```ts title="services/api/src/limits/limits.itest.ts"
+import "reflect-metadata";
+
+import type { INestApplication } from "@nestjs/common";
+import { Test } from "@nestjs/testing";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+
+import { AppModule } from "../app.module";
+import { createDb, createPool, type Db } from "../db/client";
+import { migrate } from "../db/migrate";
+import {
+  createApiKey,
+  createEnvironment,
+  environmentSigningSecret,
+  Repository,
+} from "../db/repository";
+import { mintUserToken } from "../auth/user-token";
+import { COUNTER_STORE } from "./limits.module";
+import { createCounterStore, type CounterStore } from "./store";
+import { environments } from "../db/schema";
+import { eq } from "drizzle-orm";
+
+// The limiter over real HTTP against the compose Postgres and Redis
+// Each `it` mints what it needs; the suite's own environments
+// keep it out of every other suite's way — 2.1's isolation property paying for
+// itself again.
+
+const HEADERS = {
+  limit: "x-ratelimit-limit",
+  remaining: "x-ratelimit-remaining",
+  reset: "x-ratelimit-reset",
+} as const;
+
+describe("the limiter", () => {
+  let app: INestApplication;
+  let url: string;
+  let db: Db;
+
+  /** An environment with a channel and a key, at whatever limits the caller
+   * asks for. `undefined` leaves the column null, which means "use the
+   * documented default" — and null is not zero. */
+  const seed = async (name: string, limits?: { rest?: number; send?: number }) => {
+    const env = await createEnvironment(db, { name });
+    if (limits) {
+      await db
+        .update(environments)
+        .set({
+          restLimitPerMinute: limits.rest ?? null,
+          sendLimitPerMinute: limits.send ?? null,
+        })
+        .where(eq(environments.id, env.id));
+    }
+    const repo = new Repository(db, env.id);
+    const channel = await repo.createChannel("c", "public");
+    // A BOT SENDER, SEEDED HERE AND NOT IN `send`. An application credential
+    // carries no user of its own, so FR-MSG-15 makes the body name one — and it
+    // must be a BOT: a person named by a key is refused 403, an unknown name 400
+    // (`the sender named in \`user\` is not a user of this environment`). Neither is
+    // a 429, so a fixture short of either turns every assertion in this file into
+    // "the limiter never ran".
+    //
+    // SEEDED ONCE, THROUGH THE REPOSITORY, BECAUSE THIS SUITE COUNTS REQUESTS.
+    // Upserting the bot inside the send helper would add an HTTP call per send,
+    // which moves every number below — and the assertions would still pass, for
+    // the wrong reason.
+    //
+    // NO `addMember`, AND THAT WAS MEASURED RATHER THAN ASSUMED. The first draft
+    // added one on the theory that a non-member send is refused; removing it left
+    // the suite green at 18 of 18, so the row was a claim this fixture does not
+    // need to make.
+    await repo.upsertUser("meter", {
+      display_name: "Meter",
+      kind: "bot",
+      description: "spends this suite's allowance",
+    });
+    const { credential } = await createApiKey(db, { environmentId: env.id });
+    return { env, channelId: channel.id, credential };
+  };
+
+  /** NAMES A SENDER, AND PUBLISHED'S VERSION OF THIS SUITE DID NOT HAVE TO.
+   * `createApiKey` mints an APPLICATION credential, which carries no user of its
+   * own, and FR-MSG-15 makes the send body name one — so `{ text }` alone is a 400
+   * here and every assertion about a 201's headers reads `expected 400 to be 201`.
+   * In the published order the sender chapter came LATER than the limiter; in this
+   * one it is upstream, and a fixture is the first thing a reorder invalidates. */
+  const send = (
+    channelId: string,
+    credential: string,
+    text = "one",
+  ): Promise<Response> =>
+    fetch(`${url}/v1/channels/${channelId}/messages`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${credential}`,
+      },
+      body: JSON.stringify({ text, user: "meter" }),
+    });
+
+  beforeAll(async () => {
+    const pool = createPool();
+    // Migrations here, like every other suite that needs a schema newer than
+    // whatever the database happens to be at. The rate-limit chapter's `0008` adds the
+    // policy columns, and a suite that assumed they existed would pass on a
+    // developer's machine and fail on a fresh one.
+    await migrate(pool);
+    db = createDb(pool);
+    app = (
+      await Test.createTestingModule({ imports: [AppModule] }).compile()
+    ).createNestApplication({ logger: false });
+    await app.listen(0);
+    url = await app.getUrl();
+  }, 60_000);
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  it("carries all three headers on a SUCCESSFUL response", async () => {
+    // FR-RTL-02, and the requirement an afterthought passes: a limiter that only
+    // speaks when it refuses satisfies every test written from the 429.
+    const { channelId, credential } = await seed("limits-headers");
+
+    const res = await send(channelId, credential);
+
+    expect(res.status).toBe(201);
+    expect(res.headers.get(HEADERS.limit)).toBe("600");
+    expect(res.headers.get(HEADERS.remaining)).toBe("599");
+    expect(Number(res.headers.get(HEADERS.reset))).toBeGreaterThan(
+      Math.floor(Date.now() / 1000),
+    );
+  });
+
+  it("counts down across successive responses", async () => {
+    const { channelId, credential } = await seed("limits-countdown");
+
+    const first = await send(channelId, credential);
+    const second = await send(channelId, credential);
+
+    expect(Number(first.headers.get(HEADERS.remaining))).toBe(599);
+    expect(Number(second.headers.get(HEADERS.remaining))).toBe(598);
+  });
+
+  it("refuses with 429, Retry-After, and a four-field body", async () => {
+    // Two requests allowed, the third refused. Testing a threshold means
+    // lowering it — driving 600 requests would measure the test runner.
+    const { channelId, credential } = await seed("limits-refusal", { rest: 2 });
+
+    await send(channelId, credential);
+    await send(channelId, credential);
+    const refused = await send(channelId, credential);
+
+    expect(refused.status).toBe(429);
+    expect(Number(refused.headers.get("retry-after"))).toBeGreaterThan(0);
+    expect(refused.headers.get(HEADERS.remaining)).toBe("0");
+
+    const body = (await refused.json()) as Record<string, unknown>;
+    // TOP-LEVEL, not nested under an `error` key. EIR-API-04's example showed it
+    // nested until this chapter checked what the platform actually sends; the SRS
+    // is amended to 1.3 and the flat shape is the documented one. This assertion
+    // is what stops the next reader of that requirement from "fixing" the code.
+    expect(body["code"]).toBe("rate_limited");
+    expect(typeof body["message"]).toBe("string");
+    expect(typeof body["docs_url"]).toBe("string");
+    expect(typeof body["request_id"]).toBe("string");
+  });
+
+  it("counts a REST send against BOTH budgets, and reports the nearer", async () => {
+    // FR-RTL-01. The send limit counts messages wherever they enter, so a REST send
+    // spends one of each. With `send` set lower than `rest`, the headers must
+    // follow `send` — the one that will refuse first is the only value a client
+    // can schedule against (research R11).
+    const { channelId, credential } = await seed("limits-both", {
+      rest: 100,
+      send: 3,
+    });
+
+    const first = await send(channelId, credential);
+
+    expect(first.headers.get(HEADERS.limit)).toBe("3");
+    expect(first.headers.get(HEADERS.remaining)).toBe("2");
+  });
+
+  it("names WHICH limit was reached, because they are different problems", async () => {
+    // "too many requests" says batch; "too many messages" says slow down. The
+    // code stays `rate_limited` — it is the protocol constant — and the message
+    // carries the distinction. Neither names a credential (NFR-SEC-06).
+    const { channelId, credential } = await seed("limits-which", {
+      rest: 100,
+      send: 1,
+    });
+
+    await send(channelId, credential);
+    const refused = await send(channelId, credential);
+    const body = (await refused.json()) as { message: string };
+
+    expect(refused.status).toBe(429);
+    expect(body.message).toContain("messages");
+    expect(body.message).not.toContain(credential);
+  });
+
+  it("describes the budget that REFUSED, not the one with fewest remaining", async () => {
+    // Both budgets can hit zero remaining in the same request while only one of
+    // them is over. Three sends against `rest: 3` and `send: 2` leave rest at
+    // 3/3 — spent but not over — and send at 3/2, which is. "Fewest remaining"
+    // ties at zero and picks rest, so the refusal used to answer
+    // `X-RateLimit-Limit: 3` above a body reading "too many messages".
+    //
+    // A client cannot act on that. It reads the header, sets its rate to 3 a
+    // minute, and is refused again at 2. Found by capturing the transcript for
+    // the chapter, not by a test — which is the argument for capturing them
+    // (research R41).
+    const { channelId, credential } = await seed("refusal-headers", {
+      rest: 3,
+      send: 2,
+    });
+    await send(channelId, credential, "one");
+    await send(channelId, credential, "two");
+    const refused = await send(channelId, credential, "three");
+    expect(refused.status).toBe(429);
+    expect(refused.headers.get(HEADERS.limit)).toBe("2");
+    expect(((await refused.json()) as { message: string }).message).toMatch(
+      /too many messages/,
+    );
+  });
+
+  it("never limits /healthz, whatever the environment has spent", async () => {
+    // Docker polls it every five seconds and `up -d --wait` depends on the
+    // answer. A limiter that can refuse a health check can stop a deployment.
+    const { channelId, credential } = await seed("limits-health", { rest: 1 });
+    await send(channelId, credential);
+    expect((await send(channelId, credential)).status).toBe(429);
+
+    const health = await fetch(`${url}/healthz`);
+
+    expect(health.status).toBe(200);
+    expect(health.headers.get(HEADERS.limit)).toBeNull();
+  });
+
+  it("does not count the gateway's internal routes as requests", async () => {
+    // THE CASE A PRINCIPAL-BASED EXEMPTION MISSES. The gateway forwards the END
+    // USER's token on `/internal/session`, `/internal/backfill` and
+    // `/internal/messages`, all `@Accepts("user")` — so its calls resolve exactly
+    // like customer traffic and only the route can tell them apart.
+    //
+    // Counting them again would charge a socket send twice and let a reconnect
+    // storm eat a customer's request budget (research R17).
+    const env = await createEnvironment(db, { name: "limits-internal" });
+    await db
+      .update(environments)
+      .set({ restLimitPerMinute: 1 })
+      .where(eq(environments.id, env.id));
+    const repo = new Repository(db, env.id);
+    const user = await repo.createUser("tuan", "Tuan");
+    const channel = await repo.createChannel("fleet", "public");
+    await repo.addMember(channel.id, user.id);
+    const secret = (await environmentSigningSecret(db, env.id))!.signingSecret;
+    const { token } = await mintUserToken(secret, {
+      user: "tuan",
+      environmentId: env.id,
+      ttlSeconds: 3600,
+    });
+
+    // Spend the environment's single request slot on the public path.
+    const { credential } = await createApiKey(db, { environmentId: env.id });
+    await send(channel.id, credential);
+    expect((await send(channel.id, credential)).status).toBe(429);
+
+    // The gateway's door is a different door, and it is still open.
+    const session = await fetch(`${url}/internal/session`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${token}`,
+      },
+    });
+
+    expect(session.status).toBe(200);
+    expect(session.headers.get(HEADERS.limit)).toBeNull();
+  });
+
+  it("does not count the dispatcher, which reaches every environment", async () => {
+    // A limiter that throttles the dispatcher turns one busy customer's webhook
+    // backlog into a stall for every customer — which is FR-WHK-05's failure
+    // (*"delivery shall never delay or block message delivery"*) reached from a
+    // direction that clause does not mention, and what the webhook dispatcher
+    // chapter's retry schedule was built to avoid.
+    //
+    // Unlike the gateway, this one IS recognisable by principal: the platform
+    // credential belongs to a deployment rather than a tenant, so it carries no
+    // environment to key on. Both are exempt; only one of them could have been
+    // exempted by looking at who was asking.
+    const credentialEnv = process.env["RELAY_INTERNAL_CREDENTIAL"];
+    expect(credentialEnv, "the lane must configure a platform credential").toBeTruthy();
+
+    const res = await fetch(`${url}/internal/dispatch/material`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${credentialEnv ?? ""}`,
+      },
+      body: JSON.stringify({ delivery_id: "00000000-0000-0000-0000-000000000000" }),
+    });
+
+    // Whatever it answers about a delivery that does not exist, it is not a 429
+    // and it carries no allowance headers — the route was never counted.
+    expect(res.status).not.toBe(429);
+    expect(res.headers.get(HEADERS.limit)).toBeNull();
+  });
+
+  it("an override applies to ONE environment, not to every environment", async () => {
+    // FR-RTL-04's configurability, and the half the journey map needed: it asks
+    // for "separate keys and separate quotas", so Mai can hammer her dev
+    // environment without moving production's ceiling. Independent counters
+    // would pass a weaker version of this test.
+    const tight = await seed("limits-tight", { rest: 2 });
+    const loose = await seed("limits-loose");
+
+    await send(tight.channelId, tight.credential);
+    await send(tight.channelId, tight.credential);
+    const refused = await send(tight.channelId, tight.credential);
+    const other = await send(loose.channelId, loose.credential);
+
+    expect(refused.status).toBe(429);
+    expect(other.status).toBe(201);
+    expect(other.headers.get(HEADERS.limit)).toBe("600");
+  });
+
+  it("carries the fourth field on EVERY error, not only the 429", async () => {
+    // Constitution V has asked for `code`, `message`, `docs_url` and
+    // `request_id` since chapter 1.3. The platform sent three for twenty-two
+    // chapters, above a comment promising the fourth would "join in Part 2, when
+    // a gateway exists to mint one".
+    //
+    // Four fields on one status and three on the others would be worse than
+    // either consistent answer, so this checks the statuses nobody was thinking
+    // about when the rate limiter was specified.
+    const notFound = await fetch(`${url}/v1/nope`);
+    const unauthorized = await fetch(`${url}/v1/channels/x/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    });
+
+    for (const res of [notFound, unauthorized]) {
+      const body = (await res.json()) as Record<string, unknown>;
+      // TOP-LEVEL, not nested under an `error` key — EIR-API-04's example showed
+      // it nested until this chapter checked, and the SRS is amended to 1.3.
+      expect(body["error"]).toBeUndefined();
+      expect(typeof body["code"]).toBe("string");
+      expect(typeof body["message"]).toBe("string");
+      expect(typeof body["docs_url"]).toBe("string");
+      expect(body["request_id"]).toBe(res.headers.get("x-request-id"));
+    }
+  });
+
+  it("refuses an address past the failed-auth threshold, and says nothing extra", async () => {
+    // FR-AUT-12 and EIR-API-04. Past the threshold the refusal must be
+    // INDISTINGUISHABLE from a wrong-credential refusal — a limiter that answers
+    // differently for a credential it would have accepted is an oracle.
+    //
+    // Its own key prefix, because the lane runs files in parallel and every
+    // suite asserting a 401 from loopback lands in one bucket. A suite that
+    // needs a LOW threshold needs a private key, not a private number
+    // (research R21).
+    const previousPrefix = process.env["RELAY_AUTH_KEY_PREFIX"];
+    const previousThreshold = process.env["RELAY_AUTH_FAILURES_PER_MINUTE"];
+    process.env["RELAY_AUTH_KEY_PREFIX"] = `rlauth-itest-${Date.now()}`;
+    process.env["RELAY_AUTH_FAILURES_PER_MINUTE"] = "3";
+    try {
+      const bad = () =>
+        fetch(`${url}/v1/channels/x/messages`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: "Bearer rk_live_not_a_real_key_at_all_000000",
+          },
+          body: JSON.stringify({ text: "hi" }),
+        });
+
+      const first = await bad();
+      expect(first.status).toBe(401);
+
+      await bad();
+      await bad();
+      const refused = await bad();
+
+      expect(refused.status).toBe(429);
+      const body = (await refused.json()) as { code: string; message: string };
+      expect(body.code).toBe("rate_limited");
+      // Never the credential (NFR-SEC-06), and no hint about whether it was
+      // valid.
+      expect(body.message).not.toContain("rk_live");
+      expect(body.message).not.toContain("valid");
+    } finally {
+      if (previousPrefix === undefined) delete process.env["RELAY_AUTH_KEY_PREFIX"];
+      else process.env["RELAY_AUTH_KEY_PREFIX"] = previousPrefix;
+      if (previousThreshold === undefined)
+        delete process.env["RELAY_AUTH_FAILURES_PER_MINUTE"];
+      else process.env["RELAY_AUTH_FAILURES_PER_MINUTE"] = previousThreshold;
+    }
+  });
+
+  it("counts ten client addresses as ten, not as one gateway", async () => {
+    // FR-AUT-12. A handshake authenticated through the gateway reaches the api FROM
+    // the gateway, so counting the TCP peer would put every customer's failures
+    // in one bucket and let one attacker exhaust a threshold that then refused
+    // everybody.
+    //
+    // The address rides the internal contract as a field rather than a header,
+    // because a header the caller asserts is a header the caller can forge —
+    // The credentials chapter removed exactly that pattern.
+    const previousPrefix = process.env["RELAY_AUTH_KEY_PREFIX"];
+    const previousThreshold = process.env["RELAY_AUTH_FAILURES_PER_MINUTE"];
+    process.env["RELAY_AUTH_KEY_PREFIX"] = `rlauth-fleet-${Date.now()}`;
+    process.env["RELAY_AUTH_FAILURES_PER_MINUTE"] = "3";
+    try {
+      // Ten distinct clients, one bad handshake each, all arriving from this
+      // process — which is what the gateway looks like to the api.
+      for (let i = 0; i < 10; i++) {
+        const res = await fetch(`${url}/internal/session`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: "Bearer not.a.real.token",
+          },
+          body: JSON.stringify({ client_address: `198.51.100.${i}` }),
+        });
+        // Every one is a 401: ten addresses, one failure each, none over three.
+        expect(res.status, `client ${i} should be refused for its credential`).toBe(
+          401,
+        );
+      }
+    } finally {
+      if (previousPrefix === undefined) delete process.env["RELAY_AUTH_KEY_PREFIX"];
+      else process.env["RELAY_AUTH_KEY_PREFIX"] = previousPrefix;
+      if (previousThreshold === undefined)
+        delete process.env["RELAY_AUTH_FAILURES_PER_MINUTE"];
+      else process.env["RELAY_AUTH_FAILURES_PER_MINUTE"] = previousThreshold;
+    }
+  });
+
+  it("limits account creation per address, which has no tenant to key on", async () => {
+    // FR-AUT-12. Signup has no environment — that is the point of it — and no
+    // guard, so neither the per-environment limiter nor `CredentialGuard`'s
+    // refusal reaches it. An unlimited account-creation route in a platform that
+    // limits everything else is a gap a reader notices.
+    const previousPrefix = process.env["RELAY_AUTH_KEY_PREFIX"];
+    const previousThreshold = process.env["RELAY_AUTH_FAILURES_PER_MINUTE"];
+    process.env["RELAY_AUTH_KEY_PREFIX"] = `rlauth-signup-${Date.now()}`;
+    process.env["RELAY_AUTH_FAILURES_PER_MINUTE"] = "2";
+    try {
+      const start = () =>
+        fetch(`${url}/auth/github/start`, { redirect: "manual" });
+
+      // Two allowed, whatever they answer — an unconfigured provider is a 404 and
+      // that is not what is under test here.
+      expect((await start()).status).not.toBe(429);
+      expect((await start()).status).not.toBe(429);
+
+      expect((await start()).status).toBe(429);
+    } finally {
+      if (previousPrefix === undefined) delete process.env["RELAY_AUTH_KEY_PREFIX"];
+      else process.env["RELAY_AUTH_KEY_PREFIX"] = previousPrefix;
+      if (previousThreshold === undefined)
+        delete process.env["RELAY_AUTH_FAILURES_PER_MINUTE"];
+      else process.env["RELAY_AUTH_FAILURES_PER_MINUTE"] = previousThreshold;
+    }
+  });
+
+  it("two environments carry DIFFERENT configured limits, each at its own number", async () => {
+    // Independent counters are half of what the journey map asks for. The other
+    // half is "separate keys and separate quotas": a developer raises her dev
+    // environment's ceiling and hammers it without moving production's.
+    //
+    // The previous test proves an override applies. This one proves it applies to
+    // ONE environment — a shared policy would pass the first and fail here.
+    const dev = await seed("limits-dev", { rest: 5 });
+    const prod = await seed("limits-prod", { rest: 2 });
+
+    const devFirst = await send(dev.channelId, dev.credential);
+    const prodFirst = await send(prod.channelId, prod.credential);
+
+    expect(devFirst.headers.get(HEADERS.limit)).toBe("5");
+    expect(prodFirst.headers.get(HEADERS.limit)).toBe("2");
+
+    // Production runs out at two; development still has room at three.
+    await send(prod.channelId, prod.credential);
+    expect((await send(prod.channelId, prod.credential)).status).toBe(429);
+    expect((await send(dev.channelId, dev.credential)).status).toBe(201);
+  });
+});
+
+// The failure direction, which is what this chapter is actually about
+// (SAD §6.3, FR-AUT-12, FR-RTL-02, research R3, R6).
+//
+// A REAL ioredis client against a dead port, not a mock that throws. The
+// question is what the platform does when a store it depends on is gone, and a
+// stub that rejects on command would answer a different question — it would skip
+// connection handling, which is where the first draft of `store.ts` got it wrong.
+//
+// A dead port rather than stopping the container, because the lane runs files in
+// PARALLEL and stopping Redis would break every other suite mid-run.
+describe("when the counter store is gone", () => {
+  let app: INestApplication;
+  let url: string;
+  let db: Db;
+  let channelId: string;
+  let credential: string;
+  let deadStore: CounterStore;
+
+  beforeAll(async () => {
+    const pool = createPool();
+    await migrate(pool);
+    db = createDb(pool);
+    const env = await createEnvironment(db, { name: "limits-degraded" });
+    const repo = new Repository(db, env.id);
+    channelId = (await repo.createChannel("c", "public")).id;
+    // Its own bot, because this block seeds its own environment rather than
+    // calling `seed()`. Same name, so the sends below read the same as the
+    // others, and the reason is the note on that fixture: the test under this one
+    // asserts a 201, and a 4xx for a missing or non-bot sender would turn "the
+    // limiter failed OPEN" into "the request was refused for something else".
+    await repo.upsertUser("meter", {
+      display_name: "Meter",
+      kind: "bot",
+      description: "spends this suite's allowance while the store is gone",
+    });
+    credential = (await createApiKey(db, { environmentId: env.id })).credential;
+
+    // Port 1 is reserved and nothing listens on it.
+    deadStore = createCounterStore("redis://127.0.0.1:1");
+    app = (
+      await Test.createTestingModule({ imports: [AppModule] })
+        .overrideProvider(COUNTER_STORE)
+        .useValue(deadStore)
+        .compile()
+    ).createNestApplication({ logger: false });
+    await app.listen(0);
+    url = await app.getUrl();
+  }, 60_000);
+
+  afterAll(async () => {
+    await app.close();
+    await deadStore.close();
+  });
+
+  it("SERVES the request rather than refusing it", async () => {
+    // Redis is not a source of truth (SAD §6.3), and a cache outage is not a
+    // reason to refuse a paying customer's traffic. This is the direction the
+    // tenant limiter fails in, and it is a decision rather than an accident.
+    const res = await fetch(`${url}/v1/channels/${channelId}/messages`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${credential}`,
+      },
+      body: JSON.stringify({ text: "served anyway", user: "meter" }),
+    });
+
+    expect(res.status).toBe(201);
+  });
+
+  it("keeps Limit and DROPS Remaining and Reset, rather than inventing them", async () => {
+    // FR-RTL-02. `Limit` is policy read from Postgres and is not degraded. The other
+    // two exist only because something was counting, and a client must be able to
+    // tell "you have N left" from "we are not counting".
+    //
+    // NOT a sentinel: a client that does not know `-1` would parse it as a number
+    // and conclude it was over its limit (research R6).
+    const res = await fetch(`${url}/v1/channels/${channelId}/messages`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${credential}`,
+      },
+      body: JSON.stringify({ text: "no counts", user: "meter" }),
+    });
+
+    expect(res.headers.get(HEADERS.limit)).toBe("600");
+    expect(res.headers.get(HEADERS.remaining)).toBeNull();
+    expect(res.headers.get(HEADERS.reset)).toBeNull();
+  });
+
+  it("does NOT let an address spend an unlimited number of failed logins", async () => {
+    // The other direction, in the same outage, and the reason the chapter exists.
+    // Failing open here is not a degradation — it is a brute-force window. The
+    // in-process fallback holds the same threshold per instance, so the guarantee
+    // weakens from N per window per fleet to N per window per instance rather
+    // than disappearing.
+    const previous = process.env["RELAY_AUTH_FAILURES_PER_MINUTE"];
+    process.env["RELAY_AUTH_FAILURES_PER_MINUTE"] = "3";
+    try {
+      const bad = () =>
+        fetch(`${url}/v1/channels/${channelId}/messages`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: "Bearer rk_live_still_not_a_real_key_0000000",
+          },
+          body: JSON.stringify({ text: "hi" }),
+        });
+
+      expect((await bad()).status).toBe(401);
+      await bad();
+      await bad();
+
+      expect((await bad()).status).toBe(429);
+    } finally {
+      if (previous === undefined)
+        delete process.env["RELAY_AUTH_FAILURES_PER_MINUTE"];
+      else process.env["RELAY_AUTH_FAILURES_PER_MINUTE"] = previous;
+    }
+  });
+});
+```
+
+```ts title="services/gateway/src/limits.test.ts"
+import { readFile } from "node:fs/promises";
+
+import { describe, expect, it } from "vitest";
+
+import { createGatewayLimits, decide, overLimit, windowStartFor } from "./limits.js";
+
+// The gateway's share of the arithmetic. Pure, so a window
+// boundary is a test rather than a wait.
+
+const MINUTE = 60_000;
+
+describe("windowStartFor", () => {
+  it("floors to the window, so two instances agree without talking", () => {
+    expect(windowStartFor(90_000, MINUTE)).toBe(60_000);
+    expect(windowStartFor(59_999, MINUTE)).toBe(0);
+  });
+});
+
+describe("overLimit", () => {
+  it("is false below the limit and true at it", () => {
+    expect(overLimit(599, 600)).toBe(false);
+    expect(overLimit(600, 600)).toBe(false);
+    expect(overLimit(601, 600)).toBe(true);
+  });
+
+  it("TREATS AN UNKNOWN COUNT AS UNDER THE LIMIT", () => {
+    // `null` means the store could not be reached. The gateway's two limits are
+    // TENANT limits — they protect Relay's capacity from a customer's traffic —
+    // so they fail open, exactly as the api's do. This is the direction that is
+    // right here and wrong for the auth limiter, which is the chapter's whole
+    // argument (research R3).
+    expect(overLimit(null, 600)).toBe(false);
+  });
+
+  it("a limit of zero refuses everything, and that is expressible on purpose", () => {
+    // Null in the policy column means "use the default"; zero means "refuse
+    // everything", and an environment can be switched off deliberately. The two
+    // states cannot share a representation, so zero has to behave.
+    expect(overLimit(1, 0)).toBe(true);
+  });
+});
+
+describe("decide", () => {
+  const at = (ms: number, count: number | null, limit = 600) =>
+    decide(count, limit, ms, MINUTE);
+
+  it("reports the reset as one moment, not a curve", () => {
+    // The whole reason this is a fixed window and not a token bucket: a
+    // refilling bucket's honest answer to "when may I retry" is a slope, and
+    // `X-RateLimit-Reset` has room for one number.
+    expect(at(90_000, 601).resetSeconds).toBe(120);
+    expect(at(119_999, 601).resetSeconds).toBe(120);
+  });
+
+  it("never asks a client to retry in zero seconds", () => {
+    // 1ms before the boundary the honest answer rounds to 0, and a client that
+    // obeys it retries into the same refusal.
+    expect(at(119_999, 601).retryAfterSeconds).toBe(1);
+    expect(at(60_000, 601).retryAfterSeconds).toBe(60);
+  });
+
+  it("floors remaining at zero rather than going negative", () => {
+    expect(at(0, 605).remaining).toBe(0);
+    expect(at(0, 599).remaining).toBe(1);
+  });
+
+  it("reports a full allowance when the store is unreachable", () => {
+    // Fail-open all the way through: not over, and the headers say so rather
+    // than reporting a count the gateway does not have.
+    expect(at(0, null)).toMatchObject({ over: false, remaining: 600 });
+  });
+});
+
+describe("the gateway's dependencies (ADR-05)", () => {
+  it("gains no database client, which is the property R12 exists to protect", async () => {
+    // ADR-05: the gateway never touches Postgres. The rate-limit chapter needed the
+    // environment's limits, which live in Postgres, and the tempting fix was a
+    // read-only pool "just for this". R12 spent its whole argument on why not —
+    // and then nothing checked it, which is how a design statement becomes a
+    // comment. The limits ride the authentication response the gateway was
+    // already making, so this file's manifest can stay clean.
+    const manifest = JSON.parse(
+      await readFile(new URL("../package.json", import.meta.url), "utf8"),
+    ) as { dependencies: Record<string, string> };
+    const runtime = Object.keys(manifest.dependencies);
+    for (const forbidden of ["pg", "postgres", "drizzle-orm", "@relay/db"]) {
+      expect(runtime).not.toContain(forbidden);
+    }
+    // `ioredis` IS here, and that is a different claim: Redis is a cache the
+    // gateway may hold, Postgres is the source of truth it may not (SAD §6.3).
+    expect(runtime).toContain("ioredis");
+    // `@relay/api` sits in devDependencies for the integration harness, and it
+    // does bring Postgres with it — into the test process, never into `dist`.
+    expect(runtime).not.toContain("@relay/api");
+  });
+});
+
+describe("a store that is not there", () => {
+  it("FAILS OPEN, and stops paying the connect timeout on every call", async () => {
+    // Port 1 answers nothing. The first `spend` waits out the connect timeout
+    // and fails open; the second must NOT — a cache outage that turns every
+    // handshake into a one-second wait has converted an unavailable limiter
+    // into an unavailable gateway, and NFR-PRF-04 asks for a handshake under a
+    // second (research R34).
+    const limits = createGatewayLimits("redis://127.0.0.1:1");
+    try {
+      const first = await limits.spend("env-1", "connect", 600);
+      expect(first.over).toBe(false);
+      expect(first.remaining).toBe(600);
+
+      const started = Date.now();
+      const second = await limits.spend("env-1", "connect", 600);
+      expect(second.over).toBe(false);
+      // Not "fast enough to feel nice" — fast enough that it cannot have made
+      // a connection attempt, whose timeout is a full second.
+      expect(Date.now() - started).toBeLessThan(100);
+    } finally {
+      await limits.close();
+    }
+  }, 15_000);
+});
+```
+
+Two earlier suites raise the failed-authentication threshold on purpose, and both
+now take a counter bucket of their own. Raising the threshold is private to a vitest
+worker; **the Redis key is not**. A suite that raises its ceiling and keeps the
+default prefix pushes a shared count up while being personally immune to it — 8 from
+one and 13 from the other against a threshold of 10, refused by nothing, and only
+because the suites that spawn a child reach the api over `::ffff:127.0.0.1` while
+the in-process one reaches it over `::1`. Two spellings of localhost were the whole
+of the isolation.
+
+```diff title="services/api/src/auth/credentials.itest.ts"
+@@ -15,12 +15,13 @@ import {
+   provisionOrganisation,
+   Repository,
+   revokeApiKey,
+ } from "../db/repository";
+ import { parseApiKeyCredential } from "./api-key";
+ import { MAX_TOKEN_LIFETIME_SECONDS } from "./user-token";
++import { withoutRequestId } from "../isolation/compare";
+ 
+ // The refusals, over real HTTP against the compose Postgres.
+ // Invariants 1-7, 9 and 11 of contracts/credentials.md live here; 8 and 12 are
+ // pure and live in the unit lane; 10 needs a socket and lives in the gateway's
+ // session.itest.ts.
+ //
+@@ -84,12 +85,37 @@ describe("credentials", () => {
+       .setIssuedAt(over.iat ?? now)
+       .setExpirationTime(over.exp ?? now + 3600)
+       .sign(new TextEncoder().encode(secret));
+   };
+ 
+   beforeAll(async () => {
++    // This suite submits bad credentials ON PURPOSE — that is what
++    // it is for — and the failed-authentication limiter counts them all against
++    // one loopback address. The default is ten a minute.
++    //
++    // RAISING WORKS HOWEVER POLLUTED THE SHARED COUNT, which is why this is a
++    // threshold and not a private key: the integration lane runs files in
++    // parallel, every suite asserting a `401` lands in the same bucket, and a
++    // high ceiling never refuses. A suite needing a LOW threshold needs its own
++    // key instead — see `limits.itest.ts` (research R21).
++    //
++    // Explicit and visible, rather than the default being chosen to suit the
++    // tests. The retry-and-disable chapter's `RELAY_DISABLE_SWEEP` states the rule: a flag whose
++    // default disabled a requirement would be a requirement nobody had built.
++    process.env["RELAY_AUTH_FAILURES_PER_MINUTE"] = "10000";
++    // AND ITS OWN BUCKET. Raising the threshold is private to this worker —
++    // vitest gives each file its own process — but the Redis key is not, so a
++    // suite that raises its ceiling and keeps the default prefix pushes a SHARED
++    // count up while being personally immune to it. T004a measured this file's
++    // contribution to the default bucket at 8 and signup's at 13, against a
++    // threshold of 10: nothing was refused, and only because the suites that
++    // spawn a child reach the api over `::ffff:127.0.0.1` while this one reaches
++    // it in-process over `::1`. Two address formats were the whole of the
++    // isolation. Now it is a prefix, which is a decision rather than an accident.
++    process.env["RELAY_AUTH_KEY_PREFIX"] =
++      `rlauth-credentials-${Date.now()}`;
+     db = createDb(createPool());
+ 
+     env = await createEnvironment(db, { name: "credentials-itest" });
+     key = await createApiKey(db, { environmentId: env.id });
+     const repo = new Repository(db, env.id);
+     channelId = (await repo.createChannel("general", "public")).id;
+@@ -214,13 +240,15 @@ describe("credentials", () => {
+       { text: "nowhere", user: "cred-bot" },
+       key.credential,
+       "00000000-0000-0000-0000-000000000000",
+     );
+     expect(foreignAnswer.status).toBe(404);
+     expect(absentAnswer.status).toBe(404);
+-    expect(await foreignAnswer.json()).toEqual(await absentAnswer.json());
++    expect(withoutRequestId(await foreignAnswer.json())).toEqual(
++      withoutRequestId(await absentAnswer.json()),
++    );
+ 
+     // And the reverse direction, so the test cannot pass by both being broken.
+     expect(
+       (await post({ text: "mine", user: "cred-bot" }, foreignKey.credential, foreignChannelId))
+         .status,
+     ).toBe(201);
+```
+
+```diff title="services/api/src/tenancy/signup.itest.ts"
+@@ -46,12 +46,32 @@ describe("signup", () => {
+   let app: INestApplication;
+   let url: string;
+   let db: ReturnType<typeof createDb>;
+   let provider: Awaited<ReturnType<typeof standInProvider>>;
+ 
+   beforeAll(async () => {
++    // The rate-limit chapter limited account creation per source address (FR-AUT-12), and this
++    // suite drives the signup routes repeatedly from one loopback address — which
++    // is what a suite about signup does.
++    //
++    // Raised explicitly and visibly, rather than the default being chosen to suit
++    // the tests. The same move `credentials.itest.ts` makes for the
++    // failed-authentication threshold, and for the same reason: raising survives a
++    // shared count, lowering does not (research R21).
++    process.env["RELAY_AUTH_FAILURES_PER_MINUTE"] = "10000";
++    // AND ITS OWN BUCKET. Raising the threshold is private to this worker —
++    // vitest gives each file its own process — but the Redis key is not, so a
++    // suite that raises its ceiling and keeps the default prefix pushes a SHARED
++    // count up while being personally immune to it. T004a measured the credentials
++    // suite's contribution to the default bucket at 8 and THIS file's at 13, against
++    // a threshold of 10: nothing was refused, and only because the suites that
++    // spawn a child reach the api over `::ffff:127.0.0.1` while this one reaches
++    // it in-process over `::1`. Two address formats were the whole of the
++    // isolation. Now it is a prefix, which is a decision rather than an accident.
++    process.env["RELAY_AUTH_KEY_PREFIX"] =
++      `rlauth-signup-${Date.now()}`;
+     db = createDb(createPool());
+     provider = await standInProvider({
+       id: 90210,
+       login: "tuan",
+       name: "Tuan",
+     });
+```
+
+Two gateway suites forge one frame per union member to prove the seam refuses an
+outbound type by DIRECTION, and both carried a note explaining why the `error`
+sample omits `request_id`. Every clause of it was true and the conclusion inverted
+the moment the field became required: the same `strictObject` that refused an extra
+field now refuses its absence, and nine direction assertions came back
+`invalid_frame`. **Which fields make a sample valid is a fact about the schema on the
+day, not a rule to be stated once.**
+
+```diff title="services/gateway/src/isolation.itest.ts"
+@@ -818,19 +818,28 @@ function sample(type: string, channel: string, user: string): unknown {
+       return { type, payload: { channel, user, change: "added" } };
+     case "presence.changed":
+       return { type, payload: { user, state: "online" } };
+     case "typing":
+       return { type, payload: { channel, user } };
+     case "error":
+-      // NO `request_id`. The payload is a `strictObject`, so an extra field is refused
+-      // as `invalid_frame` — and this loop asserts `unknown_frame_type`, which is a
+-      // claim about DIRECTION. A sample that fails validation tests the validator
+-      // instead, and the assertion then passes or fails for the wrong reason.
++      // A `request_id`, AND THIS COMMENT USED TO SAY *"NO `request_id`"* — for the
++      // right reason, until the field existed. The payload is a `strictObject`, so it
++      // refused an extra field then and refuses a MISSING one now that the limits
++      // chapter made `request_id` required. Either way the sample must be exactly
++      // what the schema of the day accepts, because this loop asserts
++      // `unknown_frame_type`, a claim about DIRECTION: a sample that fails validation
++      // tests the validator instead, and the assertion then passes or fails for the
++      // wrong reason. `session.itest.ts`'s builder carries the same correction.
+       return {
+         type,
+-        payload: { code: "forged", message: "forged", docs_url: "/x" },
++        payload: {
++          code: "forged",
++          message: "forged",
++          docs_url: "/x",
++          request_id: randomUUID(),
++        },
+       };
+     default:
+       return { type, payload: { idem_key: randomUUID(), channel, text: "forged" } };
+   }
+ }
+```
+
+```diff title="services/gateway/src/session.itest.ts"
+@@ -1238,22 +1238,31 @@ describe("the socket's delivery, with a fan-out attached", () => {
+         return { type, payload: { channel, user: "tuan", change: "added" } };
+       case "presence.changed":
+         return { type, payload: { user: "tuan", state: "online" } };
+       case "typing":
+         return { type, payload: { channel, user: "tuan" } };
+       default:
+-      // NO `request_id` IN THE ERROR SAMPLE. The payload is a `strictObject`, so an
+-      // extra field is refused as `invalid_frame` — and this loop asserts
+-      // `unknown_frame_type`, which is a claim about DIRECTION. A sample that fails
+-      // validation tests the validator instead.
++      // A `request_id` IN THE ERROR SAMPLE, AND THIS COMMENT USED TO SAY THE OPPOSITE.
++      // It read *"NO `request_id` IN THE ERROR SAMPLE — the payload is a `strictObject`,
++      // so an extra field is refused as `invalid_frame`"*, and it was right for exactly
++      // as long as the field did not exist. The limits chapter makes it REQUIRED, so
++      // the same `strictObject` now refuses the sample for its ABSENCE, and the loop's
++      // nine direction assertions came back `invalid_frame` — the failure this
++      // builder's own header warns about, arriving from the other side.
++      //
++      // The unchanged half is the reason: this loop asserts `unknown_frame_type`, a
++      // claim about DIRECTION, and a sample that fails validation tests the validator
++      // instead. Which fields make a sample valid is a fact about the schema on the
++      // day, not a rule to be stated once.
+         return {
+           type,
+           payload: {
+             code: "forged",
+             message: "forged",
+             docs_url: "/x",
++            request_id: randomUUID(),
+           },
+         };
+     }
+   };
+ 
+   /** T034 — T009 INVERTED, and the same shape on purpose.
+```
+
+And the dispatcher's drain gets a batch large enough to reach its own delivery,
+which is the chapter's first commit and has nothing to do with limits: a batch sized
+below what the lane leaves claimable asserts on whatever else was lying about.
+
+```diff title="services/dispatcher/src/dispatcher.itest.ts"
+@@ -264,12 +264,28 @@ describe("the dispatcher", () => {
+     const r = relay.createDeliveryRelay({
+       db,
+       publisher: publisherMod.createJetStreamPublisher({
+         ensure: relay.ensureDeliveriesStream,
+       }),
+       logger: kit.createLogger("itest-relay"),
++      // A BATCH BIG ENOUGH TO REACH THIS TEST'S OWN DELIVERY. `drainOnce` is
++      // global: it takes the fifty oldest due deliveries in the platform,
++      // oldest first, and this suite's is the newest. Every earlier suite in the
++      // run leaves due deliveries behind, so once more than fifty of them
++      // accumulate the batch fills before reaching ours, the poll times out at
++      // eight seconds, and `expected 0 to be greater than 0` is what a reader
++      // sees.
++      //
++      // It only bites in the COVERAGE lane, where `fileParallelism: false` puts
++      // every suite in one process against one database. The failing run drains
++      // the backlog itself, so the next run passes — which is why it reads as a
++      // flake rather than as the threshold it is.
++      //
++      // Found at the rate-limit chapter's baseline. The deduplication chapter fixed the same global drain
++      // in `deliveries.itest.ts` twice and never looked at this door.
++      batchSize: 10_000,
+     });
+     return r.drainOnce();
+   };
+ 
+   /** As `deliverEvent`, but with a tenant's message text in the payload — so
+    * invariant 15 has something that must NOT appear in a log line. */
+```
+
+Three more are earlier chapters' suites, changed only because `request_id`
 made two error bodies that must be indistinguishable differ in a field that says
 nothing about either. `test-event.itest.ts` loses one more line: the retry-and-disable chapter
 labelled it with a range of that feature's own working numbers, which resolve
@@ -5102,7 +6085,8 @@ Naming a dependency is the difference between a scope decision and a silent gap.
 
 - `rate_limited` emitted for the first time since 1.3 declared it — REST, the
   frame refusal, and the pre-handshake 429.
-- `request_id` on every error the platform produces.
+- `request_id` on every error the platform produces, and twenty-three
+  tenant-isolation tests told which field to ignore.
 - `4008` and `4009` still emitted by nothing, with a test that says so and can
   fail.
 - Three headers on every 2xx as well as every 429, reporting the budget that
@@ -5110,9 +6094,14 @@ Naming a dependency is the difference between a scope decision and a silent gap.
 - The tenant limiter serves when Redis is gone; the auth limiter refuses.
 - Two services, one bucket: five REST sends and five frames leave
   `rl:{env}:send:{window}` at 10.
-- Both lanes green; coverage 89.50% statements and 82.73% branches, up from
-  86.55% and 78.07%.
-- Tag `part3-ch8`.
+- A typing signal spends none of it, asserted on the limiter rather than on a
+  counter.
+- Twelve `ioredis` exemptions with five arguments between them, all in the commit
+  that adds the rule, and both directions of the list asserted.
+- Both lanes green. Integration: 37 files, 759 tests, 6m10s. Coverage: 80 files,
+  1,183 tests, 368.17 s — 92.39% statements, 86.50% branches, 92.09% functions,
+  93.83% lines, every per-file pin held.
+- Tag `rework/part3-ch22`.
 
 </Checkpoint>
 
