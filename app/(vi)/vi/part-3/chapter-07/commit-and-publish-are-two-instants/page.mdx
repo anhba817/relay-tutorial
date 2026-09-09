@@ -1,9 +1,12 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
 import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figTwoInstants, figFourQuadrants, figWhereTheMarkLives } from "./figures";
 
 export const metadata = {
   title: "Commit và publish là hai khoảnh khắc — Building Relay",
   description:
-    "Bản dịch tiếng Việt của chương này đang được chuẩn bị. Toàn bộ mã nguồn bên dưới giữ nguyên như bản tiếng Anh.",
+    "Chương 2.7 chưa thật sự khép race mà nó được đặt tên theo. Message durable ở một thời điểm và được announce ở thời điểm khác; mọi thứ đọc giữa hai mốc thấy một state không mốc nào mô tả.",
   alternates: {
     canonical: "/vi/part-3/chapter-07/commit-and-publish-are-two-instants",
     languages: {
@@ -15,11 +18,55 @@ export const metadata = {
 
 <ChapterHeader id="3.7" locale="vi" />
 
-> **Bản dịch đang được chuẩn bị.** Phần diễn giải của chương này chưa được dịch sang
-> tiếng Việt. Các khối mã bên dưới là bản gốc tiếng Anh và giống hệt bản tiếng Anh của
-> chương — bạn có thể gõ theo chúng ngay bây giờ. Bản dịch đầy đủ sẽ thay thế trang này.
+Chương 2.7 là nơi series gọi là flagship bug. Nó dựng resume protocol, mô tả race
+duplicate/gap, khép bằng overlap-plus-dedup và chứng minh bằng ba test. Nhưng nó chưa
+khép được race.
 
-## Two instants
+Client reconnect vẫn có thể nhận cùng message hai lần. Property là FR-RTM-03 — *không
+gap và không double* — và milestone suite 2.8 assert mỗi lần chạy. Nó sai suốt bảy chương.
+Chương này chỉ có bốn dòng logic cùng một cuộc điều tra dài vì sao chúng bị thiếu.
+
+<SkipAhead>
+
+Nếu buộc phải bỏ qua: gateway commit message qua API rồi **sau đó** publish lên Redis.
+Giữa hai statement, message durable nhưng chưa announce. Resume backfill query rơi vào
+khoảng đó sẽ trả message, đặt high-water mark, flush, chuyển live; publish tới sau khi
+dedup window đã đóng vì mark 2.7 là local variable bị `resume()` bỏ. Fix giữ mark trên
+`Connection` và hỏi nó trong `deliver()`. Mark **không bao giờ retire**: hai gateway
+instance publish không coordination, sequence cao nhanh có thể vượt sequence thấp bị
+delay; retire theo số cao sẽ nhận duplicate thấp. State được bound bởi
+`MAX_RESUME_CHANNELS`, vốn đã cap cursor. Trạng thái cuối là **`part3-ch7`**.
+
+</SkipAhead>
+
+## Hai thời điểm
+
+Đây là send path của gateway, không đổi từ 2.6. Hãy đọc hai `await` như hai thời điểm,
+không phải một operation. Sau await đầu, message ở PostgreSQL, có sequence và durable;
+mọi query, gồm resume backfill, thấy nó. Sau await hai, fabric biết và mọi gateway
+subscribe sẽ deliver.
+
+**Giữa hai mốc, message tồn tại nhưng chưa được announce**, state mà reasoning 2.7 không
+đặt tên.
+
+<Figure caption="Backfill query rơi giữa commit và publish. Khi fabric bắt kịp, resume đã kết thúc." code={figTwoInstants} />
+
+Đó là toàn bộ defect. Backfill trả sequence 4, mark thành 4, connection flush rồi live;
+delayed publish mới đến và deliver sequence client vừa nhận.
+
+<Why title="Vì sao lập luận chương 2.7 gần đúng đến vậy">
+
+Header của nó xét hai ordering. Backfill-then-subscribe làm rơi publish trong window;
+subscribe-then-deliver gửi overlap hai lần. Kết luận “không cần order tốt hơn mà cần
+overlap plus dedup” đúng, implementation cũng làm vậy.
+
+Gap nằm trong model: nó coi message tồn tại ở một instant, nên “publish trong resume” và
+“commit trong resume” là một event. Không phải; chúng cách nhau network round trip và
+Redis publish. Comment e2e nói frame có thể ở backfill, buffer hoặc cả hai. Ba trường hợp
+đều được xử lý. Trường hợp thứ tư — ở backfill rồi deliver live sau đó — bị bỏ vì model
+giả publish trong resume luôn vào buffer; điều đó chỉ đúng khi connection còn buffering.
+
+</Why>
 
 ```ts title="services/gateway/src/session.ts (excerpt)"
 const committed = await api.sendMessage(connection.identity, { … });
@@ -30,7 +77,29 @@ if (!committed.duplicate && committed.text !== null) {
 }
 ```
 
-## Three of four quadrants
+## Ba trong bốn quadrant
+
+`resume.itest.ts` có ba test. Đặt lên hai axis — frame publish lúc nào và sequence có
+thấp hơn hoặc bằng mark không — ta thấy ngay ô bị thiếu.
+
+<Figure caption="Model ba case tạo suite ba test. Matrix có bốn." code={figFourQuadrants} />
+
+Test ba publish `frame(44)` sau resume rồi assert nó tới. Test thiếu publish `frame(42)` —
+sequence backfill đã gửi — và assert nó không tới. **Chỉ cách một con số.** Suite được
+viết từ model ba case nên có ba test; không ai vẽ matrix.
+
+Ba test mới chạy trên code cũ làm hai test fail: `[ 42, 42 ]`, bốn giây, mọi lần, với
+stubbed API và Redis thật.
+
+<Trap title="Test thứ ba pass trước fix, và điều đó đúng">
+
+Degraded-resume test publish low sequence sau failed resume và yêu cầu nó tới; code chưa
+fix vẫn pass vì chưa gì suppress. Test không xấu hay redundant: nó bảo vệ hướng change
+có thể phá, khi suppression biến thành loss. Constitution II xếp gap tệ hơn duplicate,
+nên cần test fail nếu fix suppress quá tay. Regression test pass trước change thường
+chính là test bảo vệ ta khỏi change.
+
+</Trap>
 
 ```diff title="services/gateway/src/resume.itest.ts"
 @@ -191,7 +191,123 @@ describe("resume across a real fabric", () => {
@@ -168,7 +237,18 @@ $ pnpm --filter @relay/gateway test:integration src/resume.itest.ts
 AssertionError: expected [ 42, 42 ] to deeply equal [ 42 ]
 ```
 
-## Keeping the mark
+## Giữ lại mark
+
+Dedup đã tồn tại. `flushable` so buffered frame với mark ở bước 4 và giải thích off-by-one.
+Điều thiếu là cùng comparison ở bước sau: `suppressed` đặt câu hỏi đó trên live connection;
+`scopeMarks` bound thứ được giữ. Mark cần nơi sống: một field. Ba call site đặt nó khi
+success, clear trên mọi degrade và consult lúc delivery.
+
+<Figure caption="Bước 5 trước đây bỏ H. Giờ nó giữ lại." code={figWhereTheMarkLives} />
+
+Comment cũ nói delivery không nhìn gì ngoài phase và resume machinery vô hình với nó.
+Defect được viết như design principle. Delivery nên đơn giản, resume nên contained; nhưng
+containment đóng dedup window, trong khi window phải mở lâu hơn resume một chút.
 
 ```diff title="services/gateway/src/resume.ts"
 @@ -104,12 +104,57 @@ export function flushable(
@@ -354,7 +434,25 @@ AssertionError: expected [ 42, 42 ] to deeply equal [ 42 ]
          (n, page) => n + page.messages.length,
 ```
 
-## Why the mark is never retired
+## Tại sao mark không bao giờ retire
+
+Giữ integer theo channel suốt connection mời gọi optimisation: bỏ khi higher sequence
+tới vì window chắc đã đóng. Chưa hề. Sequence 4 commit trước 5 dưới channel row lock,
+nhưng hai gateway instance publish độc lập. A commit 4 rồi stall; B commit 5 và publish
+ngay. Retire theo 5 mở cửa cho delayed 4 duplicate. Specification ban đầu yêu cầu
+retirement; research đã lật nó.
+
+Không retire vẫn bounded: mark scoped theo cursor client đưa, contract từ chối quá
+`MAX_RESUME_CHANNELS` — 200 integer mỗi connection.
+
+<Trap title="Bound phải thuộc service này, không thuộc API">
+
+`highWaterMarks` seed từ cursor rồi thêm key cho channel backfill trả. API trả channel
+không được hỏi có thể làm map tăng vô hạn. Hôm nay điều đó không xảy ra, nhưng bound
+service này claim không nên phụ thuộc response service khác. `scopeMarks` khiến guarantee
+sống trong file phát biểu nó.
+
+</Trap>
 
 ```text
 resume completes, mark = 4
@@ -362,11 +460,56 @@ seq 5 arrives  → above the mark → deliver, and RETIRE
 seq 4 arrives  → no mark left   → deliver   ← the duplicate, again
 ```
 
-## The same seam, four times
+## Cùng một seam, bốn lần
 
-## How it was found, and what that cost
+Đây là chủ đề lặp của Part 3; fan-out được xây trước khi reader có khái niệm.
 
-## A chapter number is a reference that ages
+| Chương | Seam | Đáp án |
+|---|---|---|
+| outbox | outbox | làm hai instant atomic bằng một transaction |
+| webhook dispatcher | webhook delivery | post rồi report; khách hàng absorb duplicate |
+| retry-and-disable | attempt record | publish sau commit; record có thể mất |
+| **chương này** | **fan-out và resume** | **overlap rồi deduplicate tại reader** |
+
+Bốn trường hợp durable ở một lúc, announce ở lúc khác; bốn đáp án đúng khác nhau vì cost
+của gap khác nhau. Fan-out 2.6 có trước khi outbox gọi tên pattern nên defect bị bỏ sót.
+
+## Nó được tìm ra thế nào và phải trả giá gì
+
+Không phải nhờ reasoning, mà từ intermittent failure trong baseline retry-and-disable,
+khi lane đồng thời đỏ vì ba lỗi khác. E2e failure lẻ tẻ trông giống noise. Red lane che
+defect thật giữa false red — lý do thực tế phải sửa flake dù của người khác.
+
+<Trap title="Tần suất đã đo không phải tần suất thật">
+
+Lần trước thấy một failure trong sáu run; chương này chạy hai mươi lần trước fix và thấy
+**zero**. Defect không hiếm hơn; điều kiện expose biến mất. Race cần query rơi vào
+commit-to-publish gap, gap rộng dưới load. Backlog bốn nghìn webhook khiến lane chín phút;
+sau cleanup còn ba phút và window hẹp.
+
+Criterion hai mươi pass sau fix vì thế không thể fail — trước fix cũng đạt. Ta giữ nó để
+canh regression nhưng deterministic test mới chứng minh duplicate biến mất.
+**Intermittent failure tìm ra defect; không chứng minh fix.**
+
+</Trap>
+
+## Số chương là reference sẽ già đi
+
+Chèn chương này làm quota và isolation gauntlet dời chỗ; source comment vẫn trích số cũ.
+Cần phân biệt **provenance stamp** với **forward promise**. “Chương này thêm field” luôn
+đúng; “chương sau xây transport” stale ngay khi có chapter chèn trước nó.
+
+<Trap title="Nửa quy tắc hoá ra sai">
+
+Bản đầu nói provenance stamp an toàn vì chapter không renumber ngược. Part 3 sau đó
+regroup và renumber. Ordinal stale theo **cả hai** hướng. Rule đơn giản hơn: gọi tên
+subject. `the outbox chapter` sống qua reorder; `chapter 3.3` encode position không ai
+check. Source reference và hàng trăm page reference đã được sửa theo rule này.
+
+</Trap>
+
+Walk script cũng mang promise tương tự trong `console.log`; edit cùng argument được đặt
+ở file thuộc webhook movement, không kéo file đó vào chương này.
 
 ```diff title="services/api/src/db/schema.ts"
 @@ -372,7 +372,15 @@ export const consumedEvents = pgTable(
@@ -400,7 +543,11 @@ seq 4 arrives  → no mark left   → deliver   ← the duplicate, again
  // the requirement was finished. This one says, in a column, which half is
 ```
 
-## What the suites hold
+## Điều các suite giữ vững
+
+Predicate và scoping là pure nên test không cần socket, broker hay clock. Wiring — việc
+`deliver()` thật sự consult mark — được giữ bằng stubbed fabric. Ratchet tăng nhưng chủ ý
+dừng dưới 100.
 
 ```diff title="services/gateway/src/resume.test.ts"
 @@ -4,12 +4,14 @@ import type { Message } from "@relay/protocol";
@@ -621,7 +768,24 @@ seq 4 arrives  → no mark left   → deliver   ← the duplicate, again
            branches: 96,
 ```
 
-## The sabotage battery
+## Sabotage battery
+
+Năm mutation được apply vào code thật rồi revert với file byte-identical. Hai mutation
+ban đầu viết sai đáng chú ý hơn kết quả pass.
+
+Mutation thứ tư dự định giữ mark qua degraded resume không thể fail: mọi degrade xảy ra
+trước khi mark assign. Requirement giữ structurally vì chỉ success path set mark. Mutation
+năm sống sót vì test publish 43 rồi 42 với mark 43; retirement không fire. Scenario phải
+deliver số trên mark trước, retire rồi delayed 42 mới duplicate.
+
+<Why title="Test có tên của property nhưng không exercise nó">
+
+Test ấy có thể pass mãi: đúng tên, đúng file, hai gateway out of order — nhưng không chạm
+mechanism. Đọc không thấy vì tên mô tả intent; chạy không thấy vì nó pass. Chỉ việc bỏ
+mechanism và đòi test fail mới phân biệt test thật với trang trí. Decision “never retire
+mark” từng không có test trước battery.
+
+</Why>
 
 ```console
 =============== mutation 1: never keep the marks after a successful resume
@@ -639,7 +803,22 @@ seq 4 arrives  → no mark left   → deliver   ← the duplicate, again
   YES
 ```
 
-## A test riding a stream that keeps growing
+## Test cưỡi trên stream cứ lớn dần
+
+Lane tìm lỗi ở run 11/20. Catch-up test publish ba event nhưng gọi `ENV()` ba lần; mỗi
+call mint UUID mới nên event đi ba subject, không filter nào cover cả ba. Durable không
+filter bắt đầu đầu stream 13 nghìn event, loop chỉ có 800 poll; drain 2.756 event vẫn
+chưa hết rồi fail.
+
+<Trap>
+
+Đây là test cưỡi **shared resource đang tăng** với **fixed budget**. Nó pass cho tới khi
+resource vượt budget rồi fail ở nơi không giống cause. Số 800 chưa từng sai; chỉ từng đủ.
+
+</Trap>
+
+Scope consumer vào một environment loại race thay vì tăng budget. Assertion chỉ còn ba
+event test publish; invariant stream giữ backlog khi không ai đọc vẫn nguyên.
 
 ```text title="run 11 of 20"
 expected [ …(2756) ] to include '<uuid>'
@@ -721,5 +900,15 @@ $ pnpm test && pnpm test:integration && pnpm coverage
  Tests  191 passed (191)
  Tests  380 passed (380)
 ```
+
+<Checkpoint>
+
+Chạy hai lane và coverage gate. Client reconnect không còn thấy message đã có dù fabric
+bắt kịp trong hay sau resume. Mark là một integer mỗi channel, giữ suốt socket và không
+retire vì gateway có thể deliver higher sequence trước lower sequence.
+
+FR-RTM-03 giờ mới đúng. Nó đã sai suốt bảy chương trong flagship bug của series.
+
+</Checkpoint>
 
 <ChapterFooter id="3.7" locale="vi" />

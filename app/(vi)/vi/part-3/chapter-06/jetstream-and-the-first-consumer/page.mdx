@@ -1,9 +1,12 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
 import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figTheOtherGap, figOutcomes, figWhereItRuns } from "./figures";
 
 export const metadata = {
   title: "JetStream và consumer đầu tiên — Building Relay",
   description:
-    "Bản dịch tiếng Việt của chương này đang được chuẩn bị. Toàn bộ mã nguồn bên dưới giữ nguyên như bản tiếng Anh.",
+    "Chương outbox để lại hơn mười hai nghìn event trong stream chưa ai đọc. Chương này quyết định mọi setting, xây consumer đầu tiên và kill nó giữa lúc làm việc và acknowledge.",
   alternates: {
     canonical: "/vi/part-3/chapter-06/jetstream-and-the-first-consumer",
     languages: {
@@ -15,9 +18,7 @@ export const metadata = {
 
 <ChapterHeader id="3.6" locale="vi" />
 
-> **Bản dịch đang được chuẩn bị.** Phần diễn giải của chương này chưa được dịch sang
-> tiếng Việt. Các khối mã bên dưới là bản gốc tiếng Anh và giống hệt bản tiếng Anh của
-> chương — bạn có thể gõ theo chúng ngay bây giờ. Bản dịch đầy đủ sẽ thay thế trang này.
+Hãy hỏi broker đang giữ gì.
 
 ```text
 messages          12,930
@@ -32,7 +33,70 @@ discard           old
 duplicate_window  120 s        <- NATS's default, inherited
 ```
 
-## Every default is a decision somebody did not make
+Mười hai nghìn chín trăm ba mươi event do relay của chương outbox publish trong lúc
+chương ấy được viết, và **chưa một event nào từng được đọc**. Ba setting do con người
+chọn; phần còn lại là default của NATS khi ta không nói gì.
+
+Chương này sửa cả hai nửa. Mọi setting trở thành decision có reason; stream nhận reader
+đầu tiên — và reader tái tạo đúng failure mà outbox loại bỏ, chỉ xa thêm một hop.
+
+<SkipAhead>
+
+Nếu buộc phải bỏ qua: mọi setting của stream `EVENTS` đều được chọn có chủ ý. `max_age`
+bảy ngày cao hơn floor 24 giờ NFR-REL-08; `max_bytes` 1 GiB cùng `discard: old`; replica
+suy ra từ environment thay vì hardcode. Apply config idempotent vì hai API instance start
+cùng lúc. Subject grammar `events.{domain}.{action}.{env}` chuyển từ outbox module sang
+`@relay/protocol` để producer và consumer dùng chung. Table `consumed_events`, key
+`(consumer, event_id)`, là deduplication ledger; claim và effect của handler commit cùng
+transaction nên handler throw sẽ rollback claim. Durable pull consumer fetch batch 25,
+chỉ acknowledge sau claim commit, retry handler throw tối đa năm lần, terminate payload
+không parse ngay. Handler đầu là **scaffold** chỉ log và sẽ được webhook dispatcher thay.
+Delivery at-least-once; handling once *in effect*; ledger tạo ra khác biệt. Trạng thái
+cuối chương là tag **`part3-ch4`**.
+
+</SkipAhead>
+
+## Mỗi default là một decision chưa ai đưa ra
+
+Chương outbox tạo stream trong bốn dòng và nói rõ đó là mức tối thiểu publisher cần để
+được chứng minh. Mức design ấy đúng cho chương về outbox, nhưng sai khi consumer bắt đầu
+phụ thuộc stream.
+
+Câu đầu là setting nào còn đổi được, vì stream giữ mười hai nghìn event không thể tuỳ
+tiện recreate. Vì vậy ta hỏi broker thay vì docs.
+
+| Setting | Update tại chỗ |
+|---|---|
+| `max_age`, `duplicate_window`, `max_msgs` / `max_bytes`, `discard` | mutable |
+| `retention` | **immutable** — không thể đổi sang hoặc khỏi workqueue |
+| `storage` | **immutable** — không thể đổi storage type |
+
+Hai setting không bao giờ đổi được, và chương outbox tình cờ chọn đúng cả hai. Nếu dùng
+`memory` để tiện development — hợp lý và nhanh hơn — apply config chương này sẽ đòi xoá
+stream cùng mọi event. Giá của default không được trả lúc ta nhận nó.
+
+Mỗi con số mang reason trong code. `max_age` bảy ngày thay vì floor 24 giờ vì floor bảo
+vệ process crash, còn một tuần bảo vệ weekend: outage tối thứ Sáu có thể tới sáng thứ Hai
+mới được thấy. `discard: old` khiến chạm `max_bytes` bỏ event cũ thay vì *từ chối publish
+mới*. Từ chối publish sẽ kéo write path xuống cùng event spine — nghịch đảo outbox ngăn.
+
+<Why source="ADR-02 · NFR-REL-08 · FR-WHK-02">
+
+**Tại sao dùng `limits` retention khi đây trông như work queue?** Vì nhiều consumer sẽ
+đến, còn `workqueue` xoá message khỏi stream ngay khi *bất kỳ* consumer acknowledge.
+
+Hôm nay có một consumer nên shape vừa vặn. Nhưng SAD gọi thêm webhook dispatcher,
+analytics ingester Part 4 và live stream dashboard Part 5. Với `workqueue`, consumer ack
+đầu tiên xoá event dưới chân những consumer khác: dispatcher fire webhook và meter không
+bao giờ thấy event, khiến reconciliation 0,1% FR-ANL-06 fail âm thầm.
+
+Với `limits`, stream giữ message theo age và size; mỗi durable consumer giữ position
+riêng. Mọi người đọc mọi event. Đó là nền tảng invariant 9: consumer dừng trong N publish
+sẽ nhận đủ N khi quay lại. Nó cũng giải thích mười hai nghìn event nằm đó cả chương —
+design hoạt động khi chưa ai dùng. Và setting không thể đổi sau này; chọn `workqueue` để
+tiết kiệm ít disk hôm nay sẽ phải xoá stream ngày mai.
+
+</Why>
 
 ```diff title="services/api/src/outbox/jetstream.publisher.ts"
 @@ -1,8 +1,11 @@
@@ -168,7 +232,25 @@ duplicate_window  120 s        <- NATS's default, inherited
    return {
 ```
 
-## A grammar both sides have to agree on
+## Grammar mà hai phía phải đồng thuận
+
+ADR-02 quy định `events.{domain}.{action}.{env}`, ví dụ
+`events.msg.created.{env}`. Chương outbox implement grammar trong API outbox module vì
+lúc đó chỉ API cần.
+
+Giờ consumer cũng cần. Consumer tự assemble subject filter từ cách hiểu riêng sẽ âm thầm
+nhận *không gì cả* ngày grammar đổi: không error hay warning, chỉ position đứng yên. Vì
+vậy grammar chuyển vào `@relay/protocol`, package từ 1.3 có nhiệm vụ chứa shared shape.
+
+API tiếp tục hoạt động nhờ `event.ts` re-export thứ từng định nghĩa. Nó còn nhận thứ quan
+trọng hơn việc di chuyển: `outboxEventSchema`, envelope theo góc nhìn *consumer*. Producer
+dựng object và biết well-formed; consumer đọc bytes từ broker và không biết gì. Chương
+2.5 đã lập luận điều này cho internal HTTP hop. Message nằm sáu ngày trong stream có thêm
+sáu ngày để không còn match code đang đọc.
+
+Năm unit case trong `packages/protocol/src/internal.test.ts` giữ grammar: environment ở
+cuối; `message` viết tắt thành `msg`; domain không abbreviation giữ nguyên; thiếu part
+throw thay vì tạo `events..created.`; output match wildcard mọi consumer subscribe.
 
 ```diff title="packages/protocol/src/internal.ts"
 @@ -79,12 +79,47 @@ export const internalBackfillResponseSchema = z.strictObject({
@@ -288,7 +370,44 @@ duplicate_window  120 s        <- NATS's default, inherited
 +});
 ```
 
-## The other gap
+## Gap phía bên kia
+
+Configuration là nửa dễ. Toàn bộ chủ đề chương outbox là window giữa committed message
+và published event — dual write cùng process chết bên trong. Outbox đóng window bằng
+transaction chung. Đọc event ra và cùng window mở lại ở phía kia.
+
+<Figure
+  caption="Gap của consumer. Giữa lúc làm việc và acknowledge có một cửa sổ nơi effect đã durable nhưng broker chưa biết. Process chết ở đó tạo redelivery cho việc đã xảy ra."
+  code={figTheOtherGap}
+/>
+
+Pull consumer fetch message, làm việc rồi báo broker đã xong. Nếu chết sau *việc làm*
+nhưng trước *lời báo*, broker có nghĩa vụ deliver lần nữa. Đó là at-least-once nhìn từ
+phía nhận, điều chương outbox gọi là “embraced, not mitigated”.
+
+Walk script làm điều runtime lặp và chết trong gap bằng `SIGKILL`, không thrown exception:
+exception chạy error path, crash thì không. Work đã xảy ra trong Postgres; broker chưa
+biết. Lấy lại cùng position: attempt hai được redeliver, ledger từ chối claim, effect giữ
+ở một rồi message mới acknowledge. Thiếu dòng giữa, webhook fire hai lần, meter đếm hai
+lần và agreement 0,1% FR-ANL-06 lệch nguyên một event.
+
+Ba mươi giây `waiting` đáng trải qua một lần: đó là `ack_wait`, broker giữ message cho
+consumer mà nó chưa từ bỏ.
+
+<Trap>
+
+Ba integration test đầu timeout vì durable consumer name không phải label; nó là
+**position trong stream**, lưu trên server, dùng chung bởi mọi process cùng tên và sống
+lâu hơn chúng. Durable mới bắt đầu từ *đầu stream*. Test publish một event rồi chờ nó sau
+mười hai nghìn chín trăm event cũ. Đây không phải bug của `limits`; chính là `limits`.
+Fix là `filterSubject`, scope mỗi test theo subject environment riêng.
+
+Durable cũng không tự cleanup. Inspector từng thấy **mười hai** durable do những run đều
+pass để lại. Per-run name giữ run độc lập nhưng không giữ broker sạch; suite xoá durable
+trong `afterAll`. Shape tổng quát, lần thứ ba sau Redis subject 2.6 và outbox row:
+**shared store cần per-run handle, per-run handle cần cleanup.**
+
+</Trap>
 
 ```console
 $ node scripts/consumer-walk.mjs --kill-before-ack
@@ -312,7 +431,35 @@ times handled              1
 acknowledged               7678edc8-65cd-42c8-ac50-bdaeda79d069
 ```
 
-## The ledger
+## Ledger
+
+Second delivery phải được nhận diện; việc nhận diện cần memory sống qua process. Đó là
+một table.
+
+Không source document nào định nghĩa table. SAD risk R5 yêu cầu behaviour và để shape
+mở: future consumer quên dedupe gây double webhook/metering, mitigate bằng consumer
+template có dedup. Vì vậy đây là chapter derivation và schema nói rõ.
+
+Primary key **chính là** deduplication. Không `SELECT` rồi `INSERT`; insert là check, nên
+hai instance fetch cùng message không thể cùng kết luận mình đầu tiên. Đây là lần thứ ba
+đáp án là “để database quyết định trong một statement”.
+
+<Why source="SAD risk R5 · ADR-06 · ADR-02">
+
+**Tại sao claim cùng transaction với effect khi broker đã deduplicate?** Nếu claim commit
+riêng, handler fail giữa chừng để claim lại; redelivery sinh ra để retry failure lại bị
+bỏ như duplicate. Event không bao giờ handled nhưng table nói đã handled — một lời nói
+dối không alert nào bắt.
+
+Claim và effect phải cùng số phận: insight outbox đảo chiều. Ở đó event commit cùng
+message gây ra nó; ở đây record xử lý commit cùng việc xử lý.
+
+JetStream có dedupe theo `msgID` trong `duplicate_window` 120 giây. Tăng window không giải
+quyết: outbox có thể republish nhiều giờ sau outage, không con số nào đoán an toàn outage
+dài nhất; window hàng giờ giữ dedupe index hàng giờ trong broker memory. Broker window
+collapse common case rẻ; **guarantee nằm nơi work xảy ra**.
+
+</Why>
 
 ```diff title="services/api/src/db/schema.ts"
 @@ -322,6 +322,40 @@ export const outbox = pgTable(
@@ -487,7 +634,36 @@ CREATE TABLE "consumed_events" (
    application: { id: string; name: string };
 ```
 
-## The runtime, and what a handler is not
+## Runtime và những gì handler không phải làm
+
+Mitigation của R5 là template có dedup. Cách khiến việc quên trở nên bất khả thi là không
+để handler có gì cần nhớ. Toàn bộ interface chỉ là: handler return hoặc throw.
+Acknowledge, retry, deduplicate và raw message đều là việc của runtime; decision table
+nằm ở runtime.
+
+<Figure
+  caption="Cách runtime xử lý delivery. Ba outcome; terminate là điểm kết thúc thành thật cho message không ai parse được."
+  code={figOutcomes}
+/>
+
+`decideOutcome` được tách khỏi loop có chủ ý: đó là toàn bộ argument chương trong ba
+mươi dòng, test được không broker. Năm unit case cover payload không parse thì terminate;
+duplicate acknowledge mà không chạy handler; handler return thì acknowledge; handler
+throw thì retry không ack; handler chỉ nhận attempt number. Ba case nữa giữ envelope
+schema khớp thứ outbox publish.
+
+Các constant nhỏ nhưng có argument hai chiều. Batch 25 drain backlog mười hai nghìn theo
+step thay vì round trip, mà không để slow handler giữ deadline trên một trăm message.
+`ack_wait` 30 giây đủ cho handler thật, đủ ngắn để work của killed instance quay lại nhanh
+và khiến redelivery test còn chịu được.
+
+Handler đầu gần như không làm gì, có chủ ý. Chính runtime quanh nó tạo correctness, không
+phải code bên trong. Mọi consumer SAD gọi tên thuộc chương sau; giao việc cho handler này
+sẽ lấy trộm subject của webhook dispatcher hoặc bịa product không ai yêu cầu.
+
+<ForwardRef>Webhook dispatcher thay `createRecorder` bằng dispatcher có cùng signature
+nhưng nhiều việc hơn: HMAC signing, retry schedule 1 giây → 2 giờ của FR-WHK-03 và
+dead-letter path chương này chưa có.</ForwardRef>
 
 ```ts title="services/api/src/consumer/handler.ts"
 import type { OutboxEvent } from "../outbox/event";
@@ -818,7 +994,23 @@ export function createRecorder(logger: Logger): EventHandler {
 }
 ```
 
-## What happens to a message nobody can handle
+## Điều xảy ra với message không ai xử lý được
+
+Đây là nơi chương dễ ngừng nói. `max_deliver` là năm; handler luôn throw được retry năm
+lần; rồi sao? Ta đo nó.
+
+Sau attempt cuối, message ngừng deliver và biến khỏi view của consumer. **Không gì bắt
+nó.** Không dead-letter stream, poison-message table hay alert. Event vẫn trong stream;
+consumer khác với durable khác vẫn nhận vì `limits` retention giữ nó. Với consumer này,
+nó đã mất; dấu vết duy nhất là log delivery terminated.
+
+Payload không parse bỏ qua cả năm attempt và terminate ngay lần đầu vì cùng bytes sẽ fail
+y hệt năm lần; đốt budget chỉ đổi thời điểm drop.
+
+FR-WHK-04 yêu cầu dead-letter queue có replay. Nó thực sự thuộc webhook dispatcher vì
+cần nơi đặt message, cách quan sát và cách replay; cả ba phụ thuộc nhu cầu dispatcher.
+Xây generic version bây giờ là xây hai lần. Điều chương nợ bạn là câu này: **hiện tại,
+event có handler không thể thành công sẽ bị drop và không ai được báo.**
 
 ```text
 round 0: got seq=1 deliveryCount=1 redelivered=false
@@ -827,7 +1019,24 @@ round 1: got seq=1 deliveryCount=3 redelivered=true
 pending=0 ack_pending=0 redelivered=1
 ```
 
-## Where it runs, and what that costs
+## Nó chạy ở đâu và phải trả giá gì
+
+<Figure
+  caption="Consumer sống trong API service. Không phải vì tiện: ledger là Postgres write, còn ADR-04 chỉ cho đúng một service thực hiện những write đó."
+  code={figWhereItRuns}
+/>
+
+ADR-04 nghiêm tới mức media worker chuyển state qua internal HTTP route để không chạm
+database. Consumer deploy thành service riêng và write ledger sẽ là writer thứ hai. Vì
+vậy consumer ở trong API, giống outbox relay theo lời ADR-06: “small loop inside API
+initially, promotable to own deployment”.
+
+Đây là constraint có hoá đơn thật: webhook dispatcher được định làm service riêng. Khi
+đến đó nó cần internal route cho ledger hoặc amendment rõ ràng cho ADR-04. Một trong hai
+phải xảy ra công khai ở chương dispatcher.
+
+Start consumer là hai dòng cạnh relay và cùng reason. Connection lazy nên broker
+unreachable vẫn để API serve write.
 
 ```ts title="services/api/src/consumer/consumer.module.ts"
 import { Inject, Injectable, Module, type OnModuleDestroy } from "@nestjs/common";
@@ -968,7 +1177,21 @@ export class ConsumerModule {}
      RequestContextMiddleware,
 ```
 
-## The tests, and what they hold
+## Các test và điều chúng giữ vững
+
+Mười hai invariant. Mười chạy với broker và database thật; hai pure ở unit lane.
+
+Invariant 4 là nền móng chương và không simulate gì. Nó spawn walk script, chờ marker,
+gửi `SIGKILL`, hỏi ledger còn gì — handled một lần, chưa acknowledge. Sau đó runtime
+khởi động bằng durable name của dead process và đợi broker redeliver. Ba assertion quan
+trọng: redelivery tới; handler chạy **zero** lần; ledger vẫn nói một.
+
+Walk script test kill cũng chính là script reader chạy tay: một artifact chạy hai cách
+để không bên nào rot mà bên kia không thấy. Inspector tạo số mở và kết chương đọc broker
+thay vì config file, vì config được viết không đồng nghĩa config đã apply.
+
+Suite lớn phải trả lời: nó giữ gì hay chỉ pass? Bỏ ledger claim khỏi runtime, giữ nguyên
+mọi thứ khác, ba trên mười test fail.
 
 ```console
 $ pnpm --filter @relay/api test:integration src/consumer/consumer.itest.ts
@@ -1679,7 +1902,21 @@ process.exit(0);
 3 failed | 7 passed
 ```
 
-## The rest of the blast radius
+## Phần còn lại của blast radius
+
+Nhỏ, và tất cả liên quan background loop trong test lane.
+
+`RELAY_EVENT_CONSUMER=off` tồn tại cùng reason với `RELAY_OUTBOX_RELAY=off`, cần ở đúng
+hai nơi: e2e harness và gateway session suite đều spawn API child thật; background consumer
+trong child write table mà suite chương này assert. Đó là race giữa test file, không phải
+system property. Gateway suite nhận hai dòng tương tự dù chưa từng được chapter fence.
+
+`RELAY_NATS_REPLICAS` được khai báo vì strict mode của Turborepo lọc variable không khai
+báo — variable test set mà task không thấy là debugging session đang chờ.
+
+Coverage ratchet tiến đúng hướng: branch coverage `repository.ts` từ 85,91% lên **86,3%**,
+project total từ 78,07% lên **79,01%**. Mốc 100% cho ordering, idempotency và isolation
+vẫn chưa đạt; chương thêm branch và không giả vờ khác đi.
 
 ```diff title="turbo.json"
 @@ -25,12 +25,14 @@
@@ -1720,7 +1957,14 @@ process.exit(0);
        "api",
 ```
 
-## A second table, refused for a different reason
+## Table thứ hai, bị từ chối vì reason khác
+
+Structural check lại đỏ, nhưng lần này không cùng reason. Outbox chứa bản sao tenant data
+và lập luận không ai đọc thay tenant. `consumed_events` chỉ chứa event id và timestamp;
+row không có gì để leak — đáp án mạnh hơn và khác, nên spine ghi bằng lời riêng.
+
+Hai chương, hai table, hai argument. Pattern `%_events` sẽ hấp thụ cả hai mà không dạy
+được argument nào.
 
 ```text title="the check, on the consumer's table"
 these tables have no path to an environment: consumed_events
@@ -1750,7 +1994,24 @@ these tables have no path to an environment: consumed_events
  ];
 ```
 
-## The suite that depended on another suite
+## Suite phụ thuộc một suite khác
+
+Serialize lane ở chương trước vô tình làm file order deterministic và suite này chạy đầu.
+Nó chưa từng apply schema; nó delete table vì giả định suite khác đã tạo — khi order
+arbitrary thì thường có ai đó làm trước.
+
+<Trap>
+
+Ordering dependency giữa test file không thể được phát biểu trong test. Không có syntax
+“chạy tôi sau file kia”; suite hoặc setup thứ nó cần, hoặc dựa vào may mắn không thể mô tả.
+Suite này dựa may mắn suốt hai chương.
+
+</Trap>
+
+Cùng file còn hardcode broker URL sáu lần, outbox suite thêm một — thành
+`nats://localhost:14222` trong khi mọi nơi khác dùng `4222`. Production code đã export
+`DEFAULT_NATS_URL`; test không dùng. Default viết ở bảy nơi là bảy cơ hội viết khác, và
+lỗi xuất hiện ở nơi thứ bảy.
 
 ```text title="42P01"
 Failed query: DELETE FROM consumed_events WHERE consumer LIKE 'itest-%'
@@ -1807,7 +2068,22 @@ relation "consumed_events" does not exist
      await up.close();
 ```
 
-## What this chapter leaves for later, on purpose
+## Những điều chương này chủ ý để lại cho sau
+
+**Webhook delivery và dead-letter path ở chương webhook dispatcher.** Signing, retry
+tier, auto-disable và nơi cho message không xử lý được.
+
+**Analytics ingester (Part 4) và live stream dashboard (Part 5).** Cả hai là consumer
+của runtime; live stream dùng ephemeral consumer thay durable như SAD đã phác.
+
+**Bảy event type còn lại của FR-WHK-02.** Grammar nhận chúng không đổi. Mỗi type đến cùng
+feature có thể produce nó; subject cho event không ai emit chỉ là phỏng đoán.
+
+**Ordering.** Vẫn không được hứa vì reason chương outbox đưa ra: `data.seq` order message
+trong channel (FR-MSG-03); consumer suy order từ arrival rồi sẽ sai.
+
+<ForwardRef>Reconciliation job FR-ANL-06 cần giờ có cả hai nửa: message count trong
+Postgres và ledger nói gì đã handled. Job so sánh hàng ngày thuộc analytics path Part 4.</ForwardRef>
 
 ```bash
 docker compose up -d --wait postgres redis nats
@@ -1842,5 +2118,14 @@ configuration
   discard            old     (at the bound, drop the OLDEST)
   duplicate_window   120s   (the broker's dedupe, not ours)
 ```
+
+<Checkpoint tag="part3-ch4">
+
+Chạy toàn bộ lane. Mong đợi **133 unit test**, **97 integration test**, tất cả xanh, gồm
+journey 2.8 và outbox suite không đổi. Sau đó xem stream đã trở thành gì và tạo redelivery.
+
+Kết quả cuối: mười hai nghìn chín trăm bốn mươi mốt event, và giờ đã có thứ đọc chúng.
+
+</Checkpoint>
 
 <ChapterFooter id="3.6" locale="vi" />

@@ -1,9 +1,12 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
 import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figTheGap, figOutbox, figTwoGuarantees } from "./figures";
 
 export const metadata = {
   title: "Outbox — Building Relay",
   description:
-    "Bản dịch tiếng Việt của chương này đang được chuẩn bị. Toàn bộ mã nguồn bên dưới giữ nguyên như bản tiếng Anh.",
+    "Mỗi state change đều nợ thế giới bên ngoài một event. Cách publish hiển nhiên làm mất event trong một cửa sổ vô hình; chương này tái hiện lỗi bằng SIGKILL thật rồi commit event cùng message.",
   alternates: {
     canonical: "/vi/part-3/chapter-05/the-outbox",
     languages: {
@@ -15,11 +18,32 @@ export const metadata = {
 
 <ChapterHeader id="3.5" locale="vi" />
 
-> **Bản dịch đang được chuẩn bị.** Phần diễn giải của chương này chưa được dịch sang
-> tiếng Việt. Các khối mã bên dưới là bản gốc tiếng Anh và giống hệt bản tiếng Anh của
-> chương — bạn có thể gõ theo chúng ngay bây giờ. Bản dịch đầy đủ sẽ thay thế trang này.
+Platform giờ biết ai đang hỏi và họ thuộc tenant nào. Điều nó chưa làm được là báo cho
+bên khác rằng một việc đã xảy ra.
 
-## The two-line version, and the window inside it
+Webhook cần khả năng đó. Analytics, live dashboard và — nghiêm khắc nhất — metering cũng
+vậy; FR-ANL-06 yêu cầu metering khớp operational data trong sai số 0,1%. Tất cả đều là
+consumer của thứ platform chưa tạo: **một event cho mỗi state change**.
+
+Cách hiển nhiên để tạo event chỉ dài hai dòng và sai. Không phải sai tinh vi hay chỉ sai
+khi scale — nó âm thầm làm mất data ngay trong ngày bình thường trên machine khoẻ. Chương
+này bắt đầu bằng việc khiến nó làm mất event ngay trước mắt bạn.
+
+<SkipAhead>
+
+Nếu buộc phải bỏ qua: table `outbox` được thêm vào schema — lần này trích trực tiếp SAD
+§6.1 thay vì suy ra — cùng partial index trên unpublished row. Event row được write trong
+cùng transaction write message, chỉ ở inserted branch, nên idempotent retry đã nhận diện
+không sinh event thứ hai. Relay trong API drain bằng `SELECT … FOR UPDATE SKIP LOCKED`,
+publish lên JetStream rồi chỉ mark row sau broker acknowledgement. Delivery vì thế là
+at-least-once, vĩnh viễn và có chủ ý. Ordering **không** được guarantee; message được sắp
+theo `data.seq`. Trạng thái cuối chương là tag **`part3-ch3`**.
+
+</SkipAhead>
+
+## Phiên bản hai dòng và cửa sổ bên trong
+
+Đây là toàn bộ bug, được viết theo cách ai cũng sẽ viết lần đầu.
 
 ```ts title="the naive version (excerpt)"
 const message = await repo.sendMessage(channelId, body);   // commits
@@ -40,9 +64,65 @@ MARKER kill-me-now
 naive  env 0e9d99cb: messages=1 outbox=0
 ```
 
-## What the fourth option costs
+Hai dòng đó không bất cẩn. Chúng chạy đúng thứ tự — commit trước để không event nào mô tả
+message đã rollback. Codebase thật sẽ có error handling quanh chúng. Chúng hoạt động.
 
-## The table, quoted rather than invented
+Chúng hoạt động *gần như* mọi lúc — đó là vấn đề.
+
+<Figure
+  caption="Dual-write problem. Giữa commit và publish có một cửa sổ nơi message tồn tại còn event thì không; process chết tại đó không để lại dấu vết rằng event từng được nợ."
+  code={figTheGap}
+/>
+
+Chạy walk của chương ở mode đó và kill process trong gap. Đây không phải thought
+experiment: script in marker giữa commit và publish; parent gửi `SIGKILL` ngay khi marker
+xuất hiện.
+
+Sau đó nhìn database: một message, không event. **Và không error ở đâu cả** — không
+exception, không retry queue entry, không log line báo sai. Webhook của khách hàng không
+bao giờ fire. Meter lệch một mãi mãi; daily reconciliation của FR-ANL-06 sẽ alert nhưng
+không ai giải thích được vì chứng cứ đã chết cùng process.
+
+Failure này khác Part 2. Dropped WebSocket frame có thể recover — 2.7 recover từ Postgres
+vì Postgres còn biết. Ở đây Postgres cũng không biết.
+
+<Why source="ADR-06 · FR-ANL-06 · NFR-REL-02">
+
+**Tại sao không publish trước rồi commit?** Vì nó fail theo chiều kia, và chiều kia tệ
+hơn. Publish-before-commit biến lost event thành **phantom event**: broker mang
+`message.created` cho message có transaction sau đó rollback. Webhook fire cho message
+không tồn tại; hệ thống khách hàng tạo record; support nhận ticket về message không ai
+tìm thấy.
+
+Mất event là vấn đề nội bộ — xấu, im lặng, của ta. Bịa event là lời nói dối hướng ra hệ
+thống khách hàng, khiến họ sai theo cách ta không thấy và không sửa được. Khi buộc chọn,
+ngành chọn failure nội bộ; ADR-06 ghi lại lựa chọn ấy. Lựa chọn thứ ba là ngừng chọn —
+đó là việc outbox làm.
+
+</Why>
+
+## Chi phí của lựa chọn thứ tư
+
+ADR-06 cân bốn design. Cần nhìn design bị loại vì lý do *operational* thay vì correctness,
+vì đây là kiểu quyết định series muốn dạy.
+
+**Change-data-capture** — tail write-ahead log của Postgres bằng Debezium hay tương tự rồi
+suy event — là đáp án kiến trúc đúng nhất. WAL vốn *đã là* transactional event log; event
+và state change không thể bất đồng vì là cùng bytes.
+
+Nó vẫn bị loại. Debezium đòi Kafka Connect hoặc equivalent, mapping schema thành event
+trong config và coupling vào WAL format không phải public API. Đó là operational subsystem
+lớn hơn vấn đề, do một người vận hành (driver D8).
+
+Outbox khoảng năm mươi dòng: `INSERT` trong transaction và loop `SELECT … FOR UPDATE
+SKIP LOCKED`, publish rồi mark. Bất đối xứng năm mươi dòng so với cả subsystem là toàn bộ
+lập luận; ADR-06 gọi tên mức volume nơi nó thôi đúng (~50k event/s, khi team đủ lớn để
+vận hành Debezium).
+
+## Table được trích dẫn, không bịa ra
+
+Lần đầu trong Part 3, schema không phải derivation. SAD §6.1 định nghĩa table này trực
+tiếp, nên chương có thể trích nó.
 
 ```diff title="services/api/src/db/schema.ts"
 @@ -1,8 +1,9 @@
@@ -158,7 +238,43 @@ CREATE TABLE "outbox" (
 CREATE INDEX "outbox_unpublished" ON "outbox" USING btree ("created_at") WHERE "outbox"."published_at" IS NULL;
 ```
 
-## The event commits with the message
+Ba sự vắng mặt đáng gọi tên vì mỗi thứ đều là điều bạn có thể kỳ vọng.
+
+<Why source="FR-TEN-06 · constitution I · ADR-18">
+
+**Tại sao table này không có `environment_id` khi mọi table khác dưới boundary đều phải
+có?** Vì outbox row không phải tenant data; đó là công việc platform nợ chính mình.
+
+Rule nó có vẻ phá là rule thật: FR-TEN-06 đặt `environment_id` trên mọi row dưới tenant
+boundary; repository constructor không tồn tại nếu thiếu nó; isolation suite 2.1 chỉ
+attack column đó. Không được âm thầm tạo exception.
+
+Nhưng ai đọc table này? Không request, không tenant, không code path khách hàng chạm tới —
+chỉ relay drain event của mọi environment vì đây là bookkeeping của platform. Scope nó
+sẽ dẫn tới một relay mỗi environment, hoặc scoped query lập tức tự un-scope: đúng mặt chữ
+nhưng sai tinh thần.
+
+Environment vẫn đi cùng subject và payload để consumer filter, foreign event chỉ
+addressable tới đúng một tenant. Thứ bị bỏ là *ảo tưởng* table này scoped. Đây là exception
+thứ hai trong Part 3 sau key lookup của chương credentials; cả hai được ghi cạnh column
+vắng mặt. Exception không giải thích là cách isolation rule bị bào mòn.
+
+</Why>
+
+**Không có status column.** `published_at IS NULL` *chính là* queue. Row pending hoặc đã
+xong, không trạng thái thứ ba để mắc kẹt, không enum để năm sau thêm giá trị thứ tư.
+
+**Không attempts counter, last error hay dead-letter table.** Đó là retry accounting,
+thuộc webhook delivery (FR-WHK-03, FR-WHK-06) và chương webhook dispatcher. Relay retry
+bằng cách *không mark row done*, không cần column.
+
+§6.1 chỉ không định nghĩa index, nên đó là chapter decision và schema nói rõ. Partial
+index chỉ cover row relay đọc, khiến việc giữ published row gần như không tốn chi phí.
+
+## Event commit cùng message
+
+Đây là thay đổi sửa bug: một `INSERT`, toàn bộ sức mạnh đến từ phía nào của `COMMIT` mà
+nó đứng.
 
 ```diff title="services/api/src/db/repository.ts"
 @@ -10,14 +10,16 @@ import {
@@ -451,7 +567,44 @@ child.stdout.on("data", (chunk: Buffer) => {
 });
 ```
 
-## The relay, and the ordering that matters
+Hai chi tiết quan trọng hơn vẻ ngoài.
+
+**Chỉ nằm trên inserted branch.** Chương 2.3 dạy write path nhận diện retry: cùng
+idempotency key trả message cũ, không consume sequence vì không write gì. Nếu branch đó
+write event, client retry vì network chập chờn sẽ fire *hai* webhook cho một message —
+duplicate mà 2.3 được xây để ngăn, tái xuất ở tầng trên. Có test cho invariant này; nếu
+chỉ giữ một test, tôi giữ nó.
+
+**Envelope được dựng hoàn chỉnh trong transaction.** Relay không thêm gì về sau: không
+timestamp, id hay field. Đây không phải tidiness; nó khiến republished event byte-identical
+với attempt đầu, điều kiện để deduplication hoạt động.
+
+<Figure
+  caption="Outbox. Event commit cùng message nên chia sẻ số phận; relay riêng chuyển row tới broker và chỉ mark sau khi broker acknowledge."
+  code={figOutbox}
+/>
+
+Giờ thực hiện cùng cú kill, đúng vị trí cũ, với phiên bản này. Event sống sót process
+đáng lẽ publish nó. Không gì mất, không cần operator, relay tiếp theo sẽ gửi.
+
+<Trap>
+
+Ban đầu tôi viết test bằng thrown exception — giả crash rồi assert event sống sót. Nó
+pass ngay và chẳng chứng minh gì.
+
+Exception chạy error path; `finally` chạy; connection pool drain; transaction rollback
+*sạch sẽ*. Đó đúng behaviour đang test nhưng không phải điều real crash làm. Test mô
+phỏng crash bằng throw đang test phép lịch sự của code, không test durability.
+
+Vì vậy crash là thật: child process và `SIGKILL` từ parent ngay khi child báo đang ở gap.
+Dùng `SIGKILL`, không `process.exit()`, vì cooperative exit được flush — mà flush chính
+là thứ đang bị bác bỏ.
+
+</Trap>
+
+## Relay và ordering quan trọng
+
+Loop ngắn hơn lập luận cho nó.
 
 ```ts title="services/api/src/outbox/relay.ts"
 import type { Logger } from "@relay/service-kit";
@@ -553,7 +706,34 @@ export function createRelay({
 }
 ```
 
-## What at-least-once asks of everybody else
+`FOR UPDATE SKIP LOCKED` là dòng cần nhìn. Hai API instance là deployment bình thường —
+service stateless và chạy nhiều bản — nên hai relay drain một table không phải edge case.
+`SKIP LOCKED` khiến drainer cạnh tranh bước qua row nhau đã claim thay vì xếp hàng, biến
+horizontal scaling thành property của query thay vì leader election không ai muốn vận hành.
+
+Dòng còn lại là thứ tự hai bước cuối: **publish, rồi mark**. Đảo lại và crash giữa hai
+bước lại làm mất event. Thứ tự này khiến crash giữa hai bước *republish*: row chưa mark,
+lần sau gửi lần hai. Đó là at-least-once, vĩnh viễn. Mượn cách nói ADR-06: embrace, không
+mitigate.
+
+## At-least-once đòi hỏi gì từ mọi bên khác
+
+Duplicate phải được absorb ở đâu đó, và “đâu đó” là consumer. Mọi event mang `id` sống
+qua republish; consumer bỏ qua nó vẫn hỏng dù relay cẩn thận đến đâu.
+
+Id được tạo trong transaction và lưu trong row, nên republish gửi cùng key thay vì key
+mới. Nó cũng được đưa cho JetStream làm deduplication id để collapse common case trong
+dedupe window của broker — nhưng window là convenience, không phải guarantee. Guarantee
+là field.
+
+**Và đây là điều dễ gây đau nhất về sau: chương này không hứa event ordering.** Hai relay
+publish đồng thời có thể interleave; batch fail giữa chừng có thể republish từ điểm cũ.
+SRS không yêu cầu ordered event; ép ordering vào `SKIP LOCKED` drain sẽ mất property giúp
+nó scale.
+
+Thứ *có* thứ tự là message trong channel theo `data.seq`, đúng như FR-MSG-03 và ADR-03
+hứa từ 2.2. Consumer cần order phải đọc field đó; suy order từ arrival rồi sẽ sai, và
+ngày nó sai sẽ không trông như consumer bug.
 
 ```json title="the event envelope (excerpt)"
 {
@@ -565,9 +745,35 @@ export function createRelay({
 }
 ```
 
-## Why there are two paths now
+## Tại sao giờ có hai path
 
-## The broker is not allowed to matter
+Chương 2.6 đã xây cách báo machine khác rằng message xảy ra: Redis pub/sub, một subject
+mỗi channel. Hỏi tại sao không dùng luôn nó là hợp lý.
+
+<Figure
+  caption="Hai delivery path có chủ ý. Live frame là at-most-once vì resume recover được; durable event là at-least-once vì không gì khác recover nó."
+  code={figTwoGuarantees}
+/>
+
+Chúng trả lời hai câu hỏi khác nhau. Redis pub/sub là **at-most-once** by design (ADR-07):
+nếu không gateway nào subscribe channel đúng lúc publish, frame biến mất; không sao vì
+client reconnect, đưa cursor và backfill 2.7 trả mọi thứ bỏ lỡ từ Postgres. Chi phí của
+dropped live frame bị giới hạn bởi resume.
+
+Event không có resume. Nếu `message.created` không tới webhook dispatcher, không hệ thống
+khách hàng nào thấy gap để hỏi; webhook không fire và meter âm thầm sai. Vì vậy path này
+**at-least-once**, durable và chậm hơn — giây thay vì mili giây, vẫn trong budget 60 giây
+của FR-ANL-04. Cùng event, hai path, hai guarantee vì hậu quả mất dữ liệu khác nhau.
+
+## Broker không được phép quyết định sự sống còn
+
+Event spine kéo write path xuống cùng còn tệ hơn không có spine. Relay kết nối lazy; API
+start dù broker unreachable; publish failure để row nguyên tại chỗ.
+
+Failure matrix SAD §7 đã claim behaviour này: “broker down, event tích trong Postgres,
+relay drain khi recover”. Claim như vậy đáng chạy thử. Ba event chờ qua outage, event
+thứ tư đến sau đó; cả bốn publish mà không ai can thiệp. Signal operator theo dõi là
+`count(*)` — outbox depth — và là signal đáng alert khi hệ thống có người vận hành.
 
 ```ts title="services/api/src/outbox/jetstream.publisher.ts"
 import {
@@ -662,7 +868,27 @@ events published           4
 outbox rows waiting        0
 ```
 
-## The check that refused this table
+## Check đã từ chối table này
+
+Isolation harness đỏ trước khi code chạy. Đó là harness hoạt động trên chương đầu tiên
+thêm table kể từ khi nó được xây. Đáp án là option thứ ba, cùng reason schema comment đã
+nói: outbox row không phải record của tenant mà là việc platform nợ chính mình.
+Environment nằm trong `subject` và `payload` để consumer filter; không request path nào
+join table này thay ai.
+
+<Trap>
+
+Reason đó nói về **read**, không cover retention. Payload là full copy của message gồm
+`text`; relay mark published thay vì delete. Message xoá khỏi `messages` vẫn để lời văn
+trong outbox, và platform không xoá nó. Đây là gap thật nhưng không phải tenancy gap.
+Nó được ghi vào spine entry thay vì lý luận cho biến mất, để người đọc sau biết entry
+chỉ trả lời nửa nào.
+
+</Trap>
+
+Nếu gauntlet được xây cuối Part thay vì trước chương này, table sẽ được classify chín
+chương sau bởi người tái dựng argument từ schema. Làm ngay chỉ tốn một list entry và một
+paragraph.
 
 ```text title="the structural check, on the first table added after it"
 these tables have no path to an environment: outbox. Add environment_id, add a
@@ -703,7 +929,15 @@ a reason.
  export interface CatalogueRow extends Record<string, unknown> {
 ```
 
-## The suites could not run alongside each other
+## Các suite không thể chạy cạnh nhau
+
+Chương trước serialize task của turbo vì ba trên chín API suite fail bằng Postgres
+catalogue error. Fix đó cần thiết nhưng chưa đủ. Turbo chạy từng package, còn vitest vẫn
+chạy **file** song song trong package. Mọi suite apply migration trước khi start, nên
+nhiều suite cùng `CREATE TYPE` trên một schema.
+
+Chương trước không thể tìm thấy lỗi: schema đã apply khiến mọi suite không còn việc và
+race không có window; migration chương này mở window.
 
 ```text title="the same error, from inside one package"
 duplicate key value violates unique constraint "pg_type_typname_nsp_index"
@@ -758,9 +992,36 @@ duplicate key value violates unique constraint "pg_class_relname_nsp_index"
  });
 ```
 
-## What this chapter leaves for later, on purpose
+## Những điều chương này chủ ý để lại cho sau
 
-## The tests, and what they hold
+**Subject taxonomy, stream và mọi consumer — chương tiếp theo.** Chương này tạo một stream
+trên `events.>` vì publisher cần nơi publish; relay trỏ vào hư không không chứng minh gì.
+Bảy event type còn lại của FR-WHK-02, per-environment sharding, retention và durable pull
+consumer đầu tiên thuộc chương sau; design ở đây sẽ phải design hai lần.
+
+**Webhook delivery, signing, retry tier và dead-lettering — movement VI.** Đó là lý do
+table không có column `attempts`.
+
+**Pruning.** ADR-06 gọi việc xoá published row là trivial — đúng vậy — nhưng cần scheduler
+platform chưa có. Bịa scheduler để xoá row hiện gần như không tốn chi phí vì partial index
+là làm việc chỉ để có việc.
+
+**Reconciliation job FR-ANL-06.** Câu “làm sao biết event bị mất?” giờ có đáp án: so
+message count với event count trong Postgres. Job hỏi hàng ngày thuộc analytics path Part 4.
+
+<ForwardRef>Event type duy nhất hiện có, `message.created`, cũng là state change public
+duy nhất có route. Bảy type còn lại đến cùng feature; envelope năm field giữ nguyên khiến
+mỗi lần thêm là additive chứ không redesign.</ForwardRef>
+
+## Các test và điều chúng giữ vững
+
+Mười hai invariant: chín chạy với Postgres, hai pure, một đi cùng crash test.
+
+Invariant 6 khác thường: test chứng minh phiên bản *hỏng* vẫn hỏng. Nếu naive walk ngừng
+làm mất event, argument của chương âm thầm không còn đúng; tôi muốn test đỏ báo trước
+reader. Để kiểm tra suite thật sự giữ gì, chuyển outbox insert ra ngoài transaction rồi
+chạy lại. Bảy trên mười một fail. Một dòng đổi vị trí `INSERT` phá phần lớn claim — độ
+nhạy đúng cho suite bảo vệ durability property.
 
 ```console
 $ pnpm --filter @relay/api test:integration src/outbox/outbox.itest.ts
@@ -1259,7 +1520,23 @@ async function outboxDepthFor(db: Db, environmentId: string): Promise<number> {
 7 failed
 ```
 
-## The rest of the blast radius
+## Phần còn lại của blast radius
+
+Lần này nhỏ. Event path được thêm chứ không retire seam, nên file chương trước đã fence
+chỉ đổi vừa một màn hình.
+
+Có một fix-forward, loại nghĩa vụ thứ hai của chương. Signup suite từ chương tenancy
+assert failed provisioning không đổi *global* organisation count. Nó pass hai chương rồi
+fail ở đây với `expected 884 to be 883`, vì crash test spawn child process tự provision
+tenant. Global count chưa bao giờ là evidence; assertion ngay dưới rằng không organisation
+nào tên `doomed org` sống sót mới là evidence. Global count được bỏ.
+
+Thay đổi `turbo.json` đáng một câu vì đây là bug chương tìm thấy, không gây ra. Hai suite
+giờ spawn child từ `services/api/dist`; `nest build` xoá output trước khi build lại.
+Integration task phụ thuộc `^build` (build của dependency) nhưng không phụ thuộc `build`
+của chính package, nên API build có thể chạy lúc test đọc `dist`, làm child chết với
+`ERR_MODULE_NOT_FOUND`. Bug tiềm ẩn từ chương credentials và chỉ lộ khi suite thứ hai
+cần cùng file.
 
 ```ts title="services/api/src/outbox/publisher.ts"
 // The port. ADR-06's quieter payoff is that the outbox is "the
@@ -1793,5 +2070,16 @@ RELAY_POSTGRES_PORT=15432 RELAY_REDIS_PORT=16379 RELAY_NATS_PORT=14222 \
 node scripts/dual-write-walk.mjs --mode=naive
 node scripts/dual-write-walk.mjs --mode=outbox
 ```
+
+<Checkpoint tag="part3-ch3">
+
+Chạy toàn bộ lane. Kết quả mong đợi: **120 unit test**, **87 integration test**, tất cả
+xanh, gồm journey 2.8 không đổi.
+
+Sau đó xem bug xảy ra rồi không xảy ra: cả hai version publish khi không bị ngắt. Kill
+giữa dòng `MARKER` và publish: naive run để lại message không record nào nói event được
+nợ; outbox run để lại row đang chờ.
+
+</Checkpoint>
 
 <ChapterFooter id="3.5" locale="vi" />
