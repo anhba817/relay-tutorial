@@ -27,6 +27,7 @@ export interface Dictionary {
     contents: string;
     onThisPage: string;
     referenceDocs: string;
+    part3Moved: string;
     openNav: string;
     closeNav: string;
     referencedBy: string;
@@ -93,6 +94,7 @@ export const dictionaries: Record<Locale, Dictionary> = {
       contents: "Contents",
       onThisPage: "On this page",
       referenceDocs: "Reference documents",
+      part3Moved: "Part 3 — what moved",
       openNav: "Series contents",
       closeNav: "Close contents",
       referencedBy: "Referenced in",
@@ -154,6 +156,7 @@ export const dictionaries: Record<Locale, Dictionary> = {
       contents: "Mục lục",
       onThisPage: "Trên trang này",
       referenceDocs: "Tài liệu tham khảo",
+      part3Moved: "Phần 3 — những gì đã thay đổi",
       openNav: "Mục lục loạt bài",
       closeNav: "Đóng mục lục",
       referencedBy: "Được tham chiếu trong",

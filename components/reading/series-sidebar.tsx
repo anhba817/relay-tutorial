@@ -66,6 +66,29 @@ export function SeriesSidebar({ locale }: { locale: Locale }) {
           )}
         </div>
       ))}
+      {/* PART 3'S RENUMBERING NEEDS A DOOR. 42 redirects keep every old address
+          alive, and a redirect cannot tell a returning reader that 21 of the 26
+          numbers now name a different chapter. This is the only link to that page,
+          so it sits above the reference documents rather than inside them. */}
+      <div className="mb-6">
+        <ul className="flex flex-col gap-0.5">
+          {(() => {
+            const href = localePath(locale, "/part-3/whats-moved");
+            const current = pathname === href;
+            return (
+              <li>
+                <Link
+                  href={href}
+                  aria-current={current ? "page" : undefined}
+                  className={current ? currentClass : itemClass}
+                >
+                  {d.shell.part3Moved}
+                </Link>
+              </li>
+            );
+          })()}
+        </ul>
+      </div>
       <div className="mb-6">
         <p className="mb-2 text-xs font-semibold uppercase tracking-widest text-muted-foreground">
           {d.shell.referenceDocs}
