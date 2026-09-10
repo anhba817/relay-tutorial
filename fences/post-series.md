@@ -3072,7 +3072,7 @@ tombstone. They do not: the edit read the row, threw if it was deleted, and then
 +      // set — **a row one filter calls deleted and another calls alive**, and a
 +      // deletion that returned successfully undone by an edit already in flight.
 +      //
-+      // `gaps.md` the revisions chapter-3 recorded the opposite — *"both interleavings end in a
++      // `gaps.md` 3.23-3 recorded the opposite — *"both interleavings end in a
 +      // tombstone… there is no order of the two that leaves a message saying something
 +      // nobody wrote"* — and the test that item asked for is what disproved it: three
 +      // of five runs, and four incoherent rows left behind in the lane.
@@ -3109,7 +3109,7 @@ flaky in one run of three.
 +
 +// A CONCURRENT EDIT AND DELETION OF ONE MESSAGE (feature 043, FR-007).
 +//
-+// `gaps.md` the revisions chapter-3 has carried this since the revisions chapter built both writes. Neither takes
++// `gaps.md` 3.23-3 has carried this since the revisions chapter built both writes. Neither takes
 +// a row lock — no `FOR UPDATE`, following `assertWithinQuota`'s recorded decision to
 +// state an overshoot rather than engineer around it — so the two orderings are not
 +// symmetrical, and the claim that has never been tested is that **both of them end in a
@@ -3264,7 +3264,7 @@ one cost 30.56 s on a lane with 5.39 s of headroom.
 +   * `services/api/src/main.ts` and `services/gateway/src/main.ts` were changed to
 +   * report correctly — both used to log the port they ASKED for, which is `0`.
 +   *
-+   * IT READS THE BUFFER `capture` ALREADY FILLS. `gaps.md` the connection-cap chapter-6 counts eleven files
++   * IT READS THE BUFFER `capture` ALREADY FILLS. `gaps.md` 3.22-6 counts eleven files
 +   * that spawn a child and six that discard its output entirely; this one captured it
 +   * and used it for a failure message only. Now it is load-bearing.
 +   *
@@ -3462,7 +3462,7 @@ measured — `12 failed | 5 passed` against a dead broker — not argued: resear
 +// Redis. It is a `.test.ts`, so it runs in the lane chapter 2.1 built specifically to
 +// need no containers — the lane whose whole point is that `pnpm test` is honest on a
 +// laptop with nothing running. With the stack down it reported twelve failures that were
-+// correct behaviour, and `gaps.md` the revisions chapter-9 has carried that since it was found by
++// correct behaviour, and `gaps.md` 3.23-9 has carried that since it was found by
 +// accident.
  //
 -// That is the sender chapter's T047c one dimension over: a test that passes with half
@@ -3799,7 +3799,7 @@ The twelve that arrived, unchanged in behaviour.
 +// `.test.ts` and runs in the lane chapter 2.1 built to need no containers; these twelve
 +// talk to a real Redis, so with the stack down they reported failures that were correct
 +// behaviour and made the lane's exit code answer "does this work HERE, today" instead of
-+// "does this work without infrastructure". `gaps.md` the revisions chapter-9 carried that from the day it
++// "does this work without infrastructure". `gaps.md` 3.23-9 carried that from the day it
 +// was found by accident.
 +//
 +// WHICH TWELVE WAS MEASURED. `RELAY_REDIS_URL=redis://127.0.0.1:6399 vitest run
@@ -5098,7 +5098,7 @@ The five throws, and the event-type check beside them.
  
 +  /** FR-016. Validate against the DECLARED eight, not the emitted five.
 +   *
-+   * THE REVIEW AND `gaps.md` the revisions chapter-1 BOTH RECOMMEND `OUTBOX_EVENT_TYPES`, AND BOTH ARE
++   * THE REVIEW AND `gaps.md` 3.23-1 BOTH RECOMMEND `OUTBOX_EVENT_TYPES`, AND BOTH ARE
 +   * WRONG. That array holds the five types the platform emits; FR-WHK-02 declares eight.
 +   * Measured before this was written: **741 stored subscriptions name
 +   * `channel.created`**, which is declared and not yet built. Comparing against the
@@ -5189,7 +5189,7 @@ declared, published, unbuilt. Comparing against the emitted set would refuse all
 + *
 + * THE THREE FALSE ONES ARE NOT OVERSIGHTS. `channel.created`, `user.connected` and
 + * `user.disconnected` are declared by FR-WHK-02 and unbuilt, and **741 stored
-+ * subscriptions name `channel.created`**. The review and `gaps.md` the revisions chapter-1 both recommend
++ * subscriptions name `channel.created`**. The review and `gaps.md` 3.23-1 both recommend
 + * validating subscriptions against the EMITTED set; doing that would refuse those rows,
 + * and those customers made no mistake. */
 +export const WEBHOOK_EVENT_TYPES = {
@@ -5476,7 +5476,7 @@ passes with that defect in place.
 +  /** The channels a user belongs to, each with its revision count (feature 044, FR-014).
 +   *
 +   * ONE QUERY, NOT TWO. The count could have come from a second call, and giving each
-+   * caller its own is the two-lists-that-must-agree defect `gaps.md` the revisions chapter-4 records about
++   * caller its own is the two-lists-that-must-agree defect `gaps.md` 3.23-4 records about
 +   * `targets.ts` — two things that must match, maintained separately, with nothing
 +   * comparing them. The join costs nothing: `members` is already reached and `channels` is
 +   * one hop from it on a primary key.
@@ -5838,7 +5838,7 @@ built before this feature still satisfies it, and the gateway then reports every
 +   * The keys here are the ids above.
 +   *
 +   * `revisionCountSchema` IMPORTED, NOT RESPELLED. The same shape appears on the ack, and two
-+   * records that must agree and are maintained separately is the defect `gaps.md` the revisions chapter-4
++   * records that must agree and are maintained separately is the defect `gaps.md` 3.23-4
 +   * records about `targets.ts` — one file apart in this case.
 +   *
 +   * `.default({})` FOR THE DEPLOY WINDOW, following `banned` below: an api built before this
