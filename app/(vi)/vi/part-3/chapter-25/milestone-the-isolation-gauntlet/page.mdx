@@ -377,7 +377,7 @@ services/api/src/channels/channels.itest.ts, with `import { sql } from "drizzle-
 ```
 
 ```diff title="eslint.config.mjs"
-@@ -1,11 +1,271 @@
+@@ -1,11 +1,277 @@
  import eslint from "@eslint/js";
  import globals from "globals";
  import tseslint from "typescript-eslint";
@@ -439,6 +439,12 @@ services/api/src/channels/channels.itest.ts, with `import { sql } from "drizzle-
 +    "packages/test-harness/src/global-setup.ts",
 +    "packages/test-harness/src/setup.ts",
 +    "packages/test-harness/src/guard.itest.ts",
++  // AND THE LANE RESET'S OWN TEST, which arrives with the table it clears. It asserts
++  // what the SCRIPT DID — a planted stale delivery gone, an organisation count unmoved
++  // — and both are facts about rows the script reached through its own connection.
++  // Going through the repository layer would mean asserting the script's effect against
++  // the code the script does not use.
++  "packages/test-harness/src/reset-lane.itest.ts",
 +    // AND TWO SUITES THAT WRITE A ROW THE TYPE SYSTEM FORBIDS.
 +    //
 +    //   backfill.itest.ts  asserts what `toFrame` does with a SENDERLESS message.
@@ -649,7 +655,7 @@ services/api/src/channels/channels.itest.ts, with `import { sql } from "drizzle-
    ...tseslint.configs.recommended,
    {
      // Dev scripts run on Node directly, outside any package's tsconfig —
-@@ -39,179 +299,48 @@ export default tseslint.config(
+@@ -39,185 +305,48 @@ export default tseslint.config(
      // file that imports the driver; nothing here can catch a LISTED file that stopped
      // importing it, so the list can only grow and a stale entry holds a standing
      // exemption forever. `driver-exempt.test.ts` reads this array and asserts each
@@ -671,6 +677,12 @@ services/api/src/channels/channels.itest.ts, with `import { sql } from "drizzle-
 -      "packages/test-harness/src/global-setup.ts",
 -      "packages/test-harness/src/setup.ts",
 -      "packages/test-harness/src/guard.itest.ts",
+-      // AND THE LANE RESET'S OWN TEST, which arrives with the table it clears. It
+-      // asserts what the SCRIPT DID — a stale pending backlog gone, an organisation
+-      // count unmoved — and both are facts about rows the script reached through its
+-      // own connection. Going through the repository layer would mean asserting the
+-      // script's effect against the code the script does not use.
+-      "packages/test-harness/src/reset-lane.itest.ts",
 -      // AND TWO SUITES THAT WRITE A ROW THE TYPE SYSTEM FORBIDS.
 -      //
 -      //   backfill.itest.ts  asserts what `toFrame` does with a SENDERLESS message.
@@ -880,55 +892,6 @@ services/api/src/channels/channels.itest.ts, with `import { sql } from "drizzle-
 // MESSAGE CONTENT BEYOND EQUALITY. The pair proves the two answers match. It does
 // not prove that what they say is wise: a constant message leaking a schema detail
 // would pass every assertion below.
-```
-
-```diff title="services/api/src/db/repository.itest.ts"
-@@ -60,19 +60,38 @@ describe("tenant isolation is structural (FR-TEN-05)", () => {
-   it("membership writes with foreign ids affect zero rows", async () => {
-     const user = await repoA.getUserByExternalId("tuan");
-     const channel = await repoA.getChannelByExternalId("support");
--    expect(await repoA.addMember(channel!.id, user!.id)).toBe(true);
--    // B holds A's REAL ids — and still cannot write or read through them.
--    expect(await repoB.addMember(channel!.id, user!.id)).toBe(false);
-+    expect(await repoA.addMember(channel!.id, user!.id)).toBe("added");
-+    // Asked twice is a SUCCESS and not a failure, and telling those apart is
-+    // what the isolation gauntlet changed here: the endpoint over this call has to be
-+    // idempotent, and a unique violation reached the wire as `internal_error`.
-+    expect(await repoA.addMember(channel!.id, user!.id)).toBe("already_a_member");
-+    // B holds A's REAL ids — and still cannot write or read through them. The
-+    // answer is `not_found`, which is also what B gets for ids that exist
-+    // nowhere: three refusals, one word, on purpose.
-+    expect(await repoB.addMember(channel!.id, user!.id)).toBe("not_found");
-     expect(await repoB.listMembers(channel!.id)).toEqual([]);
-     expect(await repoB.channelsForUser(user!.id)).toEqual([]);
-     expect(await repoA.listMembers(channel!.id)).toEqual([user!.id]);
-   });
- 
-   it("uniqueness is per-tenant (DR-02): both tenants may own the same external_id", async () => {
--    await expect(
--      repoB.createUser("tuan", "A different Tuan"),
--    ).resolves.toBeTruthy();
--    await expect(repoA.createUser("tuan", "Duplicate in A")).rejects.toThrow();
-+    // B's own Tuan is a DIFFERENT row. That is the per-tenant half.
-+    const inB = await repoB.createUser("tuan", "A different Tuan");
-+    const inA = await repoA.getUserByExternalId("tuan");
-+    expect(inB.id).not.toBe(inA!.id);
-+
-+    // THE OBSERVATION CHANGED IN THE ISOLATION GAUNTLET AND THE PROPERTY DID NOT. This
-+    // used to assert that a repeat within one tenant REJECTS, which observed the
-+    // unique index by watching it raise. `createUser` is now idempotent — the
-+    // members endpoint creates a user on first membership, so a repeated request
-+    // would otherwise have answered `internal_error` — and the index is what
-+    // makes that work rather than something that got removed. So the assertion
-+    // is now that a repeat returns THE SAME ROW: still one user per tenant per
-+    // external id, observed through the outcome instead of through an exception.
-+    const again = await repoA.createUser("tuan", "Duplicate in A");
-+    expect(again.id).toBe(inA!.id);
-+    // And the existing display name wins: a second call is not an update.
-+    expect(again.display_name).toBe(inA!.display_name);
-   });
- });
- 
 ```
 
 <ChapterFooter id="3.25" locale="vi" />
