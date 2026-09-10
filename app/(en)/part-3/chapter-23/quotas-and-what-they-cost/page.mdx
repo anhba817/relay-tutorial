@@ -761,8 +761,8 @@ the part that is easy to miss.
 -- ABSENT AND NULL BOTH MEAN NO CAP. ZERO MEANS REFUSE EVERYTHING. That is the
 -- same rule 0008 wrote for the limit columns, and jsonb keeps it expressible:
 -- `#>> '{messages,hard}'` returns SQL NULL for an absent key and for a JSON null
--- alike, and the string `'0'` for zero. The distinction the rate-limit chapter needed nullable
--- columns for survives the move.
+-- alike, and the string `'0'` for zero. The distinction the rate-limit chapter
+-- needed nullable columns for survives the move.
 --
 -- WHAT THE JSONB BUYS: THE CONNECTION-METERING CHAPTER adds connection-minutes and FR-MED-12 later
 -- adds media bytes, and neither needs a table migration — a new dimension is a
@@ -848,9 +848,12 @@ CREATE TABLE usage_periods (
 -- counter. HyperLogLog in Redis is the textbook answer and is refused by the rule
 -- above: a flush would erase the month.
 --
--- A SEND WITH NO `user_id` WRITES NO ROW. A key-authenticated REST send is
--- unattributed by design since the outbox chapter, and an unattributed send counts
--- toward the message quota and toward no user.
+-- EVERY SEND WRITES A ROW, BECAUSE EVERY SEND HAS A SENDER. This paragraph used to
+-- say the opposite — that a key-authenticated REST send is unattributed by design,
+-- and that an unattributed send counts toward the message quota and toward no
+-- user — which was true of a platform whose `sendMessage` took an optional
+-- `userId`. The sender chapter made it required, so the state described here is one
+-- no write path can reach and the count of distinct users IS the count of senders.
 
 CREATE TABLE usage_active_users (
   environment_id uuid        NOT NULL REFERENCES environments(id),
@@ -865,9 +868,9 @@ CREATE TABLE usage_active_users (
 -- ---------------------------------------------------------------------------
 --
 -- The outbox chapter published events, the webhook dispatcher chapter dispatched
--- webhook deliveries, the mail-transport chapter sent disablement emails. Each is a
--- table whose claim predicate starts null, drained by a relay, retried by falling
--- due again. This is the fourth, and saying the
+-- webhook deliveries, the mail-transport chapter sent disablement emails. Each is
+-- a table whose claim predicate starts null, drained by a relay, retried by
+-- falling due again. This is the fourth, and saying the
 -- number out loud is the point: four concrete tables that look alike is a
 -- pattern, one abstract table serving four purposes is a framework.
 --
@@ -937,6 +940,27 @@ export function periodOf(at: Date): string {
   const month = String(at.getUTCMonth() + 1).padStart(2, "0");
   return `${year}-${month}-01`;
 }
+
+/** The period AFTER this one — the month a refused tenant's sends resume in.
+ *
+ * ONE COPY, AND THERE WERE TWO. `quota.error.ts` and `quota-email.ts` each carried
+ * this arithmetic: the same December wrap, the same four `??` fallbacks, differing
+ * only in what they did with the answer — the error returns `2027-01-01` and the
+ * email says `January 2027`. Two copies of a rule are two rules, and the rule here is
+ * "which month does the refusal end in", which a customer reads on an invoice.
+ *
+ * The fallbacks live here now, once. They exist because `split("-").map(Number)` is
+ * typed `(number | undefined)[]` and cannot be narrowed by the compiler, not because
+ * a period can be malformed — every one comes from `periodOf` above or from a
+ * Postgres `date` column. That makes them unreachable arms, and having them in one
+ * file rather than two is the difference between one uncoverable branch pair and
+ * three. */
+export function nextPeriod(period: string): string {
+  const [y, m] = period.split("-").map(Number);
+  const nextMonth = m === 12 ? 1 : (m ?? 1) + 1;
+  const nextYear = m === 12 ? (y ?? 0) + 1 : y;
+  return `${nextYear}-${String(nextMonth).padStart(2, "0")}-01`;
+}
 ```
 
 ### What an increase crossed
@@ -990,7 +1014,7 @@ import { z } from "zod";
  * prose — "the column is named for quotas, quotas are a later chapter". This is
  * that chapter.
  *
- * WHY A PARSER AT ALL. The rate-limit chapter's limits are typed columns and need no
+ * WHY A PARSER AT ALL. THE RATE-LIMIT CHAPTER'S limits are typed columns and need no
  * parsing; a jsonb column arrives as `unknown` and something has to turn it into
  * numbers before a cap can be compared. The alternative is a cast at each read
  * site, which is three places to get wrong instead of one.
@@ -1059,7 +1083,10 @@ export function capsFor(
 ```ts title="services/api/src/quotas/quota.error.ts"
 import type { QuotaConfig } from "./config";
 
-/** The dimensions a quota is measured in. `connection_minutes` is the connection-metering chapter's. */
+import { nextPeriod } from "./period";
+
+/** The dimensions a quota is measured in. `connection_minutes` belongs to the
+ * connection-metering chapter. */
 export type Dimension = keyof QuotaConfig;
 
 /** Raised by the repository when a send would exceed a hard cap.
@@ -1098,10 +1125,7 @@ export class QuotaExceededError extends Error {
    * and retries is behaving correctly for a rate limit and wrongly for a quota,
    * which will still be exhausted in an hour and in a week. */
   resumesOn(): string {
-    const [y, m] = this.period.split("-").map(Number);
-    const nextMonth = m === 12 ? 1 : (m ?? 1) + 1;
-    const nextYear = m === 12 ? (y ?? 0) + 1 : y;
-    return `${nextYear}-${String(nextMonth).padStart(2, "0")}-01`;
+    return nextPeriod(this.period);
   }
 
   /** The sentence a developer reads in a log at 3am. Four things in a fixed
@@ -1121,6 +1145,8 @@ export class QuotaExceededError extends Error {
 
 ```ts title="services/api/src/quotas/quota-email.ts"
 import type { Mail } from "../notifications/mailer";
+
+import { nextPeriod } from "./period";
 
 export interface CrossingFacts {
   /** "Fleet Ops / production" — how a dashboard would name it, never a uuid. */
@@ -1151,17 +1177,17 @@ function monthName(period: string): string {
   return `${months[Number(m) - 1] ?? m} ${y}`;
 }
 
+/** The month name a refusal resumes in. The arithmetic is `period.ts`'s and the
+ * NAME is this file's: an email says "January 2027" where an error body says
+ * `2027-01-01`, and the difference is the audience rather than the rule. */
 function resumesOn(period: string): string {
-  const [y, m] = period.split("-").map(Number);
-  const nextMonth = m === 12 ? 1 : (m ?? 1) + 1;
-  const nextYear = m === 12 ? (y ?? 0) + 1 : y;
-  return `${monthName(`${nextYear}-${String(nextMonth).padStart(2, "0")}-01`)}`;
+  return monthName(nextPeriod(period));
 }
 
 /** What an organisation's admins are told when usage crosses a threshold
  * (FR-RTL-07).
  *
- * NO SECRET, NO KEY, NO MESSAGE TEXT. The mail-transport chapter established that this is
+ * NO SECRET, NO KEY, NO MESSAGE TEXT. THE MAIL-TRANSPORT CHAPTER established that this is
  * verified by reading what the mail server received rather than by asserting on
  * the call, and the same test shape applies here.
  *
@@ -1208,8 +1234,9 @@ import {
 import type { Mailer } from "../notifications/mailer";
 import { quotaThreshold } from "./quota-email";
 
-// THE OUTBOX PATTERN, A FOURTH TIME — after the outbox chapter's events, the webhook dispatcher chapter's
-// deliveries and the mail-transport chapter's disablement emails. Same shape on purpose: a table whose
+// THE OUTBOX PATTERN, A FOURTH TIME — after the outbox chapter's events, the webhook
+// dispatcher chapter's deliveries and the mail-transport chapter's disablement
+// emails. Same shape on purpose: a table whose
 // claim predicate starts null, a loop that reads it, a side effect, and no state
 // shared with the request path.
 //
@@ -1397,15 +1424,398 @@ a name with no row behind it installs a trigger that can never match and reads, 
 every report, exactly like protection.
 
 ```diff title="packages/test-harness/src/sentinel.sql"
-REGENERATED
+@@ -81,71 +81,98 @@ BEGIN
+   -- so a table with no `id` raises `record "old" has no field "id"` — from inside the
+   -- refusal path, replacing the diagnosis with a message about the diagnosis.
+   --
+   -- Two tables carried an `id` when this was written and the third does not:
+   -- `read_positions` is keyed `(channel_id, user_id)` because that is what a read
+   -- position is. `to_jsonb` turns the row into a document first, so the lookup is a
+   -- key that may be absent rather than a field that must exist, and the whole row is
+   -- the fallback — which is more useful anyway for a table whose identity is a pair.
+   RAISE EXCEPTION
+     'global-operation guard: this statement modified sentinel row %.% (key %), which belongs to no test%',
+     TG_TABLE_SCHEMA, TG_TABLE_NAME,
+     COALESCE(to_jsonb(OLD) ->> 'id', to_jsonb(OLD)::text),
+     COALESCE(' — the bait planted by ' || who, '');
+ END $$;
+ 
+ -- One trigger per table carrying environment_id, firing only for a sentinel's
+ -- rows. Not `outbox`: it has no environment_id because it is platform
+ -- bookkeeping, so its bait is protected by the reader mechanism only. A stated
+ -- gap rather than an oversight (data-model.md).
+ --
+ -- THIS ARRAY IS NOT A COUNT, AND THAT IS DELIBERATE. Every table that carries
+ -- `environment_id` joins it IN THE CHAPTER THAT CREATES THE TABLE, together with
+ -- the sentinel row that makes the trigger's WHEN clause match and the case in
+ -- `guard.itest.ts` that drives it. Naming a number here — "five tables", "nine
+ -- tables" — would be a fact about the chapter that wrote the number, and every
+ -- later chapter would have to remember to change it. Nothing checks a comment.
+ --
+ -- AND BEING IN THIS ARRAY IS NOT BEING WATCHED. The trigger fires only when
+ -- `__is_sentinel(OLD.environment_id)` is true, which needs a sentinel row sitting
+ -- in the table. A name added here without bait planted in `sentinel.ts` installs
+--- a trigger that can never match, and it reads exactly like protection. That is
+--- why the three go together: the name, the bait, and the case that turns red when
+--- the name is removed.
++-- a trigger that can never match, and it reads exactly like protection. So the
++-- three go together: the name, the bait, and the case.
++--
++-- AND FOR A LONG TIME ONLY TWO OF THE THREE WERE CHECKED. `guard.itest.ts` compares
++-- this array against its own `SHAPES` and against `pg_trigger`, both directions each
++-- — and asserted nothing about the bait, because every case in it plants its own row.
++-- Deleting an insert from `plant()` left that suite entirely green. The quota chapter
++-- added the third assertion: `plant()` must leave a row in every table named here,
++-- asked of the database rather than of `sentinel.ts`'s source.
+ --
+ -- `members` IS THE COUNTER-EXAMPLE AND BELONGS NOWHERE NEAR THIS LIST. It has no
+ -- `environment_id` — the catalogue classifies it `hop`, reaching the environment
+ -- through `channels` — so `OLD.environment_id` would not compile in the WHEN
+ -- clause. The rule is the column, not the intuition that a table "feels" tenant.
+ DO $$
+ DECLARE
+   t text;
+ BEGIN
+   FOREACH t IN ARRAY ARRAY[
+     -- The instruments chapter's two. Both carry `environment_id`, both hold bait
+     -- planted by `sentinelFor`, and `guard.itest.ts` drives each one.
+     'channels',
+     'users',
+     -- THIS CHAPTER'S, AND IT ARRIVES WITH THE TABLE. `read_positions` carries
+     -- `environment_id` although `channel_id` already determines it, precisely so this
+     -- trigger can exist — a table without the column is a table the guard cannot
+     -- refuse a cross-environment delete on.
+     --
+     -- AND IT HAS NO `id`, which is the case the refusal message was changed for: it
+     -- interpolates `coalesce(to_jsonb(OLD) ->> 'id', to_jsonb(OLD)::text)` rather than
+     -- `OLD.id`, so a table keyed on `(channel_id, user_id)` still names the row it
+     -- refused.
+     --
+     -- `members` REMAINS THE COUNTER-EXAMPLE. It is per-member state too and it is
+     -- deliberately absent: no `environment_id`, so the catalogue calls it `hop` and
+     -- `OLD.environment_id` would not compile in the WHEN clause above. The rule is the
+     -- column, not the intuition that a table feels tenant-scoped.
+-    'read_positions'
++    'read_positions',
++    -- THE QUOTA CHAPTER'S THREE, AND ALL THREE ARRIVE WITH THE TABLES. Every one
++    -- carries `environment_id` as its first primary-key column, which is the rule this
++    -- array follows — the column, not the intuition.
++    --
++    -- THEY ARE THE FIRST GUARDED TABLES WHOSE ROWS ARE MONEY. A cross-environment
++    -- DELETE on `channels` loses somebody's messages; one on `usage_periods` loses the
++    -- count a customer is billed against, and the platform cannot tell afterwards
++    -- whether the month was quiet or the row was dropped. `usage_active_users` is the
++    -- same fact one dimension over, and `quota_notifications` is the record that a
++    -- customer was warned — deleting it makes the platform willing to warn them twice
++    -- or, if `delivered_at` was set, not at all.
++    --
++    -- TWO OF THEM HAVE NO `id`, which is the case `read_positions` above changed the
++    -- refusal message for: `usage_periods` is keyed `(environment_id, period)` and
++    -- `usage_active_users` on a triple. The message interpolates
++    -- `coalesce(to_jsonb(OLD) ->> 'id', to_jsonb(OLD)::text)`, so both still name the
++    -- row they refused. `quota_notifications` does have one, and it is listed beside
++    -- them rather than apart, because the guard's rule has never been about the key.
++    'usage_periods',
++    'usage_active_users',
++    'quota_notifications'
+   ] LOOP
+     EXECUTE format('DROP TRIGGER IF EXISTS __sentinel_guard_%1$s ON %1$I', t);
+     EXECUTE format(
+       'CREATE TRIGGER __sentinel_guard_%1$s
+          BEFORE UPDATE OR DELETE ON %1$I FOR EACH ROW
+          WHEN (__is_sentinel(OLD.environment_id))
+          EXECUTE FUNCTION __sentinel_guard()', t);
+   END LOOP;
+ END $$;
 ```
 
 ```diff title="packages/test-harness/src/sentinel.ts"
-REGENERATED
+@@ -51,12 +51,23 @@ export interface Sentinel {
+   /** GUARD BAIT, not drain bait. A trigger sits on `users` and `channels`, and its
+    * WHEN clause tests `__is_sentinel(OLD.environment_id)` — which needs a row IN the
+    * table to have anything to test. Without these two the triggers install, report
+    * as installed, and can never match. See `sentinel.sql`. */
+   userId: string;
+   channelId: string;
++  /** THE QUOTA CHAPTER'S BAIT, and its own three. `usage_periods`,
++   * `usage_active_users` and `quota_notifications` all carry `environment_id` and all
++   * three joined the trigger array, so all three need a row for the WHEN clause to
++   * have something to test.
++   *
++   * `quotaPeriod` is a FIXED month rather than the current one, because two of the
++   * three tables are keyed on it and a bait row whose key moved at midnight on the
++   * first would be a fixture that fails one day in thirty. It is far enough in the
++   * past that no product code will ever write the same key. */
++  quotaPeriod: string;
++  quotaNotificationId: string;
+   /** `__sentinel__:<owner>`, on every row, so a failure says whose it is. */
+   name: string;
+ }
+ 
+ /** A v4-shaped uuid derived from a string. Deterministic, so a file's sentinel is
+  * the same on every run and the delete-then-insert in `plant` is exact. */
+@@ -77,12 +88,14 @@ export function sentinelFor(owner: string): Sentinel {
+     organisationId: id("organisation"),
+     humanId: id("human"),
+     applicationId: id("application"),
+     environmentId: id("environment"),
+     userId: id("user"),
+     channelId: id("channel"),
++    quotaPeriod: "1999-01-01",
++    quotaNotificationId: id("quota-notification"),
+     name: `__sentinel__:${owner}`,
+   };
+ }
+ 
+ /** The shared sentinel this feature does NOT have, kept as a named export so a
+  * reader looking for one finds this comment instead. */
+@@ -128,12 +141,17 @@ export async function plant(
+ 
+   // Children before parents, so the deletes do not trip a foreign key — and
+   // `read_positions` references BOTH `channels` and `users`, which is why the note
+   // the instruments chapter left here said the order was not arbitrary.
+   await q(`DELETE FROM outbox         WHERE subject = $1`, [`${s.name}.bait`]);
+   await q(`DELETE FROM read_positions WHERE environment_id = $1`, [s.environmentId]);
++  // The quota chapter's three, and they come before `users` for the reason the note
++  // above gives: `usage_active_users` references it.
++  await q(`DELETE FROM quota_notifications WHERE environment_id = $1`, [s.environmentId]);
++  await q(`DELETE FROM usage_active_users  WHERE environment_id = $1`, [s.environmentId]);
++  await q(`DELETE FROM usage_periods       WHERE environment_id = $1`, [s.environmentId]);
+   await q(`DELETE FROM channels       WHERE environment_id = $1`, [s.environmentId]);
+   await q(`DELETE FROM users          WHERE environment_id = $1`, [s.environmentId]);
+ 
+   // Register before inserting bait: the trigger's WHEN clause tests membership,
+   // so an unregistered sentinel is unguarded bait.
+   await q(
+@@ -197,12 +215,64 @@ export async function plant(
+   await q(
+     `INSERT INTO read_positions (environment_id, channel_id, user_id, sequence)
+      VALUES ($1, $2, $3, 0) ON CONFLICT (channel_id, user_id) DO NOTHING`,
+     [s.environmentId, s.channelId, s.userId],
+   );
+ 
++  // THE QUOTA CHAPTER'S GUARD BAIT, one row per table it added to the array. Same
++  // rule as `read_positions` above: a name in that array with no row behind it
++  // installs a trigger that can never match, and reads as protection.
++  //
++  // `usage_active_users` reuses the sentinel's own user rather than minting one — the
++  // row only has to exist — and `quota_notifications` reuses the organisation, which
++  // it references and the sentinel already owns.
++  await q(
++    `INSERT INTO usage_periods (environment_id, period, messages_sent)
++     VALUES ($1, $2, 0) ON CONFLICT (environment_id, period) DO NOTHING`,
++    [s.environmentId, s.quotaPeriod],
++  );
++  await q(
++    `INSERT INTO usage_active_users (environment_id, period, user_id)
++     VALUES ($1, $2, $3) ON CONFLICT (environment_id, period, user_id) DO NOTHING`,
++    [s.environmentId, s.quotaPeriod, s.userId],
++  );
++  // ALREADY DELIVERED, AND THAT IS THE FOURTH MEASUREMENT OF ONE LAW. The
++  // disablement notifications and the webhook deliveries both had to concede the
++  // same point: **bait may be claimable only where draining it is DATABASE work.**
++  // A sweep or a publish qualifies; anything that does per-row I/O does not.
++  //
++  // `drainQuotaNotifications` claims on `delivered_at IS NULL` and then calls
++  // `deliver(row)` — a mail send. So an undelivered bait row is claimed by every
++  // quota relay in the lane.
++  //
++  // AND HERE THE LAW ARRIVES WITH TEETH RATHER THAN WITH LATENCY. The three earlier
++  // instances cost seconds; this one is a hard failure, because the quota chapter
++  // also put `quota_notifications` under the guard. The drain claims the sentinel's
++  // row on a connection carrying no exemption, the trigger refuses the UPDATE, and
++  // the transaction is poisoned — `25P02 in_failed_sql_transaction` on the next
++  // statement, six tests red, and the message names neither the bait nor the guard.
++  //
++  // Delivered two hours ago, so the row is still a row a global count would see and
++  // is outside every claim window.
++  //
++  // `DO UPDATE`, NOT `DO NOTHING`, AND THAT IS NOT TIDINESS. A sentinel's ids are
++  // derived from its owner, so this row's id is the same on every run for ever — and
++  // `DO NOTHING` would mean the state the row was FIRST planted with is the state it
++  // keeps. A lane that ran this fixture once before the line above said
++  // `delivered_at` holds an undelivered bait row that no later run can repair, and the
++  // failure it causes is the one described above: refused, poisoned, six red. Here the
++  // row's STATE is part of the fixture's contract and not merely its existence.
++  await q(
++    `INSERT INTO quota_notifications
++       (id, environment_id, organisation_id, period, dimension, threshold,
++        quota, usage_at_crossing, delivered_at)
++     VALUES ($1, $2, $3, $4, 'messages', 50, 1, 1, now() - interval '2 hours')
++     ON CONFLICT (id) DO UPDATE SET delivered_at = EXCLUDED.delivered_at`,
++    [s.quotaNotificationId, s.environmentId, s.organisationId, s.quotaPeriod],
++  );
++
+   // DRAIN BAIT: unpublished events. `outbox` carries no environment_id — it is
+   // platform bookkeeping — so the subject is what identifies these, and it is also
+   // why the trigger cannot guard them (data-model.md). The count is `BAIT_ROWS` and
+   // not one, because a single row cannot tell a batch that ignored its limit from
+   // one that honoured it.
+   await q(
 ```
 
 ```diff title="packages/test-harness/src/guard.itest.ts"
-REGENERATED
+@@ -2,13 +2,13 @@ import { readFileSync } from "node:fs";
+ import { join } from "node:path";
+ 
+ import pg from "pg";
+ import { afterAll, beforeAll, describe, expect, it } from "vitest";
+ 
+ import { databaseUrl } from "./db-url.js";
+-import { sentinelFor, type Sentinel } from "./sentinel.js";
++import { plant, sentinelFor, type Sentinel } from "./sentinel.js";
+ 
+ // THE GUARD, DRIVEN ONE TABLE AT A TIME.
+ //
+ // `sentinel.sql` names the guarded tables in an array and installs a trigger for
+ // each. Installing a trigger is cheap and silent, and it is not the same as being
+ // watched: the WHEN clause tests `__is_sentinel(OLD.environment_id)`, so a table
+@@ -43,12 +43,18 @@ const VICTIM = sentinelFor("packages/test-harness/src/guard.itest.ts#victim");
+ // over zero rows, so an update that matches none passes under a trigger refusing
+ // everything. Measured, not reasoned about — the first version of this file scoped
+ // its permitted update to an id nothing held, and it stayed green with the WHEN
+ // clause deleted from the trigger.
+ const NEIGHBOUR = sentinelFor("packages/test-harness/src/guard.itest.ts#neighbour");
+ 
++// A THIRD SENTINEL THAT ONLY `plant()` EVER TOUCHES. Everything else in this file
++// plants the victim's rows through `SHAPES`, which is right for the refusal cases and
++// useless for asking whether `plant()` itself covers the array — a question about the
++// function every OTHER integration suite depends on.
++const CANARY = sentinelFor("packages/test-harness/src/guard.itest.ts#canary");
++
+ // READ OUT OF `sentinel.sql`, not restated. A second copy of the list would agree
+ // with the first by somebody remembering, and the cases below are generated from
+ // it — so a table added to the array arrives here with its cases already written,
+ // and one removed takes its cases with it. Parsing beats copying wherever the
+ // parse can fail loudly, which is what the length assertion is for.
+ const GUARDED: readonly string[] = (() => {
+@@ -136,12 +142,61 @@ const SHAPES: Readonly<Record<string, Shape>> = {
+     // works for all three tables and does not assume a surrogate key — the absence of
+     // one being the reason this table joined the guard with a message change.
+     mark: `sequence = $1`,
+     read: `SELECT sequence AS v FROM read_positions WHERE environment_id = $1`,
+     marked: (n) => n,
+   },
++  // THE QUOTA CHAPTER'S THREE. Two of them have no `metadata` and no `id`, which is
++  // the shape `read_positions` above already forced this table to accommodate — so
++  // these three cost three entries and no change to the mechanism, which is what a
++  // table of shapes is for.
++  //
++  // Each marks a column nothing else in the fixture writes, and each reads back scoped
++  // by environment. `usage_periods.messages_sent` is a count, so the mark is a number
++  // and the `touch` is the no-op `messages_sent = messages_sent`: the refusal cases
++  // only have to REACH the trigger, and a case that changed the count would leave the
++  // suite unable to tell a refusal from an arithmetic mistake.
++  usage_periods: {
++    plant: `INSERT INTO usage_periods (environment_id, period, messages_sent)
++            VALUES ($1, $2, 0) ON CONFLICT (environment_id, period) DO NOTHING`,
++    values: (s) => [s.environmentId, s.quotaPeriod],
++    touch: `messages_sent = messages_sent`,
++    mark: `messages_sent = $1`,
++    read: `SELECT messages_sent AS v FROM usage_periods WHERE environment_id = $1`,
++    // `bigint` comes back from `pg` as a STRING, not a number — the driver will not
++    // narrow a 64-bit integer into a float — so the expectation is the string. Found
++    // by the case failing with `expected '7' to be 7`, which is the whole reason this
++    // is a per-table function rather than one shared expectation.
++    marked: (n) => String(n),
++  },
++  usage_active_users: {
++    plant: `INSERT INTO usage_active_users (environment_id, period, user_id)
++            VALUES ($1, $2, $3)
++            ON CONFLICT (environment_id, period, user_id) DO NOTHING`,
++    values: (s) => [s.environmentId, s.quotaPeriod, s.userId],
++    // Every column of this table is either the key or `first_seen_at`, so the mark has
++    // to be the timestamp — there is nothing else to write. It takes an epoch offset so
++    // two marks in one run differ.
++    touch: `first_seen_at = first_seen_at`,
++    mark: `first_seen_at = to_timestamp($1)`,
++    read: `SELECT extract(epoch from first_seen_at)::bigint AS v
++             FROM usage_active_users WHERE environment_id = $1`,
++    marked: (n) => String(n),
++  },
++  quota_notifications: {
++    plant: `INSERT INTO quota_notifications
++              (id, environment_id, organisation_id, period, dimension, threshold,
++               quota, usage_at_crossing)
++            VALUES ($1, $2, $3, $4, 'messages', 50, 1, 1)
++            ON CONFLICT (id) DO NOTHING`,
++    values: (s) => [s.quotaNotificationId, s.environmentId, s.organisationId, s.quotaPeriod],
++    touch: `last_error = last_error`,
++    mark: `last_error = $1::text`,
++    read: `SELECT last_error AS v FROM quota_notifications WHERE environment_id = $1`,
++    marked: (n) => String(n),
++  },
+ };
+ 
+ let admin: pg.Client;
+ let plain: pg.Client;
+ 
+ beforeAll(async () => {
+@@ -179,12 +234,16 @@ beforeAll(async () => {
+   // construction rather than by somebody remembering.
+   for (const table of GUARDED) {
+     const shape = SHAPES[table]!;
+     await admin.query(shape.plant, shape.values(VICTIM));
+   }
+ 
++  // AND THE CANARY, THROUGH THE REAL FUNCTION. `plant()` is what `setup.ts` runs once
++  // per test file, so this is the only place in the suite where it is exercised at all.
++  await plant(admin, CANARY);
++
+   // The neighbour's tenancy, DELIBERATELY NOT registered in
+   // `__sentinel_environments` — that omission is the whole point of these rows.
+   await admin.query(
+     `INSERT INTO organisations (id, name) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING`,
+     [NEIGHBOUR.organisationId, NEIGHBOUR.name],
+   );
+@@ -244,12 +303,47 @@ describe("the guard refuses an unscoped mutation of a sentinel row", () => {
+          JOIN pg_class c ON c.oid = t.tgrelid
+         WHERE t.tgname LIKE '__sentinel_guard_%' AND NOT t.tgisinternal`,
+     );
+     expect(rows.map((r) => r.relname).sort()).toEqual([...GUARDED].sort());
+   });
+ 
++  it("plants a sentinel row in every guarded table, so the canary is never missing", async () => {
++    // THE THIRD DIRECTION, AND IT WAS THE ONE NOBODY ASSERTED. `sentinel.sql` says the
++    // name, the bait and the case "go together" — and two of the three were checked
++    // against each other while the bait was checked by nothing. Measured: deleting the
++    // `usage_periods` insert from `plant()` left this suite at 32 of 32 green, and
++    // deleting `read_positions`' — an older chapter's — did too.
++    //
++    // WHAT THAT COSTS IS NOT THIS SUITE. Every case below plants its OWN row through
++    // `SHAPES`, so this file is unaffected by a missing insert. What `plant()` is for is
++    // every OTHER integration suite: `setup.ts` runs it once per test FILE, and the row
++    // it leaves is what makes an unscoped `DELETE FROM usage_periods` in somebody
++    // else's suite meet a trigger at all. A name added to the array with a shape and no
++    // bait leaves that table with no canary in any lane run, and reads as protection.
++    //
++    // ASKED OF THE DATABASE, not of `sentinel.ts`'s source. A source scan would pass on
++    // an insert that runs and inserts nothing — `ON CONFLICT DO NOTHING` against a row
++    // this fixture does not own, say — which is the shape a fixture fails in.
++    // AGAINST THE CANARY, AND THE FIRST VERSION OF THIS USED THE VICTIM — which is
++    // planted through `SHAPES` in `beforeAll`, so every count was nonzero for a reason
++    // that had nothing to do with `plant()`. It stayed green with the insert deleted,
++    // twice, which is exactly the vacuity this assertion was written to end.
++    const missing: string[] = [];
++    for (const table of GUARDED) {
++      const { rows } = await admin.query<{ n: string }>(
++        `SELECT count(*)::text AS n FROM ${table} WHERE environment_id = $1`,
++        [CANARY.environmentId],
++      );
++      if (rows[0]!.n === "0") missing.push(table);
++    }
++    expect(
++      missing,
++      `guarded, and plant() leaves no row to guard: ${missing.join(", ")}`,
++    ).toEqual([]);
++  });
++
+   for (const table of GUARDED) {
+     it(`refuses an unscoped UPDATE on ${table}`, async () => {
+       // No WHERE at all — the shape a global sweep has. The refusal must name the
+       // table and the owner, because a bare failure sends the next reader to the
+       // wrong file.
+       await expect(
 ```
 
 The third assertion in that last file is new, and it exists because the first two
@@ -1419,7 +1829,35 @@ sentinel nothing else in the file touches — the first version counted rows
 in two comments, while never holding it:
 
 ```diff title="packages/protocol/src/codes.ts"
-REGENERATED
+@@ -223,12 +223,28 @@ export const ERROR_CODES = {
+   // survived — only the code could have caught it.
+   //
+   // THE VOCABULARY WAS NOT INVENTED HERE. The reference decided it; this is the
+   // registry catching up, which is the direction `check-error-codes` cannot check
+   // (it reads the built `dist` against the docs and counts, so a code documented and
+   // unregistered looks like a code nobody has written a section for).
++  // THE QUOTA CHAPTER'S ONE CODE, AND THIS FILE HAS BEEN CITING IT SINCE BEFORE IT
++  // EXISTED. Two comments above argue against reusing it — the banned-user code says
++  // "the same argument this file already makes for `wrong_credential_type` and
++  // `quota_exceeded`", and `channel_member_limit_exceeded` says "NOT `quota_exceeded`.
++  // That is a monthly, billable, resets-on-a-date refusal whose message promises a
++  // resume date." Both were true and neither was checked: `quota_exceeded` was not in
++  // this object, and a registry that names a code only in prose is a registry that
++  // cannot refuse a typo of it.
++  //
++  // `402`, WHICH IS THE ONLY STATUS IN THIS FILE THAT MEANS MONEY. The rate limiter
++  // owns `429`, and a client that sleeps for `Retry-After` and retries is behaving
++  // correctly for a rate limit and wrongly for this: the month will still be exhausted
++  // in an hour. So the resume date goes in the MESSAGE, where a person reads it,
++  // rather than in a header a client acts on.
++  quota_exceeded:
++    "this environment has used its monthly quota; sends resume when the period rolls over",
+   webhook_endpoint_limit_reached:
+     "this environment already holds the maximum number of webhook endpoints; delete one, or use another environment",
+   webhook_url_invalid: "the url is not a valid absolute URL — send scheme, host and path",
+   webhook_url_insecure:
+     "the url must use https; a signature over a plaintext channel protects the body, not the reader",
+   webhook_url_private_address:
 ```
 
 The two quota suites join the driver exemption, each for its own reason — one
@@ -1427,7 +1865,35 @@ writes a row the repository cannot, the other reads the roll-up tables the
 repository would otherwise be asked to check against itself:
 
 ```diff title="eslint.config.mjs"
-REGENERATED
+@@ -74,12 +74,28 @@ export default tseslint.config(
+       // "the state under test is one the repository is now unable to reach". Both are
+       // listed by path rather than reached through a shared helper, because a helper in
+       // another file names none of these specifiers and this rule sees only imports —
+       // an invisible exemption is worse than a listed one.
+       "services/api/src/internal/backfill.itest.ts",
+       "services/api/src/messages/history.itest.ts",
++      // THE QUOTA CHAPTER'S PERIOD SUITE, and its case is the two above's in a third
++      // shape: the state under test is one the repository cannot reach. `periodOf`
++      // returns the month a timestamp falls in, and the property is that a row INSERTED
++      // under that value is FOUND by it — which needs a `usage_periods` row written
++      // directly, because every repository path that writes one derives the period from
++      // the clock and so cannot disagree with the function under test.
++      //
++      // A suite that used the repository here would be asserting that `periodOf` equals
++      // itself.
++      "services/api/src/quotas/period.itest.ts",
++      // AND THE QUOTA SUITE ITSELF, for a different reason from its sibling above.
++      // `period.itest.ts` writes a row the repository cannot; this one READS the two
++      // roll-up tables directly to check what a send left behind. Going through
++      // `usageFor` would mean asserting the roll-up against the function that reads
++      // it — the same circularity, one table over.
++      "services/api/src/quotas/quotas.itest.ts",
+       // ── AND EVERY OTHER REDIS CLIENT, BY PATH, WITH THE ARGUMENT IT NEEDS ──
+       //
+       // The rule arrives here and TWELVE files older than it already import `ioredis`.
+       // A missing exemption is not a silent one — this rule goes red on a chapter
+       // nobody is editing — so all of them land in the commit that adds the rule.
+       // FIVE DIFFERENT ARGUMENTS, and a blanket "the gateway's Redis files" would
 ```
 
 And the lanes learn about a fourth relay. The dispatcher's config gains the guard
@@ -1459,34 +1925,360 @@ One copy in `period.ts` left one pair, and this directory's branch coverage went
 
 
 ```diff title="services/api/vitest.integration.config.mts"
-REGENERATED
+@@ -29,12 +29,14 @@ export default defineConfig({
+     // the list is exactly the relays that exist, because `setup.ts` refuses a name
+     // no module reads.
+     env: {
+       RELAY_HARNESS_BAIT: "on",
+       RELAY_OUTBOX_RELAY: "off",
+       RELAY_EVENT_CONSUMER: "off",
++      // The quota relay, the fourth. Same reason as the other three.
++      RELAY_QUOTA_RELAY: "off",
+     },
+     include: ["src/**/*.itest.ts"],
+     // ONE FILE AT A TIME, BECAUSE THEY SHARE ONE DATABASE.
+     //
+     // Every suite here runs migrations before it starts. Vitest runs FILES in parallel
+     // by default, so several of them issue `CREATE TYPE` against the same schema at the
 ```
 
 ```diff title="services/dispatcher/vitest.integration.config.mts"
-REGENERATED
+@@ -2,12 +2,47 @@ import { defineConfig } from "vitest/config";
+ 
+ // The dispatcher's integration lane. Same convention 2.1
+ // established for the api and 2.6 for the gateway: *.itest.ts is invisible to
+ // the Docker-free unit include, so `pnpm test` stays runnable with no stores.
+ export default defineConfig({
+   test: {
++    // Feature 030: the global-operation guard. `globalSetup` migrates and
++    // then installs the trigger once per lane; `setupFiles` sets the
++    // exemption for files on the harness's list and, where the lane carries
++    // bait, plants it per file.
++    globalSetup: ["../../packages/test-harness/src/global-setup.ts"],
++    setupFiles: ["../../packages/test-harness/src/setup.ts"],
++    // FEATURE 030, MEASURED: nine suites in this lane import `AppModule`, and none
++    // of them set a relay flag. Each relay defaults to on when its flag is unset
++    // (`process.env.RELAY_OUTBOX_RELAY ?? "on"`), so those nine booted four
++    // background loops that sweep the whole database while every other suite's
++    // fixtures sit in it. Research R13 recorded the exposure as nil on the strength
++    // of the four suites that spawn an api CHILD and set the flags in the child's
++    // env; it did not look at the suites that boot the app in process.
++    //
++    // A relay catches and logs its own errors, so the guard's refusal inside one is
++    // a log line and a green lane. Setting the flags here makes the quiet database
++    // a property of the lane rather than a convention nobody applied.
++    // NO BAIT IN THIS LANE (feature 030, research R44). Measured: 200 bait
++    // deliveries alone, on a freshly migrated database, fail 10 of this suite's 16
++    // tests — with instance 5's fix in place. The suite waits 8 seconds for the
++    // dispatcher process to deliver its own row, and the dispatcher consumes a
++    // shared FIFO stream, so 200 jobs ahead of it exhaust the poll. Bait that fails
++    // the suite whether or not the fault is present carries no information.
++    //
++    // The exemption handling stays: the trigger is database state and outlives
++    // whichever lane installed it, so every lane pointed at that database meets it.
++    env: {
++      RELAY_HARNESS_BAIT: "on",
++      RELAY_OUTBOX_RELAY: "off",
++      RELAY_DELIVERY_RELAY: "off",
++      RELAY_NOTIFICATION_RELAY: "off",
++      RELAY_EVENT_CONSUMER: "off",
++      // The quota relay, the fourth. Same reason as the other three.
++      RELAY_QUOTA_RELAY: "off",
++    },
+     include: ["src/**/*.itest.ts"],
+     // A delivery to a hostile endpoint spends real time on timeouts and the
+     // widening schedule. The default 5 s would fail the suite for being honest.
+     testTimeout: 120_000,
+     hookTimeout: 120_000,
+   },
 ```
 
 ```diff title="vitest.coverage.config.mts"
-REGENERATED
+@@ -23,12 +23,31 @@ export default defineConfig({
+     // then installs the trigger once per lane; `setupFiles` sets the
+     // exemption for files on the harness's list and, where the lane carries
+     // bait, plants it per file. This lane gets exemption
+     // handling and NO bait: it holds no reader-shape fault, and planting
+     // would change its workload for no return (FR-022).
+     globalSetup: ["./packages/test-harness/src/global-setup.ts"],
++    // FEATURE 030, MEASURED: nine suites in this lane import `AppModule`, and none
++    // of them set a relay flag. Each relay defaults to on when its flag is unset
++    // (`process.env.RELAY_OUTBOX_RELAY ?? "on"`), so those nine booted four
++    // background loops that sweep the whole database while every other suite's
++    // fixtures sit in it. Research R13 recorded the exposure as nil on the strength
++    // of the four suites that spawn an api CHILD and set the flags in the child's
++    // env; it did not look at the suites that boot the app in process.
++    //
++    // A relay catches and logs its own errors, so the guard's refusal inside one is
++    // a log line and a green lane. Setting the flags here makes the quiet database
++    // a property of the lane rather than a convention nobody applied.
++    env: {
++      RELAY_OUTBOX_RELAY: "off",
++      RELAY_DELIVERY_RELAY: "off",
++      RELAY_NOTIFICATION_RELAY: "off",
++      RELAY_EVENT_CONSUMER: "off",
++      // The quota relay, the fourth. Same reason as the other three.
++      RELAY_QUOTA_RELAY: "off",
++    },
+     setupFiles: ["./packages/test-harness/src/setup.ts"],
+     include: [
+       "packages/*/src/**/*.test.ts",
+       "services/*/src/**/*.test.ts",
+       "packages/*/src/**/*.itest.ts",
+       "services/*/src/**/*.itest.ts",
+@@ -636,12 +655,108 @@ export default defineConfig({
+         "services/gateway/src/limits.ts": {
+           branches: 90,
+           functions: 100,
+           lines: 100,
+           statements: 100,
+         },
++
++        // HOW THESE SIX WERE VALIDATED, STATED BECAUSE THE USUAL PROBE DOES NOT WORK
++        // HERE. The re-pin ritual is "demand 101% of a real key and watch it name
++        // itself; demand 101% of a key naming no file and watch nothing happen".
++        // Running that against ONE test file is vacuous twice over: without
++        // `--coverage` the thresholds are not evaluated at all, and with it the global
++        // floor fires first — `Coverage for lines (0.28%) does not meet global
++        // threshold (70%)` — and drowns the per-file signal. Both were measured.
++        //
++        // So these are validated by the FULL run, which is the instrument: 87 files,
++        // 1,263 tests, exit 0 with every key below holding. The silent-key half is
++        // carried from the previous chapter's probe rather than re-run.
++        //
++        // THE QUOTA CHAPTER'S SIX, AND PUBLISHED PINNED NONE OF THEM. The chapter
++        // before this one pinned all eight of its files; this one shipped seven and
++        // left the ratchet nothing to hold, which is visible only by comparing two
++        // chapters that are adjacent in THIS order and were not in the published one.
++        //
++        // `policy.ts` and `quota.error.ts` are pure — no clock, no store, no
++        // framework — and reach 100 on every metric. A branch they miss is a case
++        // nobody thought of rather than one nobody could reach.
++        "services/api/src/quotas/policy.ts": {
++          branches: 100,
++          functions: 100,
++          lines: 100,
++          statements: 100,
++        },
++        "services/api/src/quotas/quota.error.ts": {
++          branches: 100,
++          functions: 100,
++          lines: 100,
++          statements: 100,
++        },
++
++        // AND THREE WHOSE ONLY SHORTFALL IS A `??` THE COMPILER DEMANDS AND THE DATA
++        // NEVER REACHES. Each is a fallback on a value `noUncheckedIndexedAccess`
++        // will not narrow:
++        //
++        //   config.ts:65      `parsed.error.issues[0]?.message ?? "invalid"` — a zod
++        //                     failure carries at least one issue, always
++        //   period.ts:43-44   `(m ?? 1)` and `(y ?? 0)` in `nextPeriod`, on a period
++        //                     that came from `periodOf` or from a `date` column
++        //   quota-email.ts:31 `months[Number(m) - 1] ?? m` — a month outside 1..12
++        //
++        // READ THE FRACTION, NOT THE PERCENTAGE, because 75 reads like a hole and is
++        // not one. These files are small enough that one arm moves the figure a long
++        // way, and the counts say what the percentages hide:
++        //
++        //   config.ts       9/10 branches   the one is the `?? "invalid"`
++        //   period.ts       6/8             the two are `?? 1` and `?? 0`
++        //   quota-email.ts  6/8             the two are `?? m`, both arms of one guard
++        //   quota-relay.ts  29/30 statements  the one is the catch inside `run()`
++        //
++        // A pin of 75 on an eight-branch file leaves room for exactly the two arms
++        // named above and nothing else: lose a third and it goes red.
++        //
++        // NOT DELETED, WHICH IS THIS RATCHET'S USUAL ANSWER, because deleting them
++        // means a non-null assertion: the same assumption moved somewhere a type
++        // change cannot invalidate. Pinned at the reading with the arm named instead.
++        //
++        // AND THE FIGURE IMPROVED BY REMOVING A COPY RATHER THAN ADDING A TEST.
++        // `quota.error.ts` and `quota-email.ts` each carried this arithmetic and each
++        // paid for its own pair of unreachable arms; the extraction into `period.ts`
++        // left one pair, and this directory's branches went 86.53% to 88.63%.
++        "services/api/src/quotas/config.ts": {
++          branches: 90,
++          functions: 100,
++          lines: 100,
++          statements: 100,
++        },
++        "services/api/src/quotas/period.ts": {
++          branches: 75,
++          functions: 100,
++          lines: 100,
++          statements: 100,
++        },
++        "services/api/src/quotas/quota-email.ts": {
++          branches: 75,
++          functions: 100,
++          lines: 100,
++          statements: 100,
++        },
++
++        // The relay's loop, and the shortfall is the one every relay in this codebase
++        // reports: `start`, `stop` and the `run` loop are entered by no test, because
++        // every suite drives `drainOnce()` directly — which is the right way to assert
++        // on rows and the wrong way to learn whether the loop that calls it in
++        // production works. Line 118 is the catch inside that loop. Three files
++        // already sit in this config unpinned for the same reason; this one is pinned
++        // because the rest of it IS covered and a floor at 70 would hold nothing.
++        "services/api/src/quotas/quota-relay.ts": {
++          branches: 100,
++          functions: 100,
++          lines: 96,
++          statements: 96,
++        },
+       },
+     },
+   },
+   plugins: [
+     swc.vite({
+       module: { type: "es6" },
 ```
 
 ```diff title="turbo.json"
-REGENERATED
+@@ -51,13 +51,14 @@
+         "RELAY_WEBHOOK_SECRET_KEY",
+         "RELAY_EVENT_CONSUMER",
+         "RELAY_NATS_REPLICAS",
+         "RELAY_E2E_API_PORT",
+         "RELAY_SMTP_URL",
+         "RELAY_MAILPIT_URL",
+-        "RELAY_NOTIFICATION_RELAY"
++        "RELAY_NOTIFICATION_RELAY",
++        "RELAY_QUOTA_RELAY"
+       ]
+     },
+     "//#lint:root": {
+       "inputs": [
+         "**/*.{ts,mts,cts,mjs,js}",
+         "eslint.config.mjs",
 ```
 
 The end-to-end lane gets the policy setter and a journey of its own — the cap
 through the other door, and what it leaves alone:
 
 ```diff title="packages/e2e/src/harness.ts"
-REGENERATED
+@@ -312,12 +312,19 @@ export interface System {
+     credential: string;
+     channel: string;
+     dispatcher: Client;
+     tuan: Client;
+   }>;
+   seedForeignTenant: () => Promise<{ channel: string; text: string }>;
++  /** Set an environment's quota policy.
++   *
++   * Here rather than in the test, because `packages/e2e` may not import `pg` —
++   * the driver restriction chapter 2.5 added, and this package is not on its
++   * ignores list. The harness already holds the api's own database handle, so
++   * the one place that may write is the one place that does. */
++  setQuota: (environmentId: string, config: unknown) => Promise<void>;
+   client: (name: string, environmentId: string) => Promise<Client>;
+   stop: () => Promise<void>;
+ }
+ 
+ export async function boot({ gateways = 2 } = {}): Promise<System> {
+   const { db, seeder } = loadApiInternals();
+@@ -551,12 +558,20 @@ export async function boot({ gateways = 2 } = {}): Promise<System> {
+       await repo.addMember(channel.id, user.id);
+       const text = "this belongs to another tenant";
+       await repo.sendMessage(channel.id, { text, userId: user.id });
+       say(`seeded a foreign tenant (${other}) with one message`);
+       return { channel: channel.id, text };
+     },
++    async setQuota(environmentId, config) {
++      await (
++        db as { execute: (q: string) => Promise<unknown> }
++      ).execute(
++        `UPDATE environments SET quota_config = '${JSON.stringify(config)}'::jsonb
++          WHERE id = '${environmentId}'`,
++      );
++    },
+     async client(name, environmentId) {
+       return new Client(name, await token(environmentId, name), say);
+     },
+     async stop() {
+       for (const child of children) child.kill("SIGTERM");
+       await new Promise((resolve) => setTimeout(resolve, 200));
 ```
 
 ```ts title="packages/e2e/src/quotas.itest.ts"
-REGENERATED
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+
+import type { Frame } from "@relay/protocol";
+
+import { boot, type Client, type System } from "./harness.js";
+
+// The cap through the OTHER door, and what it leaves alone.
+//
+// The rate-limit chapter's limiter never sees `/internal/messages`: `operationsFor` returns
+// [] for anything outside `/v1`, and that is the route the gateway posts a
+// WebSocket send to. This chapter's enforcement point is `sendMessage`, which
+// both doors reach — and this is the test that proves it rather than the research
+// note that predicted it (research R3).
+//
+// This lane and not the gateway's, because the refusal has to come from a real
+// api child and the gateway's own lane does not spawn one.
+
+describe("a quota through the socket", () => {
+  let system: System;
+  let environmentId: string;
+  let channel: string;
+  let dispatcher: Client;
+
+  beforeAll(async () => {
+    system = await boot({ gateways: 1 });
+    const seeded = await system.seedConversation();
+    ({ environmentId, channel, dispatcher } = seeded);
+    await dispatcher.connect(system.gateways[0]!);
+  }, 120_000);
+
+  afterAll(async () => {
+    await system?.stop();
+  });
+
+  it("refuses the send and leaves the socket open", async () => {
+    // One message through, then the cap set at what has already been used.
+    dispatcher.send(channel, "before the cap");
+    await dispatcher.waitFor(
+      (f: Frame) => f.type === "message.created",
+      "the first message to land",
+    );
+
+    await system.setQuota(environmentId, { messages: { hard: 1 } });
+
+    const before = dispatcher.frames.length;
+    dispatcher.send(channel, "after the cap");
+
+    // The socket does not carry the 402 — the gateway holds the connection and
+    // the api refuses the POST behind it. What matters here is the negative: no
+    // `message.created` for the refused send, and the connection still up.
+    await new Promise((r) => setTimeout(r, 2_000));
+    const created = dispatcher.frames
+      .slice(before)
+      .filter((f: Frame) => f.type === "message.created");
+    expect(created).toHaveLength(0);
+
+    // SC-003 — STILL OPEN, AND STILL RECEIVING. A cap that closed the socket
+    // would be an outage dressed as a business control, and FR-RTL-08 exists to
+    // say it is not one.
+    await system.setQuota(environmentId, {});
+    dispatcher.send(channel, "after the cap was lifted");
+    await dispatcher.waitFor(
+      (f: Frame) =>
+        f.type === "message.created" &&
+        JSON.stringify(f).includes("after the cap was lifted"),
+      "the socket to still be carrying messages",
+    );
+  }, 120_000);
+});
 ```
 
 ```diff title="services/api/src/db/schema.ts"
-@@ -3,8 +3,9 @@ import {
+@@ -1,12 +1,13 @@
+ import { sql } from "drizzle-orm";
+ import {
    bigserial,
    bigint,
    boolean,
@@ -1496,7 +2288,11 @@ REGENERATED
    integer,
    jsonb,
    pgTable,
-@@ -694,4 +695,119 @@ export const webhookDisableNotifications = pgTable(
+   primaryKey,
+   text,
+@@ -914,6 +915,122 @@ export const webhookDisableNotifications = pgTable(
+     // Nothing beyond the primary key and the tenant. Volume is one row per
+     // endpoint per outage, so an index for any other access pattern would be
      // guessing at a query nobody has written.
      index("webhook_disable_notifications_environment_idx").on(t.environmentId),
    ],
@@ -1508,7 +2304,7 @@ REGENERATED
 +//
 +// The POLICY is not here, because it was already here. `environments.quotaConfig`
 +// has been declared since chapter 2.1 and read by nothing for eighteen chapters;
-+// The rate-limit chapter was offered it for rate-limit policy and refused it in prose, on the
++// the rate-limit chapter was offered it for rate-limit policy and refused it in prose, on the
 +// grounds that the column is named for quotas and quotas are a later chapter.
 +// This is that chapter. `quotas/config.ts` is the only thing that parses it.
 +//
@@ -1566,8 +2362,9 @@ REGENERATED
 +  (t) => [primaryKey({ columns: [t.environmentId, t.period, t.userId] })],
 +);
 +
-+// THE OUTBOX, A FOURTH TIME — after the outbox chapter's events, the webhook dispatcher chapter's deliveries and the mail-transport chapter's
-+// disablement emails. Four concrete tables that look alike is a pattern; one
++// THE OUTBOX, A FOURTH TIME — after the outbox chapter's events, the webhook
++// dispatcher chapter's deliveries and the mail-transport chapter's disablement
++// emails. Four concrete tables that look alike is a pattern; one
 +// abstract table serving four purposes is a framework.
 +//
 +// `webhookDisableNotifications` cannot be reused: its `endpointId` is NOT NULL
@@ -1619,7 +2416,9 @@ REGENERATED
 ```
 
 ```diff title="services/api/src/db/repository.ts"
-@@ -26,15 +26,22 @@ import {
+@@ -20,24 +20,31 @@ import {
+   messageEdits,
+   readPositions,
    memberships,
    messages,
    organisations,
@@ -1633,7 +2432,12 @@ REGENERATED
    webhookDisableNotifications,
    webhookEndpoints,
  } from "./schema";
- import { messageCreatedEvent } from "../outbox/event";
+ import {
+   membershipEvent,
+   messageCreatedEvent,
+   messageDeletedEvent,
+   messageUpdatedEvent,
+ } from "../outbox/event";
 +import { capsFor, type Caps } from "../quotas/config";
 +import { thresholdsCrossed } from "../quotas/policy";
 +import { QuotaExceededError, type Dimension } from "../quotas/quota.error";
@@ -1642,7 +2446,11 @@ REGENERATED
  import {
    DISABLE_AFTER_MS,
    DISABLE_MIN_ATTEMPTS,
-@@ -276,8 +283,143 @@ export async function environmentLimits(
+   disableReason,
+   runWindowMs,
+@@ -275,12 +282,149 @@ export async function environmentLimits(
+     rest: row.rest ?? DEFAULT_LIMITS.rest,
+     send: row.send ?? DEFAULT_LIMITS.send,
      connect: row.connect ?? DEFAULT_LIMITS.connect,
    };
  }
@@ -1656,7 +2464,7 @@ REGENERATED
 + *
 + * A NULL QUOTA IS CARRIED THROUGH AS NULL rather than resolved to `Infinity` or
 + * `-1`. The absent state stays absent all the way to the reader — the same rule
-+ * The rate-limit chapter's nullable limit columns encode, and the reason `capsFor` returns
++ * the rate-limit chapter's nullable limit columns encode, and the reason `capsFor` returns
 + * `null` rather than a sentinel.
 + *
 + * Admin surface: takes an environment id rather than being scoped by construction,
@@ -1725,13 +2533,15 @@ REGENERATED
 +  hardCapInForce: boolean;
 +}
 +
-+/** The outbox drain, a FOURTH time — after the outbox chapter's events, the webhook dispatcher chapter's
-+ * deliveries and the mail-transport chapter's disablement emails. Same claim predicate, same
-+ * per-row error handling, same required batch size.
++/** The outbox drain, a FOURTH time — after the outbox chapter's events, the webhook
++ * dispatcher chapter's deliveries and the mail-transport chapter's disablement
++ * emails. Same claim predicate, same per-row error handling, same required batch
++ * size.
 + *
 + * PER-ROW `try`/`catch` WITH A REQUIRED `onError`, and the default that used to
-+ * sit on the mail-transport chapter's version is not repeated here: it discarded a row's failure with no
-+ * log line, and feature 030's R48 removed it after finding it as this file's last
++ * sit on the mail-transport chapter's version is not repeated here: it discarded a
++ * row's failure with no log line, and feature 030's R48 removed it after finding it
++ * as this file's last
 + * uncovered function. One bad recipient must not abort the batch and must not
 + * vanish either. */
 +export async function drainQuotaNotifications(
@@ -1786,7 +2596,11 @@ REGENERATED
  // The outbox drain (ADR-06). Part of the ADMIN surface for the
  // same reason the credential lookup is: it runs on behalf of the platform
  // rather than of a tenant, and it is deliberately NOT scoped by environment —
-@@ -2230,8 +2372,16 @@ export class Repository {
+ // one relay drains every environment's events, because an outbox row is work
+ // the platform owes itself.
+@@ -3499,12 +3643,19 @@ export class Repository {
+       text: string;
+       metadata?: unknown;
        idempotencyKey?: string;
      },
    ): Promise<MessageRow> {
@@ -1798,17 +2612,19 @@ REGENERATED
 +      // than the database's, because both statements need the same value and
 +      // only one of them can be `now()`.
 +      const period = periodOf(new Date());
-+
-       const [channel] = await tx
-         .select({ id: channels.id, lastSequence: channels.lastSequence })
-         .from(channels)
-         .where(
-@@ -2241,8 +2391,40 @@ export class Repository {
-           ),
-         )
-         .for("update");
-       if (!channel) throw new ChannelNotFoundError(channelId);
-+
+ 
+       // ── THE BAN, FIRST, AND AHEAD OF THE CHANNEL READ (FR-031, FR-021a) ─────
+       //
+       // T072 left this slot and only Phase 15 can fill it, because until now nothing
+       // wrote `banned_at`. The position is the requirement: **before the channel is
+       // resolved**, so a banned user gets one answer for every channel id — real,
+@@ -3663,12 +3814,43 @@ export class Repository {
+       // T155a. Leaving the slot visible is the point; a reader who finds two checks
+       // where the requirement names three should be able to see which is missing.
+       //
+       // History stays readable while archived (FR-020). Only the write refuses.
+       if (channel.archivedAt !== null) throw new ChannelArchivedError(channelId);
+ 
 +      // THE CAP, CHECKED BEFORE THE MESSAGE IS WRITTEN (FR-RTL-08).
 +      //
 +      // Here rather than in middleware, because the rate-limit chapter's limiter never sees
@@ -1838,13 +2654,17 @@ REGENERATED
 +      // The joined read is about 1.2ms of that and US1 needs it whether or not a
 +      // cap exists. An earlier uncontrolled benchmark reported 273% and sent three
 +      // separate hypotheses chasing what turned out to be warm-up (T033).
-+      const quota = await this.assertWithinQuota(tx, period, userId);
++      const quota = await this.assertWithinQuota(tx, period, userId, senderIsPerson);
 +
        const seq = channel.lastSequence + 1;
        const id = randomUUID();
  
        const insert = tx.insert(messages).values({
-@@ -2323,8 +2505,111 @@ export class Repository {
+         id,
+         channelId: channel.id,
+@@ -3774,12 +3956,125 @@ export class Repository {
+       });
+       await tx.insert(outbox).values({
          subject: event.subject,
          payload: event.payload,
        });
@@ -1854,7 +2674,8 @@ REGENERATED
 +      // Same argument as the event above it, one requirement further on. A quota
 +      // is about THIS MONTH and must not forget, so the count cannot live in the
 +      // per-minute counter store the rate-limit chapter built — a flush there costs one
-+      // window of over-service, a flush here costs the month (a quota must survive the counter store).
++      // window of over-service, a flush here costs the month. A quota must survive
++      // the counter store.
 +      //
 +      // It is an increment rather than a query because the alternative is a read
 +      // over `messages`, which carries no `environment_id` and no index on
@@ -1873,20 +2694,29 @@ REGENERATED
 +          set: { messagesSent: sql`${usagePeriods.messagesSent} + 1` },
 +        });
 +
-+      // The distinct-user count, and the reason it is a row rather than a
-+      // counter: incrementing it would need to know whether this user already
-+      // sent this period, which is a read. The row IS the answer, and
-+      // `ON CONFLICT DO NOTHING` makes the second send of the month free.
++      // The distinct-user count.
++      // UNCONDITIONAL, AND THE GUARD THAT WAS HERE COULD NOT BE FALSE. It read
++      // `if (userId !== undefined)`, with a comment saying a key-authenticated REST
++      // send carries no `userId` and so counts toward the message quota and toward no
++      // user. That was true of a platform where the parameter was optional; the sender
++      // chapter made it REQUIRED — `userId: string`, and its own comment says required
++      // is the whole mechanism, because SC-003 asks that no write path be able to
++      // produce a senderless message.
 +      //
-+      // ONLY WHEN THE SEND IS ATTRIBUTED. A key-authenticated REST send carries
-+      // no `userId` — unattributed by design since the outbox chapter — and counts
-+      // toward the message quota and toward no user.
-+      if (userId !== undefined) {
-+        await tx
-+          .insert(usageActiveUsers)
-+          .values({ environmentId: this.environmentId, period, userId })
-+          .onConflictDoNothing();
-+      }
++      // So there is no unattributed send left to guard against, and the arm was one
++      // the type system forbids. Deleted rather than covered, which is what this
++      // repository does with an unreachable arm — and the deletion is also the more
++      // honest statement: every message counted here has a sender, and the distinct-user
++      // count is exactly the senders.
++      //
++      // A row rather than a counter, and that has not changed: incrementing one would
++      // need to know whether this user already sent this period, which is a read. The
++      // row IS the answer, and `ON CONFLICT DO NOTHING` makes the second send of the
++      // month free.
++      await tx
++        .insert(usageActiveUsers)
++        .values({ environmentId: this.environmentId, period, userId })
++        .onConflictDoNothing();
 +
 +      // What this send crossed, if anything. Almost always nothing, which is why
 +      // the caps are read first and the whole block skipped when none is set.
@@ -1956,9 +2786,13 @@ REGENERATED
          id,
          channel_id: channel.id,
          seq,
-@@ -2333,8 +2618,193 @@ export class Repository {
-       };
-     });
+         text,
+         /** WHAT WAS SENT, AND THE INSERT IS NOT ENOUGH ON ITS OWN.
+@@ -4230,12 +4525,236 @@ export class Repository {
+         ),
+       )
+       .limit(1);
+     return rows.length > 0;
    }
  
 +  /** Refuse the send if a hard cap is already met (FR-RTL-08).
@@ -1979,7 +2813,16 @@ REGENERATED
 +  private async assertWithinQuota(
 +    tx: Db,
 +    period: string,
-+    userId: string | undefined,
++    /** `string`, NOT `string | undefined`, and the narrowing is the sender chapter's.
++     * Its one caller is `sendMessage`, whose `userId` is required — so the optional
++     * type here bought an arm nothing could take, and the arm below it read
++     * `users_.hard === null || userId === undefined`. Second dead `userId` comparison
++     * this chapter's port has met; the first was the distinct-user insert's guard. */
++    userId: string,
++    /** WHETHER THE SENDER IS A PERSON, computed at the ban check from the same row so
++     * this costs nothing beyond passing it. It decides the ENFORCED ceiling and not the
++     * bill — see the two notes below, which are the two halves of one exemption. */
++    senderIsPerson: boolean,
 +  ): Promise<{
 +    caps: { messages: Caps; active_users: Caps };
 +    sent: number;
@@ -2050,7 +2893,23 @@ REGENERATED
 +      });
 +    }
 +
-+    if (users_.hard === null || userId === undefined) {
++    // A BOT IS EXEMPT FROM THE CEILING, AND BILLED FOR THE SEND (FR-RTL-05 as this
++    // project's own SRS amendment left it). The clause caps "unique active PERSONS";
++    // FR-ANL-05 still meters "unique active users", and the insert in `sendMessage`
++    // counts a bot like anyone — which is what makes a bot billed and exempt at once.
++    //
++    // THE REASON IS WHOSE SEND GETS REFUSED. The ceiling bounds a customer's human
++    // population, and a customer's own software must not be able to lock their people
++    // out of sending. It would: the block below refuses the FIRST send of a period by
++    // anyone once the count is reached, so the person refused is never whoever caused
++    // it.
++    if (!senderIsPerson) {
++      return { caps: { messages: messages_, active_users: users_ }, sent };
++    }
++    // NO CAP ON USERS, NOTHING MORE TO CHECK. The `|| userId === undefined` that stood
++    // beside this is gone with the parameter's type: a send with no sender is a state
++    // no write path can produce since the sender chapter made `userId` required.
++    if (users_.hard === null) {
 +      return { caps: { messages: messages_, active_users: users_ }, sent };
 +    }
 +
@@ -2068,13 +2927,28 @@ REGENERATED
 +      return { caps: { messages: messages_, active_users: users_ }, sent };
 +    }
 +
++    // AND THIS IS THE EXEMPTION'S SECOND HALF, which is the one that decides whether
++    // it works. Returning early above is visible: a bot's send is not refused. But the
++    // count the ceiling compares against would still hold the bot's row, displacing a
++    // person — so a customer at a ceiling of five with two bots could seat three
++    // people. **A test that only watches a bot's send succeed passes with the first
++    // half alone**, which is why the one below sends as a PERSON after a bot.
++    //
++    // THE JOIN FILTERS `kind` AND NOT `deleted_at`, and the wrong version is the one a
++    // careful reader writes: three `users` joins in this file pair with
++    // `isNull(users.deletedAt)` and it is the house idiom. `deleteUser` is a SOFT
++    // delete and leaves `usage_active_users` alone, so adding that filter would make a
++    // deleted person's row stop counting — and deleting users would become a way to
++    // free ceiling slots, which it is not.
 +    const [count] = await tx
 +      .select({ n: sql<number>`count(*)::int` })
 +      .from(usageActiveUsers)
++      .innerJoin(users, eq(users.id, usageActiveUsers.userId))
 +      .where(
 +        and(
 +          eq(usageActiveUsers.environmentId, this.environmentId),
 +          eq(usageActiveUsers.period, period),
++          eq(users.kind, "person"),
 +        ),
 +      );
 +    const active = count?.n ?? 0;
@@ -2089,7 +2963,7 @@ REGENERATED
 +    return { caps: { messages: messages_, active_users: users_ }, sent };
 +  }
 +
-+  /** Write a row for each threshold a usage increase crossed (   * FR-RTL-07, FR-RTL-07).
++  /** Write a row for each threshold a usage increase crossed (FR-RTL-07).
 +   *
 +   * IN THE SAME TRANSACTION AS THE THING THAT CAUSED IT. The crossing and the
 +   * message commit together or neither does, which is the same argument the
@@ -2149,29 +3023,28 @@ REGENERATED
     * recovery leg of 2.3's duplicate-recognised path. The channel join
     * carries the tenant scope: every query in this layer answers only for
     * its own environment, private helpers included (constitution I). */
+   private async getMessageByIdempotencyKey(
+     tx: Db,
 ```
 
 ```diff title="services/api/src/messages/messages.service.ts"
-@@ -1,6 +1,8 @@
- import {
-   BadRequestException,
-+  HttpException,
-+  HttpStatus,
-   Injectable,
-   NotFoundException,
- } from "@nestjs/common";
- 
-@@ -9,8 +11,9 @@ import {
+@@ -16,12 +16,13 @@ import {
    Repository,
    type MessageRow,
    type MessageWithSender,
+   SenderNotPermittedError,
  } from "../db/repository";
+ import { protocolError } from "../protocol-error";
 +import { QuotaExceededError } from "../quotas/quota.error";
  import { decodeCursor, encodeCursor } from "./cursor";
- import type { HistoryQuery, SendMessageBody } from "./messages.schema";
+ import type { EditMessageBody, HistoryQuery, SendMessageBody } from "./messages.schema";
  
  // The thin layer between HTTP and the repository (chapters 2.2 + 2.3). It
-@@ -55,8 +58,40 @@ export class MessagesService {
+ // owns two things: turning the layer's domain error into the wire's 404,
+ // and carrying the write path's inputs down to the repository.
+@@ -138,12 +139,45 @@ export class MessagesService {
+       if (error instanceof ChannelNotFoundError) {
+         // A CONSTANT message: echoing the id back would make the foreign-id
          // answer differ from the missing-id answer, and "different" is
          // itself a disclosure (FR-TEN-05).
          throw new NotFoundException("channel not found");
@@ -2186,7 +3059,7 @@ REGENERATED
 +        // add one to, and adding two would be the drift EIR-API-04 and
 +        // `ProtocolErrorFilter` exist to prevent (research R3).
 +        //
-+        // `402`, NOT `429`. The rate-limit chapter owns `429`, and a client that sleeps for
++        // `402`, NOT `429`. THE RATE-LIMIT CHAPTER owns `429`, and a client that sleeps for
 +        // `Retry-After` and retries is behaving correctly for a rate limit and
 +        // wrongly for a quota — which will still be exhausted in an hour and in
 +        // three weeks. There is a time at which sends resume and it is in the
@@ -2196,15 +3069,16 @@ REGENERATED
 +        // a code from the status for 400, 401, 403 and 404, and everything else
 +        // becomes `internal_error` — so an unnamed `402` would emit a body
 +        // calling itself an internal error while carrying a `402`. That is the
-+        // lie chapter 2.2 fixed for 400 and the credentials chapter for 403, and the credentials chapter's
-+        // mechanism — a thrower naming its own code — is what this uses. The
-+        // filter builds the four-field envelope and derives `docs_url` from the
-+        // code.
-+        throw new HttpException(
-+          {
-+            code: "quota_exceeded",
-+            message: error.publicMessage(),
-+          },
++        // lie chapter 2.2 fixed for 400 and the credentials chapter for 403.
++        //
++        // THROUGH `protocolError`, NOT `new HttpException`, and in this order that is
++        // available rather than clever: the error-registry chapter made `ErrorCode` a
++        // type, so `"quota_exceeded"` is checked against the register at compile time
++        // instead of being a string this file believes in. A typo here used to ship a
++        // body naming a code no reference documents and a `docs_url` pointing at it.
++        throw protocolError(
++          "quota_exceeded",
++          error.publicMessage(),
 +          HttpStatus.PAYMENT_REQUIRED,
 +        );
 +      }
@@ -2212,12 +3086,16 @@ REGENERATED
      }
    }
  
+   /** Change what a message says (FR-001, FR-013, FR-014).
+    *
 ```
 
 ```diff title="services/api/src/app.module.ts"
-@@ -11,8 +11,9 @@ import { HealthController } from "./health.controller";
- import { InternalModule } from "./internal/internal.module";
- import { MessagesModule } from "./messages/messages.module";
+@@ -15,12 +15,13 @@ import { ChannelsModule } from "./channels/channels.module";
+ // line the module is compiled, exported, imported by nothing, and none of the user
+ // routes exist. The file appeared in no task until an enumeration asked which
+ // chapter fences it.
+ import { UsersModule } from "./users/users.module";
  import { ConsumerModule } from "./consumer/consumer.module";
  import { NotificationsModule } from "./notifications/notifications.module";
 +import { QuotasModule } from "./quotas/quotas.module";
@@ -2225,7 +3103,11 @@ REGENERATED
  import { WebhooksModule } from "./webhooks/webhooks.module";
  import { TenancyModule } from "./tenancy/tenancy.module";
  import { LOGGER, apiLogger } from "./logger";
-@@ -32,8 +33,9 @@ import { RequestContextMiddleware } from "./request-context.middleware";
+ import { ProtocolErrorFilter } from "./protocol-error.filter";
+ import { LimitsModule } from "./limits/limits.module";
+@@ -38,12 +39,13 @@ import { RequestContextMiddleware } from "./request-context.middleware";
+     ChannelsModule,
+     UsersModule,
      InternalModule,
      TenancyModule,
      OutboxModule,
@@ -2235,10 +3117,14 @@ REGENERATED
      WebhooksModule,
      LimitsModule,
    ],
+   controllers: [HealthController],
+   providers: [
 ```
 
 ```diff title="services/api/src/main.ts"
-@@ -5,8 +5,9 @@ import { createLogger } from "@relay/service-kit";
+@@ -3,12 +3,13 @@ import "reflect-metadata";
+ import { NestFactory } from "@nestjs/core";
+ import { createLogger } from "@relay/service-kit";
  
  import { AppModule } from "./app.module";
  import { EventConsumerService } from "./consumer/consumer.module";
@@ -2248,7 +3134,11 @@ REGENERATED
  import { DeliveryRelayService } from "./webhooks/webhooks.module";
  
  // Nest's own banner logger stays off: this workspace already decided what a
-@@ -25,8 +26,9 @@ async function bootstrap(): Promise<void> {
+ // log line looks like (one JSON object, NFR-OBS-01), and the framework does
+ // not get a second opinion.
+@@ -35,12 +36,13 @@ async function bootstrap(): Promise<void> {
+   app.get(OutboxRelayService).start();
+   // The disablement notifications the retry-and-disable chapter wrote and nothing
    // delivered. Its backlog drains on this first start as ordinary undelivered
    // work — no migration and no special case, because `delivered_at IS NULL` was
    // already true of every one of those rows.
@@ -2258,6 +3148,8 @@ REGENERATED
    // publishing deliveries that have become due. Started here for the outbox chapter's reason —
    // a retry schedule that only runs when someone remembers is not a schedule.
    app.get(DeliveryRelayService).start();
+   // And the first thing that reads what the relay publishes.
+   // Same placement, same reason, same lazy connection: an unreachable broker
 ```
 
 <ChapterFooter id="3.23" />
