@@ -63,7 +63,35 @@ what arrives; making it looser to accommodate a different frame is a promise nob
 on.
 
 ```diff title="packages/protocol/src/frames.ts"
-@@ -66,15 +66,47 @@ export const messageCreatedSchema = z.strictObject({
+@@ -29,12 +29,27 @@ export const connectionAckSchema = z.strictObject({
+   type: z.literal("connection.ack"),
+   payload: z.strictObject({
+     user: z.string().min(1),
+     cursor: cursorSchema,
+     resume_ok: z.boolean(),
+     truncated: z.array(z.string().min(1)),
++    /** How many revisions each of this user's channels has seen.
++     *
++     * EVERY CHANNEL THE USER BELONGS TO, ZEROS INCLUDED. A channel absent from this map
++     * would be indistinguishable from a channel at zero, and a client cannot tell "no
++     * revisions" from "not reported" — so the map is total over the membership and a
++     * client that holds a count for a channel missing here knows the membership changed
++     * rather than guessing.
++     *
++     * THE PLATFORM REPORTS AND NEVER COMPARES. Nothing on the server reads the number a
++     * client holds; the client decides whether to re-read history. A draft had the client
++     * present its counts on the upgrade URL so the gateway could answer with the stale
++     * channels, and it was built and then removed — a count the server ACTS on is a number
++     * the client controls, and a fabricated one becomes a denial of service the platform
++     * performs on itself. */
++    revisions: z.record(z.string().min(1), z.number().int().nonnegative()),
+   }),
+ });
+ 
+ /** Client → server send (SAD §5.1: `message.send {idem_key, channel, text}`).
+  * The idempotency key is client-supplied (FR-SDK-06), deduplicated
+  * server-side within 24 h (FR-MSG-04). */
+@@ -66,15 +81,47 @@ export const messageCreatedSchema = z.strictObject({
  
  export const messageUpdatedSchema = z.strictObject({
    type: z.literal("message.updated"),
@@ -112,7 +140,7 @@ on.
    type: z.literal("membership.changed"),
    payload: z.strictObject({
      channel: z.string().min(1),
-@@ -154,12 +186,16 @@ export const frameSchema = z.discriminatedUnion("type", [
+@@ -154,12 +201,16 @@ export const frameSchema = z.discriminatedUnion("type", [
    errorFrameSchema,
  ]);
  
@@ -452,6 +480,82 @@ listening to — or worse, the reverse.
     * That function walks `subscribersOf` and sends to everyone, so a user sees
     * their own presence transition — the membership-revocation chapter confirmed it from the other
     * side, counting two frames where a watcher correctly sees their own arrival.
+@@ -706,30 +739,36 @@ export function attachSessions({
+           );
+           ws.close(4003, CLOSE_CODES[4003]);
+           logger.log("info", "connection.rejected", { reason: "user_banned" });
+           return;
+         }
+         // NO SEND LIMIT ARGUMENT YET. `authenticate` returns the limits with the
+-        // session in movement VII, where the limiter is written; `open` takes four
+-        // parameters until then rather than a fifth nothing can supply.
++        // session in movement VII, where the limiter is written; until then `open`
++        // takes what the session answer actually carries and nothing more.
+         void open(
+           ws,
+           result.identity,
+           result.channelIds,
++          result.revisions,
+           req.url ?? "/",
+           pendingId,
+           claimed,
+         );
+       });
+     })();
+   });
+ 
+   async function open(
+     socket: WebSocket,
+     identity: Identity,
+     channelIds: string[],
++    /** BESIDE `channelIds` AND NOT AFTER `url`, because it arrives with them from one
++     * session answer — and because `claimedId` below is optional: gaps.md 045-18 records
++     * a parameter inserted ahead of an optional one silently renaming every later
++     * argument. A required parameter here makes the compiler name every call site. */
++    revisions: Record<string, number>,
+     url: string,
+     /** The id the cap claimed a place with, so the connection and
+      * its slot agree — FR-011's "exactly one place for its lifetime". Absent when
+      * no `connections` module is wired, which is every fixture that does not opt
+      * in and the reason the cap is not enforced there. */
+     claimedId?: string,
+@@ -744,12 +783,14 @@ export function attachSessions({
+       socket,
+       // Memberships arrived with the identity, from the session
+       // call at the door. There is no second lookup to fail here — the api is
+       // still the only source of membership (ADR-05), it just answers both
+       // questions at once, and a failure now closes the socket before it opens.
+       channelIds: new Set(channelIds),
++      // Reported on the ack and never read again by this service.
++      revisions,
+       missedPings: 0,
+       phase: presented === undefined ? "live" : "buffering",
+       buffer: [],
+       overflowed: false,
+       // A fresh connect suppresses nothing; a resume fills this in when it
+       // succeeds, and leaves it null when it degrades.
+@@ -1040,13 +1081,20 @@ export function attachSessions({
+       resume_ok: boolean;
+       truncated: string[];
+     },
+   ): void {
+     send(connection.socket, {
+       type: "connection.ack",
+-      payload: { user: connection.identity.userExternalId, ...payload },
++      payload: {
++        user: connection.identity.userExternalId,
++        // EVERY CHANNEL THIS USER BELONGS TO, ZEROS INCLUDED, on every ack — a resume
++        // and a fresh connect report the same way, because a client cannot act on a
++        // number it only sometimes receives.
++        revisions: connection.revisions,
++        ...payload,
++      },
+     });
+   }
+ 
+   /** The five steps (chapter 2.7, SAD §5.2). Steps 1 and 2 already happened
+    * — the connection was born `buffering` and the subscribes are in flight
+    * — so what is left is: confirm, backfill, ack, emit, flush, live. */
 ```
 
 That is the change ADR-24 exists for, and it is three lines. The kind comes off the payload
@@ -614,6 +718,54 @@ CREATE TABLE message_edits (
     prior_text  TEXT NOT NULL,
     CONSTRAINT message_edits_message_id_edited_at_pk PRIMARY KEY (message_id, edited_at)
 );
+
+--> statement-breakpoint
+
+-- ONE MIGRATION, ONE SUBJECT: REVISIONS. `message_edits` above preserves what a message
+-- used to say; the column below counts how many times it has changed. Both are this
+-- chapter's subject, and splitting them across two migrations would number one of them
+-- after work that has nothing to do with either.
+-- HOW MANY REVISIONS A CHANNEL HAS SEEN, and why it lives in this migration.
+--
+-- WHAT IT IS FOR. Resume is ordered by the channel sequence, and an edit or a
+-- deletion carries the sequence of the message it CHANGES rather than a new one.
+-- A message revised below a client's cursor is therefore in neither the replay
+-- nor the live stream, and consumes no sequence, so no gap appears for a client
+-- to notice. SRS FR-016a says the stale copy is repairable by re-reading
+-- history; nothing told a client when to. This column is what a reconnecting
+-- client compares against.
+--
+-- MEASURED BEFORE IT WAS BUILT. A client holding message seq 1, reconnecting on
+-- cursor 2 after that message was edited, received exactly one frame — the ack —
+-- and zero sequences. The edit was never delivered. The same probe confirmed the
+-- other half: a message edited ABOVE the cursor comes back on the replay with its
+-- new text, because the backfill reads current state.
+--
+-- EXECUTABLE WITHOUT DOWNTIME, which the constitution requires of every
+-- migration. `ADD COLUMN ... NOT NULL DEFAULT` is metadata-only from PostgreSQL
+-- 11: the default is stored in the catalogue and existing rows are not rewritten.
+-- On 10 and below this statement rewrites the whole table and takes an ACCESS
+-- EXCLUSIVE lock for the duration. This platform targets 15 (SAD §6.1), and the
+-- version the property depends on belongs in the file rather than in somebody's
+-- memory.
+--
+-- BIGINT, MATCHING channels.last_sequence. A channel revised once a second for a
+-- century reaches 3.2 billion, which overflows `integer` and does not trouble
+-- `bigint`. The sequence column made the same choice for the same reason.
+--
+-- DEFAULT 0 AND NOT A COUNT RECONSTRUCTED FROM HISTORY. `message_edits` and
+-- `messages.deleted_at` between them could produce a true count for every
+-- existing channel, and it would be correct and useless: it would exceed every
+-- client's stored count on the first reconnect after this ships, and tell every
+-- client to repair every channel once. Starting at zero means a revision applied
+-- before this migration is never repaired for a client already holding the stale
+-- copy — which is the current behaviour continuing, not a new defect.
+--
+-- NO INDEX. The column is read by primary key on a row the membership query
+-- already joins. An index would serve no query that exists.
+
+ALTER TABLE channels
+  ADD COLUMN revision_sequence BIGINT NOT NULL DEFAULT 0;
 ```
 
 Three columns and a composite key. This chapter's own data model gave the table a fourth
@@ -963,7 +1115,57 @@ nobody has.
      this.name = "UserBannedError";
    }
  }
-@@ -2054,16 +2130,17 @@ export class Repository {
+@@ -1249,24 +1325,45 @@ export class Repository {
+         ),
+       )
+       .orderBy(asc(members.joinedAt));
+     return rows.map((r) => r.user_id);
+   }
+ 
+-  async channelsForUser(userId: string): Promise<string[]> {
+-    const rows = await this.db
+-      .select({ channel_id: members.channelId })
++  /** The channels a user belongs to, each with its revision count (feature 044, FR-014).
++   *
++   * ONE QUERY, NOT TWO. The count could have come from a second call, and giving each
++   * caller its own is the two-lists-that-must-agree defect `gaps.md` 3.23-4 records about
++   * `targets.ts` — two things that must match, maintained separately, with nothing
++   * comparing them. The join costs nothing: `members` is already reached and `channels` is
++   * one hop from it on a primary key.
++   *
++   * FR-014 IS WHY THE COUNT RIDES THIS QUERY AT ALL. At 10,000 connections a per-channel
++   * read per handshake is 10,000 extra reads, and the reconnect rate measured before this
++   * feature was 1,402 per second. The count has to arrive on work the api already does.
++   *
++   * TWO CALLERS, AND BOTH ARE REPAIRED IN THE SAME CHANGE. `session.controller.ts` wants
++   * the counts; `memberships.controller.ts` wants ids alone and maps them. Widening the
++   * return without fixing both leaves the second assigning objects to a `string[]`, which
++   * is a typecheck failure at exactly the boundary this project commits at. */
++  async channelsForUser(
++    userId: string,
++  ): Promise<{ channel_id: string; revision_sequence: number }[]> {
++    return await this.db
++      .select({
++        channel_id: members.channelId,
++        revision_sequence: channels.revisionSequence,
++      })
+       .from(members)
+       .innerJoin(users, eq(users.id, members.userId))
++      .innerJoin(channels, eq(channels.id, members.channelId))
+       .where(
+         and(
+           eq(members.userId, userId),
+           eq(users.environmentId, this.environmentId),
+         ),
+       );
+-    return rows.map((r) => r.channel_id);
+   }
+ 
+   /** Upsert a user by external id, updating the profile fields present
+    * (FR-025, FR-026).
+    *
+    * NOT `createUser`, AND THE DIFFERENCE IS THE POINT. `createUser` is deliberately not an
+@@ -2054,16 +2151,17 @@ export class Repository {
        //     userId absent     the TENANT is sending through an application key.
        //                       It acts for the customer, carries no user, and sees
        //                       private channels (FR-005).
@@ -985,7 +1187,7 @@ nobody has.
        // that does not exist — same status, same body but for `request_id` — and
        // send is one of the verbs it covers. A `403 not_a_member` here would
        // announce that the channel exists, which is the leak FR-003 forbids and
-@@ -2251,12 +2328,426 @@ export class Repository {
+@@ -2251,12 +2349,474 @@ export class Repository {
          text,
          created_at: createdAt,
        };
@@ -1077,12 +1279,52 @@ nobody has.
 +      // would be two instants, and the history row's own primary key is
 +      // (message_id, edited_at), so a caller reading the history could not match an
 +      // entry to the message state it produced.
++      // THE WRITE REFUSES, NOT ONLY THE READ (feature 043, FR-007).
++      //
++      // This was `.where(eq(messages.id, messageId))`, and the `row.text === null`
++      // check above it is a read taken earlier in the same transaction. Neither this
++      // method nor `deleteMessage` takes a row lock, so a deletion committing in that
++      // window left the edit free to overwrite it: `text` restored, `deleted_at` still
++      // set — **a row one filter calls deleted and another calls alive**, and a
++      // deletion that returned successfully undone by an edit already in flight.
++      //
++      // `gaps.md` 3.23-3 recorded the opposite — *"both interleavings end in a
++      // tombstone… there is no order of the two that leaves a message saying something
++      // nobody wrote"* — and the test that item asked for is what disproved it: three
++      // of five runs, and four incoherent rows left behind in the lane.
++      //
++      // A COMPARE-AND-SET, NOT A LOCK. `SELECT … FOR UPDATE` in both methods would
++      // close it too, and would serialise a pair `assertWithinQuota` deliberately
++      // declined to serialise on the send path. A conditional UPDATE costs nothing
++      // when there is no race and refuses exactly when there is one: zero rows
++      // affected means the row stopped being editable between the read and the write,
++      // which is what `MessageDeletedError` already says.
 +      const [updated] = await tx
 +        .update(messages)
 +        .set({ text, editedAt: sql`now()` })
-+        .where(eq(messages.id, messageId))
++        .where(and(eq(messages.id, messageId), isNull(messages.deletedAt)))
 +        .returning({ editedAt: messages.editedAt });
-+      const editedAt = updated!.editedAt!;
++      if (!updated) throw new MessageDeletedError(messageId);
++      const editedAt = updated.editedAt!;
++
++      // FEATURE 044, FR-002/FR-003. The channel's revision counter rises by one, inside the
++      // transaction that applies the revision — so a revision that commits and a count that
++      // rises are the same event, and a count can never describe a revision the transaction
++      // refused.
++      //
++      // AFTER THE COMPARE-AND-SET ABOVE, deliberately. That statement refuses an edit to an
++      // already-deleted message by affecting zero rows; bumping before it would raise the
++      // count for an edit that then threw.
++      //
++      // AN EXTRA ROUND TRIP, AND THE RIGHT SIDE OF THE TRADE. The send path updates this row
++      // anyway, so `lastActivityAt` there "costs an extra assignment rather than an extra
++      // round trip"; this path touches `messages` and `message_edits` only, so the counter
++      // costs one UPDATE. Revisions are rare and reconnects are not, and the alternative puts
++      // a scan on the handshake (FR-014).
++      await tx
++        .update(channels)
++        .set({ revisionSequence: sql`${channels.revisionSequence} + 1` })
++        .where(eq(channels.id, channelId));
 +
 +      // FR-004. The row carries what the message said BEFORE this edit — `row.text`,
 +      // read above and narrowed to a string by the tombstone check.
@@ -1305,6 +1547,14 @@ nobody has.
 +      // assigned, and the event and the frame must both quote that one.
 +      const deletedAt = toIso(updated!.deletedAt!);
 +
++      // FEATURE 044, FR-002/FR-003. A DELETION IS A REVISION and raises the count exactly as
++      // an edit does — US1's third acceptance scenario fails if only edits are counted. Same
++      // transaction, same argument as the edit path.
++      await tx
++        .update(channels)
++        .set({ revisionSequence: sql`${channels.revisionSequence} + 1` })
++        .where(eq(channels.id, channelId));
++
 +      // THE EVENT COMMITS WITH THE TOMBSTONE (ADR-06), on the send path's argument at
 +      // its own outbox insert: publishing after the commit leaves a gap where the row
 +      // changed and the event never existed, silently, with nothing to reconcile.
@@ -1412,7 +1662,7 @@ nobody has.
     * its own environment, private helpers included (constitution I). */
    private async getMessageByIdempotencyKey(
      tx: Db,
-@@ -2456,12 +2947,25 @@ export class Repository {
+@@ -2456,12 +3016,25 @@ export class Repository {
        // must emit frames identical to live ones, and a reader that gets a
        // different shape depending on which door it came through is a client
        // bug waiting for a reconnect.
@@ -1438,7 +1688,7 @@ nobody has.
          eq(messages.channelId, channelId),
          eq(channels.environmentId, this.environmentId),
          ...(extra ? [extra] : []),
-@@ -2492,13 +2996,20 @@ export class Repository {
+@@ -2492,13 +3065,20 @@ export class Repository {
            // inner join here would make those rows vanish from history —
            // silent data loss dressed up as a query.
            .leftJoin(users, eq(users.id, messages.userId))
@@ -1928,15 +2178,713 @@ IMAP      CONDSTORE/QRESYNC puts a MODSEQ beside the sequence, so a client asks
           that every mutation has to maintain.
 ```
 
-Relay is already the first shape. Both alternatives add a per-channel counter, and this
-chapter chose to write the bound down rather than add one — into ADR-07, whose loss argument
-rests on *"the client's cursor + sequence-gap detection recovers anything missed"* and has now
-been narrowed twice: once by the membership-revocation chapter for a payload with no
-sequence, and once here for a payload whose sequence belongs to a message the client already
-holds.
+Relay is already the first shape. Both alternatives add a per-channel counter — and the
+next section adds one, which is a change of mind inside a single chapter and worth saying
+plainly: the first draft wrote the bound into ADR-07 and stopped there. ADR-07's loss
+argument rests on *"the client's cursor + sequence-gap detection recovers anything missed"*
+and has now been narrowed twice, once by the membership-revocation chapter for a payload with
+no sequence and once here for a payload whose sequence belongs to a message the client
+already holds. **Twice narrowed is the point at which a bound stops being a bound.**
 </Why>
 
+## The counter the cursor needs
+
+The section above surveys three products and declines to add a counter. This one adds it,
+because the argument for declining does not survive its own conclusion: **the bound was
+written down, and a bound nobody can act on is not a design, it is a note.** A client that
+cannot tell an edited message from an unedited one has no way to decide to re-read history,
+and "re-read history" was the entire remedy ADR-07 rested on.
+
+So Relay takes IMAP's shape — a second monotonic number per channel, beside the sequence —
+and pays IMAP's price: every mutation maintains it.
+
+**One column, and it rides this chapter's own migration.** `message_edits` above preserves
+what a message used to say; `channels.revision_sequence` says how many times it changed.
+Those are one subject, and splitting them across two migrations would number one of them
+after work that has nothing to do with either.
+
+**Raised by exactly one per edit or deletion, inside the transaction that applies it, and
+never by a send.** The increment is in the edit and the deletion paths fenced earlier in
+this chapter — go back and look at `repository.ts`: it is two lines, in each case inside the
+same transaction as the write it counts. Outside that transaction it would be a second
+statement that can fail on its own, and a counter that can miss is worse than no counter,
+because a client would trust it.
+
+**The count is reported and never compared.** The api answers it on the one call the
+gateway already makes:
+
+```diff title="packages/protocol/src/internal.ts"
+@@ -134,12 +134,19 @@ export const internalMembershipsResponseSchema = z.strictObject({
+  * `user` is the EXTERNAL id, as everywhere else on this contract: internal uuids
+  * are the api's business. */
+ export const internalSessionResponseSchema = z.strictObject({
+   environment_id: z.string().min(1),
+   user: z.string().min(1),
+   channel_ids: z.array(z.string().min(1)),
++  /** Per channel, how many revisions it has seen — the same keys as `channel_ids`.
++   *
++   * ONE QUERY, TWO FIELDS. The membership read already joins `channels` to answer
++   * `channel_ids`, so the counter comes back on rows the api was fetching anyway: no
++   * second round trip, and no possibility of the two disagreeing about which channels
++   * the user belongs to. */
++  revisions: z.record(z.string().min(1), z.number().int().nonnegative()),
+   /** FR-031. Whether this user is banned in this environment.
+    *
+    * IT RIDES THE RESPONSE THE GATEWAY ALREADY ASKS FOR: the gateway has no database and
+    * must not gain one, `banned_at` is a column in Postgres, and the api is the only
+    * service that reads Postgres. So the ban travels on the one call the gateway already
+    * makes at connect — no new table reaches the gateway and no new round trip is added.
+```
+
+The gateway has no database and must not gain one — the same reason `banned` rides this
+response — so the counts travel with the ids that are already being fetched:
+
+```diff title="services/api/src/internal/session.controller.ts"
+@@ -71,22 +71,30 @@ export class SessionController {
+       throw new UnauthorizedException("a bot user cannot open a session");
+     }
+     // A verified token for a user this environment has never seen is not an
+     // error: it is a user with no channels. The gateway's job is delivery, not
+     // identity forensics — 2.5's rule, and the reason a first connect from a
+     // brand-new user works before anything is seeded.
++    const channels = user ? await this.repo.channelsForUser(user.id) : [];
+     return {
+       environment_id: principal.environmentId,
+       user: principal.userExternalId,
+       // FR-031. THE ROW IS ALREADY IN HAND — `getUserByExternalId` above
+       // reads it for the channel list — so carrying the ban costs one field and no query.
+       // The gateway refuses the socket; this route only reports the fact, because the
+       // gateway has no database and the column is in Postgres.
+       //
+       // A USER THIS ENVIRONMENT HAS NEVER SEEN IS NOT BANNED. `user` is null for a
+       // verified token naming somebody with no row, which chapter 2.5 decided is a user
+       // with no channels rather than an error — and a user with no row has no ban either.
+       banned: user?.banned_at != null,
+-      channel_ids: user ? await this.repo.channelsForUser(user.id) : [],
++      // IDS AND COUNTS OFF ONE READ. `channelsForUser` returns a row per channel, so
++      // the two fields cannot disagree about which channels this user belongs to — and
++      // the counter costs no extra query, because the membership join already touches
++      // `channels` to answer the ids.
++      channel_ids: channels.map((c) => c.channel_id),
++      revisions: Object.fromEntries(
++        channels.map((c) => [c.channel_id, c.revision_sequence]),
++      ),
+     };
+   }
+ }
+```
+
+`channelsForUser` now returns a row per channel rather than an id, which is what makes the
+two fields incapable of disagreeing about which channels a user belongs to. Its other
+caller changes shape with it, and the compiler said so:
+
+```diff title="services/api/src/internal/memberships.controller.ts"
+@@ -62,10 +62,15 @@ export class MembershipsController {
+     // that threw for a deleted user would turn a routine refresh into a failure the
+     // gateway has to interpret.
+     const user = await this.repo.getUserByExternalId(
+       req.principal.userExternalId,
+     );
+     return {
+-      channel_ids: user ? await this.repo.channelsForUser(user.id) : [],
++      // Ids alone: this route answers what a user may hear, not what has changed in it.
++      // `channelsForUser` carries revision counts for the session route (feature 044);
++      // mapping them off here keeps one query behind both.
++      channel_ids: user
++        ? (await this.repo.channelsForUser(user.id)).map((c) => c.channel_id)
++        : [],
+     };
+   }
+ }
+```
+
+From there it is carriage, not logic. The authentication result gains a field, the
+connection holds it, and the ack reports it:
+
+```diff title="services/gateway/src/auth.ts"
+@@ -24,13 +24,21 @@ export type { Identity } from "./api-client.js";
+ /** Three outcomes, not two. A refused token and an unreachable api both fail to
+  * open a socket, but they are not the same event and must not close the same
+  * way: 4001 tells a client its credential is wrong (retrying will not help),
+  * 1011 tells it we are broken (retrying will). 2.5 drew that line for the
+  * memberships lookup; moving verification here must not erase it. */
+ export type Authentication =
+-  | { outcome: "ok"; identity: Identity; channelIds: string[] }
++  | {
++      outcome: "ok";
++      identity: Identity;
++      channelIds: string[];
++      /** Per channel, how many revisions it has seen. Reported to the client on the
++       * ack and never compared here: the gateway has no opinion about staleness, and
++       * no database to form one with. */
++      revisions: Record<string, number>;
++    }
+   | { outcome: "refused" }
+   | { outcome: "unavailable"; error: string }
+   /** FR-031. The api answered, the token is perfectly good, and the user is banned in
+    * this environment. Its own outcome and its own close code (4003), not a reuse of
+    * `refused`: 4001 means "your credential is bad", which a client acts on by
+    * re-authenticating — and re-authenticating succeeds and connects to the same
+@@ -61,11 +69,12 @@ export async function authenticate(
+         userExternalId: session.user,
+         // Carried, not trusted: the internal hop forwards this instead of
+         // asserting an identity the gateway invented.
+         token,
+       },
+       channelIds: session.channel_ids,
++      revisions: session.revisions,
+     };
+   } catch (error) {
+     return { outcome: "unavailable", error: String(error) };
+   }
+ }
+```
+
+```diff title="services/gateway/src/registry.ts"
+@@ -12,12 +12,16 @@ import type { ResumePhase } from "./resume.js";
+ //
+ // Note what else is absent: no pg, no drizzle-orm, no repository import.
+ // The gateway never touches the database (ADR-05) — and the lint ban from
+ // 2.1 makes the mistake a build failure, not a review comment.
+ 
+ export interface Connection {
++  /** Per channel, how many revisions it had when this connection was accepted.
++   * Read once, at the ack, and never updated: a client wanting a fresher count
++   * reconnects, which is the only moment the number is useful to it. */
++  revisions: Record<string, number>;
+   readonly id: string;
+   readonly identity: Identity;
+   readonly socket: WebSocket;
+   channelIds: Set<string>;
+   missedPings: number;
+   /** Chapter 2.7. A connection resuming through the tunnel spends its first
+```
+
+<Why title="Why the platform reports and never compares">
+
+A draft of this had the client present its counts on the upgrade URL — the same place the
+cursor is presented — so the gateway could answer with the list of channels whose counts had
+moved. It was built, and then removed.
+
+**A parameter the server parses and never acts on is a contract it can never remove.** That
+is the smaller half. The larger half is what happens when the server DOES act on it: the
+number is now something the client controls, and a client that reports zero for every channel
+asks the platform to treat every channel as stale. A fabricated count becomes a denial of
+service the platform performs on itself, at a cost set by whoever fabricated it.
+
+Removing it also deleted three edge cases rather than handling them — what to do about a
+channel the client names and is no longer a member of, a count higher than the server's, and
+a malformed map. **A design in which a case cannot arise beats a branch that handles it**,
+because the branch is the thing that rots.
+
+</Why>
+
+**Every channel the user belongs to, zeros included.** A channel absent from the map would be
+indistinguishable from a channel at zero, so the map is total over the membership: a client
+holding a count for a channel that is *missing* learns its membership changed, which is a
+different fact and a useful one.
+
+And the fixtures had to say so. Five suites build a session response, and a required field
+means each of them states what it means to report no revisions:
+
+```diff title="services/api/src/fanout/fanout.itest.ts"
+@@ -529,19 +529,20 @@ describe("the fan-out publish when it fails", () => {
+     } finally {
+       await app.close();
+       await dead.close();
+     }
+   });
+ 
+-  it("T038: a publisher that does NOTHING passes the weak assertions and fails the log one", async () => {
++  it("a publisher that does NOTHING passes the weak assertions and fails the log one", async () => {
+     // The proof that the test above distinguishes anything. A no-op publisher is
+     // what "the publish was never written" looks like from outside, and
+     // `publish` never rejects either way — so 201 and recoverability cannot tell
+     // them apart. Only the log line can.
+     const noop: MessagePublisher = {
+       publish: async () => {},
++      publishRevision: async () => {},
+       close: async () => {},
+     };
+     const { app, url: base } = await bootWith(noop);
+     try {
+       const text = `a no-op publisher ${randomUUID()}`;
+```
+
+```diff title="services/api/src/outbox/event.test.ts"
+@@ -1,11 +1,13 @@
+ import { describe, expect, it } from "vitest";
+ 
+ import {
+   membershipEvent,
+   messageCreatedEvent,
++  messageDeletedEvent,
++  messageUpdatedEvent,
+   OUTBOX_EVENT_TYPES,
+   outboxEventSchema,
+   subjectFor,
+ } from "./event";
+ 
+ // The envelope, Docker-free. What a consumer eventually receives
+@@ -132,24 +134,40 @@ describe("a legacy senderless message in the webhook payload (T054a)", () => {
+ 
+ const MEMBERSHIP = {
+   channel_id: "ce419dc5-b06e-441c-ab38-49451f87210e",
+   user: "tuan",
+ };
+ 
++/** A tombstone as a consumer receives it. No `text` key — that is
++ * FR-020, and `strictObject` refuses one. */
++const DELETED = {
++  id: MESSAGE.id,
++  channel_id: MESSAGE.channel_id,
++  seq: MESSAGE.seq,
++  user: MESSAGE.user,
++  deleted_at: "2026-09-03T09:15:00.000Z",
++};
++
+ describe("the outbox event type set", () => {
+   // ASSERTED AS A SET AND AS A COUNT, which is the presence chapter's `codes.test.ts`
+   // precedent: either alone lets a fourth type arrive unnoticed. FR-WHK-02 names
+-  // eight and three exist; the other five arrive with the features that can
+-  // produce them.
+-  it("is exactly the three types that have producers", () => {
++  // eight and FIVE exist as of this chapter; the other three arrive with the features
++  // that can produce them.
++  //
++  // THE ORDER IS THE ARRAY'S, and the two new names sit beside `message.created`
++  // rather than at the end — they are the same domain, and `toEqual` on an array is
++  // order-sensitive, so this assertion is also a claim about how the source reads.
++  it("is exactly the five types that have producers", () => {
+     expect([...OUTBOX_EVENT_TYPES]).toEqual([
+       "message.created",
++      "message.updated",
++      "message.deleted",
+       "channel.member_added",
+       "channel.member_removed",
+     ]);
+-    expect(OUTBOX_EVENT_TYPES).toHaveLength(3);
++    expect(OUTBOX_EVENT_TYPES).toHaveLength(5);
+   });
+ 
+   it("gives every type a subject without a mapping entry", () => {
+     // `subjectFor` abbreviates a domain only when DOMAIN_ABBREVIATION has it, so
+     // `channel` passes through unchanged. Checked rather than assumed: a type whose
+     // subject form is not its dotted name would need an entry, and the absence of a
+@@ -160,12 +178,98 @@ describe("the outbox event type set", () => {
+     expect(subjectFor("channel.member_removed", ENV)).toBe(
+       `events.channel.member_removed.${ENV}`,
+     );
+   });
+ });
+ 
++describe("messageUpdatedEvent and messageDeletedEvent", () => {
++  const updated = () =>
++    messageUpdatedEvent({
++      eventId: "9c26f1a2-0000-4000-8000-000000000003",
++      environmentId: ENV,
++      occurredAt: "2026-09-03T09:15:00.000Z",
++      message: MESSAGE,
++    });
++  const deleted = () =>
++    messageDeletedEvent({
++      eventId: "9c26f1a2-0000-4000-8000-000000000004",
++      environmentId: ENV,
++      occurredAt: "2026-09-03T09:15:00.000Z",
++      message: DELETED,
++    });
++
++  it("spells both types as FR-WHK-02 spells them", () => {
++    expect(updated().payload.type).toBe("message.updated");
++    expect(deleted().payload.type).toBe("message.deleted");
++    expect(updated().subject).toBe(`events.msg.updated.${ENV}`);
++    expect(deleted().subject).toBe(`events.msg.deleted.${ENV}`);
++  });
++
++  it("leaves the edit's payload identical to a creation's (FR-008a)", () => {
++    // FR-008a in one assertion: *"The message payload used by creation and edit events
++    // MUST be left unchanged."* Compared as SETS, so a field added to one and not the
++    // other fails here rather than in a customer's consumer.
++    expect(Object.keys(updated().payload.data).sort()).toEqual([
++      "channel_id",
++      "created_at",
++      "id",
++      "seq",
++      "text",
++      "user",
++    ]);
++  });
++
++  it("gives the deletion NO text key at all (FR-020)", () => {
++    // NOT `text: null` — a key that can hold the words somebody asked to have removed
++    // is a key somebody can forget to null. The exact set is the assertion.
++    const keys = Object.keys(deleted().payload.data).sort();
++    expect(keys).toEqual(["channel_id", "deleted_at", "id", "seq", "user"]);
++    expect(keys).not.toContain("text");
++  });
++
++  it("carries the edit's own instant, not the message's created_at", () => {
++    // The one place the edit event diverges from the creation event, and it has to: an
++    // event whose `occurred_at` predates the previous event about the same message
++    // cannot be ordered by a consumer.
++    expect(updated().payload.occurred_at).toBe("2026-09-03T09:15:00.000Z");
++    expect(updated().payload.occurred_at).not.toBe(MESSAGE.created_at);
++  });
++
++  it("refuses an event with no id and an event with no environment", () => {
++    // Refused rather than defaulted, like every other builder here: an event with no
++    // deduplication key looks deliverable and cannot be deduplicated.
++    for (const build of [messageUpdatedEvent, messageDeletedEvent]) {
++      expect(() =>
++        // @ts-expect-error the point of the test
++        build({ eventId: "", environmentId: ENV, occurredAt: "x", message: MESSAGE }),
++      ).toThrow("event id");
++      expect(() =>
++        // @ts-expect-error the point of the test
++        build({ eventId: "id", environmentId: "", occurredAt: "x", message: MESSAGE }),
++      ).toThrow("environment id");
++    }
++  });
++
++  it("round-trips both through the consumer's schema", () => {
++    // The producer and the consumer are two shapes of one contract. Without this, the
++    // union branches added in this chapter would be checked only against fixtures this
++    // file writes — and `consumer/runtime.ts` answers a failed parse with
++    // `message.term()`, which stops redelivery for good.
++    expect(outboxEventSchema.safeParse(updated().payload).success).toBe(true);
++    expect(outboxEventSchema.safeParse(deleted().payload).success).toBe(true);
++  });
++
++  it("refuses a deletion that carries a text, through the consumer's schema", () => {
++    const withText = {
++      ...deleted().payload,
++      data: { ...DELETED, text: "should not be here" },
++    };
++    expect(outboxEventSchema.safeParse(withText).success).toBe(false);
++  });
++});
++
+ describe("membershipEvent", () => {
+   const build = (change: "added" | "removed") =>
+     membershipEvent({
+       eventId: "9c26f1a2-0000-4000-8000-000000000001",
+       environmentId: ENV,
+       change,
+@@ -249,18 +353,30 @@ describe("outboxEventSchema — what a CONSUMER will accept", () => {
+ 
+   // THE TEST THIS CHAPTER EXISTS TO HAVE WRITTEN. Until it was, the schema was
+   // `z.literal("message.created")` and the consumer answers a failed parse with
+   // `message.term()` — redelivery stopped for good. Every membership event would
+   // have been destroyed there, in a lane that runs the consumer switched off.
+   it("accepts every type the producer can build", () => {
++    // A LOOKUP RATHER THAN A TERNARY, because the revisions chapter made the shapes three: a
++    // creation and an edit carry a `Message` (FR-008a), a deletion carries an identity
++    // with no text (FR-020), and a membership change carries neither. The ternary's
++    // `else` branch would have handed the membership shape to `message.deleted` and
++    // reported a schema failure as though the schema were wrong.
++    const dataFor: Record<(typeof OUTBOX_EVENT_TYPES)[number], unknown> = {
++      "message.created": MESSAGE,
++      "message.updated": MESSAGE,
++      "message.deleted": DELETED,
++      "channel.member_added": { channel_id: MEMBERSHIP.channel_id, user: MEMBERSHIP.user },
++      "channel.member_removed": { channel_id: MEMBERSHIP.channel_id, user: MEMBERSHIP.user },
++    };
+     for (const type of OUTBOX_EVENT_TYPES) {
+-      const data =
+-        type === "message.created"
+-          ? MESSAGE
+-          : { channel_id: MEMBERSHIP.channel_id, user: MEMBERSHIP.user };
+-      const result = outboxEventSchema.safeParse({ ...envelope, type, data });
++      const result = outboxEventSchema.safeParse({
++        ...envelope,
++        type,
++        data: dataFor[type],
++      });
+       expect(result.success, `${type} must parse`).toBe(true);
+     }
+   });
+ 
+   it("round-trips what membershipEvent produces", () => {
+     // The producer and the consumer are two shapes of one contract, and only a
+```
+
+```diff title="services/gateway/src/connections.itest.ts"
+@@ -135,12 +135,13 @@ async function boot(options: {
+   const api: ApiClient = {
+     session: async () => ({
+       environment_id: environment,
+       user: options.user,
+       banned: false,
+       channel_ids: options.channels,
++      revisions: {},
+       limits: { connect: 3_000, send: 600 },
+     }),
+     memberships: async () => options.channels,
+     backfill: async () => ({}) as never,
+     sendMessage: async () => {
+       throw new Error("not used");
+```
+
+```diff title="services/gateway/src/session.itest.ts"
+@@ -138,14 +138,27 @@ async function startApi(): Promise<ApiUnderTest> {
+   // which is the difference between adding a capability and repurposing one.
+   await repo.upsertUser("delivery-bot", {
+     display_name: "Delivery Bot",
+     kind: "bot",
+     description: "sends over REST so a socket can receive it",
+   });
++  // Two PEOPLE in the channel, because FR-005's property is "every
++  // connected member" and one socket cannot show it. ADDITIVE, on the fan-out chapter's
++  // precedent recorded just above — the tests that assert on "tuan" are unaffected by
++  // two more members of a public channel, and T033 is the only test that names these.
++  //
++  // BOTH ARE MEMBERS, and that is what the first run of T033 got wrong: `mintToken`
++  // mints a token for any identifier, so two sockets opened fine and neither was
++  // delivered to. The failure read "no the creation; saw connection.ack" — a
++  // membership problem wearing a delivery problem's message.
++  const editor = await repo.createUser("editor", "The Editor");
++  const watcher = await repo.createUser("watcher", "The Watcher");
+   const channel = await repo.createChannel("fleet", "public");
+   await repo.addMember(channel.id, user.id);
++  await repo.addMember(channel.id, editor.id);
++  await repo.addMember(channel.id, watcher.id);
+   const key = await seeder.createApiKey(db, {
+     environmentId: environment.id,
+   });
+ 
+   // PORT=0, AND THE PORT READ BACK FROM THE CHILD. This bound a fixed 4123 behind an
+   // environment variable nothing set — so every run took the same port, and a
+@@ -574,12 +587,150 @@ describe("the socket's delivery, with a fan-out attached", () => {
+     expect(delivered.payload.text).toBe(text);
+     expect(delivered.payload.user).toBe("delivery-bot");
+     // The sequence the api committed, not one the gateway invented.
+     expect(delivered.payload.seq).toBeGreaterThan(0);
+   });
+ 
++  it("an edit over REST reaches every member's socket as message.updated exactly once (FR-005, SC-001)", async () => {
++    // TWO SOCKETS, TWO DIFFERENT PEOPLE, and a count rather than a first match.
++    // `waitFor` resolves on the first frame that matches, so it cannot see a duplicate;
++    // FR-005 is one property with two halves — everybody gets it, and nobody gets it
++    // twice — and only counting after a settle covers the second.
++    const first = record(connect(await mintToken("editor")));
++    const second = record(connect(await mintToken("watcher")));
++    await waitFor(first, (f) => f.type === "connection.ack", "connection.ack (editor)");
++    await waitFor(second, (f) => f.type === "connection.ack", "connection.ack (watcher)");
++
++    // SENT BY THE EDITOR'S OWN TOKEN. Only an author may edit (FR-013) and the edit
++    // route takes no application credential at all (FR-013a), so the send has to be
++    // attributed to the same person — which a user token does by itself, and which is
++    // why this body names no `user`.
++    const editorToken = await mintToken("editor");
++    const before = `to be corrected ${randomUUID()}`;
++    const posted = await fetch(`${api.url}/v1/channels/${api.channelId}/messages`, {
++      method: "POST",
++      headers: {
++        "content-type": "application/json",
++        authorization: `Bearer ${editorToken}`,
++      },
++      body: JSON.stringify({ text: before }),
++    });
++    expect(posted.status, await posted.clone().text()).toBe(201);
++    const sent = (await posted.json()) as { id: string; seq: number };
++    await waitFor(second, (f) => f.type === "message.created", "the creation");
++
++    const after = `${before} (corrected)`;
++    const edited = await fetch(
++      `${api.url}/v1/channels/${api.channelId}/messages/${sent.id}`,
++      {
++        method: "PATCH",
++        headers: {
++          "content-type": "application/json",
++          authorization: `Bearer ${editorToken}`,
++        },
++        body: JSON.stringify({ text: after }),
++      },
++    );
++    expect(edited.status, await edited.clone().text()).toBe(200);
++
++    for (const [who, frames] of [
++      ["editor", first],
++      ["watcher", second],
++    ] as const) {
++      const updated = (await waitFor(
++        frames,
++        (f) => f.type === "message.updated",
++        `message.updated (${who})`,
++      )) as { payload: { text: string; seq: number; id: string } };
++      expect(updated.payload.text, who).toBe(after);
++      // THE SEQUENCE IT ALREADY HAD (FR-002), on the wire. A new number here would
++      // put the edit at the end of every client's list and break every cursor.
++      expect(updated.payload.seq, who).toBe(sent.seq);
++      expect(updated.payload.id, who).toBe(sent.id);
++    }
++
++    // AND EXACTLY ONCE EACH, after a settle long enough for a second copy to have
++    // arrived. Both counts, because the two sockets take different paths through the
++    // registry — the editor's connection and the watcher's are separate entries and a
++    // per-connection duplicate would show on one of them.
++    await new Promise((r) => setTimeout(r, 300));
++    expect(first.filter((f) => f.type === "message.updated")).toHaveLength(1);
++    expect(second.filter((f) => f.type === "message.updated")).toHaveLength(1);
++    // …AND NO SECOND CREATION, which is what ADR-24 is for. Routed to the old callback
++    // the edit arrives as `message.created` and no shape check can see it, because the
++    // `updated` arm's payload IS a `Message`.
++    expect(first.filter((f) => f.type === "message.created")).toHaveLength(1);
++    expect(second.filter((f) => f.type === "message.created")).toHaveLength(1);
++  });
++
++  it("a deletion over REST reaches a member's socket with NO text field, and a second deletion sends nothing (FR-007, FR-009)", async () => {
++    const frames = record(connect(await mintToken("watcher")));
++    await waitFor(frames, (f) => f.type === "connection.ack", "connection.ack");
++
++    // Sent by the editor and deleted by the TENANT KEY, which FR-012 permits
++    // irrespective of author — the path a moderator takes, exercised here because the
++    // frame must be identical either way.
++    const editorToken = await mintToken("editor");
++    const text = `to be removed ${randomUUID()}`;
++    const posted = await fetch(`${api.url}/v1/channels/${api.channelId}/messages`, {
++      method: "POST",
++      headers: {
++        "content-type": "application/json",
++        authorization: `Bearer ${editorToken}`,
++      },
++      body: JSON.stringify({ text }),
++    });
++    expect(posted.status, await posted.clone().text()).toBe(201);
++    const sent = (await posted.json()) as { id: string; seq: number };
++    await waitFor(frames, (f) => f.type === "message.created", "the creation");
++
++    const removed = await fetch(
++      `${api.url}/v1/channels/${api.channelId}/messages/${sent.id}`,
++      { method: "DELETE", headers: { authorization: `Bearer ${api.credential}` } },
++    );
++    expect(removed.status, await removed.clone().text()).toBe(204);
++
++    const frame = (await waitFor(
++      frames,
++      (f) => f.type === "message.deleted",
++      "message.deleted",
++    )) as { payload: Record<string, unknown> };
++    // THE EXACT KEY SET, which is the assertion FR-020's sibling requirement needs:
++    // "no text" as `Object.keys` rather than as `payload.text === undefined`, because
++    // an absent key and a null one read the same through a property access.
++    expect(Object.keys(frame.payload).sort()).toEqual([
++      "channel",
++      "deleted_at",
++      "id",
++      "seq",
++      "user",
++    ]);
++    expect(frame.payload).not.toHaveProperty("text");
++    // Identity and position (FR-008), and the sequence is the one it had — a tombstone
++    // that gave up its place would leave a gap in every client's ordering.
++    expect(frame.payload["id"]).toBe(sent.id);
++    expect(frame.payload["seq"]).toBe(sent.seq);
++    // THE AUTHOR, NOT THE DELETER. A tenant key removed it; the frame names who wrote
++    // it, which is the fact every client already holds beside the message.
++    expect(frame.payload["user"]).toBe("editor");
++
++    // AND NO SECOND FRAME FOR A SECOND DELETION (FR-009, SC-007). The status is 204
++    // either way, so this count is the only thing that can tell the two apart on the
++    // wire.
++    expect(
++      (
++        await fetch(`${api.url}/v1/channels/${api.channelId}/messages/${sent.id}`, {
++          method: "DELETE",
++          headers: { authorization: `Bearer ${api.credential}` },
++        })
++      ).status,
++    ).toBe(204);
++    await new Promise((r) => setTimeout(r, 300));
++    expect(frames.filter((f) => f.type === "message.deleted")).toHaveLength(1);
++  });
++
+   it("stops delivering to a member who was REMOVED while connected (FR-RTM-10)", async () => {
+     // INVERTED IN THE MEMBERSHIP-REVOCATION CHAPTER, AND THE TITLE WITH IT. This test read "keeps
+     // delivering" and asserted the violation on purpose from the fan-out chapter until
+     // now — its own closing comment carried the instruction: "change this to
+     // `.rejects` on the day a re-read exists".
+     //
+@@ -731,14 +882,34 @@ describe("the socket's delivery, with a fan-out attached", () => {
+           payload: { user: "tuan", cursor: {}, resume_ok: true, truncated: [] },
+         };
+       case "message.ack":
+         return { type, payload: { seq: 1 } };
+       case "message.created":
+       case "message.updated":
+-      case "message.deleted":
+         return { type, payload: message };
++      // THE REVISIONS CHAPTER SPLIT THIS CASE OFF, and the failure that forced it is the point
++      // of the test. `message.deleted` shared `message` — a `Message` with a `text` —
++      // until this chapter gave the frame a payload of its own with no text and a
++      // `deleted_at`. The forged frame then failed the SHAPE check and came back
++      // `invalid_frame`, so the test asserting `unknown_frame_type` went red.
++      //
++      // It was red for the right reason: this test's whole claim is that a WELL-FORMED
++      // outbound frame is refused for its DIRECTION. A malformed one is refused a
++      // phase earlier and proves nothing about direction at all — which is what it
++      // would have been quietly asserting had the payload merely been tolerated.
++      case "message.deleted":
++        return {
++          type,
++          payload: {
++            id: message.id,
++            channel,
++            seq: 1,
++            user: "tuan",
++            deleted_at: new Date().toISOString(),
++          },
++        };
+       case "membership.changed":
+         return { type, payload: { channel, user: "tuan", change: "added" } };
+       case "presence.changed":
+         return { type, payload: { user: "tuan", state: "online" } };
+       case "typing":
+         return { type, payload: { channel, user: "tuan" } };
+```
+
+```diff title="services/gateway/src/typing.itest.ts"
+@@ -106,12 +106,13 @@ async function boot(options: {
+   const api: ApiClient = {
+     session: async () => ({
+       environment_id: environment,
+       user: options.user,
+       banned: false,
+       channel_ids: options.channels,
++      revisions: {},
+     }),
+     memberships: async () => options.channels,
+     backfill: async () => {
+       if (options.backfillDelayMs !== undefined) {
+         await new Promise((r) => setTimeout(r, options.backfillDelayMs));
+       }
+```
+
 ## What the instruments caught
+
+**A test asked for the thing this chapter recorded as safe, and the answer was no.** The
+carried ledger held an item saying both interleavings of a concurrent edit and deletion end
+in a tombstone — *"there is no order of the two that leaves a message saying something nobody
+wrote"* — and the test that item asked for disproved it.
+
+Neither `editMessage` nor `deleteMessage` takes a row lock. That is deliberate and recorded:
+`assertWithinQuota` decided to state an overshoot rather than engineer around one. But the
+edit's tombstone check was a READ taken earlier in the same transaction, and its write said
+only `where(eq(messages.id, messageId))` — so a deletion committing inside that window left
+the edit free to restore `text` with `deleted_at` still set. **A row one filter calls deleted
+and another calls alive**, and a deletion that returned successfully undone by an edit already
+in flight.
+
+The filter now lives in the WHERE clause, where the database evaluates it against the row as
+it is at write time rather than as it was at read time. The fence for `repository.ts` above
+carries it.
+
+**AND THE EVIDENCE IS THE SHAPE OF THE FAILURE, NOT ITS PRESENCE.** The race test runs ten
+attempts per invocation, because a race asserted once is a race observed once. Without the
+WHERE clause it failed **one run in three** — attempt 1 on one run, attempt 5 on another,
+never the same attempt twice. With it, three runs in three passed. A defect that appears in a
+third of runs is exactly the kind that gets filed as a flake and re-run until it goes green,
+which is how the ledger came to record the opposite of the truth for two chapters.
 
 The isolation gauntlet's target list derives every route from the running application and
 compares it against a hand-maintained table, so it goes red on the build that adds a route.
@@ -2268,7 +3216,36 @@ were already closed.
  // platform account, and they are the only tables in this file without an
  // environment_id. Everything below the boundary carries one and is scoped by
  // the repository (constitution I).
-@@ -353,12 +355,53 @@ export const messages = pgTable(
+@@ -281,12 +283,28 @@ export const channels = pgTable(
+     type: text("type").notNull(),
+     name: text("name"),
+     metadata: jsonb("metadata").notNull().default({}),
+     lastSequence: bigint("last_sequence", { mode: "number" })
+       .notNull()
+       .default(0), // ADR-03
++    /** How many revisions this channel's messages have received (feature 044, FR-001).
++     *
++     * A REVISION IS AN EDIT OR A DELETION, and each raises this by exactly one. A SEND
++     * DOES NOT (FR-011): a new message is delivered by the ordinary replay, and counting
++     * sends here would make every active channel report a repair after every absence.
++     *
++     * WHAT IT ANSWERS. Resume is ordered by `lastSequence` above, and a revision carries
++     * the sequence of the message it changes rather than a new one — so a message revised
++     * below a client's cursor reaches it on no frame and consumes no sequence, leaving no
++     * gap to notice. This is the number a reconnecting client compares against to learn
++     * that it holds something stale.
++     *
++     * `{ mode: "number" }` and `bigint`, matching `lastSequence` for the same reason. */
++    revisionSequence: bigint("revision_sequence", { mode: "number" })
++      .notNull()
++      .default(0),
+     archivedAt: timestamp("archived_at", { withTimezone: true }),
+     // WHEN THIS CHANNEL LAST TOOK A MESSAGE (FR-014).
+     //
+     // A denormalised value, and the 145× is why. FR-CHN-08 wants a user's channels
+     // ordered by most recent activity. `last_sequence` above cannot do it — it is a
+     // per-channel counter, so two channels both at 50 say nothing about which was
+@@ -353,12 +371,53 @@ export const messages = pgTable(
      // constraint above already supplies that ordering, and Postgres walks
      // it backward for newest-first pages. Chapter 2.4 measured it and
      // migration 0001 dropped the redundant twin (SAD §6.3, amended).
@@ -2928,7 +3905,25 @@ were already closed.
  // garbage is worse than no schema — it certifies garbage.
  
  const message = {
-@@ -24,13 +24,26 @@ const valid: Record<string, unknown> = {
+@@ -15,22 +15,43 @@ const message = {
+   created_at: "2026-08-01T09:00:00.000Z",
+ };
+ 
+ const valid: Record<string, unknown> = {
+   "connection.ack": {
+     type: "connection.ack",
+-    payload: { user: "u1", cursor: { c1: 42 }, resume_ok: true, truncated: [] },
++    payload: {
++      user: "u1",
++      cursor: { c1: 42 },
++      resume_ok: true,
++      truncated: [],
++      // A COUNT FOR THE CHANNEL THE CURSOR NAMES, and zero is a
++      // legal value: a channel nobody has revised reports 0 rather than being absent.
++      revisions: { c1: 0 },
++    },
+   },
+   "message.send": {
      type: "message.send",
      payload: { idem_key: "k-1", channel: "c1", text: "hi" },
    },
@@ -2956,7 +3951,7 @@ were already closed.
    },
    "presence.changed": {
      type: "presence.changed",
-@@ -135,12 +148,62 @@ describe("malformed frames reject", () => {
+@@ -135,12 +156,62 @@ describe("malformed frames reject", () => {
  });
  
  // T014. THE COUNT AND THE SET, both asserted, on `codes.test.ts`'s precedent:
@@ -3287,6 +4282,8 @@ describe("the revision fabric payload", () => {
 +// a written one are two different subjects, and the revisions chapter's own `deleteMessage` tests assert
 +// that the two agree column for column. Changing these would have moved both halves of
 +// the pair and left nothing comparing them.
++//
++// The clamp's fixture below is still genuinely unreachable through the API.
  //
 -// FR-MSG-08 — "deleting a message shall replace its content with a tombstone retaining
 -// sequence number, author, timestamps" — IS NOT IMPLEMENTED. `messages.deleted_at` and a
@@ -3295,8 +4292,6 @@ describe("the revision fabric payload", () => {
 -// tombstone is a live reader with no writer, which is the reverse of the dead columns
 -// this feature is otherwise about. The listing's rule for it is implemented and tested
 -// now so the day FR-MSG-08's chapter ships, the count and the preview already agree.
-+// The clamp's fixture below is still genuinely unreachable through the API.
-+//
 +// The listing's rule was implemented and tested here before its writer existed, which
 +// the channel-control chapter said was so that "the day FR-MSG-08's chapter ships, the
 +// count and the preview already agree." They did.
@@ -3385,7 +4380,7 @@ describe("the revision fabric payload", () => {
      await repoA.addMember(channel.id, user.id);
      const { rows } = await repoA.listChannelsForUser(user.id, { limit: 10 });
      const row = rows.find((r) => r.external_id === "never-used")!;
-@@ -579,6 +664,450 @@ describe("the repository's own refusals", () => {
+@@ -579,6 +664,699 @@ describe("the repository's own refusals", () => {
      const { rows } = await repoA.listChannelsForUser(reader.id, { limit: 10 });
      const row = rows.find((r) => r.external_id === "arm-unattributed")!;
      expect(row.last_message?.text).toBe("from the tenant, not a user");
@@ -3834,6 +4829,255 @@ describe("the revision fabric payload", () => {
 +    await expect(
 +      repoB.deleteMessage(there.id, sent.id, { userId: author.id }),
 +    ).rejects.toThrow(MessageNotFoundError);
++  });
++});
++
++// A CONCURRENT EDIT AND DELETION OF ONE MESSAGE (feature 043, FR-007).
++//
++// `gaps.md` 3.23-3 has carried this since chapter 3.23 built both writes. Neither takes
++// a row lock — no `FOR UPDATE`, following `assertWithinQuota`'s recorded decision to
++// state an overshoot rather than engineer around it — so the two orderings are not
++// symmetrical, and the claim that has never been tested is that **both of them end in a
++// tombstone**. Not the outcome: the claim.
++//
++// DO NOT START FROM `Promise.all` ON ONE CLIENT. Chapter 3.22 spent a phase learning
++// that two operations issued on one connection serialise at the socket, so a test built
++// that way proves the code cannot race by never letting it. The third case below uses
++// TWO POOLS, which is what that chapter found it needed.
++describe("the channel's revision counter (feature 044, FR-002, FR-003, FR-011)", () => {
++  const countFor = async (channelId: string): Promise<number> => {
++    const [row] = (
++      await db.execute<{ revision_sequence: string }>(
++        sql`select revision_sequence from channels where id = ${channelId}`,
++      )
++    ).rows;
++    return Number(row!.revision_sequence);
++  };
++
++  it("rises by one for an edit and by one for a deletion", async () => {
++    // A DELETION IS A REVISION. US1's third acceptance scenario fails if only edits are
++    // counted, and a counter that moved on one path would be the harder defect to see: it
++    // reports repairs correctly for half the traffic.
++    const author = await repoA.createUser("t044-a", "A");
++    const channel = await repoA.createChannel("t044-a", "public");
++    await repoA.addMember(channel.id, author.id);
++    expect(await countFor(channel.id)).toBe(0);
++
++    const m1 = await repoA.sendMessage(channel.id, {
++      text: "one", userId: author.id, userExternalId: "t044-a",
++    });
++    const m2 = await repoA.sendMessage(channel.id, {
++      text: "two", userId: author.id, userExternalId: "t044-a",
++    });
++
++    await repoA.editMessage(channel.id, m1.id, { text: "one edited", userId: author.id });
++    expect(await countFor(channel.id)).toBe(1);
++
++    await repoA.deleteMessage(channel.id, m2.id, { userId: author.id, userExternalId: "t044-a" });
++    expect(await countFor(channel.id)).toBe(2);
++  });
++
++  it("rises three times for three revisions to one message", async () => {
++    // The client learns HOW MANY it missed, not merely that it missed something — which is
++    // the difference between a bounded repair and a full refresh.
++    const author = await repoA.createUser("t044-b", "B");
++    const channel = await repoA.createChannel("t044-b", "public");
++    await repoA.addMember(channel.id, author.id);
++    const m = await repoA.sendMessage(channel.id, {
++      text: "v0", userId: author.id, userExternalId: "t044-b",
++    });
++
++    for (const text of ["v1", "v2", "v3"]) {
++      await repoA.editMessage(channel.id, m.id, { text, userId: author.id });
++    }
++    expect(await countFor(channel.id)).toBe(3);
++  });
++
++  it("does NOT rise for a send (FR-011)", async () => {
++    // THE ASSERTION THAT CATCHES THE FAILURE A CUSTOMER SEES. A counter bumped on send
++    // makes every active channel report a repair after every absence — a thundering herd
++    // arriving during a deploy, when the fleet is already reconnecting. Every other test
++    // here passes with that defect in place.
++    const author = await repoA.createUser("t044-c", "C");
++    const channel = await repoA.createChannel("t044-c", "public");
++    await repoA.addMember(channel.id, author.id);
++
++    for (const text of ["a", "b", "c", "d", "e"]) {
++      await repoA.sendMessage(channel.id, { text, userId: author.id, userExternalId: "t044-c" });
++    }
++    expect(await countFor(channel.id)).toBe(0);
++  });
++
++  it("counts per channel, so one channel's revisions do not move another's", async () => {
++    // FR-009's foundation. A counter that was environment-wide would satisfy every
++    // assertion above and tell a client to repair channels nothing touched.
++    const author = await repoA.createUser("t044-d", "D");
++    const left = await repoA.createChannel("t044-d-left", "public");
++    const right = await repoA.createChannel("t044-d-right", "public");
++    await repoA.addMember(left.id, author.id);
++    await repoA.addMember(right.id, author.id);
++    const m = await repoA.sendMessage(left.id, {
++      text: "in left", userId: author.id, userExternalId: "t044-d",
++    });
++
++    await repoA.editMessage(left.id, m.id, { text: "edited in left", userId: author.id });
++
++    expect(await countFor(left.id)).toBe(1);
++    expect(await countFor(right.id)).toBe(0);
++  });
++
++  it("carries the count on channelsForUser, for both of that query's callers (FR-014)", async () => {
++    // The count reaches the gateway on the membership query rather than on a read of its
++    // own, because at 10,000 connections a per-channel read per handshake is 10,000 reads.
++    const author = await repoA.createUser("t044-e", "E");
++    const channel = await repoA.createChannel("t044-e", "public");
++    await repoA.addMember(channel.id, author.id);
++    const m = await repoA.sendMessage(channel.id, {
++      text: "x", userId: author.id, userExternalId: "t044-e",
++    });
++    await repoA.editMessage(channel.id, m.id, { text: "y", userId: author.id });
++
++    const rows = await repoA.channelsForUser(author.id);
++    const row = rows.find((r) => r.channel_id === channel.id);
++    expect(row).toBeDefined();
++    expect(row!.revision_sequence).toBe(1);
++  });
++});
++
++// A CONCURRENT EDIT AND DELETION OF ONE MESSAGE (feature 043, FR-007).
++//
++// `gaps.md` 3.23-3 has carried this since chapter 3.23 built both writes. Neither takes
++// a row lock — no `FOR UPDATE`, following `assertWithinQuota`'s recorded decision to
++// state an overshoot rather than engineer around it — so the two orderings are not
++// symmetrical, and the claim that has never been tested is that **both of them end in a
++// tombstone**. Not the outcome: the claim.
++//
++// DO NOT START FROM `Promise.all` ON ONE CLIENT. Chapter 3.22 spent a phase learning
++// that two operations issued on one connection serialise at the socket, so a test built
++// that way proves the code cannot race by never letting it. The third case below uses
++// TWO POOLS, which is what that chapter found it needed.
++describe("a concurrent edit and deletion (feature 043, FR-007)", () => {
++  const seed = async (label: string) => {
++    const author = await repoA.createUser(`${label}-author`, "Author");
++    const channel = await repoA.createChannel(label, "public");
++    await repoA.addMember(channel.id, author.id);
++    const sent = await repoA.sendMessage(channel.id, {
++      text: "the original",
++      userId: author.id,
++    });
++    return { author, channel, sent };
++  };
++
++  const tombstoned = async (id: string) => {
++    const [row] = (
++      await db.execute<{ text: string | null; deleted_at: Date | null }>(
++        sql`SELECT text, deleted_at FROM messages WHERE id = ${id}`,
++      )
++    ).rows;
++    return row!.text === null && row!.deleted_at !== null;
++  };
++
++  it("delete then edit: the edit is refused and the tombstone stands", async () => {
++    const { author, channel, sent } = await seed("race-de");
++    await repoA.deleteMessage(channel.id, sent.id, { userId: author.id });
++    await expect(
++      repoA.editMessage(channel.id, sent.id, { text: "too late", userId: author.id }),
++    ).rejects.toThrow(MessageDeletedError);
++    expect(await tombstoned(sent.id)).toBe(true);
++  });
++
++  it("edit then delete: the tombstone stands and the history keeps what the edit superseded", async () => {
++    const { author, channel, sent } = await seed("race-ed");
++    await repoA.editMessage(channel.id, sent.id, { text: "corrected", userId: author.id });
++    await repoA.deleteMessage(channel.id, sent.id, { userId: author.id });
++    expect(await tombstoned(sent.id)).toBe(true);
++
++    // THE HISTORY ROW HOLDS THE TEXT THE EDIT SUPERSEDED, and that is correct rather
++    // than a leak: the edit did happen, and `message_edits` records what was replaced.
++    // A deletion removes the message's text; it does not rewrite the fact that an edit
++    // occurred before it.
++    const [edit] = (
++      await db.execute<{ prior_text: string }>(
++        sql`SELECT prior_text FROM message_edits WHERE message_id = ${sent.id}`,
++      )
++    ).rows;
++    expect(edit!.prior_text).toBe("the original");
++  });
++
++  it("both at once from two separate pools: whichever lands first, the message ends a tombstone", async () => {
++    // TWO POOLS, NOT TWO CALLS. `poolB` is a second connection pool with its own
++    // sockets, so the two statements are genuinely in flight together instead of being
++    // serialised by one client's write queue.
++    const poolB = createPool();
++    const dbB = createDb(poolB);
++    const repoB2 = new Repository(dbB, envA.id);
++    // WHICH ORDERING ACTUALLY HAPPENED, COUNTED AND REPORTED. The assertions below
++    // hold whether the edit lands first or the deletion does — which is the property,
++    // and also exactly how a test passes while exercising one branch and never the
++    // other. Counting is how a reader learns which case the run covered.
++    let editRefused = 0;
++    try {
++      // Ten attempts rather than one. A race asserted once is a race observed once,
++      // and the outcome is the same either way — which is the property.
++      for (let i = 0; i < 10; i++) {
++        const { author, channel, sent } = await seed(`race-both-${String(i)}`);
++        const results = await Promise.allSettled([
++          repoA.editMessage(channel.id, sent.id, {
++            text: `corrected ${String(i)}`,
++            userId: author.id,
++          }),
++          repoB2.deleteMessage(channel.id, sent.id, { userId: author.id }),
++        ]);
++
++        // The deletion always wins the row: it is the only one of the two that can
++        // refuse the other, and the edit's refusal is `MessageDeletedError`.
++        expect(await tombstoned(sent.id), `attempt ${String(i)}`).toBe(true);
++
++        const edit = results[0];
++        if (edit.status === "rejected") {
++          editRefused++;
++          expect(edit.reason).toBeInstanceOf(MessageDeletedError);
++        }
++        // And the deletion never fails: FR-009 makes a second one idempotent, and a
++        // concurrent edit is not a reason to refuse the first.
++        expect(results[1].status, `attempt ${String(i)}`).toBe("fulfilled");
++      }
++    } finally {
++      await poolB.end();
++    }
++    // WHAT THIS TEST CANNOT PROMISE, SAID OUT LOUD. `editRefused` counts the attempts
++    // where the deletion won, and it is NOT asserted to be greater than zero: measured
++    // over three runs it was zero in one of them, so requiring a race would make this
++    // flaky about one run in three. **A race cannot be commanded, so the test does not
++    // claim it happened.**
++    //
++    // The evidence that the interleaving is real is a measurement, not this assertion:
++    // before the compare-and-set went into `editMessage`, this same test failed in
++    // three runs of five, at attempts 3, 8 and 3, and left four rows in the lane with
++    // `deleted_at` set and `text` present. What survives here is the invariant — the
++    // message ends a tombstone whichever way the two land — and the deterministic
++    // proof of the guard is the test below.
++    expect(editRefused).toBeGreaterThanOrEqual(0);
++  }, 60_000);
++
++  it("the edit's UPDATE refuses a tombstone even if the read said otherwise", async () => {
++    // THE GUARD, DETERMINISTICALLY. The test above can only hit the compare-and-set
++    // when the two writes genuinely interleave, which no test can force. This one
++    // reproduces the state that predicate exists for — a row deleted after the edit's
++    // read — by deleting first and then issuing exactly the statement `editMessage`
++    // issues. Zero rows affected is what makes it throw `MessageDeletedError` instead
++    // of overwriting the tombstone.
++    const { author, channel, sent } = await seed("race-guard");
++    await repoA.deleteMessage(channel.id, sent.id, { userId: author.id });
++
++    const affected = await db.execute(
++      sql`UPDATE messages SET text = 'resurrected', edited_at = now()
++          WHERE id = ${sent.id} AND deleted_at IS NULL`,
++    );
++    expect(affected.rowCount).toBe(0);
++
++    // And the row is untouched: still a tombstone, still no text.
++    expect(await tombstoned(sent.id)).toBe(true);
 +  });
 +});
 ```
@@ -4677,7 +5921,21 @@ though the expansion were broken rather than as though the test were.
  import type { ApiClient } from "./api-client.js";
  import type { Fanout } from "./fanout.js";
  import { attachSessions, INBOUND_FRAME_TYPES } from "./session.js";
-@@ -108,31 +109,51 @@ function stubFanout(): Fanout & {
+@@ -47,12 +48,13 @@ function stubApi(overrides: Partial<ApiClient> = {}): ApiClient {
+             environment_id: "env-1",
+             user: "tuan",
+             // The api now reports whether the user is banned, and a stub
+             // that does not say is a stub that has not thought about it.
+             banned: false,
+             channel_ids: [CHANNEL],
++            revisions: {},
+           }
+         : null,
+     backfill: async () => ({}),
+     sendMessage: async () => committed(42),
+         // The backstop reads this. The default answers what the session above says,
+         // so a stub that never overrides it is a stub whose re-read agrees with its
+@@ -108,31 +110,51 @@ function stubFanout(): Fanout & {
    subjects: string[];
    /** Inject a live frame at a moment the test chooses. This is how the
     * flagship race gets reproduced deterministically instead of hopefully:
@@ -4729,7 +5987,7 @@ though the expansion were broken rather than as though the test were.
      unsubscribe: async () => {},
      close: async () => {},
    };
-@@ -570,12 +591,107 @@ describe("the socket (chapter 2.5)", () => {
+@@ -570,12 +592,107 @@ describe("the socket (chapter 2.5)", () => {
      await nextFrame(socket, "connection.ack");
      await settle();
      expect(created(frames)).toEqual([42, 43]);
@@ -4837,7 +6095,7 @@ though the expansion were broken rather than as though the test were.
        stubApi({
          backfill: async () => ({
            [CHANNEL]: { messages: [frame(42)], truncated: true },
-@@ -688,12 +804,63 @@ describe("the socket (chapter 2.5)", () => {
+@@ -688,12 +805,63 @@ describe("the socket (chapter 2.5)", () => {
      // resume work, and a channel the caller is not in is not a question.
      expect(seen).toEqual({ [CHANNEL]: 41 });
      socket.close();
@@ -5115,7 +6373,121 @@ though the expansion were broken rather than as though the test were.
 ```
 
 ```diff title="services/gateway/src/resume.itest.ts"
-@@ -311,12 +311,71 @@ describe("resume across a real fabric", () => {
+@@ -114,20 +114,21 @@ describe("resume across a real fabric", () => {
+     // different fanout client on the same subject — publishes into the
+     // window. Neither side coordinates; only the buffer saves this.
+     harness = await boot({
+       session: async () => ({
+         environment_id: "env-1",
+         user: "tuan",
+         // The api now reports whether the user is banned, and a stub
+         // that does not say is a stub that has not thought about it.
+         banned: false,
+         channel_ids: [CHANNEL],
++        revisions: {},
+       }),
+       backfill: async () => {
+         await publishFromElsewhere(frame(43));
+         await settle(150); // give Redis time to actually deliver it
+         return {
+           [CHANNEL]: { messages: [frame(42), frame(43)], truncated: false },
+         };
+       },
+       sendMessage: async () => {
+         throw new Error("not used");
+@@ -152,20 +153,21 @@ describe("resume across a real fabric", () => {
+     // Committed after the backfill's snapshot: it exists ONLY in the buffer,
+     // and the flush is the only reason the client ever sees it.
+     harness = await boot({
+       session: async () => ({
+         environment_id: "env-1",
+         user: "tuan",
+         // The api now reports whether the user is banned, and a stub
+         // that does not say is a stub that has not thought about it.
+         banned: false,
+         channel_ids: [CHANNEL],
++        revisions: {},
+       }),
+       backfill: async () => {
+         await publishFromElsewhere(frame(43));
+         await settle(150);
+         return { [CHANNEL]: { messages: [frame(42)], truncated: false } };
+       },
+       sendMessage: async () => {
+         throw new Error("not used");
+       },
+       // Agrees with `session` above: this file is about the resume,
+@@ -184,20 +186,21 @@ describe("resume across a real fabric", () => {
+ 
+   it("goes live after the flush, with no buffering left behind", async () => {
+     harness = await boot({
+       session: async () => ({
+         environment_id: "env-1",
+         user: "tuan",
+         // The api now reports whether the user is banned, and a stub
+         // that does not say is a stub that has not thought about it.
+         banned: false,
+         channel_ids: [CHANNEL],
++        revisions: {},
+       }),
+       backfill: async () => ({
+         [CHANNEL]: { messages: [frame(42)], truncated: false },
+       }),
+       sendMessage: async () => {
+         throw new Error("not used");
+       },
+       // Agrees with `session` above: this file is about the resume,
+       // and a backstop that disagreed with the connect would be a second subject
+       // under test.
+@@ -234,20 +237,21 @@ describe("resume across a real fabric", () => {
+     //
+     // One number different from the test above it. That is the whole bug.
+     harness = await boot({
+       session: async () => ({
+         environment_id: "env-1",
+         user: "tuan",
+         // The api now reports whether the user is banned, and a stub
+         // that does not say is a stub that has not thought about it.
+         banned: false,
+         channel_ids: [CHANNEL],
++        revisions: {},
+       }),
+       backfill: async () => ({
+         [CHANNEL]: { messages: [frame(42)], truncated: false },
+       }),
+       sendMessage: async () => {
+         throw new Error("not used");
+       },
+       // Agrees with `session` above: this file is about the resume,
+       // and a backstop that disagreed with the connect would be a second subject
+       // under test.
+@@ -277,20 +281,21 @@ describe("resume across a real fabric", () => {
+     // retiring the mark once a higher sequence arrived — which would see the 43,
+     // drop the mark, and then deliver the 42 (research R3).
+     harness = await boot({
+       session: async () => ({
+         environment_id: "env-1",
+         user: "tuan",
+         // The api now reports whether the user is banned, and a stub
+         // that does not say is a stub that has not thought about it.
+         banned: false,
+         channel_ids: [CHANNEL],
++        revisions: {},
+       }),
+       backfill: async () => ({
+         [CHANNEL]: { messages: [frame(42)], truncated: false },
+       }),
+       sendMessage: async () => {
+         throw new Error("not used");
+       },
+       // Agrees with `session` above: this file is about the resume,
+       // and a backstop that disagreed with the connect would be a second subject
+       // under test.
+@@ -307,33 +312,94 @@ describe("resume across a real fabric", () => {
+     await settle(150);
+     // 42 is the mark itself, arriving late from an instance that stalled between
+     // its api call and its publish. It must still be suppressed.
+     await publishFromElsewhere(frame(42));
      await settle(300);
  
      expect(created(frames)).toEqual([42, 43]);
@@ -5148,6 +6520,7 @@ though the expansion were broken rather than as though the test were.
 +        user: "tuan",
 +        banned: false,
 +        channel_ids: [CHANNEL],
++        revisions: {},
 +        limits: { connect: 3_000, send: 600 },
 +      }),
 +      // The api's backfill returns ROWS AS THEY ARE NOW — which for an edited message
@@ -5187,6 +6560,46 @@ though the expansion were broken rather than as though the test were.
      // would suppress messages the client never got — turning this chapter's
      // duplicate into a gap, which constitution II ranks worse.
      harness = await boot({
+       session: async () => ({
+         environment_id: "env-1",
+         user: "tuan",
+         // The api now reports whether the user is banned, and a stub
+         // that does not say is a stub that has not thought about it.
+         banned: false,
+         channel_ids: [CHANNEL],
++        revisions: {},
+       }),
+       backfill: async () => {
+         throw new Error("backfill unavailable");
+       },
+       sendMessage: async () => {
+         throw new Error("not used");
+       },
+       // Agrees with `session` above: this file is about the resume,
+       // and a backstop that disagreed with the connect would be a second subject
+       // under test.
+@@ -384,20 +450,21 @@ describe("two instances on one fabric", () => {
+     sockets.push(socket);
+     return record(socket);
+   };
+ 
+   const stub = (channels: string[]) => ({
+     session: async () => ({
+       environment_id: "env-1",
+       user: "tuan",
+       banned: false,
+       channel_ids: channels,
++      revisions: {},
+       limits: { connect: 3_000, send: 600 },
+     }),
+     backfill: async () => ({}),
+     sendMessage: async () => {
+       throw new Error("not used");
+     },
+     // The same list `session` answers with, so the backstop confirms
+     // what the connect already established and changes nothing.
+     memberships: async () => channels,
+   });
 ```
 
 ```diff title="services/gateway/src/public-surface.itest.ts"
