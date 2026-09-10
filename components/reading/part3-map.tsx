@@ -66,6 +66,19 @@ export function Part3Map({ locale }: { locale: "en" | "vi" }) {
         meant, and {andList(fresh)} are numbers Part 3 never had.
       </p>
 
+      <h2>If you followed the previous Part 3</h2>
+
+      <p>
+        <strong>Recreate your development database before continuing.</strong> A migration
+        belongs to the chapter that introduces it, and seven chapters moved — so seven
+        migrations were renumbered and two were divided differently. The SQL is unchanged
+        and no table differs; the <em>filenames</em> do, and a migration ledger records
+        which filenames it has applied. A database migrated in the old order will be asked
+        to apply nine migrations under new names and will refuse each one, saying the tables
+        already exist. Nothing is wrong with that database — it simply cannot be upgraded
+        into this ordering, so the reworked series starts its schema from scratch.
+      </p>
+
       <h2>By movement</h2>
       {byMovement().map((m) => (
         <section key={m.id}>
