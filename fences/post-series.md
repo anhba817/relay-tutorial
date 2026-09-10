@@ -5509,7 +5509,7 @@ passes with that defect in place.
 -    return rows.map((r) => r.channel_id);
    }
  
-   /** Upsert a user by external id, updating the profile fields present (
+   /** Upsert a user by external id, updating the profile fields present
 @@ -4565,6 +4586,25 @@ export class Repository {
        if (!updated) throw new MessageDeletedError(messageId);
        const editedAt = updated.editedAt!;
