@@ -34,15 +34,26 @@ config lives at the workspace root, and pnpm's isolated `node_modules` will not
 resolve a package's devDependency from above it.
 
 ```diff title="package.json"
-@@ -13,6 +13,7 @@
+@@ -9,23 +9,27 @@
+   "scripts": {
+     "dev": "turbo run dev",
+     "lint": "turbo run //#lint:root",
+     "lint:root": "eslint .",
      "typecheck": "turbo run typecheck",
      "test": "turbo run test",
-     "test:integration": "turbo run test:integration",
+-    "test:integration": "turbo run test:integration --concurrency=1",
++    "test:integration": "turbo run test:integration --concurrency=1 --filter=!@relay/outsider",
++    "test:outsider": "turbo run test:integration --filter=@relay/outsider",
 +    "coverage": "vitest run --config vitest.coverage.config.mts --coverage",
      "build": "turbo run build"
    },
    "devDependencies": {
-@@ -25,6 +26,8 @@
+     "@eslint/js": "^10.0.1",
+     "@types/node": "^26.1.2",
+     "eslint": "^10.8.0",
+     "globals": "^17.9.0",
+     "jose": "^6.2.7",
+     "prettier": "^3.9.6",
      "turbo": "^2.10.8",
      "typescript": "^5.9.3",
      "typescript-eslint": "^8.65.0",
@@ -51,6 +62,8 @@ resolve a package's devDependency from above it.
      "vitest": "^4.1.10",
      "ws": "^8.21.1"
    }
+ }
+\ No newline at end of file
 ```
 
 ---
@@ -115,7 +128,10 @@ resume duplicate. Putting either amendment in one of them would make that chapte
 show a reader code it never mentions, which is what this file exists to avoid.
 
 ```diff title="services/api/src/consumer/consumer.itest.ts"
-@@ -102,6 +102,33 @@
+@@ -101,12 +101,39 @@ function runtimeFor(
+     ...(environmentId
+       ? { filterSubject: subjectFor("message.created", environmentId) }
+       : {}),
    });
  }
  
@@ -149,7 +165,13 @@ show a reader code it never mentions, which is what this file exists to avoid.
  /** Durables this suite created through a CHILD process rather than directly.
   * The walk names its own — `walk-<uuid>` — so the suite cannot predict them and
   * a prefix sweep would delete a reader's walk running alongside it. It records
-@@ -172,7 +199,7 @@
+  * what it spawned instead, and cleans exactly that. */
+ const spawnedDurables: string[] = [];
+ 
+@@ -178,33 +205,36 @@ describe("the consumer", () => {
+     });
+     await ensureStream(nc);
+     await nc.drain();
    }, 60_000);
  
    afterAll(async () => {
@@ -158,7 +180,11 @@ show a reader code it never mentions, which is what this file exists to avoid.
      for (const durable of spawnedDurables) {
        await db.execute(
          `DELETE FROM consumed_events WHERE consumer = '${durable}'`,
-@@ -184,15 +211,18 @@
+       );
+     }
+     // And the durable consumers themselves. A durable is server-side state that
+     // outlives the process that made it: without this, every run of this suite
+     // left another handful behind on a shared broker, and `stream-info.mjs`
      // found twelve of them the first time it looked. Per-run names keep runs
      // independent; they do not clean up after themselves.
      //
@@ -170,7 +196,7 @@ show a reader code it never mentions, which is what this file exists to avoid.
 +    // The prefix is this SUITE's, not `itest-`. Sweeping `itest-` deleted another
 +    // suite's live consumer off this same stream — see `RUN` above.
      const nc = await connect({
-       servers: process.env.RELAY_NATS_URL ?? "nats://localhost:4222",
+       servers: process.env.RELAY_NATS_URL ?? DEFAULT_NATS_URL,
      });
      const jsm = await nc.jetstreamManager();
      for await (const info of jsm.consumers.list("EVENTS")) {
@@ -179,7 +205,13 @@ show a reader code it never mentions, which is what this file exists to avoid.
          await jsm.consumers.delete("EVENTS", info.name).catch(() => undefined);
        }
      }
-@@ -234,7 +264,7 @@
+     await nc.drain();
+   }, 60_000);
+ 
+@@ -240,13 +270,13 @@ describe("the consumer", () => {
+     expect(after.state.messages).toBeGreaterThanOrEqual(before.state.messages);
+     await nc.drain();
+   });
  
    it("invariant 3: an event is delivered, handled once, and acknowledged", async () => {
      const environmentId = ENV();
@@ -188,7 +220,13 @@ show a reader code it never mentions, which is what this file exists to avoid.
      const seen: string[] = [];
      const eventId = await publish(environmentId);
  
-@@ -303,7 +333,7 @@
+     const runtime = runtimeFor(
+       db,
+       durable,
+@@ -309,13 +339,13 @@ describe("the consumer", () => {
+   }, 180_000);
+ 
+   it("invariant 5: deduplication survives a restart", async () => {
      // The ledger is in Postgres precisely so that a process restart does not
      // reset it. A second runtime with the same durable name gets the same
      // answer the first one would have.
@@ -197,7 +235,13 @@ show a reader code it never mentions, which is what this file exists to avoid.
      const eventId = randomUUID();
  
      expect(await claimEvent(db, durable, eventId, async () => {})).toBe(
-@@ -319,7 +349,7 @@
+       "handled",
+     );
+     expect(await claimEvent(db, durable, eventId, async () => {})).toBe(
+@@ -325,13 +355,13 @@ describe("the consumer", () => {
+   });
+ 
+   it("invariant 6: two instances sharing a durable name divide the work", async () => {
      // The ordinary deployment. A durable consumer is one position in the stream,
      // so two api processes pulling from it share the work — the property the
      // broker provides here that `SKIP LOCKED` provides for the outbox.
@@ -205,8 +249,14 @@ show a reader code it never mentions, which is what this file exists to avoid.
 +    const durable = `${RUN}-shared-${Date.now()}`;
      const byA: string[] = [];
      const byB: string[] = [];
-     const ids = [
-@@ -352,7 +382,7 @@
+     // ONE environment, and both runtimes filtered to it.
+     //
+     // This used to call `ENV()` three times and construct both runtimes with no
+     // filter — the same fault the test above this one already carries a comment
+@@ -388,13 +418,13 @@ describe("the consumer", () => {
+   it("invariant 7: a handler that always throws stops being retried", async () => {
+     // `max_deliver` is 5. After that the broker stops delivering and the message
+     // leaves the consumer's view — measured in research R4, and the honest
      // answer this chapter gives rather than a dead-letter path that does not
      // exist yet.
      const environmentId = ENV();
@@ -215,7 +265,13 @@ show a reader code it never mentions, which is what this file exists to avoid.
      const eventId = await publish(environmentId);
      let attempts = 0;
  
-@@ -386,7 +416,7 @@
+     const runtime = runtimeFor(
+       db,
+       durable,
+@@ -422,13 +452,13 @@ describe("the consumer", () => {
+ 
+   it("invariant 8: an unparseable payload is terminated on the first attempt", async () => {
+     // Retrying malformed bytes five times changes nothing about them. The
      // runtime terminates the message instead of burning the budget and dropping
      // it anyway — and says so in a log line carrying no payload.
      const environmentId = ENV();
@@ -224,72 +280,28 @@ show a reader code it never mentions, which is what this file exists to avoid.
      const lines: string[] = [];
      const noisy = createLogger("consumer-itest", (line) =>
        lines.push(typeof line === "string" ? line : JSON.stringify(line)),
-@@ -416,12 +446,38 @@
+     );
+     await publishGarbage(environmentId);
+     const marker = await publish(environmentId);
+@@ -452,13 +482,13 @@ describe("the consumer", () => {
+     expect(unparseable.join("")).not.toContain("this is not an event");
+   }, 180_000);
+ 
    it("invariant 9: a consumer stopped for N publishes receives all N on restart", async () => {
      // What `limits` retention means: the stream holds messages whether or not
      // anybody is reading. The backlog waits.
 -    const durable = `itest-catchup-${Date.now()}`;
 +    const durable = `${RUN}-catchup-${Date.now()}`;
      const seen: string[] = [];
--    const runtime = runtimeFor(db, durable, async (e) => void seen.push(e.id));
-+    // ONE environment for all three publishes, and the consumer filtered to it.
-+    //
-+    // This test used to call `ENV()` three times — and `ENV` mints a fresh uuid
-+    // on every call, so the three events went to three different subjects and no
-+    // filter could cover them. Without a filter the durable starts at the head of
-+    // a stream holding ~13,000 events from earlier chapters, and the loop below
-+    // had to drain all of them inside a fixed budget of 800 polls before the
-+    // three under test were even reachable.
-+    //
-+    // Found on run 11 of the deduplication chapter's twenty post-fix lane runs: `expected
-+    // [ …(2756) ] to include '<uuid>'`. 2,756 events drained and the backlog
-+    // still not cleared. It is the same shape as the sweep and the drain in
-+    // `deliveries.itest.ts` — a test riding a shared, growing resource with a
-+    // fixed budget, which passes until the resource outgrows the budget.
-+    //
-+    // Scoped, the drain below has nothing to drain and the assertion is about
-+    // exactly the three events it published. The invariant is unchanged: the
-+    // stream holds messages whether or not anybody is reading, and the backlog
-+    // waits.
-+    const environmentId = ENV();
-+    const runtime = runtimeFor(
-+      db,
-+      durable,
-+      async (e) => void seen.push(e.id),
-+      silent,
-+      environmentId,
-+    );
+     // ONE environment for all three publishes, and the consumer filtered to it.
+     //
+     // This test used to call `ENV()` three times — and `ENV` mints a fresh uuid
+     // on every call, so the three events went to three different subjects and no
+     // filter could cover them. Without a filter the durable starts at the head of
+@@ -514,13 +544,13 @@ describe("the consumer", () => {
  
-     // Get to the head of the stream first, so "everything published while away"
--    // is measurable rather than lost in twelve thousand older events.
-+    // is measurable rather than lost among older events.
-     for (let i = 0; i < 800; i++) {
-       const { handled, duplicates } = await runtime.pollOnce();
-       if (handled + duplicates === 0) break;
-@@ -429,12 +485,18 @@
-     await runtime.stop();
- 
-     const published = [
--      await publish(ENV()),
--      await publish(ENV()),
--      await publish(ENV()),
-+      await publish(environmentId),
-+      await publish(environmentId),
-+      await publish(environmentId),
-     ];
- 
--    const restarted = runtimeFor(db, durable, async (e) => void seen.push(e.id));
-+    const restarted = runtimeFor(
-+      db,
-+      durable,
-+      async (e) => void seen.push(e.id),
-+      silent,
-+      environmentId,
-+    );
-     for (let i = 0; i < 100; i++) {
-       await restarted.pollOnce();
-       if (published.every((id) => seen.includes(id))) break;
-@@ -446,7 +508,7 @@
+     for (const id of published) expect(seen).toContain(id);
+   }, 240_000);
  
    it("invariant 12: a consumer log line carries counts, never payloads", async () => {
      const environmentId = ENV();
@@ -298,6 +310,9 @@ show a reader code it never mentions, which is what this file exists to avoid.
      const lines: string[] = [];
      const noisy = createLogger("consumer-itest", (line) =>
        lines.push(typeof line === "string" ? line : JSON.stringify(line)),
+     );
+     const eventId = await publish(environmentId, {
+       data: {
 ```
 
 ### Three — two runtimes with no filter, forty lines from the fix (feature 030)
@@ -324,60 +339,6 @@ the three events to one environment and filtering both runtimes to its subject.
 Found by grepping for the class while the first instance was on screen, which is a
 step feature 030 added to its own task list after chapter 3.7 recorded that fixing
 an instance is not fixing a class.
-
-```diff title="services/api/src/consumer/consumer.itest.ts"
-@@ -351,16 +351,45 @@ describe("the consumer", () => {
-     // broker provides here that `SKIP LOCKED` provides for the outbox.
-     const durable = `${RUN}-shared-${Date.now()}`;
-     const byA: string[] = [];
-     const byB: string[] = [];
-+    // ONE environment, and both runtimes filtered to it (feature 030, T032).
-+    //
-+    // This used to call `ENV()` three times and construct both runtimes with no
-+    // filter, which is instance 3 exactly — the fault the deduplication chapter fixed forty lines
-+    // down in this same file, in the test above this one. Three environments means
-+    // no single subject covers them, and an unfiltered durable starts at the head
-+    // of a stream holding every event earlier chapters left behind; the 400-pass
-+    // budget below then has to drain all of it before reaching these three.
-+    //
-+    // It has never failed, which is the whole problem with the class: it passes
-+    // until the stream outgrows the budget, and then it fails in whichever run
-+    // happens to cross the line. Fixing an instance is not fixing a class
-+    // (research R46).
-+    //
-+    // The environments were incidental. What this test is about is two runtimes
-+    // sharing one durable, and that is unchanged.
-+    const environmentId = ENV();
-     const ids = [
--      await publish(ENV()),
--      await publish(ENV()),
--      await publish(ENV()),
-+      await publish(environmentId),
-+      await publish(environmentId),
-+      await publish(environmentId),
-     ];
- 
--    const a = runtimeFor(db, durable, async (e) => void byA.push(e.id));
--    const b = runtimeFor(db, durable, async (e) => void byB.push(e.id));
-+    const a = runtimeFor(
-+      db,
-+      durable,
-+      async (e) => void byA.push(e.id),
-+      silent,
-+      environmentId,
-+    );
-+    const b = runtimeFor(
-+      db,
-+      durable,
-+      async (e) => void byB.push(e.id),
-+      silent,
-+      environmentId,
-+    );
-     for (let i = 0; i < 400; i++) {
-       await Promise.all([a.pollOnce(), b.pollOnce()]);
-       if (ids.every((id) => byA.includes(id) || byB.includes(id))) break;
-     }
-```
 
 ---
 
@@ -425,112 +386,142 @@ enumerates what exists — so the comparison now strips the one field that
 legitimately differs.
 
 ```diff title="services/api/src/auth/credentials.itest.ts"
-@@ -15,6 +15,7 @@ import {
+@@ -14,12 +14,13 @@ import {
+   environmentSigningSecret,
+   provisionOrganisation,
    Repository,
    revokeApiKey,
  } from "../db/repository";
-+import { parseApiKeyCredential } from "./api-key";
+ import { parseApiKeyCredential } from "./api-key";
++import { resolvePrincipal } from "./authenticate.middleware";
  import { MAX_TOKEN_LIFETIME_SECONDS } from "./user-token";
+ import { withoutRequestId } from "../isolation/compare";
  
  // The refusals, over real HTTP against the compose Postgres.
-@@ -295,10 +296,29 @@ describe("credentials", () => {
-     }
- 
-     const haystack = captured.join("") + bodies.join("");
--    const secret = key.credential.split("_").at(-1)!;
-+    // PARSED, not split. `api-key.ts` carries a paragraph explaining that
-+    // base64url's alphabet includes `_`, so the secret may contain the separator
-+    // and splitting on it is wrong — and this assertion used to do exactly that:
-+    // `key.credential.split("_").at(-1)`.
+ // Invariants 1-7, 9 and 11 of contracts/credentials.md live here; 8 and 12 are
+ // pure and live in the unit lane; 10 needs a socket and lives in the gateway's
+@@ -404,32 +405,47 @@ describe("credentials", () => {
+     // `key.credential.split("_").at(-1)` was the secret only by luck, and MEASURED OVER
+     // 200,000 MINTS it is luck that runs out both ways. The secret is base64url of 32
+     // bytes and `_` IS IN THAT ALPHABET:
+     //
+     //   26.9% of credentials  the last segment is 20 characters or fewer — the test
+     //                         searched for a FRAGMENT and passed more easily than it
+-    //                         should. A false negative, and the quiet half.
++    //                         should. A false negative, and the quiet half, true on
++    //                         MOST runs: a log line leaking the first thirty characters
++    //                         of a secret passed.
+     //   1.57%                 the segment is one character or none, and `not.toContain`
+     //                         on a single character fails against any haystack. That is
+-    //                         the loud half, and it is what the battery hit: `expected
+-    //                         '{"time":…' not to contain '0'`.
++    //                         the loud half.
 +    //
-+    // It failed the day a mint ended `…_I`, because the assertion had become
-+    // "no log line contains the letter I" and the error body for a misused key
-+    // says "this route expects an API key". That was the visible half. The
-+    // invisible half is worse and was true on most runs: whenever the secret
-+    // contained an underscore, this checked only the fragment after the LAST
-+    // one, so a log line leaking the first thirty characters of a secret passed.
-+    //
-+    // Found by the retry-and-disable chapter's baseline, which ran the lane three times.
-+    const parsed = parseApiKeyCredential(key.credential);
-+    expect(parsed).not.toBeNull();
-+    const secret = parsed!.secret;
-+    // Guards the guard: a one-character "secret" is how this assertion turned
-+    // vacuous-then-flaky, and 32 base64url-encoded bytes are never short.
-+    expect(secret.length).toBeGreaterThan(20);
++    // BOTH HALVES WERE FOUND TWICE, INDEPENDENTLY, AND THE FIXES AGREE. The published
++    // order hit it at this chapter's baseline, which ran the lane three times: the mint
++    // ended `…_I`, so the assertion had become "no log line contains the letter I" and
++    // the error body for a misused key says "this route expects an API key". This order
++    // hit it one chapter earlier, in the coverage battery, on a mint ending `_0`:
++    // `expected '{"time":…' not to contain '0'`. Two draws of the same 1.57%, and both
++    // readings arrived at the same parser and the same threshold.
+     //
+     // `parseApiKeyCredential` is the function the guard itself uses to split a
+     // presented credential, so the needle is now the same substring the product calls
+     // the secret. A test that re-derives what the code under test already computes is
+     // a second definition, and the two can disagree.
+     const parsed = parseApiKeyCredential(key.credential);
+     expect(parsed, "the fixture minted something this api cannot parse").not.toBeNull();
+     const secret = parsed!.secret;
+     // AND THE NEEDLE IS CHECKED BEFORE IT IS USED. A short needle is found in any
+     // haystack, so `not.toContain` on one is a test that always fails — the inverse of
+-    // the vacuous assertion this file is otherwise full of guards against.
++    // the vacuous assertion this file is otherwise full of guards against. 32
++    // base64url-encoded bytes are never short.
+     expect(secret.length, "the needle is too short to mean anything").toBeGreaterThan(20);
      expect(haystack).not.toContain(key.credential);
      expect(haystack).not.toContain(secret);
      expect(haystack).not.toContain(foreignKey.credential);
++    // AND THE FOREIGN KEY'S SECRET, PARSED THE SAME WAY. Checking the whole
++    // credential catches a verbatim echo; the secret alone is what a log line
++    // truncating a header would leak, and it is the half worth having.
++    expect(haystack).not.toContain(parseApiKeyCredential(foreignKey.credential)!.secret);
 +    expect(haystack).not.toContain(parseApiKeyCredential(foreignKey.credential)!.secret);
      expect(haystack).not.toContain(token);
      // The prefix alone is not a secret and may legitimately appear.
    });
-@@ -18,6 +18,23 @@ import {
- import { parseApiKeyCredential } from "./api-key";
- import { MAX_TOKEN_LIFETIME_SECONDS } from "./user-token";
  
-+// The rate-limit chapter added `request_id` to every error body (constitution V's fourth
-+// field, promised since 1.3). It is unique per request BY DESIGN, so two error
-+// bodies can no longer be compared whole — and comparing them whole is how this
-+// suite proves a foreign resource is indistinguishable from an absent one, which
-+// is a tenant-isolation property (constitution I).
-+//
-+// The id is the one field that reveals nothing about the resource, so it is the
-+// one field the comparison must drop. Everything discriminating still has to
-+// match exactly.
-+function withoutRequestId(body: unknown): unknown {
-+  if (typeof body !== "object" || body === null) return body;
-+  const rest: Record<string, unknown> = { ...(body as Record<string, unknown>) };
-+  delete rest["request_id"];
-+  return rest;
-+}
+   it("signup hands over exactly one key, and only when it creates something", async () => {
+     // R8: with no console session, signup is the only thing that can bootstrap
+@@ -616,7 +632,68 @@ describe("credentials", () => {
+       const body = (await res.json()) as { code?: string; message?: string };
+       expect(body.code).toBe("wrong_credential_type");
+       // And it must not quote the credential back (NFR-SEC-06).
+       expect(JSON.stringify(body)).not.toContain(PLATFORM);
+     });
+   });
 +
++  // --- one credential per service -----------------------------------------
 +
- // The refusals, over real HTTP against the compose Postgres.
- // Invariants 1-7, 9 and 11 of contracts/credentials.md live here; 8 and 12 are
- // pure and live in the unit lane; 10 needs a socket and lives in the gateway's
-@@ -86,6 +103,31 @@ describe("credentials", () => {
-   };
- 
-   beforeAll(async () => {
-+    // This suite submits bad credentials ON PURPOSE — that is what
-+    // it is for — and the failed-authentication limiter counts them all against
-+    // one loopback address. The default is ten a minute.
-+    //
-+    // RAISING WORKS HOWEVER POLLUTED THE SHARED COUNT, which is why this is a
-+    // threshold and not a private key: the integration lane runs files in
-+    // parallel, every suite asserting a `401` lands in the same bucket, and a
-+    // high ceiling never refuses. A suite needing a LOW threshold needs its own
-+    // key instead — see `limits.itest.ts` (research R21).
-+    //
-+    // Explicit and visible, rather than the default being chosen to suit the
-+    // tests. The retry-and-disable chapter's `RELAY_DISABLE_SWEEP` states the rule: a flag whose
-+    // default disabled a requirement would be a requirement nobody had built.
-+    process.env["RELAY_AUTH_FAILURES_PER_MINUTE"] = "10000";
-+    // AND ITS OWN BUCKET. Raising the threshold is private to this worker —
-+    // vitest gives each file its own process — but the Redis key is not, so a
-+    // suite that raises its ceiling and keeps the default prefix pushes a SHARED
-+    // count up while being personally immune to it. T004a measured this file's
-+    // contribution to the default bucket at 8 and signup's at 13, against a
-+    // threshold of 10: nothing was refused, and only because the suites that
-+    // spawn a child reach the api over `::ffff:127.0.0.1` while this one reaches
-+    // it in-process over `::1`. Two address formats were the whole of the
-+    // isolation. Now it is a prefix, which is a decision rather than an accident.
-+    process.env["RELAY_AUTH_KEY_PREFIX"] =
-+      `rlauth-credentials-${Date.now()}`;
-     db = createDb(createPool());
- 
-     env = await createEnvironment(db, { name: "credentials-itest" });
-@@ -178,7 +220,9 @@ describe("credentials", () => {
-     );
-     expect(foreignAnswer.status).toBe(404);
-     expect(absentAnswer.status).toBe(404);
--    expect(await foreignAnswer.json()).toEqual(await absentAnswer.json());
-+    expect(withoutRequestId(await foreignAnswer.json())).toEqual(
-+      withoutRequestId(await absentAnswer.json()),
-+    );
- 
-     // And the reverse direction, so the test cannot pass by both being broken.
-     expect(
++  describe("which service presented it", () => {
++    // SET, not read, for the reason the block above gives.
++    const DISPATCHER = "rk_svc_credentials_itest_0123456789abcdef01234";
++    const GATEWAY = "rk_svc_gateway_itest_fedcba98765432100fedcba9";
++    process.env["RELAY_INTERNAL_CREDENTIAL"] = DISPATCHER;
++    process.env["RELAY_INTERNAL_CREDENTIAL_GATEWAY"] = GATEWAY;
++
++    it("names the dispatcher for the dispatcher's secret", async () => {
++      expect(await resolvePrincipal(db, DISPATCHER)).toEqual({
++        kind: "platform",
++        service: "dispatcher",
++      });
++    });
++
++    it("names the GATEWAY for the gateway's secret", async () => {
++      // Until this chapter `resolvePlatformCredential` ended with a hardcoded
++      // `service: "dispatcher"`, which was true while there was one caller and
++      // became a lie the moment there were two. `PlatformPrincipal.service` is
++      // documented as "which internal service presented it, for logs".
++      expect(await resolvePrincipal(db, GATEWAY)).toEqual({
++        kind: "platform",
++        service: "gateway",
++      });
++    });
++
++    it("gives neither service the other's reach", async () => {
++      // The property beyond honest logs: the gateway terminates public traffic
++      // and the dispatcher does not, so one shared secret would let the more
++      // exposed service set the blast radius for both.
++      expect(DISPATCHER).not.toBe(GATEWAY);
++      const swapped = await resolvePrincipal(db, GATEWAY);
++      expect(swapped).not.toBeNull();
++      expect((swapped as { service: string }).service).not.toBe("dispatcher");
++    });
++
++    it("refuses a secret shorter than 32 characters, per service", async () => {
++      // A short secret is a misconfiguration, and the safe reading of one is
++      // "this service cannot authenticate" rather than "this service is open".
++      const short = "rk_svc_tooshort";
++      process.env["RELAY_INTERNAL_CREDENTIAL_GATEWAY"] = short;
++      expect(await resolvePrincipal(db, short)).toBeNull();
++      process.env["RELAY_INTERNAL_CREDENTIAL_GATEWAY"] = GATEWAY;
++    });
++
++    it("makes an unconfigured service unusable rather than universal", async () => {
++      delete process.env["RELAY_INTERNAL_CREDENTIAL_GATEWAY"];
++      expect(await resolvePrincipal(db, GATEWAY)).toBeNull();
++      // The dispatcher is untouched by its neighbour's absence.
++      expect(await resolvePrincipal(db, DISPATCHER)).not.toBeNull();
++      process.env["RELAY_INTERNAL_CREDENTIAL_GATEWAY"] = GATEWAY;
++    });
++
++    it("refuses a well-formed secret that matches nobody", async () => {
++      expect(
++        await resolvePrincipal(db, "rk_svc_nobodys_secret_0000000000000000000"),
++      ).toBeNull();
++    });
++  });
+ });
+\ No newline at end of file
 ```
 
 ---
@@ -554,18 +545,6 @@ honest price of a readable result.
 
 **No chapter owns this.** Part 6 owns CI, and when it arrives this belongs with
 it.
-
-```diff title="package.json"
-@@ -12,7 +12,7 @@
-     "lint:root": "eslint .",
-     "typecheck": "turbo run typecheck",
-     "test": "turbo run test",
--    "test:integration": "turbo run test:integration",
-+    "test:integration": "turbo run test:integration --concurrency=1",
-     "coverage": "vitest run --config vitest.coverage.config.mts --coverage",
-     "build": "turbo run build"
-   },
-```
 
 ---
 
@@ -637,126 +616,6 @@ and the attempt record, not the batch size of a test's sweep call or the locking
 behaviour of a claim it does not describe. 3.7 is about the resume duplicate and
 never mentions webhooks.
 
-```diff title="services/api/src/webhooks/deliveries.itest.ts"
-@@ -285,7 +285,37 @@ describe("the relay drains only what is due", () => {
-    * observer. Whoever claims the row, a due delivery ends up dispatched and a
-    * not-yet-due one does not. */
-   const drainEverythingDue = async (): Promise<void> => {
--    await drainDueDeliveries(db, 500, async () => {});
-+    await drainDueDeliveries(db, 50_000, async () => {});
-+  };
-+
-+  /** The same drain, retried until a row this suite owns has settled.
-+   *
-+   * FOUND AT THE DEDUPLICATION CHAPTER'S POST-FIX MEASUREMENT, on run 2 of 20: "expected null
-+   * not to be null" for a delivery that was unambiguously due. The comment above
-+   * had the principle right and the implementation one call short.
-+   *
-+   * `drainDueDeliveries` claims `FOR UPDATE SKIP LOCKED`. When a suite running in
-+   * a parallel worker holds this row inside its own open transaction, this call
-+   * SKIPS it and returns having done nothing about it — and one call is then
-+   * indistinguishable from "the relay declined to publish a due delivery", which
-+   * is the failure this test is meant to report. Draining again once the other
-+   * transaction has ended finds the row either already dispatched by that suite
-+   * or free to claim here. Either outcome satisfies the invariant; neither is
-+   * visible to a single call.
-+   *
-+   * Bounded rather than open-ended: if the property is genuinely false the row is
-+   * never dispatched and this fails after the budget with the same message, one
-+   * second later. */
-+  const drainUntilSettled = async (delivery: {
-+    id: string;
-+    event_id: string;
-+  }): Promise<void> => {
-+    for (let attempt = 0; attempt < 10; attempt++) {
-+      await drainEverythingDue();
-+      const rows = await repo.listDeliveriesForEvent(delivery.event_id);
-+      if (rows.find((r) => r.id === delivery.id)?.dispatched_at !== null) return;
-+      await new Promise((resolve) => setTimeout(resolve, 100));
-+    }
-   };
- 
-   const stateOf = async (delivery: { id: string; event_id: string }) => {
-@@ -319,7 +349,7 @@ describe("the relay drains only what is due", () => {
-   it("invariant 10: publishes a delivery that is due", async () => {
-     const delivery = await seed();
- 
--    await drainEverythingDue();
-+    await drainUntilSettled(delivery);
- 
-     expect((await stateOf(delivery)).dispatched_at).not.toBeNull();
-   });
-@@ -361,7 +391,7 @@ describe("the relay drains only what is due", () => {
-     }
- 
-     const healthy = await seed();
--    await drainEverythingDue();
-+    await drainUntilSettled(healthy);
- 
-     expect((await stateOf(healthy)).dispatched_at).not.toBeNull();
-     for (const s of sleeping) {
-@@ -372,7 +402,7 @@ describe("the relay drains only what is due", () => {
-   it("invariant 9: a claimed delivery is not claimed twice", async () => {
-     const delivery = await seed();
- 
--    await drainEverythingDue();
-+    await drainUntilSettled(delivery);
-     const first = await stateOf(delivery);
-     await drainEverythingDue();
-     const second = await stateOf(delivery);
-@@ -400,7 +430,7 @@ describe("the relay drains only what is due", () => {
- 
-     // Tier 2 is one second out.
-     await new Promise((resolve) => setTimeout(resolve, 1_500));
--    await drainEverythingDue();
-+    await drainUntilSettled(delivery);
- 
-     expect((await stateOf(delivery)).dispatched_at).not.toBeNull();
-   });
-@@ -1131,7 +1161,17 @@ describe("the failure run", () => {
-     // Still enabled: nothing has happened since, which is the whole point.
-     expect((await runOf(endpoint.id)).enabled).toBe(true);
- 
--    const disabled = await sweepDisabledEndpoints(db);
-+    // A LIMIT BIG ENOUGH TO REACH THIS ENDPOINT. The sweep is global and takes the
-+    // hundred oldest eligible endpoints; every earlier run of this suite leaves
-+    // endpoints with an open failure run behind, and those are older than this
-+    // one, so they fill the batch and this endpoint is never reached. The suite
-+    // then fails on a shared database and passes on a fresh one.
-+    //
-+    // Found at the deduplication chapter's baseline, after 781 endpoints had accumulated an open
-+    // run. Note which assertion caught it: `disabled >= 1` PASSED, because the
-+    // sweep had just disabled a hundred endpoints belonging to nobody. Only the
-+    // assertion about THIS endpoint could tell the difference.
-+    const disabled = await sweepDisabledEndpoints(db, 10_000);
-     expect(disabled).toBeGreaterThanOrEqual(1);
- 
-     const after = await runOf(endpoint.id);
-@@ -1160,9 +1200,9 @@ describe("the failure run", () => {
-     await failTimes(scoped.id, scopedRepo, endpoint.id, 5, 503);
-     await ageRun(endpoint.id, 64);
- 
--    await sweepDisabledEndpoints(db);
--    await sweepDisabledEndpoints(db);
--    await sweepDisabledEndpoints(db);
-+    await sweepDisabledEndpoints(db, 10_000);
-+    await sweepDisabledEndpoints(db, 10_000);
-+    await sweepDisabledEndpoints(db, 10_000);
- 
-     expect(await notificationsFor(endpoint.id)).toHaveLength(1);
-   }, 120_000);
-@@ -1179,7 +1219,7 @@ describe("the failure run", () => {
-     // Inside the hour: five failures, but the window has not elapsed.
-     await ageRun(recent.id, 30);
- 
--    await sweepDisabledEndpoints(db);
-+    await sweepDisabledEndpoints(db, 10_000);
- 
-     expect((await runOf(healthy.id)).enabled).toBe(true);
-     expect((await runOf(recent.id)).enabled).toBe(true);
-```
-
-
 ### Three — a delta over a global count still races (chapter 3.10 baseline)
 
 The two amendments above scoped a sweep and a drain. This one is the same class in
@@ -790,58 +649,6 @@ own rows.
 **No chapter owns this.** 3.7 fenced the two amendments above and is about the
 resume duplicate; 3.10 is about quotas. A baseline fix belongs to whichever
 chapter's baseline found it, and that chapter teaches something else.
-
-```diff title="services/api/src/webhooks/deliveries.itest.ts"
-@@ -660,19 +660,40 @@ describe("the material for one attempt", () => {
-     expect(await deliveryMaterial(db, randomUUID())).toBeNull();
-   });
- 
-   it("counts what is pending and stops counting it once it is delivered", async () => {
--    const { deliveryId } = await seedDelivery();
-+    const { deliveryId, envId } = await seedDelivery();
- 
--    // GLOBAL, and asserted as a delta for that reason — this is the number an
--    // operator watches, so it counts every tenant's backlog, and another suite
--    // seeding rows beside this one must not be able to break it.
--    const before = await pendingDeliveryDepth(db);
--    expect(before).toBeGreaterThan(0);
-+    // THE DELTA USED TO BE ASSERTED ON THE GLOBAL COUNT, and the comment above it
-+    // said a delta was safe because "another suite seeding rows beside this one
-+    // must not be able to break it". It is not, and one did:
-+    //
-+    //   AssertionError: expected 22741 to be 22742
-+    //
-+    // A delta is two reads with a gap. Another suite delivering one of its own
-+    // rows in that gap moves the second read by one more, and the assertion is a
-+    // local fact about a global operation with an extra step — the twelfth
-+    // occurrence of the fault this lane has been recording since the outbox chapter, and
-+    // the third whose defence was a comment explaining why it was fine.
-+    //
-+    // The global function still has a caller, because it is the number an operator
-+    // watches and it needs one. What it is asked is the part that cannot race:
-+    // there is a backlog.
-+    expect(await pendingDeliveryDepth(db)).toBeGreaterThan(0);
-+
-+    // The delta is asserted where it can be attributed — this environment, whose
-+    // rows nobody else writes.
-+    const pendingHere = async (): Promise<number> => {
-+      const { rows } = (await db.execute(
-+        `SELECT count(*)::int AS n FROM webhook_deliveries
-+          WHERE environment_id = '${envId}' AND state = 'pending'`,
-+      )) as unknown as { rows: { n: number }[] };
-+      return rows[0]!.n;
-+    };
- 
-+    expect(await pendingHere()).toBe(1);
-     await recordAttemptOutcome(db, { deliveryId, attempt: 1, status: 200 });
--
--    expect(await pendingDeliveryDepth(db)).toBe(before - 1);
-+    expect(await pendingHere()).toBe(0);
-   });
- });
- 
- // The answers nobody asks for on a good day.
-```
 
 ---
 
@@ -887,73 +694,6 @@ of 10, and nothing was refused only because the suites that spawn a child reach
 the api over `::ffff:127.0.0.1` while this one reaches it in-process over `::1`.
 Two address formats were the whole of the isolation.
 
-```diff title="services/api/src/tenancy/signup.itest.ts"
-@@ -277,20 +277,25 @@ describe("signup", () => {
-       const text = await res.text();
-       expect(text).not.toContain("organisation");
-     }
--    const before = await db.execute(
--      `SELECT count(*)::int AS n FROM organisations`,
--    );
--    // There is no header left to forge here. The assertion is
-+    // There is no header left to forge here. The property is
-     // unchanged — no route but signup creates a tenant — and a credential-free
-     // internal call is now refused before it reaches a handler, which is a
-     // stronger form of the same guarantee.
--    await fetch(`${url}/internal/memberships`);
--    const after = await db.execute(
--      `SELECT count(*)::int AS n FROM organisations`,
--    );
--    expect((after.rows[0] as { n: number }).n).toBe(
--      (before.rows[0] as { n: number }).n,
--    );
-+    //
-+    // THIS USED TO COMPARE `count(*) FROM organisations` BEFORE AND AFTER, and
-+    // that assertion was not about this request. The count is global, every other
-+    // suite in the lane signs organisations up while this runs, and vitest runs
-+    // these files in parallel — so it asserted that nobody anywhere created a
-+    // tenant during one `fetch`. The deduplication chapter's lane runs caught it at 9,917
-+    // organisations: `expected 9918 to be 9917`.
-+    //
-+    // What is left is the property itself, asserted where it can be attributed to
-+    // this call: the route refuses, and a request refused before it reaches a
-+    // handler has created nothing. Same reasoning as `test-event.itest.ts`, which
-+    // finds its own row rather than calling a global drain.
-+    const refused = await fetch(`${url}/internal/memberships`);
-+    expect(refused.status).not.toBe(200);
-+    expect(await refused.text()).not.toContain("organisation");
-   });
- 
-   it("refuses a callback whose state does not match the cookie (invariant 5, over HTTP)", async () => {
-@@ -49,6 +49,26 @@ describe("signup", () => {
-   let provider: Awaited<ReturnType<typeof standInProvider>>;
- 
-   beforeAll(async () => {
-+    // The rate-limit chapter limited account creation per source address (FR-AUT-12), and this
-+    // suite drives the signup routes repeatedly from one loopback address — which
-+    // is what a suite about signup does.
-+    //
-+    // Raised explicitly and visibly, rather than the default being chosen to suit
-+    // the tests. The same move `credentials.itest.ts` makes for the
-+    // failed-authentication threshold, and for the same reason: raising survives a
-+    // shared count, lowering does not (research R21).
-+    process.env["RELAY_AUTH_FAILURES_PER_MINUTE"] = "10000";
-+    // AND ITS OWN BUCKET. Raising the threshold is private to this worker —
-+    // vitest gives each file its own process — but the Redis key is not, so a
-+    // suite that raises its ceiling and keeps the default prefix pushes a SHARED
-+    // count up while being personally immune to it. T004a measured this file's
-+    // contribution to the default bucket at 8 and signup's at 13, against a
-+    // threshold of 10: nothing was refused, and only because the suites that
-+    // spawn a child reach the api over `::ffff:127.0.0.1` while this one reaches
-+    // it in-process over `::1`. Two address formats were the whole of the
-+    // isolation. Now it is a prefix, which is a decision rather than an accident.
-+    process.env["RELAY_AUTH_KEY_PREFIX"] =
-+      `rlauth-signup-${Date.now()}`;
-     db = createDb(createPool());
-     provider = await standInProvider({
-       id: 90210,
-```
-
 ---
 
 ## `services/dispatcher/src/dispatcher.itest.ts` — the sixth global drain (chapter 3.8 baseline)
@@ -996,30 +736,10 @@ of the system. Switched off here exactly as `RELAY_OUTBOX_RELAY` and
 `RELAY_EVENT_CONSUMER` already were — the third instance of one rule.
 
 ```diff title="services/dispatcher/src/dispatcher.itest.ts"
-@@ -264,6 +264,22 @@ describe("the dispatcher", () => {
-         ensure: relay.ensureDeliveriesStream,
-       }),
-       logger: kit.createLogger("itest-relay"),
-+      // A BATCH BIG ENOUGH TO REACH THIS TEST'S OWN DELIVERY. `drainOnce` is
-+      // global: it takes the fifty oldest due deliveries in the platform,
-+      // oldest first, and this suite's is the newest. Every earlier suite in the
-+      // run leaves due deliveries behind, so once more than fifty of them
-+      // accumulate the batch fills before reaching ours, the poll times out at
-+      // eight seconds, and `expected 0 to be greater than 0` is what a reader
-+      // sees.
-+      //
-+      // It only bites in the COVERAGE lane, where `fileParallelism: false` puts
-+      // every suite in one process against one database. The failing run drains
-+      // the backlog itself, so the next run passes — which is why it reads as a
-+      // flake rather than as the threshold it is.
-+      //
-+      // Found at the rate-limit chapter's baseline. The deduplication chapter fixed the same global drain
-+      // in `deliveries.itest.ts` twice and never looked at this door.
-+      batchSize: 10_000,
-     });
-     return r.drainOnce();
-   };
-@@ -108,6 +108,8 @@ function spawnApi(port: number, credential: string): ChildProcess {
+@@ -106,12 +106,14 @@ function spawnApi(port: number, credential: string): ChildProcess {
+       ...process.env,
+       PORT: String(port),
+       RELAY_INTERNAL_CREDENTIAL: credential,
        // The outbox chapter's finding 4, for the third time: this suite drives the relay
        // explicitly, so a background copy draining the same table would race it.
        RELAY_OUTBOX_RELAY: "off",
@@ -1028,6 +748,44 @@ of the system. Switched off here exactly as `RELAY_OUTBOX_RELAY` and
        RELAY_EVENT_CONSUMER: "off",
        RELAY_DELIVERY_RELAY: "off",
      },
+     stdio: ["ignore", "pipe", "pipe"],
+   });
+ }
+@@ -392,12 +394,35 @@ describe("the dispatcher", () => {
+     // Created BEFORE anything is published, or "New" would skip the first event.
+     await dispatcher.ready();
+   }, 60_000);
+ 
+   afterAll(async () => {
+     await dispatcher?.stop();
++
++    // DELETE THE DURABLES THIS RUN NAMED (feature 043, FR-003).
++    //
++    // A durable is server-side state that outlives the process that made it, and this
++    // suite named a fresh pair per run — `itest-expand-<8 hex>` and
++    // `itest-deliver-<8 hex>` — and deleted neither. Chapter 3.24's close-out found
++    // **216 consumers on DELIVERIES**, 215 of them this file's, each holding a position
++    // in a stream of 56,193 messages, and the twenty-run battery added 19 more.
++    //
++    // `services/api/src/consumer/consumer.itest.ts` has done this since chapter 3.4 and
++    // its comment says why: *"without this, every run of this suite left another handful
++    // behind on a shared broker, and `stream-info.mjs` found twelve of them the first
++    // time it looked."* That chapter learned it at twelve. **The fix was written in the
++    // file next door for twenty chapters and never applied here.**
++    //
++    // BY NAME, NOT BY PREFIX. `consumer.itest.ts` records that sweeping `itest-` deleted
++    // another suite's live consumer off the same stream; these two are this run's own.
++    if (nats && !nats.isClosed()) {
++      const jsm = await nats.jetstreamManager();
++      await jsm.consumers.delete("EVENTS", durables.expand).catch(() => undefined);
++      await jsm.consumers.delete("DELIVERIES", durables.deliver).catch(() => undefined);
++    }
++
+     if (nats && !nats.isClosed()) await nats.drain();
+     child?.kill();
+     endpoint?.close();
+     second?.close();
+   });
 ```
 
 ---
@@ -1065,72 +823,6 @@ none of them is about the shape of a test lane, and a required parameter that
 exists to make an integration suite think twice would be code those chapters never
 mention.
 
-```diff title="services/api/src/db/repository.ts"
-@@ -415,9 +415,21 @@ export interface DisableNotificationRow {
- export async function drainDisableNotifications(
-   db: Db,
-   limit: number,
-   deliver: (row: DisableNotificationRow) => Promise<void>,
--  onError: (row: DisableNotificationRow, error: unknown) => void = () => {},
-+  /** REQUIRED, as of feature 030, and for a sharper reason than `limit`'s.
-+   *
-+   * It carried `= () => {}`, a default that DISCARDS a row's failure without a
-+   * log line — the swallowed-refusal shape twice over (research R13, R39). No
-+   * caller in the tree has ever used it: `notification-relay.ts` is the only one
-+   * and it has always passed a handler. So the default was dead code that existed
-+   * only to make forgetting the handler silent.
-+   *
-+   * It also had a second life as the file's last uncovered function, which is how
-+   * it was found: `repository.ts` measures 98.7% functions against a ratchet of
-+   * 100, and it measured that before this feature touched anything (research
-+   * R47). */
-+  onError: (row: DisableNotificationRow, error: unknown) => void,
- ): Promise<number> {
-   return db.transaction(async (tx) => {
-     const claimed = (await tx.execute(
-       sql`SELECT n.id                AS "id",
-@@ -1136,11 +1148,38 @@ export async function testDeliveryResult(
-  * and not two implementations of it.
-  *
-  * Returns how many it disabled, so the relay can log a number rather than a claim.
-  */
-+/*
-+ * THE FOUR CATEGORIES OF CROSS-ENVIRONMENT FUNCTION IN THIS FILE (feature 030). Three documents asserted there were five batch-taking functions; the
-+ * answer is four, and the reason the count kept slipping is that the third
-+ * category below has no home in a sentence about batch sizes:
-+ *
-+ *   1. TAKE A BATCH SIZE, and now all four REQUIRE one:
-+ *      drainOutbox, drainDueDeliveries, drainDisableNotifications,
-+ *      sweepDisabledEndpoints.
-+ *   2. RETURN A GLOBAL COUNT and have nothing to bound: outboxDepth,
-+ *      pendingDeliveryDepth. A count is one row; there is no batch to size. These
-+ *      are restricted from tests by lint instead — a global count(*)
-+ *      compared against itself is instance 4, twice in one file.
-+ *   3. CROSS ENVIRONMENTS BUT TAKE AN ID, so they are bounded by construction:
-+ *      recordAttemptOutcome, disableEndpoint. Nothing to require and nothing to
-+ *      restrict.
-+ *
-+ * Whoever adds the next cross-environment function reads this file, not the spec.
-+ */
- export async function sweepDisabledEndpoints(
-   db: Db,
--  limit = 100,
-+  /** REQUIRED, as of feature 030 — the last of the four to carry a default.
-+   *
-+   * This would not have prevented instance 6 (research R8). The call that damaged
-+   * a neighbour's fixture was `sweepDisabledEndpoints(db)`, and
-+   * `sweepDisabledEndpoints(db, 10_000)` is worse rather than better: a bigger
-+   * batch reaches further into other people's rows. The required argument is a
-+   * prompt to think about WHOSE rows are in scope. The control is the trigger in
-+   * `packages/test-harness/src/sentinel.sql`, and a comment here claiming
-+   * otherwise would teach the wrong lesson. */
-+  limit: number,
- ): Promise<number> {
-   // An INTERVAL built from the same constant the pure policy uses, so the sweep and
-   // `shouldDisable` can never disagree about how long an hour is. Milliseconds
-   // rather than a literal `'1 hour'`: one definition, in `disable.ts`.
-```
-
 ---
 
 ## `services/api/src/webhooks/delivery-relay.ts` — the caller the compiler found (feature 030)
@@ -1140,21 +832,6 @@ One line, and it is here because the amendment above created it. Removing
 is the whole return on the change: the compiler enumerated the callers so nobody
 had to grep for them. The four call sites in `deliveries.itest.ts` already passed
 `10_000`, chapter 3.7's fix for the first recorded instance.
-
-```diff title="services/api/src/webhooks/delivery-relay.ts"
-@@ -165,9 +165,10 @@ export function createDeliveryRelay({
-    * every customer's webhooks. */
-   async function sweepOnce(): Promise<number> {
-     if (!sweepEnabled) return 0;
-     try {
--      const disabled = await sweepDisabledEndpoints(db);
-+      // The batch the default used to supply, now said out loud (feature 030).
-+      const disabled = await sweepDisabledEndpoints(db, 100);
-       if (disabled > 0) {
-         // A COUNT, and only when it is not zero. This runs several times a second
-         // when the platform is idle, and a line per pass would bury every other
-         // line in the service.
-```
 
 ---
 
@@ -1197,118 +874,577 @@ restriction; the chapters that followed added rules to it without discussing the
 This one is lane hygiene, which no chapter teaches.
 
 ```diff title="eslint.config.mjs"
-@@ -36,8 +36,13 @@ export default tseslint.config(
-       "services/api/src/limits/**",
-       "services/gateway/src/limits.ts",
-       "services/gateway/src/limits.itest.ts",
-       "services/gateway/src/fanout.ts",
-+      // THE RULE'S REASON DOES NOT APPLY HERE, and that is the
-+      // whole justification rather than a convenience. The restriction exists
-+      // because rate-limit counters are keyed `rl:{environment_id}:…`, so an
-+      // unrestricted client can read another tenant's counter. This client
-+      // touches no keys: it calls PUBLISH and nothing else, onto
-+      // `chan:{channel_id}` — a channel UUID, not an environment-scoped key —
-+      // and a subject is not readable at all, only listened to by whoever is
-+      // already subscribed. The gateway's `fanout.ts` is on this list one line
-+      // up for the same reason; the api needs it too now that it publishes.
-+      "services/api/src/fanout/**",
-+      // The test harness IS data access — its whole job is to plant rows the
-+      // repository layer must never plant and to hold a connection carrying an
-+      // exemption no product code may carry (feature 030). Restricting it from
-+      // `pg` would restrict it from existing.
-+      "packages/test-harness/**",
-     ],
+@@ -1,11 +1,277 @@
+ import eslint from "@eslint/js";
+ import globals from "globals";
+ import tseslint from "typescript-eslint";
+ 
+ // One lint config for the whole workspace (ADR-01's consequence made literal).
++// ── THE RESTRICTION SETS, HOISTED SO THEY CAN BE COMPOSED ───────────────────────
++//
++// `no-restricted-imports` is ONE rule, and in flat config a later block REPLACES an
++// earlier block's setting for it rather than merging. Everything below exists because
++// of that sentence: a second block matching `**/*.itest.ts` — every one of which the
++// `**/*.ts` block already matched — switches the first block's rule OFF for every
++// integration test in the workspace, silently.
++//
++// MEASURED BEFORE IT WAS WRITTEN. `services/api/src/channels/channels.itest.ts` is on
++// no exemption list. Given `import { sql } from "drizzle-orm"` it fails lint under a
++// single block, and under a naively-added second block the only error left is
++// `'sql' is defined but never used`.
++const DRIVER_AND_ENGINE = {
++  paths: [
++    {
++      name: "pg",
++      message:
++        "Raw database access is forbidden outside services/api/src/db (constitution I).",
++    },
++    {
++      name: "drizzle-orm",
++      message:
++        "The query engine lives inside the repository layer only (constitution I, ADR-16).",
++    },
++    {
++      name: "ioredis",
++      message:
++        "The counter store lives in services/api/src/limits and services/gateway/src/limits.ts only (constitution I). Its keys are per environment; an unrestricted client is a cross-tenant read.",
++    },
++  ],
++  patterns: [
++    {
++      group: ["drizzle-orm/*"],
++      message:
++        "The query engine lives inside the repository layer only (constitution I, ADR-16).",
++    },
++  ],
++};
++
++// The paths excused from the driver and the engine. Two data-access LAYERS as
++// directories and everything else by path, each with the argument it needs.
++const DRIVER_EXEMPT = [
++    "services/api/src/db/**",
++    "services/api/src/limits/**",
++    // DRIVER_EXEMPT — every path below is exempt from all three restricted modules,
++    // the driver's name on the marker notwithstanding: `driver-exempt.test.ts` reads
++    // the module names out of the rule, so this list governs whatever the rule names.
++    //
++    // First the lane's own infrastructure. Reasons, one per path:
++    //   global-setup.ts  installs the guard against a database vitest names
++    //   setup.ts         rewrites the connection string to carry the exemption
++    //   guard.itest.ts   holds one exempt client and one plain one, and the
++    //                    difference between them is the whole test
++    "packages/test-harness/src/global-setup.ts",
++    "packages/test-harness/src/setup.ts",
++    "packages/test-harness/src/guard.itest.ts",
++  // AND THE LANE RESET'S OWN TEST, which arrives with the table it clears. It asserts
++  // what the SCRIPT DID — a planted stale delivery gone, an organisation count unmoved
++  // — and both are facts about rows the script reached through its own connection.
++  // Going through the repository layer would mean asserting the script's effect against
++  // the code the script does not use.
++  "packages/test-harness/src/reset-lane.itest.ts",
++    // AND TWO SUITES THAT WRITE A ROW THE TYPE SYSTEM FORBIDS.
++    //
++    //   backfill.itest.ts  asserts what `toFrame` does with a SENDERLESS message.
++    //                      Those rows exist — every one written through the socket
++    //                      before the sender was threaded looks like this — and the
++    //                      repository can no longer produce one, because `userId` is
++    //                      required. The fixture has to be raw SQL or the behaviour
++    //                      has no test at all.
++    //   history.itest.ts   reads the same row from the other end: a page whose
++    //                      `user` comes back null. FR-MSG-15 made `sendMessage`
++    //                      require a sender, so this suite lost the ability to build
++    //                      its own fixture in the same change that gave it the case.
++    //
++    // This is the exemption's honest case: not "the repository is inconvenient" but
++    // "the state under test is one the repository is now unable to reach". Both are
++    // listed by path rather than reached through a shared helper, because a helper in
++    // another file names none of these specifiers and this rule sees only imports —
++    // an invisible exemption is worse than a listed one.
++    "services/api/src/internal/backfill.itest.ts",
++    "services/api/src/messages/history.itest.ts",
++    // THE QUOTA CHAPTER'S PERIOD SUITE, and its case is the two above's in a third
++    // shape: the state under test is one the repository cannot reach. `periodOf`
++    // returns the month a timestamp falls in, and the property is that a row INSERTED
++    // under that value is FOUND by it — which needs a `usage_periods` row written
++    // directly, because every repository path that writes one derives the period from
++    // the clock and so cannot disagree with the function under test.
++    //
++    // A suite that used the repository here would be asserting that `periodOf` equals
++    // itself.
++    "services/api/src/quotas/period.itest.ts",
++    // AND THE QUOTA SUITE ITSELF, for a different reason from its sibling above.
++    // `period.itest.ts` writes a row the repository cannot; this one READS the two
++    // roll-up tables directly to check what a send left behind. Going through
++    // `usageFor` would mean asserting the roll-up against the function that reads
++    // it — the same circularity, one table over.
++    "services/api/src/quotas/quotas.itest.ts",
++    // AND THE CONNECTION-METERING CHAPTER'S, WHICH MAKES THE SAME CLAIM ONE
++    // DIMENSION OVER: a credited minute survives a `FLUSHALL` of the counter store,
++    // because a quota is about THIS MONTH and the rate limiter's store is allowed to
++    // lose things. Proving that needs the flush, and the flush needs a raw client.
++    //
++    // LISTED RATHER THAN DODGED. Published's version reached for
++    // `await import("ioredis")` inside the test, which this rule cannot see — an
++    // exemption that is invisible, which the note at the top of this block calls
++    // worse than a listed one. The static import puts it back under the rule and
++    // this entry is the answer.
++    "services/api/src/quotas/connections.itest.ts",
++    // ── AND EVERY OTHER REDIS CLIENT, BY PATH, WITH THE ARGUMENT IT NEEDS ──
++    //
++    // The rule arrives here and TWELVE files older than it already import `ioredis`.
++    // A missing exemption is not a silent one — this rule goes red on a chapter
++    // nobody is editing — so all of them land in the commit that adds the rule.
++    // FIVE DIFFERENT ARGUMENTS, and a blanket "the gateway's Redis files" would
++    // erase all five distinctions the rule exists to make.
++    //
++    // (1) NO KEY IS TOUCHED AT ALL — these name a pub/sub SUBJECT and never a key,
++    // which is the property, not whether they publish or subscribe. The subjects are
++    // `chan:{channel_id}`, `member:{channel_id}` and `typing:{channel_id}`: a channel
++    // UUID, and a subject is not readable at all, only listened to by whoever already
++    // subscribed. There is no key here for a cross-tenant read to reach. (The api's
++    // two publishers publish; the gateway's `membership.ts` only ever subscribes,
++    // because the api publishes that fabric — and the argument is the same either
++    // way.)
++    "services/api/src/fanout/publisher.ts",
++    "services/api/src/membership/publisher.ts",
++    //
++    // (2) THE COUNTER STORE'S OTHER HALF. `rl:{environment_id}:…` is the key shape
++    // the whole restriction is about, and this file composes it — so it is exempt as
++    // the rule's own subject, not against its reason. `limits.itest.ts` is listed
++    // beside it for something the rule cannot express at all: its subject is that
++    // the api and the gateway increment the SAME key, and the only way to check that
++    // is to read the key with NEITHER of their code.
++    "services/gateway/src/limits.ts",
++    "services/gateway/src/limits.itest.ts",
++    "services/gateway/src/fanout.ts",
++    // `member:{env}:{user}` — the principal-addressed half of that fabric — DOES
++    // carry an environment id, and that still does not make it the limiter's case:
++    // a subject is not readable, and the id is composed from the repository's own
++    // scope on the way out and from the authenticated connection's identity on the
++    // way in, never read from a payload.
++    "services/gateway/src/membership.ts",
++    // `typing.ts` both publishes and subscribes and composes no key at all — the
++    // environment travels INSIDE the payload, where the receiving gateway checks it
++    // against the connection it is about to act on.
++    "services/gateway/src/typing.ts",
++    //
++    // (2) KEYS ARE COMPOSED AND THEY ARE ENVIRONMENT-SCOPED — the limiter's own
++    // argument rather than the publishers'. `presence:{env}:{user}` is exactly the
++    // shape the restriction guards. Every key is composed from the environment id on
++    // the authenticated connection's own identity; no path takes one from a client,
++    // and there is no scan, `KEYS` or pattern read that could reach another tenant's.
++    "services/gateway/src/presence.ts",
++    //
++    // (3) THE ENVIRONMENT COMES FIRST IN THE KEY, which is the strongest case on
++    // this list rather than the weakest. `conn:{env}:{user}:{slot}` makes
++    // constitution I structural in the key itself: reaching across a tenant needs a
++    // caller to hand this module another environment's id, and the session layer
++    // takes that from the api's verified identity. The other entries argue about
++    // what they touch; this one cannot be wrong without being lied to.
++    "services/gateway/src/connections.ts",
++    //
++    // (4) THE SUBJECT IS WHAT REACHES THE FABRIC, so the oracle cannot be either
++    // service's own client. A spy on `createFanout` or on `createPresence` proves
++    // that an object was asked to publish, not that a frame arrived — and these
++    // suites' receive halves have rejection paths (a body that is not JSON, a body
++    // that is JSON and not a transition) that no module-level API can produce,
++    // because each only ever publishes payloads its own schema built.
++    "services/api/src/fanout/fanout.itest.ts",
++    "services/gateway/src/presence.itest.ts",
++    "services/gateway/src/membership.itest.ts",
++    "services/gateway/src/typing.itest.ts",
++    //
++    // (5) THE RAW CLIENT IS THE STIMULUS, NOT THE ORACLE — a fifth reason, and the
++    // rule cannot express it. This suite's subject is delivery and it asserts on
++    // sockets. It needs a client to CAUSE a membership change: `Membership` exposes
++    // `onChange`, `subscribeChannel` and `watch` and no `publish`, because the api
++    // publishes and the gateway only ever subscribes.
++    "services/gateway/src/connections.itest.ts",
++    //
++    // `services/gateway/src/connections.test.ts` IS DELIBERATELY ABSENT, and the
++    // ledger that owed these entries said to add it. It reads the module's own
++    // source off disk and imports nothing restricted, so the exemption would be one
++    // over nothing — and `driver-exempt.test.ts`'s stale-entry check is the half of
++    // this list that goes red when a listed file stops needing it.
++];
++
++// The suites that drive a global drain on purpose — derived by asking, not by
++// remembering: these are exactly the `*.itest.ts` files in this tree that import one of
++// the functions `GLOBAL_DRAINS` names, and `drain-exempt.test.ts` asserts that in both
++// directions against the tree rather than against a second list.
++const DRAIN_EXEMPT_TESTS = [
++  // `outboxDepth` — the relay's whole subject IS a global drain.
++  "services/api/src/outbox/outbox.itest.ts",
++  // `drainDueDeliveries`, `sweepDisabledEndpoints`, `pendingDeliveryDepth`.
++  "services/api/src/webhooks/deliveries.itest.ts",
++  // `drainDueDeliveries`.
++  "services/api/src/webhooks/attempts.itest.ts",
++  //
++  // THREE, AND PUBLISHED'S LIST IS SIX. `test-event.itest.ts`,
++  // `notifications.itest.ts` and `dispatcher.itest.ts` are on it there and import
++  // nothing restricted HERE: two name a drain only in prose explaining why they do not
++  // call one, and the dispatcher's suite declares `drainDueDeliveries` as a property on
++  // a stub it builds. Listing them would be three standing exemptions over nothing on
++  // the list's first day — the failure mode this file's own note calls out, arriving
++  // by inheritance rather than by drift.
++  //
++  // `drain-exempt.test.ts` found all three, which is the only reason the list is three
++  // long. It reads the names out of `DRAIN_NAMES` below and asserts both directions
++  // against the TREE.
++];
++
++/** The six functions, and the two counts that cannot be bounded. Named once so the
++ * two specifier spellings below cannot drift apart. */
++const DRAIN_NAMES = [
++  "drainOutbox",
++  "drainDueDeliveries",
++  "drainDisableNotifications",
++  "drainQuotaNotifications",
++  "sweepDisabledEndpoints",
++  "outboxDepth",
++  "pendingDeliveryDepth",
++];
++
++const DRAIN_MESSAGE =
++  "This claims or counts rows across EVERY environment. In an integration test that " +
++  "is a local assertion about a global operation, or a global operation over a " +
++  "neighbour's fixture. Scope the assertion to rows this test created, or add the " +
++  "suite to DRAIN_EXEMPT_TESTS with its reason.";
++
++// THE GLOBAL ADMIN FUNCTIONS, RESTRICTED IN INTEGRATION TESTS.
++//
++// Six recorded instances of one fault: a test asserts a local fact about a global
++// operation, or performs one and damages a neighbour's fixture. Each imported one of
++// these and called it as though the database held only its own rows.
++//
++// The two `*Depth` functions are here for a different reason from the other five. They
++// take no batch size and cannot — a count has nothing to bound — and a global count
++// compared against itself is the instance that appeared twice in one file, four
++// chapters apart.
++//
++// WHAT THIS DOES NOT CATCH, and must not be trusted to: an indirect call — a helper in
++// another file that calls the function, imported here under an innocent name — and raw
++// SQL, which names no import at all. Both are the sentinel trigger's job; it watches
++// STATEMENTS rather than imports. A rule trusted further than it goes is worse than no
++// rule.
++//
++// BOTH SPELLINGS, because `no-restricted-imports` matches the specifier as WRITTEN.
++// `../db/repository` and `./repository` are two rules, and the second is the one a
++// suite inside `services/api/src/db/` would use.
++const GLOBAL_DRAINS = {
++  paths: [
++    {
++      name: "../db/repository",
++      importNames: DRAIN_NAMES,
++      message: DRAIN_MESSAGE,
++    },
++    {
++      name: "./repository",
++      importNames: DRAIN_NAMES,
++      message: DRAIN_MESSAGE,
++    },
++  ],
++};
++
+ export default tseslint.config(
+   { ignores: ["**/node_modules/**", "**/dist/**", "**/coverage/**"] },
+   eslint.configs.recommended,
+   ...tseslint.configs.recommended,
+   {
+     // Dev scripts run on Node directly, outside any package's tsconfig —
+@@ -39,168 +305,145 @@ export default tseslint.config(
+     // file that imports the driver; nothing here can catch a LISTED file that stopped
+     // importing it, so the list can only grow and a stale entry holds a standing
+     // exemption forever. `driver-exempt.test.ts` reads this array and asserts each
+     // path exists and still imports a module the rule below restricts — with those
+     // module names read out of the rule rather than restated.
+     files: ["**/*.ts"],
+-    ignores: [
+-      "services/api/src/db/**",
+-      "services/api/src/limits/**",
+-      // DRIVER_EXEMPT — every path below is exempt from all three restricted modules,
+-      // the driver's name on the marker notwithstanding: `driver-exempt.test.ts` reads
+-      // the module names out of the rule, so this list governs whatever the rule names.
+-      //
+-      // First the lane's own infrastructure. Reasons, one per path:
+-      //   global-setup.ts  installs the guard against a database vitest names
+-      //   setup.ts         rewrites the connection string to carry the exemption
+-      //   guard.itest.ts   holds one exempt client and one plain one, and the
+-      //                    difference between them is the whole test
+-      "packages/test-harness/src/global-setup.ts",
+-      "packages/test-harness/src/setup.ts",
+-      "packages/test-harness/src/guard.itest.ts",
+-      // AND TWO SUITES THAT WRITE A ROW THE TYPE SYSTEM FORBIDS.
+-      //
+-      //   backfill.itest.ts  asserts what `toFrame` does with a SENDERLESS message.
+-      //                      Those rows exist — every one written through the socket
+-      //                      before the sender was threaded looks like this — and the
+-      //                      repository can no longer produce one, because `userId` is
+-      //                      required. The fixture has to be raw SQL or the behaviour
+-      //                      has no test at all.
+-      //   history.itest.ts   reads the same row from the other end: a page whose
+-      //                      `user` comes back null. FR-MSG-15 made `sendMessage`
+-      //                      require a sender, so this suite lost the ability to build
+-      //                      its own fixture in the same change that gave it the case.
+-      //
+-      // This is the exemption's honest case: not "the repository is inconvenient" but
+-      // "the state under test is one the repository is now unable to reach". Both are
+-      // listed by path rather than reached through a shared helper, because a helper in
+-      // another file names none of these specifiers and this rule sees only imports —
+-      // an invisible exemption is worse than a listed one.
+-      "services/api/src/internal/backfill.itest.ts",
+-      "services/api/src/messages/history.itest.ts",
+-      // THE QUOTA CHAPTER'S PERIOD SUITE, and its case is the two above's in a third
+-      // shape: the state under test is one the repository cannot reach. `periodOf`
+-      // returns the month a timestamp falls in, and the property is that a row INSERTED
+-      // under that value is FOUND by it — which needs a `usage_periods` row written
+-      // directly, because every repository path that writes one derives the period from
+-      // the clock and so cannot disagree with the function under test.
+-      //
+-      // A suite that used the repository here would be asserting that `periodOf` equals
+-      // itself.
+-      "services/api/src/quotas/period.itest.ts",
+-      // AND THE QUOTA SUITE ITSELF, for a different reason from its sibling above.
+-      // `period.itest.ts` writes a row the repository cannot; this one READS the two
+-      // roll-up tables directly to check what a send left behind. Going through
+-      // `usageFor` would mean asserting the roll-up against the function that reads
+-      // it — the same circularity, one table over.
+-      "services/api/src/quotas/quotas.itest.ts",
+-      // ── AND EVERY OTHER REDIS CLIENT, BY PATH, WITH THE ARGUMENT IT NEEDS ──
+-      //
+-      // The rule arrives here and TWELVE files older than it already import `ioredis`.
+-      // A missing exemption is not a silent one — this rule goes red on a chapter
+-      // nobody is editing — so all of them land in the commit that adds the rule.
+-      // FIVE DIFFERENT ARGUMENTS, and a blanket "the gateway's Redis files" would
+-      // erase all five distinctions the rule exists to make.
+-      //
+-      // (1) NO KEY IS TOUCHED AT ALL — these name a pub/sub SUBJECT and never a key,
+-      // which is the property, not whether they publish or subscribe. The subjects are
+-      // `chan:{channel_id}`, `member:{channel_id}` and `typing:{channel_id}`: a channel
+-      // UUID, and a subject is not readable at all, only listened to by whoever already
+-      // subscribed. There is no key here for a cross-tenant read to reach. (The api's
+-      // two publishers publish; the gateway's `membership.ts` only ever subscribes,
+-      // because the api publishes that fabric — and the argument is the same either
+-      // way.)
+-      "services/api/src/fanout/publisher.ts",
+-      "services/api/src/membership/publisher.ts",
+-      //
+-      // (2) THE COUNTER STORE'S OTHER HALF. `rl:{environment_id}:…` is the key shape
+-      // the whole restriction is about, and this file composes it — so it is exempt as
+-      // the rule's own subject, not against its reason. `limits.itest.ts` is listed
+-      // beside it for something the rule cannot express at all: its subject is that
+-      // the api and the gateway increment the SAME key, and the only way to check that
+-      // is to read the key with NEITHER of their code.
+-      "services/gateway/src/limits.ts",
+-      "services/gateway/src/limits.itest.ts",
+-      "services/gateway/src/fanout.ts",
+-      // `member:{env}:{user}` — the principal-addressed half of that fabric — DOES
+-      // carry an environment id, and that still does not make it the limiter's case:
+-      // a subject is not readable, and the id is composed from the repository's own
+-      // scope on the way out and from the authenticated connection's identity on the
+-      // way in, never read from a payload.
+-      "services/gateway/src/membership.ts",
+-      // `typing.ts` both publishes and subscribes and composes no key at all — the
+-      // environment travels INSIDE the payload, where the receiving gateway checks it
+-      // against the connection it is about to act on.
+-      "services/gateway/src/typing.ts",
+-      //
+-      // (2) KEYS ARE COMPOSED AND THEY ARE ENVIRONMENT-SCOPED — the limiter's own
+-      // argument rather than the publishers'. `presence:{env}:{user}` is exactly the
+-      // shape the restriction guards. Every key is composed from the environment id on
+-      // the authenticated connection's own identity; no path takes one from a client,
+-      // and there is no scan, `KEYS` or pattern read that could reach another tenant's.
+-      "services/gateway/src/presence.ts",
+-      //
+-      // (3) THE ENVIRONMENT COMES FIRST IN THE KEY, which is the strongest case on
+-      // this list rather than the weakest. `conn:{env}:{user}:{slot}` makes
+-      // constitution I structural in the key itself: reaching across a tenant needs a
+-      // caller to hand this module another environment's id, and the session layer
+-      // takes that from the api's verified identity. The other entries argue about
+-      // what they touch; this one cannot be wrong without being lied to.
+-      "services/gateway/src/connections.ts",
+-      //
+-      // (4) THE SUBJECT IS WHAT REACHES THE FABRIC, so the oracle cannot be either
+-      // service's own client. A spy on `createFanout` or on `createPresence` proves
+-      // that an object was asked to publish, not that a frame arrived — and these
+-      // suites' receive halves have rejection paths (a body that is not JSON, a body
+-      // that is JSON and not a transition) that no module-level API can produce,
+-      // because each only ever publishes payloads its own schema built.
+-      "services/api/src/fanout/fanout.itest.ts",
+-      "services/gateway/src/presence.itest.ts",
+-      "services/gateway/src/membership.itest.ts",
+-      "services/gateway/src/typing.itest.ts",
+-      //
+-      // (5) THE RAW CLIENT IS THE STIMULUS, NOT THE ORACLE — a fifth reason, and the
+-      // rule cannot express it. This suite's subject is delivery and it asserts on
+-      // sockets. It needs a client to CAUSE a membership change: `Membership` exposes
+-      // `onChange`, `subscribeChannel` and `watch` and no `publish`, because the api
+-      // publishes and the gateway only ever subscribes.
+-      "services/gateway/src/connections.itest.ts",
+-      //
+-      // `services/gateway/src/connections.test.ts` IS DELIBERATELY ABSENT, and the
+-      // ledger that owed these entries said to add it. It reads the module's own
+-      // source off disk and imports nothing restricted, so the exemption would be one
+-      // over nothing — and `driver-exempt.test.ts`'s stale-entry check is the half of
+-      // this list that goes red when a listed file stops needing it.
+-    ],
++    ignores: DRIVER_EXEMPT,
++
++    rules: {
++      "no-restricted-imports": ["error", DRIVER_AND_ENGINE],
++    },
++  },
++  {
++    // ── AND THE UNION, WHICH IS THE WHOLE REASON THE SETS ARE NAMED ─────────────
++    //
++    // Every `*.itest.ts` the block above matched as `**/*.ts` is matched again here, so
++    // this rule must be the UNION or the driver ban is switched off for all of them.
++    // The two exemption lists are ignored here and given their own single rule below,
++    // because `ignores` on the FIRST block cannot reach a rule the SECOND one sets.
++    files: ["**/*.itest.ts"],
++    ignores: [...DRAIN_EXEMPT_TESTS, ...DRIVER_EXEMPT],
      rules: {
        "no-restricted-imports": [
          "error",
-@@ -69,5 +74,87 @@ export default tseslint.config(
-         },
-       ],
-     },
-   },
-+  {
-+    // THE GLOBAL ADMIN FUNCTIONS, RESTRICTED IN INTEGRATION TESTS (feature 030).
-+    //
-+    // Six recorded instances of one fault: a test asserts a local fact about a
-+    // global operation, or performs one and damages a neighbour's fixture. Each
-+    // one imported one of these functions into an `*.itest.ts` and called it as
-+    // though the database held only its own rows.
-+    //
-+    // The two `*Depth` functions are here for a different reason from the other
-+    // four. They take no batch size and cannot — a count has nothing to bound —
-+    // and a global count compared against itself is instance 4, which appeared
-+    // twice in one file four chapters apart. An earlier draft of this rule said
-+    // "every cross-environment function must require a batch size"; that was
-+    // false of these two, which is why they are restricted rather than fixed.
-+    //
-+    // WHAT THIS RULE DOES NOT CATCH, and must not be trusted to:
-+    //   * an indirect call — a helper in another file that calls the function,
-+    //     imported here under an innocent name;
-+    //   * raw SQL — `UPDATE webhook_endpoints SET enabled = false` names no
-+    //     import at all.
-+    // Both are covered by the trigger in `packages/test-harness/src/sentinel.sql`,
-+    // which watches statements rather than imports. A rule trusted further than
-+    // it goes is worse than no rule (contracts/guard.md).
-+    //
-+    // AND WHAT NEITHER CATCHES: instance 3 rode the JetStream stream rather than
-+    // the database — an unfiltered `createConsumerRuntime` in a test replays every
-+    // event earlier chapters left behind, on a fixed budget of polls. No trigger
-+    // sees that and no import is wrong; the subject filter is the property, and
-+    // the call site is the only place to notice it (research R43).
-+    files: ["**/*.itest.ts"],
-+    ignores: [
-+      // The suites that drive a global drain on purpose. THIS LIST AND
-+      // `packages/test-harness/src/exempt.ts` MUST AGREE: a file exempt from one
-+      // and not the other is a trap for whoever adds the seventh instance.
-+      "services/api/src/outbox/outbox.itest.ts",
-+      "services/api/src/webhooks/deliveries.itest.ts",
-+      "services/api/src/webhooks/test-event.itest.ts",
-+      "services/api/src/webhooks/attempts.itest.ts",
-+      "services/api/src/notifications/notifications.itest.ts",
-+      "services/dispatcher/src/dispatcher.itest.ts",
-+    ],
-+    rules: {
-+      "no-restricted-imports": [
-+        "error",
-+        {
-+          // BOTH SPELLINGS. `no-restricted-imports` matches the specifier as
-+          // written, so `../db/repository` and `./repository` are two rules —
-+          // and the second is the one `db/repository.itest.ts` and
-+          // `db/history-drift.itest.ts` would use, both of them non-exempt.
-+          // Measured by adding the import to each and running eslint.
-+          paths: [
-+            {
-+              name: "../db/repository",
-+              importNames: [
-+                "drainOutbox",
-+                "drainDueDeliveries",
-+                "drainDisableNotifications",
-+                "sweepDisabledEndpoints",
-+                "outboxDepth",
-+                "pendingDeliveryDepth",
-+              ],
-+              message:
-+                "This function operates across every environment in the database, and an integration test shares that database with every other suite. Assert on the rows this test created — read them back by id, or scope the count to your own environment_id — instead of on what a global batch happened to contain. If this suite's subject IS the global drain, add it to packages/test-harness/src/exempt.ts with a reason, and to the ignores list beside this rule.",
-+            },
-+            {
-+              name: "./repository",
-+              importNames: [
-+                "drainOutbox",
-+                "drainDueDeliveries",
-+                "drainDisableNotifications",
-+                "sweepDisabledEndpoints",
-+                "outboxDepth",
-+                "pendingDeliveryDepth",
-+              ],
-+              message:
-+                "This function operates across every environment in the database, and an integration test shares that database with every other suite. Assert on the rows this test created — read them back by id, or scope the count to your own environment_id — instead of on what a global batch happened to contain. If this suite's subject IS the global drain, add it to packages/test-harness/src/exempt.ts with a reason, and to the ignores list beside this rule.",
-+            },
-+          ],
+         {
+-          paths: [
+-            {
+-              name: "pg",
+-              message:
+-                "Raw database access is forbidden outside services/api/src/db (constitution I).",
+-            },
+-            {
+-              name: "drizzle-orm",
+-              message:
+-                "The query engine lives inside the repository layer only (constitution I, ADR-16).",
+-            },
++          paths: [...DRIVER_AND_ENGINE.paths, ...GLOBAL_DRAINS.paths],
++          patterns: DRIVER_AND_ENGINE.patterns,
 +        },
 +      ],
 +    },
 +  },
++  {
++    // The driver-exempt paths keep their exemption and gain the drain rule. Without
++    // this block the union above would restore the ban they were excused from.
++    files: DRIVER_EXEMPT,
++    rules: {
++      "no-restricted-imports": ["error", GLOBAL_DRAINS],
++    },
++  },
++  {
++    // And the drain-exempt suites get the driver rule alone. They drive a global drain
++    // on purpose; they are excused from nothing else.
++    files: DRAIN_EXEMPT_TESTS,
++    rules: {
++      "no-restricted-imports": ["error", DRIVER_AND_ENGINE],
++    },
++  },
++  {
++    // THE SEAL ON `packages/outsider` (FR-030, FR-034, research R12).
++    //
++    // That package holds one suite that behaves like a customer, and the claim it makes
++    // — an integration built from published documentation alone — is worth nothing if
++    // the suite can read the platform's source. So the claim is made mechanical, in
++    // three levels, and this block is levels 2 and 3.
++    //
++    // LEVEL 1 IS NOT A RULE AT ALL. `packages/outsider/package.json` declares no
++    // `@relay/*` dependency, and pnpm's isolated `node_modules` means there is no
++    // `@relay` directory at the workspace root — so
++    // `import { ERROR_CODES } from "@relay/protocol"` fails to RESOLVE. Nothing lints
++    // it; the module is not there.
++    //
++    // LEVEL 2 is the import rule below: a specifier that climbs out of the package by a
++    // relative or absolute path is refused. That closes the obvious way round level 1,
++    // which is to spell the same import as `../protocol/src/codes.js`.
++    //
++    // LEVEL 3 is the syntax rule, and an import rule cannot reach it.
++    // `packages/e2e/src/harness.ts` builds `join(HERE, "..", "..", "..")` and spawns the
++    // api's build output from it — a STRING, not an import specifier, so
++    // `no-restricted-imports` never sees it. The file cited as proof the hole exists is
++    // also proof the import rule does not close it. So `".."` as a literal is banned
++    // here, and so is `createRequire`, which is the other way to turn a computed path
++    // into a module.
++    //
++    // WHAT NONE OF THE THREE CLOSES, and three rules must not be left to imply a
++    // fourth: reading the repository's source with human eyes. Whoever writes that suite
++    // can open `codes.ts` in an editor, and no configuration can stop them. The seals
++    // make workspace code unIMPORTABLE; not reading it is a discipline, and the chapter
++    // says so in those words rather than presenting three rules as if they were four
++    // (FR-034).
++    //
++    // ── AND THIS BLOCK IS LAST, WHICH IS LOAD-BEARING ───────────────────────────────
++    //
++    // `no-restricted-imports` has one winner per file: the last matching block. Every
++    // block above matches `**/*.ts`, so this one has to carry the UNION it needs rather
++    // than only its own half — the driver and the engine included, because `pg` DOES
++    // resolve here by the ordinary parent walk even though `@relay/*` does not.
++    //
++    // Published's version set only the outsider's own patterns and worked by luck:
++    // `no-restricted-syntax` survives because no other block sets it, and the driver
++    // ban was simply gone for this package. That is the same replacement fault the
++    // hoisted sets above exist for, in the one block that most needs the ban.
++    files: ["packages/outsider/**/*.ts", "packages/outsider/**/*.mts"],
++    rules: {
++      "no-restricted-imports": [
++        "error",
++        {
++          paths: DRIVER_AND_ENGINE.paths,
++          patterns: [
++            ...DRIVER_AND_ENGINE.patterns,
+             {
+-              name: "ioredis",
++              group: ["@relay/*"],
+               message:
+-                "The counter store lives in services/api/src/limits and services/gateway/src/limits.ts only (constitution I). Its keys are per environment; an unrestricted client is a cross-tenant read.",
++                "packages/outsider integrates from published documentation alone. It may not import workspace code — see the three levels in eslint.config.mjs.",
+             },
+-          ],
+-          patterns: [
+             {
+-              group: ["drizzle-orm/*"],
++              // NOT `/*` as a third entry here: minimatch matched `vitest/config` with
++              // it, and a rule that refuses the test runner is a rule somebody turns
++              // off. Absolute paths are covered by the syntax selector below, which
++              // matches on the specifier itself.
++              group: ["../*", "../../*"],
+               message:
+-                "The query engine lives inside the repository layer only (constitution I, ADR-16).",
++                "packages/outsider may not reach outside itself. A relative path out of the package is the same import by another spelling.",
+             },
+           ],
+         },
+       ],
++      "no-restricted-syntax": [
++        "error",
++        {
++          selector: "Literal[value='..']",
++          message:
++            "packages/outsider may not build a path out of the package. `join(HERE, \"..\", …)` is how packages/e2e reaches the api's build output, and an import rule cannot see it.",
++        },
++        {
++          selector: "CallExpression[callee.name='createRequire']",
++          message:
++            "createRequire turns a computed path into a module, which is the escape the import rule cannot see.",
++        },
++        {
++          selector: "ImportDeclaration[source.value='node:module']",
++          message:
++            "node:module is only useful here for createRequire, which is banned above.",
++        },
++        {
++          // An absolute path is the third spelling of the same import. Matched on the
++          // specifier rather than by glob, because the glob for it also matched
++          // `vitest/config`.
++          selector: "ImportDeclaration[source.value=/^\\//]",
++          message:
++            "packages/outsider may not import by absolute path. See the three levels in eslint.config.mjs.",
++        },
++      ],
+     },
+   },
  );
+\ No newline at end of file
 ```
 
 ---
@@ -1351,80 +1487,6 @@ amendment here, because no chapter fences it.
 **No chapter owns any of this.** 2.1 introduced the integration lane, 2.6 and 2.8
 added lanes of their own, and 3.1 added the coverage lane. None of them is about
 what a shared database does to a suite that assumes it is alone.
-
-```diff title="services/api/vitest.integration.config.mts"
-@@ -6,7 +6,31 @@ import { defineConfig } from "vitest/config";
- // the compose Postgres. (.mts because this package compiles to CommonJS —
- // a .ts config would be loaded as CJS, which vitest refuses.)
- export default defineConfig({
-   test: {
-+    // Feature 030: the global-operation guard. `globalSetup` migrates and
-+    // then installs the trigger once per lane; `setupFiles` sets the
-+    // exemption for files on the harness's list and, where the lane carries
-+    // bait, plants it per file.
-+    globalSetup: ["../../packages/test-harness/src/global-setup.ts"],
-+    setupFiles: ["../../packages/test-harness/src/setup.ts"],
-+    // FEATURE 030, MEASURED: nine suites in this lane import `AppModule`, and none
-+    // of them set a relay flag. Each relay defaults to on when its flag is unset
-+    // (`process.env.RELAY_OUTBOX_RELAY ?? "on"`), so those nine booted four
-+    // background loops that sweep the whole database while every other suite's
-+    // fixtures sit in it. Research R13 recorded the exposure as nil on the strength
-+    // of the four suites that spawn an api CHILD and set the flags in the child's
-+    // env; it did not look at the suites that boot the app in process.
-+    //
-+    // A relay catches and logs its own errors, so the guard's refusal inside one is
-+    // a log line and a green lane. Setting the flags here makes the quiet database
-+    // a property of the lane rather than a convention nobody applied.
-+    env: {
-+      RELAY_HARNESS_BAIT: "on",
-+      RELAY_OUTBOX_RELAY: "off",
-+      RELAY_DELIVERY_RELAY: "off",
-+      RELAY_NOTIFICATION_RELAY: "off",
-+      RELAY_EVENT_CONSUMER: "off",
-+    },
-     include: ["src/**/*.itest.ts"],
-   },
- });
-```
-
-```diff title="services/gateway/vitest.integration.config.mts"
-@@ -5,7 +5,15 @@ import { defineConfig } from "vitest/config";
- // include, and this config is what `pnpm --filter @relay/gateway
- // test:integration` runs against the compose Redis.
- export default defineConfig({
-   test: {
-+    // Feature 030: the global-operation guard. `globalSetup` migrates and
-+    // then installs the trigger once per lane; `setupFiles` sets the
-+    // exemption for files on the harness's list and, where the lane carries
-+    // bait, plants it per file. This lane gets exemption
-+    // handling and NO bait: it holds no reader-shape fault, and planting
-+    // would change its workload for no return (feature 030).
-+    globalSetup: ["../../packages/test-harness/src/global-setup.ts"],
-+    setupFiles: ["../../packages/test-harness/src/setup.ts"],
-     include: ["src/**/*.itest.ts"],
-   },
- });
-```
-
-```diff title="packages/e2e/vitest.integration.config.mts"
-@@ -9,8 +9,16 @@ import { defineConfig } from "vitest/config";
- // The whole suite is one journey, and it boots real processes — so it gets
- // a real timeout, and it does not run its files in parallel.
- export default defineConfig({
-   test: {
-+    // Feature 030: the global-operation guard. `globalSetup` migrates and
-+    // then installs the trigger once per lane; `setupFiles` sets the
-+    // exemption for files on the harness's list and, where the lane carries
-+    // bait, plants it per file. This lane gets exemption
-+    // handling and NO bait: it holds no reader-shape fault, and planting
-+    // would change its workload for no return (feature 030).
-+    globalSetup: ["../../packages/test-harness/src/global-setup.ts"],
-+    setupFiles: ["../../packages/test-harness/src/setup.ts"],
-     include: ["src/**/*.itest.ts"],
-     testTimeout: 60_000,
-     hookTimeout: 60_000,
-     fileParallelism: false,
-```
 
 ```diff title="vitest.coverage.config.mts"
 @@ -18,8 +18,33 @@ import swc from "unplugin-swc";
@@ -1513,95 +1575,6 @@ already used that idiom forty lines down.
 a test drives a global drain without asserting on other tenants' rows is not what
 3.3 teaches.
 
-```diff title="services/api/src/outbox/outbox.itest.ts"
-@@ -177,9 +177,22 @@ describe("the outbox", () => {
-     expect((await unpublishedFor(db, env.id)).length).toBe(0);
- 
-     // Every event this environment produced reached the destination with its
-     // own id as the deduplication key.
--    const ids = publisher.sent.map((m) => m.id);
-+    //
-+    // SCOPED, and it was not (feature 030, instance 9). `publisher.sent` holds
-+    // every row this relay moved out of a table it drains globally, so the
-+    // unfiltered version asserted that no row anywhere in the outbox is ever
-+    // published twice by anybody — which is a claim about the whole platform
-+    // dressed up as a claim about three messages. It failed once in a full lane
-+    // run, `expected 3001 to be 4800`, and passed when the file ran alone: the
-+    // recurring fault's signature. The scoped idiom is the one this file already
-+    // uses forty lines down, and the sentence above the assertion was describing
-+    // it all along.
-+    const ids = publisher.sent
-+      .filter((m) => m.subject.endsWith(env.id))
-+      .map((m) => m.id);
-+    expect(ids.length).toBeGreaterThan(0);
-     expect(new Set(ids).size).toBe(ids.length);
- 
-     // A second pass has nothing of OURS to do — marked rows are done.
-     //
-@@ -214,12 +227,20 @@ describe("the outbox", () => {
-     const b = recordingPublisher();
-     const relayA = createRelay({ db, publisher: a, logger: silent, batchSize: 7 });
-     const relayB = createRelay({ db, publisher: b, logger: silent, batchSize: 7 });
- 
--    // Run them at the same time, repeatedly, until the backlog is gone.
--    for (let pass = 0; pass < 20; pass++) {
-+    // Run them at the same time, repeatedly, until THIS environment's backlog is
-+    // gone. Same reader fix as `drainUntilClear`, and sharper here: `batchSize: 7`
-+    // made twenty passes a budget of 140 rows, against a table holding thousands.
-+    // The loop ends when our rows are done or when neither relay can move
-+    // anything.
-+    for (;;) {
-       if ((await outboxDepthFor(db, env.id)) === 0) break;
--      await Promise.all([relayA.drainOnce(), relayB.drainOnce()]);
-+      const [movedA, movedB] = await Promise.all([
-+        relayA.drainOnce(),
-+        relayB.drainOnce(),
-+      ]);
-+      if (movedA + movedB === 0) break;
-     }
- 
-     expect(await outboxDepthFor(db, env.id)).toBe(0);
-     const all = [...a.sent, ...b.sent].map((m) => m.id);
-@@ -391,16 +412,35 @@ describe("the outbox", () => {
-  * filled entirely by rows this suite did not write, and a test that assumes
-  * otherwise passes alone and fails in a full lane. (It did exactly that here.)
-  * Suites cannot isolate themselves by construction on this table the way 2.1's
-  * per-suite environments let them everywhere else. */
-+/*
-+ * READER FIX (feature 030). The comment above was right about the table and wrong
-+ * about the loop.
-+ *
-+ * `passes = 20` bounded the DRIVING in units of batches while the work is bounded
-+ * by the whole table. Twenty passes of the default batch move 2,000 rows; the
-+ * seeder's bait alone is 3,400, so the loop returned with this environment's rows
-+ * untouched and the assertion below reported `expected 4 to be +0` — a correctly
-+ * scoped read of a wrongly driven relay.
-+ *
-+ * There is no right constant here, which is the point: the relay is global and
-+ * oldest-first, so reaching this suite's rows means draining everything older than
-+ * them, and how much that is depends on who else is in the database. So the loop
-+ * has no pass budget. It stops on the only two conditions that mean anything —
-+ * this environment is clear, or a pass moved nothing and the relay is therefore
-+ * done — and each pass that moves rows reduces the global backlog, so it
-+ * terminates. `safety` exists to turn a hypothetical infinite loop into a failed
-+ * test, and is derived from the work that actually exists rather than guessed.
-+ */
- async function drainUntilClear(
-   relay: { drainOnce: () => Promise<number> },
-   db: Db,
-   environmentId: string,
--  passes = 20,
- ): Promise<number> {
-   let moved = 0;
--  for (let i = 0; i < passes; i++) {
-+  const safety = (await outboxDepth(db)) + 100;
-+  for (let i = 0; i < safety; i++) {
-     if ((await outboxDepthFor(db, environmentId)) === 0) break;
-     const drained = await relay.drainOnce();
-     moved += drained;
-     if (drained === 0) break;
-```
-
 ---
 
 ## The quota relay's flag, and a harness method (chapter 3.10)
@@ -1627,32 +1600,36 @@ column, are hygiene it never discusses. A chapter may only fence a change it
 explains.
 
 ```diff title="turbo.json"
-@@ -37,9 +37,10 @@
-         "RELAY_NATS_REPLICAS",
-         "RELAY_E2E_API_PORT",
-         "RELAY_SMTP_URL",
-         "RELAY_MAILPIT_URL",
--        "RELAY_NOTIFICATION_RELAY"
+@@ -43,15 +43,28 @@
+         "RELAY_REDIS_PORT",
+         "RELAY_NATS_URL",
+         "RELAY_NATS_PORT",
+         "RELAY_OUTBOX_RELAY",
+         "RELAY_DELIVERY_RELAY",
+         "RELAY_INTERNAL_CREDENTIAL",
++        "RELAY_INTERNAL_CREDENTIAL_GATEWAY",
++        "RELAY_METER_INTERVAL_MS",
++        "RELAY_AUTH_FAILURES_PER_MINUTE",
++        "RELAY_AUTH_KEY_PREFIX",
+         "RELAY_WEBHOOK_SECRET_KEY",
+         "RELAY_EVENT_CONSUMER",
+-        "RELAY_NATS_REPLICAS"
++        "RELAY_NATS_REPLICAS",
++        "RELAY_E2E_API_PORT",
++        "RELAY_SMTP_URL",
++        "RELAY_MAILPIT_URL",
 +        "RELAY_NOTIFICATION_RELAY",
-+        "RELAY_QUOTA_RELAY"
++        "RELAY_QUOTA_RELAY",
++        "RELAY_DOCS_BASE_URL",
++        "RELAY_API_URL",
++        "RELAY_WS_URL",
++        "RELAY_DEMO_CREDENTIAL"
        ]
      },
      "//#lint:root": {
        "inputs": [
-```
-
-```diff title="services/api/vitest.integration.config.mts"
-@@ -29,8 +29,10 @@ export default defineConfig({
-       RELAY_OUTBOX_RELAY: "off",
-       RELAY_DELIVERY_RELAY: "off",
-       RELAY_NOTIFICATION_RELAY: "off",
-       RELAY_EVENT_CONSUMER: "off",
-+      // The quota chapter's relay, the fourth. Same reason as the other three.
-+      RELAY_QUOTA_RELAY: "off",
-     },
-     include: ["src/**/*.itest.ts"],
-   },
- });
+         "**/*.{ts,mts,cts,mjs,js}",
+         "eslint.config.mjs",
 ```
 
 ```diff title="vitest.coverage.config.mts"
@@ -1670,39 +1647,42 @@ explains.
 ```
 
 ```diff title="packages/e2e/src/harness.ts"
-@@ -288,8 +288,15 @@ export interface System {
-     dispatcher: Client;
-     tuan: Client;
-   }>;
-   seedForeignTenant: () => Promise<{ channel: string; text: string }>;
-+  /** Set an environment's quota policy.
-+   *
-+   * Here rather than in the test, because `packages/e2e` may not import `pg` —
-+   * the driver restriction chapter 2.5 added, and this package is not on its
-+   * ignores list. The harness already holds the api's own database handle, so
-+   * the one place that may write is the one place that does. */
-+  setQuota: (environmentId: string, config: unknown) => Promise<void>;
-   client: (name: string, environmentId: string) => Promise<Client>;
-   stop: () => Promise<void>;
- }
- 
-@@ -486,8 +493,16 @@ export async function boot({ gateways = 2 } = {}): Promise<System> {
-       await repo.sendMessage(channel.id, { text, userId: user.id });
-       say(`seeded a foreign tenant (${other}) with one message`);
-       return { channel: channel.id, text };
-     },
-+    async setQuota(environmentId, config) {
-+      await (
-+        db as { execute: (q: string) => Promise<unknown> }
-+      ).execute(
-+        `UPDATE environments SET quota_config = '${JSON.stringify(config)}'::jsonb
-+          WHERE id = '${environmentId}'`,
-+      );
-+    },
-     async client(name, environmentId) {
-       return new Client(name, await token(environmentId, name), say);
-     },
-     async stop() {
+@@ -399,19 +399,35 @@ export async function boot({ gateways = 2 } = {}): Promise<System> {
+       "RELAY_NATS_PORT",
+       // The api decrypts webhook signing secrets and authenticates
+       // the dispatcher. Both are configuration, and a child that invents either
+       // would be a second source of truth for a credential.
+       "RELAY_WEBHOOK_SECRET_KEY",
+       "RELAY_INTERNAL_CREDENTIAL",
++      // The rate-limit chapter's other half: where the notification relay posts its SMTP.
++      // The lane runs Mailpit on 11025 and the default is 1025, so an
++      // unforwarded variable is not a missing feature — it is a mailer talking
++      // confidently to a port nothing is listening on.
++      "RELAY_SMTP_URL",
++      // The failed-authentication threshold and the counter's key
++      // prefix. Forwarded for the reason this list exists at all — turbo runs
++      // tasks in STRICT env mode, so an undeclared variable reaches a child as
++      // `undefined` and the `??` behind it silently wins. A suite that raised the
++      // threshold would raise it in the parent and not in the api the child runs.
++      "RELAY_AUTH_FAILURES_PER_MINUTE",
++      "RELAY_AUTH_KEY_PREFIX",
+     ),
+     // The api children run WITHOUT the outbox relay. This journey
+     // asserts message delivery, and a background loop draining the outbox while
+     // the outbox chapter's own suite asserts on that same table is a race between two test
+     // files, not a property of the system. The relay has its own suite, which
+     // drives it explicitly.
+     RELAY_OUTBOX_RELAY: "off",
++    // The rate-limit chapter: and no notification relay either, for the same reason. This
++    // journey asserts message delivery; a loop marking rows delivered while
++    // the rate-limit chapter's own suite asserts on that column is a race between test files.
++    RELAY_NOTIFICATION_RELAY: "off",
+     // No event consumer in these children either, for the reason
+     // the line above exists — this journey asserts message delivery, and a
+     // background consumer writing to a table the broker chapter's suite asserts on is a race
+     // between test files rather than a property of the system.
+     RELAY_EVENT_CONSUMER: "off",
+     // The webhook dispatcher chapter: nor the delivery relay, for the third time and the same
 ```
 
 ## Chapter 3.11's neighbours
@@ -1775,149 +1755,11 @@ a reader code the chapter never discusses.
    },
 ```
 
-```diff title="eslint.config.mjs"
-@@ -123,24 +123,37 @@ export default tseslint.config(
-           // BOTH SPELLINGS. `no-restricted-imports` matches the specifier as
-           // written, so `../db/repository` and `./repository` are two rules —
-           // and the second is the one `db/repository.itest.ts` and
-           // `db/history-drift.itest.ts` would use, both of them non-exempt.
-           // Measured by adding the import to each and running eslint.
-           paths: [
-             {
-               name: "../db/repository",
-               importNames: [
-                 "drainOutbox",
-                 "drainDueDeliveries",
-                 "drainDisableNotifications",
-+                // The connection-metering chapter added this one, and the quota chapter should have.
-+                // `drainQuotaNotifications` claims undelivered rows across every
-+                // environment, exactly as its three siblings above do, and the quota chapter
-+                // listed it in neither this rule nor `exempt.ts` — whose comment
-+                // says the two MUST AGREE.
-+                //
-+                // SAY WHAT THIS DOES NOT BUY. It protects a future DIRECT
-+                // importer. It does not protect the suites that already drive the
-+                // drain, because they reach it through `createQuotaRelay`, and
-+                // the note above is explicit that an indirect call is what this
-+                // rule cannot see. Scoping those assertions to rows the test
-+                // created is the half that works.
-+                "drainQuotaNotifications",
-                 "sweepDisabledEndpoints",
-                 "outboxDepth",
-                 "pendingDeliveryDepth",
-               ],
-               message:
-                 "This function operates across every environment in the database, and an integration test shares that database with every other suite. Assert on the rows this test created — read them back by id, or scope the count to your own environment_id — instead of on what a global batch happened to contain. If this suite's subject IS the global drain, add it to packages/test-harness/src/exempt.ts with a reason, and to the ignores list beside this rule.",
-             },
-             {
-               name: "./repository",
-               importNames: [
-                 "drainOutbox",
-                 "drainDueDeliveries",
-```
-
-```diff title="services/api/src/auth/credentials.itest.ts"
-@@ -16,6 +16,7 @@ import {
-   revokeApiKey,
- } from "../db/repository";
- import { parseApiKeyCredential } from "./api-key";
-+import { resolvePrincipal } from "./authenticate.middleware";
- import { MAX_TOKEN_LIFETIME_SECONDS } from "./user-token";
- 
- // The rate-limit chapter added `request_id` to every error body (constitution V's fourth
-@@ -164,7 +165,22 @@ describe("credentials", () => {
-       environmentId: env.id,
-       name: "once",
-     });
--    const secret = minted.credential.split("_").at(-1)!;
-+    // THE SECRET IS EVERYTHING AFTER THE PUBLIC ID, and it is not
-+    // `split("_").at(-1)`. `api-key.ts` says why three lines from its own regex:
-+    // "the public id is hex when the secret is base64url … base64url's alphabet
-+    // INCLUDES the separator". So the secret contains underscores, and taking the
-+    // last segment yields whatever happens to follow the final one — occasionally
-+    // a single character, which the row below then contains by chance:
-+    //
-+    //     AssertionError: expected '[{"public_id":"9e5240d…' not to contain 'A'
-+    //
-+    // Latent since the tenancy chapter and found by the connection-metering chapter's twenty-run battery on
-+    // the gate run after it. Parsed with the same shape the production code
-+    // parses (`CREDENTIAL` in `api-key.ts`) rather than a guess about delimiters.
-+    const secret = /^rk_(?:dev|live)_[0-9a-f]{32}_(.+)$/.exec(
-+      minted.credential,
-+    )![1]!;
-+    expect(secret.length).toBeGreaterThan(20);
- 
-     // Nothing in the row it left behind contains what was returned. Read with
-     // a plain string rather than drizzle's `sql` helper: the query engine lives
-@@ -424,3 +440,64 @@ describe("credentials", () => {
-       expect(JSON.stringify(body)).not.toContain(PLATFORM);
-     });
-   });
-+
-+  // --- one credential per service ---------------------------
-+
-+  describe("which service presented it", () => {
-+    // SET, not read, for the reason the block above gives.
-+    const DISPATCHER = "rk_svc_credentials_itest_0123456789abcdef01234";
-+    const GATEWAY = "rk_svc_gateway_itest_fedcba98765432100fedcba9";
-+    process.env["RELAY_INTERNAL_CREDENTIAL"] = DISPATCHER;
-+    process.env["RELAY_INTERNAL_CREDENTIAL_GATEWAY"] = GATEWAY;
-+
-+    it("names the dispatcher for the dispatcher's secret", async () => {
-+      expect(await resolvePrincipal(db, DISPATCHER)).toEqual({
-+        kind: "platform",
-+        service: "dispatcher",
-+      });
-+    });
-+
-+    it("names the GATEWAY for the gateway's secret", async () => {
-+      // Until this chapter `resolvePlatformCredential` ended with a hardcoded
-+      // `service: "dispatcher"`, which was true while there was one caller and
-+      // became a lie the moment there were two. `PlatformPrincipal.service` is
-+      // documented as "which internal service presented it, for logs".
-+      expect(await resolvePrincipal(db, GATEWAY)).toEqual({
-+        kind: "platform",
-+        service: "gateway",
-+      });
-+    });
-+
-+    it("gives neither service the other's reach", async () => {
-+      // The property beyond honest logs: the gateway terminates public traffic
-+      // and the dispatcher does not, so one shared secret would let the more
-+      // exposed service set the blast radius for both.
-+      expect(DISPATCHER).not.toBe(GATEWAY);
-+      const swapped = await resolvePrincipal(db, GATEWAY);
-+      expect(swapped).not.toBeNull();
-+      expect((swapped as { service: string }).service).not.toBe("dispatcher");
-+    });
-+
-+    it("refuses a secret shorter than 32 characters, per service", async () => {
-+      // A short secret is a misconfiguration, and the safe reading of one is
-+      // "this service cannot authenticate" rather than "this service is open".
-+      const short = "rk_svc_tooshort";
-+      process.env["RELAY_INTERNAL_CREDENTIAL_GATEWAY"] = short;
-+      expect(await resolvePrincipal(db, short)).toBeNull();
-+      process.env["RELAY_INTERNAL_CREDENTIAL_GATEWAY"] = GATEWAY;
-+    });
-+
-+    it("makes an unconfigured service unusable rather than universal", async () => {
-+      delete process.env["RELAY_INTERNAL_CREDENTIAL_GATEWAY"];
-+      expect(await resolvePrincipal(db, GATEWAY)).toBeNull();
-+      // The dispatcher is untouched by its neighbour's absence.
-+      expect(await resolvePrincipal(db, DISPATCHER)).not.toBeNull();
-+      process.env["RELAY_INTERNAL_CREDENTIAL_GATEWAY"] = GATEWAY;
-+    });
-+
-+    it("refuses a well-formed secret that matches nobody", async () => {
-+      expect(
-+        await resolvePrincipal(db, "rk_svc_nobodys_secret_0000000000000000000"),
-+      ).toBeNull();
-+    });
-+  });
-```
-
 ```diff title="services/gateway/src/resume.itest.ts"
-@@ -56,20 +56,29 @@ interface Harness {
+@@ -55,27 +55,36 @@ function token(): Promise<string> {
+ 
+ interface Harness {
+   url: string;
    close: () => Promise<void>;
  }
  
@@ -1930,6 +1772,7 @@ a reader code the chapter never discusses.
    const fanout = createFanout({ url, logger: silent });
    const server: Server = serve({
      service: "gateway",
+       notFoundDocsUrl: docsUrl("not_found"),
      health: () => ({}),
      logger: silent,
    });
@@ -1950,6 +1793,8 @@ a reader code the chapter never discusses.
        await fanout.close();
        await new Promise<void>((resolve) => server.close(() => resolve()));
      },
+   };
+ }
 ```
 
 ---
@@ -1982,434 +1827,6 @@ set. The seal on `packages/outsider` is last in the file for the same reason, an
 was written before the itest blocks on its first draft — which is this same fault, a
 second time, in the same chapter.
 
-```diff title="eslint.config.mjs"
-@@ -2,6 +2,139 @@ import eslint from "@eslint/js";
- import globals from "globals";
- import tseslint from "typescript-eslint";
- 
-+// ── THE TWO RESTRICTION SETS, NAMED SO THEY CAN BE COMBINED ──────────────────
-+//
-+// `no-restricted-imports` is one rule, and in flat config a later block REPLACES
-+// an earlier block's setting for it rather than merging. That is the bug the
-+// isolation gauntlet found (R23, FR-043): a second block for `**/*.itest.ts` carrying feature
-+// 030's global-drain restriction switched the driver-and-engine ban OFF for every
-+// integration test in the workspace. Measured — `npx eslint
-+// services/api/src/quotas/period.itest.ts` exited 0 while that file imports
-+// `drizzle-orm` and is on no exemption list.
-+//
-+// So the sets live here as data and each block below composes the union it needs.
-+// Three blocks rather than two, because the two exemption lists are different
-+// files and a single block can only have one `ignores`.
-+//
-+// WHAT THIS RULE DOES NOT BUY, and it is the same boundary feature 030 drew for
-+// its own half: it sees an IMPORT. A test that reaches raw SQL through a helper in
-+// another file, or through the repository's own `db` handle, names none of these
-+// specifiers and is invisible to it. `packages/test-harness/src/sentinel.sql`
-+// watches statements instead, which is why both exist.
-+const DRIVER_AND_ENGINE = {
-+  paths: [
-+    {
-+      name: "pg",
-+      message:
-+        "Raw database access is forbidden outside services/api/src/db (constitution I).",
-+    },
-+    {
-+      name: "drizzle-orm",
-+      message:
-+        "The query engine lives inside the repository layer only (constitution I, ADR-16).",
-+    },
-+    {
-+      name: "ioredis",
-+      message:
-+        "The counter store lives in services/api/src/limits and services/gateway/src/limits.ts only (constitution I). Its keys are per environment; an unrestricted client is a cross-tenant read.",
-+    },
-+  ],
-+  patterns: [
-+    {
-+      group: ["drizzle-orm/*"],
-+      message:
-+        "The query engine lives inside the repository layer only (constitution I, ADR-16).",
-+    },
-+  ],
-+};
-+
-+// The files that legitimately need the driver or the engine in an integration
-+// test — a LIST WITH REASONS, not a directory pattern, by the doctrine
-+// `exempt.ts` states. `services/api/src/isolation/**` is deliberately ABSENT:
-+// its suites read through the repository and through `db/catalogue.ts`, written
-+// to this constraint rather than around it, which is the point of restoring the
-+// rule in the chapter that adds them.
-+const DRIVER_EXEMPT_TESTS = [
-+  // The repository layer's own suites — the layer under test IS the query layer.
-+  "services/api/src/db/repository.itest.ts",
-+  "services/api/src/db/history-drift.itest.ts",
-+  // The harness IS data access (see the note on `packages/test-harness/**`).
-+  "packages/test-harness/src/guard.itest.ts",
-+  // Redis, read with neither service's code, which is the whole subject: the api
-+  // and the gateway must increment the SAME key.
-+  "services/api/src/limits/limits.itest.ts",
-+  "services/gateway/src/limits.itest.ts",
-+  // The quota suites drive period rollover and connection accounting by writing
-+  // rows no repository method writes — a period boundary in the past, a
-+  // connection open across a rollover.
-+  "services/api/src/quotas/quotas.itest.ts",
-+  "services/api/src/quotas/period.itest.ts",
-+  "services/api/src/quotas/connections.itest.ts",
-+  // THE SUBJECT IS A ROW NO REPOSITORY METHOD CAN WRITE ANY MORE, which
-+  // is the same reason the three quota suites are here. `sendMessage` requires a sender
-+  // as of FR-MSG-15, so a senderless message — 121,250 of them exist in the lane, and
-+  // any deployment older than the sender chapter has them — can only be planted by hand. The
-+  // arms that read one (history's `user: null`, the resume's drop) have no other fixture.
-+  //
-+  // Exempted explicitly rather than reached through a helper in another file: the note
-+  // at the top of this rule says a helper would make the SQL invisible to it, and an
-+  // invisible exemption is worse than a listed one.
-+  "services/api/src/internal/backfill.itest.ts",
-+  // THE SAME ARGUMENT AS THE TWO LIMITS SUITES: its subject is what
-+  // reaches the fabric, and the only way to check that is to subscribe with
-+  // neither the api's publisher nor the gateway's `createFanout`. A spy on either
-+  // would prove that an object was asked to publish, not that a frame arrived —
-+  // and the isolation gauntlet cannot cover this path at all, because its oracle
-+  // compares response bodies and a publish is a second output channel.
-+  "services/api/src/fanout/fanout.itest.ts",
-+  "services/api/src/messages/history.itest.ts",
-+];
-+
-+
-+// Feature 030's global-admin functions, and the suites whose SUBJECT is the global
-+// drain. THIS LIST AND `packages/test-harness/src/exempt.ts` MUST AGREE: a file
-+// exempt from one and not the other is a trap for whoever adds the seventh
-+// instance.
-+const DRAIN_EXEMPT_TESTS = [
-+  "services/api/src/outbox/outbox.itest.ts",
-+  "services/api/src/webhooks/deliveries.itest.ts",
-+  "services/api/src/webhooks/test-event.itest.ts",
-+  "services/api/src/webhooks/attempts.itest.ts",
-+  "services/api/src/notifications/notifications.itest.ts",
-+  "services/dispatcher/src/dispatcher.itest.ts",
-+];
-+
-+const GLOBAL_DRAINS = {
-+  // BOTH SPELLINGS. `no-restricted-imports` matches the specifier as
-+  // written, so `../db/repository` and `./repository` are two rules —
-+  // and the second is the one `db/repository.itest.ts` and
-+  // `db/history-drift.itest.ts` would use, both of them non-exempt.
-+  // Measured by adding the import to each and running eslint.
-+  paths: [
-+    {
-+      name: "../db/repository",
-+      importNames: [
-+        "drainOutbox",
-+        "drainDueDeliveries",
-+        "drainDisableNotifications",
-+        // The connection-metering chapter added this one, and the quota chapter should have.
-+        // `drainQuotaNotifications` claims undelivered rows across every
-+        // environment, exactly as its three siblings above do, and the quota
-+        // chapter listed it in neither this rule nor `exempt.ts` — whose comment
-+        // says the two MUST AGREE.
-+        //
-+        // SAY WHAT THIS DOES NOT BUY. It protects a future DIRECT
-+        // importer. It does not protect the suites that already drive the
-+        // drain, because they reach it through `createQuotaRelay`, and
-+        // the note above is explicit that an indirect call is what this
-+        // rule cannot see. Scoping those assertions to rows the test
-+        // created is the half that works.
-+        "drainQuotaNotifications",
-+        "sweepDisabledEndpoints",
-+        "outboxDepth",
-+        "pendingDeliveryDepth",
-+      ],
-+      message:
-+        "This function operates across every environment in the database, and an integration test shares that database with every other suite. Assert on the rows this test created — read them back by id, or scope the count to your own environment_id — instead of on what a global batch happened to contain. If this suite's subject IS the global drain, add it to packages/test-harness/src/exempt.ts with a reason, and to the ignores list beside this rule.",
-+    },
-+    {
-+      name: "./repository",
-+      importNames: [
-+        "drainOutbox",
-+        "drainDueDeliveries",
-+        "drainDisableNotifications",
-+        "sweepDisabledEndpoints",
-+        "outboxDepth",
-+        "pendingDeliveryDepth",
-+      ],
-+      message:
-+        "This function operates across every environment in the database, and an integration test shares that database with every other suite. Assert on the rows this test created — read them back by id, or scope the count to your own environment_id — instead of on what a global batch happened to contain. If this suite's subject IS the global drain, add it to packages/test-harness/src/exempt.ts with a reason, and to the ignores list beside this rule.",
-+    },
-+  ],
-+};
-+
- // One lint config for the whole workspace (ADR-01's consequence made literal).
- export default tseslint.config(
-   { ignores: ["**/node_modules/**", "**/dist/**", "**/coverage/**"] },
-@@ -26,10 +159,18 @@ export default tseslint.config(
-     // layer; the gateway holds its own client in `services/gateway/src/limits.ts`
-     // and for fan-out in `fanout.ts`.
-     //
--    // `limits.itest.ts` is the one TEST allowed a raw client, and for a reason
--    // the rule cannot express: its whole subject is that the api and the gateway
--    // increment the SAME key, and the only way to check that is to read the key
--    // with neither of their code.
-+    // The tests allowed a raw client are named in `DRIVER_EXEMPT_TESTS` above, and
-+    // `services/gateway/src/limits.itest.ts` is one of them for a reason the rule
-+    // cannot express: its whole subject is that the api and the gateway increment
-+    // the SAME key, and the only way to check that is to read the key with neither
-+    // of their code.
-+    //
-+    // CORRECTED IN THE ISOLATION GAUNTLET (T069c). This comment used to say it was "the one TEST
-+    // allowed a raw client". Every test was allowed one, and had been since the
-+    // `**/*.itest.ts` block below was added — that block replaced this rule rather
-+    // than adding to it, which is the whole of R23. Its `ignores` entry here has
-+    // been redundant for exactly as long and stays only because this block also
-+    // covers the file as plain `**/*.ts`.
-     files: ["**/*.ts"],
-     ignores: [
-       "services/api/src/db/**",
-@@ -44,35 +185,7 @@ export default tseslint.config(
-       "packages/test-harness/**",
-     ],
-     rules: {
--      "no-restricted-imports": [
--        "error",
--        {
--          paths: [
--            {
--              name: "pg",
--              message:
--                "Raw database access is forbidden outside services/api/src/db (constitution I).",
--            },
--            {
--              name: "drizzle-orm",
--              message:
--                "The query engine lives inside the repository layer only (constitution I, ADR-16).",
--            },
--            {
--              name: "ioredis",
--              message:
--                "The counter store lives in services/api/src/limits and services/gateway/src/limits.ts only (constitution I). Its keys are per environment; an unrestricted client is a cross-tenant read.",
--            },
--          ],
--          patterns: [
--            {
--              group: ["drizzle-orm/*"],
--              message:
--                "The query engine lives inside the repository layer only (constitution I, ADR-16).",
--            },
--          ],
--        },
--      ],
-+      "no-restricted-imports": ["error", DRIVER_AND_ENGINE],
-     },
-   },
-   {
-@@ -90,84 +203,143 @@ export default tseslint.config(
-     // "every cross-environment function must require a batch size"; that was
-     // false of these two, which is why they are restricted rather than fixed.
-     //
--    // WHAT THIS RULE DOES NOT CATCH, and must not be trusted to:
--    //   * an indirect call — a helper in another file that calls the function,
--    //     imported here under an innocent name;
--    //   * raw SQL — `UPDATE webhook_endpoints SET enabled = false` names no
--    //     import at all.
--    // Both are covered by the trigger in `packages/test-harness/src/sentinel.sql`,
--    // which watches statements rather than imports. A rule trusted further than
--    // it goes is worse than no rule (contracts/guard.md).
-+    // AND WHAT NEITHER THIS NOR THE TRIGGER CATCHES: instance 3 rode the
-+    // JetStream stream rather than the database — an unfiltered
-+    // `createConsumerRuntime` in a test replays every event earlier chapters left
-+    // behind, on a fixed budget of polls. No trigger sees that and no import is
-+    // wrong; the subject filter is the property, and the call site is the only
-+    // place to notice it (research R43).
-     //
--    // AND WHAT NEITHER CATCHES: instance 3 rode the JetStream stream rather than
--    // the database — an unfiltered `createConsumerRuntime` in a test replays every
--    // event earlier chapters left behind, on a fixed budget of polls. No trigger
--    // sees that and no import is wrong; the subject filter is the property, and
--    // the call site is the only place to notice it (research R43).
-+    // THREE BLOCKS, and the shape is the fix rather than a tidying (R23, FR-043).
-+    // This block carries the UNION for every integration test that needs neither
-+    // exemption. The two below carry one set each, for the two exemption lists —
-+    // because a block has one `ignores` and the lists are different files, so a
-+    // single block would have had to exempt both sets from both rules.
-     files: ["**/*.itest.ts"],
--    ignores: [
--      // The suites that drive a global drain on purpose. THIS LIST AND
--      // `packages/test-harness/src/exempt.ts` MUST AGREE: a file exempt from one
--      // and not the other is a trap for whoever adds the seventh instance.
--      "services/api/src/outbox/outbox.itest.ts",
--      "services/api/src/webhooks/deliveries.itest.ts",
--      "services/api/src/webhooks/test-event.itest.ts",
--      "services/api/src/webhooks/attempts.itest.ts",
--      "services/api/src/notifications/notifications.itest.ts",
--      "services/dispatcher/src/dispatcher.itest.ts",
--    ],
-+    ignores: [...DRAIN_EXEMPT_TESTS, ...DRIVER_EXEMPT_TESTS],
-     rules: {
-       "no-restricted-imports": [
-         "error",
-         {
--          // BOTH SPELLINGS. `no-restricted-imports` matches the specifier as
--          // written, so `../db/repository` and `./repository` are two rules —
--          // and the second is the one `db/repository.itest.ts` and
--          // `db/history-drift.itest.ts` would use, both of them non-exempt.
--          // Measured by adding the import to each and running eslint.
--          paths: [
-+          paths: [...DRIVER_AND_ENGINE.paths, ...GLOBAL_DRAINS.paths],
-+          patterns: DRIVER_AND_ENGINE.patterns,
-+        },
-+      ],
-+    },
-+  },
-+  {
-+    // The driver-exempt suites still get the drain restriction. Reading raw SQL
-+    // is why they are on that list; draining every environment's rows is not.
-+    files: DRIVER_EXEMPT_TESTS,
-+    rules: {
-+      "no-restricted-imports": ["error", GLOBAL_DRAINS],
-+    },
-+  },
-+  {
-+    // And the drain-exempt suites still get the driver ban. Their subject is the
-+    // global drain, which says nothing about whether they may hold a raw client.
-+    files: DRAIN_EXEMPT_TESTS,
-+    rules: {
-+      "no-restricted-imports": ["error", DRIVER_AND_ENGINE],
-+    },
-+  },
-+  {
-+    // THE SEAL ON `packages/outsider` (FR-030, FR-034, R12).
-+    //
-+    // That package holds one suite that behaves like a customer, and the claim it
-+    // makes — an integration built from published documentation alone — is worth
-+    // nothing if the suite can read the platform's source. So the claim is made
-+    // mechanical, in three levels, and this block is levels 2 and 3.
-+    //
-+    // LEVEL 1 IS NOT A RULE AT ALL. `packages/outsider/package.json` declares no
-+    // `@relay/*` dependency, and pnpm's isolated `node_modules` means there is no
-+    // `@relay` directory at the workspace root — so
-+    // `import { ERROR_CODES } from "@relay/protocol"` fails to RESOLVE. Nothing
-+    // lints it; the module is not there.
-+    //
-+    // LEVEL 2 is the import rule below: a specifier that climbs out of the package
-+    // by a relative or absolute path is refused. That closes the obvious way round
-+    // level 1, which is to spell the same import as `../protocol/src/codes.js`.
-+    //
-+    // LEVEL 3 is the syntax rule, and an import rule cannot reach it.
-+    // `packages/e2e/src/harness.ts:31` builds `join(HERE, "..", "..", "..")` and
-+    // spawns the api's build output from it — a STRING, not an import specifier, so
-+    // `no-restricted-imports` never sees it. The file cited as proof the hole
-+    // exists is also proof the import rule does not close it. So `".."` as a
-+    // literal is banned here, and so is `createRequire`, which is the other way to
-+    // turn a computed path into a module.
-+    //
-+    // WHAT NONE OF THE THREE CLOSES, and three rules must not be left to imply a
-+    // fourth: reading the repository's source with human eyes. Whoever writes that
-+    // suite can open `codes.ts` in an editor, and no configuration can stop them.
-+    // The seals make workspace code unIMPORTABLE; not reading it is a discipline,
-+    // and the chapter says so in those words rather than presenting three rules as
-+    // if they were four (FR-034).
-+    // LAST IN THE FILE, AND THAT IS THE FIX RATHER THAN A TIDYING. This block sat
-+    // BEFORE the `**/*.itest.ts` blocks on its first draft, and the outsider's only
-+    // file is `integrate.itest.ts` — so a later block set `no-restricted-imports`
-+    // again and the seal was not in force. `npx eslint` on a file importing
-+    // `@relay/protocol` reported NOTHING.
-+    //
-+    // That is R23's fault a second time, in the same chapter, in code written by
-+    // whoever had just finished fixing the first instance. One rule name, one
-+    // winner: the last matching block. So this one is last, and it carries the
-+    // union it needs — the driver and engine ban included, because `pg` DOES
-+    // resolve here by the ordinary parent walk even though `@relay/*` does not.
-+    //
-+    // `no-restricted-syntax` survived the first draft only because no other block
-+    // sets it. Level 3 worked by luck, which is not a property to rely on.
-+    files: ["packages/outsider/**/*.ts", "packages/outsider/**/*.mts"],
-+    rules: {
-+      "no-restricted-imports": [
-+        "error",
-+        {
-+          paths: DRIVER_AND_ENGINE.paths,
-+          patterns: [
-+            ...DRIVER_AND_ENGINE.patterns,
-             {
--              name: "../db/repository",
--              importNames: [
--                "drainOutbox",
--                "drainDueDeliveries",
--                "drainDisableNotifications",
--                // The connection-metering chapter added this one, and the quota chapter should have.
--                // `drainQuotaNotifications` claims undelivered rows across every
--                // environment, exactly as its three siblings above do, and the quota chapter
--                // listed it in neither this rule nor `exempt.ts` — whose comment
--                // says the two MUST AGREE.
--                //
--                // SAY WHAT THIS DOES NOT BUY. It protects a future DIRECT
--                // importer. It does not protect the suites that already drive the
--                // drain, because they reach it through `createQuotaRelay`, and
--                // the note above is explicit that an indirect call is what this
--                // rule cannot see. Scoping those assertions to rows the test
--                // created is the half that works.
--                "drainQuotaNotifications",
--                "sweepDisabledEndpoints",
--                "outboxDepth",
--                "pendingDeliveryDepth",
--              ],
-+              group: ["@relay/*"],
-               message:
--                "This function operates across every environment in the database, and an integration test shares that database with every other suite. Assert on the rows this test created — read them back by id, or scope the count to your own environment_id — instead of on what a global batch happened to contain. If this suite's subject IS the global drain, add it to packages/test-harness/src/exempt.ts with a reason, and to the ignores list beside this rule.",
-+                "packages/outsider integrates from published documentation alone. It may not import workspace code — see the three levels in eslint.config.mjs.",
-             },
-             {
--              name: "./repository",
--              importNames: [
--                "drainOutbox",
--                "drainDueDeliveries",
--                "drainDisableNotifications",
--                "sweepDisabledEndpoints",
--                "outboxDepth",
--                "pendingDeliveryDepth",
--              ],
-+              // NOT `/*` as a third entry here: minimatch matched `vitest/config`
-+              // with it, and a rule that refuses the test runner is a rule
-+              // somebody turns off. Absolute paths are covered by the syntax
-+              // selector below, which matches on the specifier itself.
-+              group: ["../*", "../../*"],
-               message:
--                "This function operates across every environment in the database, and an integration test shares that database with every other suite. Assert on the rows this test created — read them back by id, or scope the count to your own environment_id — instead of on what a global batch happened to contain. If this suite's subject IS the global drain, add it to packages/test-harness/src/exempt.ts with a reason, and to the ignores list beside this rule.",
-+                "packages/outsider may not reach outside itself. A relative path out of the package is the same import by another spelling.",
-             },
-           ],
-         },
-       ],
-+      "no-restricted-syntax": [
-+        "error",
-+        {
-+          selector: "Literal[value='..']",
-+          message:
-+            "packages/outsider may not build a path out of the package. `join(HERE, \"..\", …)` is how packages/e2e reaches the api's build output, and an import rule cannot see it.",
-+        },
-+        {
-+          selector: "CallExpression[callee.name='createRequire']",
-+          message:
-+            "createRequire turns a computed path into a module, which is the escape the import rule cannot see.",
-+        },
-+        {
-+          selector: "ImportDeclaration[source.value='node:module']",
-+          message:
-+            "node:module is only useful here for createRequire, which is banned above.",
-+        },
-+        {
-+          // An absolute path is the third spelling of the same import. Matched on
-+          // the specifier rather than by glob, because the glob for it also
-+          // matched `vitest/config`.
-+          selector: "ImportDeclaration[source.value=/^\\//]",
-+          message:
-+            "packages/outsider may not import by absolute path. See the three levels in eslint.config.mjs.",
-+        },
-+      ],
-     },
-   },
- );
-```
-
 ---
 
 ## Chapter 3.14's neighbours
@@ -2432,62 +1849,6 @@ tenant already seeded.
 
 `resume.itest.ts` gains one line, because `serve()`'s `notFoundDocsUrl` became
 required and the compiler named every call site.
-
-```diff title="turbo.json"
-@@ -15,7 +15,8 @@
-     },
-     "test": {
-       "dependsOn": ["^build"],
--      "inputs": ["$TURBO_DEFAULT$", "$TURBO_ROOT$/compose.yaml"]
-+      "inputs": ["$TURBO_DEFAULT$", "$TURBO_ROOT$/compose.yaml"],
-+      "env": ["RELAY_DOCS_BASE_URL"]
-     },
-     "test:integration": {
-       "dependsOn": ["^build", "build"],
-@@ -41,7 +42,11 @@
-         "RELAY_SMTP_URL",
-         "RELAY_MAILPIT_URL",
-         "RELAY_NOTIFICATION_RELAY",
--        "RELAY_QUOTA_RELAY"
-+        "RELAY_QUOTA_RELAY",
-+        "RELAY_DOCS_BASE_URL",
-+        "RELAY_API_URL",
-+        "RELAY_WS_URL",
-+        "RELAY_DEMO_CREDENTIAL"
-       ]
-     },
-     "//#lint:root": {
-```
-
-```diff title="package.json"
-@@ -12,7 +12,8 @@
-     "lint:root": "eslint .",
-     "typecheck": "turbo run typecheck",
-     "test": "turbo run test",
--    "test:integration": "turbo run test:integration --concurrency=1",
-+    "test:integration": "turbo run test:integration --concurrency=1 --filter=!@relay/outsider",
-+    "test:outsider": "turbo run test:integration --filter=@relay/outsider",
-     "coverage": "vitest run --config vitest.coverage.config.mts --coverage",
-     "build": "turbo run build"
-   },
-```
-
-```diff title="services/gateway/src/resume.itest.ts"
-@@ -1,3 +1,4 @@
-+import { docsUrl } from "@relay/protocol";
- import { randomUUID } from "node:crypto";
- 
- import { WebSocket } from "ws";
-@@ -66,6 +67,7 @@ async function boot(api: Omit<ApiClient, "reportUsage">): Promise<Harness> {
-     service: "gateway",
-     health: () => ({}),
-     logger: silent,
-+    notFoundDocsUrl: docsUrl("not_found"),
-   });
-   const sessions = attachSessions({
-     server,
-```
-
 
 ## One lane learned an exclusion and the other did not (chapter 3.15)
 
@@ -2555,102 +1916,6 @@ in the pre-3.19 chapter state, because an entry above is what puts that line the
 
 The chapter shows the same lines as an excerpt and says where they really live. When Part 6
 folds these amendments into a CI chapter, this one folds with them.
-
-```diff title="eslint.config.mjs"
-@@ -88,6 +88,15 @@ const DRIVER_EXEMPT_TESTS = [
-   // compares response bodies and a publish is a second output channel.
-   "services/api/src/fanout/fanout.itest.ts",
-   "services/api/src/messages/history.itest.ts",
-+  // The presence chapter, and it is the fan-out chapter's argument in the other direction. The presence
-+  // fabric's receive half has two rejection paths — a body that is not JSON, and a
-+  // body that is JSON and not a transition — and neither can be reached through
-+  // `createPresence`, which only ever publishes payloads its own schema produced.
-+  // Putting arbitrary bytes on `presence:{channel_id}` needs a client that belongs to
-+  // neither module, exactly as checking what reaches `chan:{id}` did.
-+  //
-+  // A `publish` and nothing else: this file reads no key and composes none.
-+  "services/gateway/src/presence.itest.ts",
-+  // The membership-revocation chapter's, for that same reason and on THIS list rather than the `**/*.ts`
-+  // block's `ignores` — which is where it was written first, and where an `.itest.ts`
-+  // entry does nothing. The `**/*.itest.ts` block below REPLACES the rule for every
-+  // integration test not on one of these two lists, so an exemption above it is
-+  // overwritten in silence. This file's header states that hazard (R23, FR-043) and
-+  // the entry still went to the wrong list.
-+  //
-+  // The membership fabric's receive half has the same two rejection paths presence's
-+  // has — a body that is not JSON, and JSON the schema refuses — and neither is
-+  // reachable through `createMembership`, which only delivers what it already
-+  // accepted. A `publish` and nothing else: no key read, no key composed.
-+  "services/gateway/src/membership.itest.ts",
-+  // The typing chapter, and the same case as the two above: the assertion is on Redis,
-+  // read with neither service's code. A publish count taken through this
-+  // chapter's own module would be satisfied by a module that does nothing —
-+  // The fan-out chapter's warning, in a new place.
-+  "services/gateway/src/typing.itest.ts",
- ];
- 
- 
-@@ -206,6 +215,19 @@ export default tseslint.config(
-       // already subscribed. The gateway's `fanout.ts` is on this list one line
-       // up for the same reason; the api needs it too now that it publishes.
-       "services/api/src/fanout/**",
-+      // THE MEMBERSHIP-REVOCATION CHAPTER, AND IT IS THE ENTRY ABOVE'S CASE RATHER THAN THE LIMITER'S.
-+      // The membership publisher calls PUBLISH and nothing else, onto
-+      // `member:{channel_id}` and `member:{env}:{user}` — a subject is not
-+      // readable at all, only listened to by whoever is already subscribed, so
-+      // there is no key here for a cross-tenant read to reach.
-+      //
-+      // The SECOND of those subjects carries an environment id, which is the
-+      // shape the restriction guards, and it still does not make this the
-+      // limiter's case: the id is composed from the repository's own scope on
-+      // the way out, never read from a payload on the way in. The gateway's half
-+      // of this fabric IS the limiter's case, and its entry says so.
-+      "services/api/src/membership/**",
-+      // THIS IS `limits.ts`'s CASE, NOT `fanout.ts`'s, and the
-+      // distinction is the rule's own reason. The entry above is justified by
-+      // "this client touches no keys" — a publish onto a channel UUID, and a
-+      // subject is not readable at all. Presence's client touches keys and they
-+      // are environment-scoped: `presence:{env}:{user}`, exactly the shape the
-+      // restriction exists to guard.
-+      //
-+      // So the justification is the limiter's instead: it composes every key from
-+      // the environment id on the authenticated connection's own identity, and it
-+      // reads no key it did not compose. There is no path here that takes an
-+      // environment id from a client, and no scan, `KEYS` or pattern read that
-+      // could reach a key belonging to another tenant.
-+      "services/gateway/src/presence.ts",
-+      // THE MEMBERSHIP-REVOCATION CHAPTER, AND IT IS THE FAN-OUT'S CASE RATHER THAN PRESENCE'S — the
-+      // opposite of what the entry above had to argue. This client SUBSCRIBES and
-+      // nothing else: no `SET`, no `EXISTS`, no key of any kind, because the
-+      // module's only command-shaped work is an HTTP re-read against the api.
-+      //
-+      // One of its two subject shapes carries an environment id
-+      // (`member:{env}:{user}`) and that still does not make it presence's case: a
-+      // subject is not readable, only listened to by whoever already subscribed, and
-+      // the id is composed from the authenticated connection's own identity on the
-+      // way in. There is no path here that takes an environment id from a payload.
-+      "services/gateway/src/membership.ts",
-+      // THE TYPING CHAPTER, AND IT IS THE FAN-OUT'S CASE — the cleanest of the four, and
-+      // the only one of them that both publishes and subscribes. This client calls
-+      // PUBLISH and SUBSCRIBE and nothing else, onto `typing:{channel_id}` — a
-+      // channel UUID, not an environment-scoped key — and a subject is not readable
-+      // at all, only listened to by whoever is already subscribed.
-+      //
-+      // No environment id appears in the subject, so this entry does not even need
-+      // the argument the two above had to make. The environment travels INSIDE the
-+      // payload, where a receiving gateway checks it against the connection it is
-+      // about to act on; it is never composed into a key, because this module
-+      // composes no keys.
-+      //
-+      // THE `.itest.ts` FILE IS NOT LISTED HERE. THE MEMBERSHIP-REVOCATION CHAPTER put an `.itest.ts`
-+      // entry in this block's `ignores` and the later `**/*.itest.ts` block
-+      // silently overrode it. The typing suite's exemption lives in
-+      // `DRIVER_EXEMPT_TESTS` instead, which is the list that governs test files.
-+      "services/gateway/src/typing.ts",
-       // The test harness IS data access — its whole job is to plant rows the
-       // repository layer must never plant and to hold a connection carrying an
-       // exemption no product code may carry (feature 030). Restricting it from
-```
 
 ---
 
@@ -2830,43 +2095,6 @@ production code cannot be asked to produce — and then asserts through a real s
 The second hunk adds the module to the production block, which is the list of files allowed
 to construct an `ioredis` client at all.
 
-```diff title="eslint.config.mjs"
-@@ -114,6 +114,14 @@ const DRIVER_EXEMPT_TESTS = [
-   // chapter's own module would be satisfied by a module that does nothing —
-   // The fan-out chapter's warning, in a new place.
-   "services/gateway/src/typing.itest.ts",
-+  // The connection-cap chapter, and NOT for the reason the four above give. This file needs no
-+  // raw client to assert a publish — its subject is delivery, and it asserts on
-+  // the sockets. It needs one to CAUSE a membership change: `Membership` exposes
-+  // `onChange`, `subscribeChannel` and `watch` and no `publish`, because the api
-+  // publishes and the gateway only ever subscribes. So the raw client is the
-+  // stimulus rather than the oracle, which is a fifth reason this rule cannot
-+  // express and the reason it is listed here explicitly.
-+  "services/gateway/src/connections.itest.ts",
- ];
- 
- 
-@@ -285,6 +293,18 @@ export default tseslint.config(
-       // silently overrode it. The typing suite's exemption lives in
-       // `DRIVER_EXEMPT_TESTS` instead, which is the list that governs test files.
-       "services/gateway/src/typing.ts",
-+      // The connection-cap chapter's connection registry, and its keys are the strongest case on
-+      // this list rather than the weakest. `conn:{env}:{user}:{slot}` puts the
-+      // environment FIRST, so Principle I is structural in the key itself: a
-+      // cross-tenant read would need a caller to hand this module another
-+      // environment's id, which the session layer takes from the api's verified
-+      // identity and never from a payload.
-+      //
-+      // The `.itest.ts` file is NOT listed here, for the reason the typing note
-+      // above gives: the later `**/*.itest.ts` block would silently override it.
-+      // Its exemption is in `DRIVER_EXEMPT_TESTS`, and so is `connections.test.ts`'s
-+      // — a unit test, but one that reads the module's own source from disk.
-+      "services/gateway/src/connections.ts",
-       // The test harness IS data access — its whole job is to plant rows the
-       // repository layer must never plant and to hold a connection carrying an
-       // exemption no product code may carry (feature 030). Restricting it from
-```
-
 ## `vitest.coverage.config.mts` — chapter 3.22's connections pin
 
 The ratchet's per-file entry for `services/gateway/src/connections.ts`, at 100 on all
@@ -2989,68 +2217,12 @@ block overrides that, which the config says in a comment and then points at
 `DRIVER_EXEMPT_TESTS`. Counting organisations to prove a script did NOT delete them is a read no
 repository method offers.
 
-```diff title="eslint.config.mjs"
-@@ -60,6 +60,12 @@ const DRIVER_EXEMPT_TESTS = [
-   "services/api/src/db/history-drift.itest.ts",
-   // The harness IS data access (see the note on `packages/test-harness/**`).
-   "packages/test-harness/src/guard.itest.ts",
-+  // Feature 043. `reset-lane.mjs` clears lane debris and must leave the seeded demo
-+  // tenant alone — the constitution requires `docker compose up` to bring the stack
-+  // up with one. Counting organisations to prove a script did NOT delete them is a
-+  // read no repository method offers, and doing it through the repository layer would
-+  // scope the count to one environment, which is the opposite of what it has to check.
-+  "packages/test-harness/src/reset-lane.itest.ts",
-   // Redis, read with neither service's code, which is the whole subject: the api
-   // and the gateway must increment the SAME key.
-   "services/api/src/limits/limits.itest.ts",
-```
-
 The api logs the port it BOUND. `port` is the request — `Number(process.env.PORT ?? 4000)` — so
 under `PORT=0` this line reported `0` while the server listened elsewhere. A log stating a
 requested value as though it were assigned is wrong whether or not anybody reads it; that it also
 makes `PORT=0` usable by a harness is the second reason, not the first.
 
-```diff title="services/api/src/main.ts"
-@@ -39,7 +39,17 @@ async function bootstrap(): Promise<void> {
-   // Nest calls onModuleDestroy on shutdown hooks; without this the relay's loop
-   // would outlive the process's intent to stop.
-   app.enableShutdownHooks();
--  createLogger("api").log("info", "listening", { port });
-+  // THE PORT IT BOUND, NOT THE ONE IT ASKED FOR (feature 043, FR-002). `port` is the
-+  // REQUEST — `Number(process.env.PORT ?? 4000)` — and with `PORT=0` the operating system
-+  // assigns an ephemeral one, so this line used to report `0` while the server listened
-+  // somewhere else. A log that states a requested value as though it were the assigned one
-+  // is wrong whether or not anybody reads it; that it also makes `PORT=0` usable by a test
-+  // harness is the second reason, not the first.
-+  const bound = (app.getHttpServer() as { address(): { port: number } | string | null })
-+    .address();
-+  createLogger("api").log("info", "listening", {
-+    port: typeof bound === "object" && bound !== null ? bound.port : port,
-+  });
- }
- 
- void bootstrap();
-```
-
 The same change, the same shape, in the gateway's entry point.
-
-```diff title="services/gateway/src/main.ts"
-@@ -151,7 +151,13 @@ if (import.meta.main) {
-   const port = Number(process.env.PORT ?? 4001);
-   const logger = createLogger("gateway");
-   const server = createServer(logger).listen(port, () => {
--    logger.log("info", "listening", { port });
-+    // THE PORT IT BOUND, NOT THE ONE IT ASKED FOR (feature 043, FR-002), and the api's
-+    // entry point carries the same change for the same reason. With `PORT=0` this line
-+    // used to report `0` while the server listened on an ephemeral port.
-+    const bound = server.address();
-+    logger.log("info", "listening", {
-+      port: typeof bound === "object" && bound !== null ? bound.port : port,
-+    });
-   });
- 
-   // A GRACEFUL SHUTDOWN, WHICH THIS SERVICE DID NOT HAVE (research R11, FR-RTL-05).
-```
 
 **The edit's UPDATE became a compare-and-set, and it closes a defect the record said was not
 there.** `gaps.md` 3.23-3 asserted that both orderings of a concurrent edit and deletion end in a
@@ -3058,192 +2230,9 @@ tombstone. They do not: the edit read the row, threw if it was deleted, and then
 `WHERE id = ?` unconditionally, so a deletion committing in that window was overwritten —
 `deleted_at` set with `text` present, four such rows left in the lane. Three runs in five.
 
-```diff title="services/api/src/db/repository.ts"
-@@ -4537,12 +4537,33 @@ export class Repository {
-       // would be two instants, and the history row's own primary key is
-       // (message_id, edited_at), so a caller reading the history could not match an
-       // entry to the message state it produced.
-+      // THE WRITE REFUSES, NOT ONLY THE READ (feature 043, FR-007).
-+      //
-+      // This was `.where(eq(messages.id, messageId))`, and the `row.text === null`
-+      // check above it is a read taken earlier in the same transaction. Neither this
-+      // method nor `deleteMessage` takes a row lock, so a deletion committing in that
-+      // window left the edit free to overwrite it: `text` restored, `deleted_at` still
-+      // set — **a row one filter calls deleted and another calls alive**, and a
-+      // deletion that returned successfully undone by an edit already in flight.
-+      //
-+      // `gaps.md` 3.23-3 recorded the opposite — *"both interleavings end in a
-+      // tombstone… there is no order of the two that leaves a message saying something
-+      // nobody wrote"* — and the test that item asked for is what disproved it: three
-+      // of five runs, and four incoherent rows left behind in the lane.
-+      //
-+      // A COMPARE-AND-SET, NOT A LOCK. `SELECT … FOR UPDATE` in both methods would
-+      // close it too, and would serialise a pair `assertWithinQuota` deliberately
-+      // declined to serialise on the send path. A conditional UPDATE costs nothing
-+      // when there is no race and refuses exactly when there is one: zero rows
-+      // affected means the row stopped being editable between the read and the write,
-+      // which is what `MessageDeletedError` already says.
-       const [updated] = await tx
-         .update(messages)
-         .set({ text, editedAt: sql`now()` })
--        .where(eq(messages.id, messageId))
-+        .where(and(eq(messages.id, messageId), isNull(messages.deletedAt)))
-         .returning({ editedAt: messages.editedAt });
--      const editedAt = updated!.editedAt!;
-+      if (!updated) throw new MessageDeletedError(messageId);
-+      const editedAt = updated.editedAt!;
- 
-       // FR-004. The row carries what the message said BEFORE this edit — `row.text`,
-       // read above and narrowed to a string by the tombstone check.
-```
-
 The four tests that found it. Three cover the orderings; the fourth reproduces the guard's case
 deterministically, because a race cannot be commanded and an assertion that one happened proved
 flaky in one run of three.
-
-```diff title="services/api/src/db/repository.itest.ts"
-@@ -1424,3 +1424,140 @@ describe("the read shapes that do NOT carry attachments (FR-009)", () =>
-     expect(Object.keys(rows[0]!).sort()).toEqual(["id", "seq", "text"]);
-   });
- });
-+
-+// A CONCURRENT EDIT AND DELETION OF ONE MESSAGE (feature 043, FR-007).
-+//
-+// `gaps.md` 3.23-3 has carried this since the revisions chapter built both writes. Neither takes
-+// a row lock — no `FOR UPDATE`, following `assertWithinQuota`'s recorded decision to
-+// state an overshoot rather than engineer around it — so the two orderings are not
-+// symmetrical, and the claim that has never been tested is that **both of them end in a
-+// tombstone**. Not the outcome: the claim.
-+//
-+// DO NOT START FROM `Promise.all` ON ONE CLIENT. The connection-cap chapter spent a phase learning
-+// that two operations issued on one connection serialise at the socket, so a test built
-+// that way proves the code cannot race by never letting it. The third case below uses
-+// TWO POOLS, which is what that chapter found it needed.
-+describe("a concurrent edit and deletion (feature 043, FR-007)", () => {
-+  const seed = async (label: string) => {
-+    const author = await repoA.createUser(`${label}-author`, "Author");
-+    const channel = await repoA.createChannel(label, "public");
-+    await repoA.addMember(channel.id, author.id);
-+    const sent = await repoA.sendMessage(channel.id, {
-+      text: "the original",
-+      userId: author.id,
-+    });
-+    return { author, channel, sent };
-+  };
-+
-+  const tombstoned = async (id: string) => {
-+    const [row] = (
-+      await db.execute<{ text: string | null; deleted_at: Date | null }>(
-+        sql`SELECT text, deleted_at FROM messages WHERE id = ${id}`,
-+      )
-+    ).rows;
-+    return row!.text === null && row!.deleted_at !== null;
-+  };
-+
-+  it("delete then edit: the edit is refused and the tombstone stands", async () => {
-+    const { author, channel, sent } = await seed("race-de");
-+    await repoA.deleteMessage(channel.id, sent.id, { userId: author.id });
-+    await expect(
-+      repoA.editMessage(channel.id, sent.id, { text: "too late", userId: author.id }),
-+    ).rejects.toThrow(MessageDeletedError);
-+    expect(await tombstoned(sent.id)).toBe(true);
-+  });
-+
-+  it("edit then delete: the tombstone stands and the history keeps what the edit superseded", async () => {
-+    const { author, channel, sent } = await seed("race-ed");
-+    await repoA.editMessage(channel.id, sent.id, { text: "corrected", userId: author.id });
-+    await repoA.deleteMessage(channel.id, sent.id, { userId: author.id });
-+    expect(await tombstoned(sent.id)).toBe(true);
-+
-+    // THE HISTORY ROW HOLDS THE TEXT THE EDIT SUPERSEDED, and that is correct rather
-+    // than a leak: the edit did happen, and `message_edits` records what was replaced.
-+    // A deletion removes the message's text; it does not rewrite the fact that an edit
-+    // occurred before it.
-+    const [edit] = (
-+      await db.execute<{ prior_text: string }>(
-+        sql`SELECT prior_text FROM message_edits WHERE message_id = ${sent.id}`,
-+      )
-+    ).rows;
-+    expect(edit!.prior_text).toBe("the original");
-+  });
-+
-+  it("both at once from two separate pools: whichever lands first, the message ends a tombstone", async () => {
-+    // TWO POOLS, NOT TWO CALLS. `poolB` is a second connection pool with its own
-+    // sockets, so the two statements are genuinely in flight together instead of being
-+    // serialised by one client's write queue.
-+    const poolB = createPool();
-+    const dbB = createDb(poolB);
-+    const repoB2 = new Repository(dbB, envA.id);
-+    // WHICH ORDERING ACTUALLY HAPPENED, COUNTED AND REPORTED. The assertions below
-+    // hold whether the edit lands first or the deletion does — which is the property,
-+    // and also exactly how a test passes while exercising one branch and never the
-+    // other. Counting is how a reader learns which case the run covered.
-+    let editRefused = 0;
-+    try {
-+      // Ten attempts rather than one. A race asserted once is a race observed once,
-+      // and the outcome is the same either way — which is the property.
-+      for (let i = 0; i < 10; i++) {
-+        const { author, channel, sent } = await seed(`race-both-${String(i)}`);
-+        const results = await Promise.allSettled([
-+          repoA.editMessage(channel.id, sent.id, {
-+            text: `corrected ${String(i)}`,
-+            userId: author.id,
-+          }),
-+          repoB2.deleteMessage(channel.id, sent.id, { userId: author.id }),
-+        ]);
-+
-+        // The deletion always wins the row: it is the only one of the two that can
-+        // refuse the other, and the edit's refusal is `MessageDeletedError`.
-+        expect(await tombstoned(sent.id), `attempt ${String(i)}`).toBe(true);
-+
-+        const edit = results[0];
-+        if (edit.status === "rejected") {
-+          editRefused++;
-+          expect(edit.reason).toBeInstanceOf(MessageDeletedError);
-+        }
-+        // And the deletion never fails: FR-009 makes a second one idempotent, and a
-+        // concurrent edit is not a reason to refuse the first.
-+        expect(results[1].status, `attempt ${String(i)}`).toBe("fulfilled");
-+      }
-+    } finally {
-+      await poolB.end();
-+    }
-+    // WHAT THIS TEST CANNOT PROMISE, SAID OUT LOUD. `editRefused` counts the attempts
-+    // where the deletion won, and it is NOT asserted to be greater than zero: measured
-+    // over three runs it was zero in one of them, so requiring a race would make this
-+    // flaky about one run in three. **A race cannot be commanded, so the test does not
-+    // claim it happened.**
-+    //
-+    // The evidence that the interleaving is real is a measurement, not this assertion:
-+    // before the compare-and-set went into `editMessage`, this same test failed in
-+    // three runs of five, at attempts 3, 8 and 3, and left four rows in the lane with
-+    // `deleted_at` set and `text` present. What survives here is the invariant — the
-+    // message ends a tombstone whichever way the two land — and the deterministic
-+    // proof of the guard is the test below.
-+    expect(editRefused).toBeGreaterThanOrEqual(0);
-+  }, 60_000);
-+
-+  it("the edit's UPDATE refuses a tombstone even if the read said otherwise", async () => {
-+    // THE GUARD, DETERMINISTICALLY. The test above can only hit the compare-and-set
-+    // when the two writes genuinely interleave, which no test can force. This one
-+    // reproduces the state that predicate exists for — a row deleted after the edit's
-+    // read — by deleting first and then issuing exactly the statement `editMessage`
-+    // issues. Zero rows affected is what makes it throw `MessageDeletedError` instead
-+    // of overwriting the tombstone.
-+    const { author, channel, sent } = await seed("race-guard");
-+    await repoA.deleteMessage(channel.id, sent.id, { userId: author.id });
-+
-+    const affected = await db.execute(
-+      sql`UPDATE messages SET text = 'resurrected', edited_at = now()
-+          WHERE id = ${sent.id} AND deleted_at IS NULL`,
-+    );
-+    expect(affected.rowCount).toBe(0);
-+
-+    // And the row is untouched: still a tombstone, still no text.
-+    expect(await tombstoned(sent.id)).toBe(true);
-+  });
-+});
-```
 
 **Port 0 and a teardown that waits.** Every child now binds an ephemeral port and the harness
 reads the assignment out of the child's own `listening` line — from the buffer `capture` already
@@ -3251,819 +2240,34 @@ filled and only ever used for a failure message. `stop()` waits for each child w
 grace then SIGKILL: the api holds its listener for all 5,035 ms of a graceful exit, so awaiting
 one cost 30.56 s on a lane with 5.39 s of headroom.
 
-```diff title="packages/e2e/src/harness.ts"
-@@ -349,6 +349,38 @@ export async function boot({ gateways = 2 } = {}): Promise<System> {
-     });
-     return child;
-   };
-+  /** THE PORT THE CHILD ACTUALLY BOUND (feature 043, FR-002).
-+   *
-+   * Every child is spawned with `PORT=0`, so the operating system assigns one nothing
-+   * else holds and there is no range to register, collide with, or maintain by hand.
-+   * The value comes back out of the child's own `listening` line, which
-+   * `services/api/src/main.ts` and `services/gateway/src/main.ts` were changed to
-+   * report correctly — both used to log the port they ASKED for, which is `0`.
-+   *
-+   * IT READS THE BUFFER `capture` ALREADY FILLS. `gaps.md` 3.22-6 counts eleven files
-+   * that spawn a child and six that discard its output entirely; this one captured it
-+   * and used it for a failure message only. Now it is load-bearing.
-+   *
-+   * The alternative was a fixed port, which collides always under contention, or a
-+   * random one from a band, which `session.itest.ts:133` draws and the revisions chapter
-+   * measured as self-colliding 2.96% of runs. Binding 0 cannot collide at all. */
-+  const boundPort = async (name: string, timeoutMs = 30_000): Promise<number> => {
-+    const deadline = Date.now() + timeoutMs;
-+    for (;;) {
-+      for (const line of output.get(name) ?? []) {
-+        const m = /"msg":"listening","port":(\d+)/.exec(line);
-+        if (m) return Number(m[1]);
-+      }
-+      if (Date.now() > deadline) {
-+        throw new Error(
-+          `${name} never reported a listening port within ${timeoutMs}ms\n` +
-+            (output.get(name) ?? []).slice(-12).join("\n"),
-+        );
-+      }
-+      await new Promise((r) => setTimeout(r, 50));
-+    }
-+  };
-+
-   const dump = (what: string) => {
-     const lines = [`${what}; child output follows:`];
-     for (const [name, log] of output) {
-@@ -408,33 +440,40 @@ export async function boot({ gateways = 2 } = {}): Promise<System> {
-     RELAY_DELIVERY_RELAY: "off",
-   };
- 
--  const apiPort = Number(process.env.RELAY_E2E_API_PORT ?? 4100);
-+  // `RELAY_E2E_API_PORT` IS GONE, AND SO IS THE 4100 BEHIND IT (feature 043, FR-002).
-+  // A fixed default put three ports inside a range `limits.itest.ts` registers to
-+  // itself, unlisted in that file's map; `PORT=0` needs no map and no variable.
-   children.push(
-     capture(
-       "api",
-       spawn("node", [join(REPO, "services", "api", "dist", "main.js")], {
--        env: { ...env, PORT: String(apiPort) },
-+        env: { ...env, PORT: "0" },
-         stdio: ["ignore", "pipe", "pipe"],
-       }),
-     ),
-   );
-+  const apiPort = await boundPort("api");
-   const apiUrl = `http://127.0.0.1:${apiPort}`;
-   await waitForHealth(`${apiUrl}/healthz`, "api");
-   say(`api up on ${apiPort}`);
- 
-   const urls: string[] = [];
-   for (let i = 0; i < gateways; i++) {
--    const port = apiPort + 1 + i;
-+    // NOT `apiPort + 1 + i` ANY MORE. Deriving a gateway's port from the api's made
-+    // three ports out of one collision, and an ephemeral api port is no basis for
-+    // arithmetic. Each child binds its own.
-+    const name = `gateway ${i + 1}`;
-     children.push(
-       capture(
--        `gateway ${i + 1}`,
-+        name,
-         spawn("pnpm", ["exec", "tsx", "src/main.ts"], {
-           cwd: join(REPO, "services", "gateway"),
--          env: { ...env, PORT: String(port), RELAY_API_URL: apiUrl },
-+          env: { ...env, PORT: "0", RELAY_API_URL: apiUrl },
-           stdio: ["ignore", "pipe", "pipe"],
-         }),
-       ),
-     );
-+    const port = await boundPort(name);
-     await waitForHealth(`http://127.0.0.1:${port}/healthz`, `gateway ${i + 1}`);
-     urls.push(`ws://127.0.0.1:${port}`);
-     say(`gateway ${i + 1} up on ${port}`);
-@@ -532,8 +571,48 @@ export async function boot({ gateways = 2 } = {}): Promise<System> {
-       return new Client(name, await token(environmentId, name), say);
-     },
-     async stop() {
-+      // WAIT FOR THEM TO GO, DO NOT SLEEP AND HOPE (feature 043, FR-001).
-+      //
-+      // This signalled and slept 200 ms. A child that took longer to close its
-+      // listeners was still holding its port when the next suite booted — and the
-+      // next suite's health check passed against the dying predecessor, printed
-+      // `api up on …`, and then failed at its first real request with
-+      // `ECONNREFUSED`. **Ten of the attachments chapter's twenty-run battery failed exactly
-+      // that way**, and the debt was not settled when a run ended: it was paid by
-+      // whatever booted next, in that run or the following one.
-+      //
-+      // ALL OF THEM AT ONCE, NOT EACH IN TURN, or the waits add up per child. The
-+      // timeout has its own message so a hung child is not reported as a port
-+      // problem — which is the misdiagnosis this whole change exists to end.
-       for (const child of children) child.kill("SIGTERM");
--      await new Promise((resolve) => setTimeout(resolve, 200));
-+      await Promise.all(
-+        children.map(
-+          (child) =>
-+            new Promise<void>((resolve) => {
-+              if (child.exitCode !== null || child.signalCode !== null) return resolve();
-+              // A SHORT GRACE, THEN SIGKILL — AND THE NUMBER IS MEASURED, NOT CHOSEN.
-+              //
-+              // The api takes **5,035 ms** to exit on SIGTERM, and its listener stays
-+              // open for all of it: the port frees at 5,037 ms and the process exits at
-+              // 5,034 ms, so there is no early release to wait for. Waiting the full
-+              // drain cost the e2e package **37.28 s against a 6.72 s baseline**, on a
-+              // lane with 5.39 s of budget headroom.
-+              //
-+              // What this harness needs is the port, not a clean drain. A second is
-+              // enough for a child to flush the log lines `dump()` reports on failure,
-+              // and SIGKILL frees the port at once. The old code sent SIGTERM, slept
-+              // 200 ms and moved on, leaving the child alive and the port held — this
-+              // is strictly stronger, because the process is confirmed dead either way.
-+              const timer = setTimeout(() => {
-+                child.kill("SIGKILL");
-+              }, 1_000);
-+              child.once("exit", () => {
-+                clearTimeout(timer);
-+                resolve();
-+              });
-+            }),
-+        ),
-+      );
-     },
-   };
- }
-```
-
 The suite deletes the two durables it names per run. `consumer.itest.ts` has done this since
 chapter 3.4; chapter 3.24's close-out counted 216 consumers on DELIVERIES, 215 of them this
 file's.
-
-```diff title="services/dispatcher/src/dispatcher.itest.ts"
-@@ -406,6 +406,29 @@ describe("the dispatcher", () => {
- 
-   afterAll(async () => {
-     await dispatcher?.stop();
-+
-+    // DELETE THE DURABLES THIS RUN NAMED (feature 043, FR-003).
-+    //
-+    // A durable is server-side state that outlives the process that made it, and this
-+    // suite named a fresh pair per run — `itest-expand-<8 hex>` and
-+    // `itest-deliver-<8 hex>` — and deleted neither. The attachments chapter's close-out found
-+    // **216 consumers on DELIVERIES**, 215 of them this file's, each holding a position
-+    // in a stream of 56,193 messages, and the twenty-run battery added 19 more.
-+    //
-+    // `services/api/src/consumer/consumer.itest.ts` has done this since the broker chapter and
-+    // its comment says why: *"without this, every run of this suite left another handful
-+    // behind on a shared broker, and `stream-info.mjs` found twelve of them the first
-+    // time it looked."* That chapter learned it at twelve. **The fix was written in the
-+    // file next door for twenty chapters and never applied here.**
-+    //
-+    // BY NAME, NOT BY PREFIX. `consumer.itest.ts` records that sweeping `itest-` deleted
-+    // another suite's live consumer off the same stream; these two are this run's own.
-+    if (nats && !nats.isClosed()) {
-+      const jsm = await nats.jetstreamManager();
-+      await jsm.consumers.delete("EVENTS", durables.expand).catch(() => undefined);
-+      await jsm.consumers.delete("DELIVERIES", durables.deliver).catch(() => undefined);
-+    }
-+
-     if (nats && !nats.isClosed()) await nats.drain();
-     child?.kill();
-     endpoint?.close();
-```
 
 **Twelve tests left this file and five stayed.** It is a `.test.ts` in the lane chapter 2.1 built
 to need no containers, and twelve of its seventeen talked to a real Redis. Which five stay was
 measured — `12 failed | 5 passed` against a dead broker — not argued: research predicted two.
 
-```diff title="services/gateway/src/connections.test.ts"
-@@ -3,29 +3,43 @@ import { readFileSync } from "node:fs";
- import { dirname, join } from "node:path";
- import { fileURLToPath } from "node:url";
- 
--import { afterAll, beforeEach, describe, expect, it } from "vitest";
-+import { describe, expect, it } from "vitest";
- 
- import {
-   createConnections,
-   DEFAULT_BOUND_MS,
-   DEFAULT_HEARTBEAT_MS,
-   MAX_CONNECTIONS_PER_USER,
--  type Connections,
- } from "./connections.js";
- 
--// The slot registry.
-+// The connection-cap chapter's slot registry — THE HALF THAT NEEDS NO BROKER (feature 043: FR-006,
-+// FR-006a, FR-024, FR-024a).
- //
--// AGAINST A REAL REDIS, NOT A STUB, and that is the correctness argument rather
--// than a preference. The whole design rests on what `SET … NX` and `SET … IFEQ`
--// do: `NX` settles FR-013's race inside the command, and `IFEQ` is what stops a
--// returning connection taking a slot somebody else now holds. **A stubbed client
--// would pass with a non-atomic implementation, with an `XX` renewal that hijacks,
--// and with a `DEL` release that frees another connection's place** — all three of
--// which this chapter's analysis passes found and corrected. It would also pass
--// against a server that does not support `IFEQ` at all.
-+// This file held all seventeen of the registry's tests and twelve of them talk to a real
-+// Redis. It is a `.test.ts`, so it runs in the lane chapter 2.1 built specifically to
-+// need no containers — the lane whose whole point is that `pnpm test` is honest on a
-+// laptop with nothing running. With the stack down it reported twelve failures that were
-+// correct behaviour, and `gaps.md` 3.23-9 has carried that since it was found by
-+// accident.
- //
--// That is the sender chapter's T047c one dimension over: a test that passes with half
--// its subject applied.
-+// **WHICH FIVE STAY WAS MEASURED, NOT ARGUED.** Run the original against a dead broker
-+// and it reports `12 failed | 5 passed`:
-+//
-+//   RELAY_REDIS_URL=redis://127.0.0.1:6399 vitest run src/connections.test.ts
-+//
-+// Research predicted two and the measurement found five. The heartbeat test was filed
-+// under "asserts registry behaviour" on the strength of its title; it asserts a ratio
-+// between two constants and never reaches the broker. **A title is not an inventory of
-+// what a test touches** — the same defect as a task id in a test title, one category
-+// over.
-+//
-+// AND THE SHARED `beforeEach` IS GONE. The describe these came from built a registry
-+// against `REDIS` for every test in it, including the two that provably need none. It
-+// did not break them — `createConnections` connects lazily, which one command settled
-+// after a reading of the code said otherwise — but a container-free lane holding a Redis
-+// client it never uses is a lane that will grow one that matters.
-+//
-+// The twelve that need a broker are in `connections.itest.ts`, unchanged in behaviour.
- 
- const REDIS = process.env["RELAY_REDIS_URL"] ?? "redis://localhost:6379";
- const silent = { log: () => {} };
-@@ -34,209 +48,13 @@ const silent = { log: () => {} };
-  * that share a constant `"env-1"` and both lean on the user name "tuan". */
- const ENV = `env-${randomUUID()}`;
- 
--describe("the slot registry", () => {
--  let registry: Connections;
--  let user: string;
--
--  beforeEach(() => {
--    registry = createConnections({ url: REDIS, logger: silent });
--    // A fresh user per test rather than a flush: `FLUSHDB` would delete the keys
--    // of every other suite running in parallel, and this package's config sets no
--    // `fileParallelism`.
--    user = `u-${randomUUID()}`;
--  });
--
--  afterAll(async () => {
--    await registry.close();
--  });
--
--  // ---- ARM 1 and ARM 2: the walk -----------------------------------------
--
--  it("claims the first free slot, and reports how many were held", async () => {
--    const first = await registry.claim(ENV, user, randomUUID());
--    expect(first).toEqual({ kind: "claimed", slot: 0, held: 0 });
--
--    const second = await registry.claim(ENV, user, randomUUID());
--    // ARM 1: `SET NX` missed on slot 0 and the walk moved on.
--    expect(second).toEqual({ kind: "claimed", slot: 1, held: 1 });
--  });
--
--  it("refuses when every slot is held, and says five (FR-001)", async () => {
--    for (let i = 0; i < MAX_CONNECTIONS_PER_USER; i += 1) {
--      expect((await registry.claim(ENV, user, randomUUID())).kind).toBe("claimed");
--    }
--    // ARM 2: the walk found no free slot.
--    expect(await registry.claim(ENV, user, randomUUID())).toEqual({
--      kind: "full",
--      held: 5,
--    });
--  });
--
--  it("counts each environment separately for one user identifier (FR-012)", async () => {
--    const other = `env-${randomUUID()}`;
--    for (let i = 0; i < MAX_CONNECTIONS_PER_USER; i += 1) {
--      await registry.claim(ENV, user, randomUUID());
--    }
--    expect((await registry.claim(other, user, randomUUID())).kind).toBe("claimed");
--  });
--
--  // ---- ARM 3 and ARM 9: the renewal, and the re-claim --------------------
--
--  it("renews a slot it still holds (FR-008)", async () => {
--    const id = randomUUID();
--    const claimed = await registry.claim(ENV, user, id);
--    if (claimed.kind !== "claimed") throw new Error("expected a slot");
--    expect(await registry.renew(ENV, user, id, claimed.slot)).toEqual({
--      kind: "renewed",
--    });
--  });
--
--  it("re-claims when its slot is GONE and nothing else took it (FR-011b)", async () => {
--    // ARM 3 then ARM 9. A short-lived registry so the bound elapses inside a test
--    // rather than in a minute: the boundMs option exists for exactly this, the way
--    // `membership.ts`'s reread interval does — sixty seconds does not fit in a
--    // package whose whole wall clock is forty-five.
--    const brief = createConnections({ url: REDIS, logger: silent, boundMs: 60 });
--    const id = randomUUID();
--    const claimed = await brief.claim(ENV, user, id);
--    if (claimed.kind !== "claimed") throw new Error("expected a slot");
--    await new Promise((resolve) => setTimeout(resolve, 120));
--
--    // THE COMMON CASE AFTER ANY BRIEF OUTAGE, and the branch a design that closes
--    // on every refused renewal gets wrong. The user is under the limit; the slot
--    // simply expired.
--    expect(await brief.renew(ENV, user, id, claimed.slot)).toEqual({
--      kind: "reclaimed",
--      slot: 0,
--    });
--    await brief.close();
--  });
--
--  // ---- ARM 4 and ARM 10: the hijack, and the cap genuinely full ----------
-+describe("the slot registry, without a broker", () => {
-+  /** A registry and a user per test, not a shared hook. The two below need the OBJECT
-+   * and not the broker: `release` on a slot never held and `releaseAll([])` both settle
-+   * before any command is sent. */
-+  const registryFor = () => createConnections({ url: REDIS, logger: silent });
-+  const userFor = () => `u-${randomUUID()}`;
- 
--  it("refuses to renew a slot ANOTHER connection now holds (FR-011)", async () => {
--    // ARM 4, and the one test in the chapter that catches `IFEQ` being replaced by
--    // `XX`. `XX` tests existence and not ownership — measured on 8.10.0,
--    // `SET k B XX` against a key holding `A` returns OK — so under `XX` this
--    // renewal would silently take the slot and the count would say five while six
--    // connections were open.
--    const brief = createConnections({ url: REDIS, logger: silent, boundMs: 60 });
--    const mine = randomUUID();
--    const claimed = await brief.claim(ENV, user, mine);
--    if (claimed.kind !== "claimed") throw new Error("expected a slot");
--    await new Promise((resolve) => setTimeout(resolve, 120));
--
--    // Somebody else takes the expired slot, and fills the rest so the re-claim has
--    // nowhere to go — ARM 10.
--    for (let i = 0; i < MAX_CONNECTIONS_PER_USER; i += 1) {
--      await brief.claim(ENV, user, randomUUID());
--    }
--    expect(await brief.renew(ENV, user, mine, claimed.slot)).toEqual({
--      kind: "full",
--      held: 5,
--    });
--    await brief.close();
--  });
--
--  // ---- ARM 6, ARM 7 and ARM 8: the release ------------------------------
--
--  it("frees a slot it holds, and the slot is reusable at once (FR-010)", async () => {
--    const id = randomUUID();
--    const claimed = await registry.claim(ENV, user, id);
--    if (claimed.kind !== "claimed") throw new Error("expected a slot");
--    await registry.release(ENV, user, id, claimed.slot);
--    // NO WAIT, AND THE SLOT IS NOT PINNED — because at the default one-millisecond
--    // tombstone there are THREE outcomes, not two, and the coverage lane found the
--    // third by failing here with `slot: 1` where this assertion had demanded 0.
--    //
--    //   the tombstone is still there   `SET NX` fails, `SET IFEQ -` takes it -> 0
--    //   it expired before the walk     `SET NX` succeeds                     -> 0
--    //   it expires BETWEEN the two     both fail, the walk moves on          -> 1
--    //
--    // The third is a millisecond wide and harmless: a slot is skipped, never
--    // over-admitted, and the connection is accepted. What must not happen is a
--    // refusal, and that is what this asserts. The determinate version lives in the
--    // test below, where the window is held open at 500 ms so it cannot race.
--    //
--    // This test's FIRST version slept 20 ms and accepted any slot; the sleep is
--    // what hid the `releaseAll` defect for two phases. Removing the sleep was
--    // right and pinning the slot with it was not — the two changes arrived
--    // together and only one of them was justified.
--    const again = await registry.claim(ENV, user, randomUUID());
--    expect(again.kind).toBe("claimed");
--    if (again.kind !== "claimed") throw new Error("unreachable");
--    expect(again.slot, "a released slot cost more than one place").toBeLessThanOrEqual(1);
--  });
--
--  it("claims a slot whose tombstone has NOT expired (FR-010)", async () => {
--    // A HALF-SECOND TOMBSTONE, so the window is a window rather than a coin flip.
--    // With the shipped one-millisecond value this test would pass against the
--    // broken walk about half the time, which is how the defect survived: two of six
--    // runs of the clean-shutdown test, reported as `no connection.ack within 5s`.
--    const slow = createConnections({
--      url: REDIS,
--      logger: silent,
--      tombstoneMs: 500,
--    });
--    const id = randomUUID();
--    const claimed = await slow.claim(ENV, user, id);
--    if (claimed.kind !== "claimed") throw new Error("expected a slot");
--    await slow.release(ENV, user, id, claimed.slot);
--    expect(await slow.claim(ENV, user, randomUUID())).toEqual({
--      kind: "claimed",
--      slot: 0,
--      held: 0,
--    });
--    await slow.close();
--  });
--
--  it("accepts a claim immediately after releaseAll frees all five (FR-011a)", async () => {
--    // THE CASE THAT WAS ACTUALLY BROKEN, and it is a deploy. One slot tombstoned is
--    // one slot skipped; five tombstoned is a walk that finds nothing free and
--    // reports `full` — so a client reconnecting to the new instance is refused with
--    // `connection_limit_reached`, and the remedy that close code names is to close
--    // one of the connections it already holds. Those went with the old instance.
--    const slow = createConnections({
--      url: REDIS,
--      logger: silent,
--      tombstoneMs: 500,
--    });
--    const held = [];
--    for (let i = 0; i < MAX_CONNECTIONS_PER_USER; i += 1) {
--      const id = randomUUID();
--      const claimed = await slow.claim(ENV, user, id);
--      if (claimed.kind !== "claimed") throw new Error("expected a slot");
--      held.push({ environmentId: ENV, user, connectionId: id, slot: claimed.slot });
--    }
--    await slow.releaseAll(held);
--    expect(await slow.claim(ENV, user, randomUUID())).toEqual({
--      kind: "claimed",
--      slot: 0,
--      held: 0,
--    });
--    await slow.close();
--  });
--
--  it("does NOT free a slot another connection now holds (FR-010)", async () => {
--    // ARM 6, and the reason the release is conditional. Under a plain `DEL` this
--    // would delete the new owner's key and hand out a place that is in use — the
--    // same ownership hole `IFEQ` closed on the renewal, on the path that fix
--    // introduced.
--    const brief = createConnections({ url: REDIS, logger: silent, boundMs: 60 });
--    const mine = randomUUID();
--    const claimed = await brief.claim(ENV, user, mine);
--    if (claimed.kind !== "claimed") throw new Error("expected a slot");
--    await new Promise((resolve) => setTimeout(resolve, 120));
--
--    const theirs = randomUUID();
--    const retaken = await brief.claim(ENV, user, theirs);
--    expect(retaken).toEqual({ kind: "claimed", slot: 0, held: 0 });
--
--    await brief.release(ENV, user, mine, claimed.slot);
--    // Still theirs: the release was refused. Renewing proves it.
--    expect(await brief.renew(ENV, user, theirs, 0)).toEqual({ kind: "renewed" });
--    await brief.close();
--  });
- 
-   it("does not throw for a slot the connection never held", async () => {
-     // ARM 7, AND THE TITLE SAYS ONLY WHAT THE ASSERTION PROVES. It used to read
-@@ -248,31 +66,15 @@ describe("the slot registry", () => {
-     // The membership-revocation chapter's rule: a claim about an observable difference needs falsifying before
-     // the test is written.
-     await expect(
--      registry.release(ENV, user, randomUUID(), 3),
-+      registryFor().release(ENV, userFor(), randomUUID(), 3),
-     ).resolves.toBeUndefined();
-   });
- 
--  it("releases every slot this instance holds (FR-011a)", async () => {
--    const held = [];
--    for (let i = 0; i < 3; i += 1) {
--      const id = randomUUID();
--      const claimed = await registry.claim(ENV, user, id);
--      if (claimed.kind !== "claimed") throw new Error("expected a slot");
--      held.push({ environmentId: ENV, user, connectionId: id, slot: claimed.slot });
--    }
--    await registry.releaseAll(held);
--    await new Promise((resolve) => setTimeout(resolve, 20));
--    // All three back, so the next three claims all succeed.
--    for (let i = 0; i < 3; i += 1) {
--      expect((await registry.claim(ENV, user, randomUUID())).kind).toBe("claimed");
--    }
--  });
--
-   it("does not throw when it holds nothing", async () => {
-     // ARM 8: the empty loop, which is the shutdown path of an instance that never
-     // had a connection. Renamed for the same reason as the test above — "releases
-     // nothing" describes the keys and the assertion describes the promise.
--    await expect(registry.releaseAll([])).resolves.toBeUndefined();
-+    await expect(registryFor().releaseAll([])).resolves.toBeUndefined();
-   });
- 
-   // ---- ARM 5 and ARM 11: the registry cannot be reached -----------------
-@@ -295,7 +97,7 @@ describe("the slot registry", () => {
-       },
-       boundMs: 60,
-     });
--    expect(await gone.claim(ENV, user, randomUUID())).toEqual({
-+    expect(await gone.claim(ENV, userFor(), randomUUID())).toEqual({
-       kind: "unenforced",
-     });
-     expect(lines.some((l) => l["msg"] === "connections.failed")).toBe(true);
-@@ -315,35 +117,6 @@ describe("the slot registry", () => {
-     expect(DEFAULT_HEARTBEAT_MS).not.toBe(30_000);
-   });
- 
--  it("builds without a url, from the environment or from the default", async () => {
--    // TWO BRANCHES IN ONE LINE, and the ratchet wanted both: the default parameter
--    // — which every test above steps over by passing `url` — and the `??` inside
--    // it, whose right-hand side the lane can never reach because it always sets
--    // `RELAY_REDIS_URL`. `codes.test.ts:128` established the swap-and-restore
--    // shape for exactly this; the `finally` is what keeps a failure here from
--    // silently pointing every later suite at a different Redis.
--    const defaulted = createConnections({ logger: silent });
--    const outcome = await defaulted.claim(ENV, `u-${randomUUID()}`, randomUUID());
--    expect(outcome.kind).toBe("claimed");
--    await defaulted.close();
--
--    const before = process.env["RELAY_REDIS_URL"];
--    try {
--      delete process.env["RELAY_REDIS_URL"];
--      // `DEFAULT_REDIS_URL` is localhost:6379, which is where the lane's Redis is,
--      // so this claims a place rather than failing open — and the assertion is that
--      // it reached A Redis, not that it reached a particular one.
--      const fallback = createConnections({ logger: silent });
--      expect((await fallback.claim(ENV, `u-${randomUUID()}`, randomUUID())).kind).toBe(
--        "claimed",
--      );
--      await fallback.close();
--    } finally {
--      if (before === undefined) delete process.env["RELAY_REDIS_URL"];
--      else process.env["RELAY_REDIS_URL"] = before;
--    }
--  });
--
-   it("states the maximum in exactly one place (FR-002)", async () => {
-     // The requirement is about DRIFT, not about the value. `policy.ts` derived
-     // `connect: 3_000` from "ten thousand divided by five" and shipped a third
-```
-
 The twelve that arrived, unchanged in behaviour.
 
 ```diff title="services/gateway/src/connections.itest.ts"
-@@ -1113,3 +1113,275 @@ describe("the cap fails open, and says so (US4)", () => {
-     }
-   }, 60_000);
- });
-+
-+// THE TWELVE THAT NEED A RUNNING BROKER (feature 043: FR-006, FR-024, FR-024a).
-+//
-+// Moved here from `connections.test.ts`, unchanged in behaviour. That file is a
-+// `.test.ts` and runs in the lane chapter 2.1 built to need no containers; these twelve
-+// talk to a real Redis, so with the stack down they reported failures that were correct
-+// behaviour and made the lane's exit code answer "does this work HERE, today" instead of
-+// "does this work without infrastructure". `gaps.md` 3.23-9 carried that from the day it
-+// was found by accident.
-+//
-+// WHICH TWELVE WAS MEASURED. `RELAY_REDIS_URL=redis://127.0.0.1:6399 vitest run
-+// src/connections.test.ts` reported `12 failed | 5 passed`; these are the twelve.
-+//
-+// AGAINST A REAL REDIS, NOT A STUB, and the original file's argument for that stands
-+// unchanged and is why they moved rather than being rewritten: the design rests on what
-+// `SET … NX` and `SET … IFEQ` do. **A stubbed client would pass with a non-atomic
-+// implementation, with an `XX` renewal that hijacks, and with a `DEL` release that frees
-+// another connection's place** — all three of which the connection-cap chapter's analysis found and
-+// corrected, and it would also pass against a server with no `IFEQ` at all.
-+
-+describe("the slot registry, against a real broker", () => {
-+  let registry: Connections;
-+  let user: string;
-+  const silent = { log: () => {} };
-+  const ENV = `env-${randomUUID()}`;
-+
-+  beforeEach(() => {
-+    registry = createConnections({ url: REDIS, logger: silent });
-+    // A fresh user per test rather than a flush: `FLUSHDB` would delete the keys of
-+    // every other suite running in parallel, and this package's config sets no
-+    // `fileParallelism`.
-+    user = `u-${randomUUID()}`;
-+  });
-+
-+  afterAll(async () => {
-+    await registry.close();
-+  });
-+
-+
-+  // ---- ARM 1 and ARM 2: the walk -----------------------------------------
-+
-+  it("claims the first free slot, and reports how many were held", async () => {
-+    const first = await registry.claim(ENV, user, randomUUID());
-+    expect(first).toEqual({ kind: "claimed", slot: 0, held: 0 });
-+
-+    const second = await registry.claim(ENV, user, randomUUID());
-+    // ARM 1: `SET NX` missed on slot 0 and the walk moved on.
-+    expect(second).toEqual({ kind: "claimed", slot: 1, held: 1 });
-+  });
-+
-+  it("refuses when every slot is held, and says five (FR-001)", async () => {
-+    for (let i = 0; i < MAX_CONNECTIONS_PER_USER; i += 1) {
-+      expect((await registry.claim(ENV, user, randomUUID())).kind).toBe("claimed");
-+    }
-+    // ARM 2: the walk found no free slot.
-+    expect(await registry.claim(ENV, user, randomUUID())).toEqual({
-+      kind: "full",
-+      held: 5,
-+    });
-+  });
-+
-+  it("counts each environment separately for one user identifier (FR-012)", async () => {
-+    const other = `env-${randomUUID()}`;
-+    for (let i = 0; i < MAX_CONNECTIONS_PER_USER; i += 1) {
-+      await registry.claim(ENV, user, randomUUID());
-+    }
-+    expect((await registry.claim(other, user, randomUUID())).kind).toBe("claimed");
-+  });
-+
-+  // ---- ARM 3 and ARM 9: the renewal, and the re-claim --------------------
-+
-+  it("renews a slot it still holds (FR-008)", async () => {
-+    const id = randomUUID();
-+    const claimed = await registry.claim(ENV, user, id);
-+    if (claimed.kind !== "claimed") throw new Error("expected a slot");
-+    expect(await registry.renew(ENV, user, id, claimed.slot)).toEqual({
-+      kind: "renewed",
-+    });
-+  });
-+
-+  it("re-claims when its slot is GONE and nothing else took it (FR-011b)", async () => {
-+    // ARM 3 then ARM 9. A short-lived registry so the bound elapses inside a test
-+    // rather than in a minute: the boundMs option exists for exactly this, the way
-+    // `membership.ts`'s reread interval does — sixty seconds does not fit in a
-+    // package whose whole wall clock is forty-five.
-+    const brief = createConnections({ url: REDIS, logger: silent, boundMs: 60 });
-+    const id = randomUUID();
-+    const claimed = await brief.claim(ENV, user, id);
-+    if (claimed.kind !== "claimed") throw new Error("expected a slot");
-+    await new Promise((resolve) => setTimeout(resolve, 120));
-+
-+    // THE COMMON CASE AFTER ANY BRIEF OUTAGE, and the branch a design that closes
-+    // on every refused renewal gets wrong. The user is under the limit; the slot
-+    // simply expired.
-+    expect(await brief.renew(ENV, user, id, claimed.slot)).toEqual({
-+      kind: "reclaimed",
-+      slot: 0,
-+    });
-+    await brief.close();
-+  });
-+
-+  // ---- ARM 4 and ARM 10: the hijack, and the cap genuinely full ----------
-+
-+  it("refuses to renew a slot ANOTHER connection now holds (FR-011)", async () => {
-+    // ARM 4, and the one test in the chapter that catches `IFEQ` being replaced by
-+    // `XX`. `XX` tests existence and not ownership — measured on 8.10.0,
-+    // `SET k B XX` against a key holding `A` returns OK — so under `XX` this
-+    // renewal would silently take the slot and the count would say five while six
-+    // connections were open.
-+    const brief = createConnections({ url: REDIS, logger: silent, boundMs: 60 });
-+    const mine = randomUUID();
-+    const claimed = await brief.claim(ENV, user, mine);
-+    if (claimed.kind !== "claimed") throw new Error("expected a slot");
-+    await new Promise((resolve) => setTimeout(resolve, 120));
-+
-+    // Somebody else takes the expired slot, and fills the rest so the re-claim has
-+    // nowhere to go — ARM 10.
-+    for (let i = 0; i < MAX_CONNECTIONS_PER_USER; i += 1) {
-+      await brief.claim(ENV, user, randomUUID());
-+    }
-+    expect(await brief.renew(ENV, user, mine, claimed.slot)).toEqual({
-+      kind: "full",
-+      held: 5,
-+    });
-+    await brief.close();
-+  });
-+
-+  // ---- ARM 6, ARM 7 and ARM 8: the release ------------------------------
-+
-+  it("frees a slot it holds, and the slot is reusable at once (FR-010)", async () => {
-+    const id = randomUUID();
-+    const claimed = await registry.claim(ENV, user, id);
-+    if (claimed.kind !== "claimed") throw new Error("expected a slot");
-+    await registry.release(ENV, user, id, claimed.slot);
-+    // NO WAIT, AND THE SLOT IS NOT PINNED — because at the default one-millisecond
-+    // tombstone there are THREE outcomes, not two, and the coverage lane found the
-+    // third by failing here with `slot: 1` where this assertion had demanded 0.
-+    //
-+    //   the tombstone is still there   `SET NX` fails, `SET IFEQ -` takes it -> 0
-+    //   it expired before the walk     `SET NX` succeeds                     -> 0
-+    //   it expires BETWEEN the two     both fail, the walk moves on          -> 1
-+    //
-+    // The third is a millisecond wide and harmless: a slot is skipped, never
-+    // over-admitted, and the connection is accepted. What must not happen is a
-+    // refusal, and that is what this asserts. The determinate version lives in the
-+    // test below, where the window is held open at 500 ms so it cannot race.
-+    //
-+    // This test's FIRST version slept 20 ms and accepted any slot; the sleep is
-+    // what hid the `releaseAll` defect for two phases. Removing the sleep was
-+    // right and pinning the slot with it was not — the two changes arrived
-+    // together and only one of them was justified.
-+    const again = await registry.claim(ENV, user, randomUUID());
-+    expect(again.kind).toBe("claimed");
-+    if (again.kind !== "claimed") throw new Error("unreachable");
-+    expect(again.slot, "a released slot cost more than one place").toBeLessThanOrEqual(1);
-+  });
-+
-+  it("claims a slot whose tombstone has NOT expired (FR-010)", async () => {
-+    // A HALF-SECOND TOMBSTONE, so the window is a window rather than a coin flip.
-+    // With the shipped one-millisecond value this test would pass against the
-+    // broken walk about half the time, which is how the defect survived: two of six
-+    // runs of the clean-shutdown test, reported as `no connection.ack within 5s`.
-+    const slow = createConnections({
-+      url: REDIS,
-+      logger: silent,
-+      tombstoneMs: 500,
-+    });
-+    const id = randomUUID();
-+    const claimed = await slow.claim(ENV, user, id);
-+    if (claimed.kind !== "claimed") throw new Error("expected a slot");
-+    await slow.release(ENV, user, id, claimed.slot);
-+    expect(await slow.claim(ENV, user, randomUUID())).toEqual({
-+      kind: "claimed",
-+      slot: 0,
-+      held: 0,
-+    });
-+    await slow.close();
-+  });
-+
-+  it("accepts a claim immediately after releaseAll frees all five (FR-011a)", async () => {
-+    // THE CASE THAT WAS ACTUALLY BROKEN, and it is a deploy. One slot tombstoned is
-+    // one slot skipped; five tombstoned is a walk that finds nothing free and
-+    // reports `full` — so a client reconnecting to the new instance is refused with
-+    // `connection_limit_reached`, and the remedy that close code names is to close
-+    // one of the connections it already holds. Those went with the old instance.
-+    const slow = createConnections({
-+      url: REDIS,
-+      logger: silent,
-+      tombstoneMs: 500,
-+    });
-+    const held = [];
-+    for (let i = 0; i < MAX_CONNECTIONS_PER_USER; i += 1) {
-+      const id = randomUUID();
-+      const claimed = await slow.claim(ENV, user, id);
-+      if (claimed.kind !== "claimed") throw new Error("expected a slot");
-+      held.push({ environmentId: ENV, user, connectionId: id, slot: claimed.slot });
-+    }
-+    await slow.releaseAll(held);
-+    expect(await slow.claim(ENV, user, randomUUID())).toEqual({
-+      kind: "claimed",
-+      slot: 0,
-+      held: 0,
-+    });
-+    await slow.close();
-+  });
-+
-+  it("does NOT free a slot another connection now holds (FR-010)", async () => {
-+    // ARM 6, and the reason the release is conditional. Under a plain `DEL` this
-+    // would delete the new owner's key and hand out a place that is in use — the
-+    // same ownership hole `IFEQ` closed on the renewal, on the path that fix
-+    // introduced.
-+    const brief = createConnections({ url: REDIS, logger: silent, boundMs: 60 });
-+    const mine = randomUUID();
-+    const claimed = await brief.claim(ENV, user, mine);
-+    if (claimed.kind !== "claimed") throw new Error("expected a slot");
-+    await new Promise((resolve) => setTimeout(resolve, 120));
-+
-+    const theirs = randomUUID();
-+    const retaken = await brief.claim(ENV, user, theirs);
-+    expect(retaken).toEqual({ kind: "claimed", slot: 0, held: 0 });
-+
-+    await brief.release(ENV, user, mine, claimed.slot);
-+    // Still theirs: the release was refused. Renewing proves it.
-+    expect(await brief.renew(ENV, user, theirs, 0)).toEqual({ kind: "renewed" });
-+    await brief.close();
-+  });
-+
-+  it("releases every slot this instance holds (FR-011a)", async () => {
-+    const held = [];
-+    for (let i = 0; i < 3; i += 1) {
-+      const id = randomUUID();
-+      const claimed = await registry.claim(ENV, user, id);
-+      if (claimed.kind !== "claimed") throw new Error("expected a slot");
-+      held.push({ environmentId: ENV, user, connectionId: id, slot: claimed.slot });
-+    }
-+    await registry.releaseAll(held);
-+    await new Promise((resolve) => setTimeout(resolve, 20));
-+    // All three back, so the next three claims all succeed.
-+    for (let i = 0; i < 3; i += 1) {
-+      expect((await registry.claim(ENV, user, randomUUID())).kind).toBe("claimed");
-+    }
-+  });
-+
-+  it("builds without a url, from the environment or from the default", async () => {
-+    // TWO BRANCHES IN ONE LINE, and the ratchet wanted both: the default parameter
-+    // — which every test above steps over by passing `url` — and the `??` inside
-+    // it, whose right-hand side the lane can never reach because it always sets
-+    // `RELAY_REDIS_URL`. `codes.test.ts:128` established the swap-and-restore
-+    // shape for exactly this; the `finally` is what keeps a failure here from
-+    // silently pointing every later suite at a different Redis.
-+    const defaulted = createConnections({ logger: silent });
-+    const outcome = await defaulted.claim(ENV, `u-${randomUUID()}`, randomUUID());
-+    expect(outcome.kind).toBe("claimed");
-+    await defaulted.close();
-+
-+    const before = process.env["RELAY_REDIS_URL"];
-+    try {
-+      delete process.env["RELAY_REDIS_URL"];
-+      // `DEFAULT_REDIS_URL` is localhost:6379, which is where the lane's Redis is,
-+      // so this claims a place rather than failing open — and the assertion is that
-+      // it reached A Redis, not that it reached a particular one.
-+      const fallback = createConnections({ logger: silent });
-+      expect((await fallback.claim(ENV, `u-${randomUUID()}`, randomUUID())).kind).toBe(
-+        "claimed",
-+      );
-+      await fallback.close();
-+    } finally {
-+      if (before === undefined) delete process.env["RELAY_REDIS_URL"];
-+      else process.env["RELAY_REDIS_URL"] = before;
-+    }
-+  });
-+});
+@@ -143,12 +143,16 @@ async function boot(options: {
+     }),
+     memberships: async () => options.channels,
+     backfill: async () => ({}) as never,
+     sendMessage: async () => {
+       throw new Error("not used");
+     },
++    // NULL, WHICH IS WHAT A GATEWAY WITH NO METERING CREDENTIAL GETS. This suite is
++    // about the connection cap and reports nothing; the api's side takes the same safe direction, so
++    // with nothing configured no report is sent and no route is reached.
++    reportUsage: async () => null,
+   };
+   const registry: Connections | undefined =
+     options.cap === undefined
+       ? undefined
+       : createConnections({
+           url: options.cap.url ?? REDIS,
 ```
 
 ## The port bands, retired
@@ -4093,67 +2297,27 @@ at 4710-4769 — an overlap the retired port map recorded and nobody could act o
 health probe also asked for `/health`, a route this api has never served.
 
 ```diff title="services/gateway/src/presence.itest.ts"
-@@ -88,11 +88,58 @@ interface ApiUnderTest {
-   stop: () => void;
+@@ -91,13 +91,15 @@ interface ApiUnderTest {
  }
  
-+/** The port the OS actually gave a child, read from the child's own `listening` line.
-+ *
-+ * Feature 043 (FR-002). `main.ts` logs the address it BOUND rather than the one it was
-+ * asked for, which is the only number that is true when `PORT=0`. Waiting on a health
-+ * URL cannot replace this: a health check answers from whoever holds the port, so it
-+ * says "up" just as cheerfully when the answer is somebody else's process.
-+ *
-+ * It rejects on exit rather than waiting out the timeout, so a child that dies on
-+ * startup reports the reason it printed instead of thirty seconds of nothing. */
-+async function boundPort(
-+  child: ChildProcess,
-+  label: string,
-+  timeoutMs = 30_000,
-+): Promise<number> {
-+  let output = "";
-+  return new Promise<number>((resolve, reject) => {
-+    const done = (fn: () => void) => {
-+      clearTimeout(timer);
-+      child.off("exit", onExit);
-+      fn();
-+    };
-+    const timer = setTimeout(
-+      () =>
-+        done(() =>
-+          reject(
-+            new Error(`${label} never reported a listening port in ${timeoutMs}ms\n${output}`),
-+          ),
-+        ),
-+      timeoutMs,
-+    );
-+    const onExit = (code: number | null) =>
-+      done(() => reject(new Error(`${label} exited ${code} before listening\n${output}`)));
-+    const onData = (chunk: Buffer | string) => {
-+      output += String(chunk);
-+      const m = /"msg":"listening","port":(\d+)/.exec(output);
-+      if (m) done(() => resolve(Number(m[1])));
-+    };
-+    child.stdout?.on("data", onData);
-+    child.stderr?.on("data", onData);
-+    child.once("exit", onExit);
-+  });
-+}
-+
  /** Two members of ONE channel, which no existing gateway fixture provides:
   * `seedSocketTenants` gives one user per tenant, and presence needs a watcher and
   * a subject who share a channel. */
  async function startApi(): Promise<ApiUnderTest> {
 -  const port = 4700 + Math.floor(Math.random() * 200);
-+  // NO PORT IS CHOSEN HERE (feature 043, FR-001/FR-002). This drew from 4700-4899,
-+  // one of nine hand-allocated bands, two of which contained a service the lane runs —
-+  // `membership.itest.ts` held Postgres's 5432 and `limits.itest.ts` holds NATS's 4222.
-+  // This band collided with `meter.itest.ts`'s api range instead, which the table two
-+  // files over recorded and nobody could act on. Asking the OS ends the bookkeeping.
++  // `PORT=0`, AND THE PORT READ BACK FROM THE CHILD. This picked 4700–4899 from a
++  // table of bands maintained in comments across seven files; nothing checks such a
++  // table, and this one already overlapped another suite's range by sixty ports.
    const dist = join(REPO, "services", "api", "dist");
    if (!existsSync(join(dist, "main.js"))) {
      throw new Error(
-@@ -175,23 +222,31 @@ async function startApi(): Promise<ApiUnderTest> {
+       "the api is not built — run `pnpm build` before this lane " +
+         "(the suite talks to the real service, not a stub)",
+     );
+@@ -174,29 +176,51 @@ async function startApi(): Promise<ApiUnderTest> {
+   await otherRepo.addMember(elsewhere.id, stranger.id);
+   const otherKey = await seeder.createApiKey(db, { environmentId: other.id });
+ 
    const child: ChildProcess = spawn("node", [join(dist, "main.js")], {
      env: {
        ...process.env,
@@ -4164,288 +2328,68 @@ health probe also asked for `/health`, a route this api has never served.
        RELAY_EVENT_CONSUMER: "off",
      },
 -    stdio: "ignore",
-+    // PIPED, NOT IGNORED — the port is read back out of the child, and a spawn that
-+    // fails gets to say why.
++    // PIPED, NOT IGNORED: a child whose output is discarded cannot report the port it
++    // bound, which is why the two decisions are one decision.
 +    stdio: ["ignore", "pipe", "pipe"],
    });
-+  const port = await boundPort(child, "api");
++  const port = await new Promise<number>((resolve, reject) => {
++    const timer = setTimeout(() => reject(new Error("api never reported a port")), 30_000);
++    let buffered = "";
++    child.stdout?.on("data", (chunk: Buffer) => {
++      buffered += chunk.toString();
++      for (const line of buffered.split("\n")) {
++        if (!line.trim()) continue;
++        try {
++          const parsed = JSON.parse(line) as { msg?: string; port?: number };
++          if (parsed.msg === "listening" && typeof parsed.port === "number") {
++            clearTimeout(timer);
++            resolve(parsed.port);
++            return;
++          }
++        } catch {
++          /* a partial line; the next chunk completes it */
++        }
++      }
++    });
++    child.on("exit", (code) => {
++      clearTimeout(timer);
++      reject(new Error(`api exited before listening (code ${String(code)})`));
++    });
++  });
++  // AND NO HEALTH LOOP. The `listening` line IS the readiness signal. The loop this
++  // replaced probed `/health` against an api that serves `/healthz` — a hundred failed
++  // requests, ten seconds of sleeping, and the url returned anyway. It had never once
++  // succeeded, and nothing could tell: a flat sleep long enough for the api to boot
++  // reports success either way.
    const url = `http://127.0.0.1:${port}`;
 -  for (let i = 0; i < 100; i += 1) {
-+  // `/healthz`, AND A THROW. This probed `/health`, which the api has never served
-+  // (`health.controller.ts:7`), so `res.ok` was false on all hundred iterations and the
-+  // loop fell through and returned `url` anyway — a flat ten-second sleep that reported
-+  // success. The wrong path and the missing throw each hid the other.
-+  let healthy = false;
-+  for (let i = 0; i < 100 && !healthy; i += 1) {
-     try {
+-    try {
 -      const res = await fetch(`${url}/health`);
 -      if (res.ok) break;
-+      healthy = (await fetch(`${url}/healthz`)).ok;
-     } catch {
-       /* not up yet */
-     }
+-    } catch {
+-      /* not up yet */
+-    }
 -    await new Promise((r) => setTimeout(r, 100));
-+    if (!healthy) await new Promise((r) => setTimeout(r, 100));
-   }
-+  if (!healthy) throw new Error(`api bound ${port} and never answered /healthz`);
+-  }
    return {
      url,
      credential: key.credential,
+     subjects,
+     outboxCount: async () => {
+       const result = (await pool.query("select count(*)::int as n from outbox")) as {
 ```
 
 `isolation.itest.ts` starts TWO api children, and its band came with a counter so the
 two draws could not collide with each other. `PORT=0` makes that impossible rather
 than unlikely, so the counter goes with the band.
 
-```diff title="services/gateway/src/isolation.itest.ts"
-@@ -79,9 +79,54 @@ async function waitForHealth(url: string): Promise<void> {
-  * children, and two draws from one range can collide with each other — a 1-in-200
-  * failure that would read as a broken gateway rather than a broken fixture, which
-  * is the exact trap the fixed port was. */
--let children = 0;
-+/** The port the OS actually gave a child, read from the child's own `listening` line.
-+ *
-+ * Feature 043 (FR-002). `main.ts` logs the address it BOUND rather than the one it was
-+ * asked for, which is the only number that is true when `PORT=0`. Waiting on a health
-+ * URL cannot replace this: a health check answers from whoever holds the port, so it
-+ * says "up" just as cheerfully when the answer is somebody else's process.
-+ *
-+ * It rejects on exit rather than waiting out the timeout, so a child that dies on
-+ * startup reports the reason it printed instead of thirty seconds of nothing. */
-+async function boundPort(
-+  child: ChildProcess,
-+  label: string,
-+  timeoutMs = 30_000,
-+): Promise<number> {
-+  let output = "";
-+  return new Promise<number>((resolve, reject) => {
-+    const done = (fn: () => void) => {
-+      clearTimeout(timer);
-+      child.off("exit", onExit);
-+      fn();
-+    };
-+    const timer = setTimeout(
-+      () =>
-+        done(() =>
-+          reject(
-+            new Error(`${label} never reported a listening port in ${timeoutMs}ms\n${output}`),
-+          ),
-+        ),
-+      timeoutMs,
-+    );
-+    const onExit = (code: number | null) =>
-+      done(() => reject(new Error(`${label} exited ${code} before listening\n${output}`)));
-+    const onData = (chunk: Buffer | string) => {
-+      output += String(chunk);
-+      const m = /"msg":"listening","port":(\d+)/.exec(output);
-+      if (m) done(() => resolve(Number(m[1])));
-+    };
-+    child.stdout?.on("data", onData);
-+    child.stderr?.on("data", onData);
-+    child.once("exit", onExit);
-+  });
-+}
-+
- async function startApi(): Promise<{ url: string; stop: () => void }> {
--  const port = 4900 + ((Math.floor(Math.random() * 100) * 2 + children++) % 200);
-+  // NO BAND, AND NO COUNTER (feature 043, FR-001/FR-002). The `+ children`
-+  // alternation existed so this file's TWO api children could not draw the same
-+  // port from one 200-wide range. `PORT=0` makes that impossible rather than
-+  // unlikely — the OS does not hand the same port to two listeners.
-   const dist = join(REPO, "services", "api", "dist");
-   if (!existsSync(join(dist, "main.js"))) {
-     throw new Error(
-@@ -92,7 +137,7 @@ async function startApi(): Promise<{ url: string; stop: () => void }> {
-   const child: ChildProcess = spawn("node", [join(dist, "main.js")], {
-     env: {
-       ...process.env,
--      PORT: String(port),
-+      PORT: "0",
-       // Neither relay: this suite asserts on rows and on frames, and a
-       // background loop draining the tables another file is asserting on turns
-       // two unrelated suites into a race (the outbox chapter and the rate-limit chapter).
-@@ -106,6 +151,7 @@ async function startApi(): Promise<{ url: string; stop: () => void }> {
-     },
-     stdio: ["ignore", "pipe", "pipe"],
-   });
-+  const port = await boundPort(child, "api");
-   const url = `http://127.0.0.1:${port}`;
-   await waitForHealth(`${url}/healthz`);
-   return { url, stop: () => child.kill() };
-```
-
 `public-surface.itest.ts` is the same change, and its own comment already knew the
 shape of the problem: a previous run's child still holding a port answers the health
 check from a different environment.
 
-```diff title="services/gateway/src/public-surface.itest.ts"
-@@ -71,8 +71,53 @@ async function waitForHealth(url: string): Promise<void> {
-  * still holding a fixed port answers the health check from a DIFFERENT
-  * environment, and every token this run minted is then refused by an api that has
-  * never heard of it. */
-+/** The port the OS actually gave a child, read from the child's own `listening` line.
-+ *
-+ * Feature 043 (FR-002). `main.ts` logs the address it BOUND rather than the one it was
-+ * asked for, which is the only number that is true when `PORT=0`. Waiting on a health
-+ * URL cannot replace this: a health check answers from whoever holds the port, so it
-+ * says "up" just as cheerfully when the answer is somebody else's process.
-+ *
-+ * It rejects on exit rather than waiting out the timeout, so a child that dies on
-+ * startup reports the reason it printed instead of thirty seconds of nothing. */
-+async function boundPort(
-+  child: ChildProcess,
-+  label: string,
-+  timeoutMs = 30_000,
-+): Promise<number> {
-+  let output = "";
-+  return new Promise<number>((resolve, reject) => {
-+    const done = (fn: () => void) => {
-+      clearTimeout(timer);
-+      child.off("exit", onExit);
-+      fn();
-+    };
-+    const timer = setTimeout(
-+      () =>
-+        done(() =>
-+          reject(
-+            new Error(`${label} never reported a listening port in ${timeoutMs}ms\n${output}`),
-+          ),
-+        ),
-+      timeoutMs,
-+    );
-+    const onExit = (code: number | null) =>
-+      done(() => reject(new Error(`${label} exited ${code} before listening\n${output}`)));
-+    const onData = (chunk: Buffer | string) => {
-+      output += String(chunk);
-+      const m = /"msg":"listening","port":(\d+)/.exec(output);
-+      if (m) done(() => resolve(Number(m[1])));
-+    };
-+    child.stdout?.on("data", onData);
-+    child.stderr?.on("data", onData);
-+    child.once("exit", onExit);
-+  });
-+}
-+
- async function startApi(): Promise<{ url: string; credential: string; stop: () => void }> {
--  const port = 5200 + Math.floor(Math.random() * 200);
-+  // NO BAND (feature 043, FR-001/FR-002). This drew from a hand-allocated range, and
-+  // two of the nine such ranges contained a service the lane itself runs: NATS on
-+  // 4222 and Postgres on 5432. `PORT=0` asks the OS instead of guessing.
-   const dist = join(REPO, "services", "api", "dist");
-   if (!existsSync(join(dist, "main.js"))) {
-     throw new Error("the api is not built — run `pnpm build` before this lane");
-@@ -91,13 +136,14 @@ async function startApi(): Promise<{ url: string; credential: string; stop: () =
-   const child: ChildProcess = spawn("node", [join(dist, "main.js")], {
-     env: {
-       ...process.env,
--      PORT: String(port),
-+      PORT: "0",
-       RELAY_OUTBOX_RELAY: "off",
-       RELAY_NOTIFICATION_RELAY: "off",
-       RELAY_AUTH_KEY_PREFIX: `rlauth-public-${randomUUID().slice(0, 8)}`,
-     },
-     stdio: ["ignore", "pipe", "pipe"],
-   });
-+  const port = await boundPort(child, "api");
-   const url = `http://127.0.0.1:${port}`;
-   await waitForHealth(`${url}/healthz`);
-   return { url, credential: key.credential, stop: () => child.kill() };
-```
-
 The dispatcher's api child moves too — with one deliberate exception. Invariant 11
 kills the api and starts another, and that restart must land back on the same
 address, because the assertion is that the retry schedule survived in the DATABASE.
-
-```diff title="services/dispatcher/src/dispatcher.itest.ts"
-@@ -99,11 +99,54 @@ async function waitForHealth(url: string): Promise<void> {
- /** The api, as a child process. Extracted so invariant 11 can kill it and start
-  * a new one — the point of that test is that neither process holds the retry
-  * schedule, and a suite that could not restart the api could not show it. */
--function spawnApi(port: number, credential: string): ChildProcess {
-+/** The port the OS actually gave a child, read from the child's own `listening` line.
-+ *
-+ * Feature 043 (FR-002). `main.ts` logs the address it BOUND rather than the one it was
-+ * asked for, which is the only number that is true when `PORT=0`. Waiting on a health
-+ * URL cannot replace this: a health check answers from whoever holds the port, so it
-+ * says "up" just as cheerfully when the answer is somebody else's process.
-+ *
-+ * It rejects on exit rather than waiting out the timeout, so a child that dies on
-+ * startup reports the reason it printed instead of thirty seconds of nothing. */
-+async function boundPort(
-+  child: ChildProcess,
-+  label: string,
-+  timeoutMs = 30_000,
-+): Promise<number> {
-+  let output = "";
-+  return new Promise<number>((resolve, reject) => {
-+    const done = (fn: () => void) => {
-+      clearTimeout(timer);
-+      child.off("exit", onExit);
-+      fn();
-+    };
-+    const timer = setTimeout(
-+      () =>
-+        done(() =>
-+          reject(
-+            new Error(`${label} never reported a listening port in ${timeoutMs}ms\n${output}`),
-+          ),
-+        ),
-+      timeoutMs,
-+    );
-+    const onExit = (code: number | null) =>
-+      done(() => reject(new Error(`${label} exited ${code} before listening\n${output}`)));
-+    const onData = (chunk: Buffer | string) => {
-+      output += String(chunk);
-+      const m = /"msg":"listening","port":(\d+)/.exec(output);
-+      if (m) done(() => resolve(Number(m[1])));
-+    };
-+    child.stdout?.on("data", onData);
-+    child.stderr?.on("data", onData);
-+    child.once("exit", onExit);
-+  });
-+}
-+
-+function spawnApi(pinned: string, credential: string): ChildProcess {
-   return spawn("node", [join(API_DIST, "main.js")], {
-     env: {
-       ...process.env,
--      PORT: String(port),
-+      PORT: pinned,
-       RELAY_INTERNAL_CREDENTIAL: credential,
-       // The outbox chapter's finding 4, for the third time: this suite drives the relay
-       // explicitly, so a background copy draining the same table would race it.
-@@ -371,11 +414,11 @@ describe("the dispatcher", () => {
-     // bite is a back-to-back run whose previous child still holds the port, and
-     // then the health check answers from an api serving a different environment.
-     // See the port map at the top of `services/gateway/src/limits.itest.ts`.
--    apiPort = Number(
--      process.env["RELAY_DISPATCHER_ITEST_API_PORT"] ??
--        4310 + Math.floor(Math.random() * 60),
--    );
--    child = spawnApi(apiPort, CREDENTIAL);
-+    // NO BAND (feature 043, FR-001/FR-002). This drew 4310-4369 out of nine
-+    // hand-allocated ranges, two of which contained a service the lane runs. The
-+    // override stays for deliberate pinning; otherwise the OS assigns.
-+    child = spawnApi(process.env["RELAY_DISPATCHER_ITEST_API_PORT"] ?? "0", CREDENTIAL);
-+    apiPort = await boundPort(child, "api");
-     apiUrl = `http://127.0.0.1:${apiPort}`;
-     await waitForHealth(`${apiUrl}/healthz`);
-     // A per-run position, and only messages published after it exists. Sharing
-@@ -623,7 +666,12 @@ describe("the dispatcher", () => {
-     await dispatcher.stop();
-     child.kill("SIGKILL");
-     await new Promise((resolve) => setTimeout(resolve, 250));
--    child = spawnApi(apiPort, CREDENTIAL);
-+    // THE SAME PORT, DELIBERATELY. The rest of this file lets the OS assign, but
-+    // this restart has to land back on `apiUrl` — the assertion is that the schedule
-+    // survived in the DATABASE, and reaching it through a different port would test
-+    // the same thing while reading as though the address mattered. The predecessor was
-+    // SIGKILLed 250 ms ago and the port is free.
-+    child = spawnApi(String(apiPort), CREDENTIAL);
-     await waitForHealth(`${apiUrl}/healthz`);
- 
-     // The schedule is exactly where it was, in a database neither process was
-```
 
 `presence.itest.ts` counted `select count(*) from outbox` — every row written by
 anything — to assert that a presence transition writes none. Vitest runs this
@@ -4453,43 +2397,6 @@ package's files in parallel, so `membership.itest.ts` sending a message next doo
 moved the number: `expected 614255 to be 614250`, twice in eight runs, with nothing
 in the failure suggesting a neighbour. The outbox has no `environment_id` column, so
 the subject scopes it.
-
-```diff title="services/gateway/src/presence.itest.ts"
-@@ -149,7 +149,7 @@ async function startApi(): Promise<ApiUnderTest> {
-   }
-   const client = require_(join(dist, "db", "client.js")) as {
-     createDb: (pool: unknown) => unknown;
--    createPool: () => { query: (sql: string) => Promise<unknown> };
-+    createPool: () => { query: (sql: string, params?: unknown[]) => Promise<unknown> };
-   };
-   const seeder = require_(join(dist, "db", "repository.js")) as Seeder;
-   const pool = client.createPool();
-@@ -251,8 +251,22 @@ async function startApi(): Promise<ApiUnderTest> {
-     url,
-     credential: key.credential,
-     subjects,
-+    /** THIS ENVIRONMENT'S ROWS, NOT THE TABLE'S.
-+     *
-+     * This counted `select count(*) from outbox` — every row written by anything. The
-+     * assertion it serves is "a presence transition writes no outbox row", and vitest
-+     * runs this package's files in PARALLEL, so `membership.itest.ts` sending a message
-+     * next door moved the number and the test reported `expected 614255 to be 614250`.
-+     * Nothing in that failure suggests a neighbour.
-+     *
-+     * The outbox has no `environment_id` column — it keys on `subject`, and the subject
-+     * carries the environment (`events.msg.created.<environment_id>`), so that is what
-+     * scopes it. Measured: 2 failures in 8 consecutive runs before this. */
-     outboxCount: async () => {
--      const result = (await pool.query("select count(*)::int as n from outbox")) as {
-+      const result = (await pool.query(
-+        "select count(*)::int as n from outbox where subject like '%' || $1 || '%'",
-+        [environment.id],
-+      )) as {
-         rows: { n: number }[];
-       };
-       return result.rows[0]?.n ?? 0;
-```
-
 
 ## The migration generator, retired
 
@@ -4511,41 +2418,37 @@ constitution the whole time, and the snapshots under `migrations/meta/` had drif
 **seven behind the directory**: fifteen SQL files against eight snapshots. A generator
 that stale could only have produced a migration re-creating tables that already exist.
 
-```diff title="services/api/src/db/migrate.ts"
-@@ -8,9 +8,15 @@ import { createPool } from "./client";
- // Migrations as discipline (constitution: versioned, forward-only). There is
- // no down path — not missing, absent by design. Files apply in filename
- // order, each inside a transaction, each recorded; a re-run is a no-op.
--// drizzle-kit GENERATES these files from src/db/schema.ts; this runner —
--// not drizzle-kit's migrator — is the only thing that APPLIES them, so the
--// workspace has exactly one migration ledger: schema_migrations.
-+// THESE FILES ARE HAND-WRITTEN AND REVIEWED AGAINST SAD §6.1 (feature 043,
-+// FR-023). They were once generated by drizzle-kit from src/db/schema.ts, and
-+// that arrangement contradicted the constitution from the day it started —
-+// ADR-16 says "migrations remain versioned, forward-only, hand-reviewed SQL",
-+// which a generator's output is not. The snapshots it kept in migrations/meta/
-+// drifted to SEVEN behind the directory before they were removed, so the
-+// generator could no longer have produced a correct diff even if anyone ran it.
-+// This runner is the only thing that applies them, so the workspace has exactly
-+// one migration ledger: schema_migrations.
- 
- const MIGRATIONS_DIR = join(__dirname, "..", "..", "migrations");
- 
-```
-
 The same sentence, in the file the generator would have read.
 
 ```diff title="services/api/src/db/schema.ts"
-@@ -19,7 +19,8 @@ import {
+@@ -649,18 +649,21 @@ export const consumedEvents = pgTable(
+ // the platform's own bookkeeping AND no tenant-visible content. An endpoint is
+ // customer configuration; a dead letter holds a payload that was being sent to a
+ // customer. Both fail the test on both halves, so both are scoped and both join
+ // the cross-tenant gauntlet as targets.
+ //
+ // NAMED, NOT NUMBERED. This line used to say "chapter 3.7's cross-tenant
+-// gauntlet". The gauntlet was 3.7 when that was written, became 3.8 when a chapter
+-// was inserted ahead of it, and is now 3.9 after a second insertion — and the
+-// comment was carried neither time. A chapter number in a source comment is a
+-// reference that ages every time the plan changes, and this file is fenced
+-// byte-exact into a published chapter, so correcting it costs a fence amendment.
+-// The subject does not move; the ordinal does.
++// gauntlet", and the gauntlet has moved three times since — carried by the
++// comment none of them. A chapter number in a source comment is a reference that
++// ages every time the plan changes, and this file is fenced byte-exact into a
++// published chapter, so correcting it costs a fence amendment.
++//
++// The sentence you are reading replaced one that stated the ordinals and went
++// stale in the very next chapter, which is the rule proving itself on its own
++// explanation. It now names no numbers at all. The subject does not move; the
++// ordinal does.
+ // ---------------------------------------------------------------------------
  
- // The TS twin of SAD §6.1 (ADR-16). The schema now exists twice — once as
- // the SAD's SQL truth, once here — and that drift risk is checked, not
--// assumed away: drizzle-kit GENERATES the migration SQL from these
-+// assumed away: the migration SQL under migrations/ is hand-written from these
-+// definitions and reviewed against SAD §6.1 (feature 043 retired the generator)
- // definitions, and the generated SQL is reviewed against §6.1 before the
- // runner applies it. The four tenant-bearing tables reproduce §6.1
- // column-for-column, constraints and DR citations included. Deliberately
+ // DECISION: no source document defines this table. FR-WHK-01 and
+ // FR-WHK-08 require the behaviour — up to five endpoints per environment, each
+ // with an independently rotatable signing secret — and leave the shape open.
+ //
 ```
 
 And the dependency that made generating possible. `drizzle-orm` stays — it is the
@@ -4553,14 +2456,30 @@ query builder the repository layer is built on (ADR-16), and it has nothing to d
 generation.
 
 ```diff title="services/api/package.json"
-@@ -34,7 +34,6 @@
+@@ -19,20 +19,22 @@
+     "@relay/protocol": "workspace:*",
+     "@relay/service-kit": "workspace:*",
+     "drizzle-orm": "^0.45.2",
+     "ioredis": "^6.0.0",
+     "jose": "^6.2.7",
+     "nats": "^2.29.3",
++    "nodemailer": "^9.0.5",
+     "pg": "^8.22.0",
+     "reflect-metadata": "^0.2.2",
+     "rxjs": "^7.8.2",
+     "zod": "^4.4.3"
+   },
+   "devDependencies": {
+     "@nestjs/cli": "^11.0.24",
+     "@nestjs/testing": "^11.1.28",
      "@swc/core": "^1.15.47",
-     "@types/nodemailer": "^8.0.1",
++    "@types/nodemailer": "^8.0.1",
      "@types/pg": "^8.20.3",
--    "drizzle-kit": "^0.31.10",
+     "drizzle-kit": "^0.31.10",
      "unplugin-swc": "^1.5.9"
    }
  }
+\ No newline at end of file
 ```
 
 `drizzle.config.ts` goes with it. A config file for a retired tool is the thing that
@@ -4591,221 +2510,14 @@ relaxing the send's `.min(1)` silently relaxed the edit's, and an edit has no at
 field to justify empty text. **The maximum is common to all four sites; the floor is what
 must differ. A number cannot drag a floor along with it.**
 
-```diff title="packages/protocol/src/frames.ts"
-@@ -15,6 +15,24 @@ import {
- /** Per-channel resume cursor: { channel_id: highest seq seen } (ADR-03). */
- export const cursorSchema = z.record(z.string(), z.number().int().positive());
- 
-+/** FR-MSG-01's message-length maximum, in one place because it is one rule (FR-008).
-+ *
-+ * THREE DOORS ENFORCE IT AND ONE OF THEM DID NOT. The REST body and the internal hop each
-+ * spelled `8000` as a literal, and `messageSendSchema` below — the socket door a customer's
-+ * client writes to — carried `z.string()` with no bound at all. A rule the contract
-+ * publishes and one door does not enforce is the review's finding, and three literals is
-+ * how it happened.
-+ *
-+ * NOT IN `attachments.ts`, whose six exports are all about attachments. A message-text
-+ * bound on that shelf is the drift this constant exists to remove.
-+ *
-+ * A CONSTANT IS SAFE TO SHARE WHERE A SCHEMA WAS NOT. The attachments chapter found
-+ * `editMessageBodySchema.text` defined as `sendMessageBodySchema.shape.text`, so relaxing
-+ * the send's `.min(1)` silently relaxed the edit's — and an edit has no attachments to
-+ * justify empty text. The maximum is common to all four sites; the FLOOR is what must
-+ * differ. A number cannot drag a floor along with it. */
-+export const MESSAGE_TEXT_MAX = 8000;
-+
- /** The message on the wire — derived from the SAD §6.1 `messages` columns.
-  * Wire spellings follow SAD §5.1's own frame line (`channel`, `seq`).
-  *
-@@ -69,7 +87,19 @@ export const messageSendSchema = z.strictObject({
-     .strictObject({
-       idem_key: z.string().min(1).max(255),
-       channel: z.string().min(1),
--      text: z.string(),
-+      /** BOUNDED HERE FOR THE FIRST TIME (feature 043, FR-008/FR-009).
-+       *
-+       * This was `z.string()`. The REST and internal doors have refused over-long text
-+       * since chapter 2.2, and a socket client could send any length at all — the api's
-+       * `internalSendRequestSchema` caught it one hop later, so the refusal named the
-+       * internal contract rather than the field the customer wrote.
-+       *
-+       * The refusal now happens at the gateway, before the internal request is made:
-+       * `session.ts:1452` fails the frame parse and answers `invalid_frame` with
-+       * `payload.text` as the field. That is the same shape the attachments bound already
-+       * takes, and `refineTextAndAttachments` below records why one payload must not be
-+       * refused at two layers under two codes. */
-+      text: z.string().max(MESSAGE_TEXT_MAX),
-       /** OPTIONAL here and required on the outbound `messageSchema`, which is not an
-        * inconsistency: a caller may send none, and a payload the platform BUILDS must
-        * always say. The bound is imported rather than spelled — two schemas that happen
-```
-
 The internal door stops spelling the number.
-
-```diff title="packages/protocol/src/internal.ts"
-@@ -6,7 +6,7 @@ import {
-   refineTextAndAttachments,
- } from "./attachments.js";
- 
--import { messageSchema } from "./frames.js";
-+import { MESSAGE_TEXT_MAX, messageSchema } from "./frames.js";
- 
- // The INTERNAL service contract (chapter 2.5) — distinct from the wire
- // contract above it. `frames.ts` is what a customer's client speaks;
-@@ -29,7 +29,7 @@ export const internalSendRequestSchema = z
-      * would meet FR-019 on the REST door alone: a REST client could send a
-      * photograph with no caption and a socket client could not, with no
-      * requirement anywhere saying so. The 8,000 stays — FR-MSG-01 is untouched. */
--    text: z.string().max(8000), // FR-MSG-01
-+    text: z.string().max(MESSAGE_TEXT_MAX), // FR-MSG-01, imported not spelled
-     idempotency_key: z.string().min(1).max(255).optional(), // FR-MSG-04
-     attachments: z.array(attachmentSchema).max(MAX_ATTACHMENTS).optional(),
-   })
-```
 
 The REST door, and the edit body beside it — which keeps its own `.min(1)` and now
 shares only the maximum.
 
-```diff title="services/api/src/messages/messages.schema.ts"
-@@ -1,6 +1,7 @@
- import {
-   attachmentSchema,
-   MAX_ATTACHMENTS,
-+  MESSAGE_TEXT_MAX,
-   refineTextAndAttachments,
- } from "@relay/protocol";
- import { z } from "zod";
-@@ -15,7 +16,7 @@ export const sendMessageBodySchema = z
-      * refinement below rather than disappearing. An attachments-only message is a
-      * photograph with no caption, and it stores `text = ""` rather than a null so
-      * The revisions chapter's tombstone predicate — `text === null` — is untouched. */
--    text: z.string().max(8000),
-+    text: z.string().max(MESSAGE_TEXT_MAX),
-     metadata: z.record(z.string(), z.unknown()).optional(),
-     // Chapter 2.3 (FR-MSG-04): the client's idempotency key — minted at send
-     // time (FR-SDK-06), optional because server-originated messages may not
-@@ -53,10 +54,18 @@ export type SendMessageBody = z.infer<typeof sendMessageBodySchema>;
- 
- /** The edit body (FR-001).
-  *
-- * THE SAME BOUNDS AS THE SEND BODY'S `text`, and the same reason: FR-MSG-01 fixes them
-- * for a message and an edited message is still a message. Written as a reference to that
-- * shape rather than as a second `z.string().min(1).max(8000)`, so the two cannot drift
-- * when FR-EMJ-02's code-point counting replaces the character bound.
-+ * THE SAME MAXIMUM AS THE SEND BODY'S `text` AND A DIFFERENT FLOOR, which is the whole
-+ * history of this field in one line. FR-MSG-01 fixes the maximum for a message and an
-+ * edited message is still a message, so both import `MESSAGE_TEXT_MAX` and neither
-+ * spells it.
-+ *
-+ * THE FLOORS DIVERGED IN THE ATTACHMENTS CHAPTER AND MUST STAY DIVERGED. This paragraph used to say
-+ * the field was "written as a reference to that shape" — it was
-+ * `sendMessageBodySchema.shape.text` — and that is what broke: FR-019 removed the send's
-+ * `.min(1)` so an attachments-only message could carry empty text, and the edit's floor
-+ * went with it silently, because the types are identical either way. An edit has no
-+ * attachments field to justify empty text. The attachments chapter separated them into two literals; this
-+ * feature shares the number they agree on and leaves the rule they do not.
-  *
-  * ONE FIELD, AND THE ABSENCES ARE DECISIONS:
-  *
-@@ -84,7 +93,17 @@ export type SendMessageBody = z.infer<typeof sendMessageBodySchema>;
-  * chapter has already recorded twice; two schemas that must DIFFER cannot share a
-  * reference at all. */
- export const editMessageBodySchema = z.strictObject({
--  text: z.string().min(1).max(8000),
-+  /** THE MAXIMUM IS SHARED; THE FLOOR IS NOT, AND THAT IS THE WHOLE POINT (FR-008).
-+   *
-+   * The attachments chapter found this field defined as `sendMessageBodySchema.shape.text`, so
-+   * relaxing the send's `.min(1)` for attachments-only messages silently relaxed the
-+   * edit's too — and an edit has no attachments field to restore its floor. The compiler
-+   * could not see it: the types are identical either way.
-+   *
-+   * Importing a NUMBER cannot bring that back. `MESSAGE_TEXT_MAX` is FR-MSG-01's bound,
-+   * common to all four doors; `.min(1)` is this schema's own rule and stays written here
-+   * where it can be read. */
-+  text: z.string().min(1).max(MESSAGE_TEXT_MAX),
- });
- 
- export type EditMessageBody = z.infer<typeof editMessageBodySchema>;
-```
-
 The tests, including the one asserting that `messageSchema` is deliberately NOT
 bounded: it is what the server emits, read off rows already stored, and a reader of
 anything durable cannot impose a rule its writer did not have.
-
-```diff title="packages/protocol/src/frames.test.ts"
-@@ -1,9 +1,15 @@
- import { describe, expect, it } from "vitest";
- 
--import { frameSchema, messageDeletedSchema, messageSchema, parseFrame } from "./frames.js";
-+import {
-+  frameSchema,
-+  MESSAGE_TEXT_MAX,
-+  messageDeletedSchema,
-+  messageSchema,
-+  parseFrame,
-+} from "./frames.js";
- 
- // The contract must bite: for every frame, one specimen that parses and a
- // table of malformed near-misses that MUST reject. A schema that accepts
- // garbage is worse than no schema — it certifies garbage.
- 
- const message = {
-@@ -277,6 +283,53 @@ describe("the frame union's membership", () => {
-     );
-     expect(
-       parseFrame({ type: "typing.send", payload: { channel: "c1" } }).success,
-     ).toBe(true);
-   });
- });
-+
-+describe("the message-length maximum (feature 043, FR-008)", () => {
-+  const send = (text: string) =>
-+    parseFrame({
-+      type: "message.send",
-+      payload: { idem_key: "k1", channel: "c1", text },
-+    });
-+
-+  it("refuses a socket send one character over the maximum", () => {
-+    // The door this feature closed. It was `z.string()` — no bound at all — so an
-+    // over-long text parsed here and was refused one hop later by the api's
-+    // `internalSendRequestSchema`, under a code that named the internal contract rather
-+    // than the field the customer wrote.
-+    expect(send("a".repeat(MESSAGE_TEXT_MAX)).success).toBe(true);
-+    expect(send("a".repeat(MESSAGE_TEXT_MAX + 1)).success).toBe(false);
-+  });
-+
-+  it("names `payload.text` when it refuses, which is what the gateway sends as `field`", () => {
-+    // `session.ts` answers a failed frame parse with `invalid_frame` and
-+    // `issues[0].path.join(".")`. This asserts the path that produces, because the
-+    // field a customer sees is this array and not a string written anywhere.
-+    const result = send("a".repeat(MESSAGE_TEXT_MAX + 1));
-+    expect(result.success).toBe(false);
-+    if (result.success) return;
-+    expect(result.error.issues[0]?.path.join(".")).toBe("payload.text");
-+  });
-+
-+  it("does NOT bound the outbound message, and that is deliberate", () => {
-+    // `messageSchema` is what the server EMITS, read off rows the platform already
-+    // stored. The attachments chapter's `outboxEventSchema` defect is the argument: a reader of
-+    // anything durable cannot impose a rule its writer did not have. Every stored row
-+    // came through a bounded door, so the bound buys nothing here and would turn a
-+    // hypothetical long row into an undeliverable one.
-+    //
-+    // This test exists because the task for FR-008 named THIS schema by line number.
-+    const long = {
-+      id: "m1",
-+      channel: "c1",
-+      seq: 1,
-+      user: "u1",
-+      text: "a".repeat(MESSAGE_TEXT_MAX + 1),
-+      attachments: [],
-+      created_at: "2026-09-06T00:00:00.000Z",
-+    };
-+    expect(messageSchema.safeParse(long).success).toBe(true);
-+  });
-+});
-```
-
 
 ## The avatar URL's scheme
 
@@ -4825,132 +2537,8 @@ One fragment, consumed by both the PATCH and the bulk upsert, because
 `upsertUserEntrySchema`'s own comment already promises the two routes cannot drift into
 accepting different things for the same column.
 
-```diff title="services/api/src/users/users.schema.ts"
-@@ -49,9 +49,46 @@ const userMetadataSchema = z
-  * `null` CLEARS, and it is distinct from absent. `{"display_name": null}` removes the
-  * name; `{}` leaves it. Both columns are nullable, so the API can express the difference
-  * and a PATCH that could only set would leave a customer unable to undo one. */
-+/** FR-011, FR-012. The schemes an avatar URL may use — a list, because the list is the
-+ * requirement, and `packages/protocol/src/attachments.ts:49` is the precedent.
-+ *
-+ * `z.url()` IS NOT THIS CHECK. Re-measured against zod 4.4.3 on 2026-09-06, the same
-+ * table research R7 ran: `z.string().url()` ACCEPTS `javascript:alert(1)`,
-+ * `data:text/html,<b>`, `file:///etc/passwd`, `vbscript:` and `ftp:`. It refuses
-+ * `not-a-url` and almost nothing else. So the field this API publishes as a URL would
-+ * store a scheme the customer's own client executes when it renders the avatar — an
-+ * `<img src>` or an `<a href>` built from a value we accepted.
-+ *
-+ * `attachments.ts` already said this in the attachments chapter — *"A URL validator that accepts
-+ * `javascript:alert(1)` is not a scheme rule"* — and the avatar field, which is older,
-+ * never got the same treatment. One schema fragment, consumed twice below, because
-+ * `upsertUserEntrySchema`'s own comment already promises the two routes "cannot drift
-+ * into accepting different things for the same column". */
-+export const AVATAR_URL_SCHEMES = ["http:", "https:"] as const;
-+
-+const avatarUrl = z
-+  .string()
-+  .url()
-+  .max(2048)
-+  .refine(
-+    (value) => {
-+      // `new URL`, not a prefix match. A prefix match passes `https:/example.test` and
-+      // `httpsx://…` depending on how it is written, and the parser already knows what a
-+      // scheme is. Same argument, same code, as `attachments.ts`.
-+      let parsed: URL;
-+      try {
-+        parsed = new URL(value);
-+      } catch {
-+        return false;
-+      }
-+      return (AVATAR_URL_SCHEMES as readonly string[]).includes(parsed.protocol);
-+    },
-+    { message: "avatar_url must use the http or https scheme" },
-+  );
-+
- export const userProfileBodySchema = z.strictObject({
-   display_name: z.string().min(1).max(255).nullable().optional(),
--  avatar_url: z.string().url().max(2048).nullable().optional(),
-+  avatar_url: avatarUrl.nullable().optional(),
-   metadata: userMetadataSchema.optional(),
-   /** A bot's description, editable here (FR-004).
-    *
-@@ -89,7 +126,7 @@ export const upsertUserEntrySchema = z
-   .strictObject({
-     external_id: z.string().min(1).max(255),
-     display_name: z.string().min(1).max(255).nullable().optional(),
--    avatar_url: z.string().url().max(2048).nullable().optional(),
-+    avatar_url: avatarUrl.nullable().optional(),
-     metadata: userMetadataSchema.optional(),
-     /** What kind of thing this user is (FR-USR-07).
-      *
-```
-
 And the tests, including the control that catches an over-tight refinement: a rule
 refusing everything would pass the refusal test and break every customer.
-
-```diff title="services/api/src/users/users.itest.ts"
-@@ -485,6 +485,60 @@ describe("a user's channel listing", () => {
-       body: JSON.stringify(body),
-     });
- 
-+  // ── Feature 043: the avatar's scheme (FR-011, FR-012, SC-005) ───────────────
-+  it("refuses an avatar_url whose scheme the browser would execute, naming the field", async () => {
-+    // MEASURED, NOT ASSUMED. zod 4.4.3's `z.string().url()` accepts every one of these —
-+    // re-run on 2026-09-06, the same table research R7 produced. The field is published
-+    // as a URL and a customer's client renders it into an `<img src>` or an `<a href>`,
-+    // so `javascript:` here is a value we handed them to execute.
-+    await repo.createUser("schemer", "Schemer");
-+    for (const bad of [
-+      "javascript:alert(1)",
-+      "data:text/html,<script>alert(1)</script>",
-+      "file:///etc/passwd",
-+      "vbscript:msgbox(1)",
-+    ]) {
-+      const res = await patchProfile("schemer", { avatar_url: bad });
-+      expect(res.status).toBe(400);
-+      const body = (await res.json()) as { code: string; field?: string };
-+      // THE FIELD, NOT ONLY THE STATUS. A 400 that does not name `avatar_url` sends a
-+      // customer to check their whole body, and this route takes four fields.
-+      expect(body.field).toBe("avatar_url");
-+    }
-+  });
-+
-+  it("accepts http and https, so the rule is a scheme rule and not a ban on URLs", async () => {
-+    // THE CONTROL, and it is the half that catches an over-tight refinement. A rule that
-+    // refused everything would pass the test above and break every customer.
-+    await repo.createUser("schemer-ok", "Fine");
-+    for (const good of [
-+      "https://cdn.example.com/a/b.png",
-+      "http://cdn.example.com/a/b.png",
-+    ]) {
-+      const res = await patchProfile("schemer-ok", { avatar_url: good });
-+      expect(res.status).toBe(200);
-+    }
-+  });
-+
-+  it("applies the same rule on the bulk upsert, not just the PATCH", async () => {
-+    // TWO ROUTES, ONE FRAGMENT. `upsertUserEntrySchema`'s own comment promises the two
-+    // "cannot drift into accepting different things for the same column" — and before
-+    // this feature both accepted `javascript:`, which is agreement of the wrong kind.
-+    const res = await fetch(`${url}/v1/users`, {
-+      method: "POST",
-+      headers: {
-+        "content-type": "application/json",
-+        authorization: `Bearer ${credential}`,
-+      },
-+      body: JSON.stringify({
-+        users: [{ external_id: "bulk-schemer", avatar_url: "javascript:alert(1)" }],
-+      }),
-+    });
-+    expect(res.status).toBe(400);
-+    const body = (await res.json()) as { field?: string };
-+    expect(body.field).toContain("avatar_url");
-+  });
-+
-   // ── T131: the round trip, all three fields (SC-011) ─────────────────────────
-   it("round-trips display name, avatar url and metadata", async () => {
-     await repo.createUser("profiled", "Before");
-```
 
 ## The ratchet, re-pinned
 
@@ -5037,36 +2625,33 @@ refers to it, or the second is worse off than before.
 way back. That is the title problem in its purest form.
 
 ```diff title="services/api/src/channels/channels.itest.ts"
-@@ -174,13 +174,13 @@ describe("the public channel surface", () => {
-       expect(body.members.every((m) => m.status === "added")).toBe(true);
-       // The users did not exist a moment ago. FR-CHN-04: membership creates them.
-       expect(await repo.getUserByExternalId("tuan")).not.toBeNull();
-       expect((await repo.listMembers(channelId)).length).toBe(2);
+@@ -395,19 +395,19 @@ describe("the public channel surface", () => {
+       expect(await second.json()).toMatchObject({ type: "private" });
      });
+   });
  
--    it("says already_a_member on a repeat, and is not a 500 (T052)", async () => {
-+    it("says already_a_member on a repeat, and is not a 500", async () => {
-       const res = await addMembers(channelId, { user_ids: ["tuan"] });
-       expect(res.status).toBe(200);
-       const body = (await res.json()) as { members: { status: string }[] };
-       expect(body.members[0]?.status).toBe("already_a_member");
-       // Before this chapter `members`' primary key raised a unique violation here
-       // and `ProtocolErrorFilter` rendered it as `internal_error` — a 500 for a
-@@ -707,13 +707,13 @@ describe("the public channel surface", () => {
-       expect(absent.status).toBe(foreign.status);
-       const a = withoutRequestId(await absent.json());
-       const b = withoutRequestId(await foreign.json());
-       expect(a).toEqual(b);
-     });
+   // ── REMOVAL, BULK, BECAUSE THE REQUIREMENT ALWAYS WAS ───────────────────────
+   //
+-  // FR-006 says "up to 100 in one request" and FR-007 says the result is reported
+-  // per user — the channel-endpoints chapter's add shape in both halves. The contract specified a
+-  // single-user `DELETE` for ten analysis passes, having read "the shape the
+-  // endpoints chapter chose" as *named outcomes* and dropped *bulk*. Every pass
+-  // requirements to tasks, both said "removal", and identifier coverage read 100%.
+-  // Comparing US2's scenario 4 — which names a hundred users — to the route's path,
+-  // which named one, is what found it.
++  // FR-006 says "up to 100 in one request" and FR-007 says the result is reported per
++  // user — the endpoints chapter's add shape in both halves. The contract specified a
++  // single-user `DELETE` for ten analysis passes, having read "the shape that chapter
++  // chose" as *named outcomes* and dropped *bulk*. Every pass compared requirements
++  // to tasks, both said "removal", and identifier coverage read 100%. Comparing US2's
++  // scenario 4 — which names a hundred users — to the route's path, which named one,
++  // is what found it.
+   describe("POST /v1/channels/:channelId/members/remove (FR-006, FR-007)", () => {
+     let target: string;
  
--    it("does not change what a user has left unread (FR-022, T078)", async () => {
-+    it("does not change what a user has left unread (FR-022)", async () => {
-       // The edge case the spec names, and this is where "the count is still true"
-       // gets a definition: archiving writes ONE column on `channels` and touches no
-       // message and no read position. So `last_sequence` is what it was, every read
-       // position is what it was, and the arithmetic between them is unchanged.
-       //
-       // Asserted on the sequence rather than on a count, because the count is phase
+     const remove = (channel: string, users: string[], key = credential) =>
+       fetch(`${url}/v1/channels/${channel}/members/remove`, {
+         method: "POST",
 ```
 
 The isolation gauntlet's describe carried two ids at once, and the comment above it a third. What
@@ -5075,43 +2660,302 @@ name an environment alongside an identifier, so only those two can be told to ac
 while carrying something from another.
 
 ```diff title="services/api/src/isolation/gauntlet.itest.ts"
-@@ -679,34 +679,34 @@ describe("the isolation gauntlet", () => {
-       // environment — this is the assertion that the scoping is real.
-       expect(body).not.toContain(tenants.victim.channelId);
+@@ -1,15 +1,17 @@
+ import "reflect-metadata";
+ 
++import { randomUUID } from "node:crypto";
++
+ import type { INestApplication } from "@nestjs/common";
+ import { Test } from "@nestjs/testing";
+ import { afterAll, beforeAll, describe, expect, it } from "vitest";
+ 
+ import { AppModule } from "../app.module";
+ import { mintUserToken } from "../auth/user-token";
+-import { environmentSigningSecret, Repository } from "../db/repository";
++import { environmentSigningSecret, Repository, usageFor } from "../db/repository";
+ import { createDb, createPool } from "../db/client";
+ import {
+   credentialAttack,
+   listAttack,
+   readAttack,
+   rowsOf,
+@@ -23,12 +25,13 @@ import {
+   seedSameTenant,
+   seedTwoTenants,
+   type CollidingTenants,
+   type SameTenant,
+   type TwoTenants,
+ } from "./fixtures";
++import { periodOf } from "../quotas/period";
+ import { CLASSIFICATIONS, targetKey } from "./targets";
+ 
+ import type { Db } from "../db/client";
+ 
+ // THE GAUNTLET (NFR-SEC-09, constitution I).
+ //
+@@ -340,12 +343,28 @@ describe("the isolation gauntlet", () => {
+     // Whatever it answers, nothing of the victim's may appear in it.
+     expect(serialised).not.toContain(t.victim.userId);
+     expect(serialised).not.toContain(t.victim.channelId);
+     expect(serialised).not.toContain(t.victim.environmentId);
+   });
+ 
++  it("GET /internal/memberships — the attacker's token hears only its own channels", async () => {
++    attacked.add("GET /internal/memberships");
++    // THE SAME ATTACK AS `/internal/session` AND FOR THE SAME REASON: nothing here is
++    // forgeable but the credential. The backstop's whole job is to answer "what may
++    // this connection hear now", so a leak here is a channel id the caller could then
++    // subscribe to.
++    const res = await fetch(`${url}/internal/memberships`, {
++      headers: { authorization: `Bearer ${attackerToken}` },
++    });
++    const body: unknown = res.ok ? await res.json() : null;
++    const serialised = JSON.stringify(body ?? "");
++    expect(serialised).not.toContain(t.victim.channelId);
++    expect(serialised).not.toContain(t.victim.userId);
++    expect(serialised).not.toContain(t.victim.environmentId);
++  });
++
+   // ── the two routes this chapter added ──────────────────────────────────────────
+   //
+   // A chapter that adds an endpoint attacks it in the same chapter. The derivation
+   // found these before the classification did: `targets.itest.ts` went from 9 targets
+   // to 11 and failed naming both as unclassified.
+   it("POST /v1/channels/:channelId/members — refuses, and adds nobody", async () => {
+@@ -978,12 +997,235 @@ describe("the isolation gauntlet", () => {
+       expect(rowsOf({ data: [1] })).toHaveLength(1);
+       expect(rowsOf({ items: [1, 2, 3] })).toEqual([]);
+       expect(rowsOf(null)).toEqual([]);
      });
    });
-   // ── T031: the five platform routes, and what isolation means for them ──────
-   //
--  // T031b, the comment the plan asked for: a platform credential is not
--  // tenant-scoped and is not meant to be. The dispatcher serves every tenant, so
-+  // A platform credential is not tenant-scoped and is not meant to be. The
-+  // dispatcher serves every tenant, so
-   // its credential reaches every tenant's deliveries. FR-044 narrowed WHICH
-   // ROUTES each service may call and changed nothing about that reach.
-   //
-   // So the attack shape differs here, and the difference is worth stating
-   // exactly. Only TWO of the five platform routes name an environment alongside
-   // an identifier — `dispatch/expand` (`environment_id` beside `event_id`) and
-   // `usage/connections` (an environment per connection). Those two can be told
-   // to act on environment A while carrying something from B, and both are
-   // attacked: expand below, connections by `usage.itest.ts`'s
--  // `connection_environment_conflict` assertion (T032).
-+  // `connection_environment_conflict` assertion.
-   //
-   // The other three — `material`, `outcome`, `replay` — take one opaque
-   // identifier and DERIVE the environment from the row they find. There is no
-   // cross-environment request to make, because the caller never says which
-   // environment it means. That is not a hole this suite declines to test; it is
-   // the absence of the parameter that would make the attack expressible. What
-   // guards them is FR-044 and nothing else — which is why `material`, the one
-   // response in the platform that returns a decrypted customer secret, is the
-   // route to watch first if a platform credential ever leaks.
--  describe("the platform routes (T031, T031b)", () => {
-+  describe("the platform routes", () => {
-     const dispatcher = process.env["RELAY_INTERNAL_CREDENTIAL"] ?? "";
  
-     // Through the victim's OWN repository, which is both scoped and the only
-     // place the query engine is allowed to live (FR-043).
-     const victimDeliveries = () =>
-       tenants.victim.repo.countDeliveriesForEndpoint(tenants.victim.endpointId);
++  // ── the webhook surface (this chapter) ─────────────────────────────────────────
++  //
++  // WRITTEN BECAUSE THE LEDGER OWED THEM AND THE ACCOUNTING TEST COLLECTED. Eleven
++  // routes were classified here and none attacked; the failure named all eleven by
++  // path. Seven are the customer's endpoint surface and four are the internal seam
++  // beneath it, of which one can be attacked at all — see `targets.ts` for why the
++  // other three are `exempt` rather than silently unattacked.
++  describe("webhooks: a foreign endpoint id is another tenant's", () => {
++    const victimEndpoints = () => t.victim.repo.listEndpoints();
++
++    it("GET /v1/webhooks/:id — a foreign endpoint reads as an absent one", async () => {
++      attacked.add("GET /v1/webhooks/:id");
++      const verdict = await readAttack(
++        url,
++        t.attacker.credential,
++        { method: "GET", path: `/v1/webhooks/${t.victim.endpointId}` },
++        { method: "GET", path: `/v1/webhooks/${ABSENT_UUID}` },
++      );
++      expect(verdict.differences, verdict.differences.join("; ")).toEqual([]);
++      // A PAIR CAN AGREE BY BOTH LEAKING. The status says it refused, and the body
++      // says the victim's url never came back — an endpoint's url is the customer's
++      // own infrastructure and is exactly what must not cross.
++      expect(verdict.foreign.status).toBe(404);
++      expect(JSON.stringify(verdict.foreign.body)).not.toContain("victim");
++    });
++
++    it("GET /v1/webhooks — the listing carries its own rows and none of the victim's", async () => {
++      attacked.add("GET /v1/webhooks");
++      const verdict = await listAttack(
++        url,
++        t.attacker.credential,
++        { method: "GET", path: "/v1/webhooks" },
++        [t.victim.endpointId, t.victim.environmentId],
++      );
++      expect(verdict.status).toBe(200);
++      expect(verdict.leaked, `leaked: ${verdict.leaked.join(", ")}`).toEqual([]);
++      // AND ITS OWN ENDPOINT IS THERE. A listing that returned nothing at all would
++      // pass the leak check while being broken, which is the `list` shape's own trap.
++      expect(verdict.count, "the attacker's own listing came back empty").toBeGreaterThan(0);
++    });
++
++    it("POST /v1/webhooks — a create by one tenant cannot appear in another's list", async () => {
++      attacked.add("POST /v1/webhooks");
++      // NO IDENTIFIER TO FORGE on this route: the tenant comes from the key. So the
++      // pair is two legitimate creates and the assertion is about the VICTIM's state —
++      // this is the one webhook write whose attack is entirely the state read.
++      const body = (n: string) => ({
++        url: `https://attacker.example/${n}`,
++        event_types: ["message.created"],
++      });
++      const verdict = await writeAttack(
++        url,
++        t.attacker.credential,
++        { method: "POST", path: "/v1/webhooks", body: body("x") },
++        { method: "POST", path: "/v1/webhooks", body: body("y") },
++        victimEndpoints,
++      );
++      expect(verdict.foreign.status).toBe(201);
++      expect(verdict.stateChanged, "the victim's endpoints moved").toBe(false);
++    });
++
++    it.each(["rotate-secret", "enable", "disable", "test"])(
++      "POST /v1/webhooks/:id/%s — refused on a foreign endpoint, and nothing moves",
++      async (action) => {
++        attacked.add(`POST /v1/webhooks/:id/${action}`);
++        const verdict = await writeAttack(
++          url,
++          t.attacker.credential,
++          { method: "POST", path: `/v1/webhooks/${t.victim.endpointId}/${action}` },
++          { method: "POST", path: `/v1/webhooks/${ABSENT_UUID}/${action}` },
++          victimEndpoints,
++        );
++        expect(verdict.differences, verdict.differences.join("; ")).toEqual([]);
++        expect(verdict.foreign.status).toBe(404);
++        // ROTATE IS THE ONE THAT WOULD HURT MOST. A successful rotation on somebody
++        // else's endpoint breaks every signature they verify, and the state read is
++        // what sees it: `secret_rotated_at` is on the row this returns.
++        //
++        // AND `test` IS THE ONE THAT REACHES OUTWARD. It makes the platform POST to the
++        // url on the row, so a successful attack on a foreign endpoint would have this
++        // tenant's request arriving at another customer's server — the only route in
++        // this list whose damage lands outside the platform.
++        expect(verdict.stateChanged, "the victim's endpoints moved").toBe(false);
++      },
++    );
++
++    it("DELETE /v1/webhooks/:id — a foreign endpoint is not deleted", async () => {
++      attacked.add("DELETE /v1/webhooks/:id");
++      const verdict = await writeAttack(
++        url,
++        t.attacker.credential,
++        { method: "DELETE", path: `/v1/webhooks/${t.victim.endpointId}` },
++        { method: "DELETE", path: `/v1/webhooks/${ABSENT_UUID}` },
++        victimEndpoints,
++      );
++      expect(verdict.differences, verdict.differences.join("; ")).toEqual([]);
++      expect(verdict.foreign.status).toBe(404);
++      // DELETION IS SOFT, so the row survives either way and only the listing can
++      // tell: `listEndpoints` excludes soft-deleted rows, which is what makes this
++      // state read able to see a successful attack.
++      expect(verdict.stateChanged, "the victim's endpoints moved").toBe(false);
++    });
++  });
++
++  // ── the platform credential (this chapter) ─────────────────────────────────────
++  //
++  // A PLATFORM CREDENTIAL IS NOT TENANT-SCOPED AND IS NOT MEANT TO BE. One dispatcher
++  // serves every tenant, so its credential reaches every tenant's deliveries and a
++  // FOREIGN CREDENTIAL cannot be forged for it. What is attackable is the one route
++  // that names an environment alongside an identifier.
++  describe("the platform routes", () => {
++    const dispatcher = process.env["RELAY_INTERNAL_CREDENTIAL"];
++    // AND THE GATEWAY'S, WHICH IS A DIFFERENT SECRET SINCE FR-044. Both are `platform`
++    // and neither reaches the other's routes: the usage report is
++    // `@Accepts({ platform: ["gateway"] })` and dispatch is the dispatcher's.
++    //
++    // This suite presented the dispatcher's here and the positive control below caught
++    // it — `expected 403 to be 200` on the SETUP call, before any attack was made. A
++    // narrowing that goes unnoticed by the suite it narrows is a narrowing nobody has
++    // measured; this one announced itself on the first run.
++    const gateway = process.env["RELAY_INTERNAL_CREDENTIAL_GATEWAY"];
++
++    const expand = async (environmentId: string) =>
++      send(url, dispatcher ?? "", {
++        method: "POST",
++        path: "/internal/dispatch/expand",
++        body: {
++          event_id: randomUUID(),
++          environment_id: environmentId,
++          type: "message.created",
++          payload: { text: "expand names one environment" },
++        },
++      });
++
++    it("expand reaches only the endpoints of the environment it names", async () => {
++      attacked.add("POST /internal/dispatch/expand");
++      if (dispatcher === undefined) return; // not configured in this lane
++
++      const before = (await t.victim.repo.listEndpoints()).length;
++      const answer = await expand(t.attacker.environmentId);
++      expect(answer.status).toBe(200);
++      // THE POSITIVE CONTROL FIRST. The attacker's own endpoint subscribes to this
++      // type, so the call did something — without this the assertion below passes on
++      // a no-op, which is how this shape of test goes green while proving nothing.
++      expect((answer.body as { created?: number }).created ?? 0).toBeGreaterThan(0);
++      const rows = await t.victim.repo.listDeliveriesForEvent(
++        (answer.body as { event_id?: string }).event_id ?? randomUUID(),
++      );
++      expect(rows, "a delivery reached the victim's environment").toEqual([]);
++      expect((await t.victim.repo.listEndpoints()).length).toBe(before);
++    });
++
++    it("expand naming an environment that exists nowhere creates nothing", async () => {
++      if (dispatcher === undefined) return;
++      const answer = await expand(ABSENT_UUID);
++      expect(answer.status).toBe(200);
++      expect((answer.body as { created?: number }).created ?? -1).toBe(0);
++    });
++
++    // AND THE SECOND PLATFORM ROUTE THAT NAMES AN ENVIRONMENT ALONGSIDE AN IDENTIFIER.
++    //
++    // The derivation named it the moment this chapter added it, which is the whole
++    // reason the target list is derived and not typed: `POST /internal/usage/connections`
++    // arrived unclassified and three tests went red at once, in a file the chapter was
++    // not editing.
++    //
++    // `expand` was the only attackable platform route until now, and the argument
++    // transfers exactly. A usage report carries a connection id AND the environment to
++    // bill it to, so a caller can name one tenant while carrying an identifier from
++    // another — and the refusal has to come from the ROW, because the caller is the
++    // platform and is allowed to reach every tenant.
++    const period = periodOf(new Date());
++    const report = (connectionId: string, environmentId: string, minutes: number) =>
++      send(url, gateway ?? "", {
++        method: "POST",
++        path: "/internal/usage/connections",
++        body: {
++          connections: [
++            { connection_id: connectionId, environment_id: environmentId, period, minutes },
++          ],
++        },
++      });
++
++    it("a connection billed to one environment cannot be re-billed to another", async () => {
++      attacked.add("POST /internal/usage/connections");
++      if (gateway === undefined) return; // not configured in this lane
++
++      // THE POSITIVE CONTROL FIRST, and it is a legitimate call: the platform may
++      // report the victim's own connection. Without it the refusal below would also
++      // arrive from a route that credits nothing at all.
++      const connection = randomUUID();
++      expect((await report(connection, t.victim.environmentId, 3)).status).toBe(200);
++
++      const attackerBefore = (await usageFor(db, t.attacker.environmentId, period))
++        .connectionMinutes;
++      const victimBefore = (await usageFor(db, t.victim.environmentId, period))
++        .connectionMinutes;
++      // AND THE READER IS CHECKED BEFORE IT IS COMPARED. Both assertions at the foot
++      // of this test compare a number against itself, which is exactly the shape that
++      // passes when the reader returns nothing at all.
++      expect(victimBefore, "usageFor read no minutes for a connection just credited")
++        .toBeGreaterThanOrEqual(3);
++
++      const stolen = await report(connection, t.attacker.environmentId, 90);
++      expect(stolen.status).toBe(409);
++      expect((stolen.body as { code?: string }).code).toBe(
++        "connection_environment_conflict",
++      );
++
++      // BOTH SIDES, because only one of them is the obvious assertion. The attacker
++      // gained nothing — and the victim did not LOSE the minutes it already had, which
++      // a refusal that moved the row and then failed would still satisfy.
++      expect(
++        (await usageFor(db, t.attacker.environmentId, period)).connectionMinutes,
++        "the attacker was credited a connection it does not own",
++      ).toBe(attackerBefore);
++      expect(
++        (await usageFor(db, t.victim.environmentId, period)).connectionMinutes,
++        "the victim's minutes moved",
++      ).toBe(victimBefore);
++    });
++  });
++
+   // ── and the suite accounts for itself ───────────────────────────────────────────
+   it("ran an attack for every route the classification says to attack", () => {
+     const shouldAttack = CLASSIFICATIONS.filter((c) => c.shape !== "exempt").map(targetKey);
+     const missing = shouldAttack.filter((k) => !attacked.has(k));
+     // A classification saying `write` with no attack written for it is the same hole
+     // as a route with no classification, one level up. Named, because the useful half
 ```
