@@ -1,9 +1,12 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
 import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figBlastRadius, figRefusalOrder, figAbsence } from "./figures";
 
 export const metadata = {
   title: "Người gửi mà một tin nhắn chưa từng có — Building Relay",
   description:
-    "Bản dịch tiếng Việt của chương này đang được chuẩn bị. Toàn bộ mã nguồn bên dưới giữ nguyên như bản tiếng Anh.",
+    "Message từng không có sender. Để mọi message được attributed cần bot identity, thay đổi compile-time trên mọi caller, thứ tự refusal đúng và migration cho các row lịch sử.",
   alternates: {
     canonical: "/vi/part-3/chapter-11/the-sender-a-message-never-had",
     languages: {
@@ -15,11 +18,28 @@ export const metadata = {
 
 <ChapterHeader id="3.11" locale="vi" />
 
-> **Bản dịch đang được chuẩn bị.** Phần diễn giải của chương này chưa được dịch sang
-> tiếng Việt. Các khối mã bên dưới là bản gốc tiếng Anh và giống hệt bản tiếng Anh của
-> chương — bạn có thể gõ theo chúng ngay bây giờ. Bản dịch đầy đủ sẽ thay thế trang này.
+Mọi message phải có sender. Requirement tưởng như mới, nhưng nền tảng từng thỏa nó theo
+chiều ngược lại: API key có thể gửi “thay mặt bất kỳ user nào” mà không cần sender thật.
 
-## The requirement was already there, and it had been satisfied backwards
+## Requirement đã ở đó, và từng được thỏa theo chiều ngược
+
+FR-MSG-13 được amend để backend chỉ gửi thay mặt bot user của tenant; FR-MSG-15 yêu cầu
+mỗi message có sender. Sửa câu requirement dễ, nhưng sender chạm identity, schema, caller,
+history và socket frame.
+
+<Figure caption="Sender bắt buộc làm thay đổi blast radius của mọi caller." code={figBlastRadius} />
+<Figure caption="Refusal order phải giữ resource chưa thấy được indistinguishable." code={figRefusalOrder} />
+<Figure caption="Bot identity là trạng thái được mô tả, không phải user absence." code={figAbsence} />
+
+<Why>Compile-time signature là cách tìm toàn bộ caller đáng tin hơn prose.</Why>
+<Why>Bot dùng cùng tenant model với user, nhưng không có authentication capability.</Why>
+<Why>Historical row cần attribution có thể giải thích được.</Why>
+<Why>Refusal order là một phần của isolation contract.</Why>
+<Why>Migration chỉ đúng khi caller mới và row cũ cùng có meaning rõ ràng.</Why>
+
+<Trap>Sender optional biến omission của caller thành message hợp lệ.</Trap>
+<Trap>Chỉ từ chối lúc mint vẫn để token đã tồn tại một cửa sổ bypass.</Trap>
+<Trap>Prose không được compiler hay test runner đọc như contract.</Trap>
 
 ```text title="docs/04-srs.md (excerpt)"
 | FR-MSG-13 | The system shall support sending a message on behalf of any user via
@@ -37,7 +57,10 @@ export const metadata = {
 ~ FR-RTL-05   AMENDED  quota on "unique active users" -> "unique active persons"  P3 T
 ```
 
-## An identity that was an absence
+## Identity từng là sự vắng mặt
+
+Bot không phải user đăng nhập. Hai column trên `users` diễn tả bot identity và description
+của nó mà không tạo `bots` table thứ hai cùng nghĩa tenant-scoped.
 
 ```diff title="services/api/src/db/schema.ts"
 @@ -215,19 +215,62 @@ export const users = pgTable(
@@ -74,7 +97,7 @@ export const metadata = {
        t.environmentId,
        t.externalId,
 +    ), // DR-02
-+    // THE CONSTRAINED TEXT COLUMNS IN THIS SCHEMA NAME EACH OTHER (THE CHANNEL-CONTROL CHAPTER's
++    // THE CONSTRAINED TEXT COLUMNS IN THIS SCHEMA NAME EACH OTHER (THE CHANNEL-CONTROL CHAPTER'S
 +    // practice, applied here): `channels_type_check` on `channels.type`,
 +    // `members_role_check` on `members.role`, `memberships_role_check` on an
 +    // organisation membership's role, and this pair. One word apart is how `admin`
@@ -187,7 +210,10 @@ ADD CONSTRAINT users_kind_check                                       5.398 ms
 ADD CONSTRAINT users_bot_description_check                            3.190 ms
 ```
 
-## A compile error, not a test
+## Compile error, không phải test
+
+`sendMessage` không còn nhận sender optional. Type signature bắt mọi caller cung cấp sender;
+đây là proof mạnh hơn test vì không caller nào có thể bị quên mà vẫn compile.
 
 ```diff title="services/api/src/db/repository.ts"
 @@ -581,12 +581,21 @@ export interface UserRow {
@@ -530,23 +556,6 @@ ADD CONSTRAINT users_bot_description_check                            3.190 ms
          .update(users)
          .set(set)
          .where(
-@@ -1446,14 +1590,14 @@ export class Repository {
-         ),
-       )
-       .returning({ id: users.id });
-     return updated.length > 0;
-   }
- 
--  /** A user's channels, most recently active first, keyset-paginated (chapter
--   * 3.15, FR-013, FR-CHN-08).
-+  /** A user's channels, most recently active first, keyset-paginated (the
-+   * channel-control chapter, FR-013, FR-CHN-08).
-    *
-    * `id` IS PART OF THE KEY AND NOT DECORATION. `last_activity_at` is not unique:
-    * two channels can take a message in the same millisecond, and a keyset on a
-    * non-unique column either skips a row or repeats one at every page boundary
-    * where a tie straddles it. Postgres row comparison — `(a, b) < (x, y)` — gives
-    * the strict lexicographic "everything after this exact row" the cursor means,
 @@ -1631,19 +1775,48 @@ export class Repository {
      {
        userId,
@@ -717,7 +726,10 @@ ADD CONSTRAINT users_bot_description_check                            3.190 ms
        // learns it exists from `channel_archived` — a refusal that reveals what it is
 ```
 
-## The guards that stopped meaning anything, and the one that did not
+## Những guard không còn nghĩa, và guard vẫn còn nghĩa
+
+Sau khi sender là bắt buộc, các guard từng chặn senderless message trở thành dead branch.
+Chỉ những guard còn phân biệt bot, user bị xóa và membership mới giữ lại.
 
 ```text
 1664  the ban check                       DEAD — remove the gate, keep the check
@@ -726,7 +738,10 @@ ADD CONSTRAINT users_bot_description_check                            3.190 ms
 2049  listMessages                        LEGITIMATELY OPTIONAL — do not touch
 ```
 
-## Resolving the sender, and the order of the refusals
+## Resolve sender, và thứ tự refusal
+
+Sender được resolve trong tenant trước write. Refusal order giữ indistinguishability: foreign
+hay absent resource không được lộ qua lỗi sender, archive hoặc membership.
 
 ```diff title="services/api/src/messages/messages.controller.ts"
 @@ -7,13 +7,13 @@ import {
@@ -795,7 +810,7 @@ ADD CONSTRAINT users_bot_description_check                            3.190 ms
      private readonly messages: MessagesService,
      private readonly repo: Repository,
    ) {}
-@@ -75,24 +89,70 @@ export class MessagesController {
+@@ -76,24 +90,70 @@ export class MessagesController {
      // identifiers that need not exist, so before this a token-authenticated send
      // by a stranger succeeded UNATTRIBUTED — and an unattributed send is one the
      // membership check waves through. A user with no row is a member of nothing;
@@ -873,7 +888,7 @@ ADD CONSTRAINT users_bot_description_check                            3.190 ms
      // send or the retry that recovered it. Moved down from the service in
      // chapter 2.6, where an internal caller turned out to need the flag.
      // The field list is spelled out rather than spread-minus-`duplicate`,
-@@ -101,12 +161,17 @@ export class MessagesController {
+@@ -102,12 +162,17 @@ export class MessagesController {
      return {
        id: message.id,
        channel_id: message.channel_id,
@@ -1029,7 +1044,10 @@ ADD CONSTRAINT users_bot_description_check                            3.190 ms
          );
 ```
 
-## A bot everywhere except at the door
+## Bot ở mọi nơi trừ cánh cửa
+
+Bot được phép là sender nhưng không authenticate. Mint endpoint, credential checks và gateway
+cùng enforce rule để token đã mint trước đó không tạo một cửa sổ bypass.
 
 ```diff title="services/api/src/auth/dev-token.controller.ts"
 @@ -89,13 +89,37 @@ export class DevTokenController {
@@ -1104,7 +1122,10 @@ ADD CONSTRAINT users_bot_description_check                            3.190 ms
        environment_id: principal.environmentId,
 ```
 
-## The rows that came before
+## Những row có từ trước
+
+Migration xử lý historical senderless rows bằng identity có thể giải thích được, thay vì bịa
+ra end user. Mọi row mới từ thời điểm này phải có sender thật.
 
 ```text
 history      listMessages          user: null      readable
@@ -1152,7 +1173,10 @@ resume       toFrame               row DROPPED     not renderable
 +});
 ```
 
-## What an existing caller must change
+## Caller hiện có phải đổi gì
+
+Socket, internal API và REST caller đều truyền sender explicit. Đây là change contract;
+prose không được checker đọc nên type và test phải mang phần enforceable của nó.
 
 ```diff title="packages/test-harness/src/driver-exempt.test.ts"
 @@ -76,17 +76,29 @@ describe("the driver exemption is checked in both directions", () => {
@@ -1229,7 +1253,10 @@ resume       toFrame               row DROPPED     not renderable
            paths: [
 ```
 
-## The 20 files this chapter changes and does not teach
+## Hai mươi file chương này đổi nhưng không dạy
+
+Các file dưới đây là wiring, generated boundary và test support. Chúng cần cho change nhưng
+không bổ sung concept ngoài identity, sender và refusal order.
 
 ```diff title="packages/protocol/src/codes.test.ts"
 @@ -100,12 +100,21 @@ describe("the three refusals this chapter's channel adds", () => {
@@ -1921,8 +1948,8 @@ resume       toFrame               row DROPPED     not renderable
    // ── write ───────────────────────────────────────────────────────────────────────
    it("POST /v1/channels/:channelId/messages — refuses, and writes nothing", async () => {
      attacked.add("POST /v1/channels/:channelId/messages");
-+    // THE ATTACK PRESENTS A KEY, AND A KEY SEND NAMES A BOT (
-+    // FR-MSG-15). Without a sender both halves would be refused for naming
++    // THE ATTACK PRESENTS A KEY, AND A KEY SEND NAMES A BOT
++    // (FR-MSG-15). Without a sender both halves would be refused for naming
 +    // nobody — identically, so the pair would agree and this test would pass
 +    // while attacking the validator instead of the tenancy boundary.
 +    const from = { text: "from the attacker", user: t.attacker.botExternalId };
@@ -2343,9 +2370,9 @@ resume       toFrame               row DROPPED     not renderable
      expect(await foreign.json()).toEqual(await missing.json());
    });
  
-@@ -140,13 +153,124 @@ describe("POST /v1/channels/:channelId/messages", () => {
-   // with no user at all — and `MessagesController` declares no `@Accepts`, so the
-   // guard falls back to `EITHER` and a user token is accepted here.
+@@ -141,13 +154,124 @@ describe("POST /v1/channels/:channelId/messages", () => {
+   // sender chapter, so the guard fell back to `EITHER` and a user token was accepted
+   // here.
    //
    // So the repository test passed while the route it protects was open. A repository
    // test proves a check exists; only a route test proves it fires.
@@ -2469,7 +2496,7 @@ resume       toFrame               row DROPPED     not renderable
            "content-type": "application/json",
            authorization: `Bearer ${token}`,
          },
-@@ -181,13 +305,13 @@ describe("POST /v1/channels/:channelId/messages", () => {
+@@ -182,13 +306,13 @@ describe("POST /v1/channels/:channelId/messages", () => {
        const token = await tokenFor("insider");
        const accepted = await sendAs(token, privateChannelId, "mine to send");
        expect(accepted.status).toBe(201);
@@ -3322,8 +3349,8 @@ resume       toFrame               row DROPPED     not renderable
      ).json()) as { messages: { seq: number; user: string | null; text: string }[] };
      expect(history.messages.map((m) => m.text)).toEqual([second, first]);
 -    expect(history.messages.every((m) => m.user === null)).toBe(true);
-+    // WAS `every((m) => m.user === null)`, AND THAT IS THE CHAPTER (
-+    // T055's class). This assertion existed to prove the rows were senderless, which was
++    // WAS `every((m) => m.user === null)`, AND THAT IS THE CHAPTER
++    // (T055's class). This assertion existed to prove the rows were senderless, which was
 +    // why `toFrame` dropped them. Every REST send now names a sender, so the premise it
 +    // rested on is gone.
 +    expect(history.messages.every((m) => m.user === "rest-courier")).toBe(true);
@@ -3425,7 +3452,10 @@ resume       toFrame               row DROPPED     not renderable
          // to this file — the live-path suppression predicate and the scoping that
 ```
 
-## What it cost
+## Cái giá của thay đổi
+
+Chi phí là một migration, mọi caller phải compile lại, và test cần phân biệt bot với user.
+Đổi lại, message frame, history và fan-out đều có author mà client tin được.
 
 ```text
 files changed in relay-platform                                    31
@@ -3437,5 +3467,20 @@ integration lane        350 tests in 23 suites, 5 of 5 runs green
 unit and coverage       45 files, 524 tests, exit 0
 repository.ts           branches 92.66% (pin raised 90 -> 92), functions 100%
 ```
+
+<Checkpoint>
+
+- mọi message mới có sender
+- bot không authenticate và historical row được migrate rõ nghĩa
+- compile buộc mọi caller truyền sender
+
+</Checkpoint>
+
+<ForwardRef part="chương kế tiếp">
+
+Sender đã có; phần còn nợ là message đi từ API tới socket. Chương kế tiếp khép fan-out
+edge giữa API, Redis và gateway.
+
+</ForwardRef>
 
 <ChapterFooter id="3.11" locale="vi" />

@@ -1,9 +1,10 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
 import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
 
 export const metadata = {
   title: "Webhook sống sót trước hệ thống của khách hàng — Building Relay",
   description:
-    "Bản dịch tiếng Việt của chương này đang được chuẩn bị. Toàn bộ mã nguồn bên dưới giữ nguyên như bản tiếng Anh.",
+    "Webhook phải sống qua endpoint, secret và dispatcher của khách hàng. Chương này xây subscription, signing, schedule, delivery claim, retry và dead letter trên ba service.",
   alternates: {
     canonical: "/vi/part-3/chapter-19/webhooks-that-survive-the-customer",
     languages: {
@@ -15,9 +16,8 @@ export const metadata = {
 
 <ChapterHeader id="3.19" locale="vi" />
 
-> **Bản dịch đang được chuẩn bị.** Phần diễn giải của chương này chưa được dịch sang
-> tiếng Việt. Các khối mã bên dưới là bản gốc tiếng Anh và giống hệt bản tiếng Anh của
-> chương — bạn có thể gõ theo chúng ngay bây giờ. Bản dịch đầy đủ sẽ thay thế trang này.
+Webhook là promise gửi event ra hệ thống khách hàng, không phải chỉ là HTTP call. Nó cần
+subscription durable, secret có thể hiển thị một lần, retry schedule, signature và dead letter.
 
 ```ts title="services/api/src/consumer/handler.ts (excerpt)"
 export async function handleEvent(event: EventEnvelope, logger: Logger) {
@@ -25,7 +25,7 @@ export async function handleEvent(event: EventEnvelope, logger: Logger) {
 }
 ```
 
-## The pattern stops applying, twice
+## Pattern ngừng áp dụng, hai lần
 
 ```ts title="services/api/src/consumer/runtime.ts (excerpt)"
 // The broker chapter: the claim and the effect commit together or not at all.
@@ -41,7 +41,7 @@ await claimEvent(db, CONSUMER, event.id, async () => {
 //                           the event id they deduplicate on.
 ```
 
-## The endpoint, and the secret we must be able to give back
+## Endpoint, và secret phải có thể trả lại
 
 ```ts title="services/api/src/webhooks/secret.ts"
 import {
@@ -188,7 +188,7 @@ if (process.env.NODE_ENV === "production") {
 }
 ```
 
-## The migration, and the surface on top of it
+## Migration, và surface ở trên nó
 
 ```sql title="services/api/migrations/0010_webhooks.sql"
 -- Webhook endpoints, the delivery schedule, and dead letters.
@@ -279,6 +279,7 @@ CREATE INDEX "webhook_endpoints_environment_idx" ON "webhook_endpoints" USING bt
 ```ts title="services/api/src/webhooks/webhooks.service.ts"
 import { Injectable, NotFoundException } from "@nestjs/common";
 
+import { WEBHOOK_EVENT_TYPES } from "../outbox/event";
 import { protocolError } from "../protocol-error";
 import { Repository, type WebhookEndpointRow } from "../db/repository";
 import { encryptSecret, mintSigningSecret } from "./secret";
@@ -412,6 +413,16 @@ export class WebhooksService {
     }
   }
 
+  /** AGAINST THE DECLARED SET, NOT THE EMITTED ONE, and the difference is a customer's
+   * subscription. `OUTBOX_EVENT_TYPES` holds the five this platform emits; FR-WHK-02
+   * declares eight. Comparing against the five would refuse a subscription to a
+   * published event type whose feature has not shipped — published measured 741 rows
+   * naming one — and those customers made no mistake.
+   *
+   * So a name outside the declared eight is a typo and is refused; a declared name this
+   * platform does not emit yet is accepted, and the refusal names the set so a customer
+   * can see which they meant. A typo used to be STORED: the endpoint was created, a 201
+   * came back, and nothing was ever delivered to it. */
   private assertEventTypes(types: string[]): void {
     if (!Array.isArray(types) || types.length === 0) {
       throw protocolError(
@@ -421,9 +432,57 @@ export class WebhooksService {
         "event_types",
       );
     }
+    const declared = Object.keys(WEBHOOK_EVENT_TYPES);
+    const unknown = types.filter((t) => !declared.includes(t));
+    if (unknown.length > 0) {
+      throw protocolError(
+        "webhook_event_type_unknown",
+        `not an event type this platform declares: ${unknown.join(", ")}. ` +
+          `The accepted set is ${declared.join(", ")}.`,
+        422,
+        "event_types",
+      );
+    }
   }
 }
 ```
+
+**URL phải là HTTPS và không được trỏ vào trong.** Endpoint là URL platform sẽ fetch thay
+khách hàng từ chính network của nó; không check destination chính là server-side request
+forgery. Loopback, private range và link-local address bị từ chối bằng validation error
+khách hàng đọc được thay vì timeout không giải thích được.
+
+**Năm endpoint mỗi environment.** Năm có tính arbitrary, nhưng “unbounded” cũng là một con
+số và là số sai: expansion write một row cho từng endpoint match, nên mười nghìn endpoint
+biến một event thành mười nghìn row trong một transaction.
+
+**Secret chỉ được trả đúng một lần:** lúc creation và không bao giờ nữa. Column lưu
+ciphertext; plaintext chỉ tồn tại đủ lâu để response serialize.
+
+**Event type ngoài declared set bị từ chối, và set để check không phải set platform đang
+emit.** Đây là hai list khác nhau; khoảng cách giữa chúng là subscription của customer.
+`WEBHOOK_EVENT_TYPES` khai báo tám name FR-WHK-02 gọi tên; năm name `emitted: true`, ba name
+`channel.created`, `user.connected`, `user.disconnected` là `false` vì spec đã publish nhưng
+chưa có producer.
+
+Check subscription theo năm emitted name sẽ từ chối `user.connected` của customer đọc docs và
+subscribe một documented event. Customer không sai; platform đã đo được 741 stored row gọi tên
+một event như thế. Vì vậy validation dùng tám declared name: name ngoài set là typo và nhận
+`webhook_event_type_unknown` với accepted set trong message; declared name chưa producer vẫn
+được lưu và đơn giản là chưa bao giờ fire.
+
+Thứ nó thay thế còn tệ hơn refusal: typo từng được lưu, endpoint trả `201`, customer thấy
+subscription trong list rồi không bao giờ nhận delivery vì không event nào match
+`mesage.created`. Validation error đọc được tốt hơn subscription trông đúng mãi mãi.
+
+<Why title="Tại sao dùng flag trên type thay vì hai list">
+
+Hai constant—declared name và emitted name—là shape dễ rot: chúng chỉ khớp khi ai đó nhớ đổi
+cả hai. Repo đã trả giá khi lint exemption list drift khỏi tree nó exempt. Một table có boolean
+mỗi row không thể bất đồng với chính nó; ship producer chỉ flip `false` thành `true` trên line
+đã gọi tên event, và compiler tìm mọi reader qua `satisfies Record<string, { emitted: boolean }>`.
+
+</Why>
 
 ```ts title="services/api/src/webhooks/webhooks.controller.ts"
 import {
@@ -599,7 +658,7 @@ export class DeliveryRelayService implements OnModuleDestroy {
 export class WebhooksModule {}
 ```
 
-## Signing what you actually send
+## Ký đúng thứ thực sự gửi
 
 ```ts title="services/dispatcher/src/signature.ts"
 import { createHmac } from "node:crypto";
@@ -683,7 +742,7 @@ const sig  = sign(JSON.stringify(JSON.parse(body)));   // ← a different string
 it("verifies against a verifier written from the documentation, not from the signer", () => {
 ```
 
-## The schedule is a column, and the reason is a measurement
+## Schedule là một column, và lý do là measurement
 
 ```text
 Q1  delayed redelivery survives a restart?
@@ -970,7 +1029,7 @@ export function nextAttemptAt(attempt: number, from: Date = new Date()): Date | 
 }
 ```
 
-## Expansion, inside the claim
+## Expansion bên trong claim
 
 ```diff title="services/api/src/db/repository.ts"
 @@ -17,19 +17,24 @@ import {
@@ -1656,7 +1715,7 @@ export function nextAttemptAt(attempt: number, from: Date = new Date()): Date | 
          id,
 ```
 
-## Why the dispatcher is its own service
+## Tại sao dispatcher là service riêng
 
 ```ts title="packages/e2e/src/webhooks.itest.ts"
 import { createRequire } from "node:module";
@@ -1810,7 +1869,7 @@ describe("journey: webhooks never stand between the platform and its users", () 
 });
 ```
 
-## The seam, and the credential that crosses it
+## Seam, và credential đi qua nó
 
 ```diff title="services/api/src/auth/principal.ts"
 @@ -18,13 +18,47 @@ export interface ApplicationPrincipal {
@@ -2360,7 +2419,7 @@ export class DispatchController {
  export class InternalModule {}
 ```
 
-## The relay, again
+## Relay, lần nữa
 
 ```ts title="services/api/src/webhooks/delivery-relay.ts"
 import {
@@ -2574,7 +2633,7 @@ export function createDeliveryRelay({
    return {
 ```
 
-## The dispatcher
+## Dispatcher
 
 ```ts title="services/dispatcher/src/main.ts"
 import {
@@ -3210,7 +3269,7 @@ export async function deliverOnce(
 }
 ```
 
-## The dead letter
+## Dead letter
 
 ```ts title="services/api/src/db/repository.ts (excerpt)"
     // Attempts exhausted. The dead letter and the state change commit together —
@@ -3233,7 +3292,7 @@ export async function deliverOnce(
     return { outcome: "dead_lettered" as const, nextAttemptAt: null };
 ```
 
-## A walk that found a real bug
+## Một lượt rà tìm ra bug thật
 
 ```js title="scripts/hostile-endpoint.mjs"
 // A customer's webhook endpoint, behaving badly on purpose.
@@ -3838,7 +3897,7 @@ dead letters               0
   it("invariant 10: a FAILED delivery is retried — the same row, a second attempt", async () => {
 ```
 
-## What the suites actually hold
+## Suite thực sự giữ gì
 
 ```ts title="services/api/src/webhooks/schedule.test.ts"
 import { describe, expect, it } from "vitest";
@@ -6007,10 +6066,10 @@ describe("the dispatcher", () => {
          // `if (timer)` in chapter 2.7's `withDeadline`, whose falsy arm cannot be
 ```
 
-## Three services, three containers
+## Ba service, ba container
 
 ```dockerfile title="services/api/Dockerfile"
-# The api (chapter 3.5). The repository's containers arrive with the dispatcher:
+# The api. The repository's containers arrive with the dispatcher:
 # adding one image for the new service alone would have made the newest
 # deployable the only packaged one, which is a distinction nothing justifies.
 #

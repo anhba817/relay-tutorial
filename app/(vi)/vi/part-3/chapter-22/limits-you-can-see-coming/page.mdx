@@ -1,9 +1,10 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
 import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
 
 export const metadata = {
   title: "Những giới hạn bạn thấy trước — Building Relay",
   description:
-    "Bản dịch tiếng Việt của chương này đang được chuẩn bị. Toàn bộ mã nguồn bên dưới giữ nguyên như bản tiếng Anh.",
+    "Rate limit cần được thấy trước qua response, signal và docs. Chương này đặt fixed window counter, policy per tenant, REST/socket refusal và quota vocabulary cuối cùng được emit.",
   alternates: {
     canonical: "/vi/part-3/chapter-22/limits-you-can-see-coming",
     languages: {
@@ -15,24 +16,23 @@ export const metadata = {
 
 <ChapterHeader id="3.22" locale="vi" />
 
-> **Bản dịch đang được chuẩn bị.** Phần diễn giải của chương này chưa được dịch sang
-> tiếng Việt. Các khối mã bên dưới là bản gốc tiếng Anh và giống hệt bản tiếng Anh của
-> chương — bạn có thể gõ theo chúng ngay bây giờ. Bản dịch đầy đủ sẽ thay thế trang này.
+Giới hạn hữu ích là giới hạn developer nhìn thấy trước khi bất ngờ chạm nó. Counter, policy,
+response field và docs phải cùng nói một sự thật.
 
 ```ts title="packages/protocol/src/codes.ts (excerpt)"
 rate_limited: "too many requests",
 ```
 
-## The requirement an afterthought fails
+## Requirement mà afterthought sẽ làm hỏng
 
-## Why the window is fixed
+## Tại sao window cố định
 
 ```ts title="services/api/src/limits/store.ts (excerpt)"
 const count = await redis.incr(key);
 if (count === 1) await redis.pexpire(key, windowMs);
 ```
 
-## The arithmetic, and where it lives
+## Arithmetic, và nơi nó sống
 
 ```ts title="services/api/src/limits/bucket.ts"
 // The fixed-window arithmetic (research R1).
@@ -97,7 +97,7 @@ export function remaining(count: number, limit: number): number {
 }
 ```
 
-## Policy: three columns, and null is not zero
+## Policy: ba column, và null không phải zero
 
 ```sql title="services/api/migrations/0012_limit_policy.sql"
 -- Per-environment rate limit policy (FR-RTL-04).
@@ -136,9 +136,9 @@ ALTER TABLE environments
 quotaConfig: jsonb("quota_config").notNull().default({}),
 ```
 
-## Where the defaults came from
+## Default đến từ đâu
 
-## Two positions in the chain, both forced
+## Hai vị trí trong chain, đều bị ép buộc
 
 ```ts title="services/api/src/auth/authenticate.middleware.ts (excerpt)"
 const address = clientAddress(req);
@@ -160,7 +160,7 @@ const path =
 path,                    // was: path: req.url
 ```
 
-## What gets counted, and what does not
+## Thứ được đếm, và thứ không
 
 ```ts title="services/api/src/limits/rate-limit.middleware.ts (excerpt)"
 export function operationsFor(method: string, path: string): LimitedOperation[] {
@@ -170,7 +170,7 @@ export function operationsFor(method: string, path: string): LimitedOperation[] 
 }
 ```
 
-## The two directions
+## Hai hướng
 
 ```
 $ POST /v1/channels/{id}/messages   # 1 of 4, limit is 2
@@ -206,9 +206,9 @@ HTTP 429
  "tracked":0}
 ```
 
-## Whose failure was that?
+## Failure đó của ai?
 
-## The gateway: two limits, two shapes of refusal
+## Gateway: hai limit, hai shape refusal
 
 ```ts title="services/gateway/src/session.ts (excerpt)"
 if (decision.over) {
@@ -218,7 +218,7 @@ if (decision.over) {
 wss.handleUpgrade(req, socket, head, (ws) => { … });
 ```
 
-## One request, two opposite kinds of trust
+## Một request, hai kiểu trust đối lập
 
 ```ts title="packages/protocol/src/internal.ts (excerpt)"
 limits: z.strictObject({
@@ -227,7 +227,7 @@ limits: z.strictObject({
 }),
 ```
 
-## Two services, one counter
+## Hai service, một counter
 
 ```ts title="services/gateway/src/limits.itest.ts"
 import { spawn, type ChildProcess } from "node:child_process";
@@ -243,7 +243,7 @@ import { docsUrl } from "@relay/protocol";
 import { createLogger, serve, type Logger } from "@relay/service-kit";
 import { Redis } from "ioredis";
 import { WebSocket } from "ws";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { createApiClient } from "./api-client.js";
 import { createGatewayLimits, type GatewayLimits } from "./limits.js";
@@ -464,12 +464,42 @@ describe("one counter, two services", () => {
   /** The key the api and the gateway are both supposed to be incrementing.
    * Spelled out here rather than imported, because a test that computed it with
    * the code under test would agree with a wrong answer. */
-  const key = (operation: string) =>
+  const key = (operation: string, atMs: number = Date.now()) =>
     `rl:${api.environmentId}:${operation}:` +
-    `${Math.floor(Date.now() / 60_000) * 60_000}`;
+    `${Math.floor(atMs / 60_000) * 60_000}`;
 
-  const count = async (operation: string): Promise<number> =>
-    Number((await redis.get(key(operation))) ?? 0);
+  /** THE WINDOW IS WALL-CLOCK, SO A TEST CAN SPAN TWO OF THEM.
+   *
+   * `limits.ts:115` keys on `Math.floor(now / 60_000) * 60_000`. The bucket rolls at the
+   * top of every minute whatever the suite is doing, so ten sends either side of the
+   * boundary write two keys — and reading one of them reports `7` where the test means
+   * `10`, which looks exactly like a limiter dropping increments.
+   *
+   * Measured, twice: run 1 of feature 043's second battery and run 2 of its third.
+   * Nothing in either failure named a clock.
+   *
+   * SUMMING RATHER THAN SLEEPING, and the first attempt did sleep. Waiting for the next
+   * boundary made the test correct and blew its 5-second timeout the moment the guard
+   * actually fired — a fix whose failure mode is worse than the fault, because a timeout
+   * says nothing about what it was waiting for. This asserts the same number without
+   * spending any time: ten sends are ten sends however the minute falls across them. */
+  const windowsSince = (sinceMs: number): number[] => {
+    const first = Math.floor(sinceMs / 60_000) * 60_000;
+    const last = Math.floor(Date.now() / 60_000) * 60_000;
+    const out: number[] = [];
+    for (let w = first; w <= last; w += 60_000) out.push(w);
+    return out;
+  };
+
+  let testStartedAt = Date.now();
+
+  const count = async (operation: string): Promise<number> => {
+    let total = 0;
+    for (const w of windowsSince(testStartedAt)) {
+      total += Number((await redis.get(key(operation, w))) ?? 0);
+    }
+    return total;
+  };
 
   const mintToken = async (user = "tuan") => {
     const res = await fetch(`${api.url}/auth/dev-token`, {
@@ -533,6 +563,16 @@ describe("one counter, two services", () => {
     await new Promise<void>((resolve) => server.listen(0, resolve));
     url = `ws://127.0.0.1:${(server.address() as AddressInfo).port}`;
   }, 60_000);
+
+  beforeEach(() => {
+    // Where `count()` starts summing, and where `afterEach` starts deleting.
+    testStartedAt = Date.now();
+  });
+
+  beforeEach(() => {
+    // Where `count()` starts summing, and where `afterEach` starts deleting.
+    testStartedAt = Date.now();
+  });
 
   afterEach(async () => {
     for (const socket of sockets.splice(0)) socket.close();
@@ -709,7 +749,7 @@ describe("one counter, two services", () => {
      const missing = built().filter(
 ```
 
-## Why 4008 stays unused
+## Tại sao 4008 vẫn không dùng
 
 ```ts title="services/gateway/src/session.test.ts (excerpt)"
 for (const text of source) {
@@ -718,7 +758,7 @@ for (const text of source) {
 expect(source.join("")).toMatch(/close\(\s*400[12]/);
 ```
 
-## The fourth field
+## Field thứ tư
 
 ```ts
 expect(await foreign.json()).toEqual(await missing.json());
@@ -813,7 +853,7 @@ expect(await foreign.json()).toEqual(await missing.json());
      });
 ```
 
-## The signal that must not spend a send
+## Signal không được tiêu một send
 
 ```diff title="services/gateway/src/typing.itest.ts"
 @@ -20,12 +20,13 @@ import { createLogger, serve, type Logger } from "@relay/service-kit";
@@ -847,13 +887,13 @@ expect(await foreign.json()).toEqual(await missing.json());
      options.lines === undefined
        ? silent
        : createLogger("gateway", (line: string) => {
-@@ -106,12 +111,16 @@ async function boot(options: {
-   const api: ApiClient = {
+@@ -107,12 +112,16 @@ async function boot(options: {
      session: async () => ({
        environment_id: environment,
        user: options.user,
        banned: false,
        channel_ids: options.channels,
+       revisions: {},
 +      // The limits ride this response as of the limits chapter, and this fixture is
 +      // generous on purpose: T048b below asserts that a typing signal spends NO send
 +      // budget, and a tight number here would make that pass for the wrong reason.
@@ -864,7 +904,7 @@ expect(await foreign.json()).toEqual(await missing.json());
        if (options.backfillDelayMs !== undefined) {
          await new Promise((r) => setTimeout(r, options.backfillDelayMs));
        }
-@@ -136,12 +145,13 @@ async function boot(options: {
+@@ -137,12 +146,13 @@ async function boot(options: {
      ...(fanout === undefined ? {} : { fanout }),
      ...(presence === undefined ? {} : { presence }),
      ...(membership === undefined ? {} : { membership }),
@@ -878,7 +918,7 @@ expect(await foreign.json()).toEqual(await missing.json());
    return {
      url: `ws://127.0.0.1:${port}/v1/ws`,
      typing,
-@@ -626,12 +636,65 @@ describe("a typing signal on its way out", () => {
+@@ -627,12 +637,65 @@ describe("a typing signal on its way out", () => {
      expect(frames).toHaveLength(afterSignal);
  
      // And the fabric is still alive, so the silence above was a decision.
@@ -946,9 +986,9 @@ expect(await foreign.json()).toEqual(await missing.json());
     *
 ```
 
-## A limit a developer is meant to hit
+## Limit developer được kỳ vọng sẽ chạm
 
-## What the capture found that the tests did not
+## Capture tìm ra gì mà test không thấy
 
 ```
 HTTP 429
@@ -984,13 +1024,13 @@ retry-after: 51
 }
 ```
 
-## What this chapter changed outside the code
+## Chương này đổi gì ngoài code
 
 ```json
 { "error": { "code": "…", "message": "…", "docs_url": "…" } }
 ```
 
-## The chapter in full
+## Toàn bộ chương
 
 ```ts title="services/api/src/limits/policy.ts"
 // The limit policy: what each environment is allowed, and what each number rests
@@ -2193,7 +2233,7 @@ describe("peek at the cap", () => {
 ```
 
 ```diff title="packages/protocol/src/frames.ts"
-@@ -199,20 +199,32 @@ export const typingSendSchema = z.strictObject({
+@@ -214,20 +214,32 @@ export const typingSendSchema = z.strictObject({
    payload: z.strictObject({
      channel: z.string().min(1),
    }),
@@ -2231,7 +2271,7 @@ describe("peek at the cap", () => {
 ```
 
 ```diff title="packages/protocol/src/frames.test.ts"
-@@ -61,12 +61,17 @@ const valid: Record<string, unknown> = {
+@@ -69,12 +69,17 @@ const valid: Record<string, unknown> = {
    error: {
      type: "error",
      payload: {
@@ -2719,7 +2759,7 @@ describe("peek at the cap", () => {
 ```
 
 ```diff title="packages/protocol/src/internal.ts"
-@@ -186,12 +186,29 @@ export const internalSessionResponseSchema = z.strictObject({
+@@ -193,12 +193,29 @@ export const internalSessionResponseSchema = z.strictObject({
     *
     * `.default(false)` so an api built before this chapter still satisfies the schema
     * during a rolling deploy — the gateway then treats a missing field as "not banned",
@@ -2768,13 +2808,13 @@ describe("peek at the cap", () => {
  //
  // It answers the gateway's only question at connect: who is this, and what may
  // they hear? Both halves used to be answered in two different places — the
-@@ -71,12 +72,17 @@ export class SessionController {
-       throw new UnauthorizedException("a bot user cannot open a session");
+@@ -72,12 +73,17 @@ export class SessionController {
      }
      // A verified token for a user this environment has never seen is not an
      // error: it is a user with no channels. The gateway's job is delivery, not
      // identity forensics — 2.5's rule, and the reason a first connect from a
      // brand-new user works before anything is seeded.
+     const channels = user ? await this.repo.channelsForUser(user.id) : [];
 +    // The gateway's limits, resolved here because the gateway has no
 +    // database and must not gain one (research R12). Null columns are already
 +    // defaults by the time they leave the repository, so the gateway never has to
@@ -2786,13 +2826,13 @@ describe("peek at the cap", () => {
        // FR-031. THE ROW IS ALREADY IN HAND — `getUserByExternalId` above
        // reads it for the channel list — so carrying the ban costs one field and no query.
        // The gateway refuses the socket; this route only reports the fact, because the
-@@ -84,9 +90,13 @@ export class SessionController {
-       //
-       // A USER THIS ENVIRONMENT HAS NEVER SEEN IS NOT BANNED. `user` is null for a
-       // verified token naming somebody with no row, which chapter 2.5 decided is a user
-       // with no channels rather than an error — and a user with no row has no ban either.
-       banned: user?.banned_at != null,
-       channel_ids: user ? await this.repo.channelsForUser(user.id) : [],
+@@ -92,9 +98,13 @@ export class SessionController {
+       // the counter costs no extra query, because the membership join already touches
+       // `channels` to answer the ids.
+       channel_ids: channels.map((c) => c.channel_id),
+       revisions: Object.fromEntries(
+         channels.map((c) => [c.channel_id, c.revision_sequence]),
+       ),
 +      limits: {
 +        connect: limits?.connect ?? DEFAULT_LIMITS.connect,
 +        send: limits?.send ?? DEFAULT_LIMITS.send,
@@ -2803,37 +2843,31 @@ describe("peek at the cap", () => {
 ```
 
 ```diff title="services/gateway/src/auth.ts"
-@@ -24,13 +24,22 @@ export type { Identity } from "./api-client.js";
- /** Three outcomes, not two. A refused token and an unreachable api both fail to
-  * open a socket, but they are not the same event and must not close the same
-  * way: 4001 tells a client its credential is wrong (retrying will not help),
-  * 1011 tells it we are broken (retrying will). 2.5 drew that line for the
-  * memberships lookup; moving verification here must not erase it. */
- export type Authentication =
--  | { outcome: "ok"; identity: Identity; channelIds: string[] }
-+  | {
-+      outcome: "ok";
-+      identity: Identity;
-+      channelIds: string[];
+@@ -32,12 +32,17 @@ export type Authentication =
+       identity: Identity;
+       channelIds: string[];
+       /** Per channel, how many revisions it has seen. Reported to the client on the
+        * ack and never compared here: the gateway has no opinion about staleness, and
+        * no database to form one with. */
+       revisions: Record<string, number>;
 +      /** The environment's two socket allowances, read from
 +       * Postgres by the api and carried on the same response — the gateway has
 +       * no database client and R12 spent its whole argument on keeping it that
 +       * way. */
 +      limits: { connect: number; send: number };
-+    }
+     }
    | { outcome: "refused" }
    | { outcome: "unavailable"; error: string }
    /** FR-031. The api answered, the token is perfectly good, and the user is banned in
     * this environment. Its own outcome and its own close code (4003), not a reuse of
     * `refused`: 4001 means "your credential is bad", which a client acts on by
-    * re-authenticating — and re-authenticating succeeds and connects to the same
-@@ -61,11 +70,12 @@ export async function authenticate(
-         userExternalId: session.user,
+@@ -70,11 +75,12 @@ export async function authenticate(
          // Carried, not trusted: the internal hop forwards this instead of
          // asserting an identity the gateway invented.
          token,
        },
        channelIds: session.channel_ids,
+       revisions: session.revisions,
 +      limits: session.limits,
      };
    } catch (error) {
@@ -2843,7 +2877,7 @@ describe("peek at the cap", () => {
 ```
 
 ```diff title="services/gateway/src/registry.ts"
-@@ -44,12 +44,22 @@ export interface Connection {
+@@ -48,12 +48,22 @@ export interface Connection {
     * like the natural way to bound this and hands the duplicate straight back:
     * sequences commit in order under a channel row lock but are published by
     * whichever gateway instance handled each send, so a prompt 43 can beat a stalled
@@ -3070,7 +3104,7 @@ describe("peek at the cap", () => {
        // not known before it — the comment above says the same of the rate limit.
        // After the limiter because a client hammering the door should meet the
        // cheaper check first; the limiter is one INCR and this is a walk of up to
-@@ -753,32 +849,35 @@ export function attachSessions({
+@@ -753,21 +849,23 @@ export function attachSessions({
              "this user is banned in this environment and cannot connect",
            );
            ws.close(4003, CLOSE_CODES[4003]);
@@ -3078,12 +3112,13 @@ describe("peek at the cap", () => {
            return;
          }
 -        // NO SEND LIMIT ARGUMENT YET. `authenticate` returns the limits with the
--        // session in movement VII, where the limiter is written; `open` takes four
--        // parameters until then rather than a fifth nothing can supply.
+-        // session in movement VII, where the limiter is written; until then `open`
+-        // takes what the session answer actually carries and nothing more.
          void open(
            ws,
            result.identity,
            result.channelIds,
+           result.revisions,
            req.url ?? "/",
 +          // REQUIRED, SO IT COMES BEFORE THE TWO OPTIONAL ONES. `sendLimit` is a
 +          // number and `claimedId` a string, so a wrong order here is a type error
@@ -3096,11 +3131,12 @@ describe("peek at the cap", () => {
        });
      })();
    });
- 
-   async function open(
-     socket: WebSocket,
-     identity: Identity,
-     channelIds: string[],
+@@ -779,12 +877,13 @@ export function attachSessions({
+     /** BESIDE `channelIds` AND NOT AFTER `url`, because it arrives with them from one
+      * session answer — and because `claimedId` below is optional: gaps.md 045-18 records
+      * a parameter inserted ahead of an optional one silently renaming every later
+      * argument. A required parameter here makes the compiler name every call site. */
+     revisions: Record<string, number>,
      url: string,
 +    sendLimit: number,
      /** The id the cap claimed a place with, so the connection and
@@ -3109,7 +3145,7 @@ describe("peek at the cap", () => {
       * in and the reason the cap is not enforced there. */
      claimedId?: string,
      claimedSlot?: number,
-@@ -799,12 +898,13 @@ export function attachSessions({
+@@ -807,12 +906,13 @@ export function attachSessions({
        phase: presented === undefined ? "live" : "buffering",
        buffer: [],
        overflowed: false,
@@ -3123,7 +3159,7 @@ describe("peek at the cap", () => {
      // Subscriptions follow membership: the first local member of a channel
      // makes this instance a subscriber, and the last one to leave releases
      // it (reference-counted in the fabric).
-@@ -1301,12 +1401,23 @@ export function attachSessions({
+@@ -1316,12 +1416,23 @@ export function attachSessions({
      const frame = frameSchema.safeParse(parsed);
      if (!frame.success) {
        sendError(
@@ -3147,7 +3183,7 @@ describe("peek at the cap", () => {
        );
        return;
      }
-@@ -1328,12 +1439,52 @@ export function attachSessions({
+@@ -1343,12 +1454,52 @@ export function attachSessions({
      // gateway, Redis, and whoever is subscribed.
      if (frame.data.type === "typing.send") {
        await signalTyping(connection, frame.data.payload.channel);
@@ -4113,7 +4149,7 @@ describe("a store that is not there", () => {
 ```
 
 ```diff title="services/gateway/src/isolation.itest.ts"
-@@ -818,19 +818,28 @@ function sample(type: string, channel: string, user: string): unknown {
+@@ -826,19 +826,28 @@ function sample(type: string, channel: string, user: string): unknown {
        return { type, payload: { channel, user, change: "added" } };
      case "presence.changed":
        return { type, payload: { user, state: "online" } };
@@ -4149,7 +4185,7 @@ describe("a store that is not there", () => {
 ```
 
 ```diff title="services/gateway/src/session.itest.ts"
-@@ -1238,22 +1238,31 @@ describe("the socket's delivery, with a fan-out attached", () => {
+@@ -1249,22 +1249,31 @@ describe("the socket's delivery, with a fan-out attached", () => {
          return { type, payload: { channel, user: "tuan", change: "added" } };
        case "presence.changed":
          return { type, payload: { user: "tuan", state: "online" } };
@@ -4241,13 +4277,13 @@ describe("a store that is not there", () => {
  // The door, the frames, and the liveness clock — all provable without a
  // database, because the gateway has no database (ADR-05). The api is a
  // stub here for exactly that reason: if these tests needed Postgres, the
-@@ -49,12 +50,17 @@ function stubApi(overrides: Partial<ApiClient> = {}): ApiClient {
-             environment_id: "env-1",
+@@ -50,12 +51,17 @@ function stubApi(overrides: Partial<ApiClient> = {}): ApiClient {
              user: "tuan",
              // The api now reports whether the user is banned, and a stub
              // that does not say is a stub that has not thought about it.
              banned: false,
              channel_ids: [CHANNEL],
+             revisions: {},
 +            // The limits ride the session response because the
 +            // gateway has no database to read them from — so the stub supplies
 +            // them, exactly as the api would. Generous by default: every test
@@ -4259,7 +4295,7 @@ describe("a store that is not there", () => {
      sendMessage: async () => committed(42),
          // The backstop reads this. The default answers what the session above says,
          // so a stub that never overrides it is a stub whose re-read agrees with its
-@@ -158,17 +164,40 @@ function stubFanout(): Fanout & {
+@@ -159,17 +165,40 @@ function stubFanout(): Fanout & {
      },
      unsubscribe: async () => {},
      close: async () => {},
@@ -4300,7 +4336,7 @@ describe("a store that is not there", () => {
        notFoundDocsUrl: docsUrl("not_found"),
      health: () => ({}),
      logger: silent,
-@@ -177,12 +206,13 @@ async function boot(
+@@ -178,12 +207,13 @@ async function boot(
      server,
      api,
      logger: silent,
@@ -4314,7 +4350,7 @@ describe("a store that is not there", () => {
    return {
      url: `ws://127.0.0.1:${port}/v1/ws`,
      close: async () => {
-@@ -882,6 +912,255 @@ describe("INBOUND_FRAME_TYPES", () => {
+@@ -883,6 +913,257 @@ describe("INBOUND_FRAME_TYPES", () => {
      // use to type as somebody else.
      for (const forgeable of ["message.ack", "message.created", "typing"]) {
        expect(INBOUND_FRAME_TYPES.has(forgeable as never)).toBe(false);
@@ -4464,6 +4500,7 @@ describe("a store that is not there", () => {
 +          // that does not say is a stub that has not thought about it.
 +          banned: false,
 +          channel_ids: [CHANNEL],
++          revisions: {},
 +          limits: { connect: 2, send: 600 },
 +        }),
 +      }),
@@ -4500,6 +4537,7 @@ describe("a store that is not there", () => {
 +          // that does not say is a stub that has not thought about it.
 +          banned: false,
 +          channel_ids: [CHANNEL],
++          revisions: {},
 +          limits: { connect: 3_000, send: configured },
 +        }),
 +      }),
@@ -4573,8 +4611,7 @@ describe("a store that is not there", () => {
 ```
 
 ```diff title="services/gateway/src/resume.itest.ts"
-@@ -115,20 +115,23 @@ describe("resume across a real fabric", () => {
-     // different fanout client on the same subject — publishes into the
+@@ -116,20 +116,23 @@ describe("resume across a real fabric", () => {
      // window. Neither side coordinates; only the buffer saves this.
      harness = await boot({
        session: async () => ({
@@ -4584,6 +4621,7 @@ describe("a store that is not there", () => {
          // that does not say is a stub that has not thought about it.
          banned: false,
          channel_ids: [CHANNEL],
+         revisions: {},
 +        // The limits ride the session response now. Generous, and
 +        // beside the point of every test in this file.
 +        limits: { connect: 3_000, send: 600 },
@@ -4597,8 +4635,7 @@ describe("a store that is not there", () => {
        },
        sendMessage: async () => {
          throw new Error("not used");
-@@ -153,20 +156,23 @@ describe("resume across a real fabric", () => {
-     // Committed after the backfill's snapshot: it exists ONLY in the buffer,
+@@ -155,20 +158,23 @@ describe("resume across a real fabric", () => {
      // and the flush is the only reason the client ever sees it.
      harness = await boot({
        session: async () => ({
@@ -4608,6 +4645,7 @@ describe("a store that is not there", () => {
          // that does not say is a stub that has not thought about it.
          banned: false,
          channel_ids: [CHANNEL],
+         revisions: {},
 +        // The limits ride the session response now. Generous, and
 +        // beside the point of every test in this file.
 +        limits: { connect: 3_000, send: 600 },
@@ -4621,8 +4659,7 @@ describe("a store that is not there", () => {
          throw new Error("not used");
        },
        // Agrees with `session` above: this file is about the resume,
-@@ -185,20 +191,23 @@ describe("resume across a real fabric", () => {
- 
+@@ -188,20 +194,23 @@ describe("resume across a real fabric", () => {
    it("goes live after the flush, with no buffering left behind", async () => {
      harness = await boot({
        session: async () => ({
@@ -4632,6 +4669,7 @@ describe("a store that is not there", () => {
          // that does not say is a stub that has not thought about it.
          banned: false,
          channel_ids: [CHANNEL],
+         revisions: {},
 +        // The limits ride the session response now. Generous, and
 +        // beside the point of every test in this file.
 +        limits: { connect: 3_000, send: 600 },
@@ -4645,8 +4683,7 @@ describe("a store that is not there", () => {
        // Agrees with `session` above: this file is about the resume,
        // and a backstop that disagreed with the connect would be a second subject
        // under test.
-@@ -235,20 +244,23 @@ describe("resume across a real fabric", () => {
-     //
+@@ -239,20 +248,23 @@ describe("resume across a real fabric", () => {
      // One number different from the test above it. That is the whole bug.
      harness = await boot({
        session: async () => ({
@@ -4656,6 +4693,7 @@ describe("a store that is not there", () => {
          // that does not say is a stub that has not thought about it.
          banned: false,
          channel_ids: [CHANNEL],
+         revisions: {},
 +        // The limits ride the session response now. Generous, and
 +        // beside the point of every test in this file.
 +        limits: { connect: 3_000, send: 600 },
@@ -4669,8 +4707,7 @@ describe("a store that is not there", () => {
        // Agrees with `session` above: this file is about the resume,
        // and a backstop that disagreed with the connect would be a second subject
        // under test.
-@@ -278,20 +290,23 @@ describe("resume across a real fabric", () => {
-     // retiring the mark once a higher sequence arrived — which would see the 43,
+@@ -283,20 +295,23 @@ describe("resume across a real fabric", () => {
      // drop the mark, and then deliver the 42 (research R3).
      harness = await boot({
        session: async () => ({
@@ -4680,6 +4717,7 @@ describe("a store that is not there", () => {
          // that does not say is a stub that has not thought about it.
          banned: false,
          channel_ids: [CHANNEL],
+         revisions: {},
 +        // The limits ride the session response now. Generous, and
 +        // beside the point of every test in this file.
 +        limits: { connect: 3_000, send: 600 },
@@ -4693,8 +4731,7 @@ describe("a store that is not there", () => {
        // Agrees with `session` above: this file is about the resume,
        // and a backstop that disagreed with the connect would be a second subject
        // under test.
-@@ -380,20 +395,23 @@ describe("resume across a real fabric", () => {
-     // would suppress messages the client never got — turning this chapter's
+@@ -387,20 +402,23 @@ describe("resume across a real fabric", () => {
      // duplicate into a gap, which constitution II ranks worse.
      harness = await boot({
        session: async () => ({
@@ -4704,6 +4741,7 @@ describe("a store that is not there", () => {
          // that does not say is a stub that has not thought about it.
          banned: false,
          channel_ids: [CHANNEL],
+         revisions: {},
 +        // The limits ride the session response now. Generous, and
 +        // beside the point of every test in this file.
 +        limits: { connect: 3_000, send: 600 },
@@ -5087,7 +5125,7 @@ describe("a store that is not there", () => {
        //                    difference between them is the whole test
        "packages/test-harness/src/global-setup.ts",
        "packages/test-harness/src/setup.ts",
-@@ -58,12 +74,89 @@ export default tseslint.config(
+@@ -64,12 +80,89 @@ export default tseslint.config(
        // "the state under test is one the repository is now unable to reach". Both are
        // listed by path rather than reached through a shared helper, because a helper in
        // another file names none of these specifiers and this rule sees only imports —
@@ -5177,7 +5215,7 @@ describe("a store that is not there", () => {
          "error",
          {
            paths: [
-@@ -74,12 +167,17 @@ export default tseslint.config(
+@@ -80,12 +173,17 @@ export default tseslint.config(
              },
              {
                name: "drizzle-orm",
@@ -5238,6 +5276,6 @@ describe("a store that is not there", () => {
      // drives it explicitly.
 ```
 
-## What this chapter does not deliver
+## Chương này không deliver gì
 
 <ChapterFooter id="3.22" locale="vi" />

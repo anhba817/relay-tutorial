@@ -1,9 +1,10 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
 import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
 
 export const metadata = {
   title: "Presence, và ai được phép nhìn thấy — Building Relay",
   description:
-    "Bản dịch tiếng Việt của chương này đang được chuẩn bị. Toàn bộ mã nguồn bên dưới giữ nguyên như bản tiếng Anh.",
+    "Presence chỉ có nghĩa khi đúng người được thấy. Chương này biến frame đã khai báo thành state có TTL, scope theo membership và failure semantics khi Redis unavailable.",
   alternates: {
     canonical: "/vi/part-3/chapter-13/who-is-allowed-to-see-it",
     languages: {
@@ -15,11 +16,13 @@ export const metadata = {
 
 <ChapterHeader id="3.13" locale="vi" />
 
-> **Bản dịch đang được chuẩn bị.** Phần diễn giải của chương này chưa được dịch sang
-> tiếng Việt. Các khối mã bên dưới là bản gốc tiếng Anh và giống hệt bản tiếng Anh của
-> chương — bạn có thể gõ theo chúng ngay bây giờ. Bản dịch đầy đủ sẽ thay thế trang này.
+Presence từng là một từ trong protocol vocabulary mà platform không bao giờ nói ra. Để nó
+có meaning cần state, expiration, audience và một answer rõ ràng khi store không có.
 
-## A word in the vocabulary that nothing has ever said
+## Một từ trong vocabulary mà không gì từng nói
+
+`presence.changed` đã nằm trong frame union nhưng không có emitter. Declared frame không
+phải capability; capability bắt đầu ở state transition có người quan sát được.
 
 ```text title="packages/protocol/src/frames.ts (excerpt)"
 /** Presence states per FR-RTM-06; delivery scope is FR-RTM-07's concern. */
@@ -36,7 +39,10 @@ export const presenceChangedSchema = z.strictObject({
 ["presence.changed", "outbound", "derived from connections the gateway holds, not claimed"],
 ```
 
-## The plumbing a reader was promised, and why it is not this
+## Plumbing reader được hứa, và tại sao không phải đây
+
+Presence không thay history hay resume. Nó là ephemeral state; message persistence vẫn đi
+qua database và cursor. Trộn hai loại state sẽ làm client suy diễn sai guarantee.
 
 ```text title="chapter 2.6 (excerpt)"
 And presence (FR-RTM-06) and typing (FR-RTM-08) will reuse this exact pub/sub
@@ -184,7 +190,10 @@ describe("presenceFabricSchema", () => {
 });
 ```
 
-## A key whose existence is the state
+## Key mà sự tồn tại chính là state
+
+Redis key có TTL đại diện online presence. Heartbeat gia hạn key; absence sau grace period
+là offline, không cần một record delete bền vững.
 
 ```text title="the whole data model (excerpt)"
 presence:{env}:{user}          exists  <=>  the user is online
@@ -197,7 +206,11 @@ FR-RTM-06's grace     the SRS        how long after a close before "offline"
 the presence key TTL  docs/05-sad.md how long the key survives without a refresh
 ```
 
-## The grace period, and a fix that was worse than the bug
+## Grace period, và một fix còn tệ hơn bug
+
+Disconnect tức thì không phải offline chắc chắn vì network jitter và reconnect. Grace period
+tránh flap, nhưng fix không được giữ stale timer làm user vừa reconnect lại bị broadcast
+offline.
 
 ```ts title="services/gateway/src/presence.ts"
 import { randomUUID } from "node:crypto";
@@ -638,7 +651,10 @@ export function createPresence({
 }
 ```
 
-## Who is allowed to see it
+## Ai được phép nhìn thấy nó
+
+Presence audience theo channel membership. Người cùng tenant nhưng không phải member không
+được nhận state; visibility check phải dùng cùng rule mà socket session dùng.
 
 ```text title="FR-RTM-07, and there is no code for it (excerpt)"
 a transition publishes on presence:{c} for each of the SUBJECT's channels
@@ -871,7 +887,10 @@ delivery walks registry.subscribersOf(c), which is a membership test
      });
 ```
 
-## When the store is not there
+## Khi store không ở đó
+
+Redis unavailable không được tạo online/offline fiction. Gateway degrade theo policy được
+ghi rõ và log failure để operator biết presence không authoritative.
 
 ```text title="services/gateway/src/presence.ts (excerpt)"
 logger.log("error", "presence.failed", { op, error: String(error) });
@@ -1102,7 +1121,7 @@ async function startApi(): Promise<ApiUnderTest> {
   }
   const client = require_(join(dist, "db", "client.js")) as {
     createDb: (pool: unknown) => unknown;
-    createPool: () => { query: (sql: string) => Promise<unknown> };
+    createPool: () => { query: (sql: string, params?: unknown[]) => Promise<unknown> };
   };
   const seeder = require_(join(dist, "db", "repository.js")) as Seeder;
   const pool = client.createPool();
@@ -1197,7 +1216,20 @@ async function startApi(): Promise<ApiUnderTest> {
     credential: key.credential,
     subjects,
     outboxCount: async () => {
-      const result = (await pool.query("select count(*)::int as n from outbox")) as {
+      /** THIS ENVIRONMENT'S ROWS, NOT THE TABLE'S.
+       *
+       * This counted `select count(*) from outbox` — every row written by anything. The
+       * assertion it serves is "a presence transition writes no outbox row", and the lane
+       * runs this package's files in PARALLEL, so `membership.itest.ts` sending a message
+       * next door moves the number and the test reports `expected 614255 to be 614250`.
+       * Nothing in that failure suggests a neighbour.
+       *
+       * The outbox has no `environment_id` column — it keys on `subject`, and the subject
+       * carries the environment, so that is what scopes it. */
+      const result = (await pool.query(
+        "select count(*)::int as n from outbox where subject like '%' || $1 || '%'",
+        [environment.id],
+      )) as {
         rows: { n: number }[];
       };
       return result.rows[0]?.n ?? 0;

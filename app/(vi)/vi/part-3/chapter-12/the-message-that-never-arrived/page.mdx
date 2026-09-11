@@ -1,9 +1,12 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
 import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figTwoDoors, figOrdering, figFailureShape, figMembershipSnapshot } from "./figures";
 
 export const metadata = {
   title: "Tin nhắn chưa từng tới — Building Relay",
   description:
-    "Bản dịch tiếng Việt của chương này đang được chuẩn bị. Toàn bộ mã nguồn bên dưới giữ nguyên như bản tiếng Anh.",
+    "Fan-out edge đã có trong kiến trúc từ trước API. Để message REST thực sự tới socket cần giữ ordering, xác định hai caller và biến best-effort publish thành delivery contract có failure rõ ràng.",
   alternates: {
     canonical: "/vi/part-3/chapter-12/the-message-that-never-arrived",
     languages: {
@@ -15,11 +18,29 @@ export const metadata = {
 
 <ChapterHeader id="3.12" locale="vi" />
 
-> **Bản dịch đang được chuẩn bị.** Phần diễn giải của chương này chưa được dịch sang
-> tiếng Việt. Các khối mã bên dưới là bản gốc tiếng Anh và giống hệt bản tiếng Anh của
-> chương — bạn có thể gõ theo chúng ngay bây giờ. Bản dịch đầy đủ sẽ thay thế trang này.
+Message gửi qua REST từng được persist nhưng không bao giờ tới socket. Fan-out edge đã được
+vẽ trong architecture trước khi API tồn tại; chương này làm edge đó thành sự thật.
 
-## The edge was drawn before the api existed
+## Edge được vẽ trước khi API tồn tại
+
+SAD đã mô tả API publish fan-out tới Redis và gateway subscribe `chan:{channel_id}`. Gateway
+đã làm nửa subscribe; API send path write row và outbox rồi dừng. Diagram không phải
+implementation, nhưng nó là contract mà hai nửa phải gặp nhau.
+
+<Figure caption="Delivery có hai cửa: persistence và fan-out live." code={figTwoDoors} />
+<Figure caption="Commit phải xảy ra trước publish." code={figOrdering} />
+<Figure caption="Failure shape quyết định caller có thể kết luận gì." code={figFailureShape} />
+<Figure caption="Membership được snapshot ở boundary của message." code={figMembershipSnapshot} />
+
+<Why>Publisher boundary giữ repository không biết Redis.</Why>
+<Why>Protocol grammar dùng chung tránh API và gateway drift.</Why>
+<Why>Failure explicit tốt hơn delivery không xảy ra nhưng response vẫn thành công.</Why>
+<Why>History và cursor là authority khi live path im lặng.</Why>
+
+<Trap>Publish trước commit có thể phát message history chưa đọc được.</Trap>
+<Trap>Catch rồi log Redis error biến delivery contract thành best effort âm thầm.</Trap>
+<Trap>Payload sai field name phải fail test, không chỉ fail strict schema.</Trap>
+<Trap>Live silence không chứng minh persistence failure.</Trap>
 
 ```text title="docs/05-sad.md (excerpt)"
     api -- "publish fan-out" --> redis
@@ -143,7 +164,10 @@ export const metadata = {
 +export * from "./fanout.js";
 ```
 
-## The ordering cannot be copied
+## Ordering không thể copy lại
+
+Socket send publish sau commit. REST send phải giữ đúng ordering đó: commit message trước,
+rồi publish frame; publish trước commit có thể deliver message mà history chưa thấy.
 
 ```text title="docs/05-sad.md (excerpt)"
 - **Ack after commit, never before** (FR-MSG-05). The Redis fan-out happens after the ack;
@@ -166,7 +190,10 @@ export const metadata = {
     max   0.965 ms
 ```
 
-## Where the publish goes, and the two callers that decide it
+## Publish đi đâu, và hai caller quyết định nó
+
+REST API và socket gateway cùng tạo message, nên phải dùng chung subject, frame và failure
+semantics. Repository giữ data access; caller biết message nào đã được accept để fan-out.
 
 ```text title="services/api/src/messages/messages.controller.ts (excerpt)"
     const message = await this.messages.send(
@@ -383,7 +410,10 @@ services/api/src/messages/messages.controller.ts
        created_at: message.created_at,
 ```
 
-## Two guards, one of which has a reason nobody wrote down
+## Hai guard, một guard có lý do chưa ai viết ra
+
+Publish chỉ chạy cho message có sender và channel visible. Guard tách invalid request khỏi
+delivery failure, đồng thời tránh phát frame mà gateway schema không thể dựng trung thực.
 
 ```text title="services/api/src/messages/messages.controller.ts (excerpt)"
     if (!message.duplicate && message.text !== null) {
@@ -414,7 +444,10 @@ export const messageSchema = z.strictObject({
     expect(parsed.success, JSON.stringify(parsed.error?.issues)).toBe(true);
 ```
 
-## The grammar had to move, and the compiler said why
+## Grammar phải chuyển chỗ, và compiler nói lý do
+
+Subject grammar thuộc `@relay/protocol`, nơi API và gateway cùng import. Compiler bắt import
+CommonJS/ESM sai thay vì để Redis client hỏng lúc runtime.
 
 ```text title="tsc, four seconds after the export was added (excerpt)"
 src/index.ts(12,1): error TS2308: Module "./internal.js" has already exported a
@@ -426,7 +459,10 @@ events.msg.created.{environment_id}     the spine   — carries the tenant
 chan:{channel_id}                       the fan-out — carries a channel
 ```
 
-## Failing is the interesting half
+## Failure mới là nửa thú vị
+
+Success chỉ chứng minh Redis sẵn sàng. Publish failure không thể bị catch rồi log trong khi
+REST trả 201; như vậy là best-effort success giả, không phải delivery contract.
 
 ```text title="services/api/src/fanout/publisher.ts (excerpt)"
       if (now() < downUntil) return;
@@ -450,7 +486,10 @@ chan:{channel_id}                       the fan-out — carries a channel
       expect(lines.find((l) => l["msg"] === "fanout.publish_failed")).toBeUndefined();
 ```
 
-## What the measurements said about the client
+## Measurement nói gì về client
+
+API lần đầu nói chuyện với Redis, nên measurement bao gồm connection lifecycle, retry và
+hành vi broker unavailable, không chỉ latency.
 
 ```diff title="services/api/package.json"
 @@ -16,12 +16,13 @@
@@ -480,7 +519,10 @@ chan:{channel_id}                       the fan-out — carries a channel
     with commandTimeout: 100               rejected in 100 ms, then 4 ms, then 100 ms
 ```
 
-## The clause this chapter did not fix
+## Clause chương này không sửa
+
+Live fan-out không thay resume correctness hay outbox delivery. Các clause đó cần consumer
+và retry semantics riêng, không thể hứa bằng publish trực tiếp.
 
 ```text title="services/gateway/src/session.ts (excerpt)"
     registry.add(connection);
@@ -489,11 +531,20 @@ chan:{channel_id}                       the fan-out — carries a channel
     // it (reference-counted in the fabric).
 ```
 
-## What a client can conclude from silence
+## Client có thể kết luận gì từ im lặng
 
-## The clause, and the amendment that was not needed
+Không thấy live frame không chứng minh message không tồn tại. Cursor và history vẫn là
+authority để phân biệt delay, reconnect và message chưa được gửi.
 
-## The seven files this chapter changes and does not teach
+## Clause, và amendment không cần thiết
+
+Sender chapter sửa attribution; chương này sửa delivery. Không phải chapter liền kề nào
+cũng cần amend requirement—đôi khi implementation là phần còn thiếu.
+
+## Bảy file chương này đổi nhưng không dạy
+
+Đây là plumbing hỗ trợ: dependency wiring, test setup và config. Chúng giữ contract hoạt
+động nhưng không phải concept mới.
 
 ```diff title="services/api/src/auth/principal.ts"
 @@ -28,12 +28,16 @@ export type PrincipalKind = Principal["kind"];
@@ -668,8 +719,8 @@ chan:{channel_id}                       the fan-out — carries a channel
      );
  
 @@ -283,33 +283,56 @@ describe("a channel, a member and a message, all over the public API", () => {
-     // WAS `every((m) => m.user === null)`, AND THAT IS THE CHAPTER (
-     // T055's class). This assertion existed to prove the rows were senderless, which was
+     // WAS `every((m) => m.user === null)`, AND THAT IS THE CHAPTER
+     // (T055's class). This assertion existed to prove the rows were senderless, which was
      // why `toFrame` dropped them. Every REST send now names a sender, so the premise it
      // rested on is gone.
      expect(history.messages.every((m) => m.user === "rest-courier")).toBe(true);
@@ -905,7 +956,9 @@ chan:{channel_id}                       the fan-out — carries a channel
 +});
 ```
 
-## The four new files, in full
+## Bốn file mới, đầy đủ
+
+Các file mới đặt publisher boundary, Redis connection và tests cho success/failure path.
 
 ```ts title="packages/protocol/src/fanout.ts"
 /** The live fan-out's subject grammar (chapter 2.6, ADR-07).
@@ -1321,5 +1374,20 @@ describe("the api's fan-out publisher", () => {
   });
 });
 ```
+
+<Checkpoint>
+
+- REST send publish fan-out sau commit
+- publish failure không trả success giả
+- gateway nhận cùng protocol frame mà socket send dùng
+
+</Checkpoint>
+
+<ForwardRef>
+
+Delivery live đã được nối. Những guarantee về persistence, resume và background delivery
+vẫn được giữ bằng các boundary riêng của chúng.
+
+</ForwardRef>
 
 <ChapterFooter id="3.12" locale="vi" />

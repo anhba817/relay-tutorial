@@ -1,9 +1,12 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
 import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figWrongWay, figUnread, figKeyset, figDeletion } from "./figures";
 
 export const metadata = {
   title: "Những gì một người dùng thấy — Building Relay",
   description:
-    "Bản dịch tiếng Việt của chương này đang được chuẩn bị. Toàn bộ mã nguồn bên dưới giữ nguyên như bản tiếng Anh.",
+    "Bề mặt user cần channel theo activity, unread count, profile và ban. Measurement nhỏ ban đầu che một query shape không scale, nên chapter xây schema và test tại bốn kích thước.",
   alternates: {
     canonical: "/vi/part-3/chapter-10/what-a-user-sees",
     languages: {
@@ -15,11 +18,41 @@ export const metadata = {
 
 <ChapterHeader id="3.10" locale="vi" />
 
-> **Bản dịch đang được chuẩn bị.** Phần diễn giải của chương này chưa được dịch sang
-> tiếng Việt. Các khối mã bên dưới là bản gốc tiếng Anh và giống hệt bản tiếng Anh của
-> chương — bạn có thể gõ theo chúng ngay bây giờ. Bản dịch đầy đủ sẽ thay thế trang này.
+User surface không chỉ là endpoint mới. Nó cần nói channel nào hoạt động gần đây, user chưa
+đọc gì, ai đã bị xóa, và ban ảnh hưởng một connection đang mở như thế nào.
 
-## 0.87 milliseconds, and the number was a lie
+## 0.87 milliseconds, và con số là lời nói dối
+
+Query ban đầu order channel bằng `max(created_at)` của message. Ở dữ liệu nhỏ nó mất 0.87 ms;
+ở một triệu message nó thành sequential scan trên mọi message trong environment. Con số nhỏ
+không đo được shape của workload thật.
+
+<Figure caption="Benchmark nhỏ có thể che query shape không scale." code={figWrongWay} />
+<Figure caption="Unread count cần read position theo từng user và channel." code={figUnread} />
+<Figure caption="Keyset cursor giữ pagination ổn định khi activity thay đổi." code={figKeyset} />
+<Figure caption="Soft deletion giữ author lịch sử mà không giữ profile." code={figDeletion} />
+
+<Why>Đo ở nhiều kích thước biến latency thành evidence về query shape.</Why>
+<Why>Read position là state của user, không phải counter toàn cục của channel.</Why>
+<Why>Cursor phải mang ordering key để page sau không phụ thuộc offset biến động.</Why>
+<Why>Soft delete tách historical attribution khỏi personal data.</Why>
+<Why>Ban cần được kiểm tra ở nơi connection vẫn có thể hành động.</Why>
+
+<Trap>Test fixture nhỏ có thể làm sequential scan trông như một quyết định đúng.</Trap>
+<Trap>Offset pagination bỏ hoặc lặp row khi activity đổi giữa hai page.</Trap>
+<Trap>Unread count không phải promise transactionally exact.</Trap>
+<Trap>Xóa row author làm history không còn trung thực.</Trap>
+<Trap>Token mới bị từ chối không tự đóng socket đang mở.</Trap>
+<Trap>Cross-tenant attack không thay same-tenant authorization control.</Trap>
+<Trap>Status 404 không tự nói channel absent hay invisible.</Trap>
+<Trap>Table trong guard array mà không bait vẫn không được drive.</Trap>
+<Trap>Column không reader chưa phải product capability.</Trap>
+
+<SkipAhead>
+
+Các diff dưới đây đặt schema, endpoint và test để những property này được enforce.
+
+</SkipAhead>
 
 ```sql
 order by (select max(created_at) from messages where channel_id = c.id) desc
@@ -230,7 +263,11 @@ main()
   });
 ```
 
-## The count with no counter
+## Count không có counter
+
+Unread count không thể suy ra an toàn từ `last_sequence` một mình: nó cần read position
+theo từng user/channel. `read_positions` lưu sequence đã đọc, còn query tính phần phía sau
+nó; row chỉ được tạo khi user thực sự đọc.
 
 ```diff title="services/api/src/db/repository.ts"
 @@ -1,19 +1,20 @@
@@ -392,7 +429,7 @@ main()
     *
     * BULK, BECAUSE THE REQUIREMENT ALWAYS WAS. FR-006 says "up to 100 in one
 -   * request" and FR-007 says the result is reported per user — which is chapter
--   * 3.13's `addMembers` shape in both halves. `contracts/membership.md` specified a
+-   * the endpoints chapter's `addMembers` shape in both halves. `contracts/membership.md` specified a
 +   * request" and FR-007 says the result is reported per user — which is the
 +   * endpoints chapter's `addMembers` shape in both halves. `contracts/membership.md` specified a
     * single-user `DELETE …/members/:userExternalId` for ten analysis passes, having
@@ -466,8 +503,8 @@ main()
      return rows.map((r) => r.channel_id);
    }
  
-+  /** Upsert a user by external id, updating the profile fields present (
-+   * FR-025, FR-026).
++  /** Upsert a user by external id, updating the profile fields present
++   * (FR-025, FR-026).
 +   *
 +   * NOT `createUser`, AND THE DIFFERENCE IS THE POINT. `createUser` is deliberately not an
 +   * update: its comment says so — "the display name of the existing row wins; quietly
@@ -800,8 +837,8 @@ main()
 +    return updated.length > 0;
 +  }
 +
-+  /** A user's channels, most recently active first, keyset-paginated (chapter
-+   * 3.15, FR-013, FR-CHN-08).
++  /** A user's channels, most recently active first, keyset-paginated (the
++   * channel-control chapter, FR-013, FR-CHN-08).
 +   *
 +   * `id` IS PART OF THE KEY AND NOT DECORATION. `last_activity_at` is not unique:
 +   * two channels can take a message in the same millisecond, and a keyset on a
@@ -1046,7 +1083,10 @@ main()
        //
 ```
 
-## The plan, at four sizes
+## Plan, ở bốn kích thước
+
+Plan được đo ở empty, small, medium và million-message fixture. Index đúng làm query giữ
+shape bounded; benchmark nhỏ chỉ là một điểm dữ liệu, không phải bằng chứng scale.
 
 ```diff title="services/api/src/db/repository.itest.ts"
 @@ -277,6 +277,225 @@ describe("members_role_check names the channel's three (FR-011, R8)", () => {
@@ -1449,9 +1489,16 @@ export const readPositionBodySchema = z.strictObject({
 export type ReadPositionBody = z.infer<typeof readPositionBodySchema>;
 ```
 
-## Two approximations, stated
+## Hai approximation được nói rõ
 
-## The user surface
+Unread là snapshot lúc read, và activity là timestamp của message cuối. Cả hai approximation
+đều được nói rõ để client không diễn giải chúng như transactionally exact counter.
+
+## User surface
+
+Endpoint listing trả channel visible của user, activity, unread count và cursor. Pagination
+phải stable: cursor mang ordering key để page tiếp theo không lặp hay bỏ channel khi có write
+mới.
 
 ```ts title="services/api/src/users/users.module.ts"
 import { Module, Scope } from "@nestjs/common";
@@ -1906,7 +1953,10 @@ export class UsersController {
 }
 ```
 
-## The deletion that keeps the row
+## Deletion vẫn giữ row
+
+Xóa user không xóa author của message lịch sử. `deleted_at` và profile đã clear giữ identity
+đủ để history trung thực mà không giữ personal data không cần thiết.
 
 ```diff title="services/gateway/src/isolation.itest.ts"
 @@ -37,47 +37,108 @@ function declaredFrameTypes(): string[] {
@@ -3461,7 +3511,10 @@ describe("a user's channel listing", () => {
 });
 ```
 
-## A user record on first authentication, which nothing did
+## User record ở lần authentication đầu, điều trước đó không gì làm
+
+Authentication lần đầu materialize user record. Trước đó token có thể hợp lệ cho external id
+không có row; user surface cần row để profile, membership và ban có state nhất quán.
 
 ```json
 { "code": "invalid_request", "message": "unknown user" }
@@ -3659,7 +3712,10 @@ describe("a user's channel listing", () => {
  });
 ```
 
-## The ban, and what it does to a connection already open
+## Ban, và tác động lên connection đang mở
+
+Ban không chỉ từ chối token mới. Gateway phải kiểm tra lại khi connection hiện hữu hành động,
+để user bị ban không tiếp tục gửi bằng socket đã mở.
 
 ```diff title="packages/protocol/src/internal.ts"
 @@ -134,12 +134,28 @@ export const internalMembershipsResponseSchema = z.strictObject({
@@ -4289,7 +4345,7 @@ describe("a user's channel listing", () => {
        ["read history", "GET", (c) => `/v1/channels/${c}/messages?limit=10`],
        ["send", "POST", (c) => `/v1/channels/${c}/messages`, { text: "not mine" }],
        ["join", "POST", (c) => `/v1/channels/${c}/join`],
-+      // THE FIFTH VERB (SC-001a, THE CHANNEL-CONTROL CHAPTER's T121a). Its route is built in the
++      // THE FIFTH VERB (SC-001a, THE CHANNEL-CONTROL CHAPTER'S T121a). Its route is built in the
 +      // unread-count phase rather than with the other four, so it joins the oracle
 +      // here — the verb list is the authority and the count of verbs is not written
 +      // down anywhere, which is the fix for a number that went three, then four,
@@ -4693,8 +4749,8 @@ describe("a user's channel listing", () => {
 +   * later test's profile PATCH answer 404. Phase 7 hit the same class twice: a test that
 +   * mutates a shared fixture breaks whichever test runs after it, and the fix is a
 +   * fixture of its own rather than an ordering constraint nobody can see. */
-+  /** Ban and unban this tenant's own user through the public route (
-+   * T153). */
++  /** Ban and unban this tenant's own user through the public route
++   * (T153). */
 +  banSelf: () => Promise<void>;
 +  unbanSelf: () => Promise<void>;
 +  seedDeletable: () => Promise<{
@@ -4820,7 +4876,10 @@ BEGIN
     'webhook_endpoints',
 ```
 
-## The fourth attack shape, and the two it turned out not to cover
+## Attack shape thứ tư, và hai thứ nó không cover
+
+Same-tenant non-member attack bổ sung cho cross-tenant gauntlet. Nó kiểm tra authorization
+trong tenant, nhưng không thay thế control chứng minh member hợp lệ vẫn thành công.
 
 ```ts title="services/api/src/isolation/targets.ts (excerpt)"
   // NO `list` SHAPE YET, and that is deliberate rather than an omission. Nothing this
@@ -4849,13 +4908,19 @@ vs   {"data":[{"external_id":"absent-0000…","status":"created",…}]}   (absen
     const attacked = counts.read + counts.write + counts.credential;
 ```
 
-## The 404 that stopped being a signal
+## 404 không còn là signal
+
+Khi visibility predicate dùng chung, 404 có thể là channel absent hoặc private channel caller
+không thấy. Test phải so whole envelope và state, không suy nghĩa của refusal từ status.
 
 ```
 AssertionError: expected 200 to be 404
 ```
 
-## The guard's third table, and the message that needed it
+## Table thứ ba của guard, và message cần nó
+
+Table mới có `environment_id` được thêm vào sentinel guard cùng chapter tạo nó. Guard chỉ có
+giá trị khi bait và test drive table thật; chỉ thêm tên vào array không tạo protection.
 
 ```
 record "old" has no field "id"
@@ -4869,76 +4934,10 @@ record "old" has no field "id"
     COALESCE(' — the bait planted by ' || who, '');
 ```
 
-## What the two chapters cost, in numbers
+## Hai chương tốn gì, bằng con số
 
-```diff title="packages/service-kit/src/index.ts"
-@@ -56,7 +56,7 @@
-   health: () => Record<string, unknown>;
-   logger?: Logger;
-   /** The `docs_url` for the not-found envelope this server answers unknown routes
--   * with (FR-027).
-+   * with (the error-registry chapter, FR-027).
-    *
-    * REQUIRED, AND THE DEPENDENCY INVERTS RATHER THAN BEING ADDED. The obvious move
-    * is to import `docsUrl` from `@relay/protocol` here — and this package declares
-@@ -78,7 +78,7 @@
-  * answers with the service's health payload, and unknown routes get the
-  * EIR-API-04 error shape.
-  *
-- * The docs_url is no longer a placeholder — the isolation gauntlet made it a required option
-+ * The docs_url is no longer a placeholder — the error-registry chapter made it a required option
-  * and the caller derives it from `@relay/protocol`'s registry, which is how a
-  * package with no dependencies can still emit a URL the registry owns. */
- export function serve(options: ServeOptions): Server {
-```
-
-```diff title="services/api/src/messages/zod-validation.pipe.ts"
-@@ -15,7 +15,7 @@
-     const result = this.schema.safeParse(value);
-     if (!result.success) {
-       const issue = result.error.issues[0];
--      // WHICH FIELD, and the isolation gauntlet is where that stopped being optional.
-+      // WHICH FIELD, and the error-registry chapter is where that stopped being optional.
-       //
-       // EIR-API-04's error shape has carried a `field` since chapter 1.3 and
-       // `errorFrameSchema` declares it — and nothing in the api had ever set it.
-```
-
-```diff title="services/api/src/protocol-error.filter.ts"
-@@ -39,7 +39,7 @@
-       typeof (response as { code?: unknown }).code === "string"
-         ? (response as { code: string }).code
-         : null;
--    // TYPED AS `ErrorCode` (FR-025). The ladder emitted five codes
-+    // TYPED AS `ErrorCode` (the error-registry chapter, FR-025). The ladder emitted five codes
-     // that were not in the registry for twenty-two chapters — `invalid_request`,
-     // `forbidden`, `not_found`, `internal_error` and the frame codes — and
-     // `docs_url` is derived from the code, so each one shipped a link to a page
-```
-
-```diff title="services/api/src/protocol-error.ts"
-@@ -1,7 +1,7 @@
- import { HttpException } from "@nestjs/common";
- import type { ErrorCode } from "@relay/protocol";
- 
--/** An HTTP failure that NAMES ITS OWN CODE, typed (FR-025, FR-026).
-+/** An HTTP failure that NAMES ITS OWN CODE, typed (the error-registry chapter, FR-025, FR-026).
-  *
-  * The credentials chapter introduced the convention that a thrower may name its code, because
-  * `wrong_credential_type` is a distinction a status cannot carry. What it could not
-```
-
-```diff title="services/gateway/src/main.ts"
-@@ -28,7 +28,7 @@
-     }),
-     logger: log,
-     // The registry owns the URL; `service-kit` owns no dependencies. So the URL
--    // crosses the boundary as data (FR-027, R9).
-+    // crosses the boundary as data (the error-registry chapter, FR-027, R9).
-     notFoundDocsUrl: docsUrl("not_found"),
-   });
-   // The socket server rides the SAME listener as health — one port, two
-```
+Các con số dưới đây ghi rõ fence, test, migration và coverage thay đổi. Count là evidence
+cho scope, không phải thay thế cho behaviour assertion.
 
 ```diff title="services/gateway/src/public-surface.itest.ts"
 @@ -17,13 +17,13 @@ import { attachSessions } from "./session.js";
@@ -5082,7 +5081,10 @@ record "old" has no field "id"
  }
 ```
 
-## The column that has no reader
+## Column không có reader
+
+Một column mới chỉ có ý nghĩa khi reader hoặc decision consult nó. Nếu chưa có reader, nó
+được ghi như debt thay vì được gọi là capability đã ship.
 
 ```diff title="services/api/src/db/schema.ts"
 @@ -197,12 +197,30 @@ export const users = pgTable(
@@ -5235,7 +5237,7 @@ record "old" has no field "id"
  //
 ```
 
-## The chapter in full
+## Toàn bộ chương
 
 ```diff title="packages/test-harness/src/sentinel.sql"
 @@ -69,18 +69,30 @@ BEGIN
@@ -5310,7 +5312,7 @@ record "old" has no field "id"
 ```
 
 ```diff title="packages/test-harness/src/sentinel.ts"
-@@ -123,17 +123,19 @@ export const SENTINEL = {
+@@ -123,17 +123,21 @@ export const SENTINEL = {
  export async function plant(
    client: { query(sql: string, values?: unknown[]): Promise<unknown> },
    s: Sentinel,
@@ -5325,7 +5327,9 @@ record "old" has no field "id"
 +  // Children before parents, so the deletes do not trip a foreign key — and
 +  // `read_positions` references BOTH `channels` and `users`, which is why the note
 +  // the instruments chapter left here said the order was not arbitrary.
-+  await q(`DELETE FROM outbox         WHERE subject = $1`, [`${s.name}.bait`]);
++  // The subject the plant below writes, not the one it used to: a cleanup keyed on
++  // a stale subject leaves every row it was meant to remove.
++  await q(`DELETE FROM outbox         WHERE subject = $1`, [`events.${s.name}.bait`]);
 +  await q(`DELETE FROM read_positions WHERE environment_id = $1`, [s.environmentId]);
 +  await q(`DELETE FROM channels       WHERE environment_id = $1`, [s.environmentId]);
 +  await q(`DELETE FROM users          WHERE environment_id = $1`, [s.environmentId]);
@@ -5335,7 +5339,7 @@ record "old" has no field "id"
    await q(
      `INSERT INTO __sentinel_environments (environment_id, owner) VALUES ($1, $2)
       ON CONFLICT (environment_id) DO UPDATE SET owner = EXCLUDED.owner`,
-@@ -182,12 +184,24 @@ export async function plant(
+@@ -182,12 +186,24 @@ export async function plant(
    );
    await q(
      `INSERT INTO channels (id, environment_id, external_id, type, name)
@@ -5474,5 +5478,21 @@ record "old" has no field "id"
  
  const ENV = () => randomUUID();
 ```
+
+<Checkpoint>
+
+- user surface có listing, cursor, unread count và profile
+- query được đo tại bốn kích thước, gồm million-message fixture
+- ban được kiểm tra trên cả credential mới lẫn connection đang mở
+- mọi table tenant-scoped mới được sentinel guard drive
+
+</Checkpoint>
+
+<ForwardRef part="Part 3 khép lại">
+
+Các surface kế tiếp phải giữ cùng discipline: requirement, route, caller, data access và
+attack đều cần evidence khớp nhau, không chỉ một endpoint xanh.
+
+</ForwardRef>
 
 <ChapterFooter id="3.10" locale="vi" />

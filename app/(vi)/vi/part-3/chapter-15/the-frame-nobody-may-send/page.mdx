@@ -1,9 +1,10 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
 import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
 
 export const metadata = {
   title: "Cái frame không ai được gửi — Building Relay",
   description:
-    "Bản dịch tiếng Việt của chương này đang được chuẩn bị. Toàn bộ mã nguồn bên dưới giữ nguyên như bản tiếng Anh.",
+    "Presence frame là server-originated: client không bao giờ được gửi nó. Chương này thêm rate limit, protocol rule, wiring và tests để phân biệt quyền publish của client và service.",
   alternates: {
     canonical: "/vi/part-3/chapter-15/the-frame-nobody-may-send",
     languages: {
@@ -15,9 +16,8 @@ export const metadata = {
 
 <ChapterHeader id="3.15" locale="vi" />
 
-> **Bản dịch đang được chuẩn bị.** Phần diễn giải của chương này chưa được dịch sang
-> tiếng Việt. Các khối mã bên dưới là bản gốc tiếng Anh và giống hệt bản tiếng Anh của
-> chương — bạn có thể gõ theo chúng ngay bây giờ. Bản dịch đầy đủ sẽ thay thế trang này.
+Presence có frame mới, nhưng frame đó không phải input của client. Đây là boundary protocol:
+gateway có thể publish presence, socket client chỉ được gửi grammar đã được cho phép.
 
 ```text title="services/gateway/src/session.ts before this chapter (excerpt)"
 if (frame.data.type !== "message.send") {
@@ -27,7 +27,7 @@ if (frame.data.type !== "message.send") {
 }
 ```
 
-## The plan for this chapter was wrong, and a grep is what said so
+## Plan của chương sai, và grep nói điều đó
 
 ```text title="the grep that changed the chapter (excerpt)"
 services/gateway/src/fanout.ts
@@ -42,7 +42,7 @@ services/gateway/src/session.ts
   912: send(connection.socket, { type: "message.created", payload: message });
 ```
 
-## One shape, where membership needed two
+## Một shape, nơi membership cần hai shape
 
 ```ts title="packages/protocol/src/typing.ts"
 import { z } from "zod";
@@ -221,7 +221,7 @@ describe("typingFabricSchema", () => {
 });
 ```
 
-## The module publishes, which none of the others do
+## Module publish, điều các module khác không làm
 
 ```ts title="services/gateway/src/typing.ts"
 import {
@@ -404,7 +404,7 @@ export function createTyping({
 }
 ```
 
-## The seam, and what a set costs that a comparison did not
+## Seam, và cái giá của set so với comparison
 
 ```diff title="services/gateway/src/session.ts"
 @@ -6,12 +6,13 @@ import {
@@ -828,9 +828,9 @@ export function createTyping({
          idempotency_key: idem_key,
 ```
 
-## Two adjacent functions with opposite rules
+## Hai function kề nhau với rule đối ngược
 
-## The number this chapter cannot make true
+## Con số chương này không thể làm thành thật
 
 ```ts title="packages/protocol/src/frames.ts, chapter 1.3 (excerpt)"
 export const typingSchema = z.strictObject({
@@ -842,13 +842,13 @@ export const typingSchema = z.strictObject({
 });
 ```
 
-## Two seconds, and why it is not five
+## Hai giây, và tại sao không phải năm
 
 ```ts title="services/gateway/src/session.ts (excerpt)"
 export const DEFAULT_RENEWAL_INTERVAL_MS = 2_000;
 ```
 
-## The protocol, and the two counters that had to move
+## Protocol, và hai counter phải thay đổi
 
 ```diff title="packages/protocol/src/frames.ts"
 @@ -98,12 +98,37 @@ export const typingSchema = z.strictObject({
@@ -1350,7 +1350,7 @@ export const DEFAULT_RENEWAL_INTERVAL_MS = 2_000;
 +});
 ```
 
-## Wiring, and the exemption that has to name its case
+## Wiring, và exemption phải gọi tên case của nó
 
 ```diff title="services/gateway/src/main.ts"
 @@ -2,12 +2,13 @@ import { CLOSE_CODES, docsUrl, frameSchema } from "@relay/protocol";
@@ -1402,7 +1402,7 @@ export const DEFAULT_RENEWAL_INTERVAL_MS = 2_000;
    const requested = Number(process.env.PORT ?? 4001);
 ```
 
-## The tests, and the two that could have proved nothing
+## Test, và hai test có thể chẳng chứng minh gì
 
 ```ts title="services/gateway/src/typing.test.ts"
 import { describe, expect, it } from "vitest";
@@ -1704,6 +1704,29 @@ async function startRedisProxy(): Promise<{
 const settle = (ms = 300): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
+/** WAIT FOR THINGS TO ARRIVE, rather than for a clock to run out.
+ *
+ * A flat `settle(n)` before an assertion is a bet that the lane is idle, and this lane
+ * is not: it runs four files at once beside an api lane doing the same. A frame still
+ * in Redis when the clock expires reads as `expected [] to have a length of 1 but got
+ * 0` — a message that names no neighbour and no load. It cost one run of a twenty-run
+ * battery and one of six amplified runs, in two different tests of this file.
+ *
+ * ARRIVAL IS A CONDITION; ABSENCE IS NOT. This polls to a deadline and returns the
+ * moment the count is reached, so an idle lane pays nothing for it. Proving that
+ * nothing ELSE arrives cannot be shortened that way, so the tests making THAT claim
+ * keep their quiet window — `settle(1_500)` for the silence after a refused signal,
+ * `settle(120)` for the one inside a debounce interval. Those sleeps are the
+ * instrument; the ones this replaced were a guess. */
+const arrived = async (
+  of: () => unknown[],
+  count: number,
+  timeoutMs = 10_000,
+): Promise<void> => {
+  const deadline = Date.now() + timeoutMs;
+  while (of().length < count && Date.now() < deadline) await settle(25);
+};
+
 describe("a typing signal on its way out", () => {
   const open: Array<() => Promise<void>> = [];
   const sockets: WebSocket[] = [];
@@ -1765,7 +1788,7 @@ describe("a typing signal on its way out", () => {
     // The same connection, the same fabric, a channel it does hold: the publisher
     // works, so the silence above is the filter.
     socket.send(JSON.stringify({ type: "typing.send", payload: { channel: mine } }));
-    await settle();
+    await arrived(() => watchMine.signals, 1);
     expect(watchMine.signals).toEqual([
       { environment: "env-1", channel: mine, user: "tuan" },
     ]);
@@ -2015,7 +2038,10 @@ describe("a typing signal on its way out", () => {
     const signaller = connect(tuan);
     await acked(signaller);
     signaller.send(JSON.stringify({ type: "typing.send", payload: { channel } }));
-    await settle();
+    // The REFUSAL is the arrival. A log line has to cross the gateway before it can be
+    // counted, and `settle()` bet 300ms on that — `expected [] to have a length of 1 but
+    // got 0`, once in six amplified runs, naming neither the line nor the load.
+    await arrived(() => lines.filter((l) => l["msg"] === "typing.failed"), 1);
 
     expect(typingFor(outsideFrames, channel)).toEqual([]);
     expect(
@@ -2224,7 +2250,7 @@ describe("a typing signal on its way out", () => {
     expect(watcher.signals, "the second was inside the interval").toHaveLength(1);
 
     socket.send(JSON.stringify({ type: "typing.send", payload: { channel } }));
-    await settle();
+    await arrived(() => watcher.signals, 2);
     expect(watcher.signals, "the third was after it").toHaveLength(2);
   });
 
@@ -2309,13 +2335,13 @@ describe("a typing signal on its way out", () => {
     // so both publish.
     a.send(JSON.stringify({ type: "typing.send", payload: { channel: first } }));
     b.send(JSON.stringify({ type: "typing.send", payload: { channel: first } }));
-    await settle();
+    await arrived(() => watchFirst.signals, 2);
     expect(watchFirst.signals).toHaveLength(2);
 
     // One connection, a second channel: the interval is per channel, so it
     // publishes again despite having just published.
     a.send(JSON.stringify({ type: "typing.send", payload: { channel: second } }));
-    await settle();
+    await arrived(() => watchSecond.signals, 1);
     expect(watchSecond.signals).toHaveLength(1);
 
     // T059a. Neither of Tuan's sockets heard either of Tuan's signals, and Mai
@@ -2326,7 +2352,7 @@ describe("a typing signal on its way out", () => {
   });
   /** T063. A TYPING FRAME ARRIVING MID-RESUME IS SENT IMMEDIATELY (FR-018).
    *
-   * **THE MEMBERSHIP-REVOCATION CHAPTER's EQUIVALENT PASSED TWICE WITH ITS SUBJECT DELETED**, and its
+   * **THE MEMBERSHIP-REVOCATION CHAPTER'S EQUIVALENT PASSED TWICE WITH ITS SUBJECT DELETED**, and its
    * record in `specs/038-chapter-3-20/baseline.txt` is what this test is built
    * against. Both of its traps are handled here:
    *
@@ -2390,12 +2416,12 @@ describe("a typing signal on its way out", () => {
     // `buffering` until the backfill returns.
     await settle(250);
     signaller.send(JSON.stringify({ type: "typing.send", payload: { channel } }));
-    await settle(250);
+    await arrived(() => typingFor(frames, channel), 1);
     expect(typingFor(frames, channel)).toHaveLength(1);
     expect(frames.filter((f) => f.type === "message.created")).toEqual([]);
 
     // And the backfill still arrives afterwards, so the resume was real.
-    await settle(900);
+    await arrived(() => frames.filter((f) => f.type === "message.created"), 1);
     expect(frames.filter((f) => f.type === "message.created")).toHaveLength(1);
     const typingAt = frames.findIndex((f) => f.type === "typing");
     const backfilledAt = frames.findIndex((f) => f.type === "message.created");
@@ -2654,7 +2680,15 @@ describe("a typing signal on its way out", () => {
       JSON.stringify({ environment: "env-1", channel, user: "tuan" }),
     );
 
-    await settle(700);
+    // FOUR FRAMES, THEN A QUIET WINDOW — not 700ms and hope.
+    //
+    // Both halves of this claim need a different wait. "Each kind arrives" is a
+    // condition, so it is polled to a deadline and costs nothing on an idle lane.
+    // "Nothing arrived twice" is the ABSENCE of a fifth frame, which no condition can
+    // confirm early — so the quiet window stays, taken AFTER the four have landed
+    // rather than instead of waiting for them.
+    await arrived(() => frames.filter((f) => f.type !== "connection.ack"), 4);
+    await settle(300);
 
     const byType = (type: string): unknown[] =>
       frames.filter((f) => f.type === type);
@@ -2781,6 +2815,6 @@ describe("createTyping's own arms", () => {
 });
 ```
 
-## Where FR-RTM-05 stands now
+## FR-RTM-05 hiện đứng ở đâu
 
 <ChapterFooter id="3.15" locale="vi" />
