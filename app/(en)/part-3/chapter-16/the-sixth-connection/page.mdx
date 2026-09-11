@@ -2840,7 +2840,7 @@ rebuilt — without that it would have tested the previous chapter's code and pa
 wrong reason.
 
 ```diff title="services/gateway/src/presence.itest.ts"
-@@ -751,12 +751,23 @@ describe("presence: the grace period (FR-RTM-06)", () => {
+@@ -764,12 +764,23 @@ describe("presence: the grace period (FR-RTM-06)", () => {
      expect(seen.frames.filter((f) => f.payload.state === "offline")).toHaveLength(1);
    }, 30_000);
  
@@ -2890,6 +2890,280 @@ last chapter. A hunk anchored on a line that does not exist yet matches zero tim
 chapter shows the lines and the appendix carries the change. The presence chapter was the first to
 hit this and wrote the rule down; this is the second.
 </Why>
+
+## The lane stops running one file at a time
+
+`connections.itest.ts` above says the gateway's integration config sets no
+`fileParallelism`. That is true from this chapter and was not true before it: both
+integration lanes have run one file at a time since the outbox chapter, and this is where
+they stop.
+
+**THE ORIGINAL REASON WAS REAL.** Every suite in these lanes runs migrations before it
+starts, vitest runs FILES in parallel by default, and two suites issuing `CREATE TYPE`
+against one schema get `duplicate key value violates unique constraint
+"pg_type_typname_nsp_index"` back — an error about Postgres's own catalogue that reads like a
+driver fault and is not one. The outbox chapter added a table, hit it, and serialised the
+lane.
+
+**AND THE REASON WAS GONE EIGHT CHAPTERS AGO.** `globalSetup` arrived in the instruments
+chapter, wired into all four lanes, and it migrates ONCE before any file starts; the
+per-suite `migrate(pool)` calls are idempotent on `schema_migrations` and find nothing to do.
+From that chapter the race has no window at all, and the setting stayed anyway — including in
+a comment written in that same chapter, which justified the api and gateway lanes keeping it
+by the race its own change had just closed.
+
+<Why>
+**Why that is a measurement and not a reading of the code.** A fresh, unmigrated database is
+the maximal window: every migration pending, every file racing. Run the api lane at *this*
+chapter's tag against one, files in parallel — 17 files, 312 tests, green; the gateway lane
+9 files, 197 tests, green. The control is the same probe at the outbox chapter, before
+`globalSetup` existed: `42P01 relation "organisations" does not exist`, in every suite that
+does not migrate itself. **The pair is what makes the green mean something** — without the
+red half it is a run that proves the database happened to be ready.
+</Why>
+
+Serialising every file for ever to cover one run costs **175 seconds a battery**, measured
+either side on the same machine and the same database: the api lane 176s → 102s, the gateway
+lane 136s → 35s, and the whole integration pipeline **403.76s → 232.05s**, that last pair
+being the mean of twenty runs a side rather than one run a side.
+
+So the question is what ELSE the serialisation was holding up, and that took running the
+lanes without it and reading what fell over. **Eight places, across eight chapters, each
+scoped wider than its own subject:**
+
+| where | what the test claims | what it actually reads |
+| --- | --- | --- |
+| the tenancy chapter | no route but signup creates a tenant | every organisation in the database |
+| the outbox chapter | two relays publish every row exactly once | every envelope id in the table |
+| the instruments chapter | bait a bounded batch must not take | rows on a subject no stream accepts, carrying no envelope id |
+| the presence chapter | this environment wrote no outbox row | the whole table's count |
+| the revisions chapter | a forged `connection.ack` is refused for its DIRECTION | a frame the schema rejects one phase earlier |
+| the retry chapter | the lane reset deleted no organisation | a count still open at the far end |
+| the notifications chapter | this endpoint's row is not sent a second time | the drain's global total |
+| the limits chapter | ten sends land in one counting window | a wall-clock minute bucket, read twice |
+
+**THREE OF THE EIGHT WERE ALREADY KNOWN** and came in filed, from the features that hit them:
+presence's count and the limits chapter's two reads. The other five came from running the lane
+unserialised — and **three of the five are not assertions about the platform at all.** One is a
+fixture that plants rows no broker will accept. One is a sample frame that a required field
+added three chapters later quietly invalidated, in two files, while the test asserting the
+wrong refusal stayed green. One could never have failed for its own reason at all: an
+unauthenticated request is refused before it reaches a handler, so the count it guarded could
+only ever move because of a neighbour.
+
+**THE ESTIMATE SAID THREE, THEN THE MEASUREMENT SAID SIX, AND THEN IT SAID EIGHT.** The first
+six arrived one failure at a time, over six runs — which is the slowest possible way to find
+them and, worse, an unreliable one: each instance is rare, so "the lane was green three times"
+is weak evidence that gets weaker the more of it you spend. The last two came from asking the
+question directly instead: **which queries read a table every other suite writes, without a
+predicate naming this test's own rows?** That is a question the repository can answer in one
+pass, and it found both in seconds.
+
+**A count of a fix counts the fix and not what the fix drags with it**, and it is wrong in the
+same direction every time. When the count keeps growing, stop counting failures and go ask the
+tree.
+
+```diff title="services/api/vitest.integration.config.mts"
+@@ -31,20 +31,43 @@ export default defineConfig({
+     env: {
+       RELAY_HARNESS_BAIT: "on",
+       RELAY_OUTBOX_RELAY: "off",
+       RELAY_EVENT_CONSUMER: "off",
+     },
+     include: ["src/**/*.itest.ts"],
+-    // ONE FILE AT A TIME, BECAUSE THEY SHARE ONE DATABASE.
+-    //
+-    // Every suite here runs migrations before it starts. Vitest runs FILES in parallel
+-    // by default, so several of them issue `CREATE TYPE` against the same schema at the
+-    // same moment and Postgres answers `duplicate key value violates unique constraint
+-    // "pg_type_typname_nsp_index"` — an error about its own catalogue, which reads like
+-    // a driver fault and is not one.
+-    //
+-    // It only bites when a migration is PENDING. With the schema already applied every
+-    // suite finds nothing to do and the race has no window, which is why serialising the
+-    // turbo tasks was enough until this chapter added a table.
+-    fileParallelism: false,
++    // FILES IN PARALLEL AGAIN, AND EIGHT PLACES ARE WHY IT COULD NOT BE.
++    //
++    // This lane ran one file at a time from the outbox chapter, for a real reason: a
++    // PENDING migration lets two suites issue `CREATE TYPE` against one schema, and
++    // Postgres answers `duplicate key value violates unique constraint
++    // "pg_type_typname_nsp_index"` — an error about its own catalogue that reads like a
++    // driver fault. That window closed in the instruments chapter, when `globalSetup`
++    // began migrating once before any file starts; the setting outlived it by eight
++    // chapters. The probe is a fresh database with every file racing, and it passes.
++    //
++    // What actually kept the files apart was EIGHT places scoped wider than their own
++    // subject, spread across eight chapters. The connection-cap chapter has them in a
++    // table with what each one really read. Three were known and carried in; five came
++    // from running the lane without the setting and reading what fell over, one at a
++    // time, over six runs. **Three of the five are not assertions at all.**
++    //
++    // AND THE WORKER COUNT IS MEASURED, NOT INHERITED. Vitest defaults to roughly one
++    // worker per core, which here is nine NestJS applications against one Postgres:
++    //
++    //   maxWorkers    1      2      3      5    default(9)
++    //   api lane    177s   102s   102s   102s     102s
++    //   peak used  4188M  4275M  4467M  4817M    5456M
++    //
++    // **Every second of the saving is in one-to-two.** This lane waits on a shared
++    // database and broker far more than it computes, so a second file fills the first
++    // one's gaps and a third has no gap left to fill — it just pays for another runtime.
++    // The gateway's curve has its knee at FOUR, not two (69s, 46s, 35s, 35s), because its
++    // suites each drive a child process of their own; **the right number is per-lane and
++    // measured, and a default is neither.** Above the knee it stops being free: the
++    // gateway at six workers is no faster than at four and its typing suite starts
++    // missing a presence frame.
++    maxWorkers: 2,
++    //
++    // Each of the eight is fixed where it lives. The migration race is left to the one
++    // run it can happen on.
+   },
+ });
+```
+
+```diff title="services/gateway/vitest.integration.config.mts"
+@@ -12,20 +12,41 @@ export default defineConfig({
+     // bait, plants it per file. This lane gets exemption
+     // handling and NO bait: it holds no reader-shape fault, and planting
+     // would change its workload for no return (FR-022).
+     globalSetup: ["../../packages/test-harness/src/global-setup.ts"],
+     setupFiles: ["../../packages/test-harness/src/setup.ts"],
+     include: ["src/**/*.itest.ts"],
+-    // ONE FILE AT A TIME, BECAUSE THEY SHARE ONE DATABASE.
++    // FILES IN PARALLEL AGAIN, AND EIGHT PLACES ARE WHY IT COULD NOT BE.
+     //
+-    // Every suite here runs migrations before it starts. Vitest runs FILES in parallel
+-    // by default, so several of them issue `CREATE TYPE` against the same schema at the
+-    // same moment and Postgres answers `duplicate key value violates unique constraint
+-    // "pg_type_typname_nsp_index"` — an error about its own catalogue, which reads like
+-    // a driver fault and is not one.
++    // This lane ran one file at a time from the outbox chapter, for a real reason: a
++    // PENDING migration lets two suites issue `CREATE TYPE` against one schema, and
++    // Postgres answers `duplicate key value violates unique constraint
++    // "pg_type_typname_nsp_index"` — an error about its own catalogue that reads like a
++    // driver fault. That window closed in the instruments chapter, when `globalSetup`
++    // began migrating once before any file starts; the setting outlived it by eight
++    // chapters. The probe is a fresh database with every file racing, and it passes.
+     //
+-    // It only bites when a migration is PENDING. With the schema already applied every
+-    // suite finds nothing to do and the race has no window, which is why serialising the
+-    // turbo tasks was enough until this chapter added a table.
+-    fileParallelism: false,
++    // What actually kept the files apart was EIGHT places scoped wider than their own
++    // subject, spread across eight chapters. The connection-cap chapter has them in a
++    // table with what each one really read. Three were known and carried in; five came
++    // from running the lane without the setting and reading what fell over, one at a
++    // time, over six runs. **Three of the five are not assertions at all.**
++    //
++    // AND THE WORKER COUNT IS MEASURED, NOT INHERITED. Vitest defaults to roughly one
++    // worker per core, which here is nine NestJS applications against one Postgres:
++    //
++    //   maxWorkers      2      3      4      6
++    //   gateway lane  69s    46s    35s    35s
++    //   peak used   4313M  4623M  4717M  5064M
++    //
++    // **The knee is at four here and at TWO in the api lane**, whose curve is flat from
++    // two workers on. These suites each drive a child api of their own, so they overlap
++    // further before they start queueing on the same database — **the right number is
++    // per-lane and measured, and a default is neither.** Above the knee it stops being
++    // free: six workers is no faster than four, and `typing.itest.ts` starts missing a
++    // presence frame it waits for.
++    maxWorkers: 4,
++    //
++    // Each of the eight is fixed where it lives. The migration race is left to the one
++    // run it can happen on.
+   },
+ });
+```
+
+And the third config is the one that named the other two as the exception:
+
+```diff title="packages/test-harness/vitest.integration.config.mts"
+@@ -3,17 +3,23 @@ import { defineConfig } from "vitest/config";
+ // The guard's own lane. `globalSetup` installs the function and the triggers, the
+ // same file every other lane uses; there is deliberately NO `setupFiles`, because
+ // this suite manages its own connections — one carrying the exemption and one
+ // not — and a setup file that rewrote DATABASE_URL would remove the distinction
+ // the tests are about.
+ //
+-// AND NO `fileParallelism: false`, unlike the api and gateway lanes. Those need it
+-// because several suites call `migrate(pool)` concurrently and race on
+-// `pg_type_typname_nsp_index`; here `globalSetup` migrates once and there is one
+-// suite. A setting that changes nothing is worth leaving out — it reads as a
+-// requirement to whoever copies this file next.
++// AND NO `fileParallelism: false` — WHICH IS NOW TRUE OF EVERY LANE BUT COVERAGE, AND
++// WAS WRITTEN HERE AS THE EXCEPTION. The api and gateway lanes set it because several
++// suites call `migrate(pool)` concurrently and race on `pg_type_typname_nsp_index`. That
++// race is one run wide — the first after a schema change — and serialising every file for
++// ever to cover it cost 175 seconds a battery; both lanes dropped it in this chapter, once
++// the six places that actually needed the files kept apart were fixed where they live.
++//
++// Here it was never needed for either reason: `globalSetup` migrates once and there is one
++// suite. A setting that changes nothing is worth leaving out — it reads as a requirement to
++// whoever copies this file next, which is exactly how it spread to two lanes that then kept
++// it for six chapters after the reason had been fixed.
+ export default defineConfig({
+   test: {
+     globalSetup: ["src/global-setup.ts"],
+     include: ["src/**/*.itest.ts"],
+     hookTimeout: 60_000,
+   },
+```
+
+<Why>
+**Why a comment is worth a hunk.** This file never set `fileParallelism` and never needed
+to — one suite, and `globalSetup` migrating once. The comment said so, and explained the
+other two lanes by the race. **A sentence that justifies somebody else's setting goes stale
+when they drop it**, and it is the kind of staleness nothing detects: no checker reads
+prose, and a comment in a config file is read by exactly the person about to copy the file.
+That is how the setting reached two lanes in the first place.
+</Why>
+
+## How many files at once, and why the default is the wrong number
+
+Dropping `fileParallelism: false` hands the decision to vitest, which runs about one worker
+per core. Ten cores here, two lanes running at once under `TURBO_CONCURRENCY=2`: eighteen
+NestJS applications against one Postgres. **That is not a tuning choice, it is a bill**, and
+the first thing it bought was a killed twenty-run battery — out of memory, mid-run, with no
+test having failed.
+
+So the worker count was measured the same way everything else here was:
+
+| maxWorkers | 1 | 2 | 3 | 5 | default (9) |
+| --- | --- | --- | --- | --- | --- |
+| **api lane** | 177s | **102s** | 102s | 102s | 102s |
+| peak used | 4188M | **4275M** | 4467M | 4817M | 5456M |
+
+**EVERY SECOND OF THE SAVING IS IN ONE-TO-TWO.** Seventy-five seconds for eighty-seven
+megabytes, and then nothing — a third worker is 192M for zero, a ninth is 1.2G for zero. The
+reason is what the lane is: it waits on a shared database and broker far more than it
+computes, so a second file fills the first one's gaps and a third finds no gap left. Nine
+workers do not run nine files faster; they queue on the same Postgres and pay nine runtimes
+for the privilege.
+
+**AND THE GATEWAY'S NUMBER IS DIFFERENT, WHICH IS THE POINT.**
+
+| maxWorkers | 2 | 3 | 4 | 6 |
+| --- | --- | --- | --- | --- |
+| **gateway lane** | 69s | 46s | **35s** | 35s |
+| peak used | 4313M | 4623M | **4717M** | 5064M |
+
+Its knee is four. These suites each drive an api child of their own, so they overlap further
+before they start queueing — and a single number copied from the other lane would have cost
+this one half its saving. **The right worker count is per-lane, and it is measured.** A
+default is neither: it is a number about the machine, chosen by something that has never
+seen the workload.
+
+**ABOVE THE KNEE IT STOPS BEING FREE.** The gateway at six workers is exactly as fast as at
+four and `typing.itest.ts` starts missing a presence frame it waits for. That is the shape to
+watch for — not a cliff, but the point where the speed stops arriving and the failures start.
+A number pinned at the knee is the one place both are true.
+
+**AND THE RACE IS LEFT TO THE ONE RUN IT CAN HAPPEN ON**, said in the comment rather than
+left implied. If a future chapter adds a table and somebody runs the lane before migrating,
+two suites can still collide — and the answer then is to migrate, not to serialise every file
+in the repository for ever.
 
 ## Where FR-RTM-09 stands now
 

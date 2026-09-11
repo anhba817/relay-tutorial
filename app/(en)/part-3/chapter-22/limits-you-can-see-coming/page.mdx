@@ -599,7 +599,7 @@ import { docsUrl } from "@relay/protocol";
 import { createLogger, serve, type Logger } from "@relay/service-kit";
 import { Redis } from "ioredis";
 import { WebSocket } from "ws";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { createApiClient } from "./api-client.js";
 import { createGatewayLimits, type GatewayLimits } from "./limits.js";
@@ -820,12 +820,42 @@ describe("one counter, two services", () => {
   /** The key the api and the gateway are both supposed to be incrementing.
    * Spelled out here rather than imported, because a test that computed it with
    * the code under test would agree with a wrong answer. */
-  const key = (operation: string) =>
+  const key = (operation: string, atMs: number = Date.now()) =>
     `rl:${api.environmentId}:${operation}:` +
-    `${Math.floor(Date.now() / 60_000) * 60_000}`;
+    `${Math.floor(atMs / 60_000) * 60_000}`;
 
-  const count = async (operation: string): Promise<number> =>
-    Number((await redis.get(key(operation))) ?? 0);
+  /** THE WINDOW IS WALL-CLOCK, SO A TEST CAN SPAN TWO OF THEM.
+   *
+   * `limits.ts:115` keys on `Math.floor(now / 60_000) * 60_000`. The bucket rolls at the
+   * top of every minute whatever the suite is doing, so ten sends either side of the
+   * boundary write two keys — and reading one of them reports `7` where the test means
+   * `10`, which looks exactly like a limiter dropping increments.
+   *
+   * Measured, twice: run 1 of feature 043's second battery and run 2 of its third.
+   * Nothing in either failure named a clock.
+   *
+   * SUMMING RATHER THAN SLEEPING, and the first attempt did sleep. Waiting for the next
+   * boundary made the test correct and blew its 5-second timeout the moment the guard
+   * actually fired — a fix whose failure mode is worse than the fault, because a timeout
+   * says nothing about what it was waiting for. This asserts the same number without
+   * spending any time: ten sends are ten sends however the minute falls across them. */
+  const windowsSince = (sinceMs: number): number[] => {
+    const first = Math.floor(sinceMs / 60_000) * 60_000;
+    const last = Math.floor(Date.now() / 60_000) * 60_000;
+    const out: number[] = [];
+    for (let w = first; w <= last; w += 60_000) out.push(w);
+    return out;
+  };
+
+  let testStartedAt = Date.now();
+
+  const count = async (operation: string): Promise<number> => {
+    let total = 0;
+    for (const w of windowsSince(testStartedAt)) {
+      total += Number((await redis.get(key(operation, w))) ?? 0);
+    }
+    return total;
+  };
 
   const mintToken = async (user = "tuan") => {
     const res = await fetch(`${api.url}/auth/dev-token`, {
@@ -889,6 +919,16 @@ describe("one counter, two services", () => {
     await new Promise<void>((resolve) => server.listen(0, resolve));
     url = `ws://127.0.0.1:${(server.address() as AddressInfo).port}`;
   }, 60_000);
+
+  beforeEach(() => {
+    // Where `count()` starts summing, and where `afterEach` starts deleting.
+    testStartedAt = Date.now();
+  });
+
+  beforeEach(() => {
+    // Where `count()` starts summing, and where `afterEach` starts deleting.
+    testStartedAt = Date.now();
+  });
 
   afterEach(async () => {
     for (const socket of sockets.splice(0)) socket.close();
@@ -4818,7 +4858,7 @@ field now refuses its absence, and nine direction assertions came back
 day, not a rule to be stated once.**
 
 ```diff title="services/gateway/src/isolation.itest.ts"
-@@ -818,19 +818,28 @@ function sample(type: string, channel: string, user: string): unknown {
+@@ -826,19 +826,28 @@ function sample(type: string, channel: string, user: string): unknown {
        return { type, payload: { channel, user, change: "added" } };
      case "presence.changed":
        return { type, payload: { user, state: "online" } };
@@ -4854,7 +4894,7 @@ day, not a rule to be stated once.**
 ```
 
 ```diff title="services/gateway/src/session.itest.ts"
-@@ -1238,22 +1238,31 @@ describe("the socket's delivery, with a fan-out attached", () => {
+@@ -1249,22 +1249,31 @@ describe("the socket's delivery, with a fan-out attached", () => {
          return { type, payload: { channel, user: "tuan", change: "added" } };
        case "presence.changed":
          return { type, payload: { user: "tuan", state: "online" } };

@@ -1947,6 +1947,29 @@ async function startRedisProxy(): Promise<{
 const settle = (ms = 300): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
+/** WAIT FOR THINGS TO ARRIVE, rather than for a clock to run out.
+ *
+ * A flat `settle(n)` before an assertion is a bet that the lane is idle, and this lane
+ * is not: it runs four files at once beside an api lane doing the same. A frame still
+ * in Redis when the clock expires reads as `expected [] to have a length of 1 but got
+ * 0` — a message that names no neighbour and no load. It cost one run of a twenty-run
+ * battery and one of six amplified runs, in two different tests of this file.
+ *
+ * ARRIVAL IS A CONDITION; ABSENCE IS NOT. This polls to a deadline and returns the
+ * moment the count is reached, so an idle lane pays nothing for it. Proving that
+ * nothing ELSE arrives cannot be shortened that way, so the tests making THAT claim
+ * keep their quiet window — `settle(1_500)` for the silence after a refused signal,
+ * `settle(120)` for the one inside a debounce interval. Those sleeps are the
+ * instrument; the ones this replaced were a guess. */
+const arrived = async (
+  of: () => unknown[],
+  count: number,
+  timeoutMs = 10_000,
+): Promise<void> => {
+  const deadline = Date.now() + timeoutMs;
+  while (of().length < count && Date.now() < deadline) await settle(25);
+};
+
 describe("a typing signal on its way out", () => {
   const open: Array<() => Promise<void>> = [];
   const sockets: WebSocket[] = [];
@@ -2008,7 +2031,7 @@ describe("a typing signal on its way out", () => {
     // The same connection, the same fabric, a channel it does hold: the publisher
     // works, so the silence above is the filter.
     socket.send(JSON.stringify({ type: "typing.send", payload: { channel: mine } }));
-    await settle();
+    await arrived(() => watchMine.signals, 1);
     expect(watchMine.signals).toEqual([
       { environment: "env-1", channel: mine, user: "tuan" },
     ]);
@@ -2258,7 +2281,10 @@ describe("a typing signal on its way out", () => {
     const signaller = connect(tuan);
     await acked(signaller);
     signaller.send(JSON.stringify({ type: "typing.send", payload: { channel } }));
-    await settle();
+    // The REFUSAL is the arrival. A log line has to cross the gateway before it can be
+    // counted, and `settle()` bet 300ms on that — `expected [] to have a length of 1 but
+    // got 0`, once in six amplified runs, naming neither the line nor the load.
+    await arrived(() => lines.filter((l) => l["msg"] === "typing.failed"), 1);
 
     expect(typingFor(outsideFrames, channel)).toEqual([]);
     expect(
@@ -2467,7 +2493,7 @@ describe("a typing signal on its way out", () => {
     expect(watcher.signals, "the second was inside the interval").toHaveLength(1);
 
     socket.send(JSON.stringify({ type: "typing.send", payload: { channel } }));
-    await settle();
+    await arrived(() => watcher.signals, 2);
     expect(watcher.signals, "the third was after it").toHaveLength(2);
   });
 
@@ -2552,13 +2578,13 @@ describe("a typing signal on its way out", () => {
     // so both publish.
     a.send(JSON.stringify({ type: "typing.send", payload: { channel: first } }));
     b.send(JSON.stringify({ type: "typing.send", payload: { channel: first } }));
-    await settle();
+    await arrived(() => watchFirst.signals, 2);
     expect(watchFirst.signals).toHaveLength(2);
 
     // One connection, a second channel: the interval is per channel, so it
     // publishes again despite having just published.
     a.send(JSON.stringify({ type: "typing.send", payload: { channel: second } }));
-    await settle();
+    await arrived(() => watchSecond.signals, 1);
     expect(watchSecond.signals).toHaveLength(1);
 
     // T059a. Neither of Tuan's sockets heard either of Tuan's signals, and Mai
@@ -2633,12 +2659,12 @@ describe("a typing signal on its way out", () => {
     // `buffering` until the backfill returns.
     await settle(250);
     signaller.send(JSON.stringify({ type: "typing.send", payload: { channel } }));
-    await settle(250);
+    await arrived(() => typingFor(frames, channel), 1);
     expect(typingFor(frames, channel)).toHaveLength(1);
     expect(frames.filter((f) => f.type === "message.created")).toEqual([]);
 
     // And the backfill still arrives afterwards, so the resume was real.
-    await settle(900);
+    await arrived(() => frames.filter((f) => f.type === "message.created"), 1);
     expect(frames.filter((f) => f.type === "message.created")).toHaveLength(1);
     const typingAt = frames.findIndex((f) => f.type === "typing");
     const backfilledAt = frames.findIndex((f) => f.type === "message.created");
@@ -2897,7 +2923,15 @@ describe("a typing signal on its way out", () => {
       JSON.stringify({ environment: "env-1", channel, user: "tuan" }),
     );
 
-    await settle(700);
+    // FOUR FRAMES, THEN A QUIET WINDOW — not 700ms and hope.
+    //
+    // Both halves of this claim need a different wait. "Each kind arrives" is a
+    // condition, so it is polled to a deadline and costs nothing on an idle lane.
+    // "Nothing arrived twice" is the ABSENCE of a fifth frame, which no condition can
+    // confirm early — so the quiet window stays, taken AFTER the four have landed
+    // rather than instead of waiting for them.
+    await arrived(() => frames.filter((f) => f.type !== "connection.ack"), 4);
+    await settle(300);
 
     const byType = (type: string): unknown[] =>
       frames.filter((f) => f.type === type);

@@ -763,11 +763,11 @@ of the system. Switched off here exactly as `RELAY_OUTBOX_RELAY` and
 +    //
 +    // A durable is server-side state that outlives the process that made it, and this
 +    // suite named a fresh pair per run — `itest-expand-<8 hex>` and
-+    // `itest-deliver-<8 hex>` — and deleted neither. Chapter 3.24's close-out found
++    // `itest-deliver-<8 hex>` — and deleted neither. The attachments chapter's close-out found
 +    // **216 consumers on DELIVERIES**, 215 of them this file's, each holding a position
 +    // in a stream of 56,193 messages, and the twenty-run battery added 19 more.
 +    //
-+    // `services/api/src/consumer/consumer.itest.ts` has done this since chapter 3.4 and
++    // `services/api/src/consumer/consumer.itest.ts` has done this since the broker chapter and
 +    // its comment says why: *"without this, every run of this suite left another handful
 +    // behind on a shared broker, and `stream-info.mjs` found twelve of them the first
 +    // time it looked."* That chapter learned it at twelve. **The fix was written in the
@@ -2958,4 +2958,166 @@ while carrying something from another.
      const missing = shouldAttack.filter((k) => !attacked.has(k));
      // A classification saying `write` with no attack written for it is the same hole
      // as a route with no classification, one level up. Named, because the useful half
+```
+
+## The teardown, and the process that holds the port
+
+`stop()` signalled its children and slept 200 ms. A child that took longer to close its
+listeners was still holding its port when the next suite booted, so that suite's health check
+passed against the dying predecessor and then failed at its first real request with
+`ECONNREFUSED`. **Ten of the attachments chapter's twenty-run battery failed exactly that
+way** — and the debt was not settled when a run ended, it was paid by whatever booted next.
+It waits for them now, with a measured one-second grace before `SIGKILL`: the api takes
+5,035 ms to drain and its listener stays open for all of it, so waiting for a clean exit cost
+the e2e package 37.28 s against a 6.72 s baseline. This harness needs the port, not the
+drain.
+
+**AND THE ASSERTION THAT PROVES IT HAD A BLIND SPOT OF ITS OWN.** The test probes the first
+system's api port after `stop()` returns, which is the right probe for the api: it is one
+`spawn("node", …)` and the signal reaches the server. The gateway was
+`spawn("pnpm", ["exec", "tsx", …])` — four processes deep. SIGTERM reached `pnpm`, `pnpm`
+exited without passing it on, `child.once("exit")` resolved on `pnpm`'s exit, and the gateway
+kept running with its port held. **Twelve survivors per lane run, indefinitely, under a green
+test.**
+
+Measured rather than reasoned about: clear every stray, run the lane, count what is left.
+Twelve before, zero after, and the run got faster — 13 s for four files. The gateway is
+spawned the way the api is now, from `dist/main.js`, which the lane already builds because
+`test:integration` dependsOn `build`.
+
+**A red probe proves the teardown for the process you spawned.** Only a probe of the service
+that leaks proves it for the process that holds the port — and a package-manager wrapper is
+not the thing you are trying to kill.
+
+**No chapter owns this.** The harness belongs to chapter 2.8 and its teardown is not any Part
+3 chapter's subject; the fix is here because the thing it repairs is lane hygiene, not a
+chapter's argument.
+
+```diff title="packages/e2e/src/harness.ts"
+@@ -465,13 +465,26 @@ export async function boot({ gateways = 2 } = {}): Promise<System> {
+   const urls: string[] = [];
+   for (let i = 0; i < gateways; i++) {
+     const name = `gateway ${i + 1}`;
+     children.push(
+       capture(
+         name,
+-        spawn("pnpm", ["exec", "tsx", "src/main.ts"], {
++        // `node dist/main.js`, THE SAME WAY THE API IS SPAWNED, AND THE REASON IS THE
++        // TEARDOWN. This was `pnpm exec tsx src/main.ts`, which is four processes: pnpm,
++        // its own launcher, tsx, and the node worker that binds the port. `stop()` holds
++        // the FIRST of those. SIGTERM reached pnpm, pnpm exited without passing it on,
++        // `child.once("exit")` resolved on pnpm's exit, and the gateway kept running with
++        // its port held — twelve survivors per lane run, indefinitely.
++        //
++        // AND THE TEARDOWN TEST WAS GREEN THROUGHOUT, because it probes the API's port.
++        // The api is one `spawn("node", …)` and always died correctly. A red probe proves
++        // the teardown for the process you spawned; only a probe of the LEAKING service
++        // proves it for the process that holds the port. `dist/main.js` exists here for
++        // the same reason it does for the api — `test:integration` dependsOn `build` —
++        // so this costs nothing and removes three processes from the chain.
++        spawn("node", [join(REPO, "services", "gateway", "dist", "main.js")], {
+           cwd: join(REPO, "services", "gateway"),
+           env: { ...env, PORT: "0", RELAY_API_URL: apiUrl },
+           stdio: ["ignore", "pipe", "pipe"],
+         }),
+       ),
+     );
+@@ -570,11 +583,51 @@ export async function boot({ gateways = 2 } = {}): Promise<System> {
+       );
+     },
+     async client(name, environmentId) {
+       return new Client(name, await token(environmentId, name), say);
+     },
+     async stop() {
++      // WAIT FOR THEM TO GO, DO NOT SLEEP AND HOPE (feature 043, FR-001).
++      //
++      // This signalled and slept 200 ms. A child that took longer to close its
++      // listeners was still holding its port when the next suite booted — and the
++      // next suite's health check passed against the dying predecessor, printed
++      // `api up on …`, and then failed at its first real request with
++      // `ECONNREFUSED`. **Ten of the attachments chapter's twenty-run battery failed exactly
++      // that way**, and the debt was not settled when a run ended: it was paid by
++      // whatever booted next, in that run or the following one.
++      //
++      // ALL OF THEM AT ONCE, NOT EACH IN TURN, or the waits add up per child. The
++      // timeout has its own message so a hung child is not reported as a port
++      // problem — which is the misdiagnosis this whole change exists to end.
+       for (const child of children) child.kill("SIGTERM");
+-      await new Promise((resolve) => setTimeout(resolve, 200));
++      await Promise.all(
++        children.map(
++          (child) =>
++            new Promise<void>((resolve) => {
++              if (child.exitCode !== null || child.signalCode !== null) return resolve();
++              // A SHORT GRACE, THEN SIGKILL — AND THE NUMBER IS MEASURED, NOT CHOSEN.
++              //
++              // The api takes **5,035 ms** to exit on SIGTERM, and its listener stays
++              // open for all of it: the port frees at 5,037 ms and the process exits at
++              // 5,034 ms, so there is no early release to wait for. Waiting the full
++              // drain cost the e2e package **37.28 s against a 6.72 s baseline**, on a
++              // lane with 5.39 s of budget headroom.
++              //
++              // What this harness needs is the port, not a clean drain. A second is
++              // enough for a child to flush the log lines `dump()` reports on failure,
++              // and SIGKILL frees the port at once. The old code sent SIGTERM, slept
++              // 200 ms and moved on, leaving the child alive and the port held — this
++              // is strictly stronger, because the process is confirmed dead either way.
++              const timer = setTimeout(() => {
++                child.kill("SIGKILL");
++              }, 1_000);
++              child.once("exit", () => {
++                clearTimeout(timer);
++                resolve();
++              });
++            }),
++        ),
++      );
+     },
+   };
+ }
+```
+
+## Two imports the tenancy chapter's fence cannot carry
+
+`signup.itest.ts`'s invariant 7 stopped counting the whole `organisations` table and started
+reading the source instead — which needs `node:fs` and `node:path`. The assertion itself is
+taught where it lives, in the keys-and-tokens chapter's diff. **The two import lines are not**,
+and the reason is structural rather than an oversight: this file arrives before Part 3 begins,
+so the tenancy chapter fences it as a WHOLE @@ -1,10 +1,12 @@
+ import "reflect-metadata";
+ 
++import { readFileSync, readdirSync } from "node:fs";
+ import { createServer } from "node:http";
+ import type { AddressInfo } from "node:net";
++import { join } from "node:path";
+ 
+ import { Test } from "@nestjs/testing";
+ import type { INestApplication } from "@nestjs/common";
+ import { afterAll, beforeAll, describe, expect, it } from "vitest";
+ 
+ import { AppModule } from "../app.module";, and a whole-body fence is the chain's
+foundation — every later diff in every later chapter is anchored on it.
+
+**REGENERATING IT WAS TRIED AND MEASURED.** Bringing that fence up to date satisfies the
+per-chapter check and takes the cumulative chain from **111 problems to 203**, because
+ninety-two hunks downstream are anchored on the bytes it replaced. The per-chapter checker and
+the chain disagree here, and the chain is the one carrying the readers: a foundation fence is
+not a thing to regenerate for two lines.
+
+So the two lines arrive here, after every chapter, the way any change no chapter owns does.
+
+```diff title="services/api/src/tenancy/signup.itest.ts"
+@@ -1,10 +1,12 @@
+ import "reflect-metadata";
+ 
++import { readFileSync, readdirSync } from "node:fs";
+ import { createServer } from "node:http";
+ import type { AddressInfo } from "node:net";
++import { join } from "node:path";
+ 
+ import { Test } from "@nestjs/testing";
+ import type { INestApplication } from "@nestjs/common";
+ import { afterAll, beforeAll, describe, expect, it } from "vitest";
+ 
+ import { AppModule } from "../app.module";
 ```

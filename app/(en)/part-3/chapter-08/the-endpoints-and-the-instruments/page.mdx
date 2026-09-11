@@ -2514,10 +2514,26 @@ export async function plant(
   // why the trigger cannot guard them (data-model.md). The count is `BAIT_ROWS` and
   // not one, because a single row cannot tell a batch that ignored its limit from
   // one that honoured it.
+  //
+  // AND IT IS AN `events.` SUBJECT WITH AN ENVELOPE ID, WHICH IT WAS NOT. Bait
+  // imitates an unpublished event, and these rows sit in the one table the outbox
+  // chapter's relay drains GLOBALLY, oldest first. A bait row is therefore reachable
+  // by any test that drains for real, and the first version was unreachable in the
+  // two ways that matter: `EVENTS` accepts `events.>` and nothing accepts
+  // `<name>.bait`, so a real publish came back `NatsError: 503`; and `'{}'` carries
+  // no `id`, so `publishPending` handed the broker `msgID: undefined` and every bait
+  // row looked like the same event. Both were measured: 3,200 pending rows in 16
+  // subjects, every unroutable row in this lane and no other.
+  //
+  // A FIXTURE THAT IMITATES A THING MUST BE USABLE EVERYWHERE THE THING IS. The
+  // count, the table and the unpublished state — everything the bait is FOR — are
+  // unchanged; what changed is the two fields that made it a landmine rather than
+  // bait.
   await q(
     `INSERT INTO outbox (subject, payload)
-     SELECT $1, '{}'::jsonb FROM generate_series(1, $2)`,
-    [`${s.name}.bait`, BAIT_ROWS],
+     SELECT $1, jsonb_build_object('id', gen_random_uuid()::text, 'type', 'bait')
+       FROM generate_series(1, $2)`,
+    [`events.${s.name}.bait`, BAIT_ROWS],
   );
 }
 ```
@@ -2974,10 +2990,10 @@ export default defineConfig({
      }
  
      expect(await outboxDepthFor(db, env.id)).toBe(0);
-     const all = [...a.sent, ...b.sent].map((m) => m.id);
-     expect(new Set(all).size).toBe(all.length);
-   });
-@@ -390,20 +409,37 @@ describe("the outbox", () => {
+ 
+     // UNIQUE AMONG THE ROWS THIS TEST WROTE. `drainOnce` is global and ordered
+     // oldest-first, so these two relays publish the whole table's backlog on the way
+@@ -408,20 +427,37 @@ describe("the outbox", () => {
   * deliberately NOT tenant-scoped — one loop drains every environment's events,
   * because an outbox row is work the platform owes itself. So a batch can be
   * filled entirely by rows this suite did not write, and a test that assumes
