@@ -350,12 +350,12 @@ export const series: Part[] = [
         // 25 later chapter-edits, and the reorder put every one of them before the
         // file existed. The harness has to precede its editors; the verdict does not.
         readerProduces:
-          "A cross-tenant suite whose target list derives itself from the running router and fails on a route it has no decision about, three attack shapes that compare a pair rather than a status code, a structural check that every table has a path back to one tenant, and the socket surface attacked from the protocol's own frame union",
+          "A cross-tenant suite whose target list derives itself from the running router, three attack shapes that compare a pair of responses rather than a status code, a structural check that every table has a path back to one tenant, and the socket attacked from the protocol's own frame union",
         sourceDoc: "docs/04-srs.md, docs/05-sad.md",
         readerMinutes: 55,
         titleVi: "Cửa ải cô lập tenant",
         readerProducesVi:
-          "Một bộ kiểm thử cross-tenant tự suy ra danh sách mục tiêu từ router đang chạy và đỏ khi gặp route nó chưa có quyết định nào, ba dạng tấn công so sánh một CẶP phản hồi thay vì một mã trạng thái, một kiểm tra cấu trúc rằng mọi bảng đều có đường về tenant, và tầng socket bị tấn công từ chính frame union của protocol",
+          "Một bộ kiểm thử cross-tenant tự suy ra danh sách mục tiêu từ router đang chạy, ba dạng tấn công so sánh một CẶP phản hồi thay vì một mã trạng thái, một kiểm tra cấu trúc rằng mọi bảng đều có đường về tenant, và tầng socket bị tấn công từ chính frame union của protocol",
       },
       {
         id: "3.5",
@@ -416,12 +416,12 @@ export const series: Part[] = [
         // public endpoints the gauntlet found missing, and the instruments that
         // verify the verifiers.
         readerProduces:
-          "The two public endpoints Part 3 needed and nobody had built, idempotency enforced by a unique index rather than in memory, every validation error naming its field for the first time, the global-operation guard watching nine tables instead of five, and the api repository layer's branch coverage answered with a number",
+          "The two public endpoints Part 3 needed, idempotency enforced by a unique index rather than in memory, every validation error naming its field for the first time, the global-operation guard watching nine tables instead of five, and repository branch coverage answered with a number",
         sourceDoc: "docs/04-srs.md",
         readerMinutes: 80,
         titleVi: "Các endpoint và các thiết bị đo",
         readerProducesVi:
-          "Hai endpoint công khai mà Part 3 cần và chưa ai xây, tính đẳng xâm (idempotent) do unique index bảo đảm chứ không phải do bộ nhớ ứng dụng, mọi lỗi validation lần đầu tiên gọi tên field của nó, guard thao tác toàn cục canh chín bảng thay vì năm, và độ phủ nhánh của tầng repository được trả lời bằng một con số",
+          "Hai endpoint công khai mà Part 3 cần, tính đẳng xâm do unique index bảo đảm chứ không phải do bộ nhớ, mọi lỗi validation lần đầu gọi tên field của nó, guard thao tác toàn cục canh chín bảng thay vì năm, và độ phủ nhánh của tầng repository được trả lời bằng một con số",
       },
       {
         id: "3.9",
@@ -466,12 +466,12 @@ export const series: Part[] = [
         // read the sender. Three chapters later a senderless row is one the platform
         // cannot describe, and 121,250 of them exist in the test lane.
         readerProduces:
-          "Bot users carrying a description the database requires, a sender required on every message and enforced by the compiler rather than a test, an application credential that may speak as software and not as any person, refusals that reveal nothing about who exists, and a bot that is billed as an active user while being exempt from the ceiling that refuses sends",
+          "Bot users carrying a description the database requires, a sender on every message enforced by the compiler rather than a test, a credential that speaks as software and never as a person, refusals that reveal nothing about who exists, and a bot billed as active yet exempt from the send ceiling",
         sourceDoc: "docs/04-srs.md",
         readerMinutes: 80,
         titleVi: "Người gửi mà một tin nhắn chưa từng có",
         readerProducesVi:
-          "Bot user mang theo một description mà cơ sở dữ liệu bắt buộc phải có, một người gửi bắt buộc trên mọi tin nhắn và được chính trình biên dịch bảo đảm thay vì một bài test, một application credential chỉ được nói với danh nghĩa phần mềm chứ không phải bất kỳ con người nào, những lời từ chối không hé ra ai đang tồn tại, và một bot vẫn được tính tiền như active user nhưng được miễn khỏi cái ngưỡng vốn từ chối tin gửi",
+          "Bot user mang theo description mà cơ sở dữ liệu bắt buộc, một người gửi trên mọi tin nhắn do compiler bảo đảm chứ không phải test, một credential nói với danh nghĩa phần mềm, không phải con người, từ chối mà không hé lộ ai tồn tại, và một bot vẫn tính tiền như active user nhưng miễn trần gửi",
       },
       {
         id: "3.12",
@@ -485,12 +485,12 @@ export const series: Part[] = [
         // none read as far as the second. `sourceDoc` is the SAD rather than the SRS
         // because no SRS clause changed: FR-RTM-01 already required this.
         readerProduces:
-          "A message sent over REST that reaches a live socket, an ordering that splits by transport because a request handler's response IS its acknowledgement, a publisher that survives a dead broker in 2 ms where the gateway's client hangs for ever, and a P1 clause measured as unmet and recorded rather than narrowed",
+          "A message sent over REST that reaches a live socket, an ordering that splits by transport because a request handler's response IS its acknowledgement, a publisher that survives a dead broker in 2 ms, and a P1 clause measured as unmet and recorded rather than narrowed",
         sourceDoc: "docs/05-sad.md",
         readerMinutes: 70,
         titleVi: "Tin nhắn chưa từng tới",
         readerProducesVi:
-          "Một tin nhắn gửi qua REST tới được socket đang mở, một thứ tự phải tách theo transport vì response của một request handler CHÍNH LÀ acknowledgement của nó, một publisher sống sót qua broker đã chết trong 2 ms ở nơi client của gateway treo vô hạn, và một điều khoản P1 được đo là chưa thoả mãn rồi ghi lại thay vì bị thu hẹp",
+          "Một tin nhắn gửi qua REST tới được socket đang mở, một thứ tự tách theo transport vì response của request handler CHÍNH LÀ acknowledgement của nó, một publisher sống sót qua broker đã chết trong 2 ms, và một điều khoản P1 được đo là chưa thoả rồi ghi lại thay vì bị thu hẹp",
       },
       {
         id: "3.13",
@@ -503,12 +503,12 @@ export const series: Part[] = [
         // ADR-10's subject clause — the first supersession in the series — and
         // Appendix C's open question 3, closed as not opt-in.
         readerProduces:
-          "A frame that has been in the protocol union since chapter 1.3 and had no producer, a second subject grammar that leaves the message hot path byte-identical, a key whose existence is the state and whose SET … NX is the election, a grace period whose first fix stranded users online for ever, and a delivery scope with no filtering code in it at all",
+          "A frame in the protocol union since chapter 1.3 that finally has a producer, a second subject grammar leaving the message hot path byte-identical, a key whose existence is the state and whose SET … NX is the election, a grace period whose first fix stranded users online, and no filtering code",
         sourceDoc: "docs/05-sad.md",
         readerMinutes: 70,
         titleVi: "Presence, và ai được phép nhìn thấy",
         readerProducesVi:
-          "Một frame đã nằm trong protocol union từ chương 1.3 mà chưa từng có producer, một subject grammar thứ hai giữ nguyên từng byte của đường đi message, một key mà sự tồn tại của nó chính là trạng thái và SET … NX của nó chính là cuộc bầu chọn, một grace period mà bản vá đầu tiên khiến người dùng mắc kẹt online vĩnh viễn, và một phạm vi chuyển giao không có lấy một dòng code lọc nào",
+          "Một frame nằm trong protocol union từ chương 1.3 nay mới có bên phát, một subject grammar thứ hai giữ nguyên từng byte đường đi message, một key mà sự tồn tại chính là trạng thái, SET … NX chính là bầu chọn, một grace period mà bản vá đầu khiến người dùng kẹt online, và không dòng code lọc nào",
         // The ONLY signal that gates the Vietnamese URL in the sitemap. Chapters 3.10
         // to 3.18 each shipped a translated body without it, so nine Vietnamese pages
         // route and are absent from the sitemap — carried into `gaps.md` rather than
@@ -526,12 +526,12 @@ export const series: Part[] = [
         // a lossy fabric because a dropped message is recovered by its cursor, and a
         // revocation has none.
         readerProduces:
-          "A clause unmet since chapter 2.6 and asserted as violated by a test since 3.18, closed with that test inverted and its 5,500 ms wait unchanged; a third subject grammar whose second shape addresses a principal rather than a channel, because an addition cannot ride the subject its own instance has not subscribed to; a ban that arrives as one change and leaves as one frame per channel, with the sentinel never reaching a client; and a periodic re-read standing in for a cursor that does not exist",
+          "A clause unmet since chapter 2.6, closed by inverting the test that caught it; a third subject grammar addressing a principal rather than a channel, because an addition cannot ride a subject its instance never subscribed to; and a ban that arrives as one change and leaves as one frame per channel",
         sourceDoc: "docs/05-sad.md",
         readerMinutes: 75,
         titleVi: "Membership đổi ngay dưới một socket đang sống",
         readerProducesVi:
-          "Một điều khoản chưa được thoả từ chương 2.6 và bị một bài test khẳng định là vi phạm từ 3.18, nay đóng lại bằng chính bài test đó đảo ngược với thời gian chờ 5.500 ms giữ nguyên; một ngữ pháp subject thứ ba mà hình dạng thứ hai gửi tới một principal thay vì một channel, bởi một lần thêm thành viên không thể đi nhờ cái subject mà chính instance của nó chưa subscribe; một lệnh ban tới nơi như một thay đổi và rời đi thành một frame cho mỗi channel, với ký hiệu canh gác không bao giờ chạm tới client; và một lần đọc lại định kỳ đứng thay cho một cursor không tồn tại",
+          "Một điều khoản chưa thoả từ chương 2.6, nay đóng bằng cách đảo ngược bài test đã bắt nó; một ngữ pháp subject thứ ba gửi tới principal thay vì channel, bởi một lần thêm thành viên không thể đi nhờ subject mà instance chưa subscribe; và một lệnh ban tới như một thay đổi, ra một frame mỗi channel",
         translatedIn: ["vi"],
       },
       {
@@ -546,12 +546,12 @@ export const series: Part[] = [
         // keep, and the clause is the customer's contract — so the boundary is
         // recorded rather than the requirement rewritten.
         readerProduces:
-          "The first second inbound frame in twenty chapters, behind a named set whose size and membership a test pins; a fourth subject grammar taken rather than avoided, after re-deriving ADR-19's count and finding seven typed points where the record says three; a two-second renewal interval that is a different quantity from FR-RTM-08's five-second expiry, at 2.5 renewals per window so one dropped publish does not flicker; and an honest verdict on a clause this platform cannot perform — no frame ends an indicator, so the timer is the receiving client's",
+          "The first second inbound frame in twenty chapters, behind a named set a test pins; a fourth subject grammar taken rather than avoided, after re-deriving ADR-19's count and finding seven typed points where the record says three; and an honest verdict on a clause this platform cannot perform",
         sourceDoc: "docs/05-sad.md",
         readerMinutes: 70,
         titleVi: "Cái frame không ai được gửi",
         readerProducesVi:
-          "Frame đầu vào thứ hai đầu tiên sau hai mươi chương, đứng sau một tập hợp có tên mà một bài test ghim cả kích thước lẫn thành viên; một ngữ pháp subject thứ tư được nhận chứ không phải né, sau khi đếm lại con số của ADR-19 và tìm thấy bảy điểm được định kiểu chứ không phải ba như bản ghi viết; một khoảng renew hai giây vốn là đại lượng khác với hạn năm giây của FR-RTM-08, ở mức 2,5 lần renew mỗi cửa sổ nên một lần publish bị rơi không làm nhấp nháy; và một phán quyết thành thật về một điều khoản nền tảng này không thực hiện được — không frame nào kết thúc một chỉ báo, nên timer thuộc về bên nhận",
+          "Frame đầu vào thứ hai đầu tiên sau hai mươi chương, đứng sau một tập hợp có tên được test ghim; một ngữ pháp subject thứ tư được nhận chứ không né, sau khi đếm lại con số ADR-19 và thấy bảy điểm định kiểu chứ không phải ba; và một phán quyết thành thật về điều khoản nền tảng không làm được",
         translatedIn: ["vi"],
       },
       {
@@ -565,12 +565,12 @@ export const series: Part[] = [
         // atomic needs Lua and Constitution VII admits a second language only on
         // profiling evidence a five-channel fixture cannot produce.
         readerProduces:
-          "FR-RTM-09 closed in both halves: a five-connection cap that no gateway instance can compute on its own, held as five slot keys claimed with `SET NX PX` and renewed with `SET IFEQ PX`; a sixth close code, because all five existing ones send a client to the wrong remedy and this is the only refusal in the set whose correct handling is not a retry; a refusal that completes the handshake in order to close it, because a browser cannot read the body of a failed upgrade; and a cap that fails open loudly, where the log line is the only thing that distinguishes `unenforced` from `under the limit`",
+          "FR-RTM-09 closed in both halves: a five-connection cap no gateway instance can compute alone, held as five slot keys claimed with `SET NX PX`; a sixth close code, the only refusal in the set whose correct handling is not a retry; and a cap that fails open loudly, the log line its only evidence",
         sourceDoc: "docs/05-sad.md",
         readerMinutes: 70,
         titleVi: "Kết nối thứ sáu, và con số ấy sống ở đâu",
         readerProducesVi:
-          "FR-RTM-09 đóng lại ở cả hai nửa: một cái trần năm kết nối mà không instance gateway nào tự tính được, giữ dưới dạng năm khoá slot giành bằng `SET NX PX` và gia hạn bằng `SET IFEQ PX`; một mã đóng thứ sáu, vì cả năm mã cũ đều đẩy client tới phương thuốc sai còn đây là lời từ chối duy nhất trong bộ mà cách xử lý đúng không phải là thử lại; một lời từ chối hoàn tất cái bắt tay chỉ để đóng nó, vì trình duyệt không đọc được thân phản hồi của một lần upgrade thất bại; và một cái trần hỏng theo hướng mở một cách ồn ào, nơi dòng log là thứ duy nhất phân biệt `unenforced` với `dưới mức trần`",
+          "FR-RTM-09 đóng lại ở cả hai nửa: một trần năm kết nối mà không instance gateway nào tự tính được, giữ thành năm khoá slot giành bằng `SET NX PX`; một mã đóng thứ sáu, lời từ chối duy nhất trong bộ mà xử lý đúng không phải thử lại; và một trần hỏng mở ồn ào, dòng log là bằng chứng duy nhất",
         translatedIn: ["vi"],
       },
       {
@@ -586,12 +586,12 @@ export const series: Part[] = [
         // does not exist, and ADR-07's loss argument rests on gap detection,
         // which cannot see an edit below a client's cursor.
         readerProduces:
-          "FR-MSG-07, FR-MSG-08 and FR-MSG-10 built, and the last two of FR-RTM-05's six event kinds given their first producers: a fifth subject grammar, `revision:{channel_id}`, carrying both mutations with the kind in the payload, because a tombstone is not a `Message` and an edit is one and would be indistinguishable from a creation; `message_edits` reproduced from SAD §6.1 as published, with what the composite key costs written down; two error codes rather than the generic 403, because no credential grants authorship and no permission change makes a message yours; a tenancy check taught that reachability is not adjacency, after it refused the new table in four milliseconds; and the one soft edge documented rather than closed — a message older than a client's cursor that changed during a disconnect produces no frame **and no sequence gap**, so the mechanism that repairs every other missed frame sees nothing to repair",
+          "FR-MSG-07, FR-MSG-08 and FR-MSG-10 built, and FR-RTM-05's last two event kinds given their first producers: a fifth subject grammar carrying both mutations with the kind in the payload, because a tombstone is not a `Message` and an edit is; and two error codes rather than the generic 403",
         sourceDoc: "docs/05-sad.md",
         readerMinutes: 75,
         titleVi: "Những lời ai đó muốn lấy lại",
         readerProducesVi:
-          "FR-MSG-07, FR-MSG-08 và FR-MSG-10 được dựng, và hai kind cuối trong sáu kind của FR-RTM-05 lần đầu có bên phát: một ngữ pháp subject thứ năm, `revision:{channel_id}`, mang cả hai loại thay đổi với cái kind nằm trong payload, bởi một bia mộ không phải `Message` còn một lần sửa thì là và sẽ không phân biệt được với một lần tạo; bảng `message_edits` dựng lại đúng như SAD §6.1 đã công bố, kèm cái giá của khoá chính ghép được viết ra; hai mã lỗi thay cho 403 chung chung, bởi không credential nào cấp quyền tác giả và không thay đổi phân quyền nào biến một tin nhắn thành của bạn; một phép kiểm tenancy được dạy rằng khả năng tới được không phải là kề nhau, sau khi nó từ chối cái bảng mới trong bốn mili giây; và cái mép mềm duy nhất được ghi lại thay vì đóng lại — một tin nhắn cũ hơn con trỏ của client mà đổi trong lúc mất kết nối thì không sinh frame nào **và không có lỗ hổng số thứ tự nào**, nên cơ chế sửa chữa mọi frame bị lỡ khác chẳng thấy gì để sửa",
+          "FR-MSG-07, FR-MSG-08 và FR-MSG-10 được dựng, và hai kind cuối của FR-RTM-05 lần đầu có bên phát: một ngữ pháp subject thứ năm mang cả hai loại thay đổi với kind nằm trong payload, bởi một bia mộ không phải `Message` còn một lần sửa thì là; và hai mã lỗi thay cho 403 chung chung",
         translatedIn: ["vi"],
       },
       {
@@ -659,12 +659,12 @@ export const series: Part[] = [
         // anything the series has published. The CODE ships under `part3-ch8`
         // either way — this chapter explains it and fences it.
         readerProduces:
-          "The outbox pattern a third time, over a column chapter 3.6 already wrote — and Mailpit, because only a received message can prove an email carries no secret",
+          "The outbox pattern a third time, over a column the \"When to stop trying\" chapter already wrote — and Mailpit, because only a received message can prove an email carries no secret",
         sourceDoc: "docs/04-srs.md, docs/03-journey-map.md",
         readerMinutes: 60,
         titleVi: "Email chẳng ai gửi",
         readerProducesVi:
-          "Mẫu outbox lần thứ ba, trên một cột mà chương 3.6 đã viết sẵn — và Mailpit, vì chỉ thư đã nhận mới chứng minh được email không mang bí mật nào",
+          "Mẫu outbox lần thứ ba, trên một cột mà chương \"Khi nào thì thôi cố\" đã viết sẵn — và Mailpit, vì chỉ thư đã nhận mới chứng minh được email không mang bí mật nào",
       },
       {
         id: "3.22",
