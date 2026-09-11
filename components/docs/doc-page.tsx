@@ -45,7 +45,7 @@ export async function DocReferencePage({
           <h1 className="text-3xl font-semibold tracking-tight text-foreground">
             {locale === "vi" ? doc.titleVi : doc.title}
           </h1>
-          {citing.length > 0 && (
+          {doc.referencedBy !== false && citing.length > 0 && (
             <p className="mt-4 text-sm text-muted-foreground">
               {d.shell.referencedBy}:{" "}
               {citing.map((chapter, i) => (

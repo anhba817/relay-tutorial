@@ -14,6 +14,21 @@ export interface DocEntry {
   file: string;
   title: string;
   titleVi: string;
+  /** List the chapters that cite this document, under the title. Defaults to true;
+   * set false where the list has stopped being an answer.
+   *
+   * OFF FOR THE SRS AND THE SAD, AND THE COUNTS ARE THE WHOLE ARGUMENT: **27 chapters
+   * cite the SRS and 25 cite the SAD**, against 3, 2, 1, 1 and 1 for the other five.
+   * A list naming almost every chapter in the series answers "which chapters?" with
+   * "all of them" — a paragraph of links confirming what the reader already assumed,
+   * directly under the title of the document they came to read. The five short lists
+   * are unaffected and still earn their place.
+   *
+   * A THRESHOLD WAS THE OTHER OPTION and is deliberately not taken. `citing.length > N`
+   * reads as principled and would flip a page's behaviour the first time somebody
+   * published a chapter, with no line in any diff saying so. This is one field in the
+   * registry, beside the document it describes. */
+  referencedBy?: boolean;
 }
 
 export const docs: DocEntry[] = [
@@ -44,6 +59,7 @@ export const docs: DocEntry[] = [
     file: "04-srs.md",
     title: "SRS — Software Requirements Specification",
     titleVi: "SRS — Đặc tả yêu cầu phần mềm",
+    referencedBy: false,  // 27 and 25 citing chapters — see the interface
   },
   {
     slug: "sad",
@@ -51,6 +67,7 @@ export const docs: DocEntry[] = [
     file: "05-sad.md",
     title: "SAD — Software Architecture Document",
     titleVi: "SAD — Tài liệu kiến trúc phần mềm",
+    referencedBy: false,  // 27 and 25 citing chapters — see the interface
   },
   {
     slug: "adr-deep-dives",
