@@ -1,12 +1,14 @@
 import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
 import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figMessageLife, figFiveGrammars, figReadPaths, figCursorBlindSide } from "./figures";
 
 export const metadata = {
   title: "Những lời ai đó muốn lấy lại — Building Relay",
   description:
-    "Message deletion cần tombstone, authorization và read-path semantics nhất quán. Chương này đưa delete event qua protocol, storage và mọi reader có cursor.",
+    "Sửa và xoá một message. Các cột đã nằm trong schema từ chương 2.1 và chẳng gì từng ghi vào chúng; cái bảng đã nằm trong SAD từ bản nháp đầu tiên và chẳng ai dựng nó. Ba trong số các quyết định của chương này đã được xuất bản sẵn trong những tài liệu mà nó sắp sửa đem đi cài đặt.",
   alternates: {
-    canonical: "/vi/part-3/chapter-17/the-words-somebody-wants-back",
+    canonical: "/part-3/chapter-17/the-words-somebody-wants-back",
     languages: {
       en: "/part-3/chapter-17/the-words-somebody-wants-back",
       vi: "/vi/part-3/chapter-17/the-words-somebody-wants-back",
@@ -14,14 +16,51 @@ export const metadata = {
   },
 };
 
-<ChapterHeader id="3.17" locale="vi" />
+<ChapterHeader id="3.17" />
 
-Xóa message không phải là một message mới. Nó là tombstone: event nói nội dung không còn
-visible, trong khi sequence và cursor vẫn cần giữ lịch sử nhất quán.
+Ai đó gửi một message có lỗi gõ trong đó. Ai đó gửi một message vào nhầm channel.
+Ai đó gửi một message mà họ hối hận ngay lập tức. Mọi sản phẩm chat đều trả lời cả ba, còn
+Relay thì chẳng trả lời cái nào suốt mười sáu chương — trong khi suốt từng ấy thời gian vẫn mang theo
+gần như mọi thứ nó cần.
 
-## Tombstone không phải message
+`messages.edited_at` đã nằm trong schema từ chương 2.1. `deleted_at` cũng thế, một cột
+`text` cho phép null mà chính lời chú thích của schema gọi là tombstone cũng thế, một
+`metadata JSONB NOT NULL DEFAULT '{}'` cũng thế. `docs/05-sad.md` §6.1 đã xuất bản một bảng
+`message_edits` từ bản nháp đầu tiên. **Chẳng gì trong nền tảng ghi bất kỳ cái nào.** Các đường đọc
+được dựng để xoay xở: phần liệt kê channel có một quy tắc cho text null, phần backfill lúc resume bỏ
+một cái, và cả hai đều được test với các tombstone cắm bằng tay bằng SQL thô, bởi chẳng đường code
+nào tạo ra được một cái.
 
-Xóa message không phải sửa content thành chuỗi rỗng. Tombstone là một trạng thái riêng: history giữ sequence và author để cursor không gãy, nhưng không còn tiết lộ text hay attachment đã bị xóa.
+Đó là hình ảnh ngược của cái lỗ hổng thường thấy. Lỗ hổng thường thấy là một bên ghi không có bên đọc. Đây là bốn
+bên đọc và một cái bảng đang chờ một bên ghi mà chẳng ai viết, và lý do thì
+khó chịu theo một kiểu đáng ngồi lại với nó: **các bên đọc thì dễ còn các quyết định thì
+khó.**
+
+<Why>
+**Vì sao chương này chủ yếu là đọc.** Ba quyết định thiết kế của nó đã được giải quyết sẵn trong
+cái cây. `prior_text TEXT NOT NULL` quyết định chuyện gì xảy ra khi bạn sửa một message đã xoá
+trước cả khi ai đó tranh cãi về nó. `messages.metadata` quyết định người thực hiện lệnh xoá đi đâu.
+Bốn đường đọc quyết định một tombstone trông ra sao từ bên ngoài. Mọi thứ trong đó đều đã được
+xuất bản, trong một tài liệu hay một schema, trước khi chương này mở ra. **Hãy hỏi repository trước khi
+suy dẫn một câu trả lời** — chương trước học được điều đó và chương này sống nhờ nó.
+</Why>
+
+## Một tombstone không phải một message
+
+Đường truyền đã mang một frame `message.deleted` từ chương 1.3, và payload của nó chính là cùng một
+`Message` mà `message.created` mang: một id, một channel, một sequence, một user, một **text**, và
+một dấu thời gian tạo.
+
+Một message đã xoá thì không có text. Đó không phải một chi tiết của bản cài đặt này — nó là FR-MSG-08,
+điều khoản nói rằng một lần xoá *"sẽ thay nội dung của nó bằng một tombstone"*, và `messages.text`
+cho phép null đúng vì lý do đó. Nên cái frame đã xuất bản không mô tả nổi chính thứ nó được
+đặt tên theo, và lựa chọn là nới `messageSchema.text` thành cho phép null hoặc cho
+lệnh xoá một payload của riêng nó.
+
+Nới rộng sẽ bắt mọi bên tiêu thụ của mọi payload message — lần tạo, lần sửa, lần
+replay lúc resume — chấp nhận một text null mà họ không bao giờ nhận được. Schema của một frame là một lời hứa về
+thứ sẽ tới; làm nó lỏng ra để chứa một frame khác là một lời hứa chẳng ai dựa vào
+được.
 
 ```diff title="packages/protocol/src/frames.ts"
 @@ -29,12 +29,27 @@ export const connectionAckSchema = z.strictObject({
@@ -120,9 +159,40 @@ Xóa message không phải sửa content thành chuỗi rỗng. Tombstone là m�
  /** Parse anything the wire delivers. Hostile input is an expected value, not
 ```
 
-## Subject grammar thứ năm
+<Trap>
+**`strictObject` là thứ biến chuyện này thành một bảo đảm thay vì một lời chú thích.** Một bên tạo ra với tay
+sang `messageSchema` rồi gửi một tombstone với `text: ""` sẽ thất bại ngay ở schema thay vì
+đặt một message rỗng lên màn hình của ai đó. Kiểu object mặc định của Zod sẽ lặng lẽ bỏ đi
+cái khoá thừa, cùng một kết cục mà chẳng có tiếng động nào.
+</Trap>
 
-Delete event cần subject grammar riêng để gateway route đúng channel và client phân biệt nó với message mới. Grammar là contract cross-service; đừng để một service tự ghép topic bằng string mà service khác không thể validate.
+## Văn phạm subject thứ năm
+
+Giữa các instance gateway, một frame đi qua Redis pub/sub trên một subject. Có bốn
+văn phạm, và mỗi cái tới cùng một chương đã lập luận cho nó: `chan:{channel_id}` ở 2.6,
+`presence:{channel_id}` ở chương presence, `member:{channel_id}` và
+`member:{env}:{user}` ở chương thu-hồi-membership, và `typing:{channel_id}` ở chương
+typing.
+
+`chan:` mang một `Message`. `packages/protocol/src/fanout.ts` tự nói điều đó bằng lời của nó —
+*"fan-out luôn mang payload của một wire frame chứ không phải một hình dạng riêng"* — và
+hai điều nảy ra từ đó, điều thứ hai là chí mạng.
+
+Một lần **sửa** là một `Message`. Nó có thể đi nhờ `chan:` xét theo hình dạng, và bên nhận sẽ chẳng có cách nào
+biết đó là một lần cập nhật: `session.ts` đóng dấu `type: "message.created"` ngay tại chỗ gọi, nên
+loại của nó chưa bao giờ có mặt trên tấm vải. Mọi lần sửa sẽ tới nơi như một message hoàn toàn mới.
+
+Một lần **xoá** thì không phải một `Message` và không thể đi nhờ subject đó, kể cả về nguyên tắc.
+
+<Figure caption="Bốn văn phạm và cái thứ năm. Lần sửa có thể đi nhờ chan: và sẽ không phân biệt được với một lần tạo; tombstone thì không đi nhờ được chút nào." code={figFiveGrammars} />
+
+Nên chương này lấy một cái thứ năm, và cái quy tắc nó dựa vào giờ đã được bốn chương
+độc lập đi tới: **một loại không chia sẻ được kiểu payload thì không chia sẻ được subject.**
+
+Một subject chứ không phải hai, với loại nằm trong payload, theo đúng `membership.changed` của ADR-20
+và cái `change: "added" | "removed"` của nó. Một lần sửa và một lần xoá là hai
+chuyện xảy ra với một message; một bên nhận đăng ký cả hai hoặc không cái nào, và hai subject
+sẽ nhân đôi sổ sách đăng ký cho một sự phân biệt mà payload đã làm sẵn.
 
 ```ts title="packages/protocol/src/revision.ts"
 import { z } from "zod";
@@ -192,6 +262,11 @@ export const revisionFabricSchema = z.discriminatedUnion("kind", [
 
 export type RevisionFabric = z.infer<typeof revisionFabricSchema>;
 ```
+
+Tiền tố được export và bên đăng ký hỏi chính module này xem một subject có phải của
+nó không. Gateway giữ **một** bên đăng ký Redis cho cả `chan:` lẫn `revision:`, nên
+`subscriber.on("message")` phải định tuyến theo subject — và một chuỗi `"revision:"` viết thẳng trong
+gateway sẽ là một chỗ thứ hai biết văn phạm này, đúng thứ mà quy tắc kia cấm.
 
 ```diff title="services/gateway/src/fanout.ts"
 @@ -1,9 +1,13 @@
@@ -340,6 +415,11 @@ export type RevisionFabric = z.infer<typeof revisionFabricSchema>;
        subscriber.disconnect();
 ```
 
+Cả hai subject được đăng ký dưới **một** bộ đếm tham chiếu. Chúng đồng phạm vi theo
+cấu tạo: một gateway đang giữ một socket cho một channel thì muốn cả message lẫn
+revision của channel đó, và bỏ cái này mà không bỏ cái kia sẽ để các lần sửa tới cho một channel chẳng ai
+nghe — hoặc tệ hơn, ngược lại.
+
 ```diff title="services/gateway/src/session.ts"
 @@ -6,12 +6,13 @@ import {
    CLOSE_CODES,
@@ -478,9 +558,31 @@ export type RevisionFabric = z.infer<typeof revisionFabricSchema>;
     * — so what is left is: confirm, backfill, ack, emit, flush, live. */
 ```
 
-## Hai code, và tại sao không phải `forbidden`
+Đó chính là thay đổi mà ADR-24 tồn tại vì nó, và nó là ba dòng. Loại giờ đến từ chính payload.
+`deliver` ở trên nó vẫn đóng dấu `message.created`, một cách đúng đắn, bởi mọi thứ trên
+`chan:` thực sự là một lần tạo.
 
-Không tìm thấy message và không được phép xóa nó có observable semantics khác nhau, nhưng resource tenant khác vẫn không được làm oracle. Error code phải phân biệt action mà caller được biết, không tiết lộ resource ngoài scope.
+<Trap>
+**Hãy làm giả một sự phân biệt mà bạn không nhìn thấy được.** Bắt `session.ts` đóng dấu `message.created` cho mọi
+thứ tới từ tấm vải, theo đúng cách nó làm trước chương này, rồi chạy bài test giao.
+Nó báo `saw connection.ack, message.created, message.created` — lần sửa tới nơi như một lần tạo thứ hai,
+thứ mà chẳng phép kiểm hình dạng nào ở đâu bắt được, bởi payload của nhánh `updated` **chính là** một
+`Message`. Phép làm giả đó đã chạy bảy lần trong chương này, ở ba đường nối, và mỗi lần
+đều đỏ vì đúng lý do đã nêu.
+</Trap>
+
+## Hai mã, và vì sao không phải `forbidden`
+
+Một người dùng cuối sửa message của người khác. Cái gì quay về?
+
+`ProtocolErrorFilter` ánh xạ một 403 trống thành `forbidden`, nên để nó chưa quyết chính là đã quyết. Và
+mục về `forbidden` trong `docs/08-error-reference.md` tự loại mình ra tới hai lần: nó tự gọi mình là
+*"trường hợp chung: nơi nào có một mã cụ thể hơn … thì mã đó được gửi thay"*, và
+hành động cho client của nó là *"chẳng có gì client thử lại được. Đây là một thay đổi về credential hoặc về
+quyền."*
+
+**Quyền tác giả thì chẳng phải cái nào.** Không credential nào cấp nó, không màn hình phân quyền nào ban nó, và không
+lần thử lại nào có được nó. Một lập trình viên bị đẩy đi tìm một thiết lập phân quyền sẽ chẳng tìm ra cái nào.
 
 ```diff title="packages/protocol/src/codes.ts"
 @@ -127,12 +127,63 @@ export const ERROR_CODES = {
@@ -549,9 +651,25 @@ Không tìm thấy message và không được phép xóa nó có observable sem
    // FR-CHN-07's ceiling: a channel holds at most 1,000 members and an add that would
 ```
 
-## Table SAD đã publish nhưng chưa ai build
+Mã thứ hai không nằm trong kế hoạch. Sửa một message vốn đã là tombstone thì phải bị
+từ chối — `prior_text TEXT NOT NULL` nghĩa là phương án còn lại là một vi phạm ràng buộc mà bên gọi
+chẳng làm gì được — và cái hợp đồng mà chương này viết trong lúc đặc tả nói là **404**, kèm một
+lập luận: *"một 410 trên một message mà bên gọi không được phép sửa sẽ xác nhận rằng message tồn tại."*
 
-SAD đã mô tả tombstone table/state, nhưng architecture diagram không tạo migration. Chương này biến promise thành schema, index và read-path behavior có test thay vì để một table trên giấy giả làm implementation.
+Lập luận đó sai, và phải viết code ra mới thấy. Chẳng ai không được phép sửa
+message lại đi tới được lời từ chối đó: phép kiểm quyền tác giả chạy **trước** khi text được nhìn tới,
+nên một người lạ bị từ chối bằng `not_message_author` dù message có là tombstone hay không.
+Bên gọi duy nhất thấy câu trả lời tombstone là chính tác giả — và tác giả đọc được
+message trong lịch sử, bởi FR-011 giữ các message đã xoá ở đúng vị trí ban đầu của chúng.
+
+Nên một 404 ở đó nói với bên gọi rằng một message họ đang nhìn thì không tồn tại. Đó là
+defect của chương 2.8 nằm gọn trong một tài nguyên: nó tìm ra `POST` trả lời 404 cho một channel mà `GET`
+trả lời 200, và cách sửa của nó là bắt hai bên đồng ý với nhau. *Một tài nguyên không nên trả lời hai
+kiểu tuỳ theo động từ.*
+
+## Cái bảng mà SAD xuất bản và chẳng ai dựng
+
+`docs/05-sad.md:435` đã giữ đoạn DDL này từ bản nháp đầu tiên:
 
 ```sql title="services/api/migrations/0009_message_edits.sql"
 -- What a message used to say.
@@ -650,15 +768,59 @@ ALTER TABLE channels
   ADD COLUMN revision_sequence BIGINT NOT NULL DEFAULT 0;
 ```
 
-## Check chỉ đếm một hop
+Ba cột và một khoá tổ hợp. Mô hình dữ liệu của chính chương này cho cái bảng một cột
+thứ tư — `id UUID PRIMARY KEY` — rồi nói, ngay ở câu bên trên, *"Hình dạng của nó là của SAD,
+không phải của chương này."* Không hề. Mười một lượt phân tích đi qua chỗ đó, và lý do thì
+đáng gọi tên: mọi bộ kiểm trong repository này đều so **định danh**, còn đây là một
+**điều khoản**. Tên của cái bảng xuất hiện trong kế hoạch, trong các task và trong mô hình dữ liệu, mà chẳng gì
+đọc đoạn DDL bên dưới nó.
 
-Authorization không chỉ kiểm tra author id. Nó đi từ caller qua membership, channel và environment đến message; bỏ một hop có thể cho id hợp lệ vượt scope. Guard phải được test với row bait ở từng quan hệ.
+<Why>
+**Khoá tổ hợp tốn gì, điều mà SAD không nói.** Hai lần sửa cùng một message ở cùng một
+dấu thời gian sẽ va nhau — một vi phạm unique thay vì một dòng lịch sử thứ hai. Postgres giữ tới
+micro giây, nên chuyện đó cần hai lần sửa trong một micro giây trên cùng một message.
+
+Không lách, và lý do không phải vì nó khó xảy ra. Một `id` thay thế sẽ nhận
+cả hai dòng và để lại một lịch sử có hai mục cùng tuyên bố một khoảnh khắc, đó là một câu trả lời sai
+trong im lặng ở chỗ mà đây là một lời từ chối lớn tiếng. Một ràng buộc đã xuất bản là một quyết định cho tới khi một ADR
+thay thế nó, và chương này chẳng có bằng chứng nào để thay thế nó cả.
+</Why>
+
+<Trap>
+**Hãy sinh ra migration; đừng áp dụng nó.** `drizzle-kit generate` tạo ra
+`0006_wise_lyja.sql` — một con số mà `0006_member_roles.sql` đã giữ từ chương
+channel-control — chứa cái bảng này rồi thêm một `CREATE TABLE` nguyên vẹn nữa, mười hai `ALTER TABLE`
+và một index, phát lại từ migration 0006 tới 0008. Snapshot của nó nằm ở 0005 trong khi
+thư mục nằm ở 0008, bởi ba cái đó cũng được viết tay.
+
+Áp dụng vào bất kỳ database nào đã chạy chúng thì nó đỏ ngay ở `CREATE TABLE "read_positions"`.
+ADR-16 đòi hỏi đoạn SQL sinh ra phải được review đối chiếu §6.1 trước khi bộ chạy áp dụng nó,
+và lần review đó là lý do duy nhất khiến cái này chưa bao giờ chạy. **Phần sinh ra là một bản nháp; cái file mới là
+sản phẩm.**
+</Trap>
+
+## Phép kiểm chỉ đếm một bước nhảy
+
+Tạo cái bảng làm lane isolation đỏ trong bốn mili giây.
 
 ```text
 AssertionError: these tables have no path to an environment: message_edits.
 Add environment_id, add a foreign key to a table that has one, or add it to
 SPINE in db/catalogue.ts with a reason.
 ```
+
+`classifyTables` hỏi câu mà gauntlet endpoint không hỏi: *có một đường từ các dòng của mọi
+bảng quay về một tenant không?* Một bảng không có đường như thế là một chỗ rò chưa có endpoint.
+Và cả ba phương thuốc nó đưa ra đều sai ở đây. `environment_id` là một cột mà SAD không
+xuất bản; một khoá ngoại thứ hai là cùng phản bác đó cộng thêm một lần phi chuẩn hoá; còn gọi
+một bảng chứa text của message là một phần của xương sống thì không biện minh được, mà lời chú thích của chính danh sách đó
+đòi hỏi phải biện minh.
+
+**Nên câu query mới sai, không phải cái bảng.** Quy tắc nó phát biểu là mọi bảng đều có *một đường*
+quay về một environment. Bản cài đặt chỉ chấp nhận các đường **dài một bước** — một khoá
+ngoại đáp thẳng vào một bảng mang `environment_id` — và cái đó phủ mọi bảng
+từng tồn tại tới giờ. `message_edits` thì cách hai mắt xích: nó tham chiếu `messages`, thứ
+tham chiếu `channels`, thứ mang cái cột kia.
 
 ```diff title="services/api/src/db/catalogue.ts"
 @@ -14,20 +14,24 @@ import type { Db } from "./client";
@@ -786,6 +948,15 @@ SPINE in db/catalogue.ts with a reason.
    ).rows;
 ```
 
+Đây là kiểu thất bại mà repository này cứ phải trả giá mãi — một pattern khớp với các ví dụ
+trước mặt nó thay vì khớp với cái tập mà quy tắc gọi tên — lần này tới ngay trong phép kiểm vốn là
+cái cân đo cho năng suất cao nhất trong cả cái cây.
+
+<Trap>
+**"Đây không phải một sự nới lỏng" là một tuyên bố, nên hãy làm giả nó.** Hai bảng bên trong một transaction rồi
+roll back, trên database thật: một cái chẳng có khoá ngoại nào, và một cái mà chuỗi duy nhất của nó
+dẫn vào xương sống (`→ organisations →` chẳng gì).
+
 ```text
  members            | f | {channels,users}
  message_edits      | f | {channels,users}
@@ -793,9 +964,25 @@ SPINE in db/catalogue.ts with a reason.
  probe_orphan       | f |
 ```
 
-## Edit
+Cả hai phép dò đều quay về với không mục tiêu nào và cả hai đều trượt phép kiểm toàn vẹn, được gọi tên trong thông điệp. Và
+`message_edits` đọc ra `{channels,users}` — các bảng **trực tiếp** mà chuỗi của nó đáp xuống, chứ không bao giờ
+`messages`, cái nó đi xuyên qua.
 
-Edit và delete không nên bị trộn thành cùng một mutation. Edit giữ message sống với content mới; delete tạo tombstone và fan-out event khác. Hai lifecycle khác nhau cần audit và client rendering khác nhau.
+**Dòng cuối đó là chỗ mà bất biến phải được viết ra thay vì được giả định.** Cái khẳng định hiển nhiên,
+*mọi mục trong `via` tự nó đều là `direct`*, thì không thể đỏ được: `fk_targets` lọc theo
+`direct` ngay trong SQL, nên nó đúng theo cấu tạo bất cứ khi nào bộ lọc còn ở đó — và nó
+cũng sẽ xanh với cả câu query một-bước. Thứ bài test khẳng định thay vào đó là rằng
+`message_edits` đọc ra `channels, users` và **không chứa `messages`**. Bỏ bộ lọc đi
+thì chuyến đi bắt đầu báo cả các bảng nó đi xuyên qua, sáu cái ở đây, trong khi mọi
+bài test khác trong file vẫn xanh: *"một bước nhảy có mục tiêu nào đó"* thì càng đúng hơn khi có các bảng trung gian
+trong danh sách, chứ không kém đúng đi.
+</Trap>
+
+## Lần sửa
+
+Một transaction, và dòng lịch sử là lý do: một message được cập nhật trong một câu lệnh và một lịch sử
+được ghi thêm trong một câu lệnh khác thì có thể crash ở giữa, và thứ sống sót là một message mà chẳng ai
+còn giữ text cũ của nó.
 
 ```diff title="services/api/src/db/repository.ts"
 @@ -8,20 +8,26 @@ import {
@@ -1525,6 +1712,13 @@ Edit và delete không nên bị trộn thành cùng một mutation. Edit giữ 
     *
 ```
 
+Thứ **không** nằm trong danh sách `SET` chính là FR-002 được viết thành code. `sequence`, `channelId`, `userId`
+và `createdAt` đều vắng mặt, `lastActivityAt` cũng vậy — đường gửi dời cái đó trong cùng một
+hơi thở với sequence, một cách có chủ đích, còn một lần sửa thì không được, bởi phần liệt kê channel sắp xếp
+theo hoạt động gần nhất và sửa một lỗi gõ không phải một message mới. Một bài test chỉ khẳng định được
+rằng các giá trị không đổi; một việc không làm thì chẳng để lại dấu vết nào để khẳng định. Bảo đảm
+sống trong hình dạng của câu lệnh.
+
 ```diff title="services/api/src/messages/messages.controller.ts"
 @@ -1,13 +1,17 @@
  import {
@@ -1889,6 +2083,9 @@ Edit và delete không nên bị trộn thành cùng một mutation. Edit giữ 
    ) {
 ```
 
+Ba route, ba câu trả lời khác nhau cho *ai được gọi cái này*, và cả ba đều là **lời khai báo**
+chứ không phải các phép kiểm nằm trong một handler:
+
 ```text
 PATCH :messageId          @Accepts("user")           an edit is the author's, and an
                                                       application principal has no author
@@ -1896,17 +2093,78 @@ DELETE :messageId         (inherits both)            the author, or a tenant key
 GET :messageId/edits      @Accepts("application")    a moderation surface, not an end-user one
 ```
 
-## Deletion, và tại sao hai 204 không chứng minh gì
+Lớp đó khai báo `@Accepts("application", "user")`, và guard đọc
+`getAllAndOverride` — nên một route thêm vào đây **mà không có** lời khai báo sẽ thừa hưởng cả hai, và
+một lời khai báo vắng mặt thì không hề trung lập. Bỏ `@Accepts("application")` khỏi route sửa
+và bài test khẳng định một người dùng cuối bị từ chối sẽ báo `expected 200 to be 403`: mọi người dùng cuối
+giờ đọc được mọi message trong mọi channel họ thấy được từng nói gì.
 
-Hai lần DELETE trả 204 chỉ chứng minh operation idempotent ở HTTP surface. Nó chưa chứng minh history không lộ content, socket nhận event, hay user không phải author bị từ chối. Test phải quan sát từng hậu quả đó.
+<Why>
+**Vì sao một key được xoá bất cứ thứ gì mà chẳng được sửa gì.** FR-MOD-02 trao cho một tenant API key quyền xoá
+bất kỳ message nào trong environment của nó. Nó im lặng về việc sửa, và chương này đọc sự im lặng là
+không có quyền. Gỡ bỏ lời của ai đó và viết lại chúng **nhân danh họ** là hai
+hành vi khác nhau, và chỉ cái thứ hai để lại một message nói ra thứ mà tác giả của nó chưa bao giờ viết với
+chẳng gì trên đường truyền nói ra điều đó.
+</Why>
 
-## Mọi read path làm gì với tombstone
+## Lần xoá, và vì sao hai cái 204 chẳng chứng minh được gì
 
-History REST, socket replay, search hay bất cứ reader nào phải render cùng một tombstone shape. Nếu một reader quên filter, deletion chỉ tồn tại ở endpoint được demo chứ không tồn tại trong product.
+Xoá một message vốn đã xoá thì thành công. FR-009 nói thế, và đó là hành vi hiển nhiên:
+một client thử lại một request đã timeout thì không nên nhận một lỗi cho đúng trạng thái nó đã xin
+và đã có.
+
+Rắc rối là "thành công" không phải cái yêu cầu kia. Một lần xoá thứ hai mà viết lại dòng đó
+sẽ dời `deleted_at`, nên một client đã đọc tombstone rồi sẽ thấy dấu thời gian của nó
+đổi chẳng vì lý do gì — và một **event** thứ hai sẽ kích hoạt mọi webhook đã đăng ký thêm một
+lần nữa cho một lần xoá. Cả hai đều vô hình từ mã status, vốn là 204 theo cả hai
+đường.
+
+<Figure caption="Vòng đời của một message. Mọi lần chuyển trạng thái đều giữ nguyên số sequence, và đó là thứ làm cho một tombstone không để lại khoảng trống còn một lần sửa thì vô hình với một cursor." code={figMessageLife} />
+
+Nên repository trả về `alreadyDeleted` bên cạnh cái dòng, phần fan-out được canh theo nó, và
+bài test mang FR-009 đếm các dòng outbox chứ không đếm mã status. Câu trả lời của lần sửa thì
+ngược lại và cả hai đều đúng: **mọi** lần sửa đều phát ra, bởi FR-021 nói nền tảng không
+so text của message để quyết xem một lần sửa có xảy ra hay không. Mọi định nghĩa về sự bằng nhau —
+khoảng trắng, hoa thường, chuẩn hoá unicode, một ký tự vô hình — đều là một quyết định mà một khách hàng
+sẽ phải được thông báo.
+
+## Mỗi đường đọc làm gì với một tombstone
+
+FR-017 đòi hỏi điều này phải được phát biểu cho **mọi** đường đọc, còn FR-017a đòi nó phải được
+suy dẫn từ code tại thời điểm viết chứ không phải từ một danh sách, bởi một danh sách thì cũ đi
+còn code thì không. Đọc từng cái một, có bốn đường:
+
+<Figure caption="Bốn đường đọc, bốn câu trả lời. Cái thứ tư không phải một câu trả lời theo trạng thái như ba cái kia, và đó là lý do yêu cầu chỉ đếm ba cho tới khi có người đem đo." code={figReadPaths} />
+
+Cái thứ tư là cái ẩn mình. Một trang backfill ở mức trần của nó mà chứa tombstone sẽ trả về
+**ít frame hơn số dòng đã đọc** mà vẫn báo `truncated: true` — bỏ đi một dòng không render được
+không phải lý do để bảo một client đi lật lịch sử, còn giấu một mức trần thật thì mới là. Đó
+quyết định đó được đưa ra ở chương 2.7 và chương này là lần đầu tiên nó có thể chạy được,
+bởi tới giờ chẳng gì ghi được một tombstone.
+
+Thứ tương đương của lần sửa chỉ là một dòng: mọi đường đọc đều trả về text **hiện tại**, bởi
+text bị thay thế sống trong `message_edits` và chỉ một route chạm tới cái bảng đó.
 
 ## Điểm mù của cursor
 
-Cursor theo message còn sống có thể nhảy qua sequence đã tombstone và khiến page boundary không ổn định. Tombstone vẫn chiếm vị trí trong stream; cursor phải dùng ordering key bền vững thay vì đếm item client nhìn thấy.
+Đây là phần mà chương này không sửa.
+
+<Figure caption="Một client vắng mặt qua một lần sửa dưới cursor của nó và một lần xoá phía trên. Một cái để lại khoảng trống. Cái kia chẳng để lại gì cả." code={figCursorBlindSide} />
+
+Một client đang resume trình ra một cursor — một vị trí trong sequence của một channel — rồi nhận
+mọi thứ phía trên nó. Một message bị **xoá** phía trên cursor sẽ bị bỏ khỏi phần backfill, và
+client thấy một số sequence bị thiếu: một khoảng trống, đúng cái tín hiệu mà SDK
+vá lại bằng history. Cơ chế đó tồn tại từ chương 2.7 và nó chạy tốt.
+
+Một message bị **sửa ở dưới** cursor thì chẳng tạo ra frame nào và **chẳng có khoảng trống nào**. Các số sequence
+phía trên cursor liền mạch; chẳng có gì để phát hiện. Client cứ tiếp tục hiển thị một
+message mà text của nó đã đổi trong lúc nó vắng mặt, và chẳng gì trong giao thức sẽ bao giờ báo cho nó.
+
+<Why>
+**Vì sao một cursor không thể chỉ tới một lần sửa.** Một sequence sắp thứ tự các lần **tạo**. Một lần sửa chẳng tạo
+ra gì, nên chẳng có vị trí nào để nói nó đã xảy ra ở đó — một cursor chẳng có cách nào gọi tên nó. Đây
+là một tính chất của cursor, không phải một bug trong đường resume, và ba sản phẩm đã
+trả lời câu hỏi này thì trả lời theo ba cách khác nhau:
 
 ```text
 Slack     no event replay. conversations.history returns CURRENT state and a
@@ -1920,29 +2178,40 @@ IMAP      CONDSTORE/QRESYNC puts a MODSEQ beside the sequence, so a client asks
           that every mutation has to maintain.
 ```
 
-## Counter mà cursor cần
+Relay vốn đã là hình dạng thứ nhất. Cả hai phương án còn lại đều thêm một bộ đếm cho mỗi channel — và
+phần kế tiếp thêm một cái, đó là một lần đổi ý ngay bên trong một chương và đáng nói
+thẳng: bản nháp đầu viết cái giới hạn đó vào ADR-07 rồi dừng ở đó. Lập luận về mất mát của ADR-07
+dựa trên *"cursor của client + phát hiện khoảng trống sequence sẽ phục hồi bất cứ thứ gì bị bỏ lỡ"*
+và giờ đã bị thu hẹp hai lần, một lần bởi chương thu-hồi-membership cho một payload
+không có sequence và một lần ở đây cho một payload mà sequence của nó thuộc về một message client
+đã cầm sẵn. **Bị thu hẹp hai lần là điểm mà một giới hạn thôi còn là một giới hạn.**
+</Why>
 
-Channel sequence tiếp tục tăng và deletion event tham chiếu sequence của message bị xóa. Counter đó cho phép client merge realtime với history mà không cần phát minh một thứ tự riêng cho tombstone.
+## Bộ đếm mà cursor cần
 
-Phần trên khảo sát ba product rồi từ chối thêm counter. Phần này thêm nó vì chính kết luận
-đã làm argument từ chối không còn đứng vững: **bound đã được viết ra, nhưng bound client
-không thể hành động theo không phải design mà chỉ là note.** Client không phân biệt được
-message đã edit với chưa edit thì không biết khi nào phải đọc lại history; “đọc lại history”
-lại là remedy duy nhất ADR-07 dựa vào.
+Phần ở trên khảo sát ba sản phẩm rồi từ chối thêm một bộ đếm. Phần này thêm nó,
+bởi lập luận cho việc từ chối không sống nổi qua chính kết luận của nó: **cái giới hạn đã được
+viết ra, mà một giới hạn chẳng ai hành động được thì không phải một thiết kế, nó là một ghi chú.** Một client
+không phân biệt được một message đã sửa với một message chưa sửa thì chẳng có cách nào quyết định đọc lại history,
+còn "đọc lại history" lại chính là toàn bộ phương thuốc mà ADR-07 dựa vào.
 
-Relay lấy shape của IMAP: monotonic number thứ hai cho mỗi channel, đặt cạnh sequence, và
-trả giá IMAP trả—mọi mutation phải maintain nó.
+Nên Relay lấy hình dạng của IMAP — một con số đơn điệu thứ hai cho mỗi channel, nằm cạnh sequence —
+và trả cái giá của IMAP: mọi lần thay đổi đều phải duy trì nó.
 
-**Một column, đi cùng migration của chính chương này.** `message_edits` giữ nội dung cũ;
-`channels.revision_sequence` nói message đã đổi bao nhiêu lần. Hai thứ là một subject;
-tách chúng thành hai migration sẽ đánh số một thứ sau work không liên quan.
+**Một cột, và nó đi nhờ chính migration của chương này.** `message_edits` ở trên giữ lại
+thứ một message từng nói; `channels.revision_sequence` nói nó đã đổi bao nhiêu lần.
+Đó là một chủ đề, và tách chúng ra hai migration sẽ đánh số một trong hai
+sau một công việc chẳng liên quan gì tới cả hai.
 
-**Tăng đúng một lần cho mỗi edit hoặc deletion, trong transaction thực hiện nó, và không
-bao giờ khi send.** Increment nằm trong hai path edit/delete đã fence trước đó, cùng
-transaction với write nó đếm. Đặt ngoài transaction tạo statement thứ hai có thể fail;
-counter có thể bỏ sót còn tệ hơn không counter vì client sẽ tin nó.
+**Được nâng đúng một đơn vị cho mỗi lần sửa hoặc xoá, bên trong transaction áp dụng nó, và
+không bao giờ bởi một lần gửi.** Phần tăng nằm trong các đường sửa và xoá đã được fence ở phần trước
+của chương này — hãy quay lại nhìn `repository.ts`: nó là hai dòng, mỗi trường hợp đều nằm trong
+cùng transaction với lệnh ghi mà nó đếm. Bên ngoài transaction đó thì nó sẽ là một câu lệnh
+thứ hai có thể tự mình thất bại, và một bộ đếm có thể bỏ sót thì tệ hơn không có bộ đếm nào,
+bởi một client sẽ tin nó.
 
-**Count được report, không bao giờ được compare.** API trả nó trên call gateway đã thực hiện:
+**Con số được báo cáo và không bao giờ được đem so.** Api trả lời nó trên đúng lời gọi mà
+gateway vốn đã thực hiện:
 
 ```diff title="packages/protocol/src/internal.ts"
 @@ -134,12 +134,19 @@ export const internalMembershipsResponseSchema = z.strictObject({
@@ -1966,6 +2235,9 @@ counter có thể bỏ sót còn tệ hơn không counter vì client sẽ tin n�
     * service that reads Postgres. So the ban travels on the one call the gateway already
     * makes at connect — no new table reaches the gateway and no new round trip is added.
 ```
+
+Gateway chẳng có database và không được phép có một cái — cũng chính lý do khiến `banned` đi nhờ
+response này — nên các con số đi cùng với các id vốn đã đang được lấy về:
 
 ```diff title="services/api/src/internal/session.controller.ts"
 @@ -71,22 +71,30 @@ export class SessionController {
@@ -2002,6 +2274,10 @@ counter có thể bỏ sót còn tệ hơn không counter vì client sẽ tin n�
  }
 ```
 
+`channelsForUser` giờ trả về một dòng cho mỗi channel thay vì một id, và đó là thứ làm cho
+hai trường không thể bất đồng về việc một user thuộc những channel nào. Bên gọi còn lại của nó
+đổi hình dạng theo, và trình biên dịch đã nói thế:
+
 ```diff title="services/api/src/internal/memberships.controller.ts"
 @@ -62,10 +62,15 @@ export class MembershipsController {
      // that threw for a deleted user would turn a routine refresh into a failure the
@@ -2021,6 +2297,9 @@ counter có thể bỏ sót còn tệ hơn không counter vì client sẽ tin n�
    }
  }
 ```
+
+Từ đó trở đi là chuyện chuyên chở, không phải logic. Kết quả xác thực có thêm một field,
+kết nối giữ nó, và ack báo cáo nó:
 
 ```diff title="services/gateway/src/auth.ts"
 @@ -24,13 +24,21 @@ export type { Identity } from "./api-client.js";
@@ -2080,6 +2359,33 @@ counter có thể bỏ sót còn tệ hơn không counter vì client sẽ tin n�
    missedPings: number;
    /** Chapter 2.7. A connection resuming through the tunnel spends its first
 ```
+
+<Why title="Why the platform reports and never compares">
+
+Một bản nháp của chuyện này từng cho client trình các con số của nó trên URL nâng cấp — đúng chỗ
+cursor được trình ra — để gateway trả lời bằng danh sách các channel có số đã
+dịch chuyển. Nó đã được dựng, rồi bị gỡ đi.
+
+**Một tham số mà server parse rồi chẳng bao giờ hành động theo là một hợp đồng nó không bao giờ gỡ được.** Đó
+là nửa nhỏ hơn. Nửa lớn hơn là chuyện gì xảy ra khi server CÓ hành động theo nó: con số
+giờ là thứ client kiểm soát, và một client báo số không cho mọi channel sẽ
+bắt nền tảng coi mọi channel là đã cũ. Một con số bịa ra trở thành một cuộc từ chối
+dịch vụ mà nền tảng tự thực hiện lên chính mình, với chi phí do kẻ bịa ra nó đặt.
+
+Gỡ nó đi cũng xoá luôn ba trường hợp biên thay vì xử lý chúng — phải làm gì với một
+channel mà client gọi tên nhưng không còn là thành viên, một con số cao hơn của server, và
+một map dị dạng. **Một thiết kế mà trong đó một trường hợp không thể nảy sinh thì thắng một nhánh xử lý nó**,
+bởi nhánh mới là thứ mục ruỗng.
+
+</Why>
+
+**Mọi channel mà user thuộc về, kể cả các số không.** Một channel vắng mặt khỏi map sẽ
+không phân biệt được với một channel ở mức không, nên map là toàn phần trên tập membership: một client
+đang giữ một con số cho một channel *biến mất* thì học được rằng membership của nó đã đổi, đó là một
+sự thật khác và là một sự thật hữu ích.
+
+Và các fixture đã phải nói ra điều đó. Năm suite dựng một response session, và một field bắt buộc
+nghĩa là mỗi suite trong số đó phải phát biểu báo cáo không có revision nào nghĩa là gì:
 
 ```diff title="services/api/src/fanout/fanout.itest.ts"
 @@ -529,19 +529,20 @@ describe("the fan-out publish when it fails", () => {
@@ -2574,9 +2880,36 @@ counter có thể bỏ sót còn tệ hơn không counter vì client sẽ tin n�
        }
 ```
 
-## Instrument đã bắt được gì
+## Các cân đo bắt được gì
 
-Integration test bắt read path quên tombstone, gateway route sai subject và guard thiếu hop. Đó là các lỗi một unit test của repository thường không thấy vì chúng xuất hiện giữa storage, protocol và client-facing response.
+**Một bài test đòi đúng cái thứ mà chương này đã ghi lại là an toàn, và câu trả lời là không.** Sổ cái
+mang theo có một mục nói rằng cả hai cách xen kẽ của một lần sửa và một lần xoá đồng thời đều kết thúc
+bằng một tombstone — *"chẳng có thứ tự nào của hai cái để lại một message nói ra thứ chẳng ai
+viết"* — và bài test mà mục đó đòi hỏi đã bác bỏ nó.
+
+Cả `editMessage` lẫn `deleteMessage` đều không lấy khoá dòng. Đó là cố ý và có ghi lại:
+`assertWithinQuota` đã quyết định phát biểu một mức vượt thay vì đi vòng để tránh nó. Nhưng
+phép kiểm tombstone của lần sửa là một lệnh ĐỌC thực hiện sớm hơn trong cùng transaction, còn lệnh ghi của nó chỉ nói
+`where(eq(messages.id, messageId))` — nên một lần xoá commit bên trong cửa sổ đó để
+lần sửa tự do khôi phục `text` trong khi `deleted_at` vẫn còn được đặt. **Một dòng mà một bộ lọc gọi là đã xoá
+còn bộ lọc khác gọi là còn sống**, và một lần xoá trả về thành công bị một lần sửa đang bay
+huỷ bỏ mất.
+
+Bộ lọc giờ sống trong mệnh đề WHERE, nơi database ước lượng nó trên cái dòng như nó đang là
+lúc ghi chứ không phải như nó đã là lúc đọc. Fence cho `repository.ts` ở trên
+mang nó.
+
+**VÀ BẰNG CHỨNG NẰM Ở HÌNH DẠNG CỦA CÁI THẤT BẠI, KHÔNG PHẢI Ở SỰ CÓ MẶT CỦA NÓ.** Bài test race chạy mười
+lượt mỗi lần gọi, bởi một cuộc đua được khẳng định một lần là một cuộc đua được quan sát một lần. Không có
+mệnh đề WHERE thì nó đỏ **một lần chạy trên ba** — lượt 1 ở một lần chạy, lượt 5 ở lần khác,
+chẳng bao giờ cùng một lượt hai lần. Có nó thì ba lần chạy trên ba đều xanh. Một defect xuất hiện ở một
+phần ba số lần chạy thì đúng là loại bị ghi thành flake rồi chạy lại cho tới khi xanh,
+và đó là cách sổ cái đi tới chỗ ghi lại điều ngược với sự thật suốt hai chương.
+
+Danh sách mục tiêu của isolation gauntlet suy dẫn mọi route từ ứng dụng đang chạy và
+so nó với một bảng duy trì bằng tay, nên nó đỏ ở bản build thêm một route.
+Nó đã đỏ, hai lần — một lần gọi tên một route được khai báo trước khi nó được viết, và đó là hướng
+bắt được một lần đổi tên.
 
 ```diff title="services/api/src/isolation/targets.ts"
 @@ -191,12 +191,61 @@ export const CLASSIFICATIONS: readonly Classification[] = [
@@ -2666,12 +2999,25 @@ Integration test bắt read path quên tombstone, gateway route sai subject và 
    });
 ```
 
+Rồi lần thứ ba, từ một cái cân đo mà cuốn sách này chưa có khi danh sách phân loại
+được viết lần đầu. `targets.itest.ts` hỏi xem mọi route trên router có được phân loại không.
+`gauntlet.itest.ts` hỏi hướng ngược lại — liệu mọi route mà phân loại bảo phải
+tấn công có thực sự bị tấn công không — và nó gọi tên cả ba route của chương này theo đường dẫn:
+
 ```text
 AssertionError: classified but never attacked:
 GET /v1/channels/:channelId/messages/:messageId/edits,
 PATCH /v1/channels/:channelId/messages/:messageId,
 DELETE /v1/channels/:channelId/messages/:messageId
 ```
+
+Một phân loại `write` mà chẳng có đòn tấn công nào được viết cho nó thì cũng là cùng cái lỗ hổng như một route
+chưa phân loại, chỉ cao hơn một bậc: danh sách nói một credential với tới được đường dẫn này với identifier của người
+khác nằm trong đó, mà chẳng ai từng thử. Ba đòn tấn công trả lời nó khác nhau đúng
+một thứ — **credential** — và đó là toàn bộ lý do `accepts` là một field trên
+phân loại chứ không phải một lời chú thích. Lần sửa nhận một user token, phần history một application
+credential, lần xoá thì cái nào cũng được. Tấn công một cái bằng sai lớp thì bị từ chối ngay ở cửa,
+và route rồi được ghi là đã cô lập mà handler của nó chưa từng chạy.
 
 ```diff title="services/api/src/isolation/gauntlet.itest.ts"
 @@ -5,13 +5,20 @@ import { Test } from "@nestjs/testing";
@@ -2827,6 +3173,23 @@ DELETE /v1/channels/:channelId/messages/:messageId
        attackerToken,
        {
 ```
+
+<Why title="Why a fourth test, when three routes need three attacks">
+Mọi helper trong `attack.ts` đều giả mạo **cả hai** identifier — channel của một tenant khác *và* một
+message id chẳng tồn tại ở đâu — rồi so hai câu trả lời. Một route lồng nhau có thể thoả cặp đó
+trong khi chỉ kiểm identifier bên ngoài, nên trường hợp thứ tư trình ra channel của CHÍNH kẻ tấn công,
+nhìn thấy được một cách hợp pháp, với message id của nạn nhân nằm bên trong.
+
+Nó được làm giả bằng cách bỏ các điều kiện channel và environment khỏi
+`repository.messageExistsIn`. Route history khi đó trả lời **200 cho một lần đọc xuyên tenant**,
+còn bốn mươi bốn đòn tấn công khác trong file vẫn xanh.
+
+Lần sửa và lần xoá thì không với tới được theo cách đó, và đó là nửa mà phép dò không
+trưng ra và đáng nói: `editMessage` và `deleteMessage` mỗi cái đều join channel và
+environment bên trong transaction của chính nó, nên một phép kiểm tồn tại không giới hạn thì không dùng được
+để chống lại một lệnh ghi. Một lỗ hổng chỉ-đọc, tìm ra bởi bài test cũng phủ luôn hai lệnh ghi
+vốn đã được đóng.
+</Why>
 
 ```diff title="services/api/src/isolation/attack.ts"
 @@ -36,13 +36,18 @@ export interface Answer {
@@ -5543,6 +5906,23 @@ describe("the revision fabric payload", () => {
  });
 ```
 
+<ForwardRef>
+**Và nửa endpoint của FR-019 thì nợ chương webhook.** Hai dòng outbox là của
+chương này — `messages.itest.ts` ở trên khẳng định rằng mọi lần sửa đều ghi một dòng và một lần
+xoá lặp lại thì chẳng ghi dòng nào — nhưng một dòng outbox không phải một lần giao. Thứ quyết định một
+khách hàng có nghe về một lần sửa hay không là phần MỞ RỘNG: `expandEventToDeliveries` khớp kiểu của một event
+với danh sách đã đăng ký của từng endpoint, và FR-WHK-02 viết `message.updated` và
+`message.deleted` thành hai cái tên riêng chứ không phải một `message.*` chính là để một endpoint
+nhận cái này mà không nhận cái kia.
+
+Chẳng gì ở đây trưng ra được điều đó, bởi chưa có endpoint nào tồn tại để mà đăng ký. Bài test sẽ làm việc đó
+gieo hai cái — một cái đăng ký cả hai kiểu mới, một cái chỉ đăng ký lần tạo — và toàn bộ sức nặng của nó nằm ở
+cái thứ hai chẳng nghe thấy gì. Nó mang theo một cái bẫy đáng đọc trước khi viết nó:
+`seedEndpoint` có tham số và mọi chỗ gọi hiện có đều truyền `["message.created"]`, nên
+một bài test quên mất đối số sẽ nhận được sự im lặng từ một endpoint chỉ-nhận-lần-tạo và đọc ra
+như thể phần mở rộng hỏng chứ không phải như thể bài test hỏng.
+</ForwardRef>
+
 ```diff title="services/gateway/src/session.test.ts"
 @@ -1,14 +1,15 @@
  import { WebSocket } from "ws";
@@ -6280,6 +6660,45 @@ describe("the revision fabric payload", () => {
  const HERE = dirname(fileURLToPath(import.meta.url));
 ```
 
+<ForwardRef>
+**Nửa thuộc về suite outsider thì nợ về phía trước.** `packages/outsider/src/integrate.itest.ts`
+đi qua lần sửa và lịch sử của nó từ bên ngoài monorepo — `WebSocket` toàn cục của Node, không có
+import workspace nào — và file đó chưa tồn tại trong thứ tự này: nó tới cùng với người ngoài
+đã niêm phong ở cuối Phần 3. Thứ nó sẽ khẳng định là tuyên bố duy nhất mà chẳng gì ở trên nói được,
+rằng một client viết chỉ dựa vào bản tham chiếu đã xuất bản có thể sửa một message và đọc được nó
+từng nói gì.
+
+110 dòng đó không mất đi. Chúng được ghi lại cho chương ấy, kèm cái bẫy mà chính lời chú thích của chúng
+gọi tên: bản kiểm kê route của suite là *những gì bài test này gọi*, không phải một bản kiểm kê của
+bề mặt công khai, và một task trong chương này đã đọc nó theo hướng kia rồi lên lịch một lần sửa
+chẳng bao giờ cần tới. Bản kiểm kê sống trong `services/api/src/isolation/targets.ts`, nơi một
+phép kiểm suy dẫn nó từ ứng dụng đang chạy thay vì phát biểu lại nó bằng văn xuôi.
+</ForwardRef>
+
+Ratchet coverage nổ sau cùng, trên `messages.controller.ts`. Câu trả lời của nó là xoá hai
+thứ thay vì test chúng: một `?? "unknown"` trên tác giả của frame xoá, thứ vừa không
+với tới được **vừa** sẽ đặt cái từ đó lên đường truyền như tên của ai đó, và ba bản sao
+của cùng hai giá trị dự phòng ngữ cảnh, mỗi chỗ publish một bản.
+
+**Rồi một bài test làm nốt phần còn lại, và nó được đo chứ không được suy luận.** Bỏ qua đúng
+bài test đó rồi chạy lại cả loạt thì đọc ra **91.83 / 85.71 / 100 / 93.75** với ba
+câu lệnh chưa phủ — cái 400 mà mỗi handler trong ba handler mới ném ra khi subject của token
+chẳng có dòng user nào. Có nó thì: **97.95 / 92.85 / 100 / 97.91**, còn lại một câu lệnh. Nên bài test
+đáng giá +6.12 câu lệnh, +7.14 nhánh và +4.16 dòng, và nó là thứ dọn sạch
+các sàn thừa hưởng.
+
+Nhánh kết thúc ở 92.85 so với mức thừa hưởng 87, nên cái ghim đó đi **lên** 92. Dòng thì đi
+**xuống** từ 100 còn 97, và câu lệnh vẫn chưa phủ thì được gọi tên chứ không được đếm: lệnh
+ném thu hẹp trong `edit`, thứ nổ khi một request tới được handler đó mà không có user
+subject. `@Accepts("user")` trên phương thức nghĩa là guard đã từ chối sẵn mọi credential
+có thể tạo ra nó — nên nó không với tới được chừng nào decorator còn ở đó, và nó ở đó để
+kêu to nếu có ai gỡ decorator đi. Một dấu `!` sẽ khôi phục 100% bằng cách dời giả định sang một chỗ mà một
+thay đổi decorator không làm nó mất hiệu lực, và đó là cuộc đánh đổi mà file này từ chối.
+
+`repository.ts` đi hướng ngược lại và cái ghim của nó được để yên: 92.66 khi chương sender
+ghim nó ở 92, **92.97 ở đây**, với lượng phương thức mới của bốn route ở giữa. Một ratchet
+chạy theo mọi lần đọc đi lên là một ratchet mà ai đó sẽ phải hạ xuống sau này.
+
 ```diff title="vitest.coverage.config.mts"
 @@ -214,17 +214,69 @@ export default defineConfig({
          // was just written from a request whose schema requires `text`. So the false
@@ -6356,8 +6775,52 @@ describe("the revision fabric payload", () => {
          // 100% of its branches.
 ```
 
-## Requirement hiện đứng ở đâu
+<Checkpoint title="Three files changed here and are not fenced, which is a decision each time">
 
-Người có quyền có thể xóa message, mọi reader thấy tombstone nhất quán, và stream vẫn có ordering. Đây là deletion có semantics, không phải một `DELETE` làm row biến mất.
+**`services/gateway/src/session.itest.ts`** là nơi ADR-24 thực sự được chứng minh, và nó là một
+trong mười ba file mà cuốn sách này trích đoạn chứ không xâu chuỗi — nên chẳng fence nào trong chương nào giữ
+toàn văn của nó và chẳng gì so nó từng byte. Hai bài test được thêm: một lần sửa qua REST
+tới được socket của mọi thành viên dưới dạng `message.updated` với sequence gốc, **đúng
+một lần và không có `message.created` thứ hai nào**, và một lần xoá tới nơi mà chẳng có khoá `text` nào cả
+trong khi một lần xoá thứ hai thì chẳng gửi gì. Cả hai đều chạy với một Redis thật và một tiến trình gateway
+thật, và đó là nơi duy nhất mà tấm vải, api và socket ở trong cùng một câu.
 
-<ChapterFooter id="3.17" locale="vi" />
+**`services/api/src/outbox/event.test.ts`** có thêm tám bài test và không fence nào. Chúng là
+nửa của consumer: cả hai kiểu được viết đúng như FR-WHK-02 viết, payload của lần sửa giống hệt
+payload của một lần tạo, lần xoá chẳng mang khoá `text` nào, khoảnh khắc của chính lần sửa chứ không phải
+`created_at` của message, và — cái quan trọng nhất — một lần xoá mang theo một text thì bị
+schema của consumer từ chối. Cái cuối đó là phía bên đọc của lập luận bắt-buộc/tuỳ-chọn
+mà cuốn sách này giờ đã trả giá hai lần.
+
+**`services/api/src/fanout/fanout.itest.ts`** đổi đúng một dòng: một stub `publishRevision` trên
+một publisher rỗng, thêm vào bởi việc nới rộng interface làm vỡ mọi bản giả không
+cài đặt nó. Phép kiểm kiểu là thứ nói ra điều đó, và một stub một dòng thì không đáng một bản diff.
+
+</Checkpoint>
+
+## Các yêu cầu đang ở đâu
+
+FR-MSG-07, FR-MSG-08 và FR-MSG-10 đã dựng xong. Cả sáu kiểu của FR-RTM-05 đều có bên tạo ra, và một
+bài test đọc `session.ts` như văn bản để giữ điều đó đúng — chẳng gì khác nhìn thấy được một bên tạo ra, bởi một
+union zod biết các thành viên của nó chứ không biết cái gì phát ra chúng, còn coverage thì thấy một dòng chạy và
+không thấy được một dòng chưa bao giờ được viết. FR-WHK-02 đi từ ba trên tám kiểu event lên
+năm.
+
+Thứ chương này không làm: nhật ký kiểm toán của FR-MOD-03. Lần xoá ghi lại **loại** principal
+nào đã gỡ một message, trong `messages.metadata`, còn **credential nào** nó trình ra là
+một câu hỏi khác kèm theo một kỳ hạn lưu trữ. Ranh giới được viết ra chứ không
+được giả định, và đó là điều lương thiện nhất chương này làm được với một yêu cầu P3 mà nó làm cho
+với tới được.
+
+Và người thực hiện lần xoá thì được ghi lại mà không đọc được. Chẳng đường đọc nào phơi nó ra — không history,
+không phần liệt kê, không frame, không event webhook, tất cả đều mang **tác giả** của message
+bởi đó là cái tên mà một client đã cầm sẵn. Bịa ra một bề mặt đọc sẽ là quyết định, trong khi
+chẳng yêu cầu nào đòi, rằng ai được biết một người vận hành đã gỡ message của ai đó.
+
+<ForwardRef>
+Chương kế tiếp lấy phần cuối cùng của bề mặt thời-gian-thực của Phần 3. Thứ chương này để lại cho nó là một
+tấm vải với năm văn phạm subject và một quy tắc để thêm cái thứ sáu, cùng một đường resume mà giới hạn của nó
+giờ được ghi trong ADR-07 chứ không phải do ai đó đâm vào nó mà phát hiện ra.
+</ForwardRef>
+
+<ChapterFooter id="3.17" />
