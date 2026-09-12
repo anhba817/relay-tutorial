@@ -697,6 +697,7 @@ export const series: Part[] = [
         path: "/part-3/chapter-23/quotas-and-what-they-cost",
         title: "Quotas and what they cost",
         status: "published",
+        translatedIn: ["vi"],
         // The half of FR-RTL that is money rather than traffic: monthly usage
         // quotas, the hard cap that suspends and the soft threshold that only
         // alerts, and the 50/80/100% email. FR-RTL-06 is a purchasing
@@ -715,6 +716,7 @@ export const series: Part[] = [
         path: "/part-3/chapter-24/counting-a-connection",
         title: "Counting a connection",
         status: "published",
+        translatedIn: ["vi"],
         // The third dimension FR-RTL-05 names, and the only one the api cannot
         // compute from its own tables. Messages and active users are already
         // rows; a connection-minute is a duration nothing records, so the
