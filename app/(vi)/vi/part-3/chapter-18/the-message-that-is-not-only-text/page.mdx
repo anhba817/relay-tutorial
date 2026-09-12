@@ -1,12 +1,20 @@
 import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
 import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import {
+  figAttachmentShape,
+  figThreeDoors,
+  figSixReadPaths,
+  figSocketDrops,
+  figTombstone,
+} from "./figures";
 
 export const metadata = {
   title: "Tin nhắn không chỉ có chữ — Building Relay",
   description:
-    "Message content là union: text hoặc attachment metadata. Chương này đặt shape ở protocol, enforce qua REST/socket, giữ NULL khác empty list và xác định deletion để lại gì.",
+    "Attachment. Cột này đã nằm trong schema từ chương 2.1, và chương này chủ yếu nói về giá trị của một field bắt buộc — và về ba chỗ mà một trình biên dịch không nhìn tới được.",
   alternates: {
-    canonical: "/vi/part-3/chapter-18/the-message-that-is-not-only-text",
+    canonical: "/part-3/chapter-18/the-message-that-is-not-only-text",
     languages: {
       en: "/part-3/chapter-18/the-message-that-is-not-only-text",
       vi: "/vi/part-3/chapter-18/the-message-that-is-not-only-text",
@@ -14,14 +22,29 @@ export const metadata = {
   },
 };
 
-<ChapterHeader id="3.18" locale="vi" />
+<ChapterHeader id="3.18" />
 
-Message không chỉ là text. Trước khi thêm field, chapter quyết định content model, compatibility
-và nơi nào phải từ chối shape không hợp lệ.
+Bảng `messages` đã có một cột `attachments JSONB` từ chương 2.1. Chẳng gì từng
+ghi vào nó. FR-MSG-11 xuất bản hai cách để lấp nó — một URL do bạn tự host, và một
+`media_id` gọi tên thứ mà Relay host — và chương này dựng cách thứ nhất.
+
+Đó là một tính năng nhỏ với một bán kính vụ nổ lớn, và phần thú vị không phải
+cái tính năng. Nó là câu hỏi làm sao tìm ra mọi chỗ mà một field mới phải có mặt khi
+field đó là tuỳ chọn với hệ thống kiểu và bắt buộc với hợp đồng.
 
 ## Một quyết định trước mọi thứ khác
 
-Message content là union: text hoặc attachment metadata. Quyết định này phải được đặt ở protocol trước khi thêm column hay endpoint, vì nó xác định mọi caller được phép gửi gì và mọi reader phải nhận shape nào.
+Hãy làm cho field trên đường truyền thành **bắt buộc**, chứ không phải tuỳ chọn.
+
+<Why title="An optional field is a field the compiler will not help you with">
+
+`messageSchema` là thứ mà nền tảng xuất bản như một message. Cho nó
+`attachments?: Attachment[]` và mọi chỗ dựng nó vẫn biên dịch được: những chỗ bạn
+nới rộng, và những chỗ bạn quên. Một message dựng mà không có field đó vẫn parse, vẫn được giao, và
+tới một client với phần attachment đơn giản là vắng mặt. Test xanh, mất mát lặng lẽ.
+
+Làm nó thành `attachments: Attachment[]` và trình biên dịch thôi lịch sự. Build gói
+protocol, rồi typecheck hai service tiêu thụ nó:
 
 ```bash
 pnpm --filter @relay/protocol build
@@ -29,13 +52,46 @@ npx tsc -p services/api/tsconfig.json --noEmit
 npx tsc -p services/gateway/tsconfig.json --noEmit
 ```
 
-## Điều compiler không thể thấy
+**33 lỗi.** Bốn trong code sản phẩm, 29 trải trên chín file test. Mỗi cái là một chỗ mà một
+payload message được dựng, và cái danh sách đó không phải thứ bạn viết ra được bằng tay — một
+lượt phân tích trước đó đã thử, từ một lệnh grep, và đúng bốn trên bảy.
 
-Type có thể buộc caller chọn một arm, nhưng không thể chứng minh object storage có file thật, content type an toàn hay attachment thuộc tenant đúng. Runtime validation và authorization vẫn là phần của contract.
+</Why>
+
+<Trap title="The build is not optional, and the failure is silence">
+
+`tsconfig.base.json` đặt `"noEmit": true`, nên `tsc -p` chỉ typecheck và chẳng phát ra gì.
+Cấu hình phát ra là `tsconfig.build.json`. Api và gateway phân giải `@relay/protocol`
+qua `exports.types` của nó, thứ trỏ vào `dist`.
+
+Nên một thay đổi trong `packages/protocol/src` là vô hình với chúng cho tới khi gói được build —
+và lệnh typecheck trả lời **"chẳng có gì để làm"** theo đúng cái thứ tự hiển nhiên. Không phải một lỗi. Một lần
+chạy sạch sẽ không phát hiện gì, thứ đọc lên y hệt sự thành công.
+
+</Trap>
+
+## Thứ mà trình biên dịch không nhìn thấy
+
+Bốn chỗ trong code sản phẩm và 28 chỗ trong test là cả cái danh sách, và nó không phải cả cái vấn đề.
+
+Bốn chỗ kia là `messages.controller.ts` hai lần, `backfill.controller.ts` và
+`session.ts` của gateway — mọi nơi nền tảng DỰNG một message. 28 chỗ kia nằm trong chín file và
+không trải đều: riêng `publisher.test.ts` giữ mười bốn chỗ, bởi một bài test
+so một payload đã publish với một hằng viết cứng sẽ gọi tên mọi field hai lần.
+
+Ba chỗ nữa lộ ra khi các suite chạy, và chúng có một nguyên nhân chung:
 
 ```ts
 messageSendSchema.parse(value)   //  (value: unknown) => MessageSend
 ```
+
+`parse` nhận `unknown`. Một fixture đưa cho nó thì vô hình với trình biên dịch bất kể
+schema đòi hỏi gì, và bất cứ thứ gì đi qua `JSON.stringify` trên đường
+lên một subject cũng vậy. Ba chỗ lộ ra là một frame giả mạo trong một suite cô lập, hai
+payload publish bằng tay trong một bài test typing, và một tập khoá được ghim trong một file so
+payload fan-out của api với một hằng viết cứng.
+
+Ba cái cân đo, theo thứ tự, và mỗi cái tìm ra thứ mà cái trước nó không tìm được:
 
 ```
 typecheck     32   the sites a type can see — 4 production, 28 in tests
@@ -43,14 +99,82 @@ unit lane     +3   fixtures and pinned key sets, all past parse(unknown)
 integration   +6   forged frames, published payloads, one more pin
 ```
 
-## Shape, và arm từ chối
+Thứ tự không phải một thủ tục hình thức. Chạy lane unit trước lệnh typecheck sẽ trưng ra
+ba lần đỏ và giấu ba mươi hai; chạy lane tích hợp trước sẽ
+trưng ra sáu và giấu phần còn lại. Mỗi lane là một bộ lọc có hình dạng, và các hình dạng
+không lồng vào nhau.
 
-Union phải từ chối arm không hợp lệ rõ ràng: text rỗng, attachment thiếu metadata, hoặc cả text lẫn attachment khi policy chỉ cho một. Một shape permissive hôm nay thành compatibility burden ở mọi reader ngày mai.
+<Trap title="A warning in a comment is not applied by anything">
+
+Suite cô lập dựng một frame cố ý dị dạng để chứng minh rằng gateway từ chối nó
+vì **hướng** của nó chứ không phải vì hình dạng của nó. Chương revisions làm vỡ bài test đó theo
+đúng cách ấy, sửa nó, rồi viết lý do vào file — gọi tên sẵn cả hai file mà chuyện đó sẽ
+xảy ra tiếp theo:
+
+> **CHƯƠNG REVISIONS TÁCH CASE NÀY RA.** … Frame giả mạo khi đó trượt phép kiểm HÌNH DẠNG
+> và lời từ chối quay về là `invalid_frame` thay vì `unknown_frame_type`. … cùng một
+> phát hiện, trong file thứ hai của hai file dựng một frame giả mạo theo cách này, và
+> `session.itest.ts` là file còn lại.
+
+Cả hai file. Được gọi tên trước. Lại bị chương này làm vỡ, bởi hàm dựng
+frame đó trả về `unknown` và chẳng quy tắc nào viết trong một lời chú thích với tới được nó.
+
+</Trap>
+
+## Hình dạng, và cái nhánh từ chối
+
+<Figure caption="Hai nhánh ngay từ phiên bản đầu. §4.14 thay phần thân của nhánh thứ hai chứ không phải giới thiệu một discriminator về sau." code={figAttachmentShape} />
+
+FR-MSG-11 xuất bản `media_id` còn chương này thì không dựng nó. Hình dạng hiển nhiên là một
+nhánh bây giờ và một nhánh thứ hai ở Phần 4. Hình dạng hiển nhiên thì sai, và lý do là một
+câu trong chính cái yêu cầu:
+
+> Lời từ chối PHẢI nói rằng media được host thì chưa có chứ không phải rằng field đó
+> không hợp lệ, bởi `media_id` là một phần đã xuất bản của FR-MSG-11 và **một khách hàng đọc
+> điều khoản ấy sẽ gửi một cái.**
+
+Một union một-nhánh sẽ từ chối `{"type": "media"}` bằng chính thông điệp discriminator của zod. Đo
+trên đúng phiên bản đã ghim chứ không phải giả định:
 
 ```
 one arm    "Invalid discriminator value. Expected 'url'"
 two arms   "hosted media is not available yet — attach an http or https url instead"
 ```
+
+Cái thứ nhất nói *field không hợp lệ*, đúng cái điều duy nhất mà yêu cầu cấm. Cái
+thứ hai tồn tại ngay từ phiên bản đầu, parse hình dạng của nó để discriminator khớp,
+rồi mới từ chối — và gateway vốn đã chuyển tiếp thông điệp của nhánh trượt tới một socket
+client, nên cả hai cánh cửa đều nhận được cái câu ấy với giá của một nhánh.
+
+<Why title="Refusing in the controller cannot work, and the comment above it says so">
+
+Lần thử đầu tiên kiểm request body ngay trong handler gửi rồi ném một 422 ở đó. Nó
+trả về 400 thay vì thế, và lời chú thích viết bên trên phép kiểm ấy chứa chính lời bác bỏ nó:
+
+> pipe chạy trên tham số còn cái này chạy trong body, nên tới lúc điều khiển tới nơi
+> thì schema đã từ chối mọi nhánh media rồi
+
+`@Body(new ZodValidationPipe(...))` **ném lỗi**. Điều khiển chẳng bao giờ tới nơi. Phép kiểm là
+code không với tới được, nằm dưới một lời chú thích giải thích vì sao nó không với tới được.
+
+Câu trả lời tốt hơn cả cách lách: hãy để schema tự gọi tên lời từ chối của nó. Nhánh
+media mang `params: { protocolCode: "media_not_available", status: 422 }`, và
+validation pipe tôn trọng nó. Một cơ chế, hai cánh cửa — REST nhận mã và status,
+socket nhận cái câu.
+
+</Why>
+
+### Vì sao nó có một mã riêng
+
+Lời từ chối lẽ ra có thể là `invalid_request`. Mã đó nghĩa là bên gọi đã gửi một thứ mà
+hợp đồng không cho phép — mà `media_id` thì **có** trong hợp đồng. Một lập trình viên đọc
+FR-MSG-11, gửi đúng hình dạng nó xuất bản, rồi nhận `invalid_request` thì đang bị bảo
+đi kiểm lại một đoạn JSON vốn đã đúng. Họ sẽ chẳng tìm ra gì, bởi chẳng có gì
+để tìm.
+
+Nên: `media_not_available`, và **422 chứ không phải 400**. Request đúng dạng và
+hiểu được; thứ không làm được là chính cái nó yêu cầu. Sự phân biệt đó cũng chính là
+sự phân biệt mà chương 2.8 kẻ ra giữa một 404 và một 403, và nó tốn một mục mới trong error registry:
 
 ```
 codes.ts                    the entry and its argument
@@ -59,22 +183,62 @@ docs/08-error-reference.md  a section with a cause and a client action
 content/docs/…              its mirror, machine-written
 ```
 
+Bốn chỗ, dự đoán là bốn trước khi công việc bắt đầu. Cái cổng đọc registry đã build
+đối chiếu bản tham chiếu đã xuất bản sẽ đỏ ngay khoảnh khắc mã tồn tại và đỏ
+cho tới khi phần tham chiếu được viết — cách nhau một pha, một cách có chủ đích, và được ghi lại
+để một cái cổng đỏ ở giữa là một lịch trình chứ không phải một bất ngờ.
+
+<Trap title="Substance is not the same as structure">
+
+Phần tham chiếu có một nguyên nhân, một hành động cho client, và chín trăm ký tự
+lập luận. Cái cổng từ chối nó:
+
 ```
 check-error-codes: media_not_available does not say what a client should do
 ```
 
-## Một rule, ba cửa
+Nó tìm chuỗi nguyên văn `**What to do:**`. Lời khuyên thì có đó, viết dưới dạng văn xuôi.
+Nửa máy đọc được thì không. Và một bản tham chiếu đã xuất bản chính là nơi mà
+"tôi đã nói rồi" và "định dạng nói thế" là hai tuyên bố khác nhau.
 
-REST send, socket send và internal service đều phải dùng cùng validator. Sao chép rule ở ba door gần như đảm bảo một door sẽ chấp nhận payload mà hai door còn lại từ chối.
+</Trap>
+
+## Một quy tắc, ba cánh cửa
+
+<Figure caption="Một quy tắc viết vào một schema là một quy tắc mà các cánh cửa khác không có." code={figThreeDoors} />
+
+Một message giờ có thể chẳng mang text nào, khi nó mang một attachment. Cái sàn dịch chuyển chứ không
+biến mất: text chỉ được rỗng **khi** có ít nhất một attachment, và một
+lần gửi chẳng có cả hai thì vẫn bị từ chối.
+
+Đó là một quy tắc về một cặp field, và có ba schema xác thực một lần gửi.
+Viết nó vào riêng schema body REST thì đặt nó lên một cánh cửa — file đó được import bởi
+đúng một file khác và chẳng bao giờ bởi đường socket.
+
+<Trap title="The half that goes missing is the refusal">
+
+Nới lỏng giới hạn text là thứ làm cho phần cho phép chạy được. Khi đó chẳng gì thực thi cái sàn.
+Đặt quy tắc cặp lên hai trong ba schema thì yêu cầu vẫn được đáp ứng — frame
+parse, api từ chối, client nhận một lỗi — mà cái *tầng* thì sai:
 
 ```
 { text: "", attachments: [] }     invalid_request    refused by the api
 eleven attachments                invalid_frame      refused by the gateway
 ```
 
-## Ba chỗ socket send làm rơi field
+Một payload, hai quy tắc, hai tầng, hai mã, chẳng vì lý do nào mà một bên gọi phát hiện ra được.
+Giới hạn mười mục sống trên schema frame để gateway trả lời nó; quy tắc cặp giờ cũng
+thế.
 
-Socket path thường serialize request, domain command rồi frame broadcast. Attachment phải đi qua cả ba; mất field ở một bước tạo bug chỉ xuất hiện với realtime client trong khi REST history vẫn đúng.
+</Trap>
+
+## Ba chỗ mà một lần gửi qua socket đánh rơi một field
+
+<Figure caption="Ba chỗ được gọi tên, và chẳng chỗ nào báo lỗi." code={figSocketDrops} />
+
+Mọi bài test REST trong chương này đều xanh trước cả khi đường socket chạy được. Cánh cửa REST
+xác thực một body rồi trao một object có kiểu cho một service. Đường socket có ba chỗ
+mà một field được gọi tên riêng lẻ, và một field không được gọi tên thì đơn giản là biến mất:
 
 ```ts
 const { channel, text, idem_key } = frame.data.payload;   // 1
@@ -88,17 +252,122 @@ const { channel, text, idem_key } = frame.data.payload;   // 1
 await fanout?.publish({ id, channel, seq, user, text, created_at });   // 3
 ```
 
-## NULL và empty list là hai giá trị khác nhau
+Message commit. Client được ack. Chẳng có lỗi nào ở đâu trong chuỗi đó, và
+bài test duy nhất nhìn thấy được nó là một bài gửi qua socket rồi đọc cái dòng.
 
-`NULL` nghĩa là message không có attachment arm; empty list có thể nghĩa attachment arm được chọn nhưng không có item. Database và API không nên làm phẳng hai trạng thái nếu product semantics cần phân biệt chúng.
+## NULL và một danh sách rỗng là hai giá trị khác nhau
 
-## Deletion để lại gì
+<Figure caption="Sáu hình dạng cùng trả về một message và chúng không đồng ý với nhau. Ba cái mang attachment; ba cái không, và mỗi cái đều có lý do." code={figSixReadPaths} />
 
-Khi message bị tombstone, attachment metadata cũng không được tiếp tục lộ qua history. Xóa object vật lý có thể là workflow riêng, nhưng reader phải ngừng trả capability hoặc URL ngay khi deletion contract có hiệu lực.
+Cột lưu `NULL` cho một message không có attachment. Mọi lần đọc trả về `[]`. Đó
+là hai sự thật khác nhau và đúng một chỗ chuyển đổi giữa chúng — cái map trong `listMessages`
+— bởi đặt phép chuyển đổi vào từng bên gọi sẽ cho nền tảng nhiều câu trả lời bằng đúng
+số bên gọi nó có.
 
-## Required field đáng giá gì
+Gỡ cái `?? []` duy nhất đó đi thì **ba** bài test đỏ, và đó là cách bạn biết
+quyết định sống ở đâu.
 
-Một field `NOT NULL` chỉ đáng giá khi write path, migration và reader cùng tôn trọng nó. Required-by-schema không thay thế validation của union hoặc backfill cho message lịch sử.
+<Why title="Why the distinction is worth keeping at all">
+
+Sẽ đơn giản hơn nếu lưu `[]` rồi chẳng bao giờ nghĩ tới `NULL` nữa. Có hai lý do không nên.
+
+Lý do thứ nhất là chúng mang ý nghĩa khác nhau. Một dòng viết trước chương này thì có `NULL`
+— chẳng gì từng đính kèm thứ gì vào nó. Một dòng viết sau đó, với một mảng rỗng,
+sẽ nghĩa là một bên gọi đã gửi một danh sách và danh sách ấy rỗng. Đó là hai sự kiện khác nhau, và một
+cột gộp chúng lại thì không hỏi được là cái nào đã xảy ra.
+
+Lý do thứ hai là đường xoá. Attachment của một tombstone bị **gỡ liên kết**, và lệnh ghi
+làm việc đó đặt cột thành `NULL` — đúng cái giá trị mà cột đã có trước khi có gì
+được đính kèm. Nếu `[]` là trạng thái vắng, thì một lần xoá sẽ phải ghi `[]` và một bên đọc
+sẽ không còn phân biệt được *chưa từng có cái nào* với *đã có rồi bị gỡ đi* mà không
+tra tới `deleted_at`. Giữ `NULL` làm giá trị vắng mặt tốn một cái `??` ở một lần đọc và
+mua được một cột tự nó trả lời được các câu hỏi.
+
+</Why>
+
+### Chứng minh rằng các bài test có thể đỏ
+
+Bốn lần làm giả, và hai lần không làm đúng thứ được bảo mới là hai lần đáng
+giữ lại.
+
+**Làm rỗng payload publish của gateway** và bài test giao socket-tới-socket đỏ —
+đúng như dự đoán. Bài test REST-tới-socket vẫn **xanh**, điều mà task không dự đoán. Đó
+không phải một lỗ hổng: payload fan-out của một lần gửi REST được dựng trong api còn của một lần gửi qua socket thì được
+dựng trong gateway, nên chúng là hai lần dựng của một frame và một thay đổi ở bên nào cũng
+vô hình với bài test của bên kia. Nửa xanh chính là bằng chứng.
+
+**Gỡ cái `?? []`** và ba bài test đỏ, chứ không phải một cái như task gọi tên.
+
+**Gỡ hẳn cột attachment khỏi lệnh đọc history** và bài test cô lập —
+cái khẳng định rằng một người không phải thành viên chẳng thấy gì — vẫn xanh. Điều đó đã được dự đoán, và nó
+chính là điểm mấu chốt: attachment chẳng thêm bề mặt thứ hai nào **theo cấu tạo**, bởi
+phép kiểm hiển thị chạy như một cánh cổng trước lệnh đọc. Chẳng có dòng nào, nên chẳng có cột nào,
+nên chẳng có gì để rò rỉ. Bài test giữ nguyên việc của nó, là canh gác câu trả lời giống nhau
+từng byte, và thôi được ghi công cho một tuyên bố mà nó không thể không đưa ra.
+
+<Checkpoint>
+
+Một message mang một bức ảnh do người khác host. Mười là một giới hạn và mười một là một
+lời từ chối gọi tên cái field. `javascript:` bị từ chối ngay ở biên bởi một bộ parse URL
+chứ không phải một phép khớp tiền tố, bởi `z.url()` chấp nhận nó.
+
+</Checkpoint>
+
+## Một lần xoá để lại gì
+
+<Figure caption="Một lần sửa đổi text và mang theo các attachment nó vốn đã có. Một lần xoá gỡ liên kết chúng và event của nó chẳng nói gì về chúng." code={figTombstone} />
+
+Một lần sửa không đổi attachment. FR-MSG-07 đổi *text* của message, route sửa nhận
+một body một field, và bảng lịch sử nó ghi thì lưu text trước đó và không gì
+khác. Một bài test chứng minh rằng database giữ chúng; một lần làm giả thêm `attachments` vào danh sách
+`SET` của lệnh `UPDATE` ấy sẽ thấy bài test đỏ rồi lại gỡ nó ra.
+
+Vậy mà event `message.updated` vẫn phải mang chúng — bởi một consumer cần một hình dạng
+cho cả một lần tạo lẫn một lần sửa, và một event bỏ mất danh sách sẽ làm một lần sửa trông như
+một message vừa mất bức ảnh của nó.
+
+<Why title="A read nobody expected to change, did">
+
+Kế hoạch gọi tên bốn hình dạng đọc sẽ không đổi rồi khẳng định chúng. Thực ra là ba.
+
+Lệnh đọc nội bộ của đường sửa là thứ duy nhất đang giữ attachment của một message vào
+khoảnh khắc event được dựng. Nó không đổi chúng, nó không trả chúng về cho một bên gọi,
+và nó không phải một phần của bề mặt công khai — vậy mà nó vẫn phải select cái cột, bởi
+event trích dẫn nó thì không bịa ra được thứ nó chưa bao giờ đọc.
+
+Đó là hình dạng của cả cái chương gói trong một đường đọc: một field bắt buộc ở thượng nguồn ép ra
+một lệnh đọc ba tầng bên dưới, trong một pha đặt tên theo một thứ khác, cho một yêu cầu
+chẳng bao giờ nhắc tới nó.
+
+</Why>
+
+Event xoá **chẳng mang field attachment nào cả**. Không phải một cái rỗng.
+
+Frame publish một lần xoá thì chưa bao giờ mang text, vì một lý do mà chính lời chú thích của nó
+đưa ra: một payload có một field text là một payload *có thể* mang chính những lời mà ai đó đã xin
+được gỡ bỏ, và `null` là một giá trị mà ai đó có thể quên đặt. Hình dạng an toàn là
+hình dạng mà cái khoá không hề tồn tại.
+
+Một URL thì cũng phục hồi được y hệt một câu chữ. Ai đó đã đính một bức ảnh rồi
+xoá message thì đã xin cho cái liên kết ấy thôi đi lại, và một event mang
+`attachments: []` chỉ cách một lần refactor là mang `attachments: [ … ]`. Nên
+payload xoá giữ nguyên năm cái khoá của nó, và bài test canh nó thì so một tập khoá chính xác
+chứ không kiểm xem field có undefined hay không — bởi một khoá vắng mặt và một
+giá trị undefined là cùng một thứ với một phép kiểm tính đúng và là hai thứ khác nhau với một
+hợp đồng.
+
+Có một trường hợp tương ứng ở chiều đi vào. Một lần gửi khôi phục một tombstone qua một
+khoá đẳng xâm cũ sẽ trả về dòng gốc, mà giờ là một tombstone: `text: null`,
+`attachments: []`, và chẳng gì được publish. Cả hai chỗ publish đều được canh theo `text !== null`,
+nên cái guard mà chương fan-out viết cho text thì mang luôn danh sách attachment theo
+miễn phí.
+
+## Một field bắt buộc đáng giá bao nhiêu
+
+Ba mươi hai lỗi trình biên dịch, ba lỗi nữa từ lane unit, sáu nữa từ lane tích hợp, và
+một từ một bài test mà một chương trước đã viết vì một lý do hoàn toàn khác — một lần sửa thành
+text rỗng, thứ đã là một 400 suốt một chương rồi lặng lẽ thành 200 khi giới hạn text của
+lệnh gửi được nới. Schema sửa đã mượn giới hạn của lệnh gửi bằng tham chiếu:
 
 ```ts
 export const editMessageBodySchema = z.strictObject({
@@ -106,13 +375,72 @@ export const editMessageBodySchema = z.strictObject({
 });
 ```
 
+Một lần sửa chẳng có field attachment nào, nên quy tắc cặp khôi phục cái sàn của lệnh gửi thì không
+khôi phục được cái sàn của lệnh sửa. Chẳng gì trong kế hoạch dự đoán nó, và trình biên dịch không nhìn thấy được —
+các kiểu giống hệt nhau theo cả hai đường.
+
+Hai schema tình cờ đồng ý với nhau là một defect mà codebase này đã ghi lại hai lần. Dạng
+sắc hơn, thứ mà chương này kiếm được: **hai schema buộc phải khác nhau thì không được dùng chung một tham chiếu
+chút nào.**
+
+Và thêm một cái nữa, tìm ra sau tất cả những thứ đó, bởi lane coverage mà phần tổng kết của chương này chạy.
+
+Cùng quy tắc ấy đã được áp cho `outboxEventSchema`, thứ không phải là cái mà nền tảng
+dựng ra. Nó là thứ mà `consumer/runtime.ts` parse ra từ một hàng đợi bền vững — và một lần parse thất bại
+ở đó được trả lời bằng `message.term()`, thứ chặn hẳn việc giao lại. Vào bản triển khai
+ship chương này, mọi `message.created` còn nằm trên stream đó đều được ghi bởi binary
+chạy trước nó, chẳng có khoá `attachments` nào cả. Bắt buộc nghĩa là bị huỷ diệt.
+
+Sáu bài test trong `consumer.itest.ts` đỏ vì đúng chuyện đó, và chúng đỏ bởi hai
+fixture chẳng ai cập nhật vẫn viết payload theo kiểu cũ. Mười một lượt phân tích không tìm ra nó,
+và phần đầu của chính file nói vì sao: suite của api chạy với `RELAY_EVENT_CONSUMER=off`, nên
+chẳng gì trong đó đụng tới consumer.
+
+Nên quy tắc có một cái rìa, và cái rìa đó đáng được phát biểu sắc như chính quy tắc. **Bắt buộc là một
+tuyên bố về thứ bạn ghi. Một bên đọc bất cứ thứ gì bền vững — một hàng đợi, một cột, những byte mà người
+khác viết — thì không thể đòi hỏi một field mà bên ghi nó không có.** `.default([])` trên hai nhánh
+event, còn interface của bên tạo ra thì vẫn bắt buộc, bởi hai câu đó nói về
+hai hướng khác nhau.
+
+<ForwardRef>
+
+§4.14 mang tới media được host: một slot upload, object storage, và cái nhánh `media_id` mà chương
+này từ chối. Khi nó ship, `media_not_available` thôi được phát ra và phần của nó
+trong bản tham chiếu lỗi cũng ra đi theo.
+
+</ForwardRef>
+
+Phần tổng kết ghim hai file ở 100 trên cả bốn chỉ số — `packages/protocol/src/attachments.ts`,
+thứ giữ toàn bộ hợp đồng của FR-MSG-11, và `services/api/src/messages/messages.schema.ts`,
+được ghim lần đầu tiên bởi đây là chương đầu tiên tìm ra một defect trong nó. Chẳng cái nào
+xuất hiện trong bảng của bộ báo cáo coverage, thứ chỉ liệt kê các file chưa đạt, nên cả hai
+con số đều được đọc ra từ `coverage-summary.json`.
+
+<Trap title="A file at 100% branches is not a file whose every arm has run">
+
+v8 ghi một nhánh `binary-expr` là đã phủ khi toán hạng đã được **ước lượng**, chứ không phải khi nó đã đi
+cả hai hướng. Quy tắc cặp mở đầu bằng
+
 ```ts
 const hasText = typeof value.text === "string" && value.text.length > 0;
 ```
 
-## Diff
+và phép kiểm `typeof` đó chưa một lần nào sai. Cả bốn bên gọi — hai schema frame,
+body REST, và bên gọi của chính bài test — đều khai `text: z.string()`, thứ kiểm được bằng cách đọc
+chúng và đã được kiểm. Cái guard ở lại bởi chữ ký hàm mà nó thu hẹp thì cố ý là
+`string | null | undefined`, nên trình biên dịch đòi phải có nó.
 
-Các diff phía dưới nối protocol, migration, endpoint, gateway và test. Mục tiêu là một content shape duy nhất, không phải một attachment feature chỉ hoạt động ở một con đường.
+Nên cái ghim đó đáng có và cũng đáng biết nó không nói gì. Nó đỏ khi một
+chương sau thêm một nhánh mà chẳng có test, và đó là việc của nó; nó sẽ không đỏ trên một toán hạng
+chỉ từng đúng.
+
+</Trap>
+
+## Bản diff
+
+Tám file mang lập luận ở trên, và chúng tới trước.
+
+Hình dạng là mới, nên nó được phát biểu nguyên vẹn chứ không phải như một thay đổi lên thứ gì đó.
 
 ```ts title="packages/protocol/src/attachments.ts"
 import { z } from "zod";
@@ -1147,6 +1475,31 @@ export function refineTextAndAttachments(
      ...envelope,
      type: z.literal("message.deleted"),
 ```
+
+<ForwardRef>
+**Nửa của người ngoài thì nợ về phía trước.** `packages/outsider/src/integrate.itest.ts`
+gửi một message có attachment từ bên ngoài monorepo — `WebSocket` toàn cục của Node, không
+import workspace nào — rồi đọc nó ngược lại chỉ qua bề mặt đã xuất bản. Gói đó
+tới cùng người ngoài đã niêm phong ở cuối Phần 3, nên file đó chưa tồn tại trong
+thứ tự này.
+
+Nó là phép kiểm duy nhất lẽ ra có thể bắt được sự đảo ngược field-bắt-buộc từ bên ngoài, và
+nó sẽ không bắt được: người ngoài nói HTTP và WebSocket, còn sự đảo ngược thì nằm trên một schema
+đọc một hàng đợi bền vững. Thứ tìm ra nó là lane coverage, sâu sáu bài test trong
+`consumer.itest.ts`, và cái câu nó kiếm được nằm ở cuối chương này.
+
+**Một hệ quả đo được của lần hoãn thì đáng được nói ra**, bởi nó giải thích một con số
+mà chương này báo khác với bản đã xuất bản. Làm cho `messageSchema.attachments`
+thành bắt buộc sẽ gọi tên mọi chỗ dựng mà trình biên dịch nhìn thấy được, và con số đó tuỳ vào việc những
+file nào tồn tại: **32 ở đây — 4 trong code sản phẩm và 28 trong test** — so với 33 trên cây đã
+xuất bản, nơi chỗ dựng thứ năm trong code sản phẩm là `services/api/src/notifications/mailer.ts`. Bộ
+vận chuyển thư là thứ mới của chương 21 trong thứ tự này. Cùng quy tắc, cùng trình biên dịch, ít hơn một file để gọi tên.
+</ForwardRef>
+
+Hai mươi mốt file còn lại là chi phí của quyết định chứ không phải lập luận cho nó —
+mọi lần dựng một payload message mà trình biên dịch gọi tên, cộng các bài test và các
+tập khoá được ghim giữ chúng. Chúng ở đây bởi một chương đổi một file có
+chuỗi thì phải nói ra, chứ không phải bởi một người đọc phải nghiên cứu chúng.
 
 ```diff title="packages/protocol/src/codes.test.ts"
 @@ -197,6 +197,23 @@ describe("the refusal this chapter's edit path adds", () => {
@@ -2682,4 +3035,36 @@ export function refineTextAndAttachments(
        JSON.stringify({
 ```
 
-<ChapterFooter id="3.18" locale="vi" />
+<Checkpoint title="Seven files changed here and are not fenced, which is a decision each time">
+
+**`services/gateway/src/session.itest.ts`** tốn 323 dòng và tám bài test — thay đổi lớn nhất
+trong chương và là một trong mười ba file mà cuốn sách này trích đoạn chứ không xâu chuỗi, nên
+chẳng fence nào ở đâu giữ toàn văn của nó. Nó là nơi cánh cửa socket thực sự được chứng minh:
+mười một attachment bị từ chối ngay ở **gateway** với field được gọi tên, một `media_id` bị từ chối với
+đúng cái mã nói vì sao, hai attachment được commit theo thứ tự qua một socket, một lần gửi
+chỉ-có-attachment được chấp nhận còn một lần gửi chẳng có cả hai thì bị từ chối, việc giao socket-tới-socket theo
+thứ tự, một lần xoá tới nơi mà chẳng có field attachment nào cả, và ack của người gửi chỉ mang
+`seq`. Mỗi cái trong số đó đều chạy với một Redis thật và hai tiến trình gateway thật.
+
+**`packages/protocol/src/attachments.test.ts`** là 154 dòng và mười lăm bài test cho một file mà
+chương có fence. Hình dạng được trưng ra; các lần làm giả của nó thì không, và chúng là lý do
+cái ghim ở 100 có ý nghĩa — cả hai nhánh, danh sách scheme được phép, giới hạn mười mục, và
+quy tắc cặp trong cả ba hướng chấp nhận và từ chối của nó.
+
+**`services/api/src/outbox/event.test.ts`** có thêm ba bài test, và một trong số đó là toàn bộ
+lập luận của chương gói trong một khẳng định duy nhất: payload của lần sửa và của lần tạo được
+so như hai TẬP, nên một field thêm vào cái này mà không thêm vào cái kia sẽ đỏ ở đó chứ không phải trong
+consumer của một khách hàng.
+
+**`services/api/src/messages/idempotency.itest.ts`** có thêm hai: một lần thử lại đưa ra một
+danh sách attachment khác thì nhận lại danh sách đã lưu, bởi cái dòng mới là câu trả lời.
+
+**Và ba file đổi hai dòng mỗi cái** — `fanout/fanout.itest.ts`,
+`outbox/publisher.test.ts`, và `vitest.coverage.config.mts`. Hai cái đầu là các fixture mà
+field bắt buộc gọi tên; cái thứ ba là ratchet, mà hai cái ghim mới và lời cảnh báo kèm theo được trích
+trong văn xuôi ở trên chứ không trưng ra dưới dạng diff, bởi một khối ngưỡng đọc dễ hơn dưới dạng
+cái câu lập luận cho nó.
+
+</Checkpoint>
+
+<ChapterFooter id="3.18" />
