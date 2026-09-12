@@ -1,12 +1,14 @@
 import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
 import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figGrammars, figRemoval, figBackstop } from "./figures";
 
 export const metadata = {
-  title: "Membership đổi ngay dưới một socket đang sống — Xây dựng Relay",
+  title: "Membership đổi ngay dưới một socket đang sống — Building Relay",
   description:
-    "Membership thay đổi phải tới socket đang sống. Chương này tạo durable revocation record, publish qua Redis, gateway cắt đúng session và chứng minh ordering quan sát được.",
+    "Một điều khoản đã không được đáp ứng từ chương 2.6 và một bài test đã khẳng định chính sự vi phạm ấy từ chương fan-out. Membership có thêm một văn phạm subject thứ ba, event đầu tiên gửi tới một principal thay vì một channel, và một lần đọc lại định kỳ đứng thay cho một cursor không tồn tại.",
   alternates: {
-    canonical: "/vi/part-3/chapter-14/the-membership-that-changed",
+    canonical: "/part-3/chapter-14/the-membership-that-changed",
     languages: {
       en: "/part-3/chapter-14/the-membership-that-changed",
       vi: "/vi/part-3/chapter-14/the-membership-that-changed",
@@ -14,17 +16,24 @@ export const metadata = {
   },
 };
 
-<ChapterHeader id="3.14" locale="vi" />
+<ChapterHeader id="3.14" />
 
-Membership không thể chỉ là database fact khi socket đã kết nối. Remove hoặc ban phải đưa
-revocation tới gateway, cắt quyền tiếp tục nhận và gửi ở đúng boundary.
+Priya gỡ Tuấn khỏi #incidents. Route trả lời 200, dòng biến mất, và message kế tiếp
+post vào channel đó thì tới điện thoại của Tuấn.
 
-## Test từng chủ ý assert violation
+Không phải vì có gì thất bại. Mà vì chẳng gì từng được dựng để ngăn điều đó.
 
-Test cũ cố tình chứng minh socket vẫn sống sau khi membership đổi — một violation từng được chấp nhận vì revocation chưa tồn tại. Khi requirement đổi, test phải đổi từ tài liệu của khoảng trống thành bằng chứng user mất quyền đúng lúc.
+Gateway học membership của một kết nối một lần, ngay ở cửa, từ
+`POST /internal/session`. Nó dựng một `Set`, đăng ký những gì trong đó, rồi đọc đúng cái
+`Set` ấy ở mọi lần giao cho tới khi socket đóng. **Chẳng gì giữa lúc connect và lúc close đọc lại
+thứ gì cả.** Một lần gỡ bỏ là một dòng trong Postgres; cái socket đang giữ user bị gỡ thì chưa bao giờ
+nghe nói tới nó.
 
-Test cũ chứng minh lỗi: member bị remove vẫn nhận message vì session snapshot membership lúc
-connect. Chương này đảo assertion thành requirement có thể kiểm chứng.
+<Figure caption="Ba văn phạm subject trên một Redis, và hai hình dạng mà membership cần" code={figGrammars} />
+
+## Một bài test khẳng định chính sự vi phạm, một cách có chủ đích
+
+Chương fan-out viết ra thứ này rồi để nó xanh:
 
 ```text title="services/gateway/src/session.itest.ts (excerpt)"
 it("keeps delivering to a member who was REMOVED while connected (FR-RTM-10)", async () => {
@@ -35,14 +44,41 @@ it("keeps delivering to a member who was REMOVED while connected (FR-RTM-10)", a
   // membership change". Measured here: they are, indefinitely.
 ```
 
+Nó gỡ một thành viên, chờ hết 5,500 mili giây của chính điều khoản, post một message, rồi khẳng định
+rằng frame **tới nơi**. Lời chú thích kết của nó mang theo chỉ dẫn cho bất kỳ ai sửa nó:
+
 ```text title="services/gateway/src/session.itest.ts (excerpt)"
   // Reads as a pass and documents a failure. The assertion is the violation:
   // change this to `.rejects` on the day a re-read exists.
 ```
 
-## Ba grammar, và tại sao grammar thứ ba cần hai shape
+Chương này chính là cái ngày ấy. Thời gian chờ vẫn ở 5,500 ms — đảo khẳng định lại trong khi rút ngắn
+cửa sổ sẽ chứng minh rằng khẳng định đã dời đi, chứ không chứng minh rằng điều khoản đã được đáp ứng.
 
-Membership change đi qua database record, Redis event và gateway instruction. Mỗi grammar có audience và lifetime khác nhau; gateway instruction cần phân biệt “cắt một session” với “cắt mọi session của user trong channel”. Gộp chúng thành một string mơ hồ làm routing sai ở chính lúc security phụ thuộc vào nó.
+<Why title="Why the clause sat open for fourteen chapters">
+Không phải sự bỏ bê. FR-RTM-10 cần một cơ chế chưa hề tồn tại: một thứ với tới được một
+socket đang sống trên một instance khác rồi đổi những gì nó được phép nghe. Chương 2.6 dựng cái fan-out
+có thể mang một message như thế và chẳng có lý do gì để gửi một cái. Chương channel-control dựng route
+gỡ bỏ và chẳng có cách nào báo cho ai. Chương fan-out cho cái lỗ hổng một lối vào thứ hai — một lệnh gửi REST
+giờ cũng tới được một socket — rồi ghim nó bằng bài test ở trên chứ không thu hẹp điều khoản
+cho tới khi nó xanh.
+</Why>
+
+## Ba văn phạm, và vì sao cái thứ ba cần hai hình dạng
+
+`chan:{channel_id}` mang message. Chương presence thêm `presence:{channel_id}`. Cả hai đều giả định
+rằng instance đang nhận **đã đăng ký sẵn channel đó**, điều đó đúng với mọi thứ
+chúng mang.
+
+Với một lần gỡ bỏ thì nó vẫn đúng, và lý do đáng được đi chậm lại: vào đúng khoảnh khắc
+lần gỡ bỏ publish, user bị gỡ *vẫn đang là thành viên*. Một lần publish trên `member:{channel_id}`
+tới được các thành viên còn lại của channel và cả người đang bị gỡ, bởi người đang
+bị gỡ thì chưa bị gỡ khỏi tô-pô.
+
+**Một lần thêm thì không làm thế được.** Instance đang giữ thành viên mới thì chẳng đăng ký gì của
+channel đó — mà đó chính xác là thứ đang thay đổi. Chẳng có subject nào mà cả hai bên đều đã
+nghe sẵn. Nên membership cần một hình dạng thứ hai, gửi tới không phải một channel mà một con người:
+
 
 ```ts title="packages/protocol/src/membership.ts"
 import { z } from "zod";
@@ -122,9 +158,25 @@ export type MembershipFabric = z.infer<typeof membershipFabricSchema>;
 export const ALL_CHANNELS = "*";
 ```
 
-## Durable record đi trước, constitution nói vậy
+`member:{env}:{user}` là subject đầu tiên trong hệ thống này gọi tên **ai đó để báo** chứ
+không phải một thứ để nghe về. Mọi subject khác là một chủ đề; cái này là một địa chỉ.
 
-Revocation được ghi durable trước khi publish. Nếu Redis down hoặc gateway bỏ lỡ event, record là nguồn để retry, reconcile và audit; publish chỉ là cách lan truyền, không phải bằng chứng duy nhất rằng quyền đã bị thu hồi.
+<Trap title="`subjectFor` was already taken, and the collision has a cost on record">
+`packages/protocol/src/internal.ts` export một `subjectFor` cho các subject NATS của xương sống event.
+Chương fan-out đã trả giá cho vụ va tên ấy một lần — hai hàm, một cái tên, một danh sách import — nên
+các hàm dựng của module này là `subjectForChannelMembership` và `subjectForUserMembership`. Dài hơn, và
+không mập mờ ở mọi chỗ gọi.
+</Trap>
+
+## Bản ghi bền vững tới trước, và hiến pháp nói thế
+
+Hiến pháp II cấm việc publish sau một lệnh commit mà không có một dòng outbox. Lệnh publish Redis
+của chương fan-out thì hợp lệ bởi chính transaction đó đã ghi cái event bền vững. Một lệnh ghi membership
+thì chẳng ghi lại gì — nên cùng lệnh publish ấy ở đây sẽ đúng là cái trường hợp mà nguyên tắc gọi tên.
+
+FR-WHK-02 đã viết sẵn hai kiểu event, nên đây là một yêu cầu được đáp ứng chứ không phải một
+nguyên tắc được xoa dịu:
+
 
 ```diff title="services/api/src/outbox/event.ts"
 @@ -19,22 +19,60 @@ export interface MessageCreatedData {
@@ -322,6 +374,25 @@ Revocation được ghi durable trước khi publish. Nếu Redis down hoặc ga
 -});
 +]);
 ```
+
+<Trap title="The consumer would have destroyed every one of these, and three things hid it">
+`outboxEventSchema` từng là `type: z.literal("message.created")` bên trong một `strictObject`.
+Consumer trả lời một lần parse thất bại bằng `message.term()` — việc giao lại dừng hẳn. Cái
+`channel.member_added` đầu tiên tới được xương sống event lẽ ra đã **bị huỷ diệt ở consumer**,
+ghi log là `consumer.unparseable`, dưới một lời chú thích ghi "chẳng gì hứng thứ rơi xuống đây".
+
+Ba thứ giấu nó đi. Lane tích hợp chạy `RELAY_EVENT_CONSUMER=off`, nên chẳng gì đụng tới
+consumer — 505 bài test api vẫn xanh với cái defect nằm nguyên đó. Một lệnh typecheck không nhìn thấy nó:
+bên tạo ra và bên tiêu thụ chẳng bao giờ gặp nhau trong một kiểu. Và một lượt phân tích thông qua nó
+bằng cách đọc nhầm file, bởi có một cái phong bì *thứ hai*, dễ dãi hơn, trong `internal.ts` mà `type` của nó là
+`z.string().min(1)`, và đó là thứ mà một lệnh grep theo tên schema tìm thấy trước.
+
+Nó được tìm ra bởi một task nói hãy chạy consumer thay vì suy luận về nó.
+</Trap>
+
+Repository ghi cái dòng bên trong transaction ghi membership, và
+external id đến từ `RETURNING` chứ không phải từ một tham số:
+
 
 ```diff title="services/api/src/db/repository.ts"
 @@ -15,13 +15,13 @@ import {
@@ -736,9 +807,18 @@ Revocation được ghi durable trước khi publish. Nếu Redis down hoặc ga
        .set({ bannedAt: null })
 ```
 
-## Publisher, và down-window không được inherit
+<Why title="Why the external id comes from a subquery and not from the caller">
+Phiên bản đầu tiên thêm một tham số `userExternalId` vào `addMember`. Thứ đó tạo ra **68
+lỗi TypeScript trên 15 file**, mười hai trong số đó là fixture test, vài cái nằm trong các file mà
+chương khác fence — chỉ vì một chuỗi mà database đã giữ sẵn, cách đó hai lần join. Câu subquery trong
+`RETURNING` tốn một lần tra index cho mỗi lệnh ghi và đổi không chỗ gọi nào.
 
-Publisher của membership không được kế thừa blind spot của publisher cũ: down-window phải có retry/claim rõ ràng và metric cho event đang chờ. Một event security bị nuốt trong lúc transport lỗi không phải một failure có thể chấp nhận.
+Một chữ ký hàm là một hợp đồng với tất cả những ai từng gọi nó. Cái này đã được gọi suốt
+mười tám chương.
+</Why>
+
+## Publisher, và cái cửa sổ ngừng không được thừa hưởng
+
 
 ```ts title="services/api/src/membership/publisher.ts"
 import {
@@ -873,6 +953,16 @@ export function createMembershipPublisher({
 }
 ```
 
+Publisher của chương fan-out mở một cửa sổ ngừng: sau một lần thất bại nó thôi thử trong năm
+giây, nên một Redis chết thì không bắt mọi lệnh gửi phải trả một lần connect timeout. Đường đó chạy một lần cho mỗi
+message. **Đường này chạy một lần cho mỗi hành động quản trị**, nên cái cửa sổ ấy sẽ là một cỗ máy
+trạng thái với thêm hai nhánh phải phủ mà chẳng mua được gì. "Có hình dạng giống `fanout/publisher.ts`"
+là một tuyên bố mà ai đó phải kiểm được, nên ba tính chất nó thực sự thừa hưởng được gọi tên
+và cái nó không thừa hưởng cũng được gọi tên.
+
+Module tồn tại bởi riêng một nhà máy thì không tiêm được:
+
+
 ```ts title="services/api/src/membership/membership.module.ts"
 import { Inject, Injectable, Module, type OnModuleDestroy } from "@nestjs/common";
 
@@ -931,6 +1021,10 @@ export class MembershipPublisherLifecycle implements OnModuleDestroy {
 export class MembershipModule {}
 ```
 
+Cả `ChannelsModule` lẫn `UsersModule` đều import nó — một module, chứ không phải cái nhà máy đăng ký
+hai lần, thứ đó sẽ mở hai kết nối Redis cho một việc:
+
+
 ```diff title="services/api/src/channels/channels.module.ts"
 @@ -1,21 +1,22 @@
  import { Module, Scope } from "@nestjs/common";
@@ -988,9 +1082,14 @@ export class MembershipModule {}
        scope: Scope.DEFAULT,
 ```
 
-## Bốn route publish, và một route bị quên
+## Bốn route publish, và một trong số đó bị quên
 
-Add, remove, role change và ban đều có thể làm socket hiện tại không còn được phép hành động. Inventory mọi mutation route để không có một endpoint tiện tay cập nhật row mà quên phát revocation. Compiler và tests chỉ giúp sau khi boundary đã được liệt kê.
+FR-004 gọi tên bốn đường: lệnh thêm hàng loạt, `join`, lệnh gỡ hàng loạt, và lệnh cấm. Viết theo từng route,
+`join` là cái sẽ lặng im — nó là một phương thức service riêng gọi thẳng `repo.addMember`,
+nên một lệnh publish treo vào `addMembers` sẽ bỏ sót nó và chẳng gì đỏ.
+
+Một helper mà cả hai hướng cùng gọi:
+
 
 ```diff title="services/api/src/channels/channels.controller.ts"
 @@ -11,15 +11,21 @@ import {
@@ -1134,9 +1233,20 @@ Add, remove, role change và ban đều có thể làm socket hiện tại khôn
  }
 ```
 
-## Ban, và sentinel không bao giờ tới client
+Chỉ những kết cục có thay đổi thứ gì mới publish. `not_a_member` là một câu trả lời hợp lệ từ
+route gỡ bỏ còn `already_a_member` thì từ route thêm — publish những cái đó sẽ bảo một gateway
+thu hồi quyền truy cập mà chẳng ai có, và đặt một frame `membership.changed` lên một socket mà chủ của nó chưa bao giờ
+bị gỡ khỏi đâu cả.
 
-Ban là revocation server-side; client không nên nhận sentinel nội bộ rồi tự quyết định đóng. Gateway nhận instruction có scope, dừng publish/subscribe và đóng socket theo protocol đúng. Như vậy client xấu không thể bỏ qua một message “hãy tự đóng”.
+<Figure caption="Một lần gỡ bỏ, từ route tới hai nhóm khán giả mà nó với tới trong một lần publish" code={figRemoval} />
+
+## Lệnh cấm, và một sentinel chẳng bao giờ tới được một client
+
+Một lệnh cấm thu hồi mọi channel cùng lúc. Api biết nó thu hồi những channel nào; nó **không**
+biết bất kỳ kết nối nào trên bất kỳ instance nào đang giữ những channel nào trong số đó — mà cái tập theo từng kết nối
+ấy chính là thứ mà các frame của một client phải khớp. Nên tấm vải mang một thay đổi duy nhất kèm một
+sentinel toàn-bộ-channel và gateway mở rộng nó ra:
+
 
 ```diff title="services/api/src/users/users.controller.ts"
 @@ -1,21 +1,31 @@
@@ -1296,9 +1406,21 @@ Ban là revocation server-side; client không nên nhận sentinel nội bộ r�
  }
 ```
 
-## Nửa gateway
+<Why title="Why the sentinel stops at the gateway">
+Hợp đồng cho tấm vải này đưa ra hai câu trả lời và cái pha quyết định thì chẳng lấy cái nào.
+`channel: "*"` trên tấm vải thì mua được một schema, một lần parse, một đường code — và phản bác thì
+có thật: `channel` là `z.string().min(1)`, và một sentinel nằm trong một chuỗi thì đọc lên như một channel id trong
+một dòng log suốt cả năm. Một hình dạng payload riêng thì né được điều đó và tốn một schema thứ hai, một
+lần parse thứ hai và một đường giao thứ hai.
 
-Gateway phải vừa nhận pub/sub vừa sở hữu registry các socket cục bộ. Một half xử lý event mà không biết session nào bị ảnh hưởng; half kia biết socket nhưng không có source cross-instance. Chỉ ghép hai nửa mới làm revocation hoạt động khi user kết nối vào instance khác.
+Câu trả lời thứ ba lấy cái thứ nhất rồi đóng lại phản bác của nó ở đúng chỗ thực sự quan trọng. Một client
+nhận đúng những frame mà N lần gỡ bỏ riêng lẻ sẽ tạo ra. Sentinel sống sót trong
+payload của tấm vải và trong một dòng log, cả hai đều nội bộ, với `ALL_CHANNELS` là cách viết
+duy nhất của nó.
+</Why>
+
+## Nửa của gateway
+
 
 ```ts title="services/gateway/src/membership.ts"
 import {
@@ -1543,6 +1665,17 @@ export function createMembership({
 export { ALL_CHANNELS };
 ```
 
+<Trap title="Written with two Redis clients, and the second was never used">
+`fanout.ts` và `presence.ts` mỗi cái mang một cặp, bởi một kết nối ở chế độ subscriber thì không
+chạy được các lệnh thông thường. Module này được đặc tả với một cặp theo phép loại suy — mà nó
+chẳng chạy lệnh thông thường nào. Đăng ký và huỷ đăng ký là các thao tác chế độ subscriber, lần đọc lại là một
+lời gọi HTTP, việc giao thì nằm trong tiến trình. Client lệnh được tạo ra, được đấu vào một bộ nghe lỗi,
+được ngắt lúc đóng, và chẳng dùng vào việc gì. Sáu kết nối Redis cho mỗi gateway, không phải bảy.
+</Trap>
+
+Được đấu dây trong `main.ts` bên cạnh bốn cái kia:
+
+
 ```diff title="services/gateway/src/main.ts"
 @@ -1,11 +1,12 @@
  import { CLOSE_CODES, docsUrl, frameSchema } from "@relay/protocol";
@@ -1602,9 +1735,9 @@ export { ALL_CHANNELS };
 +export * from "./membership.js";
 ```
 
-## Send, rồi cut — và ordering hóa ra không phải requirement
+## Gửi, rồi cắt — và cái thứ tự hoá ra không phải cái yêu cầu
 
-Một frame đang trên đường có thể đến trước khi socket bị cắt; điều requirement hứa là sau revocation, connection không còn thực hiện hành động được bảo vệ. Đừng hứa total ordering xuyên Redis và WebSocket nếu không có cơ chế để đạt nó; hãy test refusal observable sau điểm cắt.
+FR-008 nói user bị gỡ phải được báo, và được báo *trước* khi cắt. Tầng session:
 
 ```text title="services/gateway/src/session.ts (excerpt)"
     for (const connection of subject) {
@@ -1614,6 +1747,34 @@ Một frame đang trên đường có thể đến trước khi socket bị cắ
       send(connection.socket, frame);
       if (change.change !== "removed") continue;
 ```
+
+Lời chú thích đó sai, và danh sách task tạo ra nó cũng sai theo đúng cách ấy. Bằng chứng
+đã được chạy — hai câu lệnh được hoán vị rồi suite chạy lại — và **cả hai mươi hai bài test
+đều xanh.** Lời báo đi tới một tham chiếu socket mà hàm đã cầm sẵn; lệnh cắt chỉ
+ảnh hưởng tới việc định tuyến trên tấm vải trong tương lai. Hoán vị chúng chẳng đổi gì mà một client quan sát được.
+
+Thứ mà FR-008 thực sự cấm thì nằm xa hơn một dòng. `registry.subscribersOf(channel)` là cách
+tìm ra user bị gỡ — nên cắt họ khỏi `channelIds` trước sẽ gỡ họ khỏi chính
+khán giả của lời báo. Họ bị thu hồi mà chẳng bao giờ được báo. Bản cài đặt ấy cũng đã được dựng, và
+bài test đầu tiên trong file đỏ sau năm giây mà chẳng có lời báo nào cả.
+
+<Trap title="An ordering requirement is a claim about an observable difference">
+Chương này viết ra hai cái như thế và chẳng cái nào sống sót qua chính bằng chứng của nó. Cái thứ hai là đường
+thêm thành viên: đăng ký trước, rồi mới chèn vào `channelIds`, bởi làm ngược lại thì "mở ra một cửa sổ mà
+`registry.subscribersOf` trả về một kết nối cho một channel mà instance này chưa nhận được".
+
+Nới cửa sổ đó ra 1.5 giây bằng một `fanout.subscribe` bị trì hoãn rồi publish vào bên trong nó
+thì cho ra kết quả giống hệt từng byte dưới cả hai thứ tự. Việc `subscribersOf` trả về cái kết nối
+chẳng đổi gì chừng nào *instance* chưa đăng ký: frame chẳng bao giờ tới được tiến trình.
+Cả hai thứ tự đều đánh mất message.
+
+Cả hai đều được tìm ra bằng cách chạy chính cái bằng chứng mà task tự yêu cầu. Chẳng cái nào tìm ra được bằng cách
+đọc. **Khi một task nói "thứ tự chính là cái yêu cầu", nó đang tuyên bố một sự khác biệt
+quan sát được — và tuyên bố đó cần được làm giả trước khi bài test được viết, chứ không phải sau.**
+</Trap>
+
+Đường gỡ bỏ đầy đủ, và bốn thứ nó chạm tới:
+
 
 ```diff title="services/gateway/src/session.ts"
 @@ -1,25 +1,28 @@
@@ -2003,9 +2164,34 @@ Một frame đang trên đường có thể đến trước khi socket bị cắ
        });
 ```
 
-## Revocation không có cursor
+<Trap title="The resume buffer is the reader nobody expects">
+`flushable(buffer, marks)` lọc theo `frame.seq` và không theo gì khác. Một lần gỡ bỏ rơi vào
+giữa chừng resume sẽ huỷ đăng ký channel rồi vẫn xả các message đã đệm ra — quyền truy cập bị
+thu hồi còn tồn đọng thì được giao, trong cùng một hành vi.
 
-Không như history message, revocation không dùng cursor để client tự bù. Connection bị cắt là tín hiệu; reconnect sẽ authenticate và authorize lại từ durable state. Điều này đơn giản hơn và không để client replay một quyền đã bị thu hồi.
+Bài test của nó xanh ngay cả khi bộ lọc bị xoá, hai lần, vì hai lý do chẳng liên quan. Lần đầu cursor
+được trình ra bằng đúng sequence của frame đã đệm, nên các dấu resume bỏ nó đi và bài test hoá ra
+nói về lần resume dưới một cái tựa về việc thu hồi. Lần sau thì kết nối chẳng hề đệm gì:
+cửa sổ đó là một vòng backfill, khoảng hai mươi mili giây, và lần gỡ bỏ luôn rơi
+sau lần xả. Làm chậm *tấm vải* thì không giúp được — một lần xác nhận tấm vải thất bại sẽ gọi
+`degrade()`, thứ tự nó làm rỗng cái đệm. Đường nối chạy được là `ApiClient`, thứ mà
+`attachSessions` vốn đã nhận làm tham số.
+</Trap>
+
+## Một lần thu hồi chẳng có cursor
+
+ADR-07 cho phép tấm vải này đánh mất frame, và nêu lý do của nó rõ ràng: độ bền sống trong
+Postgres, và một client bỏ lỡ một frame thì thấy sequence của frame kế tiếp, phát hiện khoảng trống, rồi
+lấy lại. Với bộ máy đó thì một frame pub/sub bị mất chỉ là một gói WiFi bị mất.
+
+**Một lần thu hồi thì chẳng có chút bộ máy nào trong đó.** Không sequence, nên không có khoảng trống để phát hiện. Chẳng có gì để
+lấy lại — chẳng có câu query "những lần thu hồi tôi đã bỏ lỡ", và cũng không thể có. Một lần thu hồi
+bị rơi thì không phải một frame bị trễ; nó là một client cứ tiếp tục nhận một channel mà nó đã bị gỡ
+khỏi đó, vô thời hạn, và đó chính là cái thất bại mà chương này tồn tại để sửa.
+
+Hiến pháp IV đòi hỏi mọi cơ chế giao mới phải giữ nguyên tính chất phục hồi. Nên
+sự thật được đọc lại theo một bộ hẹn giờ, và sự khác biệt được áp qua chính cái hàm mà một thay đổi
+đã publish đi qua:
 
 ```text title="services/gateway/src/session.ts (excerpt)"
   async function reread(connection: Connection): Promise<void> {
@@ -2022,6 +2208,15 @@ Không như history message, revocation không dùng cursor để client tự b�
     }
   }
 ```
+
+Một hành vi, hai kích hoạt. Một đường áp dụng thứ hai sẽ là một bộ quy tắc thứ hai về bộ đệm,
+bộ đếm tham chiếu và thứ tự frame, được giữ đồng bộ bằng hy vọng.
+
+<Figure caption="Lưới đỡ: một lần đọc lại dùng để làm gì với một payload chẳng có cursor" code={figBackstop} />
+
+Cái route nó đọc đã được gói protocol mô tả từ chương credentials và chẳng gì
+phục vụ từ bấy tới giờ:
+
 
 ```ts title="services/api/src/internal/memberships.controller.ts"
 import { Controller, Get, HttpCode, Req, UseGuards } from "@nestjs/common";
@@ -2189,28 +2384,102 @@ export class MembershipsController {
        });
 ```
 
-## Clause thực sự nói gì
+<Why title="Sixty seconds, and the arithmetic behind it">
+NFR-SCL-01 dự trù 10,000 kết nối cho mỗi instance, và lần đọc lại là theo từng kết nối bởi
+api trả lời cho đúng cái token mà kết nối đó đã trình ra.
 
-Clause bảo vệ khả năng hành động, không phải thẩm mỹ của một UI update. Người đã bị remove không được gửi, đọc private stream hay giữ socket đặc quyền; chi tiết đóng socket là mechanism để enforcement không phụ thuộc vào cooperation của client.
+    60 s   10,000 / 60   =   167 request mỗi giây mỗi instance
+     5 s   10,000 / 5    = 2,000 request mỗi giây mỗi instance
 
+Hai nghìn một giây thì không phải một lưới đỡ, nó là một cuộc thăm dò liên tục. Còn cái cơ chế mà nó đỡ thì đã
+đáp ứng điều khoản trong 34–88 mili giây đo được. **Năm giây và sáu mươi giây là hai ngân sách
+cho hai sự kiện khác nhau**: năm là thời gian mà một cơ chế đang chạy được phép để có hiệu lực; sáu mươi giới hạn một
+cơ chế chẳng hề chạy. Đọc chúng như một con số chính là cách một lưới đỡ trở thành một cuộc thăm dò.
+</Why>
+
+## Điều khoản, nói cho thật
+
+    trên đường thuận lợi     34 ms, 88 ms, 87 ms      ngân sách 5,000 ms
+    khi mất tấm vải          một chu kỳ lưới đỡ        60,000 ms
+
+FR-RTM-10 được đáp ứng. Lần publish mang nó với biên độ gấp năm mươi bảy lần. Khi mất tấm vải thì
+lần thu hồi vẫn tới nơi — qua lần đọc lại, trong vòng sáu mươi giây chứ không phải năm, tức là
+**vượt quá điều khoản năm mươi lăm giây**.
+
+Câu đó nằm trong chương chứ không nằm trong một khoảng thời gian chẳng ai viết ra. Lần thu hồi thì
+được bảo đảm; thứ bị giới hạn là nó có thể trễ tới đâu. Chẳng điều khoản nào trong SRS giới hạn một lần
+thu hồi sau khi mất tấm vải, và nếu có ai viết ra một điều khoản như thế, thì sáu mươi giây là con số nó phải tranh luận cùng.
+
+<Checkpoint>
 ```bash
 docker compose up -d --wait
 pnpm --filter @relay/gateway test:integration
 ```
+Bốn mươi lăm bài test trong `membership.itest.ts`. Gỡ `membership?.watch(…)` khỏi `session.ts` và
+đúng bốn bài đỏ — bốn bài nói về cái lưới đỡ:
 
-## Chương này không làm gì
+    × sửa lại một lần gỡ bỏ mà tấm vải chẳng bao giờ giao, trong vòng một chu kỳ
+    × chẳng đổi gì khi chẳng có gì đổi, và được khẳng định bằng số request
+    × hội tụ một cặp tới sai thứ tự
+    × trả lời route, ghi cái dòng và ghi log một lần khi Redis không với tới được
 
-Chương này không xây một general event bus, không giải quyết mọi distributed ordering, và không biến Redis thành source of truth. Nó thêm đúng đường revocation cần cho membership và ban, với durable record đứng trước transport.
+**Được chạy chứ không được khẳng định suông**, và bốn cái tên là lý do đáng chạy: một tuyên bố
+rằng "bốn bài đỏ" thì được thoả mãn bởi bốn bài bất kỳ, còn bốn bài đáng lẽ phải đỏ là bốn bài mà
+chủ đề của chúng là lần đọc lại. Bốn mươi mốt bài còn lại vẫn xanh khi cái watch biến mất bởi tấm vải vẫn
+giao — và đó chính là điểm mấu chốt của việc có một lưới đỡ chứ không chỉ có một tấm vải.
+</Checkpoint>
 
-## Instrument đã bắt được gì
+## Thứ chương này không làm
 
-Test cross-instance, Redis-down và socket-live bắt những lỗi unit test route không thể thấy. Chúng kiểm tra một hành vi người dùng quan sát được: quyền đổi khi connection vẫn đang tồn tại.
+**Một lần publish bị rơi thì tốn sáu mươi giây, không phải năm.** Đã nói ở trên và đáng nhắc lại ở đây,
+bởi nó là con số duy nhất trong chương này mà nếu không thì một người đọc sẽ phải tự suy ra.
+
+**Một lần đổi vai trò chẳng publish gì.** Thăng một thành viên lên moderator là một lệnh *ghi* membership
+chứ không phải một *thay đổi* membership: người đó vẫn là thành viên và quyền truy cập của họ chẳng dịch đi.
+FR-WHK-02 gọi tên hai kiểu event và chẳng cái nào là `channel.member_role_changed`. Một bài test khẳng định
+sự im lặng ấy, bởi nếu không thì "chẳng frame nào tới" sẽ không phân biệt được với một publisher hỏng.
+
+**FR-WHK-02 chưa được đáp ứng.** Nó gọi tên tám kiểu event. Trước chương này thì một kiểu có bên tạo ra;
+giờ là ba. **Chẳng endpoint nào đăng ký hai kiểu mới** — webhook dispatcher giao
+những gì nó được đăng ký, mà chưa gì đăng ký một event membership cả. Hai trong tám
+cái tên có thêm bên tạo ra là bước tiến trên một điều khoản vẫn còn mở.
+
+**Ba trong sáu kiểu frame của FR-RTM-05 vẫn chẳng có bên tạo ra**, và các lý do thì khác nhau.
+`message.updated` và `message.deleted` chờ một bề mặt sửa và xoá chưa tồn tại —
+các route chưa được dựng, nên chẳng có gì để thông báo. `typing` thì trông khác: nó là kiểu duy nhất
+có lẽ đã tái dùng được `chan:{channel_id}` thay vì cần một văn phạm thứ tư,
+bởi nó là theo từng channel, phù du, và chẳng mang câu hỏi membership nào. Đó là thứ làm cho nó
+thành một chương riêng chứ không phải một đoạn trong chương này — FR-RTM-08 tới kèm một hạn năm giây,
+một giới hạn tần suất, và câu hỏi liệu một chỉ báo đang-gõ có đáng một khoá Redis hay không.
+
+**Cái trần năm kết nối của FR-RTM-09 là của chương connection-cap, và hình dạng đặc tả của nó thì không
+chạy được:**
+`conn:{env}:{user}` là một *set* Redis với một TTL, mà một TTL thì theo khoá chứ không theo thành viên —
+nên một instance làm mới khoá sẽ giữ cho mục của một instance đã chết sống mãi mãi. SAD
+kê toa một sorted set chấm điểm theo heartbeat và tỉa lúc đọc. **Chương connection-cap dựng cái trần
+và lập luận bác cái toa đó** (ADR-23): tỉa lúc đọc thì để lần giành thành không nguyên tử
+nếu không có Lua, và Hiến pháp VII chỉ cho một ngôn ngữ thứ hai vào khi có bằng chứng profiling mà một
+fixture năm channel thì không tạo ra được — nên mỗi chỗ trở thành một khoá riêng và TTL là
+theo thành viên theo cấu tạo. Đó là mục 6 trong `gaps.md` của chương presence, và nó là một thay đổi
+thiết kế chứ không phải một lần cài đặt.
+
+<ForwardRef>
+Chỉ báo đang-gõ là kiểu kế tiếp của FR-RTM-05 sẽ có một bên tạo ra. **Thứ mà chương typing
+phải quyết là liệu nó có tái dùng được một văn phạm thay vì thêm một cái mới hay không** — và con số mà
+chương này mượn từ ADR-19 chính là thứ quyết định điều đó.
+</ForwardRef>
+
+## Các cân đo bắt được gì
+
+Danh sách mục tiêu được suy dẫn nổ lần thứ sáu trong ba tính năng. Thêm
+`GET /internal/memberships` tạo ra ba lần đỏ gọi tên cái route ấy đích danh:
 
 ```text title="services/api/src/isolation/targets.itest.ts (excerpt)"
 classifies every derived target exactly once   unclassified: [GET /internal/memberships]
 has grown from the isolation gauntlet's 24 …             expected 38 to be 39
 leaves nothing exempt by omission              expected 39 to be 38
 ```
+
 
 ```diff title="services/api/src/isolation/targets.ts"
 @@ -237,12 +237,26 @@ export const CLASSIFICATIONS: readonly Classification[] = [
@@ -2258,6 +2527,26 @@ leaves nothing exempt by omission              expected 39 to be 38
      const ADDED = [
        // The channel a customer controls.
 ```
+
+Và chuỗi fence bắt được mười tám file mà chương này sửa và các chương trước đã
+fence — trước khi một chữ nào của chương này được viết.
+
+<Trap title="A published sentence stopped being true, and no checker reads prose">
+Phần đào sâu của ADR-07 nói: *"một frame pub/sub bị mất thì không phân biệt được với một gói WiFi bị mất, và
+cả hai đều tự lành theo cùng một cách."* Đúng với mọi payload mà tấm vải ấy mang lúc nó được viết, và
+sai với cái payload mà chương này thêm vào.
+
+Những từ chịu tải là "với bộ máy đó" — và nó gọi tên một bộ máy mà một lần thu hồi thì không
+có. Bản ghi được sửa đổi chứ không bị xoá: tấm vải vẫn có thể mất mát vì cái lý do nó nêu,
+còn tuyên bố tổng quát thì cho nghỉ hưu. **Bất cứ thứ gì mới trên tấm vải này đều phải tự trả lời "cái gì phục hồi nó?"
+cho chính nó.**
+
+`git diff` tìm ra một câu đã đổi. Chẳng gì tìm ra một câu thôi còn đúng bởi
+code đã dịch chuyển bên dưới nó.
+</Trap>
+
+Các file còn lại mà chương này chạm tới, được fence để chuỗi vẫn nguyên vẹn:
+
 
 ```diff title="services/api/src/internal/internal.itest.ts"
 @@ -3,12 +3,13 @@ import "reflect-metadata";
@@ -3054,4 +3343,4 @@ describe("the all-channels sentinel", () => {
 });
 ```
 
-<ChapterFooter id="3.14" locale="vi" />
+<ChapterFooter id="3.14" />
