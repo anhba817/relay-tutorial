@@ -6,9 +6,9 @@ import { figTwoDoors, figOrdering, figFailureShape, figMembershipSnapshot } from
 export const metadata = {
   title: "Tin nhắn chưa từng tới — Building Relay",
   description:
-    "Fan-out edge đã có trong kiến trúc từ trước API. Để message REST thực sự tới socket cần giữ ordering, xác định hai caller và biến best-effort publish thành delivery contract có failure rõ ràng.",
+    "Một message gửi qua REST commit, trả về 201, rồi chẳng tới ai. Kiến trúc đã kẻ cạnh đó trước cả khi api tồn tại; chẳng ai dựng nó. Một publisher đóng nó lại, còn cái thứ tự mà nó thừa hưởng thì không chép lại được.",
   alternates: {
-    canonical: "/vi/part-3/chapter-12/the-message-that-never-arrived",
+    canonical: "/part-3/chapter-12/the-message-that-never-arrived",
     languages: {
       en: "/part-3/chapter-12/the-message-that-never-arrived",
       vi: "/vi/part-3/chapter-12/the-message-that-never-arrived",
@@ -16,41 +16,47 @@ export const metadata = {
   },
 };
 
-<ChapterHeader id="3.12" locale="vi" />
+<ChapterHeader id="3.12" />
 
-Message gửi qua REST từng được persist nhưng không bao giờ tới socket. Fan-out edge đã được
-vẽ trong architecture trước khi API tồn tại; chương này làm edge đó thành sự thật.
+Build server của một khách hàng post một message. Nó nhận một `201` kèm một số sequence. Một đồng nghiệp
+đang mở app, là thành viên của channel đó, và đang nhìn vào nó.
 
-## Edge được vẽ trước khi API tồn tại
+Chẳng gì xảy ra.
 
-Kiến trúc đã vẽ edge từ API sang publish và từ publish sang gateway trước khi endpoint gửi message tồn tại. Chương này biến mũi tên đó thành contract thực: sau khi message được commit, những socket phù hợp phải nhận đúng frame — hoặc caller phải thấy failure mà nó có thể xử lý.
+Không phải chậm — mà là không bao giờ. Dòng đã commit, sequence đã được gán, outbox đã có event của nó,
+còn cái socket ngồi cách đó một mét hai thì nhận được cái bắt tay của chính nó rồi im lặng.
+Chương isolation harness liệt kê nó như một lỗ hổng với hai nguyên nhân độc lập — không phải bằng cách suy luận về
+code mà bằng cách tấn công nó rồi đọc thứ quay về. Chương sender gỡ bỏ một nguyên nhân. Chương này gỡ bỏ
+nguyên nhân còn lại, và chỗ gọi làm việc đó là mười sáu dòng code. Cái publisher đằng sau nó là
+năm mươi bảy dòng.
 
-SAD đã mô tả API publish fan-out tới Redis và gateway subscribe `chan:{channel_id}`. Gateway
-đã làm nửa subscribe; API send path write row và outbox rồi dừng. Diagram không phải
-implementation, nhưng nó là contract mà hai nửa phải gặp nhau.
+Phần thú vị chẳng phải con số nào trong hai.
 
-<Figure caption="Delivery có hai cửa: persistence và fan-out live." code={figTwoDoors} />
-<Figure caption="Commit phải xảy ra trước publish." code={figOrdering} />
-<Figure caption="Failure shape quyết định caller có thể kết luận gì." code={figFailureShape} />
-<Figure caption="Membership được snapshot ở boundary của message." code={figMembershipSnapshot} />
+<Figure caption="Một publisher, và cánh cửa mà nó không đứng ở đó" code={figTwoDoors} />
 
-<Why>Publisher boundary giữ repository không biết Redis.</Why>
-<Why>Protocol grammar dùng chung tránh API và gateway drift.</Why>
-<Why>Failure explicit tốt hơn delivery không xảy ra nhưng response vẫn thành công.</Why>
-<Why>History và cursor là authority khi live path im lặng.</Why>
+## Cạnh ấy được kẻ trước cả khi api tồn tại
 
-<Trap>Publish trước commit có thể phát message history chưa đọc được.</Trap>
-<Trap>Catch rồi log Redis error biến delivery contract thành best effort âm thầm.</Trap>
-<Trap>Payload sai field name phải fail test, không chỉ fail strict schema.</Trap>
-<Trap>Live silence không chứng minh persistence failure.</Trap>
+`docs/05-sad.md`, sơ đồ thành phần:
 
 ```text title="docs/05-sad.md (excerpt)"
     api -- "publish fan-out" --> redis
 ```
 
+Dòng đó già hơn cả đoạn code lẽ ra phải thoả mãn nó. Ba trong số các tài liệu lập kế hoạch của
+chính chương này trích nó làm bằng chứng rằng thiết kế vẫn luôn dự định điều này — *cạnh ấy đã được kẻ
+từ đầu* — và mỗi tài liệu đều dừng đọc ở đó.
+
+Mười dòng bên dưới sơ đồ tuần tự trong cùng file ấy:
+
 ```text title="docs/05-sad.md (excerpt)"
     G->>G: publish to Redis chan:{channel_id}
 ```
+
+`G` là gateway. Khung nhìn thành phần giao việc publish cho api; khung nhìn tuần tự giao nó
+cho gateway; và một tài liệu thứ ba, phần đào sâu của ADR-07, lập luận cho Redis thay vì core NATS dựa trên
+lý do *"một phép ánh xạ sạch sẽ — gateway tới Redis, api và các worker tới NATS"*.
+
+File của chính gateway nói đúng điều đó trong một lời chú thích, và lời chú thích ấy giờ sai:
 
 ```diff title="services/gateway/src/fanout.ts"
 @@ -1,19 +1,30 @@
@@ -147,6 +153,9 @@ implementation, nhưng nó là contract mà hai nửa phải gặp nhau.
        subscriber.disconnect();
 ```
 
+Văn phạm ra đi cùng nó. `subjectForChannel` giờ sống trong gói dùng chung, còn gateway thì
+import thứ nó từng định nghĩa:
+
 ```diff title="packages/protocol/src/index.ts"
 @@ -1,9 +1,12 @@
  // @relay/protocol — the shared wire contract (ADR-01's payoff, chapter 1.3).
@@ -166,17 +175,30 @@ implementation, nhưng nó là contract mà hai nửa phải gặp nhau.
 +export * from "./fanout.js";
 ```
 
-## Ordering không thể copy lại
+<Why>
 
-Không được publish trước rồi mới ghi database. Publish có thể tới gateway ngay lập tức, còn transaction có thể rollback; client khi đó nhìn thấy message không tồn tại trong history. Commit tạo fact durable trước, rồi outbox/publisher phát fact ấy theo thứ tự sequence mà channel đã chọn.
+Chẳng cái nào trong ba cái là một lời nói dối. Chúng được viết về một hệ thống chỉ có một lối vào, vào lúc mà
+gateway là thứ duy nhất nói chuyện với một client. Một sơ đồ thành phần ghi lại ý định, một sơ đồ
+tuần tự ghi lại một vết chạy, và một ADR ghi lại một lập luận — và cả ba trôi xa nhau ngay khoảnh khắc
+có thứ gì đó có hai lối vào thay vì một.
 
-Socket send publish sau commit. REST send phải giữ đúng ordering đó: commit message trước,
-rồi publish frame; publish trước commit có thể deliver message mà history chưa thấy.
+Cái cân đo lẽ ra bắt được nó thì không phải một bộ kiểm. `check:docs` so mỗi tài liệu được soi gương
+với nguồn của nó rồi tìm ra **sự trôi dạt**, và nó nói thế trong chính lời chú thích của nó; hai bản sao
+đồng ý với nhau thì cùng sai với nhau. Đọc số dòng thì trả lời được *cạnh ấy có được kẻ không*. Nó
+chẳng bao giờ trả lời *tài liệu có tự đồng ý với chính nó không*.
+
+</Why>
+
+## Thứ tự không chép lại được
+
+Đây là cái câu mà SAD gắn vào sơ đồ đó:
 
 ```text title="docs/05-sad.md (excerpt)"
 - **Ack after commit, never before** (FR-MSG-05). The Redis fan-out happens after the ack;
   a recipient may see the message milliseconds after the sender's ack, never before durability.
 ```
+
+Một socket thực hiện được chuyện đó theo nghĩa đen, và `session.ts` làm thế:
 
 ```text title="services/gateway/src/session.ts (excerpt)"
       send(connection.socket, { type: "message.ack", payload: { seq } });
@@ -184,6 +206,39 @@ rồi publish frame; publish trước commit có thể deliver message mà histo
       // sender's confirmation, then everybody's copy: no step overtakes the
       // one before it.
 ```
+
+Nó ghi một frame ack, rồi publish. Nó làm được, bởi nó giữ hai kênh: một socket nó ghi
+được bất cứ lúc nào nó thích, và một broker nó publish vào sau đó.
+
+**Một request handler thì giữ một kênh.** Response *chính là* cái ack. Bất cứ thứ gì handler await đều xảy ra
+trước khi response được ghi ra, nên "publish sau khi ack" không phải một trình tự mà cái transport này
+tạo ra được. Cách duy nhất để có nó theo nghĩa đen là tách lần publish ra khỏi request — và một
+lần publish đã tách thì mang theo cả thất bại của nó, tới một nơi mà chẳng bài test nào và chẳng người vận hành nào thấy được
+một cách đồng bộ.
+
+<Figure caption="Cùng một bảo đảm, hai thứ tự, và một trong hai thì không có sẵn" code={figOrdering} />
+
+Nên điều khoản tách ra theo transport, và thứ nó bảo vệ vẫn sống sót qua cả hai cách đọc: **lệnh commit
+đi trước cả hai**. Một người nhận có thể thấy một message gửi bằng REST sớm hơn một chút so với cái `201` của người gửi,
+và không bao giờ thấy được message nào trước khi nó bền vững.
+
+<Trap title="The clause you amend is not always the one you are reading">
+
+Bản đặc tả của chính chương này nói *"lần publish PHẢI xảy ra sau lần acknowledgement, chứ không
+trước"* — chép từ SAD với thiện ý, trước khi có ai xác lập được chỗ publish thực sự
+nằm ở đâu. Chỗ đó nằm một dòng trên cái `return` lắp ráp response. Yêu cầu
+đã cấm đúng cái điều duy nhất mà transport làm được.
+
+Sửa một yêu cầu cho khớp một phép đo thì không giống với làm yếu nó. Phép thử là
+liệu điều khoản đã sửa còn cấm thứ gì không: cái này cấm việc publish trước khi
+commit, trên cả hai đường, và đó là toàn bộ thứ mà FR-MSG-05 vẫn luôn bảo vệ.
+
+</Trap>
+
+Có một cái giá, và nó được ghi lại chứ không bị hấp thụ. **NFR-PRF-01 đo "từ lúc lệnh gửi được
+acknowledge tới lúc người nhận nhận được"** — một khoảng có thể âm trên đường REST, và
+vì thế không đo được ở đó. Nó vẫn đo được trên đường socket. Lần publish thay vào đó
+rơi vào ngân sách của NFR-PRF-02 cho lệnh ghi, nơi nó đã được đo:
 
 ```text title="specs/036-chapter-3-18/baseline.txt (excerpt)"
     242-byte payload, 2000 samples after 200 warm-up
@@ -194,12 +249,10 @@ rồi publish frame; publish trước commit có thể deliver message mà histo
     max   0.965 ms
 ```
 
-## Publish đi đâu, và hai caller quyết định nó
+0.226 ms so với 150 ms. Con số đó là lý do lần publish được await chứ không bị tách ra: làm cho
+thất bại quan sát được thì tốn 0.15% ngân sách.
 
-Cả REST handler lẫn socket handler đều tạo message, nên không caller nào được tự dựng fan-out riêng. Một service boundary nhận message đã commit và publish event chuẩn; hai door chỉ khác cách nhận principal và trả response. Nhờ vậy một fix delivery không bị quên ở caller thứ hai.
-
-REST API và socket gateway cùng tạo message, nên phải dùng chung subject, frame và failure
-semantics. Repository giữ data access; caller biết message nào đã được accept để fan-out.
+## Lần publish đi đâu, và hai bên gọi quyết định điều đó
 
 ```text title="services/api/src/messages/messages.controller.ts (excerpt)"
     const message = await this.messages.send(
@@ -211,16 +264,44 @@ semantics. Repository giữ data access; caller biết message nào đã đượ
     );
 ```
 
+Chỗ ở hiển nhiên cho một lần publish là `MessagesService.send` — một chỗ, cả hai route, không
+trùng lặp. Nó cũng sai, và lý do là hai dòng `grep`:
+
 ```text title="the question that decides the publish site (excerpt)"
 $ grep -rl "this.messages.send(" services/api/src
 services/api/src/internal/internal.controller.ts
 services/api/src/messages/messages.controller.ts
 ```
 
+Hai bên gọi. Cái thứ hai là route công khai; **cái thứ nhất là của gateway**, và gateway
+thì vốn đã publish cho đường của chính nó. Một lần publish trong service sẽ đặt mọi message gửi qua socket
+lên màn hình của mọi thành viên hai lần.
+
+<Why>
+
+Controller hoá ra là chỗ tốt hơn vì một lý do chẳng liên quan gì tới việc
+né cái bug. Sáu field mà frame fan-out cần — `id`, `channel`, `seq`, `user`,
+`text`, `created_at` — thì *đã được lắp sẵn ở đó*, trong cái `return` dựng nên response
+công khai. `MessageRow` mang năm trong số đó còn `actingExternalId` là cái thứ sáu. Chẳng gì phải
+luồn qua, và `message.duplicate` thì đang trong tầm nhìn để dùng cho cái guard.
+
+Đặt lần publish vào service thì bạn phải luồn người gửi xuống, luồn một cờ để nói bạn là
+bên gọi nào, và giữ `duplicate` quá cái điểm mà service cố ý thôi phơi
+nó ra. Chỗ né được cái bug chính là chỗ chẳng cần đường ống mới nào.
+
+</Why>
+
+Và module giữ cho nó như thế một cách cấu trúc:
+
 ```text title="services/api/src/messages/messages.module.ts (excerpt)"
   // MESSAGE_PUBLISHER is deliberately absent. See the note above it.
   exports: [Repository, MessagesService],
 ```
+
+`internal.module.ts` import module này rồi, theo lời của chính nó, *"dùng lại nguyên cả cụm
+provider của MessagesModule"*. Được cung cấp mà không được export, publisher hoàn toàn không tiêm được
+từ route nội bộ. FR-006 đứng vững nhờ ranh giới module chứ không nhờ chỗ một lời gọi nằm —
+đúng cái trò mà module này đã chơi với `"DB"`.
 
 ```diff title="services/api/src/messages/messages.module.ts"
 @@ -1,16 +1,61 @@
@@ -307,6 +388,8 @@ services/api/src/messages/messages.controller.ts
  })
  export class MessagesModule {}
 ```
+
+Và bản thân lần publish, tại cái chỗ mà hai bên gọi đã chọn cho nó:
 
 ```diff title="services/api/src/messages/messages.controller.ts"
 @@ -1,21 +1,26 @@
@@ -416,17 +499,14 @@ services/api/src/messages/messages.controller.ts
        created_at: message.created_at,
 ```
 
-## Hai guard, một guard có lý do chưa ai viết ra
-
-Guard của write path xác nhận caller là member và channel thuộc đúng environment. Guard của publish path bảo đảm event không vượt tenant hoặc channel scope. Hai điều có vẻ trùng nhau nhưng bảo vệ hai boundary khác nhau: authorization trước write và routing sau commit.
-
-Publish chỉ chạy cho message có sender và channel visible. Guard tách invalid request khỏi
-delivery failure, đồng thời tránh phát frame mà gateway schema không thể dựng trung thực.
+## Hai cái guard, và một trong hai có một lý do chẳng ai viết ra
 
 ```text title="services/api/src/messages/messages.controller.ts (excerpt)"
     if (!message.duplicate && message.text !== null) {
       await this.fanout.publish(
 ```
+
+Cả hai đều chép từ gateway, và gateway giải thích cái thứ nhất:
 
 ```text title="services/gateway/src/session.ts (excerpt)"
       // A RECOGNISED RETRY IS NOT REPUBLISHED. 2.3 made the retry safe for
@@ -435,6 +515,8 @@ delivery failure, đồng thời tránh phát frame mà gateway schema không th
       // every member's screen twice. `text === null` is the same argument:
       // a tombstone recovered by an old key is not a creation.
 ```
+
+Cái guard thứ hai có một lý do thứ hai, và nó mạnh hơn cái lý do ngữ nghĩa:
 
 ```text title="packages/protocol/src/frames.ts (excerpt)"
 export const messageSchema = z.strictObject({
@@ -447,34 +529,59 @@ export const messageSchema = z.strictObject({
 });
 ```
 
+`text: z.string()` — **không cho phép null.** Một tombstone thì không publish được kể cả khi
+lập luận ngữ nghĩa được miễn: phía giao parse bằng chính schema này, và thứ không khớp thì bị
+bỏ kèm một dòng log trong khi lệnh gửi vẫn trả lời `201`.
+
+<Trap title="A strict object turns a wrong field name into silence">
+
+`z.strictObject` nghĩa là frame đúng sáu field. Cái dòng gọi channel của nó là `channel_id`
+còn frame gọi nó là `channel`, và chỗ publish thì có cả hai cái tên trong tầm nhìn. Publish
+`channel_id` thì đầu kia bỏ luôn cả message — không lỗi nào tới người gửi, không frame nào tới
+người nhận, một `201` trên đường truyền và không gì khác.
+
+Và đó là lý do bài test khẳng định đối chiếu với **schema** chứ không đối chiếu với một danh sách các sai lầm mà người ta
+nghĩ ra được:
+
 ```text title="services/api/src/fanout/fanout.itest.ts (excerpt)"
     const parsed = messageSchema.safeParse(JSON.parse(raw!));
     expect(parsed.success, JSON.stringify(parsed.error?.issues)).toBe(true);
 ```
 
-## Grammar phải chuyển chỗ, và compiler nói lý do
+Một `safeParse` phủ được một khoá thứ bảy, một field bị đổi tên, một người gửi bị thiếu, một
+sequence không dương và một dấu thời gian không phải RFC 3339. Định nghĩa của lớp là một bộ kiểm tốt hơn bất kỳ
+phép liệt kê các thành viên của nó.
 
-Frame grammar thuộc protocol package chứ không thuộc API hay gateway. Khi event mang sender, sequence và content mới, type chung buộc publisher và consumer cùng đổi. Compiler error ở hai phía là bằng chứng wire contract không bị một service âm thầm diễn giải khác.
+</Trap>
 
-Subject grammar thuộc `@relay/protocol`, nơi API và gateway cùng import. Compiler bắt import
-CommonJS/ESM sai thay vì để Redis client hỏng lúc runtime.
+## Văn phạm phải dời đi, và trình biên dịch nói vì sao
+
+Api không import được từ gateway, nên `subjectFor` dời vào `@relay/protocol` — đúng
+cái nước đi mà chương broker đã làm cho văn phạm subject của xương sống event, vì cùng lý do. Rồi:
 
 ```text title="tsc, four seconds after the export was added (excerpt)"
 src/index.ts(12,1): error TS2308: Module "./internal.js" has already exported a
 member named 'subjectFor'.
 ```
 
+Gói ấy đã có một cái rồi. `internal.ts` export `subjectFor(type, environmentId)` cho
+xương sống event, còn cái này là `subjectFor(channelId)` cho fan-out. Mười chín lượt phân tích
+đọc cả hai file; trình biên dịch tìm ra vụ va tên ngay lập tức.
+
+Cái mới giờ là `subjectForChannel`, bởi cái tên của xương sống là của chương broker và đã được
+xuất bản. Và đặt hai cái cạnh nhau làm lộ ra một khác biệt mà chẳng chữ ký hàm nào
+phát biểu:
+
 ```text title="the two subject grammars, together for the first time (excerpt)"
 events.msg.created.{environment_id}     the spine   — carries the tenant
 chan:{channel_id}                       the fan-out — carries a channel
 ```
 
-## Failure mới là nửa thú vị
+Subject của xương sống thì giới hạn theo tenant; của fan-out thì không. Nó biện hộ được — một channel id là
+một UUID, và một instance chỉ đăng ký các channel mà một session giới hạn theo tenant đã gọi tên lúc connect —
+và nó là loại bất đối xứng đáng được nhận ra một cách có chủ đích chứ không phải phát hiện ra sau này.
 
-Database commit thành công nhưng publish thất bại là trạng thái quan trọng nhất. Request không được giả vờ delivery đã xảy ra; outbox hoặc retryable publisher phải giữ event để thử lại, và observability phải làm failure thấy được. Best-effort chỉ là tên khác của message có thể biến mất nếu contract không nói điều đó.
-
-Success chỉ chứng minh Redis sẵn sàng. Publish failure không thể bị catch rồi log trong khi
-REST trả 201; như vậy là best-effort success giả, không phải delivery contract.
+## Thất bại mới là nửa thú vị
 
 ```text title="services/api/src/fanout/publisher.ts (excerpt)"
       if (now() < downUntil) return;
@@ -489,6 +596,23 @@ REST trả 201; như vậy là best-effort success giả, không phải delivery
         logger.log("error", "fanout.publish_failed", {
 ```
 
+`publish` chẳng bao giờ reject. Việc giao được phép thất bại bởi cái dòng đã bền vững và
+đường resume sẽ tìm ra nó — quyết định của ADR-07, và câu *"bất kỳ cơ chế giao mới nào cũng PHẢI
+giữ nguyên tính chất phục hồi này"* của hiến pháp IV.
+
+<Figure caption="Mọi đường đi qua publish() đều resolve, và đó chính là vấn đề" code={figFailureShape} />
+
+Nghĩa là bài test hiển nhiên chẳng chứng minh được gì.
+
+<Trap title="The send returned 201 while Redis was down">
+
+Câu đó đúng với một publisher đang chạy mà lần publish của nó thất bại. Nó cũng đúng với một
+publisher chẳng làm gì cả — và với việc mười lăm dòng ấy chưa bao giờ được viết. Một bài test
+khẳng định điều đó thì xanh trong cả ba thế giới.
+
+Nên suite chứa một ứng dụng thứ hai, khởi động với một publisher mà `publish` của nó là một hàm
+rỗng:
+
 ```text title="services/api/src/fanout/fanout.itest.ts (excerpt)"
       // The weak assertions — both PASS, which is the finding.
       expect((await send(base, text)).status).toBe(201);
@@ -498,12 +622,18 @@ REST trả 201; như vậy là best-effort success giả, không phải delivery
       expect(lines.find((l) => l["msg"] === "fanout.publish_failed")).toBeUndefined();
 ```
 
-## Measurement nói gì về client
+Cái `201` và khả năng phục hồi thì giống hệt nhau ở cả hai thế giới. Chỉ có dòng log tách chúng ra,
+và đó là lý do FR-011 tồn tại và lý do nó gọi tên đúng những field nó gọi tên.
 
-Client nhận frame theo sequence và có thể phát hiện gap, nhưng không được suy ra rằng im lặng nghĩa là không có message. Reconnect và history endpoint vẫn là đường phục hồi authoritative; realtime rút ngắn thời gian thấy dữ liệu, không thay thế storage durable.
+</Trap>
 
-API lần đầu nói chuyện với Redis, nên measurement bao gồm connection lifecycle, retry và
-hành vi broker unavailable, không chỉ latency.
+## Các phép đo nói gì về cái client
+
+<Why title="The api had never spoken to Redis before">
+
+Gateway đã giữ một client `ioredis` từ khi nó học cách đăng ký. Api thì chưa:
+danh sách phụ thuộc của nó gọi tên Postgres, NATS và `jose`, và chẳng có gì nói Redis. Nên
+chương này thêm một cái.
 
 ```diff title="services/api/package.json"
 @@ -16,12 +16,13 @@
@@ -522,23 +652,58 @@ hành vi broker unavailable, không chỉ latency.
      "zod": "^4.4.3"
 ```
 
+**Trong thứ tự mà cuốn sách này được viết lần đầu, dòng đó đã sẵn ở đó** — bộ giới hạn tần suất
+đặt nó ở đó, và chương này thừa hưởng một client mà api vốn đã mang. Dựng lại
+Phần 3 theo chủ đề đã dời việc giới hạn tần suất muộn đi mười chương, và cái phụ thuộc đi theo nó.
+Chẳng gì về publisher thay đổi; thứ thay đổi là chương này giờ là chương
+phải biện minh cho một phụ thuộc mới chứ không phải mượn một cái đã có.
+
+Mặt trái của cuộc đánh đổi đó là một hoá đơn mà chương này không trả được. `eslint.config.mjs` hạn chế
+`ioredis` vào hai file giữ các bộ đếm giới hạn tần suất, và chương fan-out đã xuất bản
+thêm `services/api/src/fanout/**` vào phần miễn trừ đó. **Ở đây chưa có quy tắc nào như thế**, nên
+phần miễn trừ chẳng có gì để bám vào và publisher lint sạch mà chẳng cần nó — nghĩa là
+chương limits phải thêm cả quy tắc lẫn phần miễn trừ trong một commit, không thì cổng của chính nó
+sẽ đỏ trên một file mười chương tuổi. Nó được ghi lại cho chương đó chứ không phải
+được nhớ suông.
+
+</Why>
+
+**Thất bại theo hướng mở thì không miễn phí nếu nó thất bại chậm.** Một publisher nuốt các lỗi của nó thì
+vẫn là một publisher chờ chúng, và một request handler thì chờ trên đồng hồ của bên gọi.
+Giới hạn cái client là một quyết định; làm cho một broker chết trở nên *rẻ* là quyết định thứ hai, và
+bản nháp đầu tiên của hợp đồng chương này chỉ có quyết định thứ nhất.
+
+Đã đo, trên ba kiểu thất bại không giống nhau:
+
 ```text title="specs/036-chapter-3-18/baseline.txt (excerpt)"
     the shipped publisher, 12 sends at a dead port    total 2 ms
                                                       (2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
     createFanout's options, 12 sends                  HUNG past 420 s
 ```
 
+Mặc định ioredis thử lại mãi mãi, nên một `PUBLISH` đã xếp hàng thì chẳng bao giờ reject. Chép client
+của gateway vào một request handler thì không làm các lệnh gửi chậm đi; nó làm chúng không bao giờ trả về. Mười một
+con số không là cửa sổ ngừng — sau một lần thất bại, năm giây publish kế tiếp chẳng hề chạm tới
+client chút nào.
+
+Và một hiểm hoạ mà các tuỳ chọn không phủ, tìm ra bởi có một task tồn tại để đi tìm nó:
+
 ```text title="specs/036-chapter-3-18/baseline.txt (excerpt)"
     as first shipped (no commandTimeout)   publish HUNG past a 3,000 ms bound, twice
     with commandTimeout: 100               rejected in 100 ms, then 4 ms, then 100 ms
 ```
 
-## Clause chương này không sửa
+`maxRetriesPerRequest: 0` và `connectTimeout` giới hạn một server **chết**. Một server chấp nhận
+kết nối rồi chẳng bao giờ trả lời là một kiểu thất bại khác, và chẳng tuỳ chọn nào chạm tới nó.
+`commandTimeout: 100` thì có — khoảng 440 lần p95 đo được, và nằm trong ngân sách mà một timeout
+cao hơn ngân sách thì không bảo vệ nổi.
 
-Chương này không hứa exactly-once delivery đến browser. Nó hứa message được persist trước, event có shape chung, và failure publish có owner rõ ràng. Duplicates có thể được client xử lý bằng id/sequence; mất event không được lặng lẽ coi là thành công.
+## Điều khoản mà chương này không sửa
 
-Live fan-out không thay resume correctness hay outbox delivery. Các clause đó cần consumer
-và retry semantics riêng, không thể hứa bằng publish trực tiếp.
+FR-RTM-10 là P1 và nói rằng event sẽ không tới được một client mà membership của họ không còn cho phép
+truy cập, *"có hiệu lực trong vòng 5 giây kể từ khi membership đổi"*.
+
+<Figure caption="Một ảnh chụp lấy lúc connect, và chẳng gì đọc lại nó" code={figMembershipSnapshot} />
 
 ```text title="services/gateway/src/session.ts (excerpt)"
     registry.add(connection);
@@ -547,26 +712,96 @@ và retry semantics riêng, không thể hứa bằng publish trực tiếp.
     // it (reference-counted in the fabric).
 ```
 
-## Client có thể kết luận gì từ im lặng
+`connection.channelIds` được dựng một lần, từ response session, lúc connect. Các lượt đăng ký được
+lấy một lần trên tập đó. `registry.subscribersOf` đọc đúng tập đó ở mọi lần giao.
+**Chẳng gì ở giữa đọc lại membership** — gateway chẳng có database, theo ADR-05, và
+chỉ biết membership qua response session. Vào lúc chương này ship thì chẳng có đường code nào
+đọc lại nó; chương membership-revocation dựng một đường như thế, và nó đi
+qua api chứ không đi vòng ADR-05.
 
-Im lặng chỉ nói rằng client chưa quan sát frame, không nói server chưa commit. Sau reconnect, client phải sync từ cursor để bù gap. Contract này ngăn UI dùng timeout như một verdict về dữ liệu vốn có thể đang đi qua retry.
+Đã đo: một thành viên bị gỡ qua route công khai vẫn nhận được, năm giây rưỡi sau đó.
+Bài test khẳng định chính cái vi phạm ấy.
 
-Không thấy live frame không chứng minh message không tồn tại. Cursor và history vẫn là
-authority để phân biệt delay, reconnect và message chưa được gửi.
+<Why>
 
-## Clause, và amendment không cần thiết
+Chương này không làm vỡ FR-RTM-10 và cũng không sửa nó. Lỗ hổng ấy đã tồn tại với các
+message xuất phát từ socket kể từ chương 2.6; thứ chương này thêm vào là một cánh cửa thứ hai vào một
+căn phòng vốn đã thiếu ổ khoá, và một phép đo chẳng ai từng lấy.
 
-Không cần thêm lời hứa rộng hơn khi code và tests đã thể hiện boundary đúng. Một amendment tốt làm rõ observable behavior; nó không dùng văn bản để che một reliability guarantee mà hệ thống chưa thực sự cung cấp.
+Thu hẹp cái yêu cầu là một lựa chọn có sẵn và đáng được gọi tên như thứ đã không làm. Đọc
+FR-RTM-10 thành *"trong vòng năm giây kể từ một lần kết nối lại"* thì mọi bài test đều xanh, bởi một
+lần kết nối lại dựng lại cái ảnh chụp. Cách đọc đó không phải điều khoản nói, và một bản đặc tả
+bị sửa cho tới khi khớp với code thì đã thôi là một bản đặc tả.
 
-Sender chapter sửa attribution; chương này sửa delivery. Không phải chapter liền kề nào
-cũng cần amend requirement—đôi khi implementation là phần còn thiếu.
+Nó thuộc về chương presence, dù không phải vì cái lý do viết ra ở đây trước tiên. Hoá ra presence không
+cần một lần đẩy membership nào cả: nó cần tập channel của chủ thể vào khoảnh khắc một
+lần chuyển trạng thái, và `POST /internal/session` đã trả về sẵn tập đó. Sự cũ kỹ vẫn là cùng cái defect —
+một channel gia nhập giữa chừng kết nối thì vô hình cho tới khi socket mở lại — nhưng nó là một lần đọc lại mà
+tầng session nợ, chứ không phải một cơ chế mà chương ấy dựng được trên đường đi qua.
 
-## Bảy file chương này đổi nhưng không dạy
+</Why>
 
-Các file wiring, export và fixture cần thay đổi để event đi hết đường, nhưng không phải mỗi diff là một thiết kế mới. Phần cần nhớ là commit-before-publish, shared grammar và failure ownership.
+## Một client kết luận được gì từ sự im lặng
 
-Đây là plumbing hỗ trợ: dependency wiring, test setup và config. Chúng giữ contract hoạt
-động nhưng không phải concept mới.
+Chẳng gì.
+
+Một frame bị thiếu không phải bằng chứng rằng một message không tồn tại. Fan-out là nhiều-nhất-một-lần
+theo thiết kế: không ack, không phát lại, không consumer group, và một frame trượt mất một bên đăng ký thì đơn giản là
+biến mất. Thứ làm cho điều đó chấp nhận được là nó **phục hồi được** — sequence sống trong PostgreSQL,
+cursor sống với client, và phần resume của chương 2.7 biến bất kỳ khoảng trống nào thành một lần backfill.
+
+Nên bảo đảm mà một client cầm là số sequence, không phải lần giao. Nhận `seq` 41 rồi
+`seq` 43 là cách một client biết nó đã bỏ lỡ một cái, và lấy lại là cách nó phục hồi. Lần
+publish là một sự tối ưu trên nền một bảo đảm vốn đã có sẵn — và đó chính là lý do
+nó được phép thất bại, và lý do publisher của chương này nuốt lỗi của chính nó rồi ghi log
+thay vì thử lại.
+
+## Điều khoản, và lần sửa đổi không cần tới
+
+FR-RTM-01: *"Một client đang kết nối sẽ nhận message cho mọi channel mà nó là
+thành viên, mà không cần đăng ký theo từng channel."* P1, có trong SRS từ v1, và chưa được đáp ứng với bất kỳ lệnh gửi REST nào
+cho tới chương này.
+
+<Trap title="A reader arriving from the sender chapter is looking for an amendment">
+
+Cánh cổng của chương sender là một lần sửa đổi SRS: SRS chẳng có khái niệm nào về một bot user, nên phải
+viết một cái. **Chương này chẳng đổi điều khoản SRS nào cả.** Nguyên tắc VI được thoả mãn bằng trích dẫn —
+FR-RTM-01 đã đòi hỏi điều này sẵn rồi và đã là P1 sẵn rồi.
+
+Dòng của chính kế hoạch tutorial cho chương này gọi tên FR-RTM-05, thứ nói về *những kiểu event
+nào tồn tại*. FR-RTM-05 gọi tên sáu; chương này giao một, bởi một là tất cả những gì có bên tạo ra:
+`message.updated` và `membership.changed` chẳng có bên nào ngoài các bài test, và chẳng gì ghi
+`messages.edited_at` hay `messages.deleted_at`. Điều khoản chưa được đáp ứng vẫn luôn là điều khoản về việc giao.
+
+Hai tài liệu chi phối có đổi, và chẳng cái nào là SRS: `docs/05-sad.md` có thêm một
+trình tự REST và tách cái gạch đầu dòng về thứ tự của nó, còn lập luận ánh-xạ-sạch-sẽ của ADR-07 có thêm một ngoại lệ —
+**một ngoại lệ mà chương này giờ là chương đầu tiên cần.** ADR-07 ánh xạ một tấm vải cho một service, và
+ngoại lệ là một service thứ hai publish vào nó. Trong thứ tự mà cuốn sách này được viết lần đầu thì
+ngoại lệ ấy đã có trên sổ sách, ghi ngày ở chương giới hạn tần suất và kho đếm của nó; ở đây
+api mới lần đầu nói chuyện với Redis cách đây hai mươi dòng, nên lập luận tới nơi cùng với
+trường hợp đầu tiên của nó chứ không phải trường hợp thứ hai.
+
+</Trap>
+
+## Bảy file mà chương này đổi và không dạy
+
+Hai file tồn tại bởi một dòng log cần một request id, và cái id ấy hoá ra chẳng sống ở đâu mà
+một handler đọc được — được sinh ra trong một middleware, được đặt làm một response header, và chẳng bao giờ được đặt lên
+request. Đó là một cách sửa một dòng và chẳng bài học nào cả.
+
+Bốn file là các bài test mà lời chú thích hay khẳng định của chúng nói thứ cũ. `isolation.itest.ts` giữ lại
+ghi chú "suite này chẳng gắn fan-out nào", bởi điều đó vẫn đúng với nó; thứ đã đổi là
+câu tuyên bố rằng api chẳng publish vào cái nào. `public-surface.itest.ts` có một bài test viết hai
+chương trước để ghim lỗ hổng này, và nó vỡ khi lỗ hổng đóng lại.
+
+File thứ bảy là cấu hình coverage, thứ có thêm hai cái ghim — một cái chọn trước báo cáo đầu tiên
+và một cái đo sau nó. Cả hai đều được lập luận ngay tại chỗ chúng được đặt.
+
+**`eslint.config.mjs` không có ở đây, còn trong thứ tự đã xuất bản thì nó sẽ có.**
+Publisher import `ioredis`, một quy tắc hạn chế lần import đó dựa trên thẩm quyền của hiến pháp I, và
+chương fan-out đã phải thêm một phần miễn trừ cho nó. Quy tắc ấy tới cùng chương limits, mười
+chương sau chương này, nên ở đây chẳng có gì để mà được miễn trừ khỏi — đó không phải một khoản tiết kiệm mà là một
+khoản nợ, ghi cho cái chương đưa quy tắc ấy vào.
 
 ```diff title="services/api/src/auth/principal.ts"
 @@ -28,12 +28,16 @@ export type PrincipalKind = Principal["kind"];
@@ -978,11 +1213,17 @@ Các file wiring, export và fixture cần thay đổi để event đi hết đ�
 +});
 ```
 
-## Bốn file mới, đầy đủ
+## Bốn file mới, nguyên vẹn
 
-Những file mới đặt outbox/publisher seam, protocol frame và test ở những nơi contract có thể bị quan sát. Chúng cho phép sau này thay transport mà không buộc REST, socket và gateway tự học lại semantics delivery.
+Một file mới chẳng tạo ra sự trôi dạt nào — chẳng có fence nào trước đó để nó bất đồng — nên
+`check:fences` vẫn xanh trong khi hai file mà chương này nói *về* thì chẳng ai nhận.
+Đối chiếu `git diff --name-only` với danh sách đã xác minh của chính chuỗi fence là thứ tìm ra chuyện đó,
+và nó là lý do cái thực hành ấy tồn tại chứ không phải một thủ tục hình thức ở cuối.
 
-Các file mới đặt publisher boundary, Redis connection và tests cho success/failure path.
+`services/api/src/fanout/fanout.itest.ts` cố ý vắng mặt: 522 dòng test tích hợp
+không phải thứ một chương đem in ra, và nó gia nhập `session.itest.ts` trong mục 2 của `gaps.md` như
+một đường dẫn mà chuỗi không xác minh. Hai file ngoài chuỗi, cả hai đều được ghi lại, chẳng cái nào
+bị phát hiện ra sau này.
 
 ```ts title="packages/protocol/src/fanout.ts"
 /** The live fan-out's subject grammar (chapter 2.6, ADR-07).
@@ -1401,17 +1642,47 @@ describe("the api's fan-out publisher", () => {
 
 <Checkpoint>
 
-- REST send publish fan-out sau commit
-- publish failure không trả success giả
-- gateway nhận cùng protocol frame mà socket send dùng
+Một message post qua REST tới được một socket đang mở.
+
+**Bằng chứng nằm trong một file chẳng cổng nào so.** `session.itest.ts` mở một socket, post bằng một
+API key qua HTTP, rồi chờ cái frame — cả con đường, cả hai service, một Redis. Nó là một
+trong mười bốn file mà cuốn sách này chỉ fence dưới dạng trích đoạn, nên `check:fences` chẳng bao giờ phát lại nó, và
+giờ nó giữ bằng chứng đầu-cuối cho chương này theo đúng cách nó giữ bằng chứng cho cái
+watermark revision. **Bài test mạnh nhất trong chương là bài mà chuỗi không nhìn thấy được.**
+
+    24 suite · 368 bài test tích hợp · 5 trên 5 lần chạy xanh
+    trung bình 150.31 s, stdev 0.43, ngân sách 240 s
+    publisher.ts        100 / 100 / 100 / 100  (ghim trước báo cáo đầu tiên)
+    messages.controller 87.5 nhánh              (ghim ở 87, đo sau)
+
+G1 trong `gaps.md` của chương isolation harness liệt kê hai cơ chế độc lập cho "một message gửi bằng
+REST chẳng tới socket nào". Chương sender gỡ bỏ một cái, chương này gỡ bỏ cái kia, và một bài test viết hai
+chương trước để đón đầu — tựa đề *"KHÔNG giao một message gửi bằng REST, dù trực tiếp hay lúc
+resume"* — vỡ ngay khoảnh khắc lần publish rơi xuống. Giờ nó đã bị đảo lại, và nó chờ cả hai
+frame chứ không chỉ frame đầu, bởi một frame tới nơi thì cũng sẽ được thoả mãn bởi một publisher chỉ bắn
+một lần.
 
 </Checkpoint>
 
 <ForwardRef>
 
-Delivery live đã được nối. Những guarantee về persistence, resume và background delivery
-vẫn được giữ bằng các boundary riêng của chúng.
+Cửa sổ năm giây của FR-RTM-10 không được đáp ứng trên cả hai đường, và cơ chế là một ảnh chụp
+membership chẳng có lần đọc lại nào. Chương presence thừa hưởng cái defect chứ không thừa hưởng phần chẩn đoán: presence đọc
+tập channel của chủ thể vào lúc chuyển trạng thái từ chính cái ảnh chụp cũ đó, nên một channel gia nhập
+giữa chừng kết nối thì cũng vô hình ở đó — nhưng chẳng gì trong chương ấy cần một lần đẩy membership để
+chạy được, nên nó để điều khoản ở đúng chỗ nó tìm thấy chứ không sửa trên đường đi qua.
+Chương membership-revocation mới là nơi nó đóng lại, và nó đóng cả hai nửa cùng lúc: chính cái lần đọc lại ngăn
+một thành viên đã bị gỡ nhận được cũng là thứ làm cho một lần gia nhập giữa chừng kết nối hiện ra với presence.
+
+Năm kiểu event còn lại của FR-RTM-05 vẫn chẳng có bên tạo ra. `message.updated` cần một thứ
+ghi `messages.edited_at`; `membership.changed` cần một bên tạo ra nối vào một bên ghi
+vốn đã tồn tại. Cả hai đều được ghi lại chứ không được giao.
+
+Presence nằm ngoài phạm vi ở đây, và điều đó được nói ra chứ không để im lặng: FR-RTM-06 và FR-RTM-07
+là của chương presence, còn động từ thứ ba của FR-CHN-05 — quan sát presence — thì vẫn chưa được dựng. Điều khoản
+ấy có ba động từ. Đọc và gửi đã đúng trước chương này và vẫn đúng sau nó; chương này
+trao cho động từ thứ hai nửa trực tiếp của nó, và để động từ thứ ba ở đúng chỗ chương sender để lại.
 
 </ForwardRef>
 
-<ChapterFooter id="3.12" locale="vi" />
+<ChapterFooter id="3.12" />
