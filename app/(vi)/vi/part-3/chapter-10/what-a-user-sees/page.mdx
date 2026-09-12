@@ -6,9 +6,9 @@ import { figWrongWay, figUnread, figKeyset, figDeletion } from "./figures";
 export const metadata = {
   title: "Những gì một người dùng thấy — Building Relay",
   description:
-    "Bề mặt user cần channel theo activity, unread count, profile và ban. Measurement nhỏ ban đầu che một query shape không scale, nên chapter xây schema và test tại bốn kích thước.",
+    "Sắp xếp các channel của một user theo message cuối tốn 0.87 ms trên lane test và 159 ms ở mức một triệu. Con số của lane sẽ giải quyết câu hỏi theo hướng sai — và đó là hình dạng của mọi phép đo trong chương này.",
   alternates: {
-    canonical: "/vi/part-3/chapter-10/what-a-user-sees",
+    canonical: "/part-3/chapter-10/what-a-user-sees",
     languages: {
       en: "/part-3/chapter-10/what-a-user-sees",
       vi: "/vi/part-3/chapter-10/what-a-user-sees",
@@ -16,51 +16,58 @@ export const metadata = {
   },
 };
 
-<ChapterHeader id="3.10" locale="vi" />
+<ChapterHeader id="3.10" />
 
-User surface không chỉ là endpoint mới. Nó cần nói channel nào hoạt động gần đây, user chưa
-đọc gì, ai đã bị xóa, và ban ảnh hưởng một connection đang mở như thế nào.
+Một user mở app. Trước khi một message nào được render, client hỏi đúng một câu: tôi có
+những channel nào, cái nào có thứ gì mới, và điều cuối cùng được nói là gì.
 
-## 0.87 milliseconds, và con số là lời nói dối
+Ba trường, một request. Chương này là những gì cần để trả lời chúng, và nó mở màn bằng một
+phép đo chỉ sai hướng.
 
-Một người dùng mở ứng dụng và, trước khi một message được render, client phải biết ba điều: họ có những channel nào, channel nào có activity mới, và message cuối cùng là gì. Ba field ấy trông như một request đơn giản, nhưng chúng đặt ra một câu hỏi về shape của dữ liệu chứ không chỉ về endpoint.
+## 0.87 mili giây, và con số ấy là một lời nói dối
 
-Không cần thêm column để sắp xếp theo activity: có thể lấy `max(created_at)` từ `messages`. Trên test lane lớn nhất — 579 message trong 32 channel — query đó chỉ mất 0.870 ms. Nhưng ở 2.000 channel và một triệu message, nó quét tuần tự toàn bộ bảng cho mỗi lần listing, mất khoảng 159 ms. `channels.last_activity_at` có index trả lời cùng câu hỏi trong khoảng 1.1 ms. Số đo nhỏ không sai; nó chỉ đo một database quá nhỏ để lộ chi phí sẽ tăng cùng chính đại lượng một chat platform chắc chắn sẽ tăng.
-
-Query ban đầu order channel bằng `max(created_at)` của message. Ở dữ liệu nhỏ nó mất 0.87 ms;
-ở một triệu message nó thành sequential scan trên mọi message trong environment. Con số nhỏ
-không đo được shape của workload thật.
-
-<Figure caption="Benchmark nhỏ có thể che query shape không scale." code={figWrongWay} />
-<Figure caption="Unread count cần read position theo từng user và channel." code={figUnread} />
-<Figure caption="Keyset cursor giữ pagination ổn định khi activity thay đổi." code={figKeyset} />
-<Figure caption="Soft deletion giữ author lịch sử mà không giữ profile." code={figDeletion} />
-
-<Why>Đo ở nhiều kích thước biến latency thành evidence về query shape.</Why>
-<Why>Read position là state của user, không phải counter toàn cục của channel.</Why>
-<Why>Cursor phải mang ordering key để page sau không phụ thuộc offset biến động.</Why>
-<Why>Soft delete tách historical attribution khỏi personal data.</Why>
-<Why>Ban cần được kiểm tra ở nơi connection vẫn có thể hành động.</Why>
-
-<Trap>Test fixture nhỏ có thể làm sequential scan trông như một quyết định đúng.</Trap>
-<Trap>Offset pagination bỏ hoặc lặp row khi activity đổi giữa hai page.</Trap>
-<Trap>Unread count không phải promise transactionally exact.</Trap>
-<Trap>Xóa row author làm history không còn trung thực.</Trap>
-<Trap>Token mới bị từ chối không tự đóng socket đang mở.</Trap>
-<Trap>Cross-tenant attack không thay same-tenant authorization control.</Trap>
-<Trap>Status 404 không tự nói channel absent hay invisible.</Trap>
-<Trap>Table trong guard array mà không bait vẫn không được drive.</Trap>
-<Trap>Column không reader chưa phải product capability.</Trap>
-
-<SkipAhead>
-
-Các diff dưới đây đặt schema, endpoint và test để những property này được enforce.
-
-</SkipAhead>
+"Hoạt động gần nhất lên trước" chẳng cần cột mới nào. Mọi message đều mang một `created_at`, nên
+thứ tự là một phép tổng hợp:
 
 ```sql
 order by (select max(created_at) from messages where channel_id = c.id) desc
 ```
+
+Đo trên lane test, nơi environment lớn nhất giữ **579 message trên 32
+channel**: 1.942 ms, rồi 0.630, rồi 0.870. Dưới một mili giây. Không migration, không cột
+phải backfill, không đường ghi phải đổi.
+
+Cùng câu query đó với một database nháp có **2,000 channel và 1,000,000 message**:
+159.737 ms, 158.103 ms, 158.842 ms — kèm một **lần quét tuần tự qua mọi message trong
+environment, ở mọi lần liệt kê.** Một `channels.last_activity_at` có index trả lời cùng
+câu hỏi trong 1.1 ms.
+
+<Figure caption="Cách nhau 145×, và khoảng cách ấy lớn lên theo đúng con số duy nhất mà một nền tảng chat bảo đảm là sẽ lớn lên. Lane test không nhìn thấy nó." code={figWrongWay} />
+
+Một triệu message không phải con số bất thường với một nền tảng chat — nó là năm đầu tiên
+của một khách hàng tầm trung. Và 0.87 ms của lane không *sai*: nó đo một database nhỏ
+tới mức một lần quét tuần tự thắng một lần tra index, điều đó đúng và vô dụng.
+
+<Why source="docs/04-srs.md FR-CHN-08">
+
+Đây là phương pháp của chương này, không phải một giai thoại về một câu query. Mọi con số hiệu năng
+bên dưới đều được đo hai lần — một lần ở nơi các bài test chạy, và một lần ở kích cỡ mà các bài test sẽ không bao giờ
+chạm tới — bởi lane là cái cân đo gần tay nhất và là thứ ít đại diện nhất
+trong repository.
+
+</Why>
+
+Nên `channels.last_activity_at` tồn tại, và đường ghi duy trì nó trong chính câu lệnh
+đã đẩy sequence lên.
+
+**Một migration, ba thứ, và một chương.** File bên dưới mang cột đó, bảng
+`read_positions` mà phần sau nói tới, và `users.deleted_at` cho đường xoá
+ở phía sau. Bản thiết kế sinh ra chúng tách chúng ra hai file theo CHỦ ĐỀ — một file
+hoạt-động-và-vị-trí-đọc và một file vai-trò-và-xoá-user — và chẳng file nào
+thuộc về một chương: file thứ hai giữ `members.role`, của chương trước, và
+`users.deleted_at`, của chương này. Migration áp dụng theo thứ tự, nên chương trước
+không thêm được file thứ hai mà không có file thứ nhất, còn file thứ nhất chẳng giữ thứ gì nó dùng. Con số
+đi theo chương, từ giờ.
 
 ```sql title="services/api/migrations/0007_user_surface.sql"
 -- Ordering a user's channels, knowing what they have not read, and a deleted user
@@ -189,6 +196,13 @@ ALTER TABLE users
     ADD COLUMN deleted_at TIMESTAMPTZ;
 ```
 
+Phần backfill là một script chứ không phải một phần của migration, và đó là phép đo thứ hai.
+`ALTER TABLE … ADD COLUMN … NOT NULL DEFAULT now()` trả về ngay lập tức trên Postgres 11 trở
+đi — giá trị mặc định là metadata, không phải một lần viết lại — nhưng một `SET last_activity_at = (select
+max(...))` bên trong cùng transaction sẽ khoá mọi dòng channel suốt đúng khoảng thời gian phép tổng hợp
+chạy. Với các con số ở trên, đó là 159 ms cho mỗi environment nhân với số environment
+đang tồn tại, tất cả đều đang giữ một khoá `ACCESS EXCLUSIVE`.
+
 ```js title="scripts/backfill-channel-activity.mjs"
 // Set `channels.last_activity_at` to each channel's real last activity.
 //
@@ -267,15 +281,40 @@ main()
   });
 ```
 
-## Count không có counter
+## Con số đếm không cần bộ đếm
 
-Unread không phải là counter toàn cục của channel. Nó là quan hệ giữa một user, một channel và sequence cuối cùng user đó đã nhìn thấy. Vì vậy `read_positions` lưu cursor theo từng membership; số unread được suy ra từ `channels.last_sequence` thay vì cố gắng duy trì một counter dễ lệch khi message được gửi từ nhiều nơi.
+Một client cần một con số cho mỗi channel: bao nhiêu message đã tới mà user này chưa
+đọc. Cách cài đặt hiển nhiên là một bộ đếm — tăng lúc gửi, đặt lại lúc đọc — và nó là
+cách sai vì một lý do chẳng liên quan gì tới tốc độ.
 
-Việc đánh dấu đã đọc phải là monotonic: một request cũ không được kéo cursor lùi lại. Endpoint chỉ advance vị trí khi sequence mới lớn hơn, đồng thời xác thực user vẫn là member của channel. Nhờ đó retry và hai thiết bị đang hoạt động không biến acknowledgement thành một cuộc đua.
+<Figure caption="Đường ghi đã duy trì last_sequence sẵn rồi. Mọi thứ còn lại là phép trừ." code={figUnread} />
 
-Unread count không thể suy ra an toàn từ `last_sequence` một mình: nó cần read position
-theo từng user/channel. `read_positions` lưu sequence đã đọc, còn query tính phần phía sau
-nó; row chỉ được tạo khi user thực sự đọc.
+`channels.last_sequence` là thẩm quyền đánh số từ chương 2.2, và đường ghi
+duy trì nó dưới khoá dòng channel. Nên con số đếm là phép tính trên hai con số đã
+tồn tại sẵn, và nó **chẳng có gì để làm mất hiệu lực và chẳng có gì để backfill**.
+
+Đo cho một trang 50 channel với 1,000,000 message:
+
+    đếm các dòng vượt qua vị trí       9.8 - 13.4 ms
+    một bộ đếm cache trên vị trí       1.2 -  2.1 ms
+    phép trừ                           1.1 -  4.5 ms
+
+**Bộ đếm không nhanh hơn.** Nó nằm trong khoảng nhiễu của phép trừ, và nó thêm một giá trị
+có thể bất đồng với chính các message nó đếm. Một con số cache trôi dạt thì tệ hơn một
+con số chậm hơn mà không trôi được.
+
+<Trap>
+
+**Một vị trí đọc chỉ được đi tới, và phép kẹp thuộc về SQL.**
+
+    sequence: sql`greatest(${readPositions.sequence}, excluded.sequence)`
+
+Một lần đọc-rồi-ghi sẽ đánh mất cái cao hơn trong hai lần acknowledge đồng thời, dù chúng xen kẽ
+theo thứ tự nào. `greatest` trên conflict target thì không thể: một client phát lại một lần
+acknowledge cũ sau một lần kết nối lại chập chờn sẽ nhận một 200 chẳng đổi gì, và đó là
+hành vi mà hàng đợi thử lại của một client di động tạo ra thường xuyên.
+
+</Trap>
 
 ```diff title="services/api/src/db/repository.ts"
 @@ -1,19 +1,20 @@
@@ -1091,14 +1130,56 @@ nó; row chỉ được tạo khi user thực sự đọc.
        //
 ```
 
-## Plan, ở bốn kích thước
+Hai thứ trong cái diff đó đáng đọc kỹ.
 
-`EXPLAIN ANALYZE` là bằng chứng cho query shape, không phải một nghi thức trang trí. Chương này đo plan ở dữ liệu lane, một environment vừa, một environment lớn và dữ liệu scratch một triệu message. Khi planner chuyển từ index lookup sang sequential scan, đó là tín hiệu thiết kế phải thay đổi ngay cả khi test hiện tại vẫn xanh.
+**`greatest(…, 0)` là phòng thủ trước một bug, không phải trước một trạng thái với tới được.** Một vị trí vượt quá
+`last_sequence` bị từ chối ngay lúc ghi, và `last_sequence` không bao giờ lùi — nên
+phép kẹp tồn tại cho một trạng thái mà nền tảng làm cho không dựng được. Nó chẳng tốn gì và biến
+một con số âm thành số không thay vì thành một báo cáo lỗi. Cách duy nhất để phủ nhánh đó là
+cắm thẳng một vị trí vượt quá điểm cuối vào database, và đó là điều
+`repository.itest.ts` làm, và nó là cái cân đo thứ ba trong loạt này chưa từng
+cho ra kết quả nào cho tới khi một bài test được viết riêng để bắt nó chạy.
 
-Index cũng phải đi theo predicate thật: environment trước, rồi `last_activity_at` theo thứ tự giảm dần. Một index chỉ đúng một nửa có thể vẫn nhanh ở fixture nhỏ và lại buộc database sort hoặc scan ở tenant lớn.
+**`id` nằm trong keyset chứ không phải trang trí.** `last_activity_at` không duy nhất — hai channel
+có thể nhận một message trong cùng một mili giây — và một keyset trên một cột không duy nhất thì hoặc bỏ sót
+một dòng hoặc lặp lại một dòng ở mọi ranh giới trang có một cặp trùng nằm vắt qua. Phép so sánh
+dòng của Postgres, `(a, b) < (x, y)`, cho đúng nghĩa từ điển nghiêm ngặt "mọi thứ sau đúng dòng
+này" mà cursor muốn nói, trong một điều kiện duy nhất mà planner lái được bằng index.
 
-Plan được đo ở empty, small, medium và million-message fixture. Index đúng làm query giữ
-shape bounded; benchmark nhỏ chỉ là một điểm dữ liệu, không phải bằng chứng scale.
+<Figure caption="Trang đầu tiên là trang đắt nhất, ngược hẳn với một bộ phân trang theo offset" code={figKeyset} />
+
+## Kế hoạch, ở bốn kích cỡ
+
+Tập membership lớn nhất của lane là **năm channel**. Nên phần liệt kê được đo theo đúng cách
+câu hỏi thứ tự đã được đo, trên một environment tổng hợp rồi gỡ bỏ sau đó:
+
+    membership     trang đầu                  trang sâu
+      1,000       0.46 ms  top-N heapsort      —
+      5,000       2.22 ms  top-N heapsort    0.49 ms
+     20,000      10.62 ms  top-N heapsort    0.03 ms
+     50,000       9.06 ms  NO SORT           0.03 ms
+
+Không quét tuần tự ở bất kỳ kích cỡ nào. Hai điều rơi ra và chúng đáng giá hơn các con số.
+
+**Trang đầu tiên là trang đắt nhất.** Điều kiện keyset thu hẹp tập đầu vào, nên
+việc lật trang càng đi càng *rẻ* — 10.62 ms cho trang đầu của một user 20,000 channel,
+0.03 ms cho trang cuối. Với `OFFSET` thì cùng chuyến đi ấy càng đắt theo từng trang. Sự
+bất đối xứng đó là lập luận cho keyset, được phát biểu bằng một con số thay vì một nguyên tắc.
+
+**Và cái index chương này thêm vào không phải cái planner dùng — cho tới khi nó dùng.** Tới
+20,000 membership thì kế hoạch lái từ `members_user_channel`, join sang `channels` theo id,
+rồi sắp xếp. `channels_environment_last_activity` nằm không. Ở 50,000 thì planner lật sang
+một chuyến đi song song có thứ tự trên chính index đó với một lần dò membership cho mỗi dòng, không hề có node `Sort`
+— và nó nhanh hơn cả trường hợp 20,000. Cái index kiếm được chỗ của nó ở đúng quy mô mà
+việc đi qua các channel của environment theo thứ tự hoạt động rẻ hơn việc sắp xếp membership của một
+user, và planner tự tìm ra điểm giao mà chẳng ai bảo.
+
+<SkipAhead>
+
+Nên chi phí của phần liệt kê tỉ lệ với **số membership trên mỗi user** và không bao giờ với số message — đúng
+thứ mà cột kia sinh ra để làm.
+
+</SkipAhead>
 
 ```diff title="services/api/src/db/repository.itest.ts"
 @@ -277,6 +277,225 @@ describe("members_role_check names the channel's three (FR-011, R8)", () => {
@@ -1328,7 +1409,6 @@ shape bounded; benchmark nhỏ chỉ là một điểm dữ liệu, không phả
 +  });
 +});
 ```
-
 ```ts title="services/api/src/users/users.schema.ts"
 import { z } from "zod";
 
@@ -1501,24 +1581,68 @@ export const readPositionBodySchema = z.strictObject({
 export type ReadPositionBody = z.infer<typeof readPositionBodySchema>;
 ```
 
-## Hai approximation được nói rõ
+## Hai phép xấp xỉ, được nói ra
 
-Unread count không thể hứa chính xác tuyệt đối trong lúc message mới đang được ghi. Listing có thể thấy sequence mới trước khi read position được cập nhật, hoặc ngược lại; API hứa một snapshot hợp lý, không hứa transaction xuyên qua mọi request của client. Điều quan trọng là response nói rõ contract này và cursor vẫn không bao giờ lùi.
+Cả hai đều là hệ quả của việc dùng một sequence thay vì một con số đếm, và cả hai đều thuộc loại thứ mà
+một chương phải nói to lên, không thì người đọc sẽ phát hiện ra như một cái bug.
 
-Tương tự, activity timestamp được cập nhật trên write path đã phát sinh message. Đây là denormalization có chủ đích: đổi thêm một row lúc ghi để tránh aggregate đắt tiền trên mọi lần đọc.
+**Một message đã xoá vẫn tính là một cái chưa đọc.** Một tombstone giữ nguyên sequence của nó — đó là
+điều SRS đòi hỏi ở việc xoá message — nên nó giữ nguyên chỗ của mình trong phép tính. Đếm
+các dòng vượt qua vị trí thay vào đó sẽ khiến một message đã xoá thôi là chưa đọc, với chi phí gấp 10×
+trên câu query mà một client chạy để render màn hình đầu tiên.
 
-Unread là snapshot lúc read, và activity là timestamp của message cuối. Cả hai approximation
-đều được nói rõ để client không diễn giải chúng như transactionally exact counter.
+Cùng quy tắc ấy quyết định `last_message` báo cáo cái gì: **dòng ở `last_sequence`**, với
+`text: null` khi dòng đó là một tombstone, thay vì lần ngược về dòng cuối cùng
+còn có text. Việc lần ngược là một câu query thứ hai cho mỗi channel, và nó sẽ bất đồng với
+con số đếm bên cạnh nó.
 
-## User surface
+<Trap>
 
-User surface không chỉ là danh sách channel. Nó gồm pagination keyset ổn định, unread count, profile author được render trong history và hành vi khi identity hoặc membership thay đổi. Các endpoint phải dùng cùng vocabulary về environment, member và visibility; nếu không, mỗi route sẽ tạo ra một phiên bản khác nhau của “channel mà user được phép thấy”.
+**Tombstone có bên đọc mà không có bên ghi.**
 
-Keyset cursor mang cả ordering key lẫn id dùng để phá hòa. Offset pagination sẽ bỏ hoặc lặp row nếu activity đổi giữa hai page, còn cursor theo `last_activity_at` tiếp tục từ chính vị trí mà trang trước đã quan sát.
+`messages.deleted_at` và một `text` null đã nằm trong schema từ chương 2.1.
+`backfill.controller` truyền thẳng `text` qua, nên một giá trị null đã tới được đường truyền rồi.
+**Chẳng gì trong nền tảng ghi cái nào trong hai thứ đó** — không có route xoá message, không có
+phương thức repository, không gì cả. FR-MSG-08 chưa được cài đặt.
 
-Endpoint listing trả channel visible của user, activity, unread count và cursor. Pagination
-phải stable: cursor mang ordering key để page tiếp theo không lặp hay bỏ channel khi có write
-mới.
+Nên quy tắc ở trên được đặc tả cho một trạng thái mà không route nào tạo ra được. Nó vẫn được cài đặt và
+test, với tombstone được ghi bằng SQL thô, để tới ngày chương của điều khoản đó ship thì
+con số đếm và bản xem trước đã đồng ý sẵn với nhau.
+
+Đây là hình ảnh soi gương của chính tính năng mà hai chương này thuộc về. Bốn cột có
+bên ghi mà không có bên đọc; tombstone có bên đọc mà không có bên ghi.
+
+</Trap>
+
+**Và message của chính một user vẫn tính là chưa đọc cho tới khi họ acknowledge.** Đặc tả đã giả định
+ngược lại — "message của chính một user là đã được họ đọc" — và kịch bản thì lỏng hơn và đúng:
+*việc nó có tính hay không* phải được phát biểu và test. Đã đo: nó có tính. Đường ghi không
+đẩy vị trí đọc của chính người gửi lên.
+
+<Why source="specs/034-chapter-3-15/spec.md, assumption 4">
+
+Để nguyên như vậy, và chi phí của chỗ mà thay đổi sẽ nằm chính là lý do. Đẩy vị trí
+ở phía server là một câu lệnh thứ hai trên một bảng thứ hai bên trong transaction gửi —
+thao tác tần suất cao nhất của nền tảng, cho mọi message có ghi danh người gửi, mãi mãi.
+`last_activity_at` được nhét vào câu lệnh vốn đã cập nhật `channels` chính là để
+tránh chuyện đó; một lần upsert vị trí đọc chẳng có câu lệnh nào để bám vào.
+
+Client chẳng phải trả gì cả: response của lần gửi đã mang sẵn cái sequence nó vừa
+ghi. Và lệnh gửi REST công khai chẳng ghi danh user nào, nên một lần đẩy phía server sẽ
+chạy với một số lần gửi và không chạy với số khác — tệ nhất trong ba lựa chọn.
+
+**Phiên bản đầu tiên của bài test đó giấu mất câu trả lời.** Nó gửi một message, đặt vị trí đọc
+tới sequence của message đó, rồi khẳng định là số không — pass, trong khi chỉ chứng minh rằng vị trí
+ghi được. Khẳng định thực sự quan trọng là cái *trước* lần acknowledge, và nó
+chỉ được viết ra vì hành vi đã được đo thay vì được giả định.
+
+</Why>
+
+## Bề mặt user
+
+Năm điều khoản SRS cần các route mà chủ thể là một user, mà lại chẳng có controller nào cho
+user. Treo chúng lên channels controller sẽ đặt vòng đời của user sau một
+đường dẫn channel: `POST /v1/channels/users` là một câu nói về không gì cả.
 
 ```ts title="services/api/src/users/users.module.ts"
 import { Module, Scope } from "@nestjs/common";
@@ -1559,7 +1683,6 @@ import type { RequestWithTenant } from "../messages/request-with-tenant";
 })
 export class UsersModule {}
 ```
-
 ```diff title="services/api/src/app.module.ts"
 @@ -8,12 +8,17 @@ import { APP_FILTER } from "@nestjs/core";
  import { AuthModule } from "./auth/auth.module";
@@ -1594,6 +1717,22 @@ export class UsersModule {}
    ],
    controllers: [HealthController],
 ```
+
+<Trap>
+
+Hai dòng đăng ký đó nằm trong **không task nào cả**. Kế hoạch của tính năng gọi tên mọi route,
+mọi cột và mọi bài test, mà chẳng gì nói "đăng ký module" — bởi
+`ChannelsModule` đã được đăng ký sẵn và chẳng ai suy dẫn lại một dòng đã tồn tại cho
+hàng xóm của nó.
+
+Không có nó, `UsersModule` vẫn biên dịch, vẫn export, không bị module nào import, và **tám route
+không hề tồn tại**. Bảy yêu cầu có task mà các task ấy không thể giao được chúng.
+
+Tìm ra bằng cách hỏi xem chương nào fence mỗi file: `app.module.ts` nằm trong danh sách các file mà
+tính năng này phải đổi và chẳng nằm trong task nào của nó. Không phát hiện then chốt nào của tính năng này
+với tới được bằng cách đọc kế hoạch đối chiếu các task.
+
+</Trap>
 
 ```ts title="services/api/src/users/users.service.ts"
 import { HttpStatus, Injectable, NotFoundException } from "@nestjs/common";
@@ -1826,7 +1965,6 @@ export class UsersService {
   }
 }
 ```
-
 ```ts title="services/api/src/users/users.controller.ts"
 import {
   Body,
@@ -1973,14 +2111,47 @@ export class UsersController {
 }
 ```
 
-## Deletion vẫn giữ row
+Hai trong ba trường của profile — `users.avatar_url` và `users.metadata` — đã nằm trong
+schema suốt hai mươi hai chương mà **chẳng route nào ghi hay đọc cái nào**. Đây chính là
+cặp route mà dòng tiêu đề của tính năng nói tới.
 
-Xóa user không có nghĩa là xóa tác giả khỏi lịch sử. Message cần tiếp tục nói trung thực rằng một người từng gửi nó; vì vậy user row được soft-delete bằng `deleted_at`, còn profile cá nhân được trả về theo shape tối thiểu. Xóa cứng row author sẽ làm history mồ côi hoặc buộc foreign key phải nói dối.
+Ba trạng thái mà API phân biệt, thứ mà một endpoint chỉ-đặt sẽ không làm được:
 
-Read path phải chủ động định nghĩa profile của user đã xóa: không trả email, display name hay avatar đã bị xóa, nhưng vẫn giữ id và dấu hiệu để client render author lịch sử một cách an toàn.
+    trường vắng mặt trong patch       giữ nguyên giá trị
+    trường có mặt và null             bị xoá
+    một patch rỗng {}                 200, chẳng ghi gì, trả về profile hiện tại
 
-Xóa user không xóa author của message lịch sử. `deleted_at` và profile đã clear giữ identity
-đủ để history trung thực mà không giữ personal data không cần thiết.
+Cái cuối chẳng phát ra `UPDATE` nào cả. `exactOptionalPropertyTypes` là thứ làm cho vắng mặt
+và null khác nhau trong kiểu chứ không phải theo quy ước, và đó là sự nghiêm ngặt của chương 1.4
+kiếm được chỗ đứng hai mươi bốn chương sau.
+
+**`avatar_url` được xác thực như một URL chứ không phải như một chuỗi.** Chưa gì từng quyết định cái gì
+thuộc về cột đó, nên đây là thứ đầu tiên làm chuyện ấy — và quyết định bây giờ rẻ hơn
+so với sau khi một khách hàng đã lưu `"none"` vào một triệu dòng.
+
+**Và giới hạn 4 KB giờ có một lý do, không chỉ là một điều khoản.** FR-USR-03 gọi tên 4 KB trong khi
+FR-CHN-01 gọi tên 8 KB cho một channel. Cả hai đều trong SRS, nên chẳng cái nào được thừa hưởng trong im lặng,
+nhưng "tài liệu nói thế" không phải một lập luận. Đo trên lane test: **94,144 user
+so với 27,337 channel**, 3.4:1 và đang lớn dần, bởi một channel được tạo có chủ đích còn một
+dòng user xuất hiện cho mọi người dùng cuối từng xác thực. Ở mức một triệu người dùng cuối, 4 KB mỗi người
+là 4 GB jsonb mà mọi lần đọc profile đều phải đi qua.
+
+## Lần xoá giữ lại cái dòng
+
+<Figure caption="Cái gì ra đi, cái gì ở lại, và cái frame lẽ ra đã biến mất" code={figDeletion} />
+
+FR-USR-05 đòi hỏi rằng xoá một user thì phải giữ "các message của họ dưới dạng do một user đã xoá viết".
+Cách đọc hiển nhiên là `ON DELETE SET NULL` trên `messages.user_id`: message sống sót, còn
+danh tính thì không.
+
+**Điều đó thoả mãn câu chữ và làm hỏng việc giao.** `toFrame` biến một dòng đã lưu thành một
+payload `message.created` *hoặc thành không gì cả*, và một trong hai loại dòng nó bỏ đi là dòng không có
+người gửi — `messageSchema.user` là `z.string().min(1)`, nên một tác giả null thì không thể là một frame gì cả.
+Đặt cột thành null sẽ giữ được mọi message trong kho lưu trữ và gỡ nó khỏi mọi client
+đang kết nối lại, trong im lặng, với một khoảng trống sequence là dấu vết duy nhất.
+
+Nên "do một user đã xoá viết" và "chẳng do ai viết" là hai trạng thái khác nhau, và chỉ một
+trong hai là điều khoản kia. Dòng vẫn ở lại, với profile bị xoá sạch và một dấu xoá được đặt.
 
 ```diff title="services/gateway/src/isolation.itest.ts"
 @@ -37,47 +37,108 @@ function declaredFrameTypes(): string[] {
@@ -2632,7 +2803,6 @@ Xóa user không xóa author của message lịch sử. `deleted_at` và profile
    });
  });
 ```
-
 ```ts title="services/api/src/users/users.itest.ts"
 import "reflect-metadata";
 
@@ -3535,16 +3705,19 @@ describe("a user's channel listing", () => {
 });
 ```
 
-## User record ở lần authentication đầu, điều trước đó không gì làm
+## Một bản ghi user lúc xác thực lần đầu, thứ chẳng ai làm
 
-Authentication lần đầu cần tạo user record một cách idempotent. Hai request đồng thời với cùng subject không được tạo hai user, và một identity đã soft-delete không được vô tình hồi sinh với dữ liệu profile cũ. Upsert là điểm để đặt những quy tắc đó, thay vì để từng caller tự đoán row tồn tại nghĩa là gì.
-
-Authentication lần đầu materialize user record. Trước đó token có thể hợp lệ cho external id
-không có row; user surface cần row để profile, membership và ban có state nhất quán.
+FR-USR-02 đã đòi hỏi từ lúc SRS được viết rằng "một bản ghi user sẽ được tạo
+ngầm lúc xác thực lần đầu nếu nó chưa tồn tại". Chẳng gì làm chuyện đó, và lỗ hổng có một
+triệu chứng chứ không phải một sự im lặng: mint một token cho một identifier chưa có dòng nào, gửi qua
+route nội bộ, và api trả lời
 
 ```json
 { "code": "invalid_request", "message": "unknown user" }
 ```
+
+400, và một thông điệp gọi tên bên gọi trong khi nguyên nhân là chẳng ai tạo một dòng. Việc tạo
+ngầm tồn tại chính là để ngăn câu trả lời đó.
 
 ```diff title="services/api/src/auth/dev-token.controller.ts"
 @@ -9,13 +9,13 @@ import {
@@ -3601,6 +3774,22 @@ không có row; user surface cần row để profile, membership và ban có sta
      });
      // snake_case on the wire, camelCase inside — the same boundary rule every
 ```
+
+Phần cài đặt là một lần gọi `createUser` đẳng xâm (idempotent) của chương channel-endpoints. Ba tính chất
+chỉ *trông có vẻ* miễn phí, và mỗi cái đều cần bài test riêng:
+
+**Xác thực và membership hội tụ về một dòng, bất kể cái nào tới trước** — và
+tên hiển thị sống sót, bởi `createUser` không cập nhật.
+
+**Response không nói cái nào đã xảy ra.** Một status hay một field phân biệt "đã tạo"
+với "đã tồn tại" sẽ là một lời sấm về membership: mint token cho các external id đoán mò rồi đọc
+câu trả lời để biết tenant có những cái nào. Bài test so status và tập khoá của hai
+response, chứ không so nội dung.
+
+**Một lần mint không gỡ được một lệnh cấm hay một lần xoá.** `createUser` chẳng chạm cột nào trên một dòng
+đã tồn tại. Trường hợp đã xoá là cái đáng nói: FR-030 nói trình lại id thì dùng lại
+dòng đó, và đúng thế — nhưng **dòng vẫn ở trạng thái đã xoá.** `POST /v1/users` là server của một khách hàng
+nói "user này quay lại rồi"; một lần mint chỉ nói "có ai đó xin một token".
 
 ```diff title="services/api/src/auth/credentials.itest.ts"
 @@ -351,7 +351,132 @@ describe("credentials", () => {
@@ -3738,12 +3927,19 @@ không có row; user surface cần row để profile, membership và ban có sta
  });
 ```
 
-## Ban, và tác động lên connection đang mở
+## Lệnh cấm, và nó làm gì với một kết nối đang mở
 
-Ban không chỉ là từ chối token tiếp theo. Một socket đã mở trước khi ban xảy ra vẫn có thể publish, subscribe và đọc nếu gateway không nhận được revocation. Vì vậy write path tạo record durable trước, publish signal sau, và gateway đóng đúng connection khi nhận signal. Thứ tự này làm retry an toàn: signal bị mất có thể được phát lại từ record; không có record nào phải được suy ra từ một message Redis tạm thời.
+FR-032 hỏi đúng câu đó và bản đặc tả đưa ra hai câu trả lời — đóng ở nhịp heartbeat kế tiếp,
+hoặc đóng ngay lập tức — kèm ghi chú rằng chúng khác nhau ở chỗ gateway có phải được báo hay không.
 
-Ban không chỉ từ chối token mới. Gateway phải kiểm tra lại khi connection hiện hữu hành động,
-để user bị ban không tiếp tục gửi bằng socket đã mở.
+**Câu trả lời là chẳng cái nào, và nó đã được dựng sẵn rồi.** Một lần gửi qua socket đi qua
+`/internal/messages` của api, chính là đường repository mà phép kiểm lệnh cấm ngồi ở đầu. Nên
+một socket bị cấm thôi gửi được ngay khoảnh khắc lệnh cấm hạ xuống, và vẫn tiếp tục nhận cho tới
+khi nó đóng vì một lý do khác, bởi việc giao chẳng bao giờ hỏi api điều gì.
+
+Đó không phải một thoả hiệp bịa ra cho chương này. Nó là hình dạng mà chương credentials đã chọn cho một
+token hết hạn, và lời chú thích nó để lại nói thế: *"socket vẫn còn và vẫn NHẬN,
+bởi việc giao chẳng bao giờ hỏi api điều gì. Việc ghi thì có."*
 
 ```diff title="packages/protocol/src/internal.ts"
 @@ -134,12 +134,28 @@ export const internalMembershipsResponseSchema = z.strictObject({
@@ -3776,7 +3972,6 @@ Ban không chỉ từ chối token mới. Gateway phải kiểm tra lại khi co
    typeof internalSessionResponseSchema
  >;
 ```
-
 ```diff title="services/gateway/src/auth.ts"
 @@ -26,25 +26,37 @@ export type { Identity } from "./api-client.js";
   * way: 4001 tells a client its credential is wrong (retrying will not help),
@@ -3818,7 +4013,6 @@ Ban không chỉ từ chối token mới. Gateway phải kiểm tra lại khi co
          userExternalId: session.user,
          // Carried, not trusted: the internal hop forwards this instead of
 ```
-
 ```diff title="services/gateway/src/session.ts"
 @@ -1,10 +1,18 @@
  import { randomUUID } from "node:crypto";
@@ -3914,6 +4108,26 @@ Ban không chỉ từ chối token mới. Gateway phải kiểm tra lại khi co
      for (const connection of registry.all()) {
 ```
 
+`banned` đi nhờ response của session vì đúng lý do các giới hạn tần suất đi nhờ: gateway chẳng có
+database và không được phép có một cái, còn api là service duy nhất đọc Postgres. Dòng đó
+đã nằm sẵn trong tay — cùng lần đọc ấy dựng nên danh sách channel — nên lệnh cấm tốn một field và
+không tốn câu query nào. Một boolean chứ không phải cái timestamp, bởi câu hỏi của gateway là "socket này có được
+mở không" và một cái ngày sẽ mời nó tự quyết chính sách từ đó.
+
+<Trap>
+
+**`.default(false)` làm chín stub test ngừng biên dịch, và đó là kết cục đúng.**
+
+Field này tuỳ chọn trên đường truyền để một api dựng trước chương này vẫn thoả mãn
+schema trong một lần triển khai cuốn chiếu. Nhưng `.default()` làm field *sau khi parse* thành bắt buộc, nên mọi
+stub của `api.session` trong các suite của gateway đều vỡ. `.optional()` sẽ để tất cả chúng
+pass mà chẳng cần đổi gì.
+
+Một stub không nói user có bị cấm hay không thì chưa hề nghĩ tới chuyện user có bị cấm hay
+không. Chín lần sửa là schema hỏi chín câu.
+
+</Trap>
+
 ```diff title="packages/protocol/src/codes.ts"
 @@ -4,12 +4,24 @@
  // document-fixed (4001: EIR-WS-05; 4009: SAD §7); the other two classes are
@@ -3968,7 +4182,6 @@ Ban không chỉ từ chối token mới. Gateway phải kiểm tra lại khi co
   * and constitution V calls it a reachable-page promise. Three sites build it with a
   * template literal against a host that does not resolve, and a fourth would have
 ```
-
 ```diff title="packages/protocol/src/codes.test.ts"
 @@ -4,15 +4,23 @@ import { CLOSE_CODES, docsUrl, ERROR_CODES, ERROR_DOCS_BASE, type ErrorCode } fr
  
@@ -3997,6 +4210,39 @@ Ban không chỉ từ chối token mới. Gateway phải kiểm tra lại khi co
      const meanings = Object.values(CLOSE_CODES);
      expect(new Set(meanings).size).toBe(meanings.length);
 ```
+
+**Một mã đóng thứ năm, và bài test là thứ biến nó thành một quyết định.** `4003`, chứ không tái dùng
+`4001`: token của một user bị cấm vẫn xác minh được, vẫn gọi tên một user thật và vẫn còn hạn, nên đóng bằng "token không hợp lệ
+hoặc đã hết hạn" sẽ đẩy một client vào vòng lặp xác thực lại mãi mãi — đó chính là
+lập luận mà chính registry này đã đưa ra để có các mã riêng biệt ngay từ đầu.
+
+`codes.test.ts` khẳng định **đúng cái tập** và đã đỏ ở bản build thêm `4003`. Một
+khẳng định đúng-tập là loại duy nhất làm cho một mã đóng mới trở thành có chủ đích; cập nhật nó chính là
+hành vi quyết định.
+
+<Trap>
+
+**Và gateway đang vứt đi mọi mã từ chối trừ một cái.**
+
+Tìm ra vì bài test lệnh cấm khẳng định `user_banned` trên một socket đang mở mà lại nhận
+`internal_error`. `ApiError` chỉ mang status, còn đường gửi qua socket chuyển tiếp một 401
+bằng tay rồi trả lời `internal_error` cho mọi thứ còn lại. Nên mọi lời từ chối mà api có thể đưa cho một
+lần gửi qua socket đều tới nơi dưới dạng "gửi thất bại":
+
+    user_banned         mới trong chương này
+    channel_archived    với tới được từ một lần gửi socket kể từ chương channel-control
+    invalid_request     bất kỳ body nào api từ chối
+
+Chương error-registry dựng mười ba mã, một registry và một `docs_url` phân giải được, để một client
+phân biệt được các lời từ chối — rồi một bước nhảy vứt bỏ tất cả. Một client được bảo `internal_error`
+sẽ thử lại; một client được bảo `user_banned` thì không.
+
+`ApiError` giờ mang cả phong bì, được đọc một cách phòng thủ bởi một đường lỗi không được phép thay
+status của api bằng một exception JSON. Mã chỉ được chuyển tiếp **với một 4xx và chỉ khi
+registry có định nghĩa nó** — một 5xx không phải việc của client, còn một chuỗi chưa đăng ký
+trên đường truyền sẽ vô hiệu hoá chính registry.
+
+</Trap>
 
 ```diff title="services/gateway/src/api-client.ts"
 @@ -26,19 +26,40 @@ import {
@@ -4075,7 +4321,6 @@ Ban không chỉ từ chối token mới. Gateway phải kiểm tra lại khi co
      return parsed.data;
    }
 ```
-
 ```diff title="services/api/src/internal/session.controller.ts"
 @@ -59,10 +59,19 @@ export class SessionController {
      // error: it is a user with no channels. The gateway's job is delivery, not
@@ -4098,7 +4343,6 @@ Ban không chỉ từ chối token mới. Gateway phải kiểm tra lại khi co
    }
  }
 ```
-
 ```diff title="services/api/src/isolation/targets.ts"
 @@ -15,22 +15,39 @@
   *
@@ -4272,7 +4516,6 @@ Ban không chỉ từ chối token mới. Gateway phải kiểm tra lại khi co
  /** One routable endpoint, as the running application reports it. */
  export interface DerivedTarget {
 ```
-
 ```diff title="services/api/src/isolation/targets.itest.ts"
 @@ -88,18 +88,34 @@ describe("the gauntlet's target list derives from the running application", () =
      ).map(targetKey);
@@ -4349,7 +4592,6 @@ Ban không chỉ từ chối token mới. Gateway phải kiểm tra lại khi co
        .toEqual([]);
    });
 ```
-
 ```diff title="services/api/src/isolation/gauntlet.itest.ts"
 @@ -5,13 +5,13 @@ import { Test } from "@nestjs/testing";
  import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -4713,7 +4955,6 @@ Ban không chỉ từ chối token mới. Gateway phải kiểm tra lại khi co
      // A classification saying `write` with no attack written for it is the same hole
      // as a route with no classification, one level up. Named, because the useful half
 ```
-
 ```diff title="services/api/src/messages/messages.service.ts"
 @@ -4,12 +4,13 @@ import {
    Injectable,
@@ -4760,7 +5001,6 @@ Ban không chỉ từ chối token mới. Gateway phải kiểm tra lại khi co
          // when somebody unbans. A client that cannot tell them apart retries the
          // wrong one for ever.
 ```
-
 ```diff title="services/gateway/src/isolation-fixtures.ts"
 @@ -72,12 +72,30 @@ export interface SocketTenant {
    privateHistory: () => Promise<string>;
@@ -4840,7 +5080,6 @@ Ban không chỉ từ chối token mới. Gateway phải kiểm tra lại khi co
          });
          if (!res.ok) throw new Error(`unarchive for ${label}: ${res.status}`);
 ```
-
 ```diff title="vitest.coverage.config.mts"
 @@ -108,14 +108,42 @@ export default defineConfig({
          //
@@ -4888,6 +5127,8 @@ Ban không chỉ từ chối token mới. Gateway phải kiểm tra lại khi co
          // to this file — the live-path suppression predicate and the scoping that
 ```
 
+Bảng thứ mười của guard cần mồi, và mồi cần một tính chất mà chín cái kia không có.
+
 ```sql title="packages/test-harness/src/sentinel.sql (excerpt)"
 -- TEN AS OF THE USER-SURFACE CHAPTER. `read_positions` carries `environment_id`, so it belongs
 -- here, and it has no `id` — which is what the message expression above was changed
@@ -4904,14 +5145,23 @@ BEGIN
     'webhook_endpoints',
 ```
 
-## Attack shape thứ tư, và hai thứ nó không cover
+Một đoạn trích, còn `fences/post-series.md` mang phần sửa đổi — bộ kiểm fence áp dụng
+appendix *sau* mọi chương, nên một chương nằm ở thượng nguồn của chính phần sửa đổi của nó và không thể phát biểu
+một trạng thái mà appendix dựng nên. Chương isolation harness học điều đó từ hướng ngược lại còn tính năng
+này học từ hướng này: một chương cũng không làm được việc của appendix. Bản diff
+`repository.ts` của nó chạm tới đúng trạng thái của repository, khiến chính hunk của appendix
+chẳng còn gì để áp dụng.
 
-Isolation test không thể chỉ thử tenant A truy cập id của tenant B. Same-tenant authorization vẫn cần kiểm tra: một member bình thường không được gọi thao tác dành cho admin, và một channel private không trở nên visible chỉ vì cùng environment. Bốn shape tấn công khác nhau bắt những thiếu sót khác nhau trong guard.
+**`read_positions` không giành được theo cấu tạo**, và đó là tính chất mà chín bảng kia
+không có. Chẳng gì trong nền tảng rút vị trí đọc xuyên qua các environment — lệnh xoá hàng loạt
+duy nhất là lệnh mà việc xoá một user thực hiện, giới hạn trong user đó — nên mồi
+không thể bị một thao tác toàn cục hợp pháp quét mất. Với `quota_notifications` thì mồi phải
+được cắm rất cẩn thận; ở đây chính kiểu truy cập của bảng làm việc đó.
 
-Test cũng cần “bait” từng table mà guard nói rằng nó dùng. Một table xuất hiện trong mảng guard nhưng không có row khiến query vẫn pass sẽ không chứng minh isolation; test phải làm câu trả lời đổi nếu predicate tenant bị bỏ đi.
+## Hình dạng tấn công thứ tư, và hai thứ hoá ra nó không phủ
 
-Same-tenant non-member attack bổ sung cho cross-tenant gauntlet. Nó kiểm tra authorization
-trong tenant, nhưng không thay thế control chứng minh member hợp lệ vẫn thành công.
+`GET /v1/users/:externalId/channels` là route đầu tiên trên nền tảng này trả về một
+tập hợp, và isolation gauntlet đã chờ nó từ lâu. Enum hình dạng nói thế:
 
 ```ts title="services/api/src/isolation/targets.ts (excerpt)"
   // NO `list` SHAPE YET, and that is deliberate rather than an omission. Nothing this
@@ -4919,6 +5169,18 @@ trong tenant, nhưng không thay thế control chứng minh member hợp lệ v�
   // target — and a shape with no member is a vocabulary entry that drifts. The chapter
   // that adds the first list route adds the shape and the attack together.
 ```
+
+Nên chương này thêm cả hai. Và việc thêm chúng tìm ra hai sự phân biệt mà phân loại kia chưa
+có.
+
+**Một lần liệt kê không khẳng định được cặp đôi.** Mọi đòn tấn công khác trong suite đó đều so
+identifier lạ với một identifier chẳng tồn tại ở đâu và đòi hai câu trả lời phải
+không phân biệt được — đó là thứ hiến pháp I đòi hỏi và là thứ mà riêng một mã status
+không chứng minh được. Một lần liệt kê phá vỡ điều đó, và không phải do tình cờ: user được gọi tên trong đường dẫn,
+nên một external id lạ đúng ra phải là 404, trong khi một user tồn tại mà chẳng sở hữu gì
+thì là 200 với không dòng nào. So hai cái đó thì chẳng nói lên điều gì cả.
+
+Thứ phải đúng thay vào đó thì hẹp hơn và khó hơn:
 
 ```ts title="services/api/src/isolation/attack.ts (excerpt)"
 export interface ListVerdict {
@@ -4931,36 +5193,103 @@ export interface ListVerdict {
 }
 ```
 
+<Why title="Why the leak is searched for in the serialised body">
+
+Bởi một identifier bị rò rỉ có thể tới một nơi mà hình dạng dòng không chạm tới — một
+cursor, một object lồng bên trong, một thông điệp lỗi lặp lại thứ đã được hỏi. Tính chất
+cần là cái id không xuất hiện **chút nào**, nên phép tìm chạy trên `JSON.stringify` của
+toàn bộ câu trả lời chứ không phải trên các dòng mà `rowsOf` nhận ra.
+
+Và việc `rowsOf` trả về một mảng rỗng cho một hình dạng nó không biết mới là trường hợp
+nguy hiểm: một con số không từ một body không nhận ra được thì đọc y hệt một con số không từ
+một danh sách được giới hạn đúng. Nên bộ nhận dạng được khẳng định với cả hai hình dạng nó tuyên bố
+xử lý được và một hình dạng nó không xử lý, trong chính case của nó, chứ không được tin.
+
+</Why>
+
+**Và một route lặp lại đầu vào của nó thì cũng chẳng có cặp đôi.** `POST /v1/users` và
+`DELETE /v1/users/:externalId` được viết như những đòn tấn công ghi thông thường, và cả hai đều thất bại
+vì cùng một lý do:
+
 ```
 body {"data":[{"external_id":"victim-…-user","status":"created",…}]}   (foreign)
 vs   {"data":[{"external_id":"absent-0000…","status":"created",…}]}   (absent)
 ```
 
+Hai câu trả lời khác nhau theo cấu tạo, ở đúng cái field mà request đã chọn. Chẳng lượng
+giới hạn đúng nào đổi được chuyện đó. `POST /v1/users` còn nhận identifier trong **body**
+chứ không phải trong đường dẫn, nên ngay từ đầu đã chẳng có id lạ nào trong một URL để mà so. 
+Cả hai đều chỉ kiểm trạng thái của nạn nhân, và đó là nửa mang tính chất kia.
+
+<Trap title="The type caught one site and not the arithmetic four lines below it">
+
+`shapeCounts` trả về `Record<Shape, number>`, nên thêm một thành viên vào `Shape` làm nó ngừng
+biên dịch và gọi tên đúng dòng. Bài test kế toán của suite cộng các hình dạng bằng tay:
+
 ```ts
     const attacked = counts.read + counts.write + counts.credential;
 ```
 
-## 404 không còn là signal
+Thứ mà chẳng kiểu nào kiểm được. `list` tới, record lớn lên, và tổng lặng lẽ thôi
+tính nó vào — `expected 17 to be 18`, cho một route được phân loại, bị tấn công, và không được đếm
+vào đâu cả. Giờ cả hai đều suy ra từ chính cái record, với phần miễn trừ được gọi tên bởi nó là
+lớp duy nhất cố ý không bị tấn công còn mọi thứ khác thì đều bị, dù gọi nó là gì.
 
-Với resource scoped theo tenant, 404 thường là lựa chọn đúng cho cả “không tồn tại” lẫn “tồn tại nhưng không được thấy”. Phân biệt hai trường hợp ở response có thể biến endpoint thành oracle tiết lộ dữ liệu tenant khác. Client nhận một signal đơn giản: resource này không có trong thế giới mà token hiện tại được phép quan sát.
+</Trap>
 
-Khi visibility predicate dùng chung, 404 có thể là channel absent hoặc private channel caller
-không thấy. Test phải so whole envelope và state, không suy nghĩa của refusal từ status.
+## Cái 404 thôi còn là một tín hiệu
+
+Một dòng user được tạo lúc xác thực lần đầu, đó là thứ FR-039a và FR-039b đòi hỏi
+và là thứ phần ngay trên đây dựng nên. Nó có một hệ quả mà chẳng gì trong
+yêu cầu nhắc tới.
+
+Đòn tấn công credential của gauntlet mint một token bằng khoá của kẻ tấn công nhưng gọi tên external id
+của **nạn nhân** — đó là đòn tấn công. Với việc tạo ngầm, lần mint *tạo ra*
+cái tên đó trong environment của kẻ tấn công. Chẳng gì rò rỉ: dòng đó là của chính kẻ tấn công,
+với một cái tên kẻ tấn công chọn, đúng như lệnh upsert hàng loạt sẽ tạo ra.
+
+Nhưng hai đòn tấn công viết ở phần trước đó một đoạn thì ngừng chạy đúng:
 
 ```
 AssertionError: expected 200 to be 404
 ```
 
-## Table thứ ba của guard, và message cần nó
+Chúng khẳng định rằng cấm một user lạ sẽ trả lời not-found, còn sau chương này thì một
+identifier lạ không còn đáng tin cậy trả lời not-found trên **bất kỳ** route nào gọi tên một
+user — bởi trình nó ra có thể đã tạo ra nó.
 
-Message route cần guard qua `channels`, `members` và `messages`, không chỉ một foreign key tiện tay. Mỗi join trả lời một phần khác của câu hỏi: channel thuộc environment nào, caller có còn là member không, và message có thực sự thuộc channel đó không. Bỏ một phần có thể tạo đường đi qua id hợp lệ nhưng scope sai.
+<Why title="Why this makes the suite better rather than worse">
 
-Table mới có `environment_id` được thêm vào sentinel guard cùng chapter tạo nó. Guard chỉ có
-giá trị khi bait và test drive table thật; chỉ thêm tên vào array không tạo protection.
+Bởi status chưa bao giờ là cái tính chất kia. Một 404 mà đã hoàn tất lệnh ghi mới là trường hợp
+không mã status nào phơi ra, và nó là cái người đọc nên lo; cặp đôi và
+phép so trạng thái tồn tại chính vì một status thì dễ làm cho đúng và cũng dễ đúng
+vì một lý do sai.
+
+Nên cả hai đòn tấn công đều đọc dòng của nạn nhân trước và sau, rồi khẳng định `banned_at` đích danh
+bên cạnh phép so sâu — một field thêm vào dòng đó sau này nếu không thì sẽ làm hỏng
+phép so vì một lý do chẳng liên quan gì tới lệnh cấm.
+
+Khẳng định về status là phần phải ra đi. Việc nó sống sót lâu tới vậy mới là
+điều đáng ghi nhận, chứ không phải sự mất mát.
+
+</Why>
+
+## Bảng thứ ba của guard, và message cần tới nó
+
+`read_positions` là bảng đầu tiên trên nền tảng này không có `id`. Khoá của nó là
+`(channel_id, user_id)`, bởi đó chính là một vị trí đọc — còn thông điệp từ chối của
+guard thì nội suy `OLD.id`.
+
+PL/pgSQL phân giải chuyện đó lúc chạy, trên đúng dòng mà trigger kích hoạt. Nên lệnh xoá
+không giới hạn đầu tiên trên bảng mới trả lời:
 
 ```
 record "old" has no field "id"
 ```
+
+từ bên trong đường từ chối, thay chẩn đoán bằng một thông điệp về chính việc
+chẩn đoán. Lời chú thích của chính migration đã tiên đoán chuyện đó và ghi công một chương trước
+với cách sửa; chẳng ai từng cài cách sửa nào cả.
 
 ```sql title="packages/test-harness/src/sentinel.sql (excerpt)"
   RAISE EXCEPTION
@@ -4970,12 +5299,90 @@ record "old" has no field "id"
     COALESCE(' — the bait planted by ' || who, '');
 ```
 
-## Hai chương tốn gì, bằng con số
+`to_jsonb` biến dòng đó thành một tài liệu trước, nên phép tra là một khoá có thể
+vắng mặt chứ không phải một field bắt buộc tồn tại — và toàn bộ dòng là phương án dự phòng, thứ
+dù sao cũng hữu ích hơn với một bảng mà danh tính là một cặp.
 
-Chi phí của surface này được đo cả trên đường đọc lẫn write path. Một index, một row read position và timestamp denormalized là những chi phí nhỏ, có thể dự đoán; đổi lại là tránh được aggregate theo toàn bộ message trong mỗi listing. Bảng số ở đây nhằm làm trade-off có thể kiểm chứng, không nhằm tạo cảm giác chính xác giả.
+<Trap title="Two more things the third table found">
 
-Các con số dưới đây ghi rõ fence, test, migration và coverage thay đổi. Count là evidence
-cho scope, không phải thay thế cho behaviour assertion.
+**Các case được sinh ra đã giả định mọi bảng được canh đều có `metadata`.** Chúng đặt nó thành
+`'{}'::jsonb` để khiêu khích trigger, cách đó chạy đúng đến chừng nào mọi bảng được canh
+còn có cột ấy. Báo cáo ghi `column "metadata" of relation "read_positions"
+does not exist` — năm case đỏ vì một cái cột, trong một suite nói về một trigger.
+
+**Và các fixture cắm hai bảng bởi hai là con số.** Thêm cái thứ ba để lại
+trigger chẳng có gì để khớp, nên một lệnh xoá không giới hạn đi thẳng qua — một bài test guard
+mà fixture của nó không phủ một bảng được canh thì sẽ báo bảng đó là không được canh, và
+nó đúng.
+
+Giờ cả hai là một bảng `SHAPES` duy nhất, khoá theo tên được canh và được khẳng định đối chiếu theo
+cả hai hướng. Lời chú thích đã tuyên bố khẳng định đó sẵn rồi mà suite thì không hề thực hiện
+nó; bỏ một bảng đi từng làm suite co từ mười bảy bài test xuống mười hai và vẫn
+xanh.
+
+</Trap>
+
+<Trap title="And the array's own parser took a table name out of a comment">
+
+`guard.itest.ts` đọc các tên được canh ra từ `sentinel.sql` thay vì phát biểu lại
+chúng, bằng cách quét khối mảng tìm các từ viết thường trong dấu nháy. Lời chú thích giải thích
+thông điệp từ chối ở trên có chứa một từ như thế: `to_jsonb(OLD) ->> 'id'`.
+
+Nên suite chạy năm case với một bảng tên là `id`, tất cả đều đỏ, và
+báo cáo gọi tên một cái bảng chẳng ai từng viết. Một bộ phân tích chạy trên một ngôn ngữ nó không phân tích thì
+ít nhất phải biết một lời chú thích là gì.
+
+</Trap>
+
+## Hai chương đó tốn gì, bằng con số
+
+    số file             25 → 29 → 34 → 36 → 38 → 40 → 41 → 43
+    số lần chỉnh         tám, và sáu lần trước khi có một dòng văn xuôi nào
+    chương trước         dạy 20 file, 2,947 từ văn xuôi, 20 fence
+    chương này           dạy 26 file, thêm 5 cái được fence mà không dạy
+    lane                 407 test → 550, và trung bình dịch 193.0 s → 193.55 s
+    hai mươi lần chạy    20/20 xanh, 192–197 s, stdev 1.54 s
+
+**Tám lần chỉnh một con số, và mỗi lần đến từ một câu hỏi khác.** Danh sách điều khoản
+cho 25. Danh sách task cho 29. Hỏi chương nào fence mỗi file cho 34 — và tìm ra
+`app.module.ts`, phần đăng ký chẳng nằm trong task nào. Viết ra đồ thị gọi của lệnh gửi cho 36.
+Đếm các đường dẫn mà các task gọi tên, thay vì đọc cái tổng, cho 38. Hỏi `git diff`
+xem thực sự cái gì đã đổi cho 40 — và tìm ra hai file chẳng thuộc rổ nào và một file mà tính năng
+chẳng bao giờ chạm. Việc cài đặt tìm ra một defect cho 41. Và hỏi `git diff` thêm một lần nữa ở cuối
+cho 43.
+
+**Lần chỉnh thứ tám mới là lần quan trọng, bởi nó tách con số làm hai.** Thứ một
+chương *dạy* không phải thứ nó phải *fence*. Chuỗi fence chẳng quan tâm vì sao một file
+đổi: trạng thái của một đường dẫn được tuyên bố phải bằng trạng thái của repository, nên một file được sửa chẳng vì lý do nào
+thuộc về chương này vẫn cần in ra bản diff của nó.
+
+<Why title="Sixteen of those fences no longer exist">
+
+Trong thứ tự mà cuốn sách này được viết lần đầu, mười sáu file bên dưới đổi chỉ bởi **trích dẫn
+của chúng và không gì khác** — một số hiệu chương được sửa vì công việc mà nó trỏ tới đã
+dời đi. Không dòng thực chất nào, mười sáu fence chẳng có chủ đề, và cả một commit để
+tạo ra chúng.
+
+Giờ chẳng chuyện nào trong đó xảy ra nữa. Phần này gọi tên chương theo chủ đề chứ không theo
+số, nên `isolation harness` và `chương error-registry` vẫn đúng dù các chương ấy
+nằm ở đâu, và một lần sắp xếp lại chẳng sửa gì. **Năm trong mười sáu cái được tìm ra bởi chuỗi
+fence chứ không phải bằng cách đếm** — mỗi cái cho thấy `(FR-027)` trở thành `(chương error-registry,
+FR-027)` ở một điểm mà file đã nói thế sẵn, bởi chương gọi tên
+registry giờ chạy thứ ba từ đầu thay vì thứ mười bốn. Một con số đếm các fence chỉ-có-trích-dẫn
+không thể đếm một lần rồi giữ mãi: chính lần sắp xếp lại cho chúng nghỉ hưu cũng là lần sắp xếp lại
+làm chúng dời đi. **Commit đánh số lại hai mươi hai
+trích dẫn đã bị bỏ qua, và mười sáu fence đi theo nó.**
+
+Thứ còn lại bên dưới là ba file đổi vì một lý do — field `banned` mà response session
+giờ mang, và các stub đã phải nói ra điều đó. Ba trong mười sáu cái chẳng là gì
+NGOÀI trích dẫn, và fence của chúng ra rỗng; phép kiểm tồn tại gọi tên chúng, bởi
+`packages/outsider`, `scripts/seed-demo-tenant.mjs` và suite của dispatcher đều thuộc về
+những chương mà chương này chưa tới.
+
+</Why>
+
+Nên là ba fence có chủ đề, và ba cái đó là đây:
+
 
 ```diff title="services/gateway/src/public-surface.itest.ts"
 @@ -17,13 +17,13 @@ import { attachSessions } from "./session.js";
@@ -4994,7 +5401,6 @@ cho scope, không phải thay thế cho behaviour assertion.
  // build-output seam, because there is no public way to create either — that has
  // been true since chapter 2.8 and is still true. Everything downstream of the
 ```
-
 ```diff title="services/gateway/src/resume.itest.ts"
 @@ -114,12 +114,15 @@ describe("resume across a real fabric", () => {
      // different fanout client on the same subject — publishes into the
@@ -5093,7 +5499,6 @@ cho scope, không phải thay thế cho behaviour assertion.
        },
        sendMessage: async () => {
 ```
-
 ```diff title="services/gateway/src/session.test.ts"
 @@ -40,13 +40,20 @@ function stubApi(overrides: Partial<ApiClient> = {}): ApiClient {
      // The api verifies tokens, so the stub is what decides which
@@ -5119,12 +5524,60 @@ cho scope, không phải thay thế cho behaviour assertion.
  }
 ```
 
-## Column không có reader
+**Và lần sửa tạo ra mười một trong số các fence đó không nằm trong cuốn sách này.**
 
-Một column và migration không phải capability cho đến khi có reader trả nó qua API, client dùng nó, và test quan sát behavior đó. Chương này giữ chuỗi bằng chứng từ schema đến handler, protocol và UI-facing response để không nhầm “dữ liệu đã tồn tại” với “người dùng đã nhận được tính năng”.
+Trong thứ tự nó được viết lần đầu, tính năng trước được đặc tả là một chương và
+ship thành ba, nên 31 file trích dẫn `chương 3.12` cho những thay đổi mà hai chương sau đó dạy.
+Hai mươi hai trích dẫn phải được sửa — một commit, mười một fence, không dòng thực chất
+nào — và một trong số đó thì không sửa được: `eslint.config.mjs` mang trích dẫn của nó trên một dòng
+được viết bên trong `fences/post-series.md`, nên appendix sẽ phải mang phần
+sửa còn fence của chương thì chẳng mang gì.
 
-Một column mới chỉ có ý nghĩa khi reader hoặc decision consult nó. Nếu chưa có reader, nó
-được ghi như debt thay vì được gọi là capability đã ship.
+Chẳng chuyện nào trong đó xảy ra ở đây, bởi phần này gọi tên một chương theo chủ đề của nó. `isolation
+harness` là đúng dù chương ấy nằm ở đâu, và một lần sắp xếp lại chẳng sửa gì. Commit đã
+bị bỏ qua và mười một fence đi theo nó — **và đó là phép đo rõ ràng nhất cho giá trị của một
+quy tắc đặt tên: cả một commit bảo trì, và một trường hợp duy nhất nó không với tới được.**
+
+<Trap title="The shortcut that would have generated those corrections">
+
+Phần phân loại đằng sau chúng đến từ một lối tắt mà một lời chú thích trong bộ công cụ đã bảo
+đừng tin: nó khớp mỗi file trích dẫn với trang fence nó, nghe thì giống
+cùng một câu hỏi mà không phải.
+
+**Câu trả lời của lối tắt thì dịch chuyển.** File-sang-trang phụ thuộc vào chương nào gần đây nhất
+fence một file, và chương trước đã fence lại mười một cái trong số đó. Nên `fixtures.ts`,
+`compare.ts` và `targets.ts` mỗi cái sẽ gọi tên bất kỳ chương nào chạm chúng
+sau cùng — vô nghĩa với một lời chú thích về cái sấm truyền mà isolation harness dựng nên. Suy dẫn lại
+cho từng trích dẫn theo cái quy tắc không dịch chuyển — *chương mà trang của nó dạy
+thay đổi đang được trích dẫn* — thì phân bố ra 25 / 9 / 13 trong khi lối tắt nói
+15 / 14 / 10.
+
+Chẳng cái nào trong đó còn phải suy dẫn nữa. Một cái tên chủ đề không phải một phép tra: nó không
+phụ thuộc vào ai fence một file sau cùng, hay chương nào dạy cái gì, hay lối tắt kia
+có đúng đắn hay không. **Bài tập đó chính xác và không cần thiết**, và phân biệt được hai điều ấy
+chỉ khả dĩ khi quy ước kia đã tồn tại.
+
+</Trap>
+
+## Cột không có bên đọc
+
+Chủ đề của tính năng này là bốn cột chẳng gì đọc, và một cột thứ năm được trả về bởi một
+response body trong khi chẳng quyết định nào tra tới nó. Cả năm giờ đều có bên đọc, và
+`channels.type` có quyết định đầu tiên của nó.
+
+Nó để lại **một** cái, và cái đó là của chính nó: `read_positions.updated_at`, được ghi bởi
+mọi lần ghi vị trí và chẳng gì đọc. Một field kiểm toán không có kiểm toán viên.
+
+Con số đi từ ba, xuống hai, rồi xuống một trong lúc đặc tả. `users.deleted_at` được ghi
+bởi lệnh xoá và được xoá sạch bởi lần hồi sinh và chẳng gì đọc cho tới khi một lượt phân tích cho nó
+các bên đọc; `members.role` bị gọi là chết cho tới khi một lượt sau nhận ra rằng phần liệt kê trả về
+nó — và *trả về một cột chính là đọc nó*, và đó là sự sửa chữa làm cho câu phát biểu
+sắc hơn chứ không yếu đi. Điều lương thiện còn lại để nói về `updated_at` là các lựa chọn
+của nó chỉ là một bên đọc hoặc một migration bỏ nó đi.
+
+Nên nó ở lại, và câu nói ra điều đó sống ngay cạnh cái cột chứ không chỉ trong một
+tài liệu tổng kết — bởi một cột chẳng ai chọn giữ và một cột có người chọn
+giữ thì trông y hệt nhau trong một schema.
 
 ```diff title="services/api/src/db/schema.ts"
 @@ -197,12 +197,30 @@ export const users = pgTable(
@@ -5277,9 +5730,20 @@ Một column mới chỉ có ý nghĩa khi reader hoặc decision consult nó. N
  //
 ```
 
-## Toàn bộ chương
+**Con số các cột không có bên đọc không về không ở cuối một tính năng nói về
+các cột không có bên đọc.** Nó về một, một cách có chủ đích, và cái một đó là của chúng ta.
 
-Kết quả là một user surface chịu được activity thay đổi, lịch sử có author đã xóa, pagination đang di chuyển, tenant isolation và ban xảy ra sau khi socket mở. Các diff phía dưới là implementation của contract đó; phần quan trọng là mọi shortcut đã bị đo, gọi tên và từ chối bằng một lý do có thể test.
+## Chương đầy đủ
+
+Các đoạn trích ở trên là những phần đáng tranh luận. Đây là các file, nguyên vẹn
+khi chúng là file mới và dưới dạng diff khi không phải.
+
+**Ba mươi trong ba mươi bảy file đã đổi của chương này được fence trong các phần
+ở trên** — migration, phần liệt kê, vị trí đọc, profile, lệnh xoá,
+lệnh cấm. Tiếp theo là năm file mà ba phần trước đó lập luận về
+nhưng không in nguyên vẹn, và hai suite bị bỏ ra kèm lý do.
+
+### Bảng thứ ba của guard
 
 ```diff title="packages/test-harness/src/sentinel.sql"
 @@ -69,18 +69,30 @@ BEGIN
@@ -5408,6 +5872,8 @@ Kết quả là một user surface chịu được activity thay đổi, lịch 
    // one that honoured it.
 ```
 
+### Hình dạng tấn công thứ tư
+
 ```diff title="services/api/src/isolation/attack.ts"
 @@ -75,12 +75,71 @@ export function comparePair(foreign: Answer, absent: Answer): string[] {
    const a = JSON.stringify(absent.body);
@@ -5483,6 +5949,8 @@ Kết quả là một user surface chịu được activity thay đổi, lịch 
  ): Promise<Verdict> {
 ```
 
+### Thứ mà vị trí đọc kéo theo nó
+
 ```diff title="services/api/src/channels/channels.controller.ts"
 @@ -187,14 +187,14 @@ export class ChannelsController {
     *
@@ -5523,18 +5991,27 @@ Kết quả là một user surface chịu được activity thay đổi, lịch 
 
 <Checkpoint>
 
-- user surface có listing, cursor, unread count và profile
-- query được đo tại bốn kích thước, gồm million-message fixture
-- ban được kiểm tra trên cả credential mới lẫn connection đang mở
-- mọi table tenant-scoped mới được sentinel guard drive
+- `pnpm test:integration` — 550 test, 20/20 xanh, 192–197 s, trung bình 193.55 s
+- `pnpm coverage` — 920 test, mọi ratchet đều đạt; nhánh của `repository.ts` 89.51% → 92.11%
+- `pnpm check:fences` — 0 vấn đề, 211 file; `pnpm check:figures` — 200 hình
+- `gauntlet targets: 38 derived, 35 attacked, 3 exempt`, năm động từ trên một sấm truyền
+- `tenant paths: 23 base tables — 13 direct, 2 hop, 8 spine`
+- mười hai điều khoản SRS được giao, và một cái bị chạm mà không yêu cầu nào nhận
 
 </Checkpoint>
 
-<ForwardRef part="Part 3 khép lại">
+<ForwardRef part="Part 3 closes">
 
-Các surface kế tiếp phải giữ cùng discipline: requirement, route, caller, data access và
-attack đều cần evidence khớp nhau, không chỉ một endpoint xanh.
+Phần 3 kết thúc ở đây. Thứ nó để lại được viết ra chứ không ngụ ý: outbox
+vẫn giữ text của message mãi mãi và chương của FR-MOD-06 sở hữu phần tỉa; một message gửi bằng REST
+vẫn chẳng tới socket nào, và **chương fan-out là chương thay đổi điều đó — trích
+FR-RTM-01 chứ không phải FR-RTM-05, bởi điều khoản chưa được đáp ứng nói về việc giao chứ không về
+việc có những loại event nào**; `messages.deleted_at` có
+bên đọc mà không có bên ghi, đang chờ FR-MSG-08; còn `read_positions.updated_at` là một cột
+mà tính năng này thêm vào và chẳng gì đọc.
+
+Bốn thứ còn mở, mỗi thứ có một người sở hữu. Phần 4 là đường dữ liệu thứ hai.
 
 </ForwardRef>
 
-<ChapterFooter id="3.10" locale="vi" />
+<ChapterFooter id="3.10" />
