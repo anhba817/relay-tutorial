@@ -1,12 +1,14 @@
 import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
 import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figTwoPromises, figWhereItIsEnforced, figNoSweep, figOutboxFourth } from "./figures";
 
 export const metadata = {
   title: "Quota và cái giá của nó — Building Relay",
   description:
-    "Quota là mức sử dụng theo tháng, không phải rate limit. Chương này dùng counter không increment được, enforce tại write boundary, phát event khi crossing và gửi email cảnh báo.",
+    "Rate limit nói về giây này rồi quên đi. Quota nói về tháng này và không được phép quên. Nửa còn lại của FR-RTL, và là chương đầu tiên trong loạt bài này không cần một global operation nào cả.",
   alternates: {
-    canonical: "/vi/part-3/chapter-23/quotas-and-what-they-cost",
+    canonical: "/part-3/chapter-23/quotas-and-what-they-cost",
     languages: {
       en: "/part-3/chapter-23/quotas-and-what-they-cost",
       vi: "/vi/part-3/chapter-23/quotas-and-what-they-cost",
@@ -14,12 +16,30 @@ export const metadata = {
   },
 };
 
-<ChapterHeader id="3.23" locale="vi" />
+<ChapterHeader id="3.23" />
 
-Quota cần answer về tháng nào, điều gì bị tính và chi phí khi vượt. Nó không thể là query
-đếm lại mọi message mỗi write, cũng không được nhầm với limit theo thời gian ngắn.
+Chương rate-limit đã dựng một limiter. Sáu trăm request mỗi phút, đếm trong Redis,
+ba header trên mọi response để client thấy được bức tường trước khi đâm vào.
+Chương này dựng một quota, và hai thứ đó là hai bài toán khác nhau đội chung một
+cái tên.
 
-## Query chúng ta không viết
+Rate limit nói về **giây này**. Nó quên một cách cố ý: cửa sổ đóng lại,
+bộ đếm reset, và tenant vừa bị từ chối một khoảnh khắc trước giờ được phục vụ. Nếu
+kho đếm bị xoá, cái giá là một cửa sổ phục vụ quá tay — vài
+trăm request không ai bị tính tiền, và tới phút sau hệ thống đã
+quên sự cố đó sạch sẽ như nó quên mọi thứ khác.
+
+Quota nói về **tháng này**, và nó không được quên. Nếu bộ đếm mất,
+tenant đã gửi chín nghìn message trên mức trần mười nghìn
+bắt đầu lại từ không, và hoá đơn tháng đó sai. Chỉ một câu đó
+quyết định gần như mọi lựa chọn thiết kế trong chương này.
+
+<Figure code={figTwoPromises} caption="Cùng một từ, hai lời hứa. Mọi thứ bên dưới đều bắt nguồn từ hàng thứ hai." />
+
+## Câu query chúng ta đã không viết
+
+Cách đơn giản nhất để biết một environment đã gửi bao nhiêu message tháng này là
+đếm chúng.
 
 ```sql title="the query this chapter argues against (excerpt)"
 select count(*), count(distinct m.user_id)
@@ -27,6 +47,13 @@ select count(*), count(distinct m.user_id)
  where c.environment_id = $1
    and m.created_at >= date_trunc('month', now() at time zone 'utc');
 ```
+
+Nó chạy được, không cần bảng mới nào, và một lần flush không chạm tới nó được vì
+chính các message *là* bản ghi. Trên database phát triển mà repository này
+tích luỹ từ Phần 2 — 198.690 message trên 26.331 environment — nó
+chạy trong một phần tư mili giây.
+
+Hãy đọc plan thay vì đọc đồng hồ:
 
 ```text
 ->  Bitmap Heap Scan on messages m
@@ -36,7 +63,30 @@ select count(*), count(distinct m.user_id)
 Execution Time: 0.266 ms
 ```
 
-## Test là toàn bộ chương
+Điều kiện về tháng là một **Filter**, không phải Index Cond. Mọi message mà
+environment đó từng gửi đều bị đọc lên từ heap rồi vứt đi nếu nó thuộc
+tháng khác. Hôm nay có 507 cái. Không có index nào trên
+`messages.created_at`, và `messages` hoàn toàn không mang `environment_id` — nó
+treo vào `channels`, nên plan được lái từ index của channel rồi đi bộ qua
+toàn bộ lịch sử của environment.
+
+<Why title="Why the number is not the argument">
+Trích "0.266ms" sẽ mời bạn đi kiểm lại, nhận một con số khác trên máy
+bạn, rồi kết luận là vụ này bị thổi phồng. Bằng chứng nằm ở dòng `Filter`. Nó
+nói rằng khối lượng công việc tỉ lệ với thứ tenant đã gửi kể từ ngày họ
+đăng ký, và một send path làm việc tỉ lệ với lưu lượng trọn đời là
+lỗi được ghi lại nhiều nhất của dự án này, lần này viết vào sản phẩm thay vì vào một
+bài test — mười hai lần giữa chương outbox và chương này, lần nào cũng là
+một ngân sách cố định đặt trước một tài nguyên chung đang lớn dần.
+</Why>
+
+Nên con số đếm là một roll-up: một dòng cho mỗi environment mỗi tháng, tăng lên bởi
+chính transaction ghi message.
+
+## Bài test chính là cả chương này
+
+Nếu một quota có thể bị xoá, nó không phải quota. Nên roll-up nhận một bài test mà
+limiter của chương rate-limit không thể vượt qua:
 
 ```ts title="services/api/src/quotas/quotas.itest.ts (excerpt)"
   it("reports identical figures across a FLUSHALL", async () => {
@@ -71,16 +121,43 @@ Execution Time: 0.266 ms
     expect(after).toEqual(before);
 ```
 
+Gửi ba message, đọc các con số, flush sạch kho đếm, rồi đọc
+lại. Không gì đổi cả, vì chưa từng có gì trong câu trả lời sống ở đó.
+
+<Why title="Proving the test can fail">
+Một bài test chưa ai từng thấy nó đỏ là một bài test chưa ai kiểm. Dựng lại
+theo cách của chương rate-limit — nhà của con số dời sang Redis, `sendMessage` ghi vào và
+đọc ra trên đường đi — lane nói:
+
 ```text
 × reports identical figures across a FLUSHALL      102ms
 Tests  1 failed | 6 passed (7)
 ```
 
-## Column đã có sẵn
+Một cái đỏ và sáu cái không. Mọi assertion khác trong file đều pass dưới cả hai
+thiết kế, bởi cả hai đều đếm đúng cho tới đúng lúc có thứ gì đó xoá kho.
+Đây là bài test duy nhất biết được khác biệt, và đó chính xác là lý do FR-002
+tồn tại.
+</Why>
+
+## Cái cột vốn đã nằm sẵn ở đó
+
+`environments` cần một chỗ để giữ các mức trần, và nó đã có sẵn một chỗ.
 
 ```ts title="services/api/src/db/schema.ts (excerpt)"
     quotaConfig: jsonb("quota_config").notNull().default({}),
 ```
+
+Khai báo từ chương 2.1, được gọi tên trong SRS §6.1, và không ai đọc suốt mười tám
+chương. Chương rate-limit từng được mời dùng nó cho policy rate-limit và đã từ chối, in rõ:
+
+> Khai báo ở 2.1, gọi tên trong SRS §6.1, rỗng suốt mười bảy chương — và đặt tên
+> cho **quota**. Rate limit và quota là hai lời hứa khác nhau: một cái
+> phù du và có thể mất, cái kia là tiền và phải bền. Nhét cái này
+> vào một field đặt tên cho cái kia là gộp ngay trong schema đúng cái thứ mà chương
+> này dành cả độ dài của nó để tách ra.
+
+Đây là chương đến sau. Hình dạng:
 
 ```json title="environments.quota_config (excerpt)"
 {
@@ -88,6 +165,18 @@ Tests  1 failed | 6 passed (7)
   "active_users": { "hard": null,  "soft": 500  }
 }
 ```
+
+<Trap title="Absent, null and zero are three different things">
+Trần bằng không nghĩa là *từ chối tất* — một environment có thể bị tắt
+một cách cố ý — và điều đó phải diễn đạt được. Không có key nghĩa là *không có trần*.
+Chương rate-limit cần cột nullable để tách hai thứ đó; jsonb cũng tách được
+chúng, và điều đó đáng kiểm chứ không đáng giả định: `#>> '{messages,hard}'`
+trả về SQL `NULL` cho một key vắng mặt và cho một JSON `null` như nhau, và chuỗi
+`'0'` cho số không. Một bên đọc coi null là không sẽ đình chỉ mọi tenant chưa từng
+cấu hình gì.
+</Trap>
+
+Schema lo phần còn lại:
 
 ```sql title="services/api/migrations/0013_quotas.sql (excerpt)"
 ALTER TABLE environments
@@ -108,11 +197,43 @@ ALTER TABLE environments
   );
 ```
 
+Ràng buộc đó **liệt kê** hai chiều đo, nghĩa là connection-minute của chương
+connection-metering sẽ tốn đúng một dòng ở đây. Một ràng buộc kiểm mọi
+chiều đo sẽ cần `jsonb_each`, và Postgres từ chối:
+
 ```text
 ERROR:  cannot use subquery in check constraint
 ```
 
-## Count không thể increment
+Cách vòng qua là một validator PL/pgSQL, và một hàm thủ tục trong một migration
+sản phẩm là lập luận hiến pháp VII mà chương này chưa xứng đáng.
+
+<Why title="What a cap is denominated in">
+Message và active user. Không phải tiền.
+
+FR-RTL-06 gọi nó là "hard spending cap", và không có mức giá nào ở đâu trong
+SRS hay SAD — không đơn giá, không tiền tệ, không bảng giá. Ghi chú thiết kế của chính
+yêu cầu đó gọi nó là *"một yêu cầu mua sắm, không phải yêu cầu kỹ thuật"*, mà tác hại
+nêu ra là **phơi nhiễm chi phí không giới hạn**, và một cái trần tính bằng đơn vị đo được
+chặn đúng điều đó. Bịa ra một nguyên thể định giá mà đặc tả chưa bao giờ
+nhắc tới là mở rộng phạm vi mới, và Nguyên tắc VII hỏi phạm vi mới mua được gì trước khi
+hỏi bất cứ điều gì khác.
+</Why>
+
+## Một con số không thể tăng dần
+
+Message thì dễ: cộng một. Số người dùng phân biệt thì không, và lý do đáng dành một
+phút.
+
+Để tăng số người gửi phân biệt, trước hết bạn phải biết liệu *người này*
+đã được đếm trong tháng này chưa — đó là một lần đọc, và một lần đọc phải
+đúng dưới tình huống đồng thời. Câu trả lời thông thường là một sketch xác suất:
+HyperLogLog trong Redis, vài kilobyte, đúng một cách xấp xỉ.
+
+FR-002 từ chối nó. Một lần flush sẽ xoá sạch cả tháng, mà chủ đề của cả chương này
+là tháng đó phải sống sót.
+
+Nên chính cái dòng dữ liệu **là** câu trả lời:
 
 ```sql title="services/api/migrations/0013_quotas.sql (excerpt)"
 CREATE TABLE usage_active_users (
@@ -123,6 +244,8 @@ CREATE TABLE usage_active_users (
   PRIMARY KEY (environment_id, period, user_id)
 );
 ```
+
+Một dòng cho mỗi người dùng mỗi kỳ, ghi vào mỗi lần gửi có quy trách nhiệm:
 
 ```ts title="services/api/src/db/repository.ts (excerpt)"
       // The distinct-user count, and the reason it is a row rather than a
@@ -141,7 +264,40 @@ CREATE TABLE usage_active_users (
       }
 ```
 
-## Nó được enforce ở đâu, và tại sao không ở nơi bạn nghĩ
+`ON CONFLICT DO NOTHING` làm cho message thứ hai trong tháng thành miễn phí, và con số
+là một index-only scan trên tiền tố key. Bảng bị chặn bởi số người dùng phân biệt của
+tenant trong một tháng chứ không phải bởi lưu lượng của họ, và đó là thứ khiến nó
+trả nổi — một tenant gửi một triệu message từ bốn trăm người lưu
+bốn trăm dòng.
+
+<Trap title="A key's send counts toward the messages AND toward an active user, and the bot is why">
+Mọi lần gửi đều gọi tên một user. Chương sender đã làm `userId` thành bắt buộc trên write path
+— bắt buộc để trình biên dịch hỏi câu hỏi đó, không phải người review — và một
+lần gửi REST xác thực bằng key gọi tên một **bot user**: một danh tính mà khách hàng tạo ra,
+đặt tên và mô tả cho phần mềm của chính họ.
+
+Nên một lần gửi bằng key tốn một message trên quota message *và* tính vào một
+active user. Không còn lần gửi vô chủ nào để roll-up phải có câu trả lời
+cho nó, và con số người dùng phân biệt CHÍNH LÀ con số người gửi.
+
+Phương án bị bác bỏ ở đây là một user **tổng hợp**, do nền tảng tự đúc ra, thứ sẽ
+thổi phồng chiều đo mà khách hàng bị đo trên đó mà không ai yêu cầu.
+Một bot là thứ được **khai báo**: khách hàng quyết định nó tồn tại và nhìn thấy nó trên
+hoá đơn. Thổi phồng một chiều đo bằng một danh tính có thật ai đó yêu cầu là một
+hành vi khác với việc bịa ra một danh tính thay họ.
+
+**VÀ HỆ QUẢ LÀ HAI ĐIỀU KHOẢN Ở HAI HỌ.** FR-ANL-05 *đo* "unique
+active users" còn FR-RTL-05 *chặn trần* "unique active persons" — lệch nhau một từ, và chỉ
+cái thứ hai bị thu hẹp. Nên một bot **bị tính tiền** như active user và **được miễn** khỏi
+cái trần từ chối gửi. Phần mềm của chính khách hàng không thể khoá người của họ khỏi
+việc gửi, điều mà nếu không thì nó sẽ làm: cái trần từ chối lần gửi đầu tiên của một kỳ bởi
+bất kỳ ai một khi con số chạm ngưỡng, nên người bị từ chối không bao giờ là người gây ra nó.
+</Trap>
+
+## Nó được thực thi ở đâu, và vì sao không phải chỗ bạn nghĩ
+
+Limiter của chương rate-limit là middleware. Việc hiển nhiên là đặt phép kiểm quota
+ngay cạnh nó.
 
 ```ts title="services/api/src/limits/rate-limit.middleware.ts (excerpt)"
 export function operationsFor(
@@ -152,6 +308,19 @@ export function operationsFor(
   if (method === "POST" && SEND_PATH.test(path)) return ["rest", "send"];
   return ["rest"];
 ```
+
+`operationsFor` trả về danh sách rỗng cho mọi path ngoài `/v1`, nên limiter
+không bao giờ thấy `/internal/messages` — mà đó chính là route gateway post vào khi
+một WebSocket client gửi message. Với một *rate* limit thì thế là đúng:
+`/internal` là service-tới-service, và giới hạn nó là giới hạn gateway chứ không phải
+một tenant. Với một quota thì thế là sai, bởi quota nói về thứ tenant
+đã tiêu, bất kể nó đi vào bằng cửa nào.
+
+<Figure code={figWhereItIsEnforced} caption="Hai cánh cửa, một phương thức. Limiter chỉ thấy một; sendMessage thấy cả hai." />
+
+Cả hai route đều hội tụ về `MessagesService.send`, hàm này gọi
+`Repository.sendMessage`. Phương thức đó vốn đã mở write transaction, nên phép
+kiểm, message, event và con số cùng commit hoặc không cái nào commit.
 
 ```ts title="services/api/src/db/repository.ts (excerpt)"
       // THE CAP, CHECKED BEFORE THE MESSAGE IS WRITTEN (FR-RTL-08).
@@ -186,7 +355,26 @@ export function operationsFor(
       const quota = await this.assertWithinQuota(tx, period, userId);
 ```
 
-## Sweep không cần thiết
+## Lần quét hoá ra không cần
+
+Đây là thiết kế chương này tưởng sẽ phải dựng, mà rồi không dựng.
+
+Gửi email cho một tổ chức ở mức 50%, 80% và 100% quota nghe như một
+job định kỳ: cứ vài phút, đi hết mọi environment, so usage với trần, gửi
+thứ đến hạn. Job đó là một **global operation** — nó đọc và ghi các dòng
+thuộc về mọi tenant — và codebase này đã dành trọn một feature cho cái giá của
+chúng. Nó sẽ cần một mục trong exemption list của test harness, một
+mục tương ứng trong phần ignores của lint rule, và một bài test viết đủ cẩn thận để
+sống sót qua cả hai.
+
+Không thứ nào trong số đó là cần thiết.
+
+<Figure code={figNoSweep} caption="Usage chỉ tăng vì một lần gửi, và lần gửi đó vốn đã nắm cả hai con số." />
+
+Usage tăng vì đúng một lý do: có người gửi một message. Cái transaction
+tăng con số đó biết giá trị trước và giá trị sau, nên nó biết
+chính xác message đó đã vượt qua những ngưỡng nào. Nó tự ghi các dòng ấy,
+trong cùng transaction, và không có gì định kỳ tồn tại cả.
 
 ```ts title="services/api/src/db/repository.ts (excerpt)"
    * IN THE SAME TRANSACTION AS THE THING THAT CAUSED IT. The crossing and the
@@ -233,12 +421,62 @@ export function operationsFor(
       .onConflictDoNothing();
 ```
 
+<Why title="Why this is worth a section">
+Chương instruments tồn tại bởi các global operation trong test cứ liên tục sinh ra một
+lỗi pass khi chạy một mình và fail khi chạy cùng bạn. Nó dựng một Postgres trigger để bắt
+chúng, một exemption list, và một lint rule.
+
+Chương này hoá ra chẳng cần global operation nào, và điều đó đáng giá hơn
+vẻ ngoài của nó — bởi chương này cũng đặt **ba bảng mới dưới
+trigger đó**. `usage_periods`, `usage_active_users` và `quota_notifications` đều mang
+`environment_id`, nên cả ba gia nhập mảng của guard ngay khi được tạo, mỗi cái với
+một dòng bait và một case. Một lần quét định kỳ giờ sẽ gặp đúng cái trigger mà chương này
+tự tay lắp.
+
+Nó không bao giờ có cơ hội. Không gì ở đây ghi xuyên tenant, nên không gì gia nhập
+drain-exemption list. **Cái công cụ đã đổi thiết kế chứ không chỉ đổi
+các bài test**, đó là kết quả mà tiêu chí thành công của chính nó hy vọng mà không
+đo được — và phiên bản sắc hơn của điều đó là: chương lẽ ra phải
+xin miễn trừ lại chính là chương đã mở rộng ý nghĩa của việc miễn trừ.
+</Why>
+
+<Trap title="The bait had to be planted already delivered, and this time it bit">
+Lắp trigger lên `quota_notifications` có một hệ quả mà hai bảng outbox trước cũng
+từng có, và ở đây nó tới nặng hơn.
+
+Harness gieo một dòng sentinel vào mọi bảng được canh, một lần cho mỗi file test, để một
+lệnh `UPDATE` hay `DELETE` không giới hạn trong suite của ai đó gặp một trigger chứ không phải
+gặp hư không. Nhưng `drainQuotaNotifications` giành trên `delivered_at IS NULL` — nên một dòng
+bait gieo ở trạng thái chưa gửi sẽ bị mọi quota relay trong lane giành mất, trên một connection
+không mang theo miễn trừ. Trigger từ chối lệnh update, và transaction bị
+đầu độc:
+
 ```
 Failed query: UPDATE quota_notifications SET delivered_at = now(), last_error = NULL
 25P02 in_failed_sql_transaction
 ```
 
-## Cạn quota mà không down
+Sáu test đỏ, và thông điệp không gọi tên cả bait lẫn guard.
+
+Quy tắc điều này phân xử nay đã được đo bốn lần: **bait chỉ được phép giành được ở nơi
+mà việc rút nó là công việc của database.** Một lần quét hay một lần publish thì đủ tư cách. Bất cứ thứ gì
+làm I/O từng dòng — gửi mail, giao HTTP — thì không, và bait của nó được gieo
+ở một trạng thái mà drain sẽ không giành. Hai bảng webhook nhượng bộ điều này vì
+độ trễ; bảng này nhượng bộ vì tính đúng đắn.
+
+Còn một dòng nữa quan trọng. Lệnh insert của bait dùng `ON CONFLICT (id) DO UPDATE`, không phải
+`DO NOTHING`. Id của một sentinel suy ra từ chủ của nó, nên id của dòng đó
+y hệt nhau ở mọi lần chạy, mãi mãi — với `DO NOTHING` thì trạng thái nó được gieo *lần đầu*
+là trạng thái nó giữ, và một lane từng chạy fixture một lần trước khi chỗ này được sửa
+sẽ giữ một dòng bait chưa gửi mà không lần chạy sau nào cứu được. Ở đây **trạng thái** của dòng là
+một phần trong hợp đồng của fixture, không chỉ là sự tồn tại của nó.
+</Trap>
+
+## Hết hạn mức, mà không sập
+
+FR-RTL-08 đặc biệt cụ thể, và chính sự cụ thể đó là yêu cầu: từ chối gửi,
+đọc history và các kết nối đang mở không bị ảnh hưởng. Từ chối tất
+thì dễ và sai.
 
 ```ts title="services/api/src/messages/messages.service.ts (excerpt)"
       if (error instanceof QuotaExceededError) {
@@ -275,7 +513,33 @@ Failed query: UPDATE quota_notifications SET delivered_at = now(), last_error = 
       }
 ```
 
+Status là **402**, không phải 429. Chương rate-limit sở hữu 429, và một client đọc
+`Retry-After`, ngủ, rồi thử lại là đang hành xử đúng với một rate limit và
+sai với một quota — thứ vẫn sẽ cạn sau một giờ và sau ba
+tuần. Có một thời điểm mà việc gửi được nối lại và nó nằm trong message, không nằm trong một
+header mà client sẽ hành động theo.
+
+<Trap title="The code has to be named, or the body lies">
+`ProtocolErrorFilter` suy ra mã lỗi từ status cho 400, 401, 403 và
+404. Mọi thứ khác rơi xuống `internal_error`. Một `402` ném ra mà không kèm
+code sẽ phát ra một body tự gọi mình là lỗi nội bộ trong khi mang một
+status thanh toán — đúng lời nói dối mà chương 2.2 đã sửa cho 400 và chương credentials sửa cho 403. Cơ chế
+chương credentials thêm vào, một bên ném lỗi tự gọi tên code của mình, là thứ chỗ này dựa vào, và
+bài test assert trên `code` phát ra chứ không chỉ trên status.
+</Trap>
+
+Thứ *không* bị từ chối cũng quan trọng không kém. Đọc history vẫn thành công. Kết nối đang mở
+vẫn mở — gateway giữ socket còn api từ chối cái POST phía sau nó,
+nên một lời từ chối không thể đóng thứ gì. Việc giao webhook tiếp tục với những message
+đã nhận trước khi chạm trần, bởi một message đã được xác nhận thì không bị
+rút lại xác nhận bởi một quota vượt ngưỡng sau đó.
+
 ## Outbox, lần thứ tư
+
+Email ngưỡng cần một transport, và loạt bài này đã dựng một cái ba lần
+rồi.
+
+<Figure code={figOutboxFourth} caption="Cùng một hình dạng, lần thứ tư. Hãy đọc to con số đó lên." />
 
 ```sql title="services/api/migrations/0013_quotas.sql (excerpt)"
 CREATE TABLE quota_notifications (
@@ -299,12 +563,36 @@ CREATE TABLE quota_notifications (
 );
 ```
 
+`webhook_disable_notifications` không tái dùng được: `endpoint_id` của nó là `NOT NULL`
+còn một lần vượt quota thì chẳng có endpoint nào. Nên đây là bảng thứ tư với cùng
+claim predicate, được rút bởi một relay thứ tư trông giống hệt cái thứ ba.
+
+<Why title="Four tables rather than one">
+Phương án khác là một bảng `notifications` với một cột `kind` và một payload
+JSON. Nó bớt được một migration và thêm một discriminated union vào mọi lần đọc, và
+bốn kind đó thật sự có các cột khác nhau — một URL endpoint, một phần trăm,
+một kỳ, một số lần thử giao.
+
+Bốn bảng cụ thể trông giống nhau là một pattern. Một bảng trừu tượng phục vụ bốn
+mục đích là một framework, và một framework là thứ bạn bảo trì thay cho
+thứ bạn định xây.
+</Why>
+
+Ràng buộc unique mới là phần thú vị:
+
 ```sql title="services/api/migrations/0013_quotas.sql (excerpt)"
   CONSTRAINT quota_notifications_once_per_threshold
     UNIQUE (environment_id, period, dimension, threshold)
 ```
 
+Đó là "nhiều nhất một email cho mỗi ngưỡng cho mỗi quota cho mỗi kỳ" được thực thi bởi
+schema chứ không phải được hứa bởi đoạn code ghi vào nó. Hai lần vượt ngưỡng đồng thời
+quy về một dòng, và chúng vẫn sẽ như vậy kể cả khi đoạn code ghi có sai —
+đó là khác biệt giữa một bảo đảm và một ý định.
+
 ## Nó tốn gì
+
+Send path nhận thêm một query.
 
 ```ts title="services/api/src/db/repository.ts (excerpt)"
       // THE MONTH'S USAGE COMMITS WITH THE MESSAGE (FR-RTL-05).
@@ -346,13 +634,92 @@ CREATE TABLE quota_notifications (
           .onConflictDoNothing();
 ```
 
+Cả hai câu lệnh đều là thao tác index. Lần tăng roll-up giải quyết xung đột của nó
+trên `usage_periods_pkey`, và đó là thứ mà việc lưu kỳ thay vì tính nó ra
+mua được — một lần tra cứu chính là toàn bộ primary key, và một ranh giới tháng là
+một dòng khác chứ không phải một filter khác.
+
+Đo với các pha được gắn dụng cụ và cấu hình bật trên một
+environment, 32 lần gửi đồng thời trên 32 channel:
+
 ```text
 unconfigured           1.77ms per send    assertWithinQuota = 1.246ms
 configured             2.33ms per send    assertWithinQuota = 1.586ms
 back to unconfigured   1.77ms per send    assertWithinQuota = 1.121ms
 ```
 
-## Toàn bộ chương
+Cấu hình một quota tốn khoảng nửa mili giây cho mỗi lần gửi.
+
+<Trap title="How that number was nearly wrong four times">
+Bản benchmark đầu tiên dựng một environment mới cho mỗi case và chạy chúng theo một
+thứ tự cố định. Nó báo 273%, rồi 341%, rồi 303%, rồi 411% — và mỗi lần một
+nguyên nhân khác trông có vẻ hiển nhiên. Một `FOR UPDATE` đang tuần tự hoá environment.
+Một lần tra cứu organisation đang chạy trên mọi lần gửi. Hai vòng round-trip đang giữ một
+pooled connection vượt quá kích thước pool.
+
+Cả ba đều được xử lý. Không cái nào là nguyên nhân. Nguyên nhân là chính cái benchmark: mỗi
+case mang theo phần khởi động riêng và phần bảng lớn lên riêng, nên phép đo
+phần lớn là đang đo xem vòng lặp nào chạy thứ hai.
+
+Hai trong ba thay đổi là code tốt hơn và được giữ lại — hỏi phần số học miễn phí
+trước khi query bất cứ thứ gì, và đọc các mức trần cùng usage trong một join. Cái
+thứ ba thì không thể hoàn tác kể cả khi cố ý: một khi hai lần đọc đó thành một lần
+đọc join, `FOR UPDATE cannot be applied to the nullable side of an outer join`. Phần
+vượt trần vì thế bị chặn bởi số lần gửi đang bay chứ không phải bởi
+một, và đó chính là thứ đặc tả yêu cầu ngay từ đầu.
+</Trap>
+
+<Checkpoint>
+- Usage hàng tháng được đếm trong chính transaction ghi message, và giống hệt nhau
+  qua một lần `FLUSHALL` kho đếm
+- Một trần cứng từ chối gửi với `402 quota_exceeded` và không chạm gì tới thứ một
+  tenant có thể đọc
+- Một ngưỡng mềm cảnh báo và không từ chối gì
+- Email ở 50%, 80% và 100%, nhiều nhất một cái mỗi quota mỗi kỳ, được thực thi bởi
+  một ràng buộc unique
+- Outbox pattern lần thứ tư, trong `quota_notifications`
+- Ba bảng dưới global-operation guard, mỗi bảng một dòng bait và một case
+- Không job định kỳ, không global operation, và không mục mới nào trong DRAIN exemption
+  list — hai mục mà driver rule nhận thêm là hai suite quota, chúng ghi và đọc
+  thẳng các bảng roll-up bởi đi qua repository sẽ là
+  assert một hàm với chính nó
+- `quota_exceeded` được đăng ký chứ không phải viết tay: file này từng trích nó hai lần
+  trong văn xuôi mà chưa bao giờ giữ nó, nên một lỗi gõ của nó đã đẩy một `docs_url` đi vào hư không
+- Cả hai lane xanh. Integration: 40 file, 802 test, 6m22s
+- Tag `rework/part3-ch23`
+</Checkpoint>
+
+<ForwardRef>
+FR-RTL-05 gọi tên ba chiều đo và chương này phủ hai. Message
+và active user vốn đã là các dòng dữ liệu — `messages.user_id` đã nằm trong
+`0000_core_tables.sql` từ Phần 2 — nên đếm chúng là một câu hỏi tổng hợp.
+Một connection-minute là một khoảng thời gian không gì ghi lại, và service lẽ ra phải
+ghi nó là gateway, **thứ không sở hữu bảng nào**. Đó là một chủ đề khác
+với một bài học khác, và nó là chương kế tiếp.
+</ForwardRef>
+
+
+## Toàn văn chương này
+
+Các trích đoạn ở trên là những phần đáng tranh luận. Đây là các file, nguyên vẹn
+chỗ nào mới và dạng diff chỗ nào không.
+
+**Các suite không có ở đây, và đó là một quyết định chứ không phải một thiếu sót.**
+`quotas.itest.ts` dài quá năm trăm dòng, và những assertion đáng đọc
+đã được trích ở trên — lần flush, lời từ chối bên cạnh lần đọc history thành công,
+ba email Mailpit thật sự nhận được, con bot bị tính tiền mà không chiếm chỗ.
+Phần còn lại là setup, và một trang in lại nó sẽ chôn vùi các file mang
+lập luận. Điều đó cũng đúng với năm unit suite bên cạnh: `config.test.ts`,
+`period.test.ts`, `period.itest.ts`, `policy.test.ts`, `quota-email.test.ts` và
+`quota.error.test.ts` là những bảng input và output mong đợi, mà một cái bảng thì đọc
+trong editor dễ hơn đọc trên trang giấy.
+
+Thứ CÓ ở đây là mọi thứ đã đổi bên ngoài thư mục riêng của chương này —
+bởi đó là những file người đọc đã gặp trước đây, và một diff lên một trong số chúng là
+phần dễ bỏ sót nhất.
+
+
+### Migration
 
 ```sql title="services/api/migrations/0013_quotas.sql"
 -- Monthly usage quotas (FR-RTL-05 to FR-RTL-08).
@@ -545,6 +912,8 @@ CREATE INDEX quota_notifications_undelivered
   WHERE delivered_at IS NULL;
 ```
 
+### Đang là tháng nào
+
 ```ts title="services/api/src/quotas/period.ts"
 /** The usage period an instant belongs to: the first day of its calendar month,
  * in UTC, as a plain `YYYY-MM-DD` string.
@@ -594,6 +963,8 @@ export function nextPeriod(period: string): string {
 }
 ```
 
+### Một lần tăng đã vượt qua những gì
+
 ```ts title="services/api/src/quotas/policy.ts"
 /** The percentages an organisation is emailed at (FR-RTL-07). */
 export const THRESHOLDS = [50, 80, 100] as const;
@@ -629,6 +1000,8 @@ export function thresholdsCrossed(
   return THRESHOLDS.filter((t) => from < t && to >= t);
 }
 ```
+
+### Đọc cái cột mà 2.1 để lại
 
 ```ts title="services/api/src/quotas/config.ts"
 import { z } from "zod";
@@ -705,6 +1078,8 @@ export function capsFor(
 }
 ```
 
+### Lời từ chối
+
 ```ts title="services/api/src/quotas/quota.error.ts"
 import type { QuotaConfig } from "./config";
 
@@ -765,6 +1140,8 @@ export class QuotaExceededError extends Error {
   }
 }
 ```
+
+### Email
 
 ```ts title="services/api/src/quotas/quota-email.ts"
 import type { Mail } from "../notifications/mailer";
@@ -842,6 +1219,8 @@ export function quotaThreshold(facts: CrossingFacts): Mail {
   return { subject, text };
 }
 ```
+
+### Relay, lần thứ tư
 
 ```ts title="services/api/src/quotas/quota-relay.ts"
 import type { Logger } from "@relay/service-kit";
@@ -982,6 +1361,8 @@ export function createQuotaRelay({
 }
 ```
 
+### Nhà của nó
+
 ```ts title="services/api/src/quotas/quotas.module.ts"
 import { Inject, Injectable, Module, type OnModuleDestroy } from "@nestjs/common";
 
@@ -1035,6 +1416,12 @@ export class QuotaRelayService implements OnModuleDestroy {
 })
 export class QuotasModule {}
 ```
+
+### Các file sẵn có nhận thêm gì
+
+Ba phần của guard tới cùng nhau — cái tên, dòng bait và case — bởi
+một cái tên không có dòng nào đứng sau sẽ lắp một trigger không bao giờ khớp và đọc lên, trong
+mọi báo cáo, y hệt như một lớp bảo vệ.
 
 ```diff title="packages/test-harness/src/sentinel.sql"
 @@ -81,71 +81,98 @@ BEGIN
@@ -1431,6 +1818,16 @@ export class QuotasModule {}
        await expect(
 ```
 
+Assertion thứ ba trong file cuối đó là mới, và nó tồn tại bởi hai cái đầu
+được kiểm chéo với nhau trong khi bait thì chẳng ai kiểm: xoá một lệnh
+insert khỏi `plant()` vẫn để suite xanh, kể cả suite của một chương cũ hơn. Nó hỏi
+database xem `plant()` có để lại một dòng trong mọi bảng được canh không, trên một
+sentinel mà không gì khác trong file chạm tới — bản đầu tiên đếm các dòng
+mà `beforeAll` vừa gieo qua `SHAPES`, và pass ngay cả khi lệnh insert bị xoá.
+
+`quota_exceeded` gia nhập sổ đăng ký. File này từng lập luận chống lại việc tái dùng nó hai lần,
+trong hai comment, mà chưa bao giờ giữ nó:
+
 ```diff title="packages/protocol/src/codes.ts"
 @@ -223,12 +223,28 @@ export const ERROR_CODES = {
    // survived — only the code could have caught it.
@@ -1463,6 +1860,10 @@ export class QuotasModule {}
    webhook_url_private_address:
 ```
 
+Hai suite quota gia nhập driver exemption, mỗi cái vì lý do riêng — một cái
+ghi một dòng mà repository không ghi được, cái kia đọc các bảng roll-up mà
+repository nếu không sẽ bị yêu cầu tự kiểm chính mình:
+
 ```diff title="eslint.config.mjs"
 @@ -80,12 +80,28 @@ export default tseslint.config(
        // "the state under test is one the repository is now unable to reach". Both are
@@ -1494,6 +1895,34 @@ export class QuotasModule {}
        // nobody is editing — so all of them land in the commit that adds the rule.
        // FIVE DIFFERENT ARGUMENTS, and a blanket "the gateway's Redis files" would
 ```
+
+Và các lane học về một relay thứ tư. Config của dispatcher nhận phần dây nối guard
+mà bốn lane kia đã có, tức là một commit đặt tên cho năm lane giờ hạ cánh
+cái thứ năm. Config coverage nhận cùng các cờ đó và sáu mức ghim theo file:
+
+<Trap title="Two pure files at 100, three whose only gap is a `??` the compiler demands">
+Sáu file của chương này đi vào ratchet. `policy.ts` và `quota.error.ts`
+đạt 100 trên mọi chỉ số — không đồng hồ, không kho, không framework, nên một nhánh chúng bỏ sót
+là một case không ai nghĩ ra chứ không phải một case không ai chạm tới được.
+
+Ba cái hụt ở riêng phần nhánh, và mọi nhánh thiếu đều cùng một hình dạng: một
+fallback trên một giá trị mà `noUncheckedIndexedAccess` không thu hẹp được.
+`parsed.error.issues[0]?.message ?? "invalid"` — một lần zod fail luôn mang theo một
+issue. `(m ?? 1)` trên một kỳ đến từ `periodOf` hoặc từ một cột `date`.
+`months[Number(m) - 1] ?? m` cho một tháng ngoài khoảng 1 tới 12.
+
+Chúng được **ghim lại chứ không bị xoá**, và đó không phải câu trả lời quen thuộc của ratchet này.
+Xoá chúng nghĩa là một non-null assertion, tức là cùng một giả định được dời sang
+chỗ mà một thay đổi kiểu không thể phủ nhận — một đánh đổi tệ hơn một nhánh không phủ được
+mà có lý do viết ngay bên cạnh.
+
+**Và một con số cải thiện được nhờ bỏ đi một bản sao chứ không phải nhờ thêm một bài test.** Phần
+số học tháng-kế-tiếp tồn tại hai lần, một trong phần lỗi và một trong phần email, mỗi cái
+trả giá bằng cặp nhánh không chạm tới được của riêng nó và mỗi cái có bài test tháng Mười Hai riêng.
+Một bản sao duy nhất trong `period.ts` để lại một cặp, và độ phủ nhánh của thư mục này đi từ
+86.53% lên 88.63%.
+</Trap>
+
 
 ```diff title="services/api/vitest.integration.config.mts"
 @@ -29,12 +29,14 @@ export default defineConfig({
@@ -1726,6 +2155,9 @@ export class QuotasModule {}
          "**/*.{ts,mts,cts,mjs,js}",
          "eslint.config.mjs",
 ```
+
+Lane end-to-end nhận phần setter policy và một hành trình của riêng nó —
+cái trần đi qua cửa còn lại, và thứ nó để yên:
 
 ```diff title="packages/e2e/src/harness.ts"
 @@ -312,12 +312,19 @@ export interface System {
@@ -2720,4 +3152,4 @@ describe("a quota through the socket", () => {
    // Same placement, same reason, same lazy connection: an unreachable broker
 ```
 
-<ChapterFooter id="3.23" locale="vi" />
+<ChapterFooter id="3.23" />
