@@ -1,12 +1,14 @@
 import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
 import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figWhatABucketIs, figTotalsNotDeltas, figTwoHops, figWhatTheApiCannotTell } from "./figures";
 
 export const metadata = {
   title: "Đếm một kết nối — Building Relay",
   description:
-    "Connection-minute là quota dimension khác message. Chương này thêm usage service không sở hữu table, total-based metering, shutdown accounting và enforcement ở socket door.",
+    "Message và user vốn đã là các dòng dữ liệu. Một kết nối thì chẳng là dòng nào ở đâu cả, và tiến trình duy nhất nhìn thấy được nó lại không sở hữu bảng nào — và, cho tới chương này, cũng không có cả danh tính.",
   alternates: {
-    canonical: "/vi/part-3/chapter-24/counting-a-connection",
+    canonical: "/part-3/chapter-24/counting-a-connection",
     languages: {
       en: "/part-3/chapter-24/counting-a-connection",
       vi: "/vi/part-3/chapter-24/counting-a-connection",
@@ -14,16 +16,141 @@ export const metadata = {
   },
 };
 
-<ChapterHeader id="3.24" locale="vi" />
+<ChapterHeader id="3.24" />
 
-Connection usage được tính theo phút kết nối, không phải số message. Counter phải cộng total
-đã quan sát, xử lý socket shutdown và từ chối connection mới trước khi nó tiêu quota.
+FR-RTL-05 gọi tên ba chiều đo: message đã gửi, unique active user, và
+connection-minute. Chương quota dựng hai trong số đó rồi dừng, và chỗ dừng
+đã được chọn trước khi viết một chữ nào.
 
-## Connection-minute là gì
+Message và user **vốn đã là các dòng dữ liệu**. `messages.user_id` đã nằm trong
+`0000_core_tables.sql` từ Phần 2, nên đếm chúng là một câu hỏi tổng hợp
+được trả lời bên trong một transaction mà api vốn đã sở hữu. Lần gửi biết con số
+trước và sau, nên nó biết mình đã vượt qua cái gì, và cả chương thu lại
+thành chuyện đặt một dấu `+1` ở đâu.
 
-## Service không sở hữu table, cũng không sở hữu identity
+Một kết nối thì chẳng là dòng nào ở đâu cả. Không gì ghi lại nó. Tiến trình duy nhất
+nhìn thấy được một kết nối là gateway, thứ không sở hữu bảng nào — ADR-05 nói api
+là bên ghi duy nhất, và chương 2.1 đã biến điều đó thành một lint rule để sai lầm này
+là một lỗi build chứ không phải một lời nhận xét review. `registry.ts` đã phát biểu
+tính chất đó bằng văn xuôi từ chương 2.5: *không pg, không drizzle-orm, không import
+repository.*
 
-## Total, không phải delta
+Nên chương này không nói về việc đếm. Nó nói về **đo đạc từ một service
+không thể ghi**: nó phải nói gì, phải nói bao lâu một lần, và điều gì xảy ra
+với con số khi thứ đang nói chết giữa câu.
+
+## Một connection-minute là gì
+
+`docs/04-srs.md` ghi lại một câu hỏi mở, số bốn, gửi tới Product và
+Billing: *đo connection-minute có cần độ chính xác từng giây không, hay làm tròn
+theo phút là chấp nhận được?* Một chương xuất bản mà không trả lời nó
+sẽ để người ta phát hiện ra đơn vị đo từ một tờ hoá đơn.
+
+Câu trả lời chọn ở đây: **một connection-minute là một phút theo lịch mà trong đó
+một kết nối mở ở bất kỳ phần nào của nó, tính theo từng kết nối.**
+
+<Figure caption="Một socket năm giây tốn một phút. Một socket mở từ 00:00:59 tới 00:01:01 tốn hai — nó có mặt trong hai phút theo lịch, và đơn vị đo chính là cái phút nó có mặt." code={figWhatABucketIs} />
+
+Các phương án khác đáng được gọi tên vì chúng cho ra hoá đơn khác nhau rõ rệt. Bạn
+có thể cộng dồn số giây thật rồi làm tròn lên cho mỗi kết nối, cho mỗi
+socket một mức sàn một phút. Hoặc cộng dồn số giây trên cả environment rồi làm tròn
+một lần ở cuối, đó là cách đọc đúng nghĩa đen nhất của chữ
+"connection-minute".
+
+Một nghìn socket năm giây tách chúng ra:
+
+| mô hình | một nghìn socket 5 giây | khoá chống trùng |
+|---|---|---|
+| bucket theo phút, mỗi kết nối | tới 1.000 phút | chính danh tính của bucket |
+| giây, làm tròn mỗi kết nối | 1.000 phút | một bộ cộng dồn mỗi kết nối |
+| giây, làm tròn một lần lúc đọc | 83 phút | một bộ cộng dồn mỗi kết nối |
+
+Cái thứ ba tính gần như bằng không cho một cơn bão reconnect. Cái thứ nhất tính tiền sự trồi sụt, và
+nó có một tính chất thứ hai hoá ra còn quan trọng hơn lập luận về hoá đơn:
+tập hợp các phút mà một kết nối đã chiếm chỉ có lớn lên. Một con số đếm tập đó
+cũng chỉ lớn lên, và "ghi có phần chênh lệch" trở thành toàn bộ câu chuyện
+chống trùng — một điểm ta sẽ tới trong hai mục nữa.
+
+<Why req="SRS open question 4">
+Câu hỏi được gửi tới Product và Billing và SRS vẫn để nó
+mở. Một cuốn tutorial có thể trả lời nó hoặc để đó, mà để đó nghĩa là người đọc gặp
+đơn vị đo trong một cột schema thay vì trong một đoạn văn. Ở đây nó được trả lời, kèm
+bảng so sánh đã chọn ra nó.
+</Why>
+
+## Một service không sở hữu bảng, và cũng không có danh tính
+
+Con đường tới trạng thái của gateway là HTTP nội bộ tới api. Nó có ba lời gọi —
+`/internal/session`, `/internal/backfill`, `/internal/messages` — và mỗi lời gọi
+đều **chuyển tiếp chính token của người dùng cuối**. Chương credentials đã làm nó như vậy, và
+`api-client.ts` nói rõ lý do:
+
+> token mà client trình ra lúc connect, được mang theo để bước nhảy nội bộ có thể
+> CHUYỂN TIẾP nó thay vì tự khẳng định người gọi là ai. Gateway giữ nó; nó
+> không xác minh nó và không giữ bí mật nào để làm việc đó.
+
+Một báo cáo usage chẳng là hành động của ai cả. Nó là lời khẳng định của chính tiến trình này về nhiều
+kết nối, có thể trải trên nhiều environment, về khoảng thời gian đã
+trôi qua. Không token của người dùng nào cho phép nó.
+
+Cách lách hiển nhiên là báo cáo theo từng kết nối bằng chính token của kết nối đó,
+và nó thất bại ở chỗ tệ nhất có thể: một token hết hạn trong khi socket
+vẫn mở — `handleSend` vốn đã mang một nhánh cho cái 401 sinh ra từ đó —
+và cái socket sống lâu với token đã hết hạn chính xác là cái socket có
+nhiều phút nhất trên người.
+
+Nên gateway lên tiếng cho chính mình, lần đầu tiên. Chương webhook dispatcher
+đã dựng sẵn lớp credential mà chỗ này cần: `PlatformPrincipal`,
+`@Accepts("platform")`, tiền tố `rk_svc_`. Gateway trở thành người giữ thứ hai
+của nó.
+
+<Trap>
+`resolvePlatformCredential` kết thúc bằng một `service: "dispatcher"` gán cứng. Điều đó
+đúng đúng bằng khoảng thời gian dispatcher còn một mình — và
+`PlatformPrincipal.service` được ghi là *"service nội bộ nào đã trình nó ra,
+để ghi log"*. Với một bí mật dùng chung và hai bên gọi, cái field duy nhất trong
+principal nói ai đang hỏi trở thành cái field duy nhất không tin được.
+
+Vậy thì một credential cho mỗi service. Tính chất thứ hai đáng giá hơn dòng
+log: gateway kết thúc các kết nối từ internet công cộng còn
+dispatcher thì không, nên một bí mật dùng chung để service phơi nhiễm nhiều hơn định đoạt
+bán kính vụ nổ cho cả hai.
+
+Phương án hấp dẫn kia — giữ một bí mật, để bên gọi tự xưng tên trong một
+header, chỉ tin nó để ghi log — chính là pattern mà chương credentials đã dành cả
+nó để dẹp bỏ. "Chỉ để ghi log thôi mà" là câu nói giúp một header tự khẳng định
+sống sót qua một vòng review.
+</Trap>
+
+Comment đã fence của chương credentials nói gateway "không giữ signing
+secret nào", và điều đó vẫn đúng sau chương này. Một platform credential không ký
+gì và không xác minh gì; nó nói service nào đang nói, trên đúng lời gọi
+là của riêng gateway chứ không phải của một người dùng.
+
+## Tổng, không phải phần chênh
+
+Đây là quyết định mà mọi thứ còn lại của thiết kế rơi ra từ đó.
+
+Một báo cáo nói một kết nối đã tiêu thụ bao nhiêu **tính tổng** trong một kỳ. Không phải thứ nó
+tiêu thụ kể từ báo cáo trước.
+
+<Figure caption="Một protocol gửi phần chênh cần giao ít-nhất-một-lần, một danh tính message để chống trùng, và một chỗ để giữ thứ nó chưa gửi được. Một protocol gửi tổng không cần cái nào trong ba." code={figTotalsNotDeltas} />
+
+Ba tính chất đến miễn phí:
+
+- một báo cáo bị **mất** sẽ được cái tiếp theo sửa chữa, bởi cái tiếp theo
+  mang cùng cái tổng đó cộng với phần phát sinh thêm;
+- một báo cáo được giao **hai lần** ghi có `max(0, reported − credited) = 0` ở lần
+  thứ hai;
+- một báo cáo **không giao được** thì bị bỏ chứ không xếp hàng.
+
+Cái thứ ba mới thú vị. Gateway không giữ outbox nào — đó là
+đúng lượng trạng thái bền vững cho một service mà toàn bộ thiết kế của nó là không giữ
+gì cả. Ba chương của loạt bài này đã dựng một outbox tính tới giờ, và đây là
+chương được phép không dựng.
+
+Phần số học nằm trong hai hàm không có đồng hồ, không có kho và không có framework,
+bởi chính hai dòng đó *là* protocol:
 
 ```ts title="services/api/src/quotas/credit.ts (excerpt)"
 export function creditFor(reported: number, credited: number): number {
@@ -35,12 +162,40 @@ export function highWaterMark(reported: number, credited: number): number {
 }
 ```
 
-## Socket đếm zero
+Cái `max` trong hàm đầu không phải trang trí phòng thủ. Thứ duy nhất hàm này
+không bao giờ được làm là trừ đi khỏi một hoá đơn.
+
+<Why req="FR-RTL-05">
+Chỗ hiển nhiên để nhớ những gì đã ghi có là một dòng cho mỗi kết nối mỗi
+phút — dù sao thì danh tính bucket cũng là khoá tự nhiên. Ở một nghìn
+socket đồng thời thì đó là 1.000 × 43.200 = **43,2 triệu dòng một tháng**.
+
+Chương quota đã từ chối đúng hình dạng đó cho người dùng phân biệt và chặn nó theo số người dùng
+chứ không theo lưu lượng. `usage_connections` giữ một dòng cho mỗi kết nối mỗi
+kỳ, bị chặn bởi số kết nối chứ không phải bởi thời gian trôi qua.
+</Why>
+
+## Cái socket đếm ra số không
+
+<Trap>
+Meter đi bộ qua registry mỗi sáu mươi giây và báo cáo thứ nó tìm thấy. Đó
+là toàn bộ thiết kế, và nó đếm một socket năm giây thành **số không**.
+
+`session.ts` gỡ một kết nối khỏi registry ngay dòng sau khi handler `close`
+của nó mở ra:
 
 ```ts title="services/gateway/src/session.ts (excerpt)"
 socket.on("close", (code) => {
   registry.remove(connection.id);
 ```
+
+Một socket mở ra rồi đóng lại giữa hai lần báo cáo sẽ biến mất trước khi bất cứ thứ gì kịp
+báo cáo nó. Và đó không phải sai số làm tròn — nó chính là thứ mà đơn vị phút
+theo đồng hồ được *chọn ra* để tính tiền. Một nghìn socket năm giây lẽ ra
+chẳng tốn gì cả, mà đó đúng là kết cục mà bảng so sánh hai mục
+phía trên đã bác bỏ.
+
+Handler close báo cho meter trước, và thứ tự đó chính là bản vá:
 
 ```ts title="services/gateway/src/session.ts (excerpt)"
 socket.on("close", (code) => {
@@ -48,7 +203,43 @@ socket.on("close", (code) => {
   registry.remove(connection.id);
 ```
 
-## Shutdown không tồn tại
+Không phải một báo cáo đồng bộ từ handler. Handler đó vốn đã được ghi là
+"nơi cuối cùng nên ném lỗi", và một đợt ngắt kết nối hàng loạt sẽ biến một sự kiện
+thành một loạt request HTTP.
+</Trap>
+
+Và điều này thu hẹp lời khẳng định hai mục trước, đáng nói ra thành tiếng chứ không
+nên để người đọc tự nhận ra. "Báo cáo mang theo tổng, nên không gì cần
+xếp hàng" chỉ đúng với một kết nối **vẫn còn mở** — báo cáo kế tiếp của nó mang
+cùng cái tổng cộng phần phát sinh. Một kết nối đã **đóng** thì không có báo cáo
+kế tiếp. Nên cái tổng cuối của nó được giữ lại cho tới khi một báo cáo mang nó được chấp nhận,
+tập được giữ lại bị chặn, và một lần bỏ ở mức chặn được ghi log và đếm chứ không
+bị rơi trong im lặng.
+
+Gateway không giữ hàng đợi nào, trừ đúng một trường hợp mà lập luận trên thôi
+áp dụng được. Nói ra điều đó tốt hơn một khẳng định chỉ đúng với phần lớn thiết kế.
+
+## Cái shutdown vốn không tồn tại
+
+Một cú crash mất nhiều nhất một chu kỳ báo cáo cho mỗi kết nối đang mở. Đó là
+giới hạn, nó được nêu ra, và chẳng làm gì được: một tiến trình bị giết
+không có cơ hội nói lời tạm biệt.
+
+Một lần deploy thì khác. Deploy là chuyện thường xuyên, và một lần dừng có kiểm soát biết
+các socket của nó sắp chết. Nên kế hoạch nói: đẩy một báo cáo cuối trên đường ra,
+treo nó vào handler `server.on("close")` mà `main.ts` vốn đã có.
+
+Handler đó không bao giờ chạy.
+
+`serve()` trả về một Server `node:http` trần. Không gì trong gateway gọi
+`server.close()`, và không gì lắp một signal handler — chỉ dispatcher
+làm, ở `main.ts:313`. Khi `docker stop` thì tiến trình nhận SIGTERM, hành vi mặc định
+của Node thoát ra, và cái handler mà lệnh flush treo lên không bao giờ được chạm tới.
+
+Bốn tài liệu nói rằng lệnh flush có xảy ra: mục research, yêu cầu,
+bảng tổn thất của contract, và task đã nối dây nó. Chúng đồng ý với nhau,
+đó là thứ mà đọc chéo các tài liệu chứng minh được, và **không cái nào trong số đó là
+thứ đáng lẽ phải đúng.**
 
 ```diff title="services/gateway/src/main.ts (excerpt)"
 @@ -100,4 +110,32 @@ if (import.meta.main) {
@@ -62,7 +253,48 @@ socket.on("close", (code) => {
  }
 ```
 
-## Cap, ở cánh cửa
+`sessions.close()` trở thành async để đi cùng. Một lần flush được bắn đi chứ không được
+await là đúng cái phi-bảo-đảm ấy hạ xuống thấp hơn một dòng:
+tiến trình rời đi trước khi request kịp đi.
+
+<Why req="FR-RTL-05">
+`CLOSE_CODES[4009]` đọc là "server shutdown (drain)", cố định bởi SAD §7, và chương
+này dựng đường shutdown đầu tiên mà gateway từng có — nên cái code
+nằm ngay đó. Nó vẫn không được dùng. Drain nghĩa là bảo client kết nối lại
+chỗ khác, đó là một tính năng với ngữ nghĩa riêng của nó, và với lấy một code
+chỉ vì một handler tình cờ xuất hiện chính là kiểu "đã khai báo thì cứ dùng" mà
+chương rate-limit đã từ chối đích danh.
+</Why>
+
+## Cái trần, ngay tại cửa
+
+FR-RTL-05 nói *thực thi*, không phải đo. Mỗi chiều đo từ chối chính thao tác
+tiêu thụ nó: trần message từ chối gửi, còn trần connection-minute
+từ chối **connect**. Một cái trần chỉ từ chối gửi sẽ để một kẻ nghe nhàn rỗi
+đốt tài nguyên được đo mà không gì chặn lại, và đó là cái trần không
+chặn được chính thứ nó đếm.
+
+Lời hứa của FR-RTL-08 vẫn giữ quanh nó. Các socket đang mở vẫn mở, vẫn
+giao, và vẫn tích luỹ; gửi REST và đọc history không bị đụng tới. Phần
+vượt trần là có thật và giới hạn của nó được nói thật: `(số kết nối đang mở lúc trần
+bị vượt) × (số phút tới khi mỗi cái đóng) + một chu kỳ báo cáo`, và không gì trong
+nền tảng chặn được việc một client giữ socket bao lâu. Nói thẳng vậy tốt hơn là
+bịa ra một mức trần.
+
+<Figure caption="Hai bước nhảy, hai hình dạng. Api nói HTTP và trả lời 402. Client nói WebSocket và nhận đúng từ vựng của socket." code={figTwoHops} />
+
+Một bản nháp trước của chương này chuyển tiếp HTTP status lên socket,
+mượn cái 429 thô của chương rate-limit ở cùng cánh cửa. Hình dạng đó có một lý do
+biện minh được nêu ra — *"một lời từ chối cần nói KHI NÀO quay lại; `Retry-After` là một
+header HTTP còn một close frame chẳng có chỗ nào để nhét nó"* — và lời từ chối này khước từ
+`Retry-After` một cách cố ý, bởi một client ngủ theo một header rồi thử lại là
+đúng với rate limit và sai với một quota vẫn sẽ cạn sau một
+giờ.
+
+Bỏ cái header đi thì lập luận cho hình dạng HTTP cũng đi theo. Thứ còn
+lại là hình dạng mà chương rate-limit dùng cho một **token hỏng**: hoàn tất
+cái bắt tay để một close code có socket mà đến. EIR-WS-05 đòi điều đó với
+một credential không hợp lệ; EIR-WS-06 đòi y hệt với quota cạn kiệt.
 
 ```ts title="services/gateway/src/session.ts (excerpt)"
 if (result.outcome === "over_quota") {
@@ -73,6 +305,33 @@ if (result.outcome === "over_quota") {
 }
 ```
 
+`CLOSE_CODES[4008]` đọc là `"quota exhausted"` từ chương 1.3 và chưa gì
+từng gửi nó. Mười chín chương xuất bản sau, đây là chương đó.
+
+<Trap>
+Chương rate-limit từng xuất bản một bài test tên là **"VẪN phát close code 4008 từ
+hư không"**, nó grep mã nguồn gateway và khẳng định không có kết quả nào. Comment của nó
+nói lý do:
+
+> 4008 đọc là "quota exhausted". Chưa có quota nào — quota là một chương
+> sau — và với lấy code chỉ vì nó đã được khai báo sẽ gộp mất
+> chính sự phân biệt mà chương này được dựng lên trên: một rate limit là một chỉ dẫn làm mượt, một
+> quota là một chỉ dẫn thương mại, và chúng không xứng đáng chung một tín hiệu.
+
+Đây là chương đến sau, và bài test đó đỏ ngay lần chạy đầu sau khi
+`session.ts` thay đổi. Sự phân biệt nó bảo vệ vẫn sống và giờ
+**nhìn thấy được trên đường truyền** thay vì được khẳng định trong một comment: một rate limit từ chối
+cái bắt tay bằng một 429 thô kèm `Retry-After`; một quota hoàn tất nó, gửi một error
+frame mang theo ngày nối lại, rồi đóng bằng 4008. Một client phân biệt được chúng.
+
+Bài test đảo chiều chứ không biến mất. 4008 được khẳng định là có, 4009 khẳng định là
+không, và phép tự kiểm giữ nó lương thiện — *một lệnh grep chỉ có thể pass thì không phải
+một phép kiểm* — sống tiếp qua 4009.
+</Trap>
+
+Nửa phần của api là lời từ chối của chương quota, không đổi hình dạng và được gọi tên bởi
+bên ném lỗi:
+
 ```ts title="services/api/src/internal/session.controller.ts (excerpt)"
 if (error instanceof QuotaExceededError) {
   throw new HttpException(
@@ -82,20 +341,134 @@ if (error instanceof QuotaExceededError) {
 }
 ```
 
-## API không thể nói gì, và không cần nói gì
+Được gọi tên, bởi `ProtocolErrorFilter` là `@Catch()` bắt tất và suy ra code cho bốn
+status. 402 không nằm trong bốn cái đó, nên một lời từ chối không tên sẽ tới
+gateway dưới dạng `internal_error` — đó chính là phát hiện mà lượt phân tích thứ hai
+của chương quota đã dành cả nó để tìm ra.
 
-## Dimension thứ ba tốn gì
+## Thứ api không thể biết, và không cần biết
+
+<Figure caption="Một lần đóng sạch sẽ và một gateway bị giết đi tới cùng một trạng thái. Api không bao giờ biết cái nào đã xảy ra, và không gì trong thiết kế phụ thuộc vào việc biết điều đó." code={figWhatTheApiCannotTell} />
+
+Api không bao giờ được báo khi một kết nối mở ra. Thứ đầu tiên nó nghe về bất kỳ
+kết nối nào là một báo cáo — nên "một kết nối tôi chưa từng thấy" và "báo cáo đầu tiên
+của kết nối này" là cùng một trạng thái, và chẳng có gì để phân biệt chúng
+cả. Chấp nhận nó là cái đầu tiên.
+
+Thứ *bị* từ chối là một báo cáo gọi tên một kết nối mà dòng dữ liệu của nó đã mang một
+environment khác. Một kết nối không di chuyển giữa các tenant; hoà giải một cái
+có vẻ như vậy sẽ là bịa ra một sự thật về việc số phút này của ai. Đó là
+một 409, và nó là lời từ chối theo hiến pháp I chứ không phải theo chất lượng dữ liệu.
+
+Hệ quả đáng nói: **không có bên thu gom nào.** Không quét mồ côi, không hỏi
+"kết nối còn mở không?", không job định kỳ nào cả. Usage chỉ tăng
+khi một báo cáo tới, và transaction báo cáo biết con số trước và
+sau — nên nó tự ghi các lần vượt ngưỡng của mình, đúng như transaction gửi của
+chương quota đã làm. Chương thứ hai liên tiếp đạt kết quả đó bằng lập luận đó, và
+global-operation guard của feature 030 không được dùng ở đâu cả.
+
+<Why req="FR-RTL-07">
+Guard được xác minh chứ không được giả định: năm trigger đã cài, hai mươi bảy
+environment sentinel, và một lần quét xuyên environment cố ý bị **từ chối** trước khi
+con số không được tin. Một phép kiểm guard quét một cái bảng rỗng cũng là cái pass
+rỗng tuếch mà `no-trigger-in-migrations.test.ts` bảo vệ chống lại.
+
+Và điều mà sự im lặng không chứng minh: guard canh năm bảng và không cái nào là
+bảng usage hay notification. Im lặng về `usage_connections` nghĩa là không ai
+nhìn vào đó, chứ không phải là chẳng có gì xảy ra.
+</Why>
+
+## Một chiều đo thứ ba tốn gì
+
+Chương quota đã viết cái giá ra, hai lần — trong `0013_quotas.sql` và trong
+`quotas/config.ts`:
+
+> chương connection-metering thêm connection-minute và FR-MED-12 sau này
+> thêm media byte, và không cái nào cần migration bảng — một chiều đo mới là một
+> key mới … hình dạng bên dưới được thực thi bởi một CHECK LIỆT KÊ hai
+> chiều đo, nên một chiều thứ ba thật sự tốn một lần đổi ràng buộc một dòng
+
+Đếm ra thì là bảy chỗ:
+
+| chỗ | tốn gì |
+|---|---|
+| `quotaConfigSchema` | một key |
+| `environments_quota_config_shape` | một `jsonb_typeof` + hai mệnh đề regex, ràng buộc bị bỏ rồi dựng lại |
+| `quota_notifications_dimension_check` | một giá trị `IN`, bỏ rồi dựng lại |
+| `usage_periods` | một cột và một CHECK, trên hai file |
+| `quota.error.ts` | một ternary hai chiều thành hai bảng `Record` |
+| `quota-email.ts` | một key trong `NOUN`, và một bảng `STOPPAGE` mới |
+| `usageFor` | hai field trên hình dạng trả về của nó |
+
+Lời tiên đoán đúng về hình dạng và nhẹ tay về kích cỡ, và hai trong
+bảy chỗ nó hoàn toàn không lường trước. Không có `ALTER CONSTRAINT` cho một biểu thức
+CHECK, nên cả hai ràng buộc liệt kê đều bị bỏ rồi dựng lại chứ không
+sửa.
+
+<Trap>
+Hàng thứ năm mới là thứ quan trọng. `publicMessage()` đọc là:
 
 ```ts
 `monthly ${this.dimension === "messages" ? "message" : "active user"} `
 ```
 
+`Dimension` là `keyof QuotaConfig`. Thêm `connection_minutes` vào config
+schema **đã tự nó mở rộng kiểu đó**, nên một lần vi phạm connection-minute sẽ
+hiển thị "monthly ACTIVE USER quota exhausted" trong khi trình biên dịch hoàn toàn im lặng.
+
+Một `Record<Dimension, string>` biến một chiều đo thiếu thành lỗi build. Và cùng
+bản vá đó bắt được một cái sai thứ hai bên cạnh: thông điệp kết thúc bằng "sends resume on
+…", và thứ nối lại với chiều đo này là việc kết nối. Gọi sai tên thao tác
+lúc 3 giờ sáng sẽ khiến ai đó đi tìm lỗi ở đúng nửa đang ổn.
+</Trap>
+
+<Checkpoint>
 ```bash
 pnpm --filter @relay/api test:integration src/quotas/connections.itest.ts
 pnpm --filter @relay/gateway test:integration src/meter.itest.ts
 ```
 
-## Chi phí này, được đo
+Cái đầu lái một cái đồng hồ thay vì chờ nó — không gì trong suite của chương
+này ngủ một phút. Cái thứ hai là ngoại lệ và spawn hẳn một tiến trình gateway,
+bởi một signal là thứ duy nhất mà một gateway chạy trong tiến trình không nhận được.
+
+Kỳ vọng: một kết nối bắc qua ba ranh giới ghi lại số phút nó chiếm, một
+báo cáo phát lại trả lời `{"credited": 0}`, một cú SIGKILL để con số đóng băng mười
+chu kỳ sau, và một cú SIGTERM không làm mất gì cả.
+</Checkpoint>
+
+## Chuyện này tốn gì, đo được
+
+Kế hoạch sai một điểm và một phép đo là thứ đã nói ra điều đó.
+
+Research chọn "một lời gọi thứ hai trên cùng request thay vì một
+`environmentLimits` nặng hơn", bởi chương quota đã từ chối đặt một usage join bên trong
+hàm đó. Lời từ chối ấy đúng và vẫn đúng — `environmentLimits` có một
+bên gọi thứ hai, middleware rate-limit, trên mọi request `/v1`, và nó không được
+trả giá cho một join mà nó không bao giờ đọc.
+
+Nhưng hai lời gọi tốn đúng bằng một join, khi có tính đồng thời. Độ trễ connect ở mức 32 luồng
+đi từ **15,0 ms lên 17,6 ms**, bốn lần chạy cụm lại trong 0,7 ms, nên là một
+hồi quy thật chứ không phải nhiễu. Gộp đường connect vào một lần đọc duy nhất của riêng nó
+lấy lại được 0,8 ms trong số đó. Cơ chế là thứ chương quota đã ghi lại: một
+vòng round trip thừa giữ một pooled connection suốt thời gian nó chạy, và trên mức kích thước
+pool thì chỗ đó xếp hàng.
+
+Cái mốc đem ra so được đo **một lần**, và đó là một sai lầm trong
+một dụng cụ dựng ra chính là để tránh cái benchmark mất kiểm soát của chương quota.
+Ba lần chạy bản đã ship nằm trong 0,4 ms; con số 15,001 đơn lẻ thì không, nên phần
+dư sau khi gộp không quy được rõ ràng cho ai. Lệnh `EXPLAIN` trong
+`session.perf.itest.ts` được commit chứ không phải chạy tạm, và nó chính là thứ SC-012
+thật sự yêu cầu: tra cứu bằng index, không có lần quét nào tỉ lệ với thứ một tenant
+tích luỹ.
+
+Và bộ battery hai mươi lần chạy tìm ra ba lỗi mà đọc bao nhiêu cũng không thấy.
+Cái dạy được nhiều nhất là một **cổng cố định**. `startApi()` bind 4123 và một
+describe mới bind 4124, mà đó là cổng của `limits.itest.ts`; vitest chạy các file song song.
+Tệ hơn, chạy liên tiếp thì tiến trình con của lần trước vẫn giữ cổng, tiến trình con mới
+chết vì `EADDRINUSE`, và health check nhận cái 200 của nó từ api *cũ* —
+thứ đang giữ signing secret của một environment khác. Ba assertion fail và không cái nào
+trong số đó gọi tên cái fixture:
 
 ```console
 AssertionError: expected 'internal_error' to be 'unauthorized'
@@ -103,7 +476,30 @@ AssertionError: expected 1011 to be 4001
 TypeError: fetch failed
 ```
 
-## Code, theo thứ tự
+Tôi chẩn đoán sai hai lần trước khi đo, và cả hai giả thuyết sai đều đã kịp
+vào tới comment trong code trước khi bằng chứng tới. Thứ phân xử là chạy riêng một file,
+năm lần — hai trên năm đỏ — điều đó giết sạch mọi giả thuyết xuyên-file trong một
+phép đo duy nhất và lẽ ra phải là nước đi đầu tiên chứ không phải nước thứ năm.
+
+<ForwardRef>
+`docs_url` trên `quota_exceeded` phân giải tới hư không, y hệt cái của `rate_limited`
+kể từ chương rate-limit. Thừa hưởng một cách cố ý và không làm nặng thêm: chương
+này không thêm một trường hợp thứ ba.
+
+**Khoản nợ đã được ghi ra, và ngày đáo hạn của nó không nằm ở phần này.** Chương
+error-registry mở đầu đúng trên cái phong bì này — ba trong bốn field của nó
+là thật — và nói rằng `relay.example` không phân giải được, rằng hiến pháp V gọi
+`docs_url` là một lời hứa về một trang có thể tới được, và rằng bản vá thuộc về đâu đó trong Phần 4.
+Hai mươi mốt chương sau, con số đã đi từ một lên hai và ngày đáo hạn thì
+không nhúc nhích.
+</ForwardRef>
+
+
+## Mã nguồn, theo thứ tự
+
+Mọi thứ chương này đã đổi, phát lại lên repository ở
+`rework/part3-ch23`. File mới nguyên vẹn; mọi thứ khác dạng diff có hunk so với
+trạng thái chương quota để lại.
 
 ```sql title="services/api/migrations/0014_connection_minutes.sql"
 -- Connection-minutes, the third dimension of FR-RTL-05.
@@ -2550,4 +2946,5 @@ export class UsageController {
          "RELAY_E2E_API_PORT",
 ```
 
-<ChapterFooter id="3.24" locale="vi" />
+
+<ChapterFooter id="3.24" />
