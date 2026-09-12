@@ -1,12 +1,14 @@
 import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
 import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figTheTimeline, figTwoTriggers, figWhereTheRecordGoes } from "./figures";
 
 export const metadata = {
   title: "Khi nào thì thôi cố — Building Relay",
   description:
-    "Webhook retry cần biết khi nào dừng. Chương này thêm failure stream, policy có đo lường, disable idempotent, notification và observability cho delivery đã cạn retry.",
+    "Chương webhook dispatcher đã dựng một nền tảng biết bỏ cuộc với một lần giao và không bao giờ bỏ cuộc với một endpoint. Chương này thêm bản ghi về chuyện đã xảy ra và quyết định dừng lại, theo đúng thứ tự đó — và thứ tự chính là lập luận.",
   alternates: {
-    canonical: "/vi/part-3/chapter-20/when-to-stop-trying",
+    canonical: "/part-3/chapter-20/when-to-stop-trying",
     languages: {
       en: "/part-3/chapter-20/when-to-stop-trying",
       vi: "/vi/part-3/chapter-20/when-to-stop-trying",
@@ -14,18 +16,86 @@ export const metadata = {
   },
 };
 
-<ChapterHeader id="3.20" locale="vi" />
+<ChapterHeader id="3.20" />
 
-Retry không phải lời hứa thử mãi. Mỗi failure phải thành record trước, policy quyết định lần
-thử sau, và endpoint được disable đúng một lần khi không còn delivery hữu ích.
+Server của một khách hàng đã trả lời `500` cho mọi webhook suốt ba ngày.
 
-## Record phải có trước
+Đây là thứ nền tảng của chương webhook dispatcher làm với chuyện đó. Mỗi event sinh ra một
+delivery, mỗi delivery được thử bảy lần trong hai tiếng rưỡi, mỗi
+lần thử đều hỏng, mỗi lần đều vào dead letter. Rồi event tiếp theo tới và
+toàn bộ chuyện đó lặp lại. Khách hàng không được báo. Endpoint vẫn bật.
+Không ai ở Relay biết, bởi chẳng đâu có gì đếm cả.
 
-Một delivery thất bại phải có record durable trước khi policy quyết định retry hay dừng. Nếu failure chỉ tồn tại trong log của worker chết, không ai có thể biết customer đã nhận gì, đã thử bao nhiêu lần hay có cần thông báo không.
+Nền tảng đó bỏ cuộc với một *delivery*. Nó không bao giờ bỏ cuộc với một *endpoint*.
 
-## Seam đã mang nó sẵn
+Chương này sửa điều đó, và nó làm hai việc theo một thứ tự cụ thể: nó dựng
+bản ghi về chuyện đã xảy ra, rồi mới dựng quyết định dừng
+thử. Thứ tự đó không phải ngẫu nhiên. Tắt endpoint của một khách hàng trả tiền
+là chuyện ai đó phải giải thích về sau — với khách hàng, với bộ phận hỗ trợ,
+có thể với một luật sư — và một nền tảng ra tay như vậy mà không có
+bản ghi từng lần thử thì không giải thích nổi. Đó là lý do FR-WHK-07 bị hoãn khỏi
+chương webhook dispatcher chứ không được xuất bản: quyết định đã sẵn sàng còn bằng chứng thì chưa.
 
-Transport seam từ chương webhook đã trả status, timeout và error đủ để phân loại failure. Chương này dùng seam đó thay vì tạo đường retry song song, giữ tất cả delivery outcome đi qua cùng một nơi.
+<SkipAhead>
+
+Nếu bạn phải bỏ qua: mọi lần thử giao đều được publish như một analytical event trên
+một stream JetStream `ANALYTICS` mới, subject
+`analytics.webhook.attempt.{environment_id}`, mang theo các định danh, status,
+độ trễ và kết quả — không bao giờ mang payload, bí mật hay chữ ký. Lần publish
+xảy ra **sau** khi transaction kết quả commit và **được phép mất**,
+bởi hiến pháp III nói một đường phân tích bị dồn ứ không được ảnh hưởng tới
+việc giao webhook. Chưa gì tiêu thụ stream đó; ingester của Phần 4 mới là thứ
+làm cho các lần thử truy vấn được. Auto-disable đọc hai cột vận hành trên
+`webhook_endpoints` — `failure_run_started_at` và `failure_run_attempts` —
+không bao giờ đọc stream. Một endpoint bị tắt khi chuỗi hỏng liên tục của nó
+kéo dài hơn một tiếng **và** chứa ít nhất năm lần thử, và phép kiểm
+kích hoạt từ **hai** nơi: khi một kết quả được ghi lại, và từ một lượt quét đi nhờ vòng lặp
+sẵn có của delivery relay. Cơ chế kích hoạt thứ hai tồn tại bởi phép đo
+cho thấy cái thứ nhất không bao giờ kích hoạt với một endpoint ít lưu lượng. Việc tắt ghi một dòng
+`webhook_disable_notifications` với `delivered_at` là null và cứ null,
+bởi nền tảng này chưa có email. Một test event tổng hợp khép lại
+vòng tắt-sửa-bật-lại. Trạng thái cuối chương là tag **`part3-ch6`**.
+
+</SkipAhead>
+
+## Bản ghi phải đến trước
+
+Có một phiên bản của chương này ngắn bằng một nửa. Nó thêm hai cột,
+đếm số lần hỏng, tắt endpoint sau một tiếng, rồi dừng. Mọi thứ
+FR-WHK-07 yêu cầu, không hơn.
+
+Hãy tưởng tượng cuộc trò chuyện hỗ trợ diễn ra sau đó. Một khách hàng viết vào: *webhook
+của chúng tôi ngừng ba ngày trước và chúng tôi không tắt gì cả.* Nền tảng
+có thể nói endpoint đang bị tắt. Nó có thể nói lý do một cách chung chung — nó đang
+hỏng. Nó không thể nói chuyện hỏng bắt đầu khi nào, endpoint thực sự trả lời gì,
+đã có bao nhiêu request, hay lần cuối là một `500` hay một
+timeout. Mọi sự thật đó đều tồn tại vào đúng lúc chúng quan trọng và không cái nào được
+ghi lại.
+
+Nên bản ghi lần thử đến trước, và phần còn lại của chương tiêu nó.
+
+<Why title="Why not just log it?">
+
+Nền tảng vốn đã ghi một dòng log cho mỗi lần thử. Log là hình dạng sai cho
+việc này: chúng được giữ theo thứ mà bộ gom log của người vận hành giữ, chúng
+không truy vấn được theo từng tenant, và chúng không phải thứ có thể cho khách hàng xem. SAD
+gọi một bản ghi từng lần thử là một **analytical event** và định tuyến nó
+tới kho phân tích, đó là một nơi có chính sách lưu trữ, một cột tenant
+và một bề mặt truy vấn.
+
+Đó cũng là câu trả lời theo hiến pháp. Nguyên tắc III giữ khối lượng phân tích ra khỏi
+database vận hành, và một dòng cho mỗi lần thử webhook là khối lượng phân tích
+theo mọi thước đo — một environment bận rộn sinh ra nhiều bản ghi lần thử trong một ngày hơn
+số message nó có.
+
+</Why>
+
+## Đường nối vốn đã mang sẵn nó
+
+Đây là phần dễ chịu, và nó là phần dễ chịu duy nhất của chương này.
+
+Chương webhook dispatcher đã định nghĩa hợp đồng nội bộ mà dispatcher dùng để báo cáo chuyện
+gì xảy ra khi nó post. Hãy xem thứ nó đã gửi sẵn:
 
 ```ts title="packages/protocol/src/internal.ts (excerpt)"
 export const internalDeliveryOutcomeRequestSchema = z.strictObject({
@@ -37,9 +107,36 @@ export const internalDeliveryOutcomeRequestSchema = z.strictObject({
 });
 ```
 
-## Stream thứ ba
+`latency_ms` là bắt buộc, không âm, và được gửi trên từng lần thử một. Dispatcher
+đã đo nó từ khi chương webhook dispatcher xuất bản. Và cả `dispatch.controller.ts`
+lẫn `recordAttemptOutcome` đều không nhắc tới field đó ở đâu — nó được
+schema xác thực rồi vứt xuống sàn.
 
-Failure stream tách khỏi event và delivery stream vì audience của nó là policy/observability, không phải customer endpoint. Naming stream rõ ràng giúp worker biết event nào cần retry và event nào chỉ để đo lường.
+Nên cái cột nghe có vẻ khó nhất của FR-WHK-06, *khách hàng mất bao lâu để trả lời*,
+chẳng tốn gì để có được. Dữ liệu đã tới suốt một chương; đây là
+thứ đầu tiên cần nó.
+
+Điều đó đáng dừng lại một chút, bởi nó là một pattern chứ không phải một sự trùng hợp. Một
+hợp đồng thiết kế quanh thứ bên gửi biết thường mang nhiều hơn thứ người tiêu thụ đầu tiên
+cần, và phần dư là miễn phí vào ngày có thứ khác xuất hiện. Phương án
+khác — mở rộng đường nối bây giờ, triển khai lại hai service để thêm một số nguyên
+— là cái giá mà chương webhook dispatcher tránh được bằng cách viết ra mọi thứ dispatcher có.
+
+## Một stream thứ ba
+
+Attempt event không đi trên stream `EVENTS`.
+
+`EVENTS` mang các domain event của tenant, với thời hạn lưu bảy ngày định hình cho
+những bên tiêu thụ không được bỏ lỡ cái nào. `DELIVERIES` mang công việc đã đến hạn.
+Bản ghi lần thử chẳng thuộc loại nào. Chúng có khối lượng lớn, chúng được phép mất mát
+vì một lý do mà cả mục sau nói về, và ingester của Phần 4 sẽ muốn
+tiêu thụ chúng mà không phải tiêu thụ luôn mọi message event trong nền tảng.
+
+Ba stream, ba thời hạn lưu, ba vị trí consumer. Ngữ pháp subject
+mở rộng ngữ pháp của chương broker thay vì bịa ra một quy ước thứ hai, và nó sống trong
+`@relay/protocol` bên cạnh hai cái kia vì lý do chương broker đã dời cái đầu tiên
+tới đó: một consumer tự ghép subject filter của mình sẽ chẳng nhận được gì vào ngày
+ngữ pháp thay đổi. Không lỗi, không cảnh báo, chỉ là một vị trí stream rỗng.
 
 ```diff title="packages/protocol/src/internal.ts"
 @@ -210,12 +210,72 @@ export const ALL_DELIVERIES_SUBJECT = `${DELIVERY_SUBJECT_PREFIX}.>`;
@@ -116,6 +213,25 @@ Failure stream tách khỏi event và delivery stream vì audience của nó là
  // Other services obtain writes and backfill reads via the API service's internal
  // endpoints." These are those endpoints, and they live here for the reason
 ```
+
+<Trap title="An environment id is a subject token, not a string">
+
+`analyticsSubjectFor` từ chối một environment id không phải UUID, và phép kiểm
+đó là cô lập tenant chứ không phải làm gọn input.
+
+Subject của NATS phân tách bằng dấu chấm, và `*` cùng `>` là ký tự đại diện. Một environment id
+chứa dấu chấm sẽ lặng lẽ publish tới một subject sâu hơn dự định; một cái
+chứa `>` sẽ biến một đích đến thành một lượt đăng ký. Cả hai đều không hỏng lúc
+publish. Cả hai đều đặt bản ghi lần thử của một tenant vào chỗ mà filter của tenant
+khác với tới được, đó là loại bug Sev-0 của hiến pháp I
+tới qua một lỗi định dạng chuỗi.
+
+Mọi bên gọi trong nền tảng này đều đã giữ sẵn một UUID, nên từ chối mọi thứ khác
+chẳng tốn gì và đóng hẳn cái hình dạng đó lại.
+
+</Trap>
+
+Các bài test giữ ngữ pháp đó, kể cả ba giá trị nguy hiểm:
 
 ```diff title="packages/protocol/src/internal.test.ts"
 @@ -1,9 +1,15 @@
@@ -202,6 +318,10 @@ Failure stream tách khỏi event và delivery stream vì audience của nó là
 +  });
 +});
 ```
+
+Bản thân stream được bảo đảm tồn tại theo đúng cách `DELIVERIES` làm — bằng cách truyền một
+hàm `ensure` cho publisher mà chương outbox đã dựng. Tham số đó vốn đã
+tồn tại, và đó là lý do chỗ này chỉ chín dòng chứ không phải một cơ chế mới:
 
 ```diff title="services/api/src/outbox/jetstream.publisher.ts"
 @@ -4,12 +4,14 @@ import {
@@ -298,9 +418,40 @@ Failure stream tách khỏi event và delivery stream vì audience của nó là
    /** Which stream this publisher is responsible for bringing into existence.
 ```
 
-## Publish được phép fail, và chương phải nói rõ
+## Lần publish được phép hỏng, và chương phải nói ra điều đó
 
-Publish failure không thể được nuốt; record vẫn phải còn claimable hoặc worker phải trả nó về trạng thái retry. Contract nói rõ điều này để một outage của stream không âm thầm biến thành delivery bị mất.
+FR-WHK-06 nói *mọi* lần thử giao đều phải được ghi lại.
+
+Hiến pháp III nói các analytical event được phát ra bất đồng bộ và rằng
+"việc hỏng hay dồn ứ của đường ống phân tích KHÔNG ĐƯỢC ảnh hưởng tới việc giao message,
+tính sẵn sàng của API, hay việc giao webhook."
+
+Hai điều đó không thể cùng được tối đa hoá, và xung đột này không phải chuyện kỹ thuật vặt. Để
+ghi lại mọi lần thử mà không mất mát, bản ghi phải chia sẻ một transaction với
+kết quả — chính outbox pattern mà chương outbox đã dựng, vốn tồn tại để làm cho
+"trạng thái đã đổi" và "event đã được phát" thành một sự thật nguyên tử. Làm vậy ở đây thì
+một consumer phân tích bị kẹt sẽ làm dồn ứ một bảng vận hành: outbox đầy lên,
+relay tụt lại, và một đường ống đo đạc chẳng ai theo dõi bắt đầu giữ row lock
+trên chính cái bảng quyết định webhook của một khách hàng có đi hay không.
+
+Bảo đảm sự độc lập thì lần publish xảy ra ngoài transaction,
+nơi một cú crash giữa commit và publish làm mất bản ghi.
+
+**Sự độc lập thắng**, và lý do là hai kiểu hỏng đó không
+so sánh được với nhau. Một bản ghi lần thử bị mất là một lỗ hổng trên một dashboard. Một
+transaction kết quả bị chặn là webhook của một khách hàng ngừng chạy vì một đường ống đo đạc
+đang ốm — điều mà hiến pháp III gọi thẳng là một thất bại thiết kế.
+
+Vậy nên: **chữ "mọi" của FR-WHK-06 là gần đúng**, và đoạn văn này là chỗ
+chương nói ra điều đó chứ không phải một cước chú ba mục sau. Bản ghi lần thử là
+nỗ lực-tốt-nhất. Một dashboard dựng trên chúng thỉnh thoảng sẽ thiếu một lần thử,
+và thứ mà đánh đổi đó mua được là một đường giao không thể bị dừng bởi bất cứ thứ gì
+nằm sau nó.
+
+<Figure caption="Bản ghi lần thử rời đi sau khi commit, và có thể bị bỏ mà không ai phải chờ." code={figWhereTheRecordGoes} />
+
+Đây là toàn bộ publisher. Nó là một file nhỏ và toàn bộ chủ đề của nó là một
+quyết định:
 
 ```ts title="services/api/src/webhooks/analytics.ts"
 import { webhookAttemptSubject } from "@relay/protocol";
@@ -448,6 +599,43 @@ export async function publishAttempt(
   }
 }
 ```
+
+Hai thứ trong đó gánh nhiều hơn kích cỡ của chúng.
+
+**Bản ghi được dựng bằng cách gọi tên từng field, không phải bằng cách spread input.** Một
+lần spread sẽ mang theo bất cứ thứ gì một bên gọi tương lai tình cờ gắn vào — một payload, một
+bí mật đã giải mã, một header — lên một stream lưu bảy ngày mà chẳng gì
+trong nền tảng này hiện đang đọc. Một allow-list hỏng theo hướng đóng khi ai đó thêm một
+field. Một lần spread hỏng theo hướng mở, lặng lẽ, và cái hỏng đó là nội dung message của một khách hàng
+nằm trong một kho phân tích đã được hứa là sẽ không bao giờ giữ thứ đó.
+
+**Khoá chống trùng là `{delivery}:{attempt}`**, và đó là bug của chương webhook dispatcher
+tới trong code mới. Riêng delivery id thì ổn định qua cả bảy
+lần thử; chương webhook dispatcher đã dùng nó làm `msgID` của broker cho lần publish delivery, và
+JetStream gộp mọi lần thử lại thành message của lần thử đầu tiên. Lần publish
+báo thành công, chẳng gì tới được dispatcher, và **mọi webhook hỏng đều được
+thử lại đúng không lần nào** cho tới khi một lượt đi bộ đi tìm lần thử số 2 và thấy
+chẳng gì được gửi cả. Cùng sai lầm đó ở đây sẽ lặng lẽ vứt bỏ lần thử thứ hai
+tới thứ bảy khỏi mọi dashboard từng dựng trên stream này.
+
+<Trap title="A failure that must not propagate">
+
+`publishAttempt` không bao giờ ném lỗi. Không phải "hiếm khi ném" — khối `catch` không có lệnh ném lại
+ở nhánh nào, và đó là cơ chế chứ không phải thói quen phòng thủ.
+
+Bên gọi đã commit một kết quả và dispatcher đang chờ một
+câu trả lời. Nếu chỗ này ném lỗi, một sự cố phân tích sẽ trở thành một `500` trên đường nối dispatch;
+dispatcher sẽ không acknowledge; broker sẽ giao lại; và
+khách hàng sẽ bị post **một bản sao thứ hai của một webhook họ đã nhận rồi** —
+gây ra, từ đầu tới cuối, bởi một đường ống đo đạc đang ốm.
+
+Việc nuốt lỗi nằm bên trong publisher chứ không phải ở chỗ gọi để không
+bên gọi tương lai nào có thể tạo ra đường đó bằng cách quên một `try`.
+
+</Trap>
+
+Các unit test giữ cả hai tính chất, và assertion thú vị là cái
+nói về các field thừa:
 
 ```ts title="services/api/src/webhooks/analytics.test.ts"
 import { describe, expect, it } from "vitest";
@@ -670,9 +858,9 @@ describe("publishAttempt swallows its own failure (contract invariant 4)", () =>
 });
 ```
 
-## Publish đi đâu, chính xác
+## Lần publish đi vào đâu, chính xác
 
-Failure event mang delivery id và reason tới subject/consumer dành cho retry policy, không broadcast lại payload webhook một cách vô tình. Route chính xác giữ secret-bearing data trong boundary cần thiết.
+Một dòng trong handler kết quả, và mọi thứ về nó nằm ở vị trí:
 
 ```diff title="services/api/src/internal/dispatch.controller.ts"
 @@ -14,22 +14,27 @@ import {
@@ -774,6 +962,22 @@ Failure event mang delivery id và reason tới subject/consumer dành cho retry
        };
 ```
 
+**Sau transaction**, nên không row lock nào bị giữ trong lúc hỏi một broker.
+**Chỉ khi có gì đó thực sự được ghi lại**, điều này cần một đoạn riêng.
+
+`recordAttemptOutcome` đẳng xâm trên `(delivery_id, attempt)`. Dispatcher
+post, rồi báo cáo, rồi acknowledge — nên một cú crash ở khe cuối đó khiến một
+báo cáo thứ hai thành chuyện bình thường chứ không phải ngoại lệ, và api trả lời nó bằng
+quyết định nó đã ra lần đầu và không đổi dòng nào. Publish vào lần phát lại đó
+sẽ đặt hai attempt event lên stream cho một lần thử. Chẳng gì trên
+đường phân tích chống trùng, nên một dashboard sẽ hiện một lần thử lại chưa từng
+xảy ra. Vì thế repository trả về việc nó có thật sự ghi gì không,
+và lần publish treo vào đó.
+
+Phần nối dây module là nơi publisher thứ hai xuất hiện. Mỗi
+`createJetStreamPublisher` bảo đảm đúng một stream, nên đường phân tích nhận
+cái của riêng nó chứ không mượn cái của deliveries:
+
 ```diff title="services/api/src/internal/internal.module.ts"
 @@ -1,11 +1,18 @@
  import { Module, Scope } from "@nestjs/common";
@@ -829,9 +1033,19 @@ Failure event mang delivery id và reason tới subject/consumer dành cho retry
  export class InternalModule {}
 ```
 
-## Giờ là quyết định — và measurement làm nó thay đổi
+## Giờ tới quyết định — và một phép đo đã thay đổi nó
 
-Backoff và số lần retry là policy dựa trên cost, customer experience và backlog measurement. Một con số hợp lý ở lane có thể làm queue production phình to, nên decision phải gắn với metric và có đường điều chỉnh.
+FR-WHK-07: một endpoint hỏng liên tục hơn một tiếng thì bị tắt.
+
+Chỗ hiển nhiên để kiểm là nơi các lần hỏng vốn đã được ghi lại —
+bên trong `recordAttemptOutcome`, trong cùng transaction, đúng cách chương broker đặt
+phần giành và phần tác động cạnh nhau. Không vòng lặp mới, không trạng thái mới để poll, không
+thứ mới để triển khai. Nó là thiết kế nhỏ hơn theo mọi thước đo có được trước khi
+đo bất cứ thứ gì.
+
+Vậy hãy đo nó. Lịch thử lại của chương webhook dispatcher là
+`RETRY_TIERS_MS = [0, 1s, 5s, 30s, 5min, 30min, 2h]`. Với một delivery hỏng
+mọi lần, các lần thử rơi vào đây:
 
 ```text
 attempt 1  at +0h00m00s   (within the 1h window)
@@ -843,9 +1057,51 @@ attempt 6  at +0h35m36s   (within the 1h window)
 attempt 7  at +2h35m36s
 ```
 
-## Failure run là hai column
+<Figure caption="Sáu lần thử trong một tiếng, rồi im lặng suốt hai tiếng. Quy tắc kích hoạt ngay trong khoảng trống đó." code={figTheTimeline} />
 
-`failure_count` và `next_attempt_at` mô tả run retry: một cho policy biết đã thử bao nhiêu, một cho scheduler biết khi nào thử tiếp. Không suy ra chúng từ log hay timestamps rải rác; worker cần query shape đơn giản, indexed và atomic.
+Sáu lần thử rơi vào trong tiếng đầu tiên. Lần thứ bảy rơi vào **2h35m36s**, và
+nó là lần cuối — sau nó delivery vào dead letter.
+
+**Chẳng gì xảy ra ở mốc một tiếng.** Một phép kiểm chỉ chạy khi một kết quả được
+ghi lại thì không thể kích hoạt ở ngưỡng, bởi không kết quả nào được ghi ở đâu
+gần đó. Với một delivery hỏng đơn lẻ, event tiếp theo sau 35m36s là ở
+2h35m36s, nên endpoint bị tắt muộn chín mươi lăm phút.
+
+Và rồi phần biến một vấn đề độ trễ thành một vấn đề đúng đắn: sau
+lần thử thứ bảy thì delivery chết. Nếu không event nào nữa tới cho
+environment đó, **không kết quả nào được ghi lại nữa và endpoint không bao giờ bị
+tắt.** Nó ngồi đó bật và hỏng mãi mãi — đúng cái trạng thái
+mà FR-WHK-07 tồn tại để chấm dứt.
+
+Một environment bận rộn che hoàn toàn chuyện này. Event mới cứ tới, các lần thử cứ
+xảy ra, phép kiểm kích hoạt đủ gần mốc một tiếng để chẳng ai nhận ra. Cái
+endpoint hỏng lặng lẽ là cái **ít lưu lượng**: khách hàng lưu lượng thấp,
+cũng chính là khách hàng ít có khả năng đang theo dõi nhất.
+
+<Why title="Why this is in the chapter at all">
+
+Phép đo ở trên là số học trên một bảng vốn đã được viết
+ra. Nó mất vài phút và nó đã loại bỏ cái thiết kế mà mọi thứ khác
+trong chương này lẽ ra đã được dựng lên trên.
+
+Nó ở đây bởi cái lỗi nó ngăn chặn là vô hình đúng trong những điều kiện
+mà bạn sẽ test. Gieo vài event, xem endpoint bị tắt, rồi ship.
+Bug chỉ xuất hiện với những khách hàng có lưu lượng mỏng tới mức lịch
+chạy cạn — và những khách hàng đó không gửi báo lỗi về những webhook họ đã
+thôi mong đợi.
+
+</Why>
+
+**Vậy thì hai cơ chế kích hoạt.** Khi một kết quả được ghi lại, cái này bắt mọi endpoint vẫn còn
+nhận lần thử. Và một lượt quét, cái này bắt phần còn lại.
+
+<Figure caption="Cả hai cơ chế kích hoạt đều kết thúc ở cùng một câu lệnh, và chính câu lệnh đó làm chúng đẳng xâm." code={figTwoTriggers} />
+
+## Chuỗi hỏng là hai cột
+
+Trạng thái mà auto-disable đọc không phải attempt stream. Nó là hai cột trên
+endpoint, và giữ chúng riêng biệt là thứ làm cho một lần tắt độc lập với
+sức khoẻ của một broker.
 
 ```diff title="services/api/src/db/schema.ts"
 @@ -626,29 +626,74 @@ export const webhookEndpoints = pgTable(
@@ -1037,6 +1293,33 @@ attempt 7  at +2h35m36s
 +);
 ```
 
+**Hai cột chứ không phải một bảng**, bởi một chuỗi là một dòng cho mỗi endpoint theo
+định nghĩa: nó là chuỗi *hiện tại*, và chỉ bao giờ có một. Một cái bảng sẽ
+cần một quy tắc xem dòng nào là hiện tại, và quy tắc đó chính là cái bug.
+
+**Cả hai đều null khi khoẻ mạnh.** Bất kỳ kết quả đã giao nào cũng xoá chúng, và đó là thứ
+làm cho chính sách rộng lượng với một khách hàng chập chờn — một endpoint thành công một lần mỗi
+tiếng thì không bao giờ bị tắt. Đó là một lựa chọn cố ý về việc cái hỏng nào tệ hơn.
+Một nền tảng tắt các endpoint thỉnh thoảng vẫn chạy thì tệ hơn một nền tảng
+cứ tiếp tục thử các endpoint không bao giờ chạy.
+
+**`disabled_at` là dấu vân tay.** Riêng `enabled: false` không nói ai
+đã làm điều đó. Một khách hàng tự tạm dừng endpoint của mình sẽ để `disabled_at` null;
+nền tảng thì đóng dấu vào đó. Sự bất đối xứng đó là toàn bộ FR-WHK-07, và nó là khác biệt
+giữa một ticket hỗ trợ bắt đầu bằng một câu hỏi và một ticket bắt đầu bằng một
+câu trả lời.
+
+Migration được review bằng tay, như ADR-16 đòi hỏi, và phần review được viết
+thẳng vào file chứ không phải làm rồi quên.
+
+**Nó là 0011 còn bộ sinh đề nghị 0007** — chương thứ ba liên tiếp nói điều này, và
+lý do không đổi: `drizzle-kit` đánh số theo số snapshot của riêng nó,
+các migration viết tay sau 0005 chẳng có snapshot nào, và `migrate.ts` đọc thư mục
+rồi sắp theo tên file. Thứ mà sự lặp lại này đáng giá là hình dạng của độ lệch chứ không phải
+phép tính: mọi file được sinh ra mà cuốn sách này thêm từ đây trở đi sẽ đề nghị một số thấp hơn
+bốn đơn vị so với số nó phải lấy, cho tới khi ai đó hoặc sinh lại các snapshot hoặc
+khai tử cái journal mà runner vốn đã phớt lờ.
+
 ```sql title="services/api/migrations/0011_webhook_attempts.sql"
 -- The failure run, automatic disablement, and its notification.
 --
@@ -1111,9 +1394,28 @@ ALTER TABLE "webhook_endpoints" ADD CONSTRAINT "webhook_endpoints_failure_run_ch
 ALTER TABLE "webhook_endpoints" ADD CONSTRAINT "webhook_endpoints_disabled_check" CHECK (("webhook_endpoints"."disabled_at" IS NULL) = ("webhook_endpoints"."disabled_reason" IS NULL));
 ```
 
-## Policy, không có gì khác trong đó
+<Trap title="The default that would have disabled every endpoint in the platform">
 
-Policy chỉ nhận outcome và attempt count rồi trả retry time hoặc terminal decision. Giữ nó thuần giúp test boundary — không để policy tự gửi HTTP, tự update database hoặc tự disable subscription.
+Hãy đọc lại gạch đầu dòng đầu tiên của phần review đó, bởi nó là
+phát biểu duy nhất trong migration này có thể gây ra một sự cố.
+
+`failure_run_started_at` là nullable **không có default**. Cho nó
+`DEFAULT now()` — phản xạ tự nhiên, bởi mọi cột timestamp khác trong
+schema này đều có — và mọi endpoint đang tồn tại trong nền tảng lập tức có một
+chuỗi hỏng đang mở vào đúng lúc migration chạy. Một tiếng sau lượt quét thấy
+tất cả đều vượt ngưỡng, và nền tảng tắt mọi webhook endpoint
+nó có, ghi một notification cho từng cái, và ngừng giao cho các khách hàng
+chưa từng có lần hỏng nào.
+
+Nullable-và-null nghĩa là mọi endpoint đang tồn tại đều khoẻ mạnh vào lúc nó
+chạy, và điều đó là đúng. Các ràng buộc `CHECK` bên dưới làm cùng việc đó theo
+chiều ngược lại: chúng làm cho việc ghi nửa chuỗi trở thành bất khả.
+
+</Trap>
+
+## Chính sách, không có gì khác trong đó
+
+Phần số học sống trong file riêng của nó, không database, không đồng hồ, không broker:
 
 ```ts title="services/api/src/webhooks/disable.ts"
 // When to stop trying (FR-007).
@@ -1243,6 +1545,28 @@ function humanDuration(ms: number): string {
   return `${hours}h${String(minutes % 60).padStart(2, "0")}m`;
 }
 ```
+
+Sự tách biệt này không phải để gọn. Đây là phần duy nhất của chương có một
+con số trong đó, và một hàm thuần là phiên bản duy nhất của nó có thể được test
+đầy đủ trong vài mili giây. Cả hai cơ chế kích hoạt đều gọi nó; không cái nào có thể bất đồng với
+cái kia về việc một tiếng nghĩa là gì.
+
+**Vì sao năm lần thử?** Bởi riêng một tiếng thì chưa đủ. Lịch chạy tới
+một khoảng cách hai tiếng, nên một lần hỏng rồi im lặng cũng thoả mãn "hỏng
+hơn một tiếng" với đúng một điểm dữ liệu, và tắt endpoint của một khách hàng vì
+một câu trả lời tệ chính là thứ mà một cái sàn tồn tại để chặn.
+
+Năm là cái sàn lớn nhất mà một delivery hỏng đơn lẻ vẫn vượt được trong
+cửa sổ — lần thử năm rơi vào +5m36s và lần sáu vào +35m36s, cả hai trong
+tiếng đó, nên có biên độ một. Đặt nó thành bảy thì một chuỗi một-delivery sẽ
+*không bao giờ* kích hoạt, bởi lần thử thứ bảy rơi ngoài cửa sổ: cái sàn
+sẽ trở thành lý do các endpoint ít lưu lượng vẫn bật, đó chính là cái bug mà lượt quét
+tồn tại để sửa, tái xuất qua cửa trước. Dưới năm thì nó thôi làm được
+việc của nó, bởi ba lần hỏng tới trong sáu giây và sáu giây trục trặc là
+một cơn nấc.
+
+Các bài test suy lại điều đó từ bảng tier thật chứ không phát biểu lại, để một
+chương sau đổi lịch sẽ phát hiện ra rằng nó đã đổi cả cái sàn:
 
 ```ts title="services/api/src/webhooks/disable.test.ts"
 import { describe, expect, it } from "vitest";
@@ -1442,9 +1766,10 @@ describe("disableReason says what happened", () => {
 });
 ```
 
-## Disabling, nhiều nhất một lần
+## Tắt, nhiều nhất một lần
 
-Terminal failure có thể disable subscription, nhưng action này phải idempotent. Nhiều worker/retry nhìn cùng record không được gửi nhiều notification hay thay đổi state qua lại; conditional update tạo đúng một winner.
+Cả hai cơ chế kích hoạt đều kết thúc ở cùng một câu lệnh, và câu lệnh đó là thứ thực thi
+FR-WHK-07 chứ không phải một phép kiểm ai đó phải nhớ:
 
 ```diff title="services/api/src/db/repository.ts"
 @@ -19,21 +19,29 @@ import {
@@ -2259,9 +2584,72 @@ Terminal failure có thể disable subscription, nhưng action này phải idemp
      const inserted = await this.db
 ```
 
-## Sweep đi nhờ loop đã tồn tại
+Đó là một diff lớn, nên đây là bốn thứ trong đó đáng kể.
 
-Scheduler quét delivery đến hạn trong loop dispatcher đã có thay vì thêm cron process cạnh tranh claim. Một owner cho queue giúp concurrency, shutdown và metric dễ hiểu hơn.
+**`WHERE … AND enabled = true`.** Một lần tắt thứ hai khớp không dòng nào và trả về
+không gì, nên phần notification bên dưới không bao giờ tới được. Nhiều-nhất-một-lần là một tính chất
+của SQL, không phải của đường code đã tới đó — và đó là thứ cho phép có hai
+cơ chế kích hoạt một cách an toàn.
+
+**Tổ chức được phân giải vào lúc ghi**, qua hai phép join vốn đã
+tồn tại, và được lưu lên notification. Lưu nó trông có vẻ thừa. Nó được lưu
+bởi dòng đó ghi lại một nghĩa vụ *như nó vốn có* lúc endpoint bị
+tắt, và một application chuyển giữa các tổ chức về sau không được lặng lẽ
+đổi đích của một notification vốn đã nợ một bên khác.
+
+**Lượt quét đọc status cuối từ delivery gần nhất của endpoint.** Nó
+không có kết quả nào trong tay — nó kích hoạt đúng lúc không có kết quả nào tới — nên
+không có phép join lateral đó thì lý do duy nhất nó có thể ghi là "không rõ nguyên nhân", mà đó
+chính là notification mà một kỹ sư hỗ trợ thực sự nhận được.
+
+**Kết quả của một test event được miễn khỏi tất cả những điều đó**, và đó là mục sau
+nữa.
+
+<Trap title="What the row lock is actually for">
+
+Comment trên `applyFailureRun` từng nói rằng `SELECT … FOR UPDATE` là
+toàn bộ câu chuyện đồng thời của FR-WHK-07: thiếu nó thì hai dispatcher instance
+báo cáo kết quả cho cùng một endpoint vào cùng một khoảnh khắc sẽ cùng quyết định
+tắt, và sinh ra hai lần tắt cùng hai notification.
+
+Rồi bộ sabotage gỡ cái lock ra và chạy suite. **Bốn mươi sáu bài test
+pass.**
+
+Lời khẳng định đó sai. Riêng điều kiện `enabled = true` là đủ cho
+nhiều-nhất-một-lần; cái lock đang được ghi công cho việc của điều kiện đó.
+
+<Why title="And the same sabotage now fails, which is the only proof the fix took">
+Gỡ `.for("update")` khỏi `applyFailureRun` hôm nay làm **một** bài test đỏ trên
+bảy mươi lăm: *"đếm CẢ HAI trong hai lần hỏng chồng nhau — cái lost update mà lock
+ngăn được"*, với `expected 1 to be 2`. Chạy lại ở đây chứ không trích dẫn, bởi một lời khẳng định
+rằng một bài test đã được thêm thì chẳng đáng gì bên cạnh một màn trình diễn rằng nó đỏ.
+
+Hai con số nói hai điều khác nhau và cả hai đều quan trọng. Bốn mươi sáu trên bốn mươi sáu pass là
+dụng cụ đang báo rằng một cơ chế chưa ai test đang được ghi công cho việc nó
+không làm. Một trên bảy mươi lăm fail là cũng dụng cụ đó báo rằng khoảng trống đã
+đóng — và nó là một bài test chứ không phải vài bài bởi cái lock bảo vệ đúng một
+tính chất. Một đòn sabotage làm mười bài test đỏ thường là đã làm hỏng thứ gì khác.
+</Why>
+
+Thứ mà cái lock thực sự bảo vệ là **bộ đếm**. Dưới `READ COMMITTED` cả hai
+transaction đều đọc `failure_run_attempts = 4`, cả hai đều tính ra 5, và lệnh `UPDATE`
+thứ hai chờ cái đầu rồi ghi đè nó bằng 5. Một lost update — chuỗi
+đếm thiếu một cho mỗi lần va chạm. Chẳng gì báo lỗi, chẳng gì được ghi log, và
+endpoint lặng lẽ cần thêm một lần hỏng nữa để chạm sàn năm. Ngưỡng của FR-WHK-07
+trở nên khó chạm hơn điều yêu cầu nói, theo một cách không bài test nào
+từng nhận ra.
+
+Giờ có một bài test cho bộ đếm, và comment nói cái lock làm gì.
+Đây là thứ một bộ sabotage tồn tại để làm: không phải xác nhận rằng các bài test pass, mà
+tìm ra cơ chế nào đang thực sự làm việc.
+
+</Trap>
+
+## Lượt quét đi nhờ một vòng lặp vốn đã tồn tại
+
+Cơ chế kích hoạt thứ hai là thêm một câu lệnh mỗi lần drain, trong một worker vốn đã
+tỉnh, vốn đã sở hữu một database connection, và vốn đã chạy trong service duy nhất
+được phép ghi:
 
 ```diff title="services/api/src/webhooks/delivery-relay.ts"
 @@ -9,13 +9,17 @@ import {
@@ -2394,9 +2782,22 @@ Scheduler quét delivery đến hạn trong loop dispatcher đã có thay vì th
  }
 ```
 
-## Notification không ai nhận
+Không thứ mới để triển khai, không cron, không scheduler. Hiến pháp VII đòi
+phương án buồn tẻ và ở đây phương án buồn tẻ cũng là phương án duy nhất không thêm một thứ
+thứ ba để triển khai và theo dõi chỉ vì một câu query.
 
-Disable notification được tạo như work durable, không gọi email đồng bộ trong worker. Customer có thể không nhận email; điều hệ thống hứa là notification đã được schedule/audit, không hứa inbox của bên thứ ba.
+Lượt quét chạy **sau** lần drain và chỉ khi chẳng có gì đến hạn, nên một backlog
+không bao giờ phải chờ sau việc dọn dẹp. Một endpoint hỏng suốt một
+tiếng có thể chờ thêm một phần tư giây; webhook của một khách hàng thì không.
+
+`RELAY_DISABLE_SWEEP=off` tồn tại vì một mục đích, và đó là mục đích dạy học:
+nó cho bạn xem cái endpoint ít lưu lượng cứ hỏng mãi. Màn trình diễn đó nằm ở phần sau
+của chương này, và nó là thứ duy nhất làm cho cơ chế kích hoạt thứ hai trông khác
+một biện pháp thừa.
+
+## Cái notification chẳng ai nhận
+
+Việc tắt ghi một dòng vào một bảng mới:
 
 ```text
 webhook_disable_notifications
@@ -2406,9 +2807,51 @@ webhook_disable_notifications
   delivered_at        <-- always null in this chapter
 ```
 
-## Chứng minh nó hoạt động lại
+FR-WHK-07 yêu cầu endpoint bị tắt **và tổ chức được báo qua
+email**. Nền tảng này không có bất kỳ transport email nào. Không phải một cái
+cấu hình sai — là không có.
 
-Khi endpoint hồi phục trước terminal limit, delivery phải được gửi thành công, failure count reset/được ghi đúng và subscription không bị disable. Recovery test quan trọng như exhaustion test; retry system chỉ chứng minh giá trị nếu nó biết dừng thử khi đã thành công.
+Nên yêu cầu mới hoàn thành một nửa, và `delivered_at` là cột nói ra
+điều đó. Nó tồn tại trong chương này chỉ để mà null. Một schema chỉ ghi lại
+việc tắt sẽ để một người đọc tương lai — kể cả bạn của tương lai — tin rằng
+yêu cầu đã xong, và lần đầu tiên ai đó phát hiện ra không phải vậy
+sẽ là khi một khách hàng hỏi vì sao chẳng ai báo họ.
+
+<ForwardRef>
+
+Chương quota cần chính cái transport đó cho các cảnh báo của nó, và đó là lý do nó
+không được dựng ở đây: dựng nó bây giờ nghĩa là dựng nó cho người tiêu thụ thứ hai
+trước, và đoán mò xem người đầu tiên cần gì.
+
+</ForwardRef>
+
+<Why title="Recorded, not sent — and why that is not a cop-out">
+
+Có một khác biệt thật giữa "chúng tôi đã không làm" và "chúng tôi đã làm phần phải
+bền, và để lại phần phải mang tính vận hành".
+
+Nghĩa vụ là phần bền. Tổ chức nào được nợ một lời nhắn, về
+endpoint nào, cho cửa sổ nào, với bằng chứng gì — tất cả những thứ đó phải được
+ghi lại vào đúng khoảnh khắc tắt, bên trong cùng transaction, nếu không nó
+mất. Một transport có thể thêm về sau và sẽ thấy hàng đợi đang chờ nó.
+
+Làm theo chiều ngược lại — gửi một email lúc tắt mà không có bản ghi nào —
+là phiên bản không thể sửa về sau.
+
+</Why>
+
+## Chứng minh nó chạy lại được
+
+Giờ vòng lặp khép lại. Một khách hàng có endpoint bị tắt sửa server của họ.
+Họ làm gì tiếp theo?
+
+Không có test event, họ bật lại và cầu may, và event thật đầu tiên là
+thí nghiệm. Nếu họ sai, endpoint tích thêm một tiếng hỏng nữa
+và bị tắt lần thứ hai — đó là cách một endpoint bị tắt hai lần trong một
+ngày và một khách hàng kết luận rằng nền tảng hỏng.
+
+FR-WHK-09 là một event tổng hợp, gửi tới một endpoint theo yêu cầu, giao qua
+đường bình thường với ba điểm khác biệt:
 
 ```diff title="services/api/src/webhooks/webhooks.service.ts"
 @@ -1,11 +1,17 @@
@@ -2538,6 +2981,9 @@ Khi endpoint hồi phục trước terminal limit, delivery phải được gử
    private assertDeliverableUrl(raw: string): void {
 ```
 
+Route báo lại thứ endpoint đã trả lời, và luôn trả lời `200` khi
+bài test đã chạy:
+
 ```diff title="services/api/src/webhooks/webhooks.controller.ts"
 @@ -64,12 +64,29 @@ export class WebhooksController {
    @Post(":id/disable")
@@ -2571,14 +3017,51 @@ Khi endpoint hồi phục trước terminal limit, delivery phải được gử
      await this.webhooks.remove(id);
 ```
 
-## Quan sát nó xảy ra
+<Why title="Why a non-2xx is not an HTTP error here">
 
-Metric cần phân biệt retry scheduled, delivery succeeded, terminal failure và subscription disabled. Không có các counter/trace này, operator chỉ thấy customer than phiền mà không biết queue đang chậm, transport lỗi hay policy đã dừng.
+Endpoint của một khách hàng trả lời `503` là một **bài test thành công**. Nó đã tìm ra.
+Trả về `502` từ route này sẽ gộp "chúng tôi không chạy được bài test" với
+"endpoint của bạn không khoẻ", và vào ba giờ sáng thì cái thứ hai mới là thứ
+người ta đọc.
+
+Trường hợp duy nhất mà `error` mô tả nền tảng chứ không phải khách hàng là
+khi không lần thử nào được báo cáo — không có dispatcher nào chạy. Kể cả khi đó câu trả lời
+vẫn là `200` với `delivered: false`, và phần lỗi nói bên nào đã hỏng.
+
+</Why>
+
+**Vẫn giao kể cả khi đã tắt.** Đây là điểm khác biệt làm cho vòng lặp
+khép lại được, và nó va với một bất biến từ đầu chương: một
+endpoint đã tắt thì không nhận lần thử nào. Cả hai đều đúng, và chúng gặp nhau ở đúng
+một điều kiện — cái điều kiện nơi dispatcher hỏi xin vật liệu để thực hiện một
+lần thử. `synthetic` là thứ phân biệt, và đó là mục đích của cột đó. Một
+endpoint đã xoá mềm vẫn bị từ chối: đã xoá nghĩa là biến mất khỏi API của chính khách hàng,
+và giao tới một cái như vậy sẽ là nền tảng với tới một URL mà khách hàng
+tin rằng nó đã quên.
+
+**Kết quả của nó không bao giờ chạm vào chuỗi hỏng.** Một bài test hỏng không được đẩy một
+endpoint tiến gần tới việc bị tắt — điều đó sẽ trừng phạt một khách hàng vì đã đi kiểm tra.
+Một bài test thành công cũng không được xoá chuỗi, nếu không một khách hàng có thể che giấu một
+sự cố thật bằng cách cứ test cho tới khi nó pass. Cả hai chiều, và đó là lý do phần miễn trừ
+nằm ở chỗ gọi chứ không nằm bên trong.
+
+**Bật lại xoá cả bốn cột**, nên một tiếng được đo từ lần hỏng
+tiếp theo. Không có điều đó, một khách hàng đã sửa server và bật nó lại
+sẽ bị tắt lại bởi lần hỏng đầu tiên sau đó, dựa trên một
+sự cố họ đã sửa xong.
+
+## Xem nó diễn ra
+
+Lượt đi bộ từ chương webhook dispatcher mọc thêm một cờ. Khởi động một endpoint hỏng vĩnh viễn ở
+một terminal:
 
 ```console
 $ node scripts/hostile-endpoint.mjs --mode=fail --quiet --secret=hunter2
 MARKER listening url=http://127.0.0.1:4555/hook mode=fail
 ```
+
+và ở một terminal khác, lái một event qua cả lịch rồi qua luôn
+mốc một tiếng:
 
 ```diff title="scripts/webhook-walk.mjs"
 @@ -5,15 +5,19 @@
@@ -2779,6 +3262,9 @@ MARKER listening url=http://127.0.0.1:4555/hook mode=fail
    acknowledgement slot and dead endpoints would starve healthy ones.
 ```
 
+Chuỗi của endpoint được in bên cạnh mỗi lần thử, và lần tắt có
+một mục riêng:
+
 ```console
 $ node scripts/webhook-walk.mjs --secret=hunter2 --fast-forward --watch-disable
 
@@ -2805,6 +3291,16 @@ dead letters               1
   3e2acaf8                 attempts=7 last_status=500
 ```
 
+**Hãy dừng ở hai dòng cuối trước dead letter.** Delivery là `dead`.
+Chuỗi giữ bảy lần hỏng. Endpoint là `enabled=true`.
+
+Đó là cái endpoint ít lưu lượng của research R1, tới được bằng cách chạy chứ không phải bằng
+số học. Lịch đã cạn, nên không kết quả nào nữa sẽ được
+báo cáo cho endpoint này. Một phép kiểm chỉ-theo-kết-quả đã chạy lần
+cuối cùng của nó.
+
+Rồi lượt quét:
+
 ```console
 === 6. when to stop trying ========================
   The rule: longer than 60 minutes AND at least
@@ -2826,6 +3322,9 @@ notification rows          1
 a second sweep disables    0
 ```
 
+Giờ chạy đúng thứ đó với `RELAY_DISABLE_SWEEP=off`, tức là phiên bản của
+nền tảng này chỉ xuất bản cơ chế kích hoạt hiển nhiên:
+
 ```console
 $ RELAY_DISABLE_SWEEP=off node scripts/webhook-walk.mjs --secret=hunter2 --fast-forward --watch-disable
 
@@ -2842,9 +3341,25 @@ disabled_reason            null
 notification rows          0
 ```
 
-## Stream, và một event ngoài nó
+Bảy lần hỏng, chuỗi hơn một tiếng tuổi, delivery đã vào dead letter, và
+endpoint vẫn bật. Đọc hai bản ghi đó cạnh nhau là
+thứ duy nhất làm cho cơ chế kích hoạt thứ hai có ý nghĩa.
 
-Một số event như notification có lifecycle riêng và không nên bị consumer retry hiểu nhầm là webhook delivery. Tách vocabulary ngăn policy reprocess công việc không thuộc nó.
+<Trap title="`--fast-forward` and `--watch-disable` move the clock, not the rule">
+
+Cả hai cờ đều viết lại timestamp: một cái kéo `next_attempt_at` về quá khứ để
+lịch có thể được xem trong vài giây thay vì hai tiếng rưỡi, cái kia
+làm `failure_run_started_at` già đi 64 phút.
+
+Không cái nào đổi một điều kiện. Quy tắc quyết định vẫn là cùng
+`shouldDisable` mà các bài test chạy và production chạy, đọc cùng các cột.
+Một màn trình diễn bỏ qua phần logic thay vì bỏ qua phần chờ sẽ là
+một màn trình diễn chẳng chứng minh gì, và sự phân biệt đó đáng khăng khăng bởi
+dựng ra loại kia một cách vô tình thì rất dễ.
+
+</Trap>
+
+## Stream, và một event lấy ra từ nó
 
 ```console
 $ node scripts/stream-info.mjs ANALYTICS
@@ -2863,6 +3378,15 @@ configuration
   duplicate_window   120s   (the broker's dedupe, not ours)
 consumers
 ```
+
+Bảy lần thử, bảy event, **không consumer nào**. Con số cuối đó là trạng thái
+trung thực của FR-WHK-06 ở cuối chương này.
+
+`stream-info.mjs` trước đây không nhận đối số — nó có `"EVENTS"` viết cứng
+ở ba chỗ. Trỏ bước xác thực của chương này vào nó mà không sửa sẽ
+in ra cấu hình của stream sai và pass, bởi mọi field hiện ra
+ở đây đều tồn tại trên cả hai. Một bước xác thực không thể fail thì tệ hơn không có
+bước nào.
 
 ```diff title="scripts/stream-info.mjs"
 @@ -2,41 +2,65 @@
@@ -2936,6 +3460,10 @@ consumers
  }
 ```
 
+Đây là một event, đọc ra từ stream theo cách mà ingester của Phần 4 rồi sẽ đọc:
+
+Trên subject `analytics.webhook.attempt.b0fc170b-58dc-435d-b452-3f7df834e90f`:
+
 ```json
 {
   "delivery_id": "eb8fa3c9-606f-49a1-b872-b577efefe793",
@@ -2950,9 +3478,35 @@ consumers
 }
 ```
 
-## Suite giữ gì
+Hãy đọc những field *không* có ở đó: không payload, không signing secret, không
+chữ ký, không URL, không header. Kích thước, định danh, status và thời lượng, và
+không gì khác.
 
-Suite kiểm tra transition durable qua mọi arm: transient failure, retry, success, terminal disable và notification. Mỗi test quan sát row và event, không chỉ mock function đã được gọi.
+`outcome` là field duy nhất mà dispatcher không thể cung cấp. Nó có
+status và độ trễ; chỉ api mới biết một cái `500` nghĩa là "thử lại sau
+năm phút" hay "đó là lần thứ bảy, hãy ghi dead letter".
+
+<Trap title="`skipped` is not an outcome you will ever see here">
+
+Dispatcher có một kết quả thứ tư. Khi một endpoint đã bị tắt hoặc
+xoá kể từ khi một delivery được lên lịch, `deliver.ts` ghi log `delivery.skipped` và
+đi tiếp — và không báo cáo cái đó cho ai cả.
+
+Nên không kết quả nào được ghi và không attempt event nào được publish, và điều đó đúng
+chứ không phải một lỗ hổng: một lần bỏ qua nghĩa là không request nào được thực hiện, và một bản ghi cho một
+lần thử chưa từng xảy ra sẽ đặt một dòng vào dashboard của một khách hàng mô tả
+một request mà server của họ chưa bao giờ nhận.
+
+Bản nháp đầu tiên của hợp đồng chương này liệt kê `skipped` là một giá trị thứ tư.
+Bất cứ ai viết một consumer dựa trên nó sẽ xuất bản một nhánh không bao giờ
+chạy được.
+
+</Trap>
+
+## Các suite giữ gì
+
+Ba suite mới và một suite sẵn có lớn hơn nhiều. Bản ghi lần thử, trên
+một broker thật và một api thật:
 
 ```ts title="services/api/src/webhooks/attempts.itest.ts"
 import "reflect-metadata";
@@ -3542,6 +4096,9 @@ describe("the attempt record", () => {
   }, 60_000);
 });
 ```
+
+Chuỗi hỏng, việc tắt, lượt quét, và hai tính chất mà bộ sabotage
+đã chứng minh là chưa được test:
 
 ```diff title="services/api/src/webhooks/deliveries.itest.ts"
 @@ -9,14 +9,18 @@ import {
@@ -4462,6 +5019,9 @@ describe("the attempt record", () => {
 +});
 ```
 
+Và test event, với suite này đóng vai dispatcher để nó có thể
+xác minh chữ ký theo cách một khách hàng sẽ làm:
+
 ```ts title="services/api/src/webhooks/test-event.itest.ts"
 import "reflect-metadata";
 
@@ -4969,6 +5529,22 @@ describe("the test event", () => {
 });
 ```
 
+<Why title="Why that suite plays the dispatcher by hand">
+
+`POST /test` tạo một delivery thật rồi theo dõi cái dòng đó, bởi
+lần thử xảy ra ở một tiến trình khác. Phải có gì đó tạo ra nó.
+
+Import bản build của dispatcher vào test lane của api sẽ làm suite này
+fail bất cứ khi nào hai package tình cờ build theo thứ tự ngược lại. Viết ra
+công việc của dispatcher bằng tay tốn ba mươi dòng và mua được bài test mạnh hơn:
+chữ ký được xác minh bằng `node:crypto` và công thức đã ghi trong tài liệu, không dùng gì từ
+đường ký. Một bài test xác minh bằng chính code ký của chúng ta sẽ chỉ chứng minh
+rằng code đồng ý với chính nó.
+
+</Why>
+
+Các mức ratchet coverage đã dịch chuyển, và chúng dịch **lên**:
+
 ```diff title="vitest.coverage.config.mts"
 @@ -172,12 +172,21 @@ export default defineConfig({
          // attributable — and the answer was to write `webhooks/deliveries.itest.ts` rather
@@ -5036,9 +5612,22 @@ describe("the test event", () => {
          // `if (timer)` in chapter 2.7's `withDeadline`, whose falsy arm cannot be
 ```
 
-## Sabotage battery
+Điều đó xảy ra theo cách khó, và đó là cách nó lẽ ra phải xảy ra. Đo
+giữa chương khi chuỗi hỏng đã viết còn các bài test của nó thì chưa, `repository.ts`
+đọc ra 96,46% statement và 88,80% branch — dưới cả hai ngưỡng. Cái
+dụng cụ đang nói "bạn đã thêm năm thao tác và chưa test cái nào" bằng
+thứ ngôn ngữ duy nhất nó có. Các bài test được viết; file giờ đọc ra 97,29 / 90,56 /
+100 / 99,14, và đó là những con số mà ratchet được nâng lên.
 
-Sabotage cases cố ý làm publish, claim, transport và notification fail để kiểm tra không có delivery nào kẹt hoặc bị đánh dấu thành công giả. Đây là nơi retry design được chứng minh, không phải ở happy path một lần 200.
+`disable.ts` và `analytics.ts` được ghim ở 100 trên mọi chỉ số. Hiến pháp VI
+gọi tên logic đẳng xâm một cách rõ ràng và `disable.ts` là cái điều kiện mà
+việc tắt nhiều-nhất-một-lần dựa lên; `analytics.ts` là một file mà toàn bộ công việc của nó là
+quyết định thứ gì *không* được đặt lên một stream.
+
+## Bộ sabotage
+
+Bảy mutation, mỗi cái áp lên code thật, mỗi cái được hoàn nguyên sau đó với
+file được xác minh là giống hệt từng byte:
 
 ```console
 =============== mutation 1: clear the run on failure instead of on success
@@ -5067,6 +5656,34 @@ Sabotage cases cố ý làm publish, claim, transport và notification fail đ�
      × deduplicates on the delivery AND the attempt, not the delivery alone
 ```
 
+Bảy trên bảy, và **ba trong số đó không chạy được ngay lần đầu**. Đó là
+phần đáng giữ.
+
+Mutation 4 ban đầu là `try {` → `{`, để lại một `catch` lơ lửng và không
+*biên dịch* được. Bộ sabotage ngoan ngoãn báo là đã bắt được, và nó bị bắt bởi
+`tsc` — thứ chẳng nói gì về việc một bài test có giữ tính chất đó không. Một
+mutation không biên dịch được thì không phải một mutation.
+
+Mutation 5 và 7 biên dịch được, chạy được, và **pass**. Cả hai đều lộ ra khoảng trống thật:
+vị trí của lượt quét trong vòng lặp chưa được test, và cái row lock đang được ghi công cho
+việc mà điều kiện đang làm. Cả hai đều sinh ra một bài test mới, và một cái sinh ra
+một lời chỉnh sửa cho một comment đã tự tin sai.
+
+<Why title="What a battery is actually measuring">
+
+Không phải các bài test có pass không. Mà là gỡ một cơ chế đi có làm chúng fail không.
+
+Đó là hai câu hỏi khác nhau và chỉ câu thứ hai nói cho bạn điều gì đó. Một suite
+mà mọi bài test đều pass và không mutation nào bị bắt là một suite chẳng giữ gì cả —
+và bạn không phân biệt được hai thứ đó bằng cách đọc các bài test hay đọc code, đó
+là lý do phép kiểm phải mang tính cơ học.
+
+</Why>
+
+<Checkpoint>
+
+Cả hai lane và cổng coverage:
+
 ```console
 $ pnpm test && pnpm test:integration && pnpm coverage
  Tests  184 passed (184)
@@ -5074,4 +5691,49 @@ $ pnpm test && pnpm test:integration && pnpm coverage
  Tests  363 passed (363)
 ```
 
-<ChapterFooter id="3.20" locale="vi" />
+Nền tảng giờ ghi lại chuyện xảy ra trên mọi lần thử giao, trên một stream
+dựng cho khối lượng phân tích và được cho phép mất mát một cách rõ ràng. Nó tắt
+một endpoint hỏng hơn một tiếng với ít nhất năm
+lần thử — từ hai cơ chế kích hoạt, bởi một trong hai chứng minh được là không bao giờ kích hoạt cho
+đúng những khách hàng mà chuyện này dành cho nhất. Nó ghi ra ai phải được báo và thừa nhận, trong
+một cột, rằng nó không có cách nào để báo họ. Và nó cho một khách hàng chứng minh
+bản sửa của họ chạy được trước khi bật lại bất cứ thứ gì.
+
+Hai yêu cầu được giao một nửa một cách cố ý. Các lần thử được publish mà không
+truy vấn được: ingester của Phần 4 mới là thứ hoàn tất FR-WHK-06. Notification được
+ghi lại mà không được gửi: chương rate-limit dựng transport, cho cả quota nữa.
+
+</Checkpoint>
+
+<Checkpoint title="Four files changed here without a fence, and three are instruments">
+
+**`services/api/src/isolation/targets.ts` và `gauntlet.itest.ts`** nhận thêm một route mỗi chiều:
+`POST /v1/webhooks/:id/test` được gọi tên bởi phép suy dẫn trên bản build đã đăng ký nó —
+lần thứ năm trong repository này — và nó là route duy nhất trong danh sách đó mà thiệt hại
+sẽ rơi RA NGOÀI nền tảng. Một đòn tấn công xuyên tenant thành công vào nó khiến Relay POST tới
+server của một khách hàng khác. Phân loại `write`, bị tấn công bên cạnh ba hành động anh em,
+và đáng một câu chứ không phải một diff.
+
+**`services/api/src/consumer/consumer.itest.ts`** đã thôi quét các consumer không phải của nó
+tạo ra. Phần dọn dẹp của nó xoá theo tiền tố `itest-`, thứ chưa bao giờ là của suite này để nhận,
+nên nó gỡ mất một durable đang sống thuộc về một suite khác giữa chừng — và nạn nhân báo
+`consumer deleted` hoặc `consumer not found` vì những lý do chẳng gì trong file của nó giải thích được. Một
+lượt quét theo tiền tố xoá cả những thứ nó không tạo ra; giờ tiền tố là của riêng suite này.
+
+**`services/api/src/auth/credentials.itest.ts`** là cái thứ tư, và nó là cái đáng
+đọc hai lần. Assertion rò rỉ credential của nó suy ra bí mật bằng cách tách credential
+theo `_` — ký tự nằm trong bảng chữ cái base64url, nên cái kim là mảnh sau dấu gạch dưới
+CUỐI CÙNG. Đo trên 200.000 lần đúc: **26,9%** credential cho ra một cái kim dài hai mươi
+ký tự trở xuống, nên một dòng log làm rò ba mươi ký tự đầu của một bí mật vẫn pass;
+**1,57%** cho ra một ký tự hoặc không ký tự nào, và `not.toContain` trên một ký tự đơn thì fail
+với bất kỳ đống rơm nào.
+
+Cả hai nửa đều được tìm ra hai lần, độc lập với nhau, và các bản sửa đồng ý với nhau. Thứ tự đã xuất bản chạm
+nó ở đây, trên một lần đúc kết thúc bằng `…_I` — assertion đã trở thành *"không dòng log nào chứa chữ
+I"*, trên một error body viết "this route expects an API key". Thứ tự này chạm nó sớm hơn một
+chương, trong bộ battery coverage, trên một lần đúc kết thúc bằng `_0`. Hai lần rút trúng cùng
+1,57% đó, và cả hai đều tới cùng một bộ phân tích và cùng một ngưỡng.
+
+</Checkpoint>
+
+<ChapterFooter id="3.20" />
