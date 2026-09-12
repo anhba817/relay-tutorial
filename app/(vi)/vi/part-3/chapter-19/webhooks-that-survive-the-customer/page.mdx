@@ -1,12 +1,14 @@
 import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
 import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figThePatternStops, figTheSchedule, figWhereItRuns } from "./figures";
 
 export const metadata = {
-  title: "Webhook sống sót trước hệ thống của khách hàng — Building Relay",
+  title: "Webhook sống sót qua phía khách hàng — Building Relay",
   description:
-    "Webhook phải sống qua endpoint, secret và dispatcher của khách hàng. Chương này xây subscription, signing, schedule, delivery claim, retry và dead letter trên ba service.",
+    "Handler của chương broker ghi một dòng log rồi gọi đó là một tác động. Chương này cho nó một tác động thật — một request HTTP tới một cỗ máy chúng ta không sở hữu — và chứng kiến cái pattern từng làm chương broker đúng thôi không còn áp dụng được, tới hai lần.",
   alternates: {
-    canonical: "/vi/part-3/chapter-19/webhooks-that-survive-the-customer",
+    canonical: "/part-3/chapter-19/webhooks-that-survive-the-customer",
     languages: {
       en: "/part-3/chapter-19/webhooks-that-survive-the-customer",
       vi: "/vi/part-3/chapter-19/webhooks-that-survive-the-customer",
@@ -14,10 +16,9 @@ export const metadata = {
   },
 };
 
-<ChapterHeader id="3.19" locale="vi" />
+<ChapterHeader id="3.19" />
 
-Webhook là promise gửi event ra hệ thống khách hàng, không phải chỉ là HTTP call. Nó cần
-subscription durable, secret có thể hiển thị một lần, retry schedule, signature và dead letter.
+Đây là handler của chương broker, nguyên vẹn:
 
 ```ts title="services/api/src/consumer/handler.ts (excerpt)"
 export async function handleEvent(event: EventEnvelope, logger: Logger) {
@@ -25,9 +26,45 @@ export async function handleEvent(event: EventEnvelope, logger: Logger) {
 }
 ```
 
-## Pattern ngừng áp dụng, hai lần
+Lúc đó nó được gọi là một giàn giáo và từ ấy được chọn cẩn thận. Mọi
+bảo đảm mà chương broker chứng minh — giành event, chạy tác động, commit cả hai cùng nhau, để
+một cú crash cuốn cả phần giành lẫn phần việc đi — đều được chứng minh trên một tác động
+chỉ ghi một dòng ra standard output.
 
-Webhook không thể dùng cùng pattern với realtime fan-out: customer endpoint có thể chậm, sai TLS, trả 500 hoặc biến mất nhiều ngày. Nó cũng không thể dùng synchronous HTTP request từ write path, vì message của một user không được chờ hệ thống của khách hàng.
+Chương này thay nó bằng một tác động trên cỗ máy của người khác.
+
+Chỉ một thay đổi đó làm vỡ cái pattern ở hai chỗ riêng biệt, và không chỗ nào
+là một sai lầm cần sửa. Tác động không còn gia nhập được transaction của phần giành,
+bởi nó xảy ra trên một server chúng ta không sở hữu. Và phần giành không còn được
+thực hiện bởi chính đoạn code làm việc, bởi hiến pháp IV dành riêng các lệnh ghi
+PostgreSQL cho api service và thứ thực hiện request thì không phải nó.
+
+<SkipAhead>
+
+Nếu bạn phải bỏ qua: các webhook endpoint được lưu với một signing secret mã hoá
+theo kiểu phong bì (AES-256-GCM), xoay vòng được, với cả secret hiện tại lẫn secret
+trước đó đều hợp lệ trong cửa sổ 24 giờ để một khách hàng xoay secret mà không cần
+triển khai đồng bộ. Request được ký HMAC-SHA256 trên chuỗi chuẩn hoá
+`v1:{timestamp}:{raw body}`, nghĩa là **đúng các byte thô như đã truyền đi** và
+không bao giờ là một lần serialise lại của object đã parse. Một event được mở rộng thành một
+dòng `webhook_deliveries` cho mỗi endpoint khớp, ghi **bên trong** transaction giành
+của chương broker, nên một event được giao lại không thể nhân đôi webhook của khách hàng.
+Lịch thử lại là một cột `next_attempt_at` được rút bởi một relay thứ hai trong
+api, chính là vòng lặp `SELECT … FOR UPDATE SKIP LOCKED` của chương outbox với thêm một
+điều kiện. Một độ trễ do broker giữ đã được đo là chiếm luôn một slot acknowledgement
+trong lúc nó chờ, và điều đó để các endpoint chết bỏ đói các endpoint khoẻ. Bảy lần thử
+(`now → 1s → 5s → 30s → 5min → 30min → 2h`), rồi một dead letter giữ trong
+bảy ngày. Dispatcher là một thứ triển khai mới không ghi gì vào PostgreSQL
+và chỉ chạm tới trạng thái qua một đường nối HTTP nội bộ. Bước nhảy cuối là ít-nhất-một-lần
+và nó nói ra điều đó, với event id được trao cho khách hàng làm khoá chống trùng.
+Trạng thái cuối chương là tag **`part3-ch5`**.
+
+</SkipAhead>
+
+## Cái pattern thôi áp dụng được, hai lần
+
+Lập luận đúng đắn của chương broker có một bộ phận chuyển động. Phần giành và phần tác động
+nằm trong cùng một transaction, nên chẳng có khoảng trống nào giữa chúng:
 
 ```ts title="services/api/src/consumer/runtime.ts (excerpt)"
 // The broker chapter: the claim and the effect commit together or not at all.
@@ -36,6 +73,34 @@ await claimEvent(db, CONSUMER, event.id, async () => {
 });
 ```
 
+Giờ hãy thử viết chuyện đó với một request HTTP nằm bên trong. Cái `await` ở giữa
+là một lệnh POST tới server của khách hàng. Nó đã xảy ra rồi vào lúc
+transaction commit, và roll back transaction không hề gỡ được nó ra.
+Chẳng có cách sắp xếp nào cho hai thao tác này làm chúng thành nguyên tử, bởi
+một trong hai không phải của chúng ta để mà roll back.
+
+Nên câu hỏi đổi. Khoảng trống không đóng được, và điều đó để lại đúng một thứ để
+quyết: **chúng ta muốn sai theo hướng nào**:
+
+| Thứ tự | Một cú crash trong khoảng trống tốn gì |
+|---|---|
+| giành, rồi post | webhook **mất trong im lặng**. Khách hàng không bao giờ nhận được và chẳng ai biết |
+| post, rồi giành | webhook **được gửi hai lần**. Khách hàng nhận một bản trùng và *nhận ra được* |
+
+<Figure caption="Khoảng trống không đóng được. Thứ chọn được là cú crash rơi về phía nào của nó." code={figThePatternStops} />
+
+Nền tảng chọn bản trùng. Một mất mát chẳng ai phát hiện được thì tệ hơn một
+bản trùng mà người nhận đã được trao phương tiện để hấp thụ, và chương outbox đã dành cả
+một chương để gỡ đúng loại thất bại đầu tiên đó khỏi đường publish.
+Đưa nó trở lại ở bước nhảy cuối — bước mà khách hàng thực sự cảm nhận được — sẽ
+huỷ công việc đó ở đúng chỗ nó quan trọng nhất.
+
+Quyết định đó đi kèm một nghĩa vụ, và nghĩa vụ chính là thứ giữ nó
+lương thiện. **Nếu bạn chọn ít-nhất-một-lần, bạn phải trao cho người nhận phương tiện để
+chống trùng.** Event id đi trong phong bì, có ghi trong tài liệu, ổn định qua
+mọi lần thử của cùng một delivery. Một khách hàng lưu nó lại và bỏ qua các bản lặp
+là đúng; một khách hàng không làm vậy thì đã được cho biết họ đang chọn gì.
+
 ```ts title="services/dispatcher/src/deliver.ts (excerpt)"
 //   claim BEFORE posting  → a crash in the gap loses the webhook silently.
 //   post BEFORE reporting → a crash in the gap re-posts. The customer receives
@@ -43,9 +108,31 @@ await claimEvent(db, CONSUMER, event.id, async () => {
 //                           the event id they deduplicate on.
 ```
 
-## Endpoint, và secret phải có thể trả lại
+<Why>
 
-Subscription lưu endpoint và secret theo cách service có thể dùng để ký delivery nhưng không trả lại secret thô trong listing. Secret chỉ được hiển thị khi tạo/rotate; sau đó API trả metadata đủ để operator biết subscription nào đang tồn tại.
+Cả hai thứ này đều là ít-nhất-một-lần, nên đáng nói chính xác chỗ nào
+bảo đảm thay đổi. *Bên trong* nền tảng, sổ cái của chương broker làm cho việc xử lý
+thành một-lần-về-tác-động: việc giao là ít-nhất-một-lần, và phần giành `consumed_events`
+hấp thụ các bản lặp. Ở bước nhảy của khách hàng thì chẳng có sổ cái nào ta kiểm soát, nên
+các bản lặp tới nơi. Bảo đảm yếu đi không phải vì thiết kế tệ hơn.
+Nó yếu đi vì ranh giới đã dời sang một cỗ máy không chạy code của chúng ta.
+
+</Why>
+
+## Endpoint, và cái secret ta phải trả lại được
+
+Một endpoint là một URL, một danh sách kiểu event, và một signing secret. Secret là
+cột thú vị, bởi nó là giá trị đầu tiên trong nền tảng này phải
+**lấy lại được ở dạng bản rõ**.
+
+Chương credentials lưu API key dưới dạng hash có muối và làm thế được: một key được
+trình ra rồi so sánh, không bao giờ được tái tạo. Một signing secret thì khác.
+Dispatcher phải tính một HMAC với nó trên mọi lần thử, và một HMAC cần
+chính cái secret. Một hàm băm không ký được.
+
+Nên secret được mã hoá, không phải băm. NFR-SEC-02 đã lường trước chuyện này với hai
+nhánh, một cho các credential được đem so sánh và một cho các secret được đem
+dùng:
 
 ```ts title="services/api/src/webhooks/secret.ts"
 import {
@@ -184,6 +271,27 @@ export function activeSigningSecrets(
 }
 ```
 
+Hai chi tiết trong đó là quyết định, không phải cơ chế.
+
+Cửa sổ xoay vòng là cái thứ nhất. `activeSigningSecrets` trả về một secret
+trong trường hợp thường và *hai* trong hai mươi tư giờ sau một lần xoay, và request
+mang theo một chữ ký cho mỗi cái. Một khách hàng xoay secret phải cập nhật bộ xác minh
+và cấu hình của họ, và hai thứ đó chẳng bao giờ đồng thời trong
+một lần triển khai thật. Không có cửa sổ, xoay vòng nghĩa là một phút được chọn để
+xác minh thất bại; có nó thì cả hai đều chạy và cái cũ tự hết hạn.
+
+Phân giải khoá là cái thứ hai, và nó nhỏ hơn, nhưng nó từng cắn
+repository này rồi. `encryptionKey()` đọc môi trường ở mỗi lần gọi thay vì
+lúc import. Một module ném lỗi khi đang được import sẽ kéo cả
+service sập lúc khởi động vì một tính năng mà hầu hết request không đụng tới. Tệ hơn với ta,
+nó làm cho cái thất bại đó không thể chạm tới từ một unit test, bởi file test không thể
+import the module it wants to assert on.
+
+<Trap>
+
+Fallback dành cho phát triển cố ý ồn ào, và nó từ chối tồn tại trong
+production:
+
 ```ts title="services/api/src/webhooks/secret.ts (excerpt)"
 if (process.env.NODE_ENV === "production") {
   throw new Error(
@@ -192,9 +300,26 @@ if (process.env.NODE_ENV === "production") {
 }
 ```
 
-## Migration, và surface ở trên nó
+Một giá trị mặc định im lặng ở đây sẽ nghĩa là production lặng lẽ mã hoã signing secret của mọi
+khách hàng bằng một khoá in trong một cuốn tutorial. Bản ồn ào tốn một
+biến môi trường lúc triển khai và loại bỏ nguyên một hạng sự cố.
 
-Schema cần subscription, delivery attempt, trạng thái schedule và index cho worker claim. API surface được xây trên migration theo thứ tự đó, để không có handler nào tự phát minh state transient thay cho record durable.
+</Trap>
+
+## Migration, và bề mặt bên trên nó
+
+Ba bảng tới cùng lúc, và migration được review trước khi chạy.
+Đó là kỷ luật mà chương 2.1 thiết lập sau khi một migration được sinh ra bị
+áp dụng mà không ai đọc.
+
+**Nó được đánh số 0010 còn bộ sinh đề nghị 0006**, điều này đáng một câu trước
+file chứ không chỉ nằm bên trong. `drizzle-kit` đánh số theo số snapshot của riêng nó; các
+snapshot của thư mục này dừng ở 0005 và năm migration sau đó được viết tay và chẳng
+có cái nào. Nên bộ sinh đề nghị một con số mà `0006_member_roles.sql` đã giữ từ
+chương channel-control — và `migrate.ts` đọc THƯ MỤC rồi sắp theo tên file, nên một
+0006 ở đây sẽ chạy trước bốn migration mà nó phải theo sau. Snapshot giữ số riêng
+của nó bởi dòng dõi của nó là đúng: nó là 0005 cộng ba cái bảng này, từng bảng một,
+điều đó kiểm được và đã được kiểm.
 
 ```sql title="services/api/migrations/0010_webhooks.sql"
 -- Webhook endpoints, the delivery schedule, and dead letters.
@@ -281,6 +406,8 @@ CREATE INDEX "webhook_dead_letters_environment_idx" ON "webhook_dead_letters" US
 CREATE INDEX "webhook_deliveries_due_idx" ON "webhook_deliveries" USING btree ("next_attempt_at") WHERE "webhook_deliveries"."state" = 'pending';--> statement-breakpoint
 CREATE INDEX "webhook_endpoints_environment_idx" ON "webhook_endpoints" USING btree ("environment_id");
 ```
+
+Bề mặt quản lý là CRUD bình thường với bốn quyết định trong đó:
 
 ```ts title="services/api/src/webhooks/webhooks.service.ts"
 import { Injectable, NotFoundException } from "@nestjs/common";
@@ -453,40 +580,52 @@ export class WebhooksService {
 }
 ```
 
-**URL phải là HTTPS và không được trỏ vào trong.** Endpoint là URL platform sẽ fetch thay
-khách hàng từ chính network của nó; không check destination chính là server-side request
-forgery. Loopback, private range và link-local address bị từ chối bằng validation error
-khách hàng đọc được thay vì timeout không giải thích được.
+**URL phải là HTTPS và không được trỏ vào trong.** Một endpoint là một URL mà
+nền tảng sẽ fetch thay mặt một khách hàng, từ bên trong mạng của chính nền tảng.
+Đó là định nghĩa của một cuộc tấn công giả mạo request phía server nếu chẳng ai
+kiểm nó đi đâu. Loopback, các dải riêng và các địa chỉ link-local đều bị
+từ chối, và lời từ chối là một lỗi xác thực mà khách hàng đọc được chứ không phải
+một timeout mà họ không đọc được.
 
-**Năm endpoint mỗi environment.** Năm có tính arbitrary, nhưng “unbounded” cũng là một con
-số và là số sai: expansion write một row cho từng endpoint match, nên mười nghìn endpoint
-biến một event thành mười nghìn row trong một transaction.
+**Năm endpoint cho mỗi environment.** Năm là tuỳ ý, nhưng "không giới hạn" cũng là một
+con số, và nó là con số sai: việc mở rộng ghi một dòng cho mỗi endpoint khớp,
+nên một environment với mười nghìn endpoint biến một event thành mười
+nghìn dòng bên trong một transaction duy nhất.
 
-**Secret chỉ được trả đúng một lần:** lúc creation và không bao giờ nữa. Column lưu
-ciphertext; plaintext chỉ tồn tại đủ lâu để response serialize.
+**Secret được trả về đúng một lần.** Lúc tạo, và không bao giờ nữa. Cột
+giữ bản mã, và bản rõ chỉ tồn tại đúng bằng khoảng thời gian
+response được serialise.
 
-**Event type ngoài declared set bị từ chối, và set để check không phải set platform đang
-emit.** Đây là hai list khác nhau; khoảng cách giữa chúng là subscription của customer.
-`WEBHOOK_EVENT_TYPES` khai báo tám name FR-WHK-02 gọi tên; năm name `emitted: true`, ba name
-`channel.created`, `user.connected`, `user.disconnected` là `false` vì spec đã publish nhưng
-chưa có producer.
+**Một kiểu event nằm ngoài tập đã khai báo thì bị từ chối, và tập nó được kiểm với
+không phải là tập mà nền tảng này phát ra.** Đó là hai danh sách khác nhau và khoảng cách giữa
+chúng là lượt đăng ký của một khách hàng. `WEBHOOK_EVENT_TYPES` khai báo tám cái tên
+mà FR-WHK-02 gọi; năm cái mang `emitted: true` và ba — `channel.created`,
+`user.connected`, `user.disconnected` — mang `false`, bởi chúng được công bố trong
+đặc tả và chưa gì sinh ra một cái nào.
 
-Check subscription theo năm emitted name sẽ từ chối `user.connected` của customer đọc docs và
-subscribe một documented event. Customer không sai; platform đã đo được 741 stored row gọi tên
-một event như thế. Vì vậy validation dùng tám declared name: name ngoài set là typo và nhận
-`webhook_event_type_unknown` với accepted set trong message; declared name chưa producer vẫn
-được lưu và đơn giản là chưa bao giờ fire.
+Kiểm một lượt đăng ký với năm cái sẽ từ chối `user.connected` với một khách hàng đã
+đọc tài liệu và đăng ký một event có trong tài liệu. **Họ không làm gì sai, và
+nền tảng đã xuất bản đo được 741 dòng lưu trữ gọi tên một cái.** Nên phép kiểm
+chạy trên tám cái đã khai báo: một cái tên ngoài chúng là một lỗi gõ và nhận
+`webhook_event_type_unknown` với tập được chấp nhận ghi rõ trong thông điệp, còn một cái tên đã khai báo
+mà không có bên sinh ra thì được lưu và đơn giản là không bao giờ kích hoạt.
 
-Thứ nó thay thế còn tệ hơn refusal: typo từng được lưu, endpoint trả `201`, customer thấy
-subscription trong list rồi không bao giờ nhận delivery vì không event nào match
-`mesage.created`. Validation error đọc được tốt hơn subscription trông đúng mãi mãi.
+Thứ mà chuyện đó thay thế còn tệ hơn một lời từ chối. **Một lỗi gõ từng được lưu.** Endpoint được
+tạo, `201` trả về, khách hàng thấy lượt đăng ký của mình liệt kê ra — và chẳng gì từng được
+giao tới nó, bởi không event nào sẽ khớp `mesage.created`. Một lỗi xác thực mà
+khách hàng đọc được là kết cục tốt hơn một lượt đăng ký trông có vẻ đúng mãi mãi.
 
-<Why title="Tại sao dùng flag trên type thay vì hai list">
+<Why title="Why a flag on the type rather than two lists">
 
-Hai constant—declared name và emitted name—là shape dễ rot: chúng chỉ khớp khi ai đó nhớ đổi
-cả hai. Repo đã trả giá khi lint exemption list drift khỏi tree nó exempt. Một table có boolean
-mỗi row không thể bất đồng với chính nó; ship producer chỉ flip `false` thành `true` trên line
-đã gọi tên event, và compiler tìm mọi reader qua `satisfies Record<string, { emitted: boolean }>`.
+Hình dạng hiển nhiên là hai hằng số — các tên đã khai báo và các tên được phát ra — và nó là
+hình dạng sẽ mục. Hai danh sách đồng ý với nhau vì ai đó nhớ đổi cả hai, và
+repository này đã trả giá cho chuyện đó: một danh sách miễn trừ lint và cái cây nó miễn trừ đã
+trôi xa nhau cho tới khi một bài test đọc quy tắc thay vì phát biểu lại nó.
+
+Một cái bảng với một boolean trên mỗi dòng thì không thể tự mâu thuẫn với chính nó. Xuất bản một bên sinh ra nghĩa là
+lật `false` thành `true` trên chính cái dòng đã gọi tên event đó, và trình biên dịch tìm ra
+mọi bên đọc qua `satisfies Record<string, { emitted: boolean }>` nếu hình dạng có
+đổi.
 
 </Why>
 
@@ -664,9 +803,10 @@ export class DeliveryRelayService implements OnModuleDestroy {
 export class WebhooksModule {}
 ```
 
-## Ký đúng thứ thực sự gửi
+## Ký đúng thứ bạn thực sự gửi đi
 
-Signature phải được tính trên bytes của body thực sự gửi, cùng timestamp và secret của subscription. Ký JSON trước khi serializer đổi whitespace hoặc encoding tạo verification failure khó đoán ở customer side.
+Chữ ký phủ lên một chuỗi chuẩn hoá dựng từ **các byte thô của body**,
+đúng những byte đi trên đường truyền:
 
 ```ts title="services/dispatcher/src/signature.ts"
 import { createHmac } from "node:crypto";
@@ -740,19 +880,59 @@ export function signatureHeaders({
 }
 ```
 
+Timestamp nằm trong vật liệu được ký, không nằm bên cạnh, và đó là thứ ngăn một
+request bị bắt được phát lại vô hạn. Và body là một chuỗi đã được
+serialise một lần rồi vừa được ký vừa được gửi. Đó không phải một sự tối ưu.
+
+<Trap>
+
+**Ký một cách kết xuất rồi gửi một cách khác thì chẳng gì chạy, vì những lý do chẳng ai
+nhìn thấy.** Đây là cách phổ biến nhất mà một tích hợp webhook đang chạy bị hỏng,
+và nó gần như không bao giờ trông giống cái sai lầm nó thực sự là:
+
 ```js
 // Both of these are "the same JSON".
 const body = JSON.stringify(payload);
 const sig  = sign(JSON.stringify(JSON.parse(body)));   // ← a different string
 ```
 
+Trong Node, trong cùng một tiến trình, vòng lặp đó thường trả lại đúng các byte nó
+được đưa, và đó chính xác là lý do cái bug này sống sót qua mọi bài test viết bằng
+chính ngôn ngữ của service. Nó xuất hiện vào ngày một khách hàng xác minh bằng Go, hay một proxy
+chuẩn hoá JSON, hay ai đó spread cái object vào một object mới để thêm một
+field.
+
+Script đi bộ viết cho chương này đã mắc đúng lỗi này với chính nó. Cờ
+`--print-signing-material` của nó ký cái payload object đúng như script đã
+dựng, trong khi nền tảng ký thứ đi ra từ `jsonb`, và
+PostgreSQL không bảo toàn thứ tự khoá. Chữ ký được in ra là cho một
+cách kết xuất chưa bao giờ lên đường truyền, và phải chạy thật với một endpoint thật
+mới nhận ra.
+
+</Trap>
+
+Bài test cho chuyện này được viết từ *tài liệu*, không phải từ bộ ký,
+và đó là cách duy nhất nó chứng minh được điều nó tuyên bố:
+
 ```ts title="services/dispatcher/src/signature.test.ts (excerpt)"
 it("verifies against a verifier written from the documentation, not from the signer", () => {
 ```
 
-## Schedule là một column, và lý do là measurement
+Một bài test gọi `signDelivery` hai lần rồi so kết quả thì chứng minh rằng
+hàm đó tất định. Nó chẳng chứng minh được gì về việc một khách hàng
+có xác minh được chữ ký không, mà đó là tính chất duy nhất quan trọng.
 
-`next_attempt_at` là column có index vì dispatcher cần tìm đúng delivery đến hạn mà không scan toàn bộ lịch sử. Measurement của query shape quyết định schema này; một worker loop không nên dựa vào bảng nhỏ trong test lane để biện minh cho full scan.
+## Lịch là một cột, và lý do là một phép đo
+
+Server của một khách hàng sẽ sập. Nền tảng thử lại theo một lịch giãn dần
+và cuối cùng bỏ cuộc; chừng đó nằm trong yêu cầu. Câu hỏi thú vị
+là phần *chờ* sống ở đâu.
+
+Câu trả lời hiển nhiên là broker. NATS cho phép một consumer acknowledge phủ định một
+message kèm một độ trễ, broker giữ nó, và nó quay lại khi độ trễ
+hết. Không bảng mới, không vòng lặp mới. Chương broker đã dựng sẵn consumer.
+
+Trước khi viết chuyện đó, chúng tôi đã đo nó:
 
 ```text
 Q1  delayed redelivery survives a restart?
@@ -763,6 +943,34 @@ Q2  do delayed messages hold the ack-pending budget?
     max_ack_pending=3; nak'd 3 with a 300 s delay; fetched afterwards: 0
     num_ack_pending=3  num_pending=2            YES — and that is the problem.
 ```
+
+Q1 pass sạch sẽ. Một lần giao lại có độ trễ sống sót qua một lần khởi động lại tiến trình trong vòng
+ba mili giây, tốt hơn thứ thiết kế cần. Chỉ xét Q1 thì
+độ trễ do broker giữ là câu trả lời đúng.
+
+Q2 loại nó. Một message đang chờ hết độ trễ **giữ luôn slot acknowledgement
+của nó**. Ba message đang ngủ trên `max_ack_pending: 3` làm hai
+message sẵn có thành không fetch được — không phải chậm, mà là không fetch được. Nhân chuyện đó lên quy mô một nền tảng: một
+khách hàng có endpoint sập hai tiếng chiếm mất năng lực giao
+thuộc về mọi khách hàng khác, và chính các endpoint đang chạy tốt là
+những cái ngừng được phục vụ. FR-WHK-05 nói endpoint của một khách hàng không được
+làm chậm việc giao cho khách hàng khác, và một độ trễ do broker giữ làm điều đó sai
+theo cấu tạo.
+
+<Why>
+
+**Kế hoạch được làm lại, không phải vá.** Phép đo tới sau khi
+thiết kế đã viết, và phản ứng lương thiện với "cơ chế tôi đã lên kế hoạch có một
+tính chất vi phạm một yêu cầu" là lên kế hoạch lại, không phải thêm một lời rào rồi
+đi tiếp. Research R1 và R13 ghi lại thứ đã đổi và vì sao.
+
+Thứ thay thế nhỏ hơn, và đó là phần đáng chú ý. Phần chờ
+trở thành một cột `next_attempt_at`, và thứ rút nó là vòng lặp relay của chương outbox
+với thêm một điều kiện — một cơ chế mà người đọc đã sở hữu sẵn.
+
+</Why>
+
+Nên chính cái dòng delivery *là* cái lịch:
 
 ```diff title="services/api/src/db/schema.ts"
 @@ -1,10 +1,11 @@
@@ -947,6 +1155,19 @@ Q2  do delayed messages hold the ack-pending budget?
 +);
 ```
 
+<Figure caption="Dòng delivery chính là cái lịch. Chẳng gì ngủ trong broker; một delivery chưa tới hạn đơn giản là một dòng chưa câu query nào chọn." code={figTheSchedule} />
+
+Index bộ phận là toàn bộ lập luận về hiệu năng gói trong một dòng: câu
+query rút chỉ bao giờ hỏi các dòng `pending`, nên một index chỉ chứa
+các dòng `pending` sẽ luôn nhỏ bất kể bao nhiêu dòng đã giao chất đống phía
+sau.
+
+Và bảng tier sống trong api, không phải trong dispatcher, trông có vẻ sai cho tới khi
+bạn để ý ai đọc nó. Các tier được `recordAttemptOutcome` tra khi
+nó tính `next_attempt_at` kế tiếp, và đó là một lệnh ghi database, nên
+hiến pháp IV đặt nó trong api. Đặt cái lịch trong dispatcher sẽ
+có vẻ tự nhiên mà lại đặt sai chỗ:
+
 ```ts title="services/api/src/webhooks/schedule.ts"
 // The retry schedule (FR-WHK-03).
 //
@@ -1039,9 +1260,17 @@ export function nextAttemptAt(attempt: number, from: Date = new Date()): Date | 
 }
 ```
 
-## Expansion bên trong claim
+## Mở rộng, bên trong phần giành
 
-Một event có thể fan out thành nhiều delivery theo subscription. Expansion phải diễn ra trong hoặc sau claim có ownership rõ, để hai dispatcher không cùng tạo/gửi duplicate delivery khi cùng nhìn thấy event.
+Một event có thể khớp nhiều endpoint. Biến một thành nhiều là khoảnh khắc một
+bản trùng trở nên đắt, bởi một event được giao lại mà mở rộng hai lần sẽ
+gửi cho mọi khách hàng khớp một webhook thứ hai.
+
+Kế hoạch đầu publish N message lên broker, một cái cho mỗi lần giao. Đó là một
+lệnh ghi kép: phần giành commit vào PostgreSQL, rồi N lần publish đi tới NATS, và một
+cú crash ở giữa để hai bên bất đồng. Ghi N **dòng** thay vào đó đặt
+phần mở rộng vào bên trong transaction của phần giành, nơi bảo đảm của chương broker đã
+phủ sẵn:
 
 ```diff title="services/api/src/db/repository.ts"
 @@ -17,19 +17,24 @@ import {
@@ -1727,9 +1956,44 @@ Một event có thể fan out thành nhiều delivery theo subscription. Expansi
          id,
 ```
 
-## Tại sao dispatcher là service riêng
+Cả con số `created` lẫn cờ `duplicate` đều quay về, và dispatcher
+ghi log chúng. Một bản trùng không phải lỗi. Nó là phần giành đang làm việc của nó, và một
+người vận hành đọc `duplicate=true` trong một dòng log là đang xem cơ chế chạy,
+chứ không phải tìm ra một vấn đề để điều tra.
 
-Dispatcher có lifecycle, retry, credential và concurrency khác API/gateway. Tách service giữ latency của user path độc lập với customer endpoint và cho phép scale delivery worker theo backlog thay vì theo traffic chat.
+<Why>
+
+**Lọc lượt đăng ký xảy ra lúc mở rộng, không phải lúc giao.** Một endpoint
+không đăng ký `message.created` thì chẳng có dòng nào cả, thay vì một
+dòng rồi sau đó bị bỏ qua. Một dòng delivery tồn tại mà không bao giờ gửi được là một
+lịch thử lại chứa sẵn một chỗ vĩnh viễn không làm gì, và một người vận hành đọc bảng
+chẳng có cách nào phân biệt nó với việc thực sự đang kẹt.
+
+</Why>
+
+## Vì sao dispatcher là một service riêng
+
+Chương outbox thêm outbox relay còn chương broker thêm consumer runtime,
+và cả hai đều sống bên trong api. Chương này thêm một worker nền thứ ba
+và đặt nó vào một thứ triển khai mới. Sự không nhất quán đó cần một lập luận, không thì
+nó chỉ là một sở thích.
+
+Lập luận là: đây là worker đầu tiên mà tác động của nó không phải một lệnh ghi
+database.
+
+Relay đọc outbox rồi publish; consumer giành event rồi ghi
+dòng. Cả hai đều chạm PostgreSQL, và hiến pháp IV nói api sở hữu các lệnh ghi đó,
+nên cả hai thuộc về nơi có các lệnh ghi. Tác động của dispatcher là một request HTTP
+tới server của một khách hàng. Nó chẳng cần truy cập database gì cả, và cho nó một ít
+sẽ nghĩa là một service thứ hai ghi vào PostgreSQL chẳng vì lý do nào ngoài
+sự tiện.
+
+<Figure caption="Ba service, một bên ghi. Dispatcher chỉ với tới trạng thái qua đường nối nội bộ, và đó là thứ làm hiến pháp IV mang tính cấu trúc thay vì một quy tắc người ta phải nhớ." code={figWhereItRuns} />
+
+Thứ mà việc tách *mua được* là một tính chất mà nếu không thì sẽ chỉ là một lập luận. Bên trong
+api, "webhook không làm chậm người dùng cuối" là một tuyên bố về event loop và
+connection pool: thứ bạn suy luận rồi hy vọng. Bắc qua một ranh giới tiến trình
+nó là một tuyên bố về các tiến trình, và bạn giải quyết nó bằng cách không khởi động một cái:
 
 ```ts title="packages/e2e/src/webhooks.itest.ts"
 import { createRequire } from "node:module";
@@ -1883,9 +2147,34 @@ describe("journey: webhooks never stand between the platform and its users", () 
 });
 ```
 
-## Seam, và credential đi qua nó
+Dispatcher không bao giờ được khởi động trong file đó. Nó không tồn tại suốt
+hành trình, và nền tảng được kỳ vọng là không nhận ra: message tới được người dùng
+cuối, còn endpoint của khách hàng thì chẳng nghe thấy gì.
 
-HTTP transport là seam injectable để tests điều khiển timeout, status và body. Credential cho internal dispatch đi qua seam có scope hẹp; không đưa tenant secret hay public credential vào một worker có quyền rộng hơn cần thiết.
+Thứ mà việc tách tốn cũng đáng được nói thẳng như thế, bởi một chương chỉ liệt kê
+các lợi ích của quyết định của chính nó là đang quảng cáo:
+
+- **Một bước nhảy mạng ở chỗ từng là một lần gọi hàm.** Mọi thay đổi trạng thái mà
+  dispatcher tạo ra đều là một vòng HTTP tới api. Đó là độ trễ, một
+  connection pool, và một kiểu thất bại mới (api không với tới được) phải
+  được xử lý thay vì được giả định biến mất.
+- **Một credential phải quản.** Xác thực service-với-service chưa từng tồn tại trong
+  nền tảng này trước đây; giờ thì có, và nó là thêm một secret nữa với một câu chuyện xoay vòng
+  mà ai đó phải sở hữu.
+- **Một thứ triển khai phải vận hành.** Một image thứ hai, một health check thứ hai, một thứ thứ hai
+  có thể chết. File compose phình ra, và CI cũng vậy.
+- **Một API nội bộ giờ là một hợp đồng.** `/internal/dispatch` có hai
+  bên tiêu thụ — dispatcher và các bài test — và đổi nó nghĩa là đổi cả hai.
+
+Cuộc đánh đổi đó có đúng hay không phụ thuộc vào tính chất đang được mua. Ở đây nó là
+sự cô lập giữa server đang hỏng của một khách hàng và dịch vụ của mọi khách hàng
+khác, thứ đáng giá một bước nhảy mạng. Nó sẽ không đáng một bước nhảy cho outbox
+relay, và đó chính là lý do relay vẫn nằm trong api.
+
+## Đường nối, và credential đi qua nó
+
+Dispatcher không ghi được vào PostgreSQL, nên mọi thứ nó cần đổi đều đi
+qua api. Điều đó nghĩa là một loại bên gọi mới, và một loại principal mới:
 
 ```diff title="services/api/src/auth/principal.ts"
 @@ -18,13 +18,47 @@ export interface ApplicationPrincipal {
@@ -1956,6 +2245,23 @@ HTTP transport là seam injectable để tests điều khiển timeout, status v
   * and it lives in the gateway where a browser gives no other choice.) */
 ```
 
+Hãy nhìn `environmentId?: undefined` trên platform principal. Đó không phải
+trang trí; đó là hệ thống kiểu bị bắt phải thực thi hiến pháp I. Một
+credential nền tảng vươn tới mọi environment, nên nó chẳng có một environment nào
+để bị giới hạn vào, và bất cứ đoạn code nào đọc `.environmentId` trên một union principal
+giờ phải xử lý trường hợp không có cái nào. Trình biên dịch tìm ra chỗ đầu tiên
+như thế ngay lập tức, trong một controller viết từ ba chương trước.
+
+<Trap>
+
+**Một credential vươn tới mọi environment thì không bao giờ được chấp nhận trên một route
+công khai.** Nếu được, một bên gọi cầm nó có thể đọc dữ liệu của bất kỳ tenant nào qua
+API thông thường, đó là một lỗ hổng xuyên tenant với một credential hợp lệ đứng
+trước nó: đúng cái thất bại mà hiến pháp I tồn tại để ngăn.
+
+Middleware từ chối nó theo loại chứ không theo danh sách route, bởi một danh sách
+route là thứ mà một route tương lai có thể quên có mặt trong đó:
+
 ```diff title="services/api/src/auth/authenticate.middleware.ts"
 @@ -19,16 +19,49 @@ export const AUTH_DB = "AUTH_DB";
   *
@@ -2008,6 +2314,16 @@ HTTP transport là seam injectable để tests điều khiển timeout, status v
            kind: "application",
            environmentId: key.environmentId,
 ```
+
+Bài test cho chuyện này khởi đầu bằng việc đọc `RELAY_INTERNAL_CREDENTIAL` từ
+môi trường rồi trả về sớm khi nó vắng mặt. CI chẳng bao giờ đặt nó. Suốt vài
+lần build, phép kiểm duy nhất đứng giữa một credential nền tảng và một route
+công khai chẳng làm gì cả, mà lại báo thành công. Một bài test bảo mật tự bỏ qua
+chính nó thì tệ hơn không có test: nó trả lời một câu hỏi nó chưa bao giờ hỏi.
+
+</Trap>
+
+Cách sửa là ngừng hỏi môi trường và bắt đầu quyết định:
 
 ```diff title="services/api/src/auth/credentials.itest.ts"
 @@ -13,12 +13,13 @@ import {
@@ -2100,6 +2416,11 @@ HTTP transport là seam injectable để tests điều khiển timeout, status v
  });
 ```
 
+Trình biên dịch tự tìm ra hệ quả còn lại của principal mới. Một
+controller viết trong chương credentials đọc `.environmentId` trên một principal mà giờ
+có thể là một platform principal, và ngừng biên dịch ngay khoảnh khắc union đổi. Đó
+là toàn bộ giá trị của việc biến sự phân biệt thành một kiểu thay vì một quy ước:
+
 ```diff title="services/api/src/auth/dev-token.controller.ts"
 @@ -52,12 +52,20 @@ export class DevTokenController {
    @UseGuards(CredentialGuard)
@@ -2122,6 +2443,11 @@ HTTP transport là seam injectable để tests điều khiển timeout, status v
      );
      if (!environment) throw new BadRequestException("unknown environment");
 ```
+
+Bản thân đường nối là ba thao tác, và chúng được định hình bởi thứ dispatcher
+*không* được phép làm, chứ không phải thứ nó muốn. Nó không mở rộng được một event, nên nó
+hỏi. Nó không đọc được một secret, nên nó hỏi. Nó không ghi lại được một kết cục, nên nó
+báo cáo một cái:
 
 ```diff title="packages/protocol/src/internal.ts"
 @@ -188,12 +188,125 @@ export const internalSessionResponseSchema = z.strictObject({
@@ -2251,6 +2577,10 @@ HTTP transport là seam injectable để tests điều khiển timeout, status v
  export type InternalSendResponse = z.infer<typeof internalSendResponseSchema>;
  export type InternalMembershipsResponse = z.infer<
 ```
+
+Cả hai phía đều import các schema đó, và đó là thứ ngăn hợp đồng trôi dạt:
+dispatcher không gửi được một hình dạng mà api không parse, bởi chỉ có một
+định nghĩa chứ không phải hai cái tình cờ đồng ý với nhau hôm nay.
 
 ```ts title="services/api/src/internal/dispatch.controller.ts"
 import {
@@ -2435,9 +2765,24 @@ export class DispatchController {
  export class InternalModule {}
 ```
 
-## Relay, lần nữa
+<Trap>
 
-Outbox relay chuyển fact đã commit thành công việc dispatcher có thể claim. Nó vẫn cần retry và observability như những relay trước: publish transient không được là nơi delivery contract biến mất.
+`InternalModule` tự cung cấp `"DB"` của nó thay vì import một cái, và cái provider
+thiếu đó tốn của tôi một buổi chiều. `MessagesModule` *cung cấp* `"DB"` nhưng
+không *export* nó, nên một module tưởng mình với tới được lại phân giải ra
+chẳng gì. Nest báo chuyện đó là một thất bại lúc chạy trong route nào chạm database
+trước tiên, chứ không phải một lỗi đấu dây lúc khởi động. Trong lần chạy tìm ra nó, lane unit
+rớt từ 156 test xuống 40 và hai suite nguyên vẹn đỏ trước khi nguyên nhân trở nên hiển nhiên —
+các con số từ phiên đó, không phải từ cái cây này, nơi cùng lane ấy là 361 test và
+sai lầm kia không còn ở đó để mà mắc nữa.
+
+</Trap>
+
+## Lại là relay, lần nữa
+
+Delivery relay là vòng lặp của chương outbox với thêm một điều kiện. Nó chỉ có
+thế, và việc nó chẳng cần một trừu tượng mới nào chính là bằng chứng rằng
+chương outbox đã kẻ đường nối của nó đúng chỗ:
 
 ```ts title="services/api/src/webhooks/delivery-relay.ts"
 import {
@@ -2612,6 +2957,17 @@ export function createDeliveryRelay({
 }
 ```
 
+`SELECT … FOR UPDATE SKIP LOCKED` làm đúng việc nó đã làm ở chương outbox: hai
+instance api cùng rút một bảng sẽ lấy các dòng khác nhau thay vì tranh nhau
+cùng một dòng. Nửa mới là `next_attempt_at <= now()`. Một dòng chưa tới giờ
+thì đơn giản là không được chọn. Nó chẳng giữ gì, chẳng chặn gì, và chẳng tốn
+gì ngoài một entry index.
+
+Có một thứ đã phải đổi trong publisher của chương outbox, và đó là một giả định được
+sửa lại chứ không phải một cơ chế mới. Publisher bảo đảm stream `EVENTS`
+tồn tại lúc connect, bởi ở chương outbox đó là stream duy nhất. Một stream thứ hai
+làm cho "tôi bảo đảm stream nào tồn tại" thành một tham số:
+
 ```diff title="services/api/src/outbox/jetstream.publisher.ts"
 @@ -93,24 +93,33 @@ export async function ensureStream(nc: NatsConnection): Promise<void> {
    }
@@ -2651,9 +3007,13 @@ export function createDeliveryRelay({
    return {
 ```
 
+Không có nó, lần giao đầu tiên publish lên `deliveries.*` nhận về `503`
+từ một broker chưa bao giờ được bảo rằng stream đó phải tồn tại.
+
 ## Dispatcher
 
-Dispatcher claim một batch, gửi request có signature, rồi atomically ghi attempt và schedule lần sau. Worker crash giữa các bước là case thiết kế, nên claim có lease/timeout để công việc được nhận lại mà không bị kẹt vĩnh viễn.
+Hai consumer, làm hai việc khác nhau. Một cái mở rộng event thành các dòng delivery; cái
+kia post các delivery mà relay đã quyết là tới hạn:
 
 ```ts title="services/dispatcher/src/main.ts"
 import {
@@ -2976,6 +3336,34 @@ if (import.meta.url === `file://${process.argv[1]}`) {
 }
 ```
 
+Việc nhóm trong `drainByEndpoint` chính là tính chất cô lập, và nó có tính
+cấu trúc chứ không phải một lựa chọn tinh chỉnh. FR-WHK-05 nói endpoint của một khách hàng không được
+làm chậm việc giao cho khách hàng khác. Xử lý một batch từng message một và điều đó
+thành sai ngay khoảnh khắc một endpoint duy nhất treo, bởi mọi delivery phía sau
+nó phải chờ hết một timeout chẳng liên quan gì tới nó. Nhóm theo endpoint và
+chạy các nhóm đồng thời làm tính chất đó đúng theo cấu tạo.
+
+Tuần tự hoá *bên trong* một endpoint cũng quan trọng, theo hướng ngược lại. Hai
+lần thử cùng lúc tới cùng một khách hàng sẽ để một lần thử lại vượt lên trước chính
+lần thử nó đang thử lại. Và một khách hàng có server đang vật lộn là
+người cuối cùng đáng được trao thêm tính đồng thời.
+
+<Trap>
+
+**Một lần giao lại của broker không phải một lần thử lại của khách hàng, và lẫn lộn chúng là tiêu
+ngân sách này cho cái kia.** `max_deliver: 10` trên consumer giới hạn số lần
+*broker* trả lại một công việc mà dispatcher đã không xử lý được chút nào: một cú crash,
+hoặc một api không với tới được. Bảy lần thử trong bảng tier giới hạn số lần
+*khách hàng* được liên hệ. Chúng là hai con số khác nhau đếm hai
+thứ khác nhau, và code nói ra điều đó ở chỗ mà nếu không thì ai đó sẽ phải
+đoán.
+
+</Trap>
+
+Việc mở rộng, về phía dispatcher, là một request và không gì khác. Nó không
+ghi được các dòng, nên toàn bộ việc của nó là giải mã một event nó không tin
+rồi nhờ api làm việc đó:
+
 ```ts title="services/dispatcher/src/expand.ts"
 import type { Logger } from "@relay/service-kit";
 
@@ -3054,6 +3442,14 @@ export async function expandOnce(
   return result.duplicate ? "duplicate" : "expanded";
 }
 ```
+
+Phong bì được parse chứ không được tin, vì lý do của chương 2.5: một message
+nằm trong một stream đã có đủ thời gian để thôi khớp với đoạn code
+đọc nó. Và `unparseable` là chung cuộc — cùng những byte ấy thất bại y hệt mỗi
+lần, nên thử lại là tiêu ngân sách lần thử của broker để đi tới một kết luận đã
+có sẵn ngay từ lượt đầu.
+
+Client mang tất cả những thứ này thì nhỏ, và cố ý nhỏ như vậy:
 
 ```ts title="services/dispatcher/src/api-client.ts"
 import {
@@ -3155,6 +3551,9 @@ export function createApiClient(
   };
 }
 ```
+
+Bản thân lần thử thì nhàm, và đó chính là điểm mấu chốt. Mọi thứ thú vị đã được
+quyết trước khi nó chạy:
 
 ```ts title="services/dispatcher/src/deliver.ts"
 import type { Logger } from "@relay/service-kit";
@@ -3289,9 +3688,16 @@ export async function deliverOnce(
 }
 ```
 
+`deliverOnce` không bao giờ ném lỗi vì một thất bại của khách hàng. Một 500, một timeout và một
+kết nối bị từ chối đều là *đầu vào bình thường* của một hệ thống thử lại, và biến chúng
+thành exception sẽ nghĩa là bên gọi không phân biệt được chúng với một
+thất bại thực sự không được phép hấp thụ: api không với tới được. Cái đó thì
+ném, và message được để nguyên chưa acknowledge để công việc quay lại.
+
 ## Dead letter
 
-Sau policy retry, delivery đi vào dead letter với reason và lịch sử attempt. Dead letter không phải thùng rác: nó là record để customer support, metric và eventual replay có owner rõ ràng.
+Bảy lần thử không phải là "cho tới khi được". Nó là một quyết định rằng một số lần giao
+sẽ không bao giờ thành công, và rằng nền tảng dừng lại thay vì thử lại mãi mãi:
 
 ```ts title="services/api/src/db/repository.ts (excerpt)"
     // Attempts exhausted. The dead letter and the state change commit together —
@@ -3314,9 +3720,30 @@ Sau policy retry, delivery đi vào dead letter với reason và lịch sử att
     return { outcome: "dead_lettered" as const, nextAttemptAt: null };
 ```
 
-## Một lượt rà tìm ra bug thật
+Dead letter giữ lại payload và status cuối, bởi khách hàng rồi sẽ
+hỏi chuyện gì đã xảy ra và "nó hỏng" không phải một câu trả lời. Nó được giữ
+bảy ngày và phát lại được, và lần phát lại dùng lại đúng event id
+gốc. Đó là chi tiết quan trọng: một lần phát lại là chính event đó được giao
+lại, không phải một event mới, nên một khách hàng chống trùng theo event id sẽ xử lý nó
+đúng mà chẳng cần ai nói thêm gì.
 
-Rà toàn bộ boundary thường lộ bug mà feature test không chạm: endpoint được canonicalize sai, signature dùng secret cũ sau rotation, hoặc query claim không scope đúng status. Những review này biến “đã chạy demo” thành một contract có thể vận hành.
+<Why>
+
+**Vì sao không tự tắt một endpoint đã hỏng nhiều ngày?** Nhật ký lần thử của FR-WHK-06
+và tự-tắt của FR-WHK-07 đều được hoãn sang một chương sau,
+và việc hoãn là cố ý. Tự tắt là một quyết định chính sách với một
+hệ quả mà khách hàng thấy được — nó ngừng giao webhook cho một người đang
+trả tiền cho chúng — và nó cần nhật ký lần thử để tự biện minh với khách hàng
+sau đó. Ship cơ chế mà không có bằng chứng sẽ nghĩa là tắt các
+endpoint và không giải thích được vì sao.
+
+</Why>
+
+## Một lần đi bộ tìm ra một bug thật
+
+Mọi chương trong loạt này đều ship một script người đọc chạy được. Chương này ship
+hai: một endpoint hư hỏng theo lệnh, và một lần đi bộ đưa một event đi
+suốt tới đó.
 
 ```js title="scripts/hostile-endpoint.mjs"
 // A customer's webhook endpoint, behaving badly on purpose.
@@ -3500,6 +3927,16 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
   });
 }
 ```
+
+Endpoint tự xác minh chữ ký khi được cho một secret, và nó làm thế trong
+khoảng mười lăm dòng mà toàn bộ danh sách phụ thuộc là `node:crypto`. Đó chính là
+điểm mấu chốt: **nếu một chữ ký chỉ kiểm được bằng code của chính nền tảng,
+thì thứ đã xuất bản không phải một hợp đồng.** Cách để biết điều đó là viết
+phía khách hàng mà không nhìn vào phía chúng ta.
+
+Lần đi bộ tự spawn api của nó, bởi dispatcher với tới trạng thái qua HTTP và
+phải có một thứ gì đó ở đầu kia. Một lần đi bộ bảo người đọc khởi động
+ba service trước là một lần đi bộ chẳng ai chạy:
 
 ```js title="scripts/webhook-walk.mjs"
 // The webhook dispatcher chapter walk: one event, all the way to a customer's server.
@@ -3885,6 +4322,8 @@ await stop();
 process.exit(0);
 ```
 
+Chạy lần đi bộ với `--mode=fail` rồi xem lịch giãn ra:
+
 ```text
   tiers: now → 1s → 5s → 30s → 300s → 1800s → 7200s
   7 attempts, then the delivery is dead-lettered.
@@ -3900,6 +4339,8 @@ dead letters               1
   d1d7012d                 attempts=7 last_status=500
 ```
 
+Có điều đó không phải thứ nó làm lần đầu tiên. Đây mới là:
+
 ```text
   attempt 2                failed → pending
   attempt 2                failed → pending
@@ -3910,6 +4351,29 @@ dead letters               0
 === endpoint attempts: 1 ===
 ```
 
+Một lần thử, rồi chẳng gì nữa, mãi mãi.
+
+Nguyên nhân nằm trong nền tảng, không phải trong script. Delivery relay chống trùng
+các lần publish của nó theo delivery id — và một delivery id là **như nhau cho cả bảy
+lần thử**. JetStream gộp mọi lần thử lại vào message của lần thử đầu tiên
+bên trong cửa sổ chống trùng của nó. Lần publish báo thành công. Chẳng message nào tới được
+dispatcher. Và dòng đó vẫn giữ cái `dispatched_at` mà phần giành đã đặt, thứ
+chỉ một báo cáo kết cục mới xoá — mà chẳng kết cục nào sắp tới cả.
+
+**Mọi webhook thất bại đều được thử lại đúng không lần nào, và toàn bộ lịch
+là thứ không với tới được.**
+
+<Trap>
+
+Chẳng gì bắt được nó, và lý do thì đáng giá hơn cả cái bug. Suite delivery
+lái thẳng câu query giành, không có broker trên đường. Suite của dispatcher
+dùng một *delivery mới tinh* cho mỗi trường hợp. Nên chẳng bài test nào trong repository từng
+publish cùng một delivery hai lần — đúng cái tình huống mà mọi lần thử lại
+tạo ra.
+
+Cách sửa là một dòng, và lời chú thích bên cạnh nó dài hơn cả thay đổi, bởi
+thay đổi không phải phần thú vị:
+
 ```ts title="services/api/src/webhooks/delivery-relay.ts (excerpt)"
         // Per attempt, a republish after a crash is still recognisably the same
         // work, which is what the deduplication is for. A NEW attempt is
@@ -3917,13 +4381,20 @@ dead letters               0
         id: `${row.id}:${row.attempt}`,
 ```
 
+</Trap>
+
+Bài test hồi quy chính là lần đi bộ, được làm cho chạy trong CI, và nó đã được kiểm là đỏ
+với khoá cũ trước khi được giữ lại:
+
 ```ts title="services/dispatcher/src/dispatcher.itest.ts (excerpt)"
   it("invariant 10: a FAILED delivery is retried — the same row, a second attempt", async () => {
 ```
 
-## Suite thực sự giữ gì
+## Các suite thực sự giữ gì
 
-Suite giữ các invariant: một event tạo đúng delivery, body ký khớp bytes gửi, retry không duplicate claim, và failure cuối cùng được lưu. Nó không cố giả lập internet; transport seam cung cấp failure có kiểm soát để test policy.
+Ba unit suite và ba integration suite tới cùng chương này. Các suite
+unit thì rẻ và ghim phần số học: bảng tier, vòng mã hoá — giải mã,
+công thức chữ ký:
 
 ```ts title="services/api/src/webhooks/schedule.test.ts"
 import { describe, expect, it } from "vitest";
@@ -4295,6 +4766,10 @@ describe("invariant 5: the trap, asserted rather than warned about", () => {
   });
 });
 ```
+
+Các suite integration là nơi các bảo đảm sống, bởi mỗi cái trong chúng đều
+nói về một thứ chỉ tồn tại khi một broker thật, một database thật và server
+thật của một khách hàng đều ở trong cùng một câu chuyện:
 
 ```ts title="services/api/src/webhooks/deliveries.itest.ts"
 import { randomUUID } from "node:crypto";
@@ -6016,6 +6491,31 @@ describe("the dispatcher", () => {
 });
 ```
 
+<Trap>
+
+**Một thứ triển khai mới thoát khỏi cái cân đo coverage mà chẳng ai gỡ nó
+ra.** Research R12 đã tiên đoán chuyện này và nó xảy ra đúng như mô tả, chỉ khác là
+tệ hơn dự đoán theo một hướng và tốt hơn theo một hướng khác.
+
+Tốt hơn: cái cân đo chẳng cần đổi gì cả. Glob của nó là
+`services/*/src/**`, nên dispatcher được đo ngay khoảnh khắc nó tồn tại, và
+chẳng job CI nào phải thêm bởi mọi lệnh trong workflow đều đã chạy ở
+gốc workspace.
+
+Tệ hơn: đọc nó thì thấy `expand.ts` ở **0%**. Suite của chính dispatcher
+chạm tới phần mở rộng bằng cách gọi repository thẳng vào database, nên
+consumer giải mã một event, nhờ api mở rộng nó, rồi quyết ack-hay-chấm-dứt thì chưa
+từng một lần chạy dưới test.
+
+Và `repository.ts` thì *tụt xuống*, từ 86.30% nhánh còn 78.22%, trượt bốn
+ngưỡng cùng lúc. `deliveryMaterial` và `pendingDeliveryDepth` chỉ được gọi
+bởi dispatcher, mà suite của nó chạy api như một tiến trình con, và coverage của một
+tiến trình con thì không quy về được. Cái hàm duy nhất trong nền tảng
+trao lại signing secret của một khách hàng ở dạng bản rõ, theo thước đo duy nhất mà
+hiến pháp gọi tên, là chưa được test.
+
+Ratchet được nâng lên sau đó, chứ không hạ xuống cho vừa code:
+
 ```diff title="vitest.coverage.config.mts"
 @@ -79,13 +79,13 @@ export default defineConfig({
          branches: 70,
@@ -6092,9 +6592,18 @@ describe("the dispatcher", () => {
          // `if (timer)` in chapter 2.7's `withDeadline`, whose falsy arm cannot be
 ```
 
+</Trap>
+
 ## Ba service, ba container
 
-API, gateway và dispatcher là ba service với dependency/lifecycle riêng. Compose và test harness phải khởi động đúng container, health check và credential để integration test không vô tình chạy dispatcher trong process API.
+Dispatcher là thứ đầu tiên trong repository này phải được *triển khai*
+chứ không phải chạy, và điều đó phơi ra một chuyện. Hai service đã chạy suốt
+tám chương mà chẳng có container image nào, bởi `pnpm dev` luôn
+là đủ. Một service thứ ba làm cho "thứ này thực sự ship thế nào" thành một câu hỏi
+không hoãn được nữa.
+
+Nên cả ba đều có một Dockerfile trong cùng một chương, và cái của api là cái đáng
+đọc. Hai cái kia cùng hình dạng với ít thứ hơn bên trong:
 
 ```dockerfile title="services/api/Dockerfile"
 # The api. The repository's containers arrive with the dispatcher:
@@ -6148,6 +6657,27 @@ USER node
 CMD ["node", "dist/main.js"]
 ```
 
+<Trap>
+
+Hai thứ trong đó là sẹo.
+
+`pnpm exec turbo run build --filter=@relay/api` thay vì
+`pnpm --filter @relay/api build`: filter của pnpm chạy script trong một package
+và **không** build các phụ thuộc workspace mà nó cần. Bên trong một container,
+nơi chẳng gì được build sẵn, chuyện đó tạo ra mười bảy lỗi `TS2307 cannot find module`
+chỉ vào các package có tồn tại. Filter của Turbo hiểu
+đồ thị phụ thuộc và build `^build` trước.
+
+Và `pnpm deploy --legacy`: dưới pnpm 10, `deploy` từ chối chạy trong một
+workspace không có `inject-workspace-packages`, và văn bản lỗi không hề
+nhắc tới cái cờ làm nó chạy được.
+
+</Trap>
+
+Dispatcher là một package workspace mới, không framework và ESM. ADR-15 buộc
+NestJS vào riêng api service, và một ứng dụng Nest thứ hai sẽ là nhận nuôi
+một framework theo quán tính thay vì theo quyết định:
+
 ```json title="services/dispatcher/package.json"
 {
   "name": "@relay/dispatcher",
@@ -6174,6 +6704,10 @@ CMD ["node", "dist/main.js"]
 }
 ```
 
+Gateway cần thêm một thứ nữa trước khi container hoá được: nó
+đã chạy qua `tsx` suốt từ đầu tới giờ và chẳng có script build hay start
+nào của riêng nó:
+
 ```diff title="services/gateway/package.json"
 @@ -2,12 +2,14 @@
    "name": "@relay/gateway",
@@ -6191,6 +6725,9 @@ CMD ["node", "dist/main.js"]
    "dependencies": {
      "@relay/protocol": "workspace:*",
 ```
+
+Package mới gia nhập đồ thị build. Một dòng, và vô hình cho tới khi có thứ gì đó
+không rebuild:
 
 ```diff title="turbo.json"
 @@ -41,12 +41,15 @@
@@ -6275,6 +6812,10 @@ CMD ["node", "dist/main.js"]
    // Nest calls onModuleDestroy on shutdown hooks; without this the relay's loop
    // would outlive the process's intent to stop.
 ```
+
+File compose có thêm ba service nằm sau một profile, nên `docker compose up -d --wait`
+mặc định vẫn dựng lên bốn kho lưu trữ và không gì khác, để một
+người đọc theo chương 1.2 nhận đúng thứ chương đó hứa:
 
 ```diff title="compose.yaml"
 @@ -1,9 +1,16 @@
@@ -6372,6 +6913,16 @@ CMD ["node", "dist/main.js"]
    clickhouse-data:
 ```
 
+Mục `extra_hosts` ở đó vì một lý do rất cụ thể. Một dispatcher bên trong một
+container phân giải `127.0.0.1` thành loopback của chính container, nên một webhook
+endpoint chạy trên máy của lập trình viên là không với tới được từ đó. Không có dòng
+ấy thì bước "dừng dispatcher rồi xem tồn đọng rút cạn" của phần quickstart
+không chạy được như đã viết: endpoint sẽ chẳng bao giờ nhận được gì, và
+màn trình diễn sẽ trông như một bug của nền tảng.
+
+Giàn test đầu-cuối cũng cần khoá mã hoá, bởi nó spawn các service
+thật:
+
 ```diff title="packages/e2e/src/harness.ts"
 @@ -387,24 +387,34 @@ export async function boot({ gateways = 2 } = {}): Promise<System> {
        "RELAY_REDIS_PORT",
@@ -6410,6 +6961,11 @@ CMD ["node", "dist/main.js"]
    // `apiPort + 1 + i` — a band derived from it. Run on its own the lane is green; run
 ```
 
+<Checkpoint>
+
+Dựng các kho lưu trữ lên, build, migrate, rồi chạy lần đi bộ với một endpoint
+khoẻ mạnh:
+
 ```console
 $ node scripts/hostile-endpoint.mjs --mode=ok --secret=hunter2 &
 $ node scripts/webhook-walk.mjs --secret=hunter2 --print-signing-material
@@ -6429,11 +6985,16 @@ expanded a second time     created=0 duplicate=true
   delivery bd9b677a        attempt=1 state=delivered
 ```
 
+Và về phía endpoint:
+
 ```console
 MARKER received n=1 mode=ok
 MARKER signature n=1 VERIFIED
 MARKER answered n=1 status=200
 ```
+
+Rồi nhờ nó xác minh một body đã được serialise lại, và xem hợp đồng làm
+việc của nó:
 
 ```console
 $ node scripts/hostile-endpoint.mjs --secret=hunter2 --reserialize
@@ -6442,6 +7003,8 @@ MARKER signature n=1 FAILED (body re-serialised)
     verify the BYTES that were transmitted, never the object.
 ```
 
+Cả hai lane, và cổng coverage:
+
 ```console
 $ pnpm test && pnpm test:integration && pnpm coverage
  Tests  361 passed (361)     # 7 packages
@@ -6449,4 +7012,62 @@ $ pnpm test && pnpm test:integration && pnpm coverage
  Tests  1038 passed (1038)   # 68 files, 338.6 s
 ```
 
-<ChapterFooter id="3.19" locale="vi" />
+**Ba con số đó chẳng nói gì về chương này.** Chúng là cả cái cây, và trong
+thứ tự này bề mặt webhook tới sau mười tám chương chứ không phải bốn — nên
+các lane đã lớn sẵn trước khi một dòng nào của nó được viết. Thứ các con số này có ích là
+hình dạng của khoảng cách giữa chúng: lane unit là 361 test và tốn vài giây, lane
+integration là 686 và tốn vài phút, còn lane coverage chạy cả hai trong một tiến trình
+và tốn 338.6 giây. Một suite chuyển giữa các cột đó khi nó cần một database, một
+broker, hay một service thứ hai — và chương này thêm thứ đầu tiên trong cuốn sách cần
+cả ba.
+
+Nền tảng giờ giao webhook tới khách hàng, ký chúng để khách hàng
+chứng minh được chúng đến từ chúng ta, thử lại một endpoint hỏng theo một lịch giãn dần, và
+bỏ cuộc theo cách mà ai đó giải thích được sau này. Nó làm tất cả những thứ đó từ một
+service không ghi được vào database của chính nó.
+
+</Checkpoint>
+
+<Checkpoint title="Fourteen files changed here without a fence, in two groups">
+
+**SÁU CÁI LÀ CÔNG VIỆC CỦA RIÊNG THỨ TỰ NÀY VÀ KHÔNG CÓ BẢN ĐỐI ỨNG ĐÃ XUẤT BẢN.** Chúng tồn tại bởi
+chương này tới thứ mười chín chứ không phải thứ năm, sau những cái cân đo chưa từng tồn tại
+khi bề mặt webhook được viết:
+
+`services/api/src/isolation/targets.ts` có thêm mười một phân loại còn
+`gauntlet.itest.ts` thêm chín đòn tấn công, với `fixtures.ts` gieo một endpoint cho mỗi tenant để một
+endpoint id lạ tồn tại mà giả mạo. Phép suy dẫn gọi tên cả mười một ngay khoảnh khắc module
+đăng ký — bảy cái `/v1/webhooks*` và bốn cái `/internal/dispatch/*` bên dưới chúng — và
+ba trong bốn route dispatch được ghi là `exempt` kèm một lý do chứ không phải `write` với
+không đòn tấn công nào, bởi chúng nhận một delivery id mờ đục rồi suy ra tenant từ chính dòng đó.
+Chẳng có request xuyên environment nào để mà tạo ra.
+
+`packages/protocol/src/codes.ts` và `codes.test.ts` có thêm năm mã từ chối. Đó là một
+defect mà chương này đã ship và không nhìn thấy được: cả năm cái 422 của service đều trống,
+và `ProtocolErrorFilter` chỉ suy ra một mã từ status cho 400, 401, 403 và 404, nên
+mỗi cái đi ra với `code: "internal_error"` kèm một status đúng và một thông điệp đúng
+bên cạnh. Các tên đã được xuất bản sẵn trong `docs/08-error-reference.md`; registry
+thì tụt lại phía sau.
+
+`packages/test-harness/src/bound-port.test.ts` có thêm một lời khai báo. Nó suy ra danh sách của nó
+từ `services/*/src/main.ts` để một service mới tới mà chẳng ai phải nhớ — và
+dispatcher tới mà không có `listen`, không `createServer` và không `PORT`, bởi nó không phải một
+server. Được khai báo bằng tên kèm lý do, và được khẳng định theo cả hai hướng.
+
+**TÁM CÁI LÀ FILE BUILD, VÀ CHƯƠNG CHỈ TRƯNG RA CÁI MANG THEO MỘT LẬP LUẬN.**
+`services/api/Dockerfile` được fence nguyên vẹn bởi bản build nhiều tầng, workspace đã
+tỉa và người dùng non-root chính là các quyết định; `services/gateway/Dockerfile` và
+`services/dispatcher/Dockerfile` khác nó mỗi cái hai dòng — entrypoint và
+tên package — và được mô tả bằng văn xuôi ở trên chứ không lặp lại. `.dockerignore`, hai
+`tsconfig.build.json`, `services/dispatcher/tsconfig.json` và cấu hình vitest của
+dispatcher là cấu hình mà người đọc chép một lần rồi không bao giờ đọc lại.
+
+`services/api/src/webhooks/webhooks.itest.ts` là cái thứ mười bốn, và là ngoại lệ trong
+nhóm đó: nó là 243 dòng khẳng định mà chương lập luận cho rất dài và không trưng ra.
+Phần ở trên nói nó giữ gì. Thứ được THÊM ở đây là một bài test — năm lời từ chối
+theo mã, `docs_url` và field — và nó là cái khẳng định mà sự vắng mặt của nó đã để
+`internal_error` ship trong body.
+
+</Checkpoint>
+
+<ChapterFooter id="3.19" />
