@@ -267,7 +267,7 @@ export const series: Part[] = [
         path: "/part-2/chapter-07/the-tunnel",
         title: "The tunnel",
         status: "published",
-        translatedIn: [],
+        translatedIn: ["vi"],
         readerProduces:
           "Resume protocol: cursors, backfill, subscribe-before-backfill buffer",
         sourceDoc: "docs/04-srs.md, docs/05-sad.md",
@@ -340,6 +340,7 @@ export const series: Part[] = [
         titleVi: "Lỗi có trang để xem",
         readerProducesVi:
           "Một registry khai báo mọi error code nền tảng có thể gửi, một chỗ duy nhất dựng docs_url, và một hàm ném lỗi có kiểu để code gõ sai không compile được",
+        translatedIn: ["vi"],
       },
       {
         id: "3.4",
@@ -356,6 +357,7 @@ export const series: Part[] = [
         titleVi: "Cửa ải cô lập tenant",
         readerProducesVi:
           "Một bộ kiểm thử cross-tenant tự suy ra danh sách mục tiêu từ router đang chạy, ba dạng tấn công so sánh một CẶP phản hồi thay vì một mã trạng thái, một kiểm tra cấu trúc rằng mọi bảng đều có đường về tenant, và tầng socket bị tấn công từ chính frame union của protocol",
+        translatedIn: ["vi"],
       },
       {
         id: "3.5",
@@ -422,6 +424,7 @@ export const series: Part[] = [
         titleVi: "Các endpoint và các thiết bị đo",
         readerProducesVi:
           "Hai endpoint công khai mà Part 3 cần, tính đẳng xâm do unique index bảo đảm chứ không phải do bộ nhớ, mọi lỗi validation lần đầu gọi tên field của nó, guard thao tác toàn cục canh chín bảng thay vì năm, và độ phủ nhánh của tầng repository được trả lời bằng một con số",
+        translatedIn: ["vi"],
       },
       {
         id: "3.9",
@@ -439,6 +442,7 @@ export const series: Part[] = [
         titleVi: "Kênh mà khách hàng kiểm soát",
         readerProducesVi:
           "Một loại kênh private thực sự quyết định điều gì đó ở cả bốn cửa vào, xoá thành viên và phân quyền, lưu trữ kênh để từ chối gửi tin mà không tiết lộ kênh có tồn tại, và một gauntlet tấn công chính tenant của bạn",
+        translatedIn: ["vi"],
       },
       {
         id: "3.10",
@@ -455,6 +459,7 @@ export const series: Part[] = [
         titleVi: "Những gì một người dùng thấy",
         readerProducesVi:
           "Danh sách channel phân trang bằng cursor và xếp theo hoạt động, số tin chưa đọc suy ra từ chính sequence mà đường ghi vẫn duy trì, profile người dùng được tạo ngầm ở lần xác thực đầu tiên, một người dùng đã xoá mà tin nhắn vẫn còn, và một lệnh ban có hiệu lực cả ở cửa vào lẫn trên đường gửi",
+        translatedIn: ["vi"],
       },
       {
         id: "3.11",
@@ -472,6 +477,7 @@ export const series: Part[] = [
         titleVi: "Người gửi mà một tin nhắn chưa từng có",
         readerProducesVi:
           "Bot user mang theo description mà cơ sở dữ liệu bắt buộc, một người gửi trên mọi tin nhắn do compiler bảo đảm chứ không phải test, một credential nói với danh nghĩa phần mềm, không phải con người, từ chối mà không hé lộ ai tồn tại, và một bot vẫn tính tiền như active user nhưng miễn trần gửi",
+        translatedIn: ["vi"],
       },
       {
         id: "3.12",
@@ -491,6 +497,7 @@ export const series: Part[] = [
         titleVi: "Tin nhắn chưa từng tới",
         readerProducesVi:
           "Một tin nhắn gửi qua REST tới được socket đang mở, một thứ tự tách theo transport vì response của request handler CHÍNH LÀ acknowledgement của nó, một publisher sống sót qua broker đã chết trong 2 ms, và một điều khoản P1 được đo là chưa thoả rồi ghi lại thay vì bị thu hẹp",
+        translatedIn: ["vi"],
       },
       {
         id: "3.13",
@@ -745,6 +752,7 @@ export const series: Part[] = [
         titleVi: "Cột mốc: cửa ải cô lập tenant",
         readerProducesVi:
           "Ba lần cố ý tái tạo lỗi — một lần vẫn xanh và dạy ta giới hạn của bộ kiểm thử",
+        translatedIn: ["vi"],
       },
       {
         id: "3.26",
@@ -761,6 +769,7 @@ export const series: Part[] = [
         titleVi: "Cột mốc: một người ngoài tích hợp",
         readerProducesVi:
           "Một package tích hợp bị niêm phong về mặt cơ chế nên không thể import code trong workspace, và một phán quyết cho tiêu chí ra khỏi Phase 2 của SRS kèm những gì đã đo và những gì chỉ được giả định",
+        translatedIn: ["vi"],
       },
     ],
   },
