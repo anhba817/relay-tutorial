@@ -1,12 +1,14 @@
 import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
 import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figTwoDirections, figTwoPositions, figBoundaryBurst } from "./figures";
 
 export const metadata = {
   title: "Những giới hạn bạn thấy trước — Building Relay",
   description:
-    "Rate limit cần được thấy trước qua response, signal và docs. Chương này đặt fixed window counter, policy per tenant, REST/socket refusal và quota vocabulary cuối cùng được emit.",
+    "Một rate limiter thì dễ. Hai cái, cố ý hỏng theo hai hướng ngược nhau, mới là chương này. Redis không phải nguồn sự thật — nên limiter cho tenant vẫn phục vụ khi nó biến mất, còn limiter cho auth thì tuyệt đối không được.",
   alternates: {
-    canonical: "/vi/part-3/chapter-22/limits-you-can-see-coming",
+    canonical: "/part-3/chapter-22/limits-you-can-see-coming",
     languages: {
       en: "/part-3/chapter-22/limits-you-can-see-coming",
       vi: "/vi/part-3/chapter-22/limits-you-can-see-coming",
@@ -14,25 +16,115 @@ export const metadata = {
   },
 };
 
-<ChapterHeader id="3.22" locale="vi" />
+<ChapterHeader id="3.22" />
 
-Giới hạn hữu ích là giới hạn developer nhìn thấy trước khi bất ngờ chạm nó. Counter, policy,
-response field và docs phải cùng nói một sự thật.
+Chương 1.3 đã viết ra một từ mà nền tảng chưa bao giờ nói.
 
 ```ts title="packages/protocol/src/codes.ts (excerpt)"
 rate_limited: "too many requests",
 ```
 
-## Requirement mà afterthought sẽ làm hỏng
+Được export, được định kiểu, và không gì phát ra nó từ ngày đó tới hôm nay — phần còn lại của
+Phần 1, toàn bộ Phần 2, và mọi chương của Phần 3 trước chương này. Close code
+`4008`, "quota exhausted", cũng vậy, và `4009`, "server shutdown (drain)", cũng thế. Và
+theo một kiểu khác, là field thứ tư của error envelope mà hiến pháp V đòi hỏi
+từ 1.3 — `request_id`, bên trên một comment hứa rằng nó *"sẽ gia nhập ở Phần 2, khi có một
+gateway để đúc ra nó"*. Một gateway xuất hiện ở 1.4 và chẳng đúc ra gì cả.
 
-## Tại sao window cố định
+Chương này thực thi hai trong bốn thứ đó, giải thích vì sao cái thứ ba vẫn cố ý không được
+dùng, và nói cái thứ tư đang chờ gì.
+
+Bản thân cái limiter thì dễ. Hai cái, cố ý hỏng theo hai hướng ngược
+nhau, mới là chương này.
+
+<SkipAhead>
+
+Nếu bạn phải bỏ qua: bộ đếm cửa sổ cố định theo từng environment trong Redis, khoá
+`rl:{env}:{op}:{window}`, tăng bằng `INCR` và hết hạn bằng `PEXPIRE` — không
+Lua, bởi chẳng có gì cần làm cho nguyên tử mà `INCR` chưa làm
+nguyên tử sẵn. Ba header trên **mọi** 2xx cũng như mọi 429, đó là
+cái yêu cầu mà một suy nghĩ chắp vá sẽ làm hỏng. Policy là ba cột nullable trên
+`environments`; null nghĩa là "dùng mặc định" và **không phải** số không, bởi
+từ-chối-tất-cả phải còn diễn đạt được. Limiter cho tenant **hỏng theo hướng mở** khi
+Redis biến mất, còn limiter cho lần xác thực thất bại **thì không được** — nó suy giảm
+xuống một bộ đếm trong tiến trình ở cùng ngưỡng. Gateway giữ bộ đếm riêng và
+client riêng của nó, và vẫn không có database nào — nửa sau của
+chương là bộ đếm đó, và bằng chứng rằng api và gateway tăng
+cùng một key chứ không phải hai. `request_id` gia nhập error envelope ở đây, và hoá ra
+đó là thay đổi vươn xa nhất: mọi suite trong cây so sánh
+nguyên hai error body đều phải được bảo là bỏ qua field nào. Trạng thái cuối chương
+là tag **`rework/part3-ch22`**.
+
+</SkipAhead>
+
+## Cái yêu cầu mà một suy nghĩ chắp vá sẽ làm hỏng
+
+Đây là FR-RTL-02, và nó đáng đọc hai lần:
+
+> Mọi response — 2xx cũng như 429 — đều mang `X-RateLimit-Limit`,
+> `X-RateLimit-Remaining` và `X-RateLimit-Reset`.
+
+Nửa 429 là thứ ai cũng xây. Nửa 2xx mới là cái yêu cầu. Một client
+chỉ biết hạn mức của mình vào đúng lúc nó cạn là đã biết quá muộn:
+nó có thể lùi lại, nhưng nó đã không thể tự điều nhịp. Journey map nói y hệt
+điều đó từ phía lập trình viên, ở pha Test, dưới dạng một lời than về API của
+người khác:
+
+> rate limit trả về `429` mà không có header nào cho biết hạn mức còn lại hay
+> thời điểm reset
+
+Đó là FR-RTL-02 viết bởi chính người gặp nó. Một limiter chắp vào một service
+đã hoàn thiện sẽ đặt header ở chỗ viết lời từ chối, bởi đó là
+nhánh biết về giới hạn. Đặt chúng lên đường thành công nghĩa là nó chạy trên
+**mọi** request và ghi vào cả những response nó không từ chối — một thiết kế khác,
+được quyết trước khi viết code chứ không phải sau.
+
+## Vì sao cửa sổ là cố định
+
+Phương án hiển nhiên là token bucket, và nó là thuật toán tốt hơn trên
+gần như mọi trục: nó làm mượt các đợt bùng, nó không có ranh giới, và nó là thứ bạn
+sẽ với lấy nếu yêu cầu duy nhất là "giới hạn tốc độ".
+
+<Figure caption="Cái giá của cửa sổ cố định, và thứ nó mua được." code={figBoundaryBurst} />
+
+Một cửa sổ cố định có thể bị tiêu hai lần ở ranh giới: 600 request trong giây cuối
+của một phút và 600 trong giây đầu của phút sau là 1.200 trong hai giây
+trên một giới hạn 600 mỗi phút. Điều đó có thật và không comment nào sửa được.
+
+Đó là cái giá của `X-RateLimit-Reset`.
+
+<Why title="A refilling bucket cannot answer the question the header asks">
+
+`Reset` gọi tên **một khoảnh khắc**: thời điểm hạn mức quay lại. Một cửa sổ cố định
+có đúng một cái, và mọi response bên trong nó báo cùng một giá trị — đó là lý do
+cả ba response bên dưới đều nói `1787197740`.
+
+Một token bucket chẳng có khoảnh khắc nào như vậy. Hạn mức của nó quay lại liên tục, nên
+câu trả lời trung thực cho "khi nào tôi được thử lại" là một độ dốc: một slot trong 0,1 giây, mười trong
+một giây, sáu trăm trong sáu mươi. Chọn một điểm trên đường cong đó và gọi nó là `Reset`
+thì bạn vừa bịa ra một con số mà thuật toán không có, nói cho một client
+sẽ tin nó.
+
+Lời hứa của Relay ở đây là một cái header, không phải một bảo đảm định hình lưu lượng. Nên: cửa sổ cố định,
+đợt bùng ở ranh giới được gọi tên thay vì giấu đi, và một `Reset` nói đúng điều nó nói.
+
+</Why>
+
+Bởi cửa sổ là cố định, bộ đếm là hai lệnh Redis và không Lua:
 
 ```ts title="services/api/src/limits/store.ts (excerpt)"
 const count = await redis.incr(key);
 if (count === 1) await redis.pexpire(key, windowMs);
 ```
 
-## Arithmetic, và nơi nó sống
+Chẳng có gì ở đây cần làm cho nguyên tử. `INCR` là nguyên tử và trả về giá trị mới,
+nên lần đọc và lần ghi là một thao tác. `PEXPIRE` được canh trên
+`count === 1` bởi chỉ request tạo ra key mới đặt thời hạn cho nó. Một
+script Lua ở đây sẽ thoả mãn một thói quen chứ không phải một cuộc đua.
+
+## Phần số học, và nơi nó sống
+
+Ba hàm, không kho, không đồng hồ:
 
 ```ts title="services/api/src/limits/bucket.ts"
 // The fixed-window arithmetic (research R1).
@@ -97,7 +189,16 @@ export function remaining(count: number, limit: number): number {
 }
 ```
 
-## Policy: ba column, và null không phải zero
+
+
+`windowStart` làm tròn xuống, và đó là thứ cho phép hai api instance và một gateway thống nhất
+được đang tăng bucket nào mà không cần trao đổi một lời. Không ai điều phối;
+tất cả đều chia cùng một cái đồng hồ theo cùng một cách.
+
+Vì là hàm thuần, một ranh giới cửa sổ là `windowStart(59_999, 60_000) === 0` được khẳng định
+chứ không phải được ngủ qua.
+
+## Policy: ba cột, và null không phải số không
 
 ```sql title="services/api/migrations/0012_limit_policy.sql"
 -- Per-environment rate limit policy (FR-RTL-04).
@@ -132,13 +233,80 @@ ALTER TABLE environments
     CHECK (connect_limit_per_minute IS NULL OR connect_limit_per_minute >= 0);
 ```
 
+
+
+Cả ba đều nullable, và tính nullable đó chính là quyết định.
+
+<Why title="Null means use the default; zero means refuse everything">
+
+Hình dạng hấp dẫn là `NOT NULL DEFAULT 600`, gọn hơn và có ít hơn một
+trạng thái. Nó cũng làm cho "từ chối tất cả" thành không diễn đạt được: số không trở nên
+không phân biệt được với một environment chưa ai cấu hình, và tắt một cái
+một cách cố ý — cho một tenant lạm dụng hoặc một key bị lộ — là thứ một
+người vận hành cần.
+
+Vậy nên ba trạng thái: null là "mặc định hôm nay là gì", một con số là chính
+con số đó, và không là không. Mặc định được phân giải trong repository chứ không phải tại
+chỗ gọi, bởi "null nghĩa là mặc định" là tính chất của cột và một
+bên gọi phải nhớ điều đó sẽ quên.
+
+</Why>
+
+`environments` vốn đã có một cột trông có vẻ hợp cho việc này, và nó đã
+cố ý không được dùng:
+
 ```ts title="services/api/src/db/schema.ts (excerpt)"
 quotaConfig: jsonb("quota_config").notNull().default({}),
 ```
 
-## Default đến từ đâu
+Khai báo ở 2.1, gọi tên trong SRS §6.1, rỗng suốt mười bảy chương — và đặt tên cho
+**quota**. Rate limit và quota là hai lời hứa khác nhau: một cái phù du và
+có thể mất, cái kia là tiền và phải bền. Nhét cái này vào một field
+đặt tên cho cái kia là gộp ngay trong schema đúng cái thứ mà chương này dành cả
+độ dài của nó để tách ra.
 
-## Hai vị trí trong chain, đều bị ép buộc
+## Các giá trị mặc định đến từ đâu
+
+Bốn con số, và mỗi con số đều được suy ra chứ không phải được chọn:
+
+| Thao tác | Mặc định | Suy ra từ |
+|---|---|---|
+| REST request | 600/phút | ngân sách P95 của NFR-PRF-01 ở một nhịp bền vững |
+| Gửi message | 600/phút | y hệt, và cố ý bằng nhau |
+| Kết nối | 3.000/phút | 10.000 mỗi gateway instance của NFR-SCL-01 |
+| Xác thực thất bại | 10/phút/IP | đủ chậm để chặn một lượt quét, đủ nhanh để không khoá ai vì gõ nhầm |
+
+Giới hạn connect ban đầu là 60/phút, và sai đi năm mươi lần.
+NFR-SCL-01 là một yêu cầu P1 cho mười nghìn kết nối mỗi gateway instance;
+ở mức 60 một phút thì việc đó mất **167 phút**. Một giới hạn khiến một yêu cầu năng lực P1
+không thể đạt được dưới ba tiếng là một cái bug có hẳn một cột policy.
+
+<Trap title="Even at 3,000, one promise only half holds">
+
+NFR-REL-03 yêu cầu client kết nối lại sau khi gateway khởi động lại. Ở mức 3.000 một
+phút, một environment mười nghìn kết nối mất hơn ba phút để quay
+lại — và đó là trường hợp *tốt*, khi nó vừa đủ trên một instance. Trải ra nhiều
+instance, bộ đếm dùng chung từ chối các lần kết nối lại từ tất cả cùng lúc.
+
+Câu trả lời đúng đắn là một khoảng ân hạn để drain, và close code **`4009`** tồn tại
+đúng cho việc đó — "server shutdown (drain)", không gì phát ra nó, bởi chưa có drain nào
+để phát. NFR-REL-03 để phần miễn trừ cho chương nào dựng ra một cái.
+
+Được gọi tên chứ không được sửa. Một chương lặng lẽ xuất bản một giới hạn xung đột với
+một yêu cầu độ tin cậy sẽ tệ hơn một chương nói ra chỗ xung đột
+nằm ở đâu.
+
+</Trap>
+
+## Hai vị trí trong chuỗi, cả hai đều bị ép
+
+<Figure caption="Chuỗi middleware, và vì sao mỗi limiter ngồi đúng chỗ của nó." code={figTwoPositions} />
+
+Limiter cho tenant chạy **sau** `AuthenticateMiddleware` và không có lựa chọn nào khác:
+giới hạn thuộc về một environment, và không gì biết đó là environment nào cho tới khi credential
+được phân giải. Bộ đếm xác thực thất bại chạy **bên trong** nó, và cũng không có
+lựa chọn nào khác: nó đếm trường hợp không có principal, nên nó không thể chạy ở
+bất cứ đâu giả định là có một cái.
 
 ```ts title="services/api/src/auth/authenticate.middleware.ts (excerpt)"
 const address = clientAddress(req);
@@ -153,6 +321,20 @@ if (principal !== null) {
 }
 ```
 
+Sự thất bại được *quan sát* ở đây và bị *từ chối* ở chỗ khác: middleware này chưa bao giờ
+ném lỗi, kể từ chương credentials, nên nó đặt một cờ và `CredentialGuard` dựng cái 429 lên
+từ đó.
+
+<Trap title="`req.url` is `/`, and the request log has said so since chapter 2.2">
+
+Phiên bản đầu của limiter đếm ra số không. Express viết lại `req.url`
+tương đối so với điểm mount, nên bên trong một middleware mount ở gốc app nó
+đọc ra `/` cho mọi request trong hệ thống, và `operationsFor("POST", "/")`
+trả về `[]`.
+
+Đường dẫn đầy đủ là `req.originalUrl`. Sửa limiter lại lòi ra đúng cái bug đó ở một
+file bên cạnh, trong đoạn code chẳng ai ngờ tới:
+
 ```ts title="services/api/src/request-context.middleware.ts (excerpt)"
 const path =
   (req as { originalUrl?: string }).originalUrl ?? req.url ?? "/";
@@ -160,7 +342,18 @@ const path =
 path,                    // was: path: req.url
 ```
 
-## Thứ được đếm, và thứ không
+Dùng chuỗi fallback thay vì chỉ mỗi `req.originalUrl`, bởi
+`IncomingMessage` không có thuộc tính đó: nó là của Express, thêm vào cái object
+mà Node giao lại, còn middleware này được định kiểu theo của Node.
+
+Mọi dòng log có cấu trúc mà nền tảng này phát ra từ chương 2.2 đều ghi
+`path: "/"`. Không gì hỏng và không test nào nhận ra. Một bug trong một field quan sát
+là vô hình theo cấu tạo: thứ lẽ ra sẽ báo cho bạn chính là thứ đang
+hỏng.
+
+</Trap>
+
+## Thứ gì được đếm, và thứ gì không
 
 ```ts title="services/api/src/limits/rate-limit.middleware.ts (excerpt)"
 export function operationsFor(method: string, path: string): LimitedOperation[] {
@@ -170,7 +363,38 @@ export function operationsFor(method: string, path: string): LimitedOperation[] 
 }
 ```
 
+Một lần gửi message tốn **hai** ngân sách, một request và một message. Mọi thứ khác
+dưới `/v1/` tốn một request, và bất cứ thứ gì ngoài đó không tốn gì — `/healthz`,
+đường nối nội bộ của gateway, phần báo cáo kết quả của dispatcher.
+
+<Why title="The internal seam cannot be exempted by looking at the principal">
+
+Miễn trừ hiển nhiên là "đừng giới hạn credential của chính nền tảng", và nó
+không chạy. Chương credentials đã quyết rằng gateway chuyển tiếp token của **người dùng cuối** chứ không
+tự khẳng định một danh tính của riêng nó, nên các lời gọi nội bộ của nó phân giải thành
+`kind: "user"` và không phân biệt được với lưu lượng của khách hàng ở mức principal.
+Chỉ miễn trừ platform credential thì một environment chạm giới hạn REST sẽ mất
+các socket của nó, vì một ngân sách mà socket không bao giờ tiêu. Miễn trừ phải khoá theo
+**đường dẫn**.
+
+Dispatcher được miễn hai lần: theo đường dẫn, và vì chẳng có environment nào để khoá
+lên. Sự dư thừa đó không phải thiết kế; nó rơi ra từ hai quy tắc, và bộ sabotage
+là thứ làm nó hiện ra. Bỏ quy tắc đường dẫn đi thì dispatcher vẫn chạy
+và gateway hỏng — đó là lời phát biểu rõ nhất có thể về việc miễn trừ nào
+đang gánh cho bên gọi nào.
+
+</Why>
+
+Bóp cổ dispatcher sẽ biến backlog webhook của một khách hàng thành một sự đình trệ
+cho mọi khách hàng, điều mà FR-WHK-05 cấm bằng đúng chừng ấy chữ.
+
 ## Hai hướng
+
+Đây là chương này.
+
+<Figure caption="Một sự cố, hai limiter, hai câu trả lời trái ngược — và cả hai đều đúng." code={figTwoDirections} />
+
+Redis biến mất. Limiter cho tenant không đếm được, nên nó **vẫn phục vụ request**:
 
 ```
 $ POST /v1/channels/{id}/messages   # 1 of 4, limit is 2
@@ -186,6 +410,20 @@ x-ratelimit-remaining: (absent)
 x-ratelimit-reset: (absent)
 ```
 
+Bốn request trên một giới hạn hai, tất cả đều được phục vụ. SAD §6.3 nói Redis không phải
+nguồn sự thật, và từ chối tất cả vì bộ đếm không dùng được sẽ biến
+một sự cố cache thành một sự cố nền tảng — một thất bại lớn hơn nhiều so với cái nó
+ngăn chặn.
+
+Để ý xem header nào sống sót. `Limit` ở lại: nó là policy đọc từ Postgres và
+không bị suy giảm. `Remaining` và `Reset` biến mất, bởi chúng chỉ tồn tại chừng nào
+còn có thứ gì đó đang đếm. Vắng mặt là câu trả lời trung thực; `-1` là một giá trị canh mà một
+client không biết quy ước sẽ phân tích thành một con số và đọc thành "vượt
+giới hạn của bạn".
+
+Giờ vẫn sự cố đó, vẫn tiến trình đó, vẫn khoảnh khắc đó, nhưng với
+limiter xác thực thất bại:
+
 ```
 $ POST /auth/dev-token   # bad credential 1 of 5, threshold is 3
 HTTP 401
@@ -199,6 +437,33 @@ $ POST /auth/dev-token   # bad credential 5 of 5, threshold is 3
 HTTP 429
 ```
 
+Bị từ chối. Áp lý lẽ của limiter tenant vào đây thì nó cho câu trả lời sai: một
+cửa sổ không giới hạn cho các lần đăng nhập hỏng không phải một sự suy giảm, nó là một cái lỗ, và một
+kẻ tấn công chờ một sự cố cache sẽ có một lượt quét mật khẩu không bị bóp.
+
+<Why title="Failing closed is not the answer either">
+
+Bản năng là đảo ngược quy tắc: nếu hỏng-theo-hướng-mở là sai thì hỏng-theo-hướng-đóng.
+Điều đó biến một lần khởi động lại Redis thành một sự cố xác thực cho mọi khách hàng, kể cả
+những người chẳng ai tấn công — ngăn một thất bại hiếm bằng cách bảo đảm một thất bại
+thường xuyên.
+
+Câu trả lời thứ ba là một bộ đếm trong tiến trình ở cùng ngưỡng. Bảo đảm
+yếu đi từ *N mỗi cửa sổ trên toàn cụm* thành *N mỗi cửa sổ mỗi instance* — một
+bội số nhỏ thay vì vô hạn — và nền tảng vẫn tiếp tục xác thực được.
+
+Cái map bị **chặn kích thước**, bởi nó khoá theo dữ liệu kẻ tấn công điều khiển được và một cái
+không chặn sẽ đóng một lỗ brute-force bằng cách mở một lỗ cạn kiệt bộ nhớ.
+Ở mức trần nó **ngừng nhận key mới** thay vì loại bỏ key cũ, bởi
+việc loại bỏ chính là thứ kẻ tấn công điều khiển: dội mười nghìn địa chỉ mới tinh và mọi
+kẻ tấn công đang bị theo dõi rơi khỏi map. Một key không nhận được thì bị báo là
+không rõ, và không rõ thì bị từ chối.
+
+</Why>
+
+Một dòng trong log, giới hạn một lần mỗi mười giây, bởi một sự cố Redis
+dưới tải sẽ phát ra một dòng mỗi lần thử và biến một sự cố thành hai:
+
 ```json
 {"time":"2026-08-20T03:48:30.986Z","level":"error","service":"api",
  "msg":"limits.auth_degraded",
@@ -206,9 +471,22 @@ HTTP 429
  "tracked":0}
 ```
 
-## Failure đó của ai?
+Không credential và không địa chỉ, theo NFR-SEC-06. `tracked` là số địa chỉ mà
+fallback đang giữ, và đó là thứ cho người vận hành biết mức trần đã gần chưa.
 
-## Gateway: hai limit, hai shape refusal
+## Đó là thất bại của ai?
+
+Bộ đếm khoá theo địa chỉ của **client**, không phải của bên gọi, và làm sai chỗ này
+là một cái lỗ chứ không phải một sự bất tiện. Một cái bắt tay được xác thực qua
+gateway tới api *từ gateway*; khoá theo bên gọi thì mọi lần hỏng của mọi
+khách hàng đổ vào một xô, nên một kẻ tấn công làm cạn một ngưỡng rồi
+ngưỡng đó từ chối tất cả mọi người — một cuộc tấn công từ chối dịch vụ với vũ khí là một rate limiter.
+
+## Gateway: hai giới hạn, hai hình dạng từ chối
+
+Socket có một giới hạn thiết lập và một giới hạn gửi, và hai lời từ chối của nó
+không giống nhau. Một **cái bắt tay** vượt giới hạn nhận một HTTP 429, ghi thẳng lên raw
+upgrade socket trước khi `wss.handleUpgrade` kịp được gọi:
 
 ```ts title="services/gateway/src/session.ts (excerpt)"
 if (decision.over) {
@@ -218,7 +496,44 @@ if (decision.over) {
 wss.handleUpgrade(req, socket, head, (ws) => { … });
 ```
 
-## Một request, hai kiểu trust đối lập
+Một **frame** vượt giới hạn nhận một `error` frame, và kết nối vẫn mở.
+
+<Why title="A refusal has to say when to come back, and a close frame has nowhere to put it">
+
+`Retry-After` là một header HTTP. Một close frame mang một code và một chuỗi lý do
+ngắn, và "4008, thử lại sau" không phải thứ một client lên lịch được. Nên
+lời từ chối ở bắt tay xảy ra khi vẫn còn một HTTP response để ghi
+header lên.
+
+Điều đó cố ý khác với đường 4001 ngay bên dưới nó, vốn
+**hoàn tất** cái bắt tay để rồi đóng nó, bởi EIR-WS-05 đòi một
+close code khi token hỏng và một close code cần một socket để mà tới. Hai
+lời từ chối, hai hình dạng, mỗi cái vì thứ nó phải mang.
+
+Lời từ chối ở frame giữ kết nối mở vì một lý do đáng nói: đóng nó
+sẽ khiến client kết nối lại, một lần kết nối lại tốn một cái bắt tay, và một cái bắt tay
+tiêu hạn mức **thiết lập**. Một limiter đóng socket sẽ là
+trừng phạt kẻ bị giới hạn bằng cách đẩy họ chạm một giới hạn thứ hai.
+
+</Why>
+
+## Một request, hai kiểu tin tưởng trái ngược
+
+Gateway được miễn khỏi limiter tenant — các lời gọi nội bộ của nó không tốn gì của
+khách hàng — và đồng thời không được tin khi nói ai đã gây ra một lần đăng nhập
+hỏng. Một request, cả hai phán quyết.
+
+Nghe như mâu thuẫn mà không phải. *"Lời gọi này có nên tính vào ngân sách của một
+khách hàng không?"* là câu hỏi về **công việc của ai**, và công việc của gateway chính là lưu lượng
+socket của khách hàng, vốn đã được đếm ở mức frame. *"Đó là thất bại của ai?"*
+là câu hỏi về **một credential đến từ đâu**, và gateway chuyển tiếp credential đó
+chứ không tạo ra nó. Tin một service là hạ tầng không giống
+tin nó là một nguồn gốc.
+
+Thứ khác mà gateway không làm được là đọc database. ADR-05 cấm, và
+chương credentials đã trả giá bằng một vòng round trip thay vì gửi signing secret của mọi environment
+tới một service không giữ trạng thái tenant nào. Nên các giới hạn đi nhờ trên authentication
+response mà gateway vốn đã thực hiện:
 
 ```ts title="packages/protocol/src/internal.ts (excerpt)"
 limits: z.strictObject({
@@ -227,7 +542,48 @@ limits: z.strictObject({
 }),
 ```
 
-## Hai service, một counter
+<Trap title="A socket's limit is fixed for its lifetime, and that is a stated property">
+
+Các giới hạn được cache trên `Connection` lúc nó mở, bên cạnh các dấu mà chương
+deduplication đặt ở đó. Một policy thay đổi khi socket đang mở **không** tới được nó cho tới khi
+client kết nối lại. Phương án khác là một lần đọc Postgres cho mỗi frame, từ một service
+không giữ database client nào, trên đúng đường nóng của thứ mà giới hạn bảo vệ.
+
+Được khẳng định chứ không giả định: một test mở một socket, đặt giới hạn gửi của environment
+về không, gửi một frame và mong đợi một **ack** — rồi mở một socket thứ hai
+và mong đợi `rate_limited`. Một hệ quả mà ai đó đã chấp nhận thì đáng có một test;
+nếu không nó là một bất ngờ đang chờ một ticket hỗ trợ.
+
+</Trap>
+
+Thêm một field bắt buộc vào schema đó làm hỏng bảy fixture viết tay, tất cả đều
+được trình biên dịch tìm ra trước khi một test kịp chạy. Làm nó optional kèm default sẽ
+chẳng làm hỏng gì — và cả bảy cái đó khi ấy sẽ lặng lẽ
+chạy qua nhánh mặc định, kể cả hai bài test mà chủ đề của chúng là một
+giới hạn **đã được cấu hình**.
+
+## Hai service, một bộ đếm
+
+Một lần gửi qua socket và một lần gửi qua REST tiêu cùng một ngân sách — một client có thể nhân đôi
+hạn mức bằng cách mở một WebSocket thì chẳng có hạn mức nào — đó là lý do bộ đếm
+sống trong Redis chứ không phải trong tiến trình nào. Không bên nào thấy được bộ nhớ của bên kia.
+
+Vì thế gateway giữ Redis client của riêng nó — **cái thứ chín**, và là cái đầu tiên
+có việc là đếm chứ không phải chuyên chở. Bị ép chứ không phải được chọn, và
+lý do giống nhau cho cả tám cái nó lẽ ra có thể mượn: mỗi cái hoặc là một
+**subscriber**, mà một kết nối ở chế độ subscribe không chạy được `INCR`, hoặc nó thuộc về
+một module **tuỳ chọn** trong session server. Một limiter đi nhờ vòng đời của fan-out
+sẽ biến mất trong mọi cấu hình không có fabric; một cái đi nhờ presence
+sẽ biến mất trong mọi cấu hình không có presence. `main.ts` dựng nó bên cạnh
+các cái khác để `close()` của nó có chủ, và `main.test.ts` đọc mã nguồn file đó để
+khẳng định dòng ấy tồn tại — bởi một module được dựng mà không bao giờ được tiêm vào là code chết với
+mọi dòng xung quanh nó vẫn đang chạy.
+
+Một bài integration test mang lời khẳng định đó, và nó là bài duy nhất trong chương
+không thể làm rẻ hơn: một tiến trình api con thật, một gateway thật, một Redis thật.
+Năm lần gửi qua REST và năm frame `message.send` để lại xô `send` dùng chung
+ở mức **10** và `rest` ở mức **5**. Hai bộ đếm riêng biệt sẽ đọc ra 5 và 5 và pass mọi
+bài test khác trong suite.
 
 ```ts title="services/gateway/src/limits.itest.ts"
 import { spawn, type ChildProcess } from "node:child_process";
@@ -684,6 +1040,15 @@ describe("one counter, two services", () => {
 });
 ```
 
+Tiến trình api con nhận `PORT=0` và suite đọc cổng từ chính dòng
+`listening` của con. Một cổng cấp phát bằng tay thì không kiểm được: con số mà chương này
+lẽ ra đã lấy nằm cùng dải với broker mà lane đang chạy, và thất bại
+là im lặng ở cả hai chiều — tiến trình con không bind được, và health check nhận câu
+trả lời từ bất cứ thứ gì đang thật sự giữ cổng.
+
+Cái client thứ chín cũng phải được *truyền vào*, và một dòng của `main.ts` là toàn bộ
+chuyện đó:
+
 ```diff title="services/gateway/src/main.test.ts"
 @@ -139,29 +139,57 @@ describe("every fabric createServer builds is injected", () => {
    // a property of the text — every module built above the call appears inside it.
@@ -749,7 +1114,51 @@ describe("one counter, two services", () => {
      const missing = built().filter(
 ```
 
-## Tại sao 4008 vẫn không dùng
+<Trap title="The check against an uninjected module could not see this one">
+
+File đó suy ra các fabric từ chính văn bản của `main.ts` chứ không liệt kê chúng, để một
+cái thứ sáu xuất hiện mà không ai phải nhớ. Mẫu của nó là
+`const x = createY({` — một lời gọi với một **đối số object**. `createGatewayLimits()`
+không nhận cái nào; nó đọc url từ môi trường. Nên cái module mà chương này thêm vào
+nằm ngoài phép kiểm được viết ra chính để chuyện này thành bất khả, và nằm ngoài nó
+theo hướng pass: xoá `limits,` khỏi lời gọi `attachSessions` thì
+suite vẫn xanh trong khi mọi socket đều không bị giới hạn.
+
+Phép kiểm tích cực cũng chẳng giúp được gì. Nó khẳng định `built().length > 1`, và
+năm cái tên thoả mãn điều đó dễ như sáu cái. **"Nhiều hơn một" là một phép kiểm chống lại một
+lần parse chẳng tìm thấy gì; nó không phải phép kiểm chống lại một lần parse tìm thấy gần hết.** Giờ
+nó là một assertion trên danh sách theo tên.
+
+Mở rộng mẫu có cái bẫy riêng của nó, và đó là lý do bản vá bị giới hạn trong
+thân của `createServer`: bỏ dấu `{` đi thì cũng khớp cả `createLogger` và
+`createServer` bên dưới hàm, và cả hai cái đó tình cờ thoả mãn phép kiểm
+tiêm vào — nên phép kiểm mở rộng sẽ pass vì lý do sai.
+
+</Trap>
+
+<Trap title="There is no batch send, and that is why FR-RTL-01 was rewritten">
+
+Một bản nháp trước biện minh cho hai ngân sách bằng cách tưởng tượng một request mang nhiều
+message. Chẳng có endpoint nào như thế: `sendMessageBodySchema` và
+`messageSendSchema` mỗi cái mang một `text`.
+
+Nên trên **một** transport đơn lẻ thì hai bộ đếm dịch chuyển cùng nhau, và một limiter
+đếm request không phân biệt được với một cái đếm message. Bài test
+phân biệt được chúng là bài xuyên transport ở trên, nơi năm frame làm dịch chuyển
+`send` và để `rest` yên.
+
+</Trap>
+
+## Vì sao 4008 vẫn không được dùng
+
+`4008` đọc là "quota exhausted". Chưa có quota nào cả.
+
+Với lấy nó chỉ vì nó đã được khai báo sẽ gộp mất sự phân biệt mà chương này
+được dựng lên trên. Một rate limit nói *chậm lại, quay lại sau bốn mươi giây,
+không có gì sai cả*. Một quota nói *bạn đã dùng hết thứ bạn mua*. Chúng hỏng theo
+hai hướng khác nhau, và một cái thuộc về Redis còn cái kia thì không thể.
+
+Nên có một bài test khẳng định không gì trong gateway gửi nó:
 
 ```ts title="services/gateway/src/session.test.ts (excerpt)"
 for (const text of source) {
@@ -758,11 +1167,62 @@ for (const text of source) {
 expect(source.join("")).toMatch(/close\(\s*400[12]/);
 ```
 
+Dòng thứ hai mới quan trọng. Một lời khẳng định về **sự vắng mặt** không thể được
+chứng minh bằng bất kỳ input nào — chẳng có frame nào bạn gửi để quan sát một code
+không bao giờ được gửi — nên phép kiểm đọc mã nguồn. Nhưng một regex nhắm vào một code không ai
+gửi thì pass bất kể regex đó đúng hay sai. Chạy cùng mẫu đó lên
+những code mà gateway *có* gửi mới là thứ làm cho lời khẳng định phủ định đáng
+giá.
+
 ## Field thứ tư
+
+`request_id` giờ nằm trên mọi lỗi mà nền tảng phát ra — REST envelope,
+`error` frame của socket, error filter của framework. Không chỉ riêng 429.
+
+Nó làm hỏng hai mươi ba bài test cô lập tenant trong hai file, và chúng đều đúng
+khi hỏng. Mỗi bài so sánh hai error body xem có bằng nhau không:
 
 ```ts
 expect(await foreign.json()).toEqual(await missing.json());
 ```
+
+Tính chất đó là thật: một credential cho environment sai và một cái cho một
+tài nguyên không tồn tại phải **không phân biệt được**, nếu không lỗi trở thành một nhà tiên tri
+liệt kê ra thứ gì tồn tại. Một id theo từng request làm hai body khác nhau ở một field
+chẳng mang thông tin gì về cả hai, nên phép so sánh bỏ nó ra và so phần
+còn lại — một cách phát biểu chính xác hơn về điều mà các bài test đó luôn muốn nói.
+
+Hai mươi hai trong hai mươi ba cái là cross-tenant gauntlet, và tất cả đều hỏng
+qua một hàm: `comparePair` trong `isolation/attack.ts`, hàm này `JSON.stringify` cả
+hai câu trả lời. Một dòng, một field, hai mươi hai đòn tấn công xanh trở lại.
+
+<Why title="The file that broke had already written down what to do about it">
+
+Phần đầu của `attack.ts` không chỉ giải thích phép so sánh nguyên body. Nó gọi tên
+điều kiện sẽ chấm dứt phép so sánh đó, và nó gọi tên ai sẽ quyết định:
+
+> *"Nên status và nguyên body được so sánh. Chưa có gì phải loại khỏi
+> phép so sánh: error envelope là `code`, `message` và `docs_url`, cả ba
+> đều phải khớp. **Khi một field theo từng request gia nhập, chương thêm nó vào
+> sở hữu quyết định bỏ nó ra khỏi đây** — và chương đó sẽ phải lập luận rằng field ấy
+> không tiết lộ gì về tài nguyên."*
+
+`channels.itest.ts` mang cùng ghi chú đó ở dạng thu nhỏ — *"chưa có gì ở đây là
+theo từng request, nên chưa loại gì cả"* — ba dòng phía trên chính assertion đã
+hỏng.
+
+Vậy là lập luận đã được nợ và nó ngắn. `code`, `message` và `docs_url` là
+những câu trả lời về tài nguyên; `request_id` là một câu trả lời về việc hỏi. Nó là field duy nhất
+trong envelope không suy ra từ thứ được hỏi, và đó chính xác là lý do
+bỏ nó đi không gỡ bỏ lỗ rò nào — và cũng chính xác là lý do không thể bỏ nó lặng lẽ, bởi
+field kế tiếp gia nhập có thể lại suy ra từ chính tài nguyên.
+
+**MỘT COMMENT HƯỚNG TỚI TƯƠNG LAI ĐÁNG VIẾT KHI NÓ GHI LẠI ĐIỀU KIỆN KÍCH HOẠT VÀ
+NGƯỜI SỞ HỮU.** Một cái ghi lại một kết cục thay vào đó — "thứ này tồn tại vì một chương sau
+cần nó" — thì người đọc tìm thấy nó không kiểm được, và repository này có
+một cái như vậy.
+
+</Why>
 
 ```diff title="services/api/src/isolation/attack.ts"
 @@ -9,17 +9,32 @@
@@ -825,6 +1285,9 @@ expect(await foreign.json()).toEqual(await missing.json());
  /** A list's correct answer to "nothing of yours here" is an EMPTY RESULT, and that
 ```
 
+Bài test bề mặt channel duy nhất không đi qua `comparePair` được đối xử y hệt,
+và comment của nó nhận cùng lời chỉnh sửa:
+
 ```diff title="services/api/src/channels/channels.itest.ts"
 @@ -197,17 +197,19 @@ describe("the public channel surface", () => {
  
@@ -853,7 +1316,18 @@ expect(await foreign.json()).toEqual(await missing.json());
      });
 ```
 
-## Signal không được tiêu một send
+## Tín hiệu không được tiêu một lần gửi
+
+FR-014 đòi một thứ mà code vốn đã làm và chẳng gì kiểm được. Một tín hiệu typing
+không phải một lần gửi và không được tiêu ngân sách của một lần gửi — một client giữ một phím
+nếu không sẽ vét cạn hạn mức message của khách hàng bằng một cái chỉ báo.
+
+`session.ts` đã return khỏi nhánh `typing.send` trước khi chạm tới bất cứ thứ gì
+có thể tiêu, kể từ chương typing. **Nên tính chất đó đúng theo cấu tạo
+và không kiểm được**: chẳng có gì bên dưới cái return sớm để mà chạm tới.
+Thêm limiter vào bên dưới nó chính là thứ làm cho cái return sớm trở nên quan trọng, và
+bài test nói rằng nó vẫn tới trước là thứ đứng chắn giữa một chỉ báo và một
+ngân sách.
 
 ```diff title="services/gateway/src/typing.itest.ts"
 @@ -20,12 +20,13 @@ import { createLogger, serve, type Logger } from "@relay/service-kit";
@@ -986,9 +1460,51 @@ expect(await foreign.json()).toEqual(await missing.json());
     *
 ```
 
-## Limit developer được kỳ vọng sẽ chạm
+<Why title="Asserted on the limiter, not on a counter">
 
-## Capture tìm ra gì mà test không thấy
+Một double ghi lại chứng minh nhánh typing không bao giờ **chạm tới** `limits.spend`. Một
+bộ đếm đọc ra từ Redis chứng minh con số không dịch chuyển — điều cũng đúng với một
+nhánh tiêu rồi hoàn lại, và với một nhánh tiêu vào một key chẳng ai
+đọc. Hai cách cài đặt thoả mãn "con số không dịch chuyển" và chỉ một
+thoả mãn "lời gọi đó chưa bao giờ được thực hiện".
+
+Được phủ định bằng cách dời cái return sớm xuống dưới limiter: năm tín hiệu, năm lần tiêu `send`
+được ghi lại, đỏ.
+
+</Why>
+
+## Một giới hạn mà lập trình viên được kỳ vọng sẽ chạm phải
+
+Pha Test của journey map có lập trình viên cố ý lái một rate limit,
+để xem thư viện client của cô ấy làm gì với một cái 429. Cô ấy là người dùng duy nhất trong bản đồ
+chủ động chạm tới 600 một phút.
+
+Đó là lý do FR-RTL-04 nói giới hạn của một môi trường phát triển được kỳ vọng là sẽ được
+nâng lên. Các cột là theo từng environment, nên nâng một cái để test tải không
+làm dịch chuyển trần của production — mà một policy dùng chung sẽ có nghĩa đúng như vậy.
+
+<Trap title="The test named after tenant isolation was not the one testing it">
+
+Bộ sabotage có một mutation làm mọi environment dùng chung một
+bộ đếm — một lỗi xuyên tenant đúng loại mà hiến pháp I tồn tại để
+ngăn chặn. Ba bài test hỏng. Bài tên là *"một override áp dụng cho MỘT
+environment, không phải cho mọi environment"* **không** nằm trong số đó.
+
+Nó gieo hai environment, cho một cái giới hạn thấp, và kiểm xem cái thấp có bị
+từ chối trước không. Với một bộ đếm dùng chung thì nó vẫn bị — giới hạn thấp hơn chạm số của nó
+trước, bất kể ai đang tiêu. Bài test khẳng định một hệ quả sống sót qua
+chính cái lỗi mà nó được đặt tên theo.
+
+Thứ bắt được nó là cho hai environment những giới hạn cấu hình **khác nhau** và
+kiểm mỗi cái được thực thi ở con số của riêng nó, điều mà một bộ đếm dùng chung không giả được. Một
+bài test đặt tên theo một tính chất không phải bằng chứng rằng tính chất đó được kiểm.
+
+</Trap>
+
+## Thứ bản ghi hình bắt được mà các bài test thì không
+
+Chương này ghi lại các bản ghi thay vì mô tả chúng. Bản ghi đầu tiên
+của một cái 429 in ra thế này:
 
 ```
 HTTP 429
@@ -996,6 +1512,22 @@ x-ratelimit-limit: 3
 retry-after: 22
 {"code":"rate_limited","message":"too many messages for this environment; …"}
 ```
+
+`Limit: 3` bên trên "too many messages", trên một environment có giới hạn gửi là 2.
+
+Cả hai ngân sách chạm mức còn lại bằng không trên request đó trong khi chỉ một cái vượt: với
+`rest` ở 3 và `send` ở 2, lần gửi thứ ba để rest ở 3 trên 3 — đã tiêu hết, chưa
+vượt — và send ở 3 trên 2, tức là đã vượt. Header mô tả cái nào còn ít nhất,
+hoà thì thuộc về cái đầu, và cái đầu là `rest`. Nên body gọi tên
+ngân sách đã từ chối còn header gọi tên cái kia. Một client đọc
+`Limit: 3`, tự điều nhịp ở ba một phút, và bị từ chối ở hai.
+
+Bản vá là một dòng: một lời từ chối mô tả cái ngân sách đã từ chối, và "còn ít
+nhất" chỉ chi phối những response đang được phục vụ. Mười tám bài integration test phủ
+middleware đó và không cái nào bắt được, bởi mỗi cái khẳng định một field và chẳng ai
+nhìn vào một response trọn vẹn.
+
+Sau khi sửa:
 
 ```
 $ POST /v1/channels/{id}/messages   # the first send
@@ -1024,13 +1556,106 @@ retry-after: 51
 }
 ```
 
-## Chương này đổi gì ngoài code
+`x-ratelimit-reset` là cùng một giá trị trên cả ba, và đó là cửa sổ cố định
+đang là một cửa sổ cố định. Và body có bốn field, thứ nó chưa từng có trước
+chương này.
+
+## Chương này đã đổi gì bên ngoài code
+
+Ba thứ, mỗi thứ là điều một chương buộc phải nói ra thành tiếng.
+
+### Nó sửa SRS
+
+EIR-API-04 ghi lại một error body lồng dưới một khoá `error`:
 
 ```json
 { "error": { "code": "…", "message": "…", "docs_url": "…" } }
 ```
 
-## Toàn bộ chương
+Nền tảng chưa bao giờ phát ra cái đó. Mọi lỗi từ chương 1.3 đều phẳng,
+envelope của hiến pháp V là phẳng, và fence chain đã phát lại các error body
+phẳng vào các chương đã xuất bản suốt từ đó.
+
+Hai tài liệu bất đồng và một cái sai. Bọc mọi error response lại để khớp
+SRS là một thay đổi phá vỡ một hợp đồng công khai — mà CON-05 coi là một
+sự kiện đánh phiên bản — cho một hình dạng chưa ai từng nhận. Nên tài liệu được
+chỉnh theo code: `docs/04-srs.md` bản **1.3** ghi năm field ở
+mức cao nhất và bỏ lớp bọc trong ví dụ. Một chương thay đổi một yêu cầu nguồn thì nói
+ra, và đó là kỷ luật mà fence chain thực thi cho code áp lên
+các tài liệu mà code được dựng từ đó.
+
+### Nó hoàn tất bộ yêu cầu của Phase 2 trong SRS
+
+§7.3 liệt kê Phase 2 là FR-TEN, FR-AUT, FR-WHK và FR-RTL ở mức P2, và FR-RTL-01…04
+là cái cuối trong bốn. **Tiêu chí thoát** của pha là một thứ khác và
+thuộc về cửa ải cô lập: *"một lập trình viên bên ngoài tích hợp chỉ bằng tài liệu
+công khai, không cần trợ giúp."* Các yêu cầu hoàn tất ở đây; pha thoát
+khi một người ngoài repository này dùng được thứ chúng mô tả.
+
+### `docs_url` giờ là placeholder ở đúng một chỗ, và chỗ đó vẫn tốn gì đó
+
+Mọi lỗi đều mang một `docs_url` trỏ tới
+`https://relay.example/docs/errors/{code}`, thứ không phân giải được.
+
+**MỘT NỬA KHOẢN NỢ NÀY ĐÃ ĐƯỢC TRẢ, VÀ BỞI MỘT CHƯƠNG BẠN ĐÃ ĐỌC.** Chương error
+registry đã biến URL thành một hàm — `docsUrl(code)`, một dòng trong `codes.ts`, với
+code làm neo nguyên văn — nên phần host là placeholder ở đúng một chỗ
+chứ không phải ở mọi nơi dựng ra một lỗi. Comment của chính nó nói điều đó
+mua được gì: *"host vẫn là placeholder cho tới khi trang tài liệu tồn tại. Thứ thôi là
+placeholder là SỐ CHỖ phải đổi khi ngày đó tới: một."*
+
+**NỬA CÒN LẠI LÀ VẤN ĐỀ CỦA CHƯƠNG NÀY VÀ NÓ KHÓ HƠN.** Một chỗ sửa
+không làm một trang xuất hiện. Cái link vô hại từ chương 1.3, bởi
+các code nó gọi tên là những code lập trình viên gặp khi đang làm sai điều gì đó.
+`rate_limited` thì khác: nó là lỗi đầu tiên mà một tích hợp đang chạy tốt nhận được
+**thường xuyên**, vào đúng lúc tác giả của nó muốn tra cứu.
+
+Thời điểm rất đắt. Chương này khép lại bộ yêu cầu cho một pha
+thoát bằng việc tích hợp chỉ từ tài liệu công khai, trong khi lại xuất bản chính error
+code dễ khiến người ta đi tìm tài liệu không có ở đó nhất.
+Hiến pháp V đòi mọi code phải có một trang tới được; chẳng code nào có. Một trang
+tài liệu không phải việc của chương này để dựng, nhưng một URL ngụ ý ngược lại thì tệ hơn một
+cái vắng mặt.
+
+**VÀ HÌNH DẠNG THÌ ĐÃ SAI SẴN, THỨ MÀ CHỈ MỘT NGƯỜI ĐỌC MỚI NHẬN RA.** `docsUrl` dựng
+một ĐƯỜNG DẪN cho mỗi code — `/docs/errors/rate_limited` — trong khi bản tham chiếu đang tồn tại,
+`docs/08-error-reference.md`, là một tài liệu duy nhất với một tiêu đề cho mỗi code. Kể cả khi có
+host, dạng đường dẫn phân giải tới một trang cho mỗi code mà chẳng gì viết ra; bản tham chiếu
+cần một fragment. Typecheck không thấy được, registry check không thấy được — nó
+so tên chứ không so hình dạng link — và không bài test nào trong repository này hỏi liệu một URL
+có phân giải được không nếu host tồn tại. Đó là một dòng để sửa vào ngày trang tài liệu xuất hiện,
+và đó là toàn bộ lập luận cho việc tập trung nó lại. Nó cũng là một link chết với
+sự tự tin bằng cả một hàm đứng sau, cho tới ngày đó.
+
+<ForwardRef>
+
+Câu hỏi số 5 trong Phụ lục C của SRS hỏi: *"Endpoint token chế độ dev có nên bị giới hạn
+gắt hơn không?"* SRS liệt kê nó là thứ chặn FR-AUT-12, và chương
+này không trả lời nó.
+
+Thứ đã đổi: route đó vốn không có giới hạn và giờ mang giới hạn REST của environment nó,
+cộng thêm bộ đếm xác thực thất bại trên credential mà nó từ chối.
+
+Thứ không đổi: policy là ba cột trên `environments`, nên nó có một chỗ cho
+một environment và **không chỗ nào cho một route**. "Gắt hơn ở riêng endpoint này" là
+thứ không diễn đạt được trong hình dạng chương này đã chọn.
+
+Hình dạng vẫn đúng — sự cô lập của FR-RTL-04 là theo environment, và một
+bảng theo route sẽ là một lần join trên mọi request. Nhưng không ai nhận ra, lúc
+chọn nó, rằng nó đã khoá lại một câu hỏi mở mà SRS đã viết ra từ trước.
+Được ghi lại để chương kế tiếp chạm vào policy bắt đầu từ ràng buộc đó chứ không
+phải khám phá lại nó.
+
+</ForwardRef>
+
+## Toàn văn chương này
+
+Mọi thứ ở trên, đúng như repository đang giữ.
+
+### Bản thân các bộ đếm
+
+Bốn file không có framework nào trong đó, và một migration. `bucket.ts` và
+migration nằm ở trên; đây là phần còn lại.
 
 ```ts title="services/api/src/limits/policy.ts"
 // The limit policy: what each environment is allowed, and what each number rests
@@ -1115,6 +1740,7 @@ export function authFailureThreshold(): number {
  * about. */
 export const WINDOW_MS = 60_000;
 ```
+
 
 ```ts title="services/api/src/limits/fallback.ts"
 // The in-process counter the AUTH limiter falls back to when Redis is gone
@@ -1225,6 +1851,7 @@ export function createFallbackCounter({
   };
 }
 ```
+
 
 ```ts title="services/api/src/limits/store.ts"
 import { Redis } from "ioredis";
@@ -1395,6 +2022,7 @@ export function createCounterStore(
 }
 ```
 
+
 ```ts title="services/api/src/limits/client-address.ts"
 import type { RequestWithPrincipal } from "../auth/principal";
 
@@ -1435,6 +2063,7 @@ export function clientAddress(
   return req.socket?.remoteAddress ?? "unknown";
 }
 ```
+
 
 ```ts title="services/api/src/limits/auth-limiter.ts"
 import { Inject, Injectable } from "@nestjs/common";
@@ -1536,6 +2165,7 @@ export class AuthLimiter {
   }
 }
 ```
+
 
 ```ts title="services/api/src/limits/rate-limit.middleware.ts"
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -1785,6 +2415,7 @@ export class RateLimitMiddleware implements NestMiddleware {
 }
 ```
 
+
 ```ts title="services/gateway/src/limits.ts"
 import { Redis } from "ioredis";
 
@@ -1919,6 +2550,13 @@ export function createGatewayLimits(
 }
 ```
 
+
+Vòng đời của store là một module vì một lý do: một client `ioredis` giữ
+event loop mở, và mọi tài nguyên sống lâu trong api này đều đóng qua
+`OnModuleDestroy`. Không có hook đó thì các suite sẽ treo **sau khi assertion của chúng
+pass** — test xanh và một lane không bao giờ quay về, đó là hình dạng tệ nhất
+có thể có.
+
 ```ts title="services/api/src/limits/limits.module.ts"
 import { Inject, Injectable, Module, type OnModuleDestroy } from "@nestjs/common";
 
@@ -1969,6 +2607,9 @@ export class CounterStoreLifecycle implements OnModuleDestroy {
 })
 export class LimitsModule {}
 ```
+
+Và ba file thuần nhận các bài test thuần: không đồng hồ, không kho, không framework, nên một
+nhánh chúng bỏ sót là một case không ai nghĩ ra chứ không phải một case không ai chạm tới được.
 
 ```ts title="services/api/src/limits/bucket.test.ts"
 import { describe, expect, it } from "vitest";
@@ -2232,6 +2873,15 @@ describe("peek at the cap", () => {
 });
 ```
 
+`fallback.ts` xứng đáng với cách đọc nghiêm khắc nhất của hiến pháp VI: nó là thứ
+limiter AUTH suy giảm xuống, và một nhánh không được đo trong đó là một cái lỗ ngay trong thứ
+mà chương này nói về.
+
+### Bộ từ vựng, cuối cùng cũng được nói ra
+
+`rate_limited` và field thứ tư. Ba trong bốn file này được viết ở
+Phần 1 và đã chờ từ đó.
+
 ```diff title="packages/protocol/src/frames.ts"
 @@ -214,20 +214,32 @@ export const typingSendSchema = z.strictObject({
    payload: z.strictObject({
@@ -2270,6 +2920,7 @@ describe("peek at the cap", () => {
  export const frameSchema = z.discriminatedUnion("type", [
 ```
 
+
 ```diff title="packages/protocol/src/frames.test.ts"
 @@ -69,12 +69,17 @@ const valid: Record<string, unknown> = {
    error: {
@@ -2291,6 +2942,7 @@ describe("peek at the cap", () => {
    for (const [name, frame] of Object.entries(valid)) {
 ```
 
+
 ```diff title="packages/service-kit/src/index.ts"
 @@ -95,12 +95,16 @@ export function serve(options: ServeOptions): Server {
      } else {
@@ -2310,6 +2962,7 @@ describe("peek at the cap", () => {
      logger.log("info", "request", {
        request_id: requestId,
 ```
+
 
 ```diff title="services/api/src/protocol-error.filter.ts"
 @@ -72,16 +72,29 @@ export class ProtocolErrorFilter implements ExceptionFilter {
@@ -2344,6 +2997,17 @@ describe("peek at the cap", () => {
  }
 ```
 
+
+### Đường đi của request
+
+Chuỗi xử lý, principal nó mang theo, và policy nó đọc.
+
+`schema.ts` cũng mất ba con số. Chương deduplication đã viết một comment giải thích rằng
+một số chương trong một comment mã nguồn là một tham chiếu sẽ già đi — và chứng minh điều đó
+bằng cách liệt kê các số thứ tự mà cross-tenant gauntlet đã đi qua. Kế hoạch
+lại dịch chuyển trong lúc chương này đang được viết, và lời giải thích đã cũ đi
+trên chính chủ đề của nó. Giờ nó không gọi tên số nào cả.
+
 ```diff title="services/api/src/request-context.middleware.ts"
 @@ -20,17 +20,28 @@ export class RequestContextMiddleware implements NestMiddleware {
      // ...and on the request, so a handler can put it in a line of its own. The
@@ -2376,6 +3040,7 @@ describe("peek at the cap", () => {
    }
  }
 ```
+
 
 ```diff title="services/api/src/auth/principal.ts"
 @@ -59,19 +59,33 @@ export type Principal =
@@ -2413,6 +3078,7 @@ describe("peek at the cap", () => {
   * never quote the credential (NFR-SEC-06). */
  export function describePrincipalKind(kind: PrincipalKind): string {
 ```
+
 
 ```diff title="services/api/src/auth/authenticate.middleware.ts"
 @@ -3,13 +3,20 @@ import { Inject, Injectable, type NestMiddleware } from "@nestjs/common";
@@ -2479,6 +3145,7 @@ describe("peek at the cap", () => {
  }
 ```
 
+
 ```diff title="services/api/src/auth/credential.guard.ts"
 @@ -1,18 +1,20 @@
  import {
@@ -2539,6 +3206,7 @@ describe("peek at the cap", () => {
      }
 ```
 
+
 ```diff title="services/api/src/auth/auth.module.ts"
 @@ -1,9 +1,11 @@
  import { Module } from "@nestjs/common";
@@ -2575,6 +3243,7 @@ describe("peek at the cap", () => {
  })
  export class AuthModule {}
 ```
+
 
 ```diff title="services/api/src/app.module.ts"
 @@ -20,12 +20,14 @@ import { ConsumerModule } from "./consumer/consumer.module";
@@ -2626,6 +3295,7 @@ describe("peek at the cap", () => {
    }
  }
 ```
+
 
 ```diff title="services/api/src/db/schema.ts"
 @@ -128,23 +128,63 @@ export const environments = pgTable(
@@ -2694,6 +3364,8 @@ describe("peek at the cap", () => {
  // SAD §6.1 does not have one. Its shape is a chapter derivation, recorded here
 ```
 
+
+
 ```diff title="services/api/src/db/repository.ts"
 @@ -1,12 +1,16 @@
  import { randomUUID } from "node:crypto";
@@ -2758,6 +3430,12 @@ describe("peek at the cap", () => {
  // the platform owes itself.
 ```
 
+
+### Socket
+
+Các giới hạn đi nhờ trên authentication response, và gateway cache chúng trên
+kết nối thay vì đọc lại.
+
 ```diff title="packages/protocol/src/internal.ts"
 @@ -193,12 +193,29 @@ export const internalSessionResponseSchema = z.strictObject({
     *
@@ -2790,6 +3468,7 @@ describe("peek at the cap", () => {
   * Here rather than in either service, for the reason the broker chapter moved the event
   * grammar here: a consumer that assembles its own subject filter receives
 ```
+
 
 ```diff title="services/api/src/internal/session.controller.ts"
 @@ -11,13 +11,14 @@ import {
@@ -2842,6 +3521,7 @@ describe("peek at the cap", () => {
  }
 ```
 
+
 ```diff title="services/gateway/src/auth.ts"
 @@ -32,12 +32,17 @@ export type Authentication =
        identity: Identity;
@@ -2876,6 +3556,7 @@ describe("peek at the cap", () => {
  }
 ```
 
+
 ```diff title="services/gateway/src/registry.ts"
 @@ -48,12 +48,22 @@ export interface Connection {
     * like the natural way to bound this and hands the duplicate straight back:
@@ -2901,6 +3582,7 @@ describe("peek at the cap", () => {
  
    add(connection: Connection): void {
 ```
+
 
 ```diff title="services/gateway/src/session.ts"
 @@ -1,8 +1,9 @@
@@ -3238,6 +3920,7 @@ describe("peek at the cap", () => {
      try {
 ```
 
+
 ```diff title="services/gateway/src/main.ts"
 @@ -4,12 +4,13 @@ import { createLogger, serve, type Logger } from "@relay/service-kit";
  import { createApiClient } from "./api-client.js";
@@ -3298,6 +3981,15 @@ describe("peek at the cap", () => {
  if (import.meta.main) {
    const requested = Number(process.env.PORT ?? 4001);
 ```
+
+
+### Các suite giữ gì
+
+Các suite của riêng chương này trước. Limiter của api được lái qua HTTP thật trên
+Postgres và Redis của compose, và mọi lần gửi trong đó đều gọi tên một bot: một application
+credential không mang user riêng, nên người gửi được gieo một lần qua
+repository chứ không phải mỗi lần gửi — **suite này đếm request**, và một lời gọi thừa
+mỗi lần gửi sẽ làm dịch chuyển mọi con số trong đó trong khi các assertion vẫn xanh.
 
 ```ts title="services/api/src/limits/limits.itest.ts"
 import "reflect-metadata";
@@ -4040,6 +4732,15 @@ describe("a store that is not there", () => {
 });
 ```
 
+Hai suite trước đó cố ý nâng ngưỡng xác thực thất bại, và cả hai
+giờ nhận một xô đếm của riêng mình. Nâng ngưỡng là chuyện riêng của một vitest
+worker; **cái key Redis thì không**. Một suite nâng trần của mình mà giữ
+tiền tố mặc định sẽ đẩy một con số dùng chung lên trong khi bản thân nó miễn nhiễm — 8 từ
+một cái và 13 từ cái kia trên một ngưỡng 10, chẳng bị gì từ chối, và chỉ
+bởi các suite spawn một tiến trình con tới api qua `::ffff:127.0.0.1` còn
+cái chạy trong tiến trình tới nó qua `::1`. Hai cách viết localhost là toàn bộ
+sự cô lập.
+
 ```diff title="services/api/src/auth/credentials.itest.ts"
 @@ -15,12 +15,13 @@ import {
    provisionOrganisation,
@@ -4148,6 +4849,14 @@ describe("a store that is not there", () => {
      });
 ```
 
+Hai suite gateway rèn một frame cho mỗi thành viên union để chứng minh đường nối từ chối một
+kiểu đi ra theo HƯỚNG, và cả hai đều mang một ghi chú giải thích vì sao mẫu `error`
+bỏ `request_id`. Mọi mệnh đề của nó đều đúng và kết luận đảo ngược
+ngay khoảnh khắc field đó thành bắt buộc: chính cái `strictObject` từng từ chối một field
+thừa giờ từ chối sự vắng mặt của nó, và chín assertion về hướng trả về
+`invalid_frame`. **Field nào làm một mẫu hợp lệ là một sự thật về schema của
+ngày hôm đó, không phải một quy tắc phát biểu một lần rồi thôi.**
+
 ```diff title="services/gateway/src/isolation.itest.ts"
 @@ -826,19 +826,28 @@ function sample(type: string, channel: string, user: string): unknown {
        return { type, payload: { channel, user, change: "added" } };
@@ -4223,6 +4932,10 @@ describe("a store that is not there", () => {
    /** T034 — T009 INVERTED, and the same shape on purpose.
 ```
 
+Và phần drain của dispatcher nhận một batch đủ lớn để chạm tới chính lần giao của nó,
+đó là commit đầu tiên của chương và chẳng liên quan gì tới giới hạn: một batch cỡ
+nhỏ hơn thứ lane còn để giành được sẽ khẳng định trên bất cứ thứ gì khác đang nằm đó.
+
 ```diff title="services/dispatcher/src/dispatcher.itest.ts"
 @@ -264,12 +264,28 @@ describe("the dispatcher", () => {
      const r = relay.createDeliveryRelay({
@@ -4254,6 +4967,14 @@ describe("a store that is not there", () => {
    /** As `deliverEvent`, but with a tenant's message text in the payload — so
     * invariant 15 has something that must NOT appear in a log line. */
 ```
+
+Ba cái nữa là suite của các chương trước, đổi chỉ vì `request_id`
+làm hai error body vốn phải không phân biệt được lại khác nhau ở một field chẳng nói
+gì về cả hai. `test-event.itest.ts` mất thêm một dòng: chương retry-và-disable
+đã dán nhãn nó bằng một dải các con số làm việc của chính feature đó, thứ phân giải
+tới nơi không người đọc nào theo được. FR-WHK-09 mới là thứ chúng muốn nói — và một lượt quét
+truy vết mà chính lời giải thích của nó làm vấp là một lượt quét người ta bắt đầu phớt lờ, nên các
+con số không được nhắc lại ở đây.
 
 ```diff title="services/gateway/src/session.test.ts"
 @@ -3,18 +3,19 @@ import { afterEach, describe, expect, it } from "vitest";
@@ -4610,6 +5331,7 @@ describe("a store that is not there", () => {
 +});
 ```
 
+
 ```diff title="services/gateway/src/resume.itest.ts"
 @@ -116,20 +116,23 @@ describe("resume across a real fabric", () => {
      // window. Neither side coordinates; only the buffer saves this.
@@ -4757,6 +5479,9 @@ describe("a store that is not there", () => {
        // under test.
 ```
 
+
+
+
 ```diff title="services/api/src/messages/messages.itest.ts"
 @@ -399,22 +399,26 @@ describe("POST /v1/channels/:channelId/messages", () => {
      const missing = await fetch(
@@ -4788,6 +5513,7 @@ describe("a store that is not there", () => {
    // The membership check lives in `repository.sendMessage` and is gated on `userId`
    // being present. `repository.itest.ts` proves the check EXISTS by driving that
 ```
+
 
 ```diff title="services/api/src/webhooks/attempts.itest.ts"
 @@ -18,12 +18,13 @@ import {
@@ -4822,6 +5548,7 @@ describe("a store that is not there", () => {
    }, 30_000);
 ```
 
+
 ```diff title="services/api/src/webhooks/test-event.itest.ts"
 @@ -13,12 +13,13 @@ import {
    createApiKey,
@@ -4855,6 +5582,8 @@ describe("a store that is not there", () => {
      // No dispatcher, nobody playing one. The route must not hang for ever and must
      // not claim the endpoint is unhealthy — it does not know that. This is the one
 ```
+
+
 
 ```diff title="vitest.coverage.config.mts"
 @@ -70,12 +70,24 @@ export default defineConfig({
@@ -4967,6 +5696,11 @@ describe("a store that is not there", () => {
        module: { type: "es6" },
 ```
 
+
+### Cấu hình
+
+Cả stack nhận địa chỉ, và api nhận một dependency vào service đó:
+
 ```diff title="compose.yaml"
 @@ -75,13 +75,13 @@ services:
  
@@ -5018,6 +5752,62 @@ describe("a store that is not there", () => {
        retries: 5
        start_period: 20s
 ```
+
+Tên container chứ không phải `localhost`, bởi mặc định của chính api —
+`redis://localhost:6379` — không phải service Redis khi nhìn từ bên trong một container. Và
+limiter tenant hỏng theo hướng mở theo thiết kế, nên một địa chỉ thiếu sẽ không làm sập
+thứ gì: cả stack đã compose sẽ phục vụ mọi request không giới hạn trong khi vẫn báo một
+giới hạn. Hiến pháp đòi `docker compose up` phải dựng lên toàn bộ stack,
+và đây là thứ làm cho điều đó thành thật chứ không chỉ là im lặng.
+
+Hạn chế `ioredis` cùng hình dạng với thứ chương 2.4 đặt cho `pg`: một store khoá
+theo từng tenant có đúng một nhà, và một client không bị hạn chế ở bất cứ đâu khác là một
+lần đọc xuyên tenant đang chờ được viết ra.
+
+**VÀ NÓ TỚI MUỘN MƯỜI HAI FILE, ĐÓ MỚI LÀ PHẦN THÚ VỊ.** Một quy tắc
+thường hạ cánh trước đoạn code nó quản. Cái này hạ cánh sau: tới lúc
+counter store tồn tại, mười hai file trong repository này đã import `ioredis` —
+hai publisher của api, năm module gateway, và năm suite cần một client
+không thuộc về service nào. Mỗi cái đều phải được miễn trừ **trong cùng
+commit thêm quy tắc**, nếu không quy tắc sẽ làm đỏ một chương chẳng ai đang sửa.
+
+<Trap title="A missing exemption is not a silent failure, and that is the only mercy here">
+
+Chiều ngược lại — một miễn trừ cho một quy tắc chưa tồn tại — thì im lặng. Thêm
+`services/api/src/fanout/**` vào một quy tắc không có thành viên nào thì chẳng gì xảy ra: eslint
+chẳng có hạn chế nào để miễn trừ khỏi, danh sách lớn thêm một mục chết, và
+dấu hiệu rắc rối đầu tiên là vào ngày quy tắc tới.
+
+Đó là lý do các miễn trừ **không** phải một dòng ghi "các file Redis của gateway".
+Có năm lập luận khác nhau trong mười hai cái đó, và một mẫu bao trùm xoá sạch
+cả năm:
+
+- **Ba cái không chạm tới key nào cả** — `chan:{channel_id}`, `member:{channel_id}`,
+  `typing:{channel_id}`. Một subject pub/sub không đọc được; nó chỉ được lắng nghe
+  bởi ai đã subscribe. Chẳng có gì ở đó để một lần đọc xuyên tenant
+  với tới.
+- **Một cái ghép key và chúng mang theo environment** — `presence:{env}:{user}`,
+  đúng hình dạng mà hạn chế này canh giữ. Lập luận của nó là lập luận của chính limiter: mọi
+  key đều đến từ environment id trên kết nối đã xác thực, không đường nào lấy
+  một cái từ client, và không có scan hay đọc theo mẫu.
+- **Một cái đặt environment LÊN ĐẦU** — `conn:{env}:{user}:{slot}`. Đó là
+  ca mạnh nhất trong danh sách chứ không phải yếu nhất, bởi nó mang tính cấu trúc: một
+  lần đọc xuyên tenant cần một bên gọi đưa cho module id của environment khác, và
+  lớp session lấy cái đó từ danh tính đã được api xác minh.
+- **Bốn suite khẳng định trên thứ tới được fabric**, nên nguồn phán xử không thể là client của
+  chính service nào — một spy chứng minh một object được yêu cầu publish, chứ không phải một
+  frame đã tới nơi.
+- **Client thô của một suite là TÁC NHÂN KÍCH THÍCH, không phải nguồn phán xử.** `Membership` cung cấp
+  `onChange`, `subscribeChannel` và `watch` và không có `publish`, bởi api
+  publish còn gateway chỉ bao giờ subscribe. Bài test cần một client để *gây ra*
+  một thay đổi thành viên.
+
+Hai mục là mẫu thư mục và cả hai đều là TẦNG truy cập dữ liệu: `db/**` cho
+driver và `limits/**` cho counter store. Mọi thứ khác là một đường dẫn.
+
+</Trap>
+
+Nửa còn lại của danh sách miễn trừ là bài test đọc nó:
 
 ```diff title="packages/test-harness/src/driver-exempt.test.ts"
 @@ -12,12 +12,18 @@ import { describe, expect, it } from "vitest";
@@ -5079,6 +5869,15 @@ describe("a store that is not there", () => {
    });
  });
 ```
+
+Nó khẳng định ở cả hai chiều — mọi đường dẫn được liệt kê phải tồn tại và phải vẫn còn import
+thứ mà quy tắc hạn chế — và đó là cách một client Redis thứ mười ba không thể lặng lẽ
+thừa hưởng miễn trừ của người khác, và cách một mục cũ không thể nằm đó giữ một
+miễn trừ trên một file đã thôi cần nó. **Một assertion trong đó đã phải được
+sửa, và đó là loại thay đổi duy nhất mà file này lẽ ra cần**: nó nói
+đúng một mục được phép là mẫu thư mục, mà giờ có hai. Hai phép kiểm
+đọc tên các module bị hạn chế ra từ chính quy tắc thì chẳng cần sửa gì, và đó
+chính là thứ chúng được viết ra để làm.
 
 ```diff title="eslint.config.mjs"
 @@ -14,12 +14,23 @@ export default tseslint.config(
@@ -5235,6 +6034,7 @@ describe("a store that is not there", () => {
                  "The query engine lives inside the repository layer only (constitution I, ADR-16).",
 ```
 
+
 ```diff title="turbo.json"
 @@ -43,12 +43,14 @@
          "RELAY_REDIS_PORT",
@@ -5252,6 +6052,7 @@ describe("a store that is not there", () => {
          "RELAY_SMTP_URL",
          "RELAY_MAILPIT_URL",
 ```
+
 
 ```diff title="packages/e2e/src/harness.ts"
 @@ -397,12 +397,19 @@ export async function boot({ gateways = 2 } = {}): Promise<System> {
@@ -5276,6 +6077,70 @@ describe("a store that is not there", () => {
      // drives it explicitly.
 ```
 
-## Chương này không deliver gì
 
-<ChapterFooter id="3.22" locale="vi" />
+**VÀ KHÔNG DEPENDENCY MỚI NÀO**, điều đáng một dòng bởi limiter là
+chương bạn sẽ nghĩ là phải thêm một cái. `ioredis` đã có sẵn trong `services/api/package.json`:
+chương fan-out đặt nó ở đó cho publisher của đường gửi REST. Counter store
+với lấy client mà api vốn đã có, và thứ duy nhất chương này thêm vào
+file đó là không gì cả.
+
+
+## Những gì chương này không giao
+
+**Quota.** FR-RTL-05…08 — trần hàng tháng, giới hạn chi cứng và mềm,
+email 50/80/100% — là chương kế tiếp, và sự phụ thuộc mới là lý do cho
+thứ tự đó chứ không phải độ dài. Một quota là tiêu thụ được đo, và phần đo nó
+đọc thì đến muộn hơn nữa. Dựng quota trên một bộ đếm Redis hỏng theo hướng mở sẽ
+đặt tiền vào một cái kho mà chương này đã dành cả độ dài để lập luận rằng nó được phép làm mất
+đồ, và đó là lý do chương sau với lấy Postgres.
+
+**Bất cứ điều gì về TRẦN kết nối**, và trong thứ tự này đó là một lời tuyên bố phạm vi
+chứ không phải một dependency còn thiếu. Chương connection-cap đã dựng
+registry `conn:{env}:{user}:{slot}`, và nó nằm cách một lớp so với bộ đếm mà chương
+này thêm: cái trần hỏi *có bao nhiêu cái đang mở*, cái giới hạn hỏi *có bao nhiêu cái được mở
+trong phút này*. Hai câu hỏi, hai cơ chế, và cánh cửa kiểm cái rẻ
+trước — limiter là một lệnh `INCR`, còn cái trần là một lượt đi qua tới năm key.
+
+Đáng nói bởi chúng đọc lên giống nhau và hỏng khác nhau. Một client chạm trần phải
+đóng một kết nối; một client vượt giới hạn kết nối phải chờ. Cái đầu là close
+code `4004` sau một error frame, cái thứ hai là một HTTP 429 trước khi cái bắt tay
+hoàn tất — và lý do cho khác biệt đó có hẳn một mục riêng ở trên.
+
+**Giới hạn theo từng API key.** SRS nói theo tenant, và environment là
+ranh giới mà hiến pháp I thực thi. Một key là một credential, không phải một tenant.
+
+**Một dashboard hiển thị hạn mức còn lại.** Chẳng có dashboard nào. Các header
+là nửa lời hứa đó mà hiến pháp V đòi hỏi.
+
+**Một khoảng ân hạn để drain**, thiếu nó thì giới hạn kết nối và NFR-REL-03 chỉ
+đồng ý một nửa. Close code `4009` đã được khai báo và đang chờ.
+
+**Một trang tài liệu**, thứ mà chương này là chương làm nó bắt đầu tốn kém.
+
+Gọi tên một dependency là khác biệt giữa một quyết định phạm vi và một lỗ hổng im lặng.
+
+<Checkpoint>
+
+- `rate_limited` được phát ra lần đầu kể từ khi 1.3 khai báo nó — REST, lời
+  từ chối ở frame, và cái 429 trước bắt tay.
+- `request_id` trên mọi lỗi nền tảng tạo ra, và hai mươi ba
+  bài test cô lập tenant được bảo bỏ qua field nào.
+- `4008` và `4009` vẫn không gì phát ra, với một bài test nói vậy và có thể
+  fail.
+- Ba header trên mọi 2xx cũng như mọi 429, báo cái ngân sách đã
+  từ chối khi có một cái, và cái gần nhất khi không có.
+- Limiter tenant vẫn phục vụ khi Redis biến mất; limiter auth thì từ chối.
+- Hai service, một cái xô: năm lần gửi REST và năm frame để lại
+  `rl:{env}:send:{window}` ở mức 10.
+- Một tín hiệu typing không tiêu gì trong đó, được khẳng định trên limiter chứ không phải trên một
+  bộ đếm.
+- Mười hai miễn trừ `ioredis` với năm lập luận giữa chúng, tất cả trong commit
+  thêm quy tắc, và cả hai chiều của danh sách đều được khẳng định.
+- Cả hai lane xanh. Integration: 37 file, 759 test, 6m10s. Coverage: 80 file,
+  1.183 test, 368,17 s — 92,39% statement, 86,50% branch, 92,09% function,
+  93,83% line, mọi mức ghim theo file đều giữ.
+- Tag `rework/part3-ch22`.
+
+</Checkpoint>
+
+<ChapterFooter id="3.22" />
