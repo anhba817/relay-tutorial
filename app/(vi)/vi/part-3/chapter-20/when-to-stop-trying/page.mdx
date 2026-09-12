@@ -21,7 +21,11 @@ thử sau, và endpoint được disable đúng một lần khi không còn deli
 
 ## Record phải có trước
 
+Một delivery thất bại phải có record durable trước khi policy quyết định retry hay dừng. Nếu failure chỉ tồn tại trong log của worker chết, không ai có thể biết customer đã nhận gì, đã thử bao nhiêu lần hay có cần thông báo không.
+
 ## Seam đã mang nó sẵn
+
+Transport seam từ chương webhook đã trả status, timeout và error đủ để phân loại failure. Chương này dùng seam đó thay vì tạo đường retry song song, giữ tất cả delivery outcome đi qua cùng một nơi.
 
 ```ts title="packages/protocol/src/internal.ts (excerpt)"
 export const internalDeliveryOutcomeRequestSchema = z.strictObject({
@@ -34,6 +38,8 @@ export const internalDeliveryOutcomeRequestSchema = z.strictObject({
 ```
 
 ## Stream thứ ba
+
+Failure stream tách khỏi event và delivery stream vì audience của nó là policy/observability, không phải customer endpoint. Naming stream rõ ràng giúp worker biết event nào cần retry và event nào chỉ để đo lường.
 
 ```diff title="packages/protocol/src/internal.ts"
 @@ -210,12 +210,72 @@ export const ALL_DELIVERIES_SUBJECT = `${DELIVERY_SUBJECT_PREFIX}.>`;
@@ -293,6 +299,8 @@ export const internalDeliveryOutcomeRequestSchema = z.strictObject({
 ```
 
 ## Publish được phép fail, và chương phải nói rõ
+
+Publish failure không thể được nuốt; record vẫn phải còn claimable hoặc worker phải trả nó về trạng thái retry. Contract nói rõ điều này để một outage của stream không âm thầm biến thành delivery bị mất.
 
 ```ts title="services/api/src/webhooks/analytics.ts"
 import { webhookAttemptSubject } from "@relay/protocol";
@@ -664,6 +672,8 @@ describe("publishAttempt swallows its own failure (contract invariant 4)", () =>
 
 ## Publish đi đâu, chính xác
 
+Failure event mang delivery id và reason tới subject/consumer dành cho retry policy, không broadcast lại payload webhook một cách vô tình. Route chính xác giữ secret-bearing data trong boundary cần thiết.
+
 ```diff title="services/api/src/internal/dispatch.controller.ts"
 @@ -14,22 +14,27 @@ import {
    type InternalDeliveryOutcomeRequest,
@@ -821,6 +831,8 @@ describe("publishAttempt swallows its own failure (contract invariant 4)", () =>
 
 ## Giờ là quyết định — và measurement làm nó thay đổi
 
+Backoff và số lần retry là policy dựa trên cost, customer experience và backlog measurement. Một con số hợp lý ở lane có thể làm queue production phình to, nên decision phải gắn với metric và có đường điều chỉnh.
+
 ```text
 attempt 1  at +0h00m00s   (within the 1h window)
 attempt 2  at +0h00m01s   (within the 1h window)
@@ -832,6 +844,8 @@ attempt 7  at +2h35m36s
 ```
 
 ## Failure run là hai column
+
+`failure_count` và `next_attempt_at` mô tả run retry: một cho policy biết đã thử bao nhiêu, một cho scheduler biết khi nào thử tiếp. Không suy ra chúng từ log hay timestamps rải rác; worker cần query shape đơn giản, indexed và atomic.
 
 ```diff title="services/api/src/db/schema.ts"
 @@ -626,29 +626,74 @@ export const webhookEndpoints = pgTable(
@@ -1098,6 +1112,8 @@ ALTER TABLE "webhook_endpoints" ADD CONSTRAINT "webhook_endpoints_disabled_check
 ```
 
 ## Policy, không có gì khác trong đó
+
+Policy chỉ nhận outcome và attempt count rồi trả retry time hoặc terminal decision. Giữ nó thuần giúp test boundary — không để policy tự gửi HTTP, tự update database hoặc tự disable subscription.
 
 ```ts title="services/api/src/webhooks/disable.ts"
 // When to stop trying (FR-007).
@@ -1427,6 +1443,8 @@ describe("disableReason says what happened", () => {
 ```
 
 ## Disabling, nhiều nhất một lần
+
+Terminal failure có thể disable subscription, nhưng action này phải idempotent. Nhiều worker/retry nhìn cùng record không được gửi nhiều notification hay thay đổi state qua lại; conditional update tạo đúng một winner.
 
 ```diff title="services/api/src/db/repository.ts"
 @@ -19,21 +19,29 @@ import {
@@ -2243,6 +2261,8 @@ describe("disableReason says what happened", () => {
 
 ## Sweep đi nhờ loop đã tồn tại
 
+Scheduler quét delivery đến hạn trong loop dispatcher đã có thay vì thêm cron process cạnh tranh claim. Một owner cho queue giúp concurrency, shutdown và metric dễ hiểu hơn.
+
 ```diff title="services/api/src/webhooks/delivery-relay.ts"
 @@ -9,13 +9,17 @@ import {
    RetentionPolicy,
@@ -2376,6 +2396,8 @@ describe("disableReason says what happened", () => {
 
 ## Notification không ai nhận
 
+Disable notification được tạo như work durable, không gọi email đồng bộ trong worker. Customer có thể không nhận email; điều hệ thống hứa là notification đã được schedule/audit, không hứa inbox của bên thứ ba.
+
 ```text
 webhook_disable_notifications
   environment_id · organisation_id · endpoint_id
@@ -2385,6 +2407,8 @@ webhook_disable_notifications
 ```
 
 ## Chứng minh nó hoạt động lại
+
+Khi endpoint hồi phục trước terminal limit, delivery phải được gửi thành công, failure count reset/được ghi đúng và subscription không bị disable. Recovery test quan trọng như exhaustion test; retry system chỉ chứng minh giá trị nếu nó biết dừng thử khi đã thành công.
 
 ```diff title="services/api/src/webhooks/webhooks.service.ts"
 @@ -1,11 +1,17 @@
@@ -2548,6 +2572,8 @@ webhook_disable_notifications
 ```
 
 ## Quan sát nó xảy ra
+
+Metric cần phân biệt retry scheduled, delivery succeeded, terminal failure và subscription disabled. Không có các counter/trace này, operator chỉ thấy customer than phiền mà không biết queue đang chậm, transport lỗi hay policy đã dừng.
 
 ```console
 $ node scripts/hostile-endpoint.mjs --mode=fail --quiet --secret=hunter2
@@ -2818,6 +2844,8 @@ notification rows          0
 
 ## Stream, và một event ngoài nó
 
+Một số event như notification có lifecycle riêng và không nên bị consumer retry hiểu nhầm là webhook delivery. Tách vocabulary ngăn policy reprocess công việc không thuộc nó.
+
 ```console
 $ node scripts/stream-info.mjs ANALYTICS
 stream ANALYTICS
@@ -2923,6 +2951,8 @@ consumers
 ```
 
 ## Suite giữ gì
+
+Suite kiểm tra transition durable qua mọi arm: transient failure, retry, success, terminal disable và notification. Mỗi test quan sát row và event, không chỉ mock function đã được gọi.
 
 ```ts title="services/api/src/webhooks/attempts.itest.ts"
 import "reflect-metadata";
@@ -5007,6 +5037,8 @@ describe("the test event", () => {
 ```
 
 ## Sabotage battery
+
+Sabotage cases cố ý làm publish, claim, transport và notification fail để kiểm tra không có delivery nào kẹt hoặc bị đánh dấu thành công giả. Đây là nơi retry design được chứng minh, không phải ở happy path một lần 200.
 
 ```console
 =============== mutation 1: clear the run on failure instead of on success

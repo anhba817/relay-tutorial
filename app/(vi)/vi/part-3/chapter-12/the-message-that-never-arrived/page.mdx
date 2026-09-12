@@ -23,6 +23,8 @@ vẽ trong architecture trước khi API tồn tại; chương này làm edge đ
 
 ## Edge được vẽ trước khi API tồn tại
 
+Kiến trúc đã vẽ edge từ API sang publish và từ publish sang gateway trước khi endpoint gửi message tồn tại. Chương này biến mũi tên đó thành contract thực: sau khi message được commit, những socket phù hợp phải nhận đúng frame — hoặc caller phải thấy failure mà nó có thể xử lý.
+
 SAD đã mô tả API publish fan-out tới Redis và gateway subscribe `chan:{channel_id}`. Gateway
 đã làm nửa subscribe; API send path write row và outbox rồi dừng. Diagram không phải
 implementation, nhưng nó là contract mà hai nửa phải gặp nhau.
@@ -166,6 +168,8 @@ implementation, nhưng nó là contract mà hai nửa phải gặp nhau.
 
 ## Ordering không thể copy lại
 
+Không được publish trước rồi mới ghi database. Publish có thể tới gateway ngay lập tức, còn transaction có thể rollback; client khi đó nhìn thấy message không tồn tại trong history. Commit tạo fact durable trước, rồi outbox/publisher phát fact ấy theo thứ tự sequence mà channel đã chọn.
+
 Socket send publish sau commit. REST send phải giữ đúng ordering đó: commit message trước,
 rồi publish frame; publish trước commit có thể deliver message mà history chưa thấy.
 
@@ -191,6 +195,8 @@ rồi publish frame; publish trước commit có thể deliver message mà histo
 ```
 
 ## Publish đi đâu, và hai caller quyết định nó
+
+Cả REST handler lẫn socket handler đều tạo message, nên không caller nào được tự dựng fan-out riêng. Một service boundary nhận message đã commit và publish event chuẩn; hai door chỉ khác cách nhận principal và trả response. Nhờ vậy một fix delivery không bị quên ở caller thứ hai.
 
 REST API và socket gateway cùng tạo message, nên phải dùng chung subject, frame và failure
 semantics. Repository giữ data access; caller biết message nào đã được accept để fan-out.
@@ -412,6 +418,8 @@ services/api/src/messages/messages.controller.ts
 
 ## Hai guard, một guard có lý do chưa ai viết ra
 
+Guard của write path xác nhận caller là member và channel thuộc đúng environment. Guard của publish path bảo đảm event không vượt tenant hoặc channel scope. Hai điều có vẻ trùng nhau nhưng bảo vệ hai boundary khác nhau: authorization trước write và routing sau commit.
+
 Publish chỉ chạy cho message có sender và channel visible. Guard tách invalid request khỏi
 delivery failure, đồng thời tránh phát frame mà gateway schema không thể dựng trung thực.
 
@@ -446,6 +454,8 @@ export const messageSchema = z.strictObject({
 
 ## Grammar phải chuyển chỗ, và compiler nói lý do
 
+Frame grammar thuộc protocol package chứ không thuộc API hay gateway. Khi event mang sender, sequence và content mới, type chung buộc publisher và consumer cùng đổi. Compiler error ở hai phía là bằng chứng wire contract không bị một service âm thầm diễn giải khác.
+
 Subject grammar thuộc `@relay/protocol`, nơi API và gateway cùng import. Compiler bắt import
 CommonJS/ESM sai thay vì để Redis client hỏng lúc runtime.
 
@@ -460,6 +470,8 @@ chan:{channel_id}                       the fan-out — carries a channel
 ```
 
 ## Failure mới là nửa thú vị
+
+Database commit thành công nhưng publish thất bại là trạng thái quan trọng nhất. Request không được giả vờ delivery đã xảy ra; outbox hoặc retryable publisher phải giữ event để thử lại, và observability phải làm failure thấy được. Best-effort chỉ là tên khác của message có thể biến mất nếu contract không nói điều đó.
 
 Success chỉ chứng minh Redis sẵn sàng. Publish failure không thể bị catch rồi log trong khi
 REST trả 201; như vậy là best-effort success giả, không phải delivery contract.
@@ -487,6 +499,8 @@ REST trả 201; như vậy là best-effort success giả, không phải delivery
 ```
 
 ## Measurement nói gì về client
+
+Client nhận frame theo sequence và có thể phát hiện gap, nhưng không được suy ra rằng im lặng nghĩa là không có message. Reconnect và history endpoint vẫn là đường phục hồi authoritative; realtime rút ngắn thời gian thấy dữ liệu, không thay thế storage durable.
 
 API lần đầu nói chuyện với Redis, nên measurement bao gồm connection lifecycle, retry và
 hành vi broker unavailable, không chỉ latency.
@@ -521,6 +535,8 @@ hành vi broker unavailable, không chỉ latency.
 
 ## Clause chương này không sửa
 
+Chương này không hứa exactly-once delivery đến browser. Nó hứa message được persist trước, event có shape chung, và failure publish có owner rõ ràng. Duplicates có thể được client xử lý bằng id/sequence; mất event không được lặng lẽ coi là thành công.
+
 Live fan-out không thay resume correctness hay outbox delivery. Các clause đó cần consumer
 và retry semantics riêng, không thể hứa bằng publish trực tiếp.
 
@@ -533,15 +549,21 @@ và retry semantics riêng, không thể hứa bằng publish trực tiếp.
 
 ## Client có thể kết luận gì từ im lặng
 
+Im lặng chỉ nói rằng client chưa quan sát frame, không nói server chưa commit. Sau reconnect, client phải sync từ cursor để bù gap. Contract này ngăn UI dùng timeout như một verdict về dữ liệu vốn có thể đang đi qua retry.
+
 Không thấy live frame không chứng minh message không tồn tại. Cursor và history vẫn là
 authority để phân biệt delay, reconnect và message chưa được gửi.
 
 ## Clause, và amendment không cần thiết
 
+Không cần thêm lời hứa rộng hơn khi code và tests đã thể hiện boundary đúng. Một amendment tốt làm rõ observable behavior; nó không dùng văn bản để che một reliability guarantee mà hệ thống chưa thực sự cung cấp.
+
 Sender chapter sửa attribution; chương này sửa delivery. Không phải chapter liền kề nào
 cũng cần amend requirement—đôi khi implementation là phần còn thiếu.
 
 ## Bảy file chương này đổi nhưng không dạy
+
+Các file wiring, export và fixture cần thay đổi để event đi hết đường, nhưng không phải mỗi diff là một thiết kế mới. Phần cần nhớ là commit-before-publish, shared grammar và failure ownership.
 
 Đây là plumbing hỗ trợ: dependency wiring, test setup và config. Chúng giữ contract hoạt
 động nhưng không phải concept mới.
@@ -957,6 +979,8 @@ cũng cần amend requirement—đôi khi implementation là phần còn thiếu
 ```
 
 ## Bốn file mới, đầy đủ
+
+Những file mới đặt outbox/publisher seam, protocol frame và test ở những nơi contract có thể bị quan sát. Chúng cho phép sau này thay transport mà không buộc REST, socket và gateway tự học lại semantics delivery.
 
 Các file mới đặt publisher boundary, Redis connection và tests cho success/failure path.
 

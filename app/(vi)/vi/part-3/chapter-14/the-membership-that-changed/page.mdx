@@ -21,6 +21,8 @@ revocation tới gateway, cắt quyền tiếp tục nhận và gửi ở đúng
 
 ## Test từng chủ ý assert violation
 
+Test cũ cố tình chứng minh socket vẫn sống sau khi membership đổi — một violation từng được chấp nhận vì revocation chưa tồn tại. Khi requirement đổi, test phải đổi từ tài liệu của khoảng trống thành bằng chứng user mất quyền đúng lúc.
+
 Test cũ chứng minh lỗi: member bị remove vẫn nhận message vì session snapshot membership lúc
 connect. Chương này đảo assertion thành requirement có thể kiểm chứng.
 
@@ -39,6 +41,8 @@ it("keeps delivering to a member who was REMOVED while connected (FR-RTM-10)", a
 ```
 
 ## Ba grammar, và tại sao grammar thứ ba cần hai shape
+
+Membership change đi qua database record, Redis event và gateway instruction. Mỗi grammar có audience và lifetime khác nhau; gateway instruction cần phân biệt “cắt một session” với “cắt mọi session của user trong channel”. Gộp chúng thành một string mơ hồ làm routing sai ở chính lúc security phụ thuộc vào nó.
 
 ```ts title="packages/protocol/src/membership.ts"
 import { z } from "zod";
@@ -119,6 +123,8 @@ export const ALL_CHANNELS = "*";
 ```
 
 ## Durable record đi trước, constitution nói vậy
+
+Revocation được ghi durable trước khi publish. Nếu Redis down hoặc gateway bỏ lỡ event, record là nguồn để retry, reconcile và audit; publish chỉ là cách lan truyền, không phải bằng chứng duy nhất rằng quyền đã bị thu hồi.
 
 ```diff title="services/api/src/outbox/event.ts"
 @@ -19,22 +19,60 @@ export interface MessageCreatedData {
@@ -732,6 +738,8 @@ export const ALL_CHANNELS = "*";
 
 ## Publisher, và down-window không được inherit
 
+Publisher của membership không được kế thừa blind spot của publisher cũ: down-window phải có retry/claim rõ ràng và metric cho event đang chờ. Một event security bị nuốt trong lúc transport lỗi không phải một failure có thể chấp nhận.
+
 ```ts title="services/api/src/membership/publisher.ts"
 import {
   ALL_CHANNELS,
@@ -982,6 +990,8 @@ export class MembershipModule {}
 
 ## Bốn route publish, và một route bị quên
 
+Add, remove, role change và ban đều có thể làm socket hiện tại không còn được phép hành động. Inventory mọi mutation route để không có một endpoint tiện tay cập nhật row mà quên phát revocation. Compiler và tests chỉ giúp sau khi boundary đã được liệt kê.
+
 ```diff title="services/api/src/channels/channels.controller.ts"
 @@ -11,15 +11,21 @@ import {
    Post,
@@ -1125,6 +1135,8 @@ export class MembershipModule {}
 ```
 
 ## Ban, và sentinel không bao giờ tới client
+
+Ban là revocation server-side; client không nên nhận sentinel nội bộ rồi tự quyết định đóng. Gateway nhận instruction có scope, dừng publish/subscribe và đóng socket theo protocol đúng. Như vậy client xấu không thể bỏ qua một message “hãy tự đóng”.
 
 ```diff title="services/api/src/users/users.controller.ts"
 @@ -1,21 +1,31 @@
@@ -1285,6 +1297,8 @@ export class MembershipModule {}
 ```
 
 ## Nửa gateway
+
+Gateway phải vừa nhận pub/sub vừa sở hữu registry các socket cục bộ. Một half xử lý event mà không biết session nào bị ảnh hưởng; half kia biết socket nhưng không có source cross-instance. Chỉ ghép hai nửa mới làm revocation hoạt động khi user kết nối vào instance khác.
 
 ```ts title="services/gateway/src/membership.ts"
 import {
@@ -1589,6 +1603,8 @@ export { ALL_CHANNELS };
 ```
 
 ## Send, rồi cut — và ordering hóa ra không phải requirement
+
+Một frame đang trên đường có thể đến trước khi socket bị cắt; điều requirement hứa là sau revocation, connection không còn thực hiện hành động được bảo vệ. Đừng hứa total ordering xuyên Redis và WebSocket nếu không có cơ chế để đạt nó; hãy test refusal observable sau điểm cắt.
 
 ```text title="services/gateway/src/session.ts (excerpt)"
     for (const connection of subject) {
@@ -1989,6 +2005,8 @@ export { ALL_CHANNELS };
 
 ## Revocation không có cursor
 
+Không như history message, revocation không dùng cursor để client tự bù. Connection bị cắt là tín hiệu; reconnect sẽ authenticate và authorize lại từ durable state. Điều này đơn giản hơn và không để client replay một quyền đã bị thu hồi.
+
 ```text title="services/gateway/src/session.ts (excerpt)"
   async function reread(connection: Connection): Promise<void> {
     const actual = new Set(await api.memberships(connection.identity));
@@ -2173,6 +2191,8 @@ export class MembershipsController {
 
 ## Clause thực sự nói gì
 
+Clause bảo vệ khả năng hành động, không phải thẩm mỹ của một UI update. Người đã bị remove không được gửi, đọc private stream hay giữ socket đặc quyền; chi tiết đóng socket là mechanism để enforcement không phụ thuộc vào cooperation của client.
+
 ```bash
 docker compose up -d --wait
 pnpm --filter @relay/gateway test:integration
@@ -2180,7 +2200,11 @@ pnpm --filter @relay/gateway test:integration
 
 ## Chương này không làm gì
 
+Chương này không xây một general event bus, không giải quyết mọi distributed ordering, và không biến Redis thành source of truth. Nó thêm đúng đường revocation cần cho membership và ban, với durable record đứng trước transport.
+
 ## Instrument đã bắt được gì
+
+Test cross-instance, Redis-down và socket-live bắt những lỗi unit test route không thể thấy. Chúng kiểm tra một hành vi người dùng quan sát được: quyền đổi khi connection vẫn đang tồn tại.
 
 ```text title="services/api/src/isolation/targets.itest.ts (excerpt)"
 classifies every derived target exactly once   unclassified: [GET /internal/memberships]

@@ -41,6 +41,8 @@ là fact về **một người**, còn connection nằm trên nhiều machine kh
 
 ## Count không thể sống cùng chỗ với connection
 
+Giới hạn năm connection là giới hạn theo user, không theo gateway instance. Một instance chỉ thấy socket của nó; đếm cục bộ cho phép một user mở năm socket ở mỗi instance. Count phải sống trong shared store, còn gateway chỉ giữ ownership của connection mà nó đang phục vụ.
+
 CON-02 cấm sticky routing cho correctness. Load balancer có thể đặt năm socket của user lên
 nhiều instance; instance được hỏi count chỉ biết phần của nó.
 
@@ -51,12 +53,16 @@ key từ draft đầu, nhưng bằng hai shape và hai tense; đó là công vi�
 
 ## Tại sao chương này từ chối shape SAD đã publish
 
+SAD từng đặt connection count cạnh gateway như một cache tiện lợi. Khi requirement được kiểm tra với nhiều instance, shape đó mâu thuẫn với chính tính chất global của quota. Tài liệu kiến trúc phải được sửa khi evidence thay đổi, không được bảo vệ chỉ vì đã publish.
+
 SAD dùng sorted set prune khi đọc. Shape đó cần Lua cho atomic check-and-insert, trong khi
 Constitution VII đòi superseding ADR kèm profiling evidence trước khi thêm language thứ hai.
 Năm key Redis độc lập đưa TTL theo từng slot thành property tự nhiên và giữ command bình
 thường; ADR-23 ghi driver và điều kiện đảo quyết định.
 
 ## Năm key, ba command, mọi command đều conditional
+
+Acquire, refresh và release cần atomic conditional commands: chỉ chủ sở hữu hiện tại được gia hạn hoặc giải phóng slot, và count chỉ tăng khi slot thật sự được tạo. Key theo user và connection id tránh việc một socket cũ xóa quota của socket mới.
 
 ```ts title="services/gateway/src/connections.ts"
 import { Redis } from "ioredis";
@@ -387,7 +393,11 @@ export function createConnections({
 
 ## Tombstone nghĩa là free, và đọc ngược nó là defect
 
+Một tombstone hết hạn nghĩa là slot đã tự do, không phải connection vẫn còn. Đọc ngược semantics expiry sẽ từ chối user sau khi connection chết bất thường. TTL là cleanup path quan trọng, không chỉ là tối ưu cho happy path.
+
 ## Refusal đi đâu
+
+Khi không acquire được slot, handshake phải từ chối trước khi session được đăng ký hay subscribe bất cứ channel nào. Response phải có error code và retry semantics rõ để client phân biệt quota với authentication failure.
 
 ```diff title="services/gateway/src/session.ts"
 @@ -16,12 +16,17 @@ import {
@@ -777,6 +787,8 @@ export function createConnections({
 
 ## Close code thứ sáu, và tại sao năm code kia không đủ
 
+Connection-limit cần close code riêng vì client có hành động phục hồi khác với ban, protocol error hay server shutdown. Dùng một code cũ làm mờ metric và khiến UI chỉ có thể đoán lý do bị cắt.
+
 ```diff title="packages/protocol/src/codes.ts"
 @@ -16,12 +16,33 @@ export const CLOSE_CODES = {
    // "a client that cannot tell them apart retries the wrong one for ever".
@@ -898,7 +910,11 @@ export function createConnections({
 
 ## Connection làm gì khi mất chỗ
 
+Nếu refresh thất bại vì slot bị mất hoặc store trả về state mâu thuẫn, gateway đóng connection. Một socket không còn chứng minh mình sở hữu slot không nên tiếp tục hành động dưới quota của user.
+
 ## Fail open, và tại sao log line là evidence duy nhất
+
+Redis unavailable là lựa chọn policy: fail open duy trì availability nhưng không enforce global limit; fail closed bảo vệ quota nhưng từ chối connection lành. Nếu chọn fail open, log line một mình không phải evidence đủ — cần metric và alert để quyết định ấy được quan sát.
 
 ```text
 {"msg":"connection.cap_unenforced","connection_id":"…","user":"tuan"}
@@ -908,6 +924,8 @@ export function createConnections({
 ```
 
 ## Test, và tám cách chúng bị cố ý làm hỏng
+
+Test phải thử hai gateway, TTL expiry, release của owner sai, reconnect và store failure. Những sabotage case này phân biệt test thực sự drive shared state với test chỉ kiểm tra một mock trả về giá trị mong muốn.
 
 ```text
 RELAY_REDIS_URL=redis://127.0.0.1:6399 vitest run src/connections.test.ts
@@ -2423,6 +2441,8 @@ describe("the slot registry, against a real broker", () => {
 
 ## Wiring, và test hỏi có gì bị quên không
 
+Wiring inject limiter vào mọi gateway lifecycle path: open, heartbeat, close và shutdown. Test wiring tồn tại để bắt việc module được viết nhưng không được đăng ký — lỗi mà unit test của limiter không thể thấy.
+
 ```diff title="services/gateway/src/main.ts"
 @@ -2,12 +2,13 @@ import { CLOSE_CODES, docsUrl, frameSchema } from "@relay/protocol";
  import { createLogger, serve, type Logger } from "@relay/service-kit";
@@ -2609,6 +2629,8 @@ const DRIVER_EXEMPT_TESTS = [
 
 ## Lane không còn chạy từng file một
 
+Integration suite giờ có shared Redis và nhiều gateway process, nên chạy từng file tạo môi trường khác với production. Lane phải chạy group đúng để lifecycle và cleanup được kiểm tra như một hệ thống.
+
 ```diff title="services/api/vitest.integration.config.mts"
 @@ -31,20 +31,43 @@ export default defineConfig({
      env: {
@@ -2757,6 +2779,10 @@ const DRIVER_EXEMPT_TESTS = [
 
 ## Bao nhiêu file cùng lúc, và tại sao default sai
 
+Parallelism mặc định có thể làm test tranh port, Redis namespace hoặc resource quota. Concurrency được chọn bằng measurement và isolation thực tế, không theo số CPU mà runner tình cờ thấy.
+
 ## FR-RTM-09 hiện đứng ở đâu
+
+Requirement hiện được enforce ở shared boundary: connection chỉ sống khi giữ một slot, slot tự hết hạn, và client nhận lý do refusal có tên. Các fence bên dưới hiện thực hóa contract đó.
 
 <ChapterFooter id="3.16" locale="vi" />

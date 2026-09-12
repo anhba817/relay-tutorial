@@ -1,12 +1,14 @@
 import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
 import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figOutboxThrice, figHeadOfLine, figWhatMailpitProves } from "./figures";
 
 export const metadata = {
   title: "Email chẳng ai gửi — Building Relay",
   description:
-    "Webhook disable notification đã có table nhưng chưa có mail. Chương này thêm transport SMTP, recipient resolution, claim seam, Mailpit integration và behavior khi mail server unavailable.",
+    "Chương retry-và-disable đã tắt các webhook endpoint hỏng và ghi lại một dòng nói điều đó. Không ai đọc nó. Transport lần này là outbox pattern lần thứ ba — và lần thứ ba không cần một migration nào cả.",
   alternates: {
-    canonical: "/vi/part-3/chapter-21/the-email-nobody-was-sending",
+    canonical: "/part-3/chapter-21/the-email-nobody-was-sending",
     languages: {
       en: "/part-3/chapter-21/the-email-nobody-was-sending",
       vi: "/vi/part-3/chapter-21/the-email-nobody-was-sending",
@@ -14,10 +16,11 @@ export const metadata = {
   },
 };
 
-<ChapterHeader id="3.21" locale="vi" />
+<ChapterHeader id="3.21" />
 
-Webhook bị disable cần thông báo cho đúng người. Record đã tồn tại, nhưng không service nào
-claim nó hay gửi email; chương này nối record, recipient, transport và delivery semantics.
+Chương retry-và-disable đã dựng cơ chế tự động tắt webhook. Một endpoint hỏng suốt một
+giờ với hai mươi lần thử sẽ bị tắt, và một dòng được ghi lại để nói rằng
+tổ chức đó xứng đáng nhận một lời giải thích:
 
 ```ts title="services/api/src/db/repository.ts (excerpt)"
 await tx.insert(webhookDisableNotifications).values({
@@ -29,7 +32,43 @@ await tx.insert(webhookDisableNotifications).values({
 });
 ```
 
-## Table đã có shape đúng
+Hai chương sau, những dòng ấy vẫn nằm đó và `delivered_at` vẫn null trên
+từng dòng một. FR-WHK-07 mới hoàn thành một nửa: nền tảng biết mình nợ một
+email và không có cách nào gửi đi.
+
+Chương này gửi nó. Phần thú vị không nằm ở SMTP.
+
+<SkipAhead>
+
+Nếu bạn phải bỏ qua: transport là **outbox pattern lần thứ ba** —
+giành các dòng chưa gửi theo thứ tự cũ nhất trước bằng `FOR UPDATE SKIP LOCKED`, gửi, đánh dấu —
+và lần thứ ba **không cần migration**, vì chương retry-và-disable đã viết sẵn cột
+`delivered_at` và để nó null. Backlog thoát đi ngay lần chạy đầu như
+công việc chưa gửi bình thường, không có case đặc biệt nào, bởi theo chính định nghĩa
+của claim predicate thì nó đúng là như vậy. Mailpit vào `compose.yaml` như container
+thứ năm, và các test đọc thứ nó **nhận được** thay vì thứ bên gửi
+truyền vào — FR-WHK-07 cấm bí mật nằm trong email và chỉ message đã nhận mới
+phân xử được điều đó. Pattern được chép lại từ chương outbox rồi **cố ý
+đi chệch khỏi nó**, bởi một mail server sống với hầu hết địa chỉ và chết với một địa chỉ,
+và chép nguyên hành vi abort-cả-batch đã cho queue một thứ head-of-line
+blocking vĩnh viễn. Trạng thái cuối chương là tag **`part3-ch9`**.
+
+</SkipAhead>
+
+## Cái bảng vốn đã đúng hình dạng
+
+<Figure caption="Ba outbox, ba chương — và lần thứ ba không tốn một thay đổi schema nào." code={figOutboxThrice} />
+
+Chương outbox rút bảng `outbox` sang NATS, khoá trên `published_at IS NULL`.
+Chương webhook dispatcher rút `webhook_deliveries` sang endpoint của khách, khoá trên state
+và thời điểm đến hạn. Chương này rút `webhook_disable_notifications` sang SMTP, khoá
+trên `delivered_at IS NULL`.
+
+Cột đó tồn tại từ chương retry-và-disable và null trên mọi dòng từng được
+ghi. Nghĩa là claim predicate mà transport cần đã được viết ra hai
+chương trước khi transport tồn tại — và cái backlog hai chương đó
+tích lại không phải vấn đề migration. Nó là công việc chưa gửi, theo chính định nghĩa
+của predicate:
 
 ```sql title="services/api/src/db/repository.ts (excerpt)"
 WHERE n.delivered_at IS NULL
@@ -38,7 +77,60 @@ LIMIT $1
   FOR UPDATE OF n SKIP LOCKED
 ```
 
-## Mailpit, và constitution VII
+<Why title="If the backlog needs special handling, the shape is wrong">
+
+Cám dỗ ở đây là một script chạy một lần: tìm các dòng chương retry-và-disable bỏ lại,
+gửi chúng, rồi mới khởi động relay. Nó sẽ chạy được, và nó sẽ là bằng chứng của một
+sai lầm thiết kế.
+
+Một dòng viết trước khi transport tồn tại và một dòng viết ba mươi giây trước
+khác nhau đúng một điểm — tuổi của chúng — và claim vốn đã sắp theo tuổi.
+Viết code để phân biệt chúng là khẳng định rằng chúng khác loại trong khi
+chúng cùng một loại. Có một test lái ba lần disable riêng biệt
+và rút cả ba trong một pass bình thường, và nó trông
+y hệt mọi test khác trong file — đó mới là điểm mấu chốt.
+
+</Why>
+
+`FOR UPDATE OF n SKIP LOCKED` là cơ chế của chương outbox giữ nguyên: hai api
+instance có thể rút cùng lúc và bỏ qua dòng bên kia đã giành thay vì
+chặn nhau. `OF n` là phần thêm — claim join `environments`,
+`applications` và `webhook_endpoints` để dựng message, và khoá luôn những
+dòng đó sẽ khiến việc gửi một email chặn mất khách đang sửa endpoint của họ.
+
+## Mailpit, và hiến pháp VII
+
+Hiến pháp VII đòi container thứ năm phải tự biện minh. Đây là lời
+biện minh, và nó là FR-WHK-07:
+
+> Thông báo KHÔNG ĐƯỢC chứa signing secret của endpoint, một API key, hay
+> bất kỳ credential nào khác.
+
+<Figure caption="Vì sao assertion cần một server thật chứ không phải một stub." code={figWhatMailpitProves} />
+
+Đó là một khẳng định về **nội dung của một email**. Một stub mailer ghi lại
+object mà bên gửi truyền vào, nên một test assert trên stub là đang đọc lại chính
+input của mình — và một mailer nhét bí mật vào một header mà stub không mô hình hoá
+vẫn sẽ pass. Vật chứng duy nhất phân xử được là một message mà server đã thực sự
+nhận, đủ cả header, encoding và mọi thứ.
+
+Vậy nên Mailpit: một SMTP server nhận tất, không giao đi đâu, và mở
+một HTTP API để đọc thứ nó bắt được. Cổng `11025` và `18025`, lệch khỏi
+mặc định, khớp quy ước `15432`/`16379`/`14222` mà mọi store khác trong
+compose file này đều theo — để lane không đụng với container riêng của
+lập trình viên. Có healthcheck, vì thiếu nó thì `docker compose up -d --wait`
+chờ *đang chạy* chứ không phải *đã sẵn sàng*, và suite có thể đọc API
+trước khi nó phục vụ. Không volume: một hộp thư test sống sót qua restart sẽ là
+một hộp thư test rò rỉ trạng thái giữa các lần chạy.
+
+<Trap title="`INFRA_SERVICES` knew about four containers and the gate could not tell">
+
+`packages/config/src/infra.test.ts` đã kiểm từ chương 1.2 rằng mọi
+service có tên trong `INFRA_SERVICES` đều xuất hiện trong `compose.yaml`. Nó chỉ chạy một chiều. Một
+container thêm vào compose mà không đăng ký thì vô hình — hằng số sẽ
+lặng lẽ thôi gọi tên hạ tầng local trong khi cổng gác vẫn xanh.
+
+Thêm container thứ năm là thứ đã phát hiện ra nó. Assertion chiều ngược lại dài bốn dòng:
 
 ```ts title="packages/config/src/infra.test.ts (excerpt)"
 const services = compose.slice(0, compose.indexOf("\nvolumes:"));
@@ -48,7 +140,16 @@ const declared = [...services.matchAll(/^ {2}([a-z][a-z0-9-]*):$/gm)]
 expect([...declared].sort()).toEqual([...INFRA_SERVICES].sort());
 ```
 
-## Message, và seam làm FR-WHK-07 thành thật
+Lát cắt ở đây quan trọng. Tên volume nằm cùng mức thụt lề ở block ngay dưới, nên một
+lượt quét cả file sẽ báo `postgres-data` là service chưa đăng ký — đó
+chính là cách phiên bản đầu của assertion này thất bại, một cách đúng đắn, vì lý do
+sai.
+
+</Trap>
+
+## Message, và cái đường nối làm FR-WHK-07 thành sự thật
+
+Mailer gồm hai mảnh, và chỗ cắt chính là biện pháp bảo mật.
 
 ```ts title="services/api/src/notifications/mailer.ts (excerpt)"
 export interface DisableFacts {
@@ -63,11 +164,44 @@ export interface DisableFacts {
 }
 ```
 
+`disableNotification(facts)` biến chỗ đó thành subject và body, không chạm tới
+SMTP, không chạm đồng hồ, không chạm database — nên thứ email *nói* được quyết định bởi một unit
+test. `createMailer()` là phần nói chuyện với server, và mỏng đến mức
+chẳng còn gì trong đó để làm sai.
+
+`DisableFacts` **không có field nào cho bí mật**. Mailer không thể làm rò thứ nó
+chưa từng được đưa, điều đó biến FR-WHK-07 thành thuộc tính của kiểu dữ liệu thay vì của một filter
+đặt trên output — và filter là thứ bạn viết khi hình dạng đã thua từ trước.
+
+Bản quét vẫn chạy, cả trong unit test lẫn trên thứ Mailpit nhận được,
+bởi "không thể xảy ra" là một khẳng định còn một bản quét là bằng chứng.
+
+<Trap title="A scan that forbids the word also forbids saying there isn’t one">
+
+Phiên bản quét đầu tiên tìm `/\bsecret\b/i` ở bất cứ đâu trong message,
+và message trượt. Không phải vì nó chứa bí mật — mà vì body viết:
+
+> Thư này không chứa signing secret và không chứa credential nào. Nếu bạn cần
+> secret để xác minh delivery, hãy đọc nó từ dashboard.
+
+Đó là một câu đáng giữ. Người đọc vừa được báo endpoint của mình đã tắt
+sẽ thắc mắc secret đi đâu mất, và trả lời chỉ tốn hai dòng.
+
+Nên bản quét tách đôi. Giá trị bị cấm tuyệt đối — `rk_live_`, `whsec_`, một JWT
+nhận qua base64 header của nó, bất kỳ chuỗi bốn mươi ký tự base64 nào. Nhãn chỉ bị cấm
+khi có giá trị đi sau: `/\bsecret\b\s*[:=]/`. Một bản quét từ ngữ thô bạo sẽ đẩy
+phần văn xuôi tới chỗ nói vòng vo trong khi một khối base64 ba dòng bên dưới
+lọt lưới, và đó là đánh đổi sai ở cả hai chiều.
+
+Và bản quét nhãn được chứng minh là có thể nổ:
+
 ```ts title="services/api/src/notifications/mailer.test.ts (excerpt)"
 expect("signing secret: whsec_abc").toMatch(/\bsecret\b\s*[:=]/i);
 ```
 
-## Recipient được resolve lúc gửi
+</Trap>
+
+## Người nhận, phân giải ngay lúc gửi
 
 ```ts title="services/api/src/db/repository.ts (excerpt)"
 SELECT DISTINCT h.email
@@ -77,7 +211,31 @@ SELECT DISTINCT h.email
    AND h.email IS NOT NULL
 ```
 
-## Không có ai để gửi
+Tổ chức đến từ **chính dòng dữ liệu**, không phải từ chủ sở hữu hiện tại của endpoint.
+Chương retry-và-disable đã phi chuẩn hoá `organisation_id` lên notification đúng vì điều này,
+với lý do viết thẳng vào schema lúc đó:
+
+> dòng này ghi lại một nghĩa vụ NHƯ NÓ VỐN CÓ lúc endpoint bị tắt, và
+> một application chuyển giữa các tổ chức về sau không được lặng lẽ đổi đích của
+> một notification vốn đã nợ một bên khác
+
+Chương này là đoạn code đầu tiên phụ thuộc vào điều đó, hai chương sau khi cột
+được thêm. Một phi chuẩn hoá có lý do viết ra mà không ai đọc là một ván cược; đây là
+lúc ván cược đó được trả.
+
+Mọi thành viên có địa chỉ, không riêng owner. `memberships.role` là một trong
+owner, admin hoặc member, và chọn một tập con ở đây là chương này tự bịa ra
+một mô hình notification-preferences — mà đó là chuyện của product.
+
+Một message cho mỗi người nhận, không bao giờ một message với vài địa chỉ trên đó. Địa chỉ
+email của đồng nghiệp một khách hàng là dữ liệu của khách hàng đó, và một header `To`
+mà mọi người nhận đều đọc được là một sự tiết lộ không ai yêu cầu.
+
+## Không còn ai để viết thư
+
+`humans.email` cho phép null. Một con người đăng nhập qua provider không trả về
+địa chỉ nào thì không có địa chỉ, nên một tổ chức mà mọi thành viên đều không thể liên lạc là
+một trạng thái schema cho phép — một nhánh, không phải một `if` phòng thủ.
 
 ```ts title="services/api/src/notifications/notification-relay.ts (excerpt)"
 if (recipients.length === 0) {
@@ -91,7 +249,44 @@ if (recipients.length === 0) {
 }
 ```
 
+Trả về bình thường **đánh dấu dòng đã gửi**, và điều đó là cố ý. Không có
+địa chỉ nào để thử lại, và để nó còn giành được nghĩa là giành lại đúng cái dòng
+không gửi được ấy mỗi năm giây, mãi mãi. Thứ thay thế email là dòng
+log: nghĩa vụ được giải trừ tới mức có thể, và việc nó không
+hoàn thành được thì được ghi lại thay vì nuốt đi.
+
 ## Mutation không thể fail
+
+Bộ sabotage của chương có một phát nhắm vào file này: **đánh dấu
+`delivered_at` trước khi lệnh gửi trả về**. Nó phải làm đỏ cái test nói rằng dấu
+được đặt sau.
+
+Nó pass.
+
+<Why title="A transaction rolled back the thing the mutation was attacking">
+
+Batch là một transaction, chép từ chương outbox. Một lần gửi ném lỗi thoát ra
+khỏi transaction callback, Postgres roll back toàn bộ, và `UPDATE … SET delivered_at = now()`
+trong block `finally` đi theo luôn.
+
+Nên đánh dấu trước khi gửi và đánh dấu sau khi gửi cho ra hành vi quan sát được
+*y hệt nhau*. Cái thứ tự mà mutation nhắm vào vốn không phải thứ tự hệ thống có —
+và dòng comment phía trên `finally`, thừa kế từ chương outbox, mô tả một bảo đảm mà
+rollback đang lặng lẽ gỡ bỏ.
+
+</Why>
+
+Lần theo điều đó tìm ra một lỗi tệ hơn thứ mutation đang tìm.
+
+<Figure caption="Một địa chỉ mail server từ chối, và cả hàng đợi dừng lại vĩnh viễn." code={figHeadOfLine} />
+
+Các dòng được giành **cũ nhất trước**. Một dòng luôn ném lỗi — một địa chỉ mà mail
+server từ chối thẳng, chuyện hết sức bình thường với một địa chỉ — vì thế
+luôn bị giành đầu tiên, luôn làm abort cả batch, và mọi notification
+phía sau nó không bao giờ được gửi. Head-of-line blocking vĩnh viễn cả hàng đợi,
+chỉ từ một người nhận hỏng.
+
+Bản vá là cô lập theo từng dòng:
 
 ```ts title="services/api/src/db/repository.ts (excerpt)"
 for (const raw of claimed.rows) {
@@ -106,9 +301,76 @@ for (const raw of claimed.rows) {
 }
 ```
 
-## Mail server biến mất tốn gì
+Giờ không gì roll back nữa, nên thứ tự là thật và mutation fail đúng như nó
+phải fail. Và có một test được đặt tên theo cái lỗi không ai đi tìm: một
+địa chỉ Mailpit từ chối, một địa chỉ tốt đứng sau, và cái tốt đi được.
 
-## Toàn bộ chương
+<Why title="Why this diverges from the outbox one screen up">
+
+`drainOutbox` cho phép một publish hỏng làm abort batch của nó, và điều đó đúng với nó. Một
+broker hoặc sống hoặc chết: một publish fail nghĩa là cái tiếp theo cũng vậy, nên abort
+chẳng mất gì và pass sau thử lại cả lô.
+
+Một mail server không như thế. Nó sống với hầu hết địa chỉ và chết với một. Khác biệt
+nằm ở dependency, không nằm ở pattern — và chép hình dạng
+mà không suy lại cho một dependency mới chính xác là cách thứ này bị viết sai lần
+đầu. Outbox pattern là đúng; "cùng một pattern" không giống "cùng một
+đoạn code".
+
+Liệu `drainOutbox` có vấn đề tương đương không là một câu hỏi thật mà chương này
+không trả lời. Kiểu hỏng của nó nhẹ hơn — một broker được-ăn-cả-ngã-về-không khiến
+một dòng vĩnh viễn không publish được là chuyện khó xảy ra — nhưng "khó xảy ra" không phải
+"không thể", và file đó giờ có một hàng xóm đọc lên khác hẳn vì một
+lý do người đọc nhìn thấy được.
+
+</Why>
+
+<Trap title="`git checkout --` ate the fix, in the chapter that warned about it">
+
+Bước hoàn nguyên của bộ sabotage là `git checkout -- <file>`. Bộ sabotage của chương retry-và-disable
+đã làm mất một sửa chữa chưa commit và trượt chính bài kiểm tra byte-identical của mình,
+nên danh sách task của chương rate-limit ghi **commit trước khi chạy battery**, in
+đậm, hai lần.
+
+Nó lại xảy ra. Bản vá cô lập-từng-dòng được viết để đáp lại một mutation vừa
+pass, đã xác nhận qua chín test xanh, rồi bị huỷ bởi bước hoàn nguyên
+của chính mutation đó — bởi nó chưa được commit, và
+`git checkout --` không phân biệt nổi một bản sửa với một đòn phá hoại.
+
+Chỉ dẫn đó không bị quên. Nó không đủ: "commit trước battery"
+thoả mãn được đúng một lần, mà battery là một vòng lặp. Quy tắc sống sót qua
+thực chiến là **commit trước mỗi mutation**.
+
+</Trap>
+
+## Mail server biến mất thì tốn gì
+
+Không gì cả, và có một test nói vậy.
+
+Tắt một endpoint là ghi một dòng rồi trả về; chuyện có ai email được hay không là
+vấn đề của riêng vòng lặp này. Với relay trỏ vào một cổng
+không trả lời gì: không ném lỗi, không giao thư, dòng vẫn còn giành được, và một endpoint
+thứ hai vẫn tắt bình thường trong lúc đó. Việc giao message, API và webhook
+dispatch không hề chạm tới SMTP.
+
+Đó là lý do transport là một cái bảng và một vòng lặp chứ không phải một lời gọi nằm trong
+đường đi disable. Một SMTP timeout bên trong `sweepDisabledEndpoints` sẽ biến một
+sự cố mail thành một sự cố webhook — đánh đổi dependency ít quan trọng nhất trong
+hệ thống lấy một trong những thứ quan trọng nhất.
+
+Relay poll mỗi năm giây thay vì 200ms như event relay. Không ai
+chờ nó: FR-WHK-07 yêu cầu tổ chức được báo, không yêu cầu được báo
+trong vòng một giây, và một mail server bị poll năm lần một giây bởi một service
+không có gì để gửi là một service đang bất lịch sự với dependency của mình.
+
+## Toàn văn chương này
+
+Mọi thứ ở trên, đúng như repository đang giữ.
+
+### Transport
+
+Ba file mới. `mailer.ts` tách phần message khỏi phần gửi, bởi thứ
+một email NÓI được quyết định bởi unit test còn thứ SMTP làm thì không.
 
 ```ts title="services/api/src/notifications/mailer.ts"
 import { createTransport, type Transporter } from "nodemailer";
@@ -212,6 +474,7 @@ export function createMailer(
   };
 }
 ```
+
 
 ```ts title="services/api/src/notifications/notification-relay.ts"
 import type { Logger } from "@relay/service-kit";
@@ -385,6 +648,7 @@ export function createNotificationRelay({
 }
 ```
 
+
 ```ts title="services/api/src/notifications/notifications.module.ts"
 import { Inject, Injectable, Module, type OnModuleDestroy } from "@nestjs/common";
 
@@ -453,6 +717,12 @@ export class NotificationRelayService implements OnModuleDestroy {
 })
 export class NotificationsModule {}
 ```
+
+
+### Claim, và nơi nó được khởi động
+
+Repository nhận thêm phần drain và phần tra cứu người nhận; `main.ts` khởi động
+vòng lặp bên cạnh hai vòng kia.
 
 ```diff title="services/api/src/db/repository.ts"
 @@ -312,12 +312,187 @@ export async function drainOutbox(
@@ -645,6 +915,7 @@ export class NotificationsModule {}
  export const DISPATCHER_CONSUMER = "dispatcher";
 ```
 
+
 ```diff title="services/api/src/main.ts"
 @@ -2,12 +2,13 @@ import "reflect-metadata";
  
@@ -679,6 +950,12 @@ export class NotificationsModule {}
    // And the first thing that reads what the relay publishes.
    // Same placement, same reason, same lazy connection: an unreachable broker
 ```
+
+
+### Container thứ năm
+
+Mailpit, healthcheck của nó, và mục đăng ký giờ đã có một cổng gác chạy
+cả hai chiều.
 
 ```diff title="compose.yaml"
 @@ -70,12 +70,39 @@ services:
@@ -723,6 +1000,7 @@ export class NotificationsModule {}
      profiles: ["services"]
 ```
 
+
 ```diff title="packages/config/src/infra.ts"
 @@ -8,12 +8,16 @@ export const COMPOSE_FILE = "compose.yaml";
  
@@ -742,6 +1020,7 @@ export class NotificationsModule {}
    "nats-data",
    "clickhouse-data",
 ```
+
 
 ```diff title="packages/config/src/infra.test.ts"
 @@ -29,12 +29,33 @@ describe("the compose declaration agrees with @relay/config", () => {
@@ -780,6 +1059,76 @@ export class NotificationsModule {}
    });
 ```
 
-## Chương này không deliver gì
 
-<ChapterFooter id="3.21" locale="vi" />
+## Những gì chương này không giao
+
+**Bất cứ điều gì về flapping.** Một endpoint bị tắt, bật lại rồi tắt nữa
+sinh ra hai dòng và hai email, và không gì gộp chúng lại. Đó là cố ý
+— một sự cố thứ hai thật sự là một chuyện thứ hai cần được báo, và edge case của spec
+nói rằng không notification nào được đè notification kia — nhưng một endpoint flap
+hàng giờ sẽ gửi hàng giờ. Giải nó nghĩa là một mô hình notification-preferences, mà đó
+là product chứ không phải đường ống.
+
+**Giới hạn retry.** Một dòng fail mãi mãi sẽ được thử lại mãi mãi, mỗi năm
+giây. Nó không còn chặn ai nữa, đó là nửa cấp bách; một trạng thái dead-letter
+cho notification là nửa còn lại và không có ở đây.
+
+**Khả năng gửi đến đích.** Không SPF, không DKIM, không xử lý bounce, không provider. Mailpit
+nhận tất, điều đó đúng với một hộp thư test và chẳng nói gì cho bạn về
+việc một mail server thật sẽ làm gì.
+
+**Mọi notification khác.** Đây là một email cho một sự kiện. Các ngưỡng quota của FR-RTL
+cần thêm ba cái nữa, và chúng đến cùng với quota.
+
+<Checkpoint>
+
+- `delivered_at` được set lần đầu tiên kể từ khi chương retry-và-disable khai báo nó.
+- Backlog mà chương retry-và-disable tích lại đã thoát ngay lần chạy đầu, không có case đặc biệt nào.
+- Mailpit là container thứ năm trong `compose.yaml`, được đăng ký trong
+  `INFRA_SERVICES`, và cổng gác giờ kiểm việc đăng ký đó ở cả hai chiều.
+- FR-WHK-07 được assert trên thứ một server **đã nhận**, không phải thứ bên gửi
+  truyền vào.
+- Một địa chỉ không gửi được nữa không còn chặn cả hàng đợi, và có một test đặt tên
+  theo đúng chuyện đó.
+- Tag `rework/part3-ch21` — và trong thứ tự đã xuất bản, `part3-ch9`, trỏ vào
+  cùng commit với `part3-ch8`. Va chạm đó là câu chuyện riêng của chương này: xem bên dưới.
+
+</Checkpoint>
+
+<Checkpoint title="Eleven files changed here without a fence, and one boundary that was never in the history">
+
+**TAG ĐÃ XUẤT BẢN CỦA CHƯƠNG NÀY VÀ CHƯƠNG SAU TRỎ VÀO CÙNG MỘT COMMIT.** `part3-ch8`
+và `part3-ch9` đều là `b0600560`, và mười chín commit trước chúng chứa công việc của hai
+chương đan xen: rate limiter và mail transport này. Ranh giới chương
+là chuyện biên tập chứ chưa bao giờ nằm trong history — đó là lý do đây là chương đầu tiên trong
+bản dựng lại mà dải commit đã xuất bản phải bị **cắt đôi** thay vì hoãn nguyên khối.
+
+Đơn vị của sổ cái thôi là commit và trở thành hunk. `a068427` thêm
+mailer *và* hai dòng vào `services/gateway/src/limits.itest.ts`, một file mà chương limits
+tạo ra, *và* chuyển tiếp `RELAY_AUTH_FAILURES_PER_MINUTE` cùng `RELAY_AUTH_KEY_PREFIX` bên cạnh
+`RELAY_SMTP_URL`. Hai cái đầu là của limiter. Thứ phân xử mỗi hunk là ĐÍCH của nó, không phải
+tên file — một commit chạm vào file của hai chương thì không thể phân loại theo tên file được.
+
+**NÊN TÁM TRONG MƯỜI CHÍN FILE THAY ĐỔI ĐƯỢC FENCE VÀ MƯỜI MỘT THÌ KHÔNG**, và mười một cái đó
+chia ra rất rõ:
+
+`harness.ts`, `turbo.json`, `services/api/package.json` và `app.module.ts` là dây nối —
+một biến môi trường được chuyển tiếp, một dependency, một module được đăng ký. `session.itest.ts` và
+`dispatcher.itest.ts` mỗi file thêm một dòng tắt relay mới trong tiến trình con, vì
+cùng lý do mọi suite trong cuốn sách này tắt các vòng lặp nền: một vòng lặp đánh dấu dòng đã
+gửi trong khi một file khác đang assert trên cột đó là một cuộc đua giữa các file test.
+
+`notifications.itest.ts` và `mailer.test.ts` là test của riêng chương này, đã lập luận dài
+ở trên và trình bày trong bản chạy chứ không phải dạng diff. `test-event.itest.ts` mất một
+id cục bộ của feature vốn không phân giải tới đâu cả. `schema.ts` là đoạn văn về số chương
+cũ, mà bản thân nó cũng đã cũ — quy tắc tự chứng minh trên chính lời giải thích của nó.
+
+`vitest.coverage.config.mts` mang câu trả lời của ratchet cho chương này, và đó là một
+**lệnh xoá**: mọi test đều pass còn các hàm của `repository.ts` đọc ra 99.12% so với mức ghim
+100, bởi `onError` của `drainDisableNotifications` có một default không bao giờ được dựng.
+Người gọi duy nhất luôn truyền vào một callback ghi log. Giờ nó bắt buộc, và
+trình biên dịch hỏi câu hỏi đó thay cho người review.
+
+</Checkpoint>
+
+<ChapterFooter id="3.21" />

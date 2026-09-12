@@ -27,6 +27,8 @@ export async function handleEvent(event: EventEnvelope, logger: Logger) {
 
 ## Pattern ngừng áp dụng, hai lần
 
+Webhook không thể dùng cùng pattern với realtime fan-out: customer endpoint có thể chậm, sai TLS, trả 500 hoặc biến mất nhiều ngày. Nó cũng không thể dùng synchronous HTTP request từ write path, vì message của một user không được chờ hệ thống của khách hàng.
+
 ```ts title="services/api/src/consumer/runtime.ts (excerpt)"
 // The broker chapter: the claim and the effect commit together or not at all.
 await claimEvent(db, CONSUMER, event.id, async () => {
@@ -42,6 +44,8 @@ await claimEvent(db, CONSUMER, event.id, async () => {
 ```
 
 ## Endpoint, và secret phải có thể trả lại
+
+Subscription lưu endpoint và secret theo cách service có thể dùng để ký delivery nhưng không trả lại secret thô trong listing. Secret chỉ được hiển thị khi tạo/rotate; sau đó API trả metadata đủ để operator biết subscription nào đang tồn tại.
 
 ```ts title="services/api/src/webhooks/secret.ts"
 import {
@@ -189,6 +193,8 @@ if (process.env.NODE_ENV === "production") {
 ```
 
 ## Migration, và surface ở trên nó
+
+Schema cần subscription, delivery attempt, trạng thái schedule và index cho worker claim. API surface được xây trên migration theo thứ tự đó, để không có handler nào tự phát minh state transient thay cho record durable.
 
 ```sql title="services/api/migrations/0010_webhooks.sql"
 -- Webhook endpoints, the delivery schedule, and dead letters.
@@ -660,6 +666,8 @@ export class WebhooksModule {}
 
 ## Ký đúng thứ thực sự gửi
 
+Signature phải được tính trên bytes của body thực sự gửi, cùng timestamp và secret của subscription. Ký JSON trước khi serializer đổi whitespace hoặc encoding tạo verification failure khó đoán ở customer side.
+
 ```ts title="services/dispatcher/src/signature.ts"
 import { createHmac } from "node:crypto";
 
@@ -743,6 +751,8 @@ it("verifies against a verifier written from the documentation, not from the sig
 ```
 
 ## Schedule là một column, và lý do là measurement
+
+`next_attempt_at` là column có index vì dispatcher cần tìm đúng delivery đến hạn mà không scan toàn bộ lịch sử. Measurement của query shape quyết định schema này; một worker loop không nên dựa vào bảng nhỏ trong test lane để biện minh cho full scan.
 
 ```text
 Q1  delayed redelivery survives a restart?
@@ -1030,6 +1040,8 @@ export function nextAttemptAt(attempt: number, from: Date = new Date()): Date | 
 ```
 
 ## Expansion bên trong claim
+
+Một event có thể fan out thành nhiều delivery theo subscription. Expansion phải diễn ra trong hoặc sau claim có ownership rõ, để hai dispatcher không cùng tạo/gửi duplicate delivery khi cùng nhìn thấy event.
 
 ```diff title="services/api/src/db/repository.ts"
 @@ -17,19 +17,24 @@ import {
@@ -1717,6 +1729,8 @@ export function nextAttemptAt(attempt: number, from: Date = new Date()): Date | 
 
 ## Tại sao dispatcher là service riêng
 
+Dispatcher có lifecycle, retry, credential và concurrency khác API/gateway. Tách service giữ latency của user path độc lập với customer endpoint và cho phép scale delivery worker theo backlog thay vì theo traffic chat.
+
 ```ts title="packages/e2e/src/webhooks.itest.ts"
 import { createRequire } from "node:module";
 import { createServer, type Server } from "node:http";
@@ -1870,6 +1884,8 @@ describe("journey: webhooks never stand between the platform and its users", () 
 ```
 
 ## Seam, và credential đi qua nó
+
+HTTP transport là seam injectable để tests điều khiển timeout, status và body. Credential cho internal dispatch đi qua seam có scope hẹp; không đưa tenant secret hay public credential vào một worker có quyền rộng hơn cần thiết.
 
 ```diff title="services/api/src/auth/principal.ts"
 @@ -18,13 +18,47 @@ export interface ApplicationPrincipal {
@@ -2421,6 +2437,8 @@ export class DispatchController {
 
 ## Relay, lần nữa
 
+Outbox relay chuyển fact đã commit thành công việc dispatcher có thể claim. Nó vẫn cần retry và observability như những relay trước: publish transient không được là nơi delivery contract biến mất.
+
 ```ts title="services/api/src/webhooks/delivery-relay.ts"
 import {
   ALL_DELIVERIES_SUBJECT,
@@ -2634,6 +2652,8 @@ export function createDeliveryRelay({
 ```
 
 ## Dispatcher
+
+Dispatcher claim một batch, gửi request có signature, rồi atomically ghi attempt và schedule lần sau. Worker crash giữa các bước là case thiết kế, nên claim có lease/timeout để công việc được nhận lại mà không bị kẹt vĩnh viễn.
 
 ```ts title="services/dispatcher/src/main.ts"
 import {
@@ -3271,6 +3291,8 @@ export async function deliverOnce(
 
 ## Dead letter
 
+Sau policy retry, delivery đi vào dead letter với reason và lịch sử attempt. Dead letter không phải thùng rác: nó là record để customer support, metric và eventual replay có owner rõ ràng.
+
 ```ts title="services/api/src/db/repository.ts (excerpt)"
     // Attempts exhausted. The dead letter and the state change commit together —
     // a delivery marked dead with no dead letter behind it would be a failure
@@ -3293,6 +3315,8 @@ export async function deliverOnce(
 ```
 
 ## Một lượt rà tìm ra bug thật
+
+Rà toàn bộ boundary thường lộ bug mà feature test không chạm: endpoint được canonicalize sai, signature dùng secret cũ sau rotation, hoặc query claim không scope đúng status. Những review này biến “đã chạy demo” thành một contract có thể vận hành.
 
 ```js title="scripts/hostile-endpoint.mjs"
 // A customer's webhook endpoint, behaving badly on purpose.
@@ -3898,6 +3922,8 @@ dead letters               0
 ```
 
 ## Suite thực sự giữ gì
+
+Suite giữ các invariant: một event tạo đúng delivery, body ký khớp bytes gửi, retry không duplicate claim, và failure cuối cùng được lưu. Nó không cố giả lập internet; transport seam cung cấp failure có kiểm soát để test policy.
 
 ```ts title="services/api/src/webhooks/schedule.test.ts"
 import { describe, expect, it } from "vitest";
@@ -6067,6 +6093,8 @@ describe("the dispatcher", () => {
 ```
 
 ## Ba service, ba container
+
+API, gateway và dispatcher là ba service với dependency/lifecycle riêng. Compose và test harness phải khởi động đúng container, health check và credential để integration test không vô tình chạy dispatcher trong process API.
 
 ```dockerfile title="services/api/Dockerfile"
 # The api. The repository's containers arrive with the dispatcher:

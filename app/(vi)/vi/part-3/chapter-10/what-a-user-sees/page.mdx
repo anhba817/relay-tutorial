@@ -23,6 +23,10 @@ User surface không chỉ là endpoint mới. Nó cần nói channel nào hoạt
 
 ## 0.87 milliseconds, và con số là lời nói dối
 
+Một người dùng mở ứng dụng và, trước khi một message được render, client phải biết ba điều: họ có những channel nào, channel nào có activity mới, và message cuối cùng là gì. Ba field ấy trông như một request đơn giản, nhưng chúng đặt ra một câu hỏi về shape của dữ liệu chứ không chỉ về endpoint.
+
+Không cần thêm column để sắp xếp theo activity: có thể lấy `max(created_at)` từ `messages`. Trên test lane lớn nhất — 579 message trong 32 channel — query đó chỉ mất 0.870 ms. Nhưng ở 2.000 channel và một triệu message, nó quét tuần tự toàn bộ bảng cho mỗi lần listing, mất khoảng 159 ms. `channels.last_activity_at` có index trả lời cùng câu hỏi trong khoảng 1.1 ms. Số đo nhỏ không sai; nó chỉ đo một database quá nhỏ để lộ chi phí sẽ tăng cùng chính đại lượng một chat platform chắc chắn sẽ tăng.
+
 Query ban đầu order channel bằng `max(created_at)` của message. Ở dữ liệu nhỏ nó mất 0.87 ms;
 ở một triệu message nó thành sequential scan trên mọi message trong environment. Con số nhỏ
 không đo được shape của workload thật.
@@ -264,6 +268,10 @@ main()
 ```
 
 ## Count không có counter
+
+Unread không phải là counter toàn cục của channel. Nó là quan hệ giữa một user, một channel và sequence cuối cùng user đó đã nhìn thấy. Vì vậy `read_positions` lưu cursor theo từng membership; số unread được suy ra từ `channels.last_sequence` thay vì cố gắng duy trì một counter dễ lệch khi message được gửi từ nhiều nơi.
+
+Việc đánh dấu đã đọc phải là monotonic: một request cũ không được kéo cursor lùi lại. Endpoint chỉ advance vị trí khi sequence mới lớn hơn, đồng thời xác thực user vẫn là member của channel. Nhờ đó retry và hai thiết bị đang hoạt động không biến acknowledgement thành một cuộc đua.
 
 Unread count không thể suy ra an toàn từ `last_sequence` một mình: nó cần read position
 theo từng user/channel. `read_positions` lưu sequence đã đọc, còn query tính phần phía sau
@@ -1085,6 +1093,10 @@ nó; row chỉ được tạo khi user thực sự đọc.
 
 ## Plan, ở bốn kích thước
 
+`EXPLAIN ANALYZE` là bằng chứng cho query shape, không phải một nghi thức trang trí. Chương này đo plan ở dữ liệu lane, một environment vừa, một environment lớn và dữ liệu scratch một triệu message. Khi planner chuyển từ index lookup sang sequential scan, đó là tín hiệu thiết kế phải thay đổi ngay cả khi test hiện tại vẫn xanh.
+
+Index cũng phải đi theo predicate thật: environment trước, rồi `last_activity_at` theo thứ tự giảm dần. Một index chỉ đúng một nửa có thể vẫn nhanh ở fixture nhỏ và lại buộc database sort hoặc scan ở tenant lớn.
+
 Plan được đo ở empty, small, medium và million-message fixture. Index đúng làm query giữ
 shape bounded; benchmark nhỏ chỉ là một điểm dữ liệu, không phải bằng chứng scale.
 
@@ -1491,10 +1503,18 @@ export type ReadPositionBody = z.infer<typeof readPositionBodySchema>;
 
 ## Hai approximation được nói rõ
 
+Unread count không thể hứa chính xác tuyệt đối trong lúc message mới đang được ghi. Listing có thể thấy sequence mới trước khi read position được cập nhật, hoặc ngược lại; API hứa một snapshot hợp lý, không hứa transaction xuyên qua mọi request của client. Điều quan trọng là response nói rõ contract này và cursor vẫn không bao giờ lùi.
+
+Tương tự, activity timestamp được cập nhật trên write path đã phát sinh message. Đây là denormalization có chủ đích: đổi thêm một row lúc ghi để tránh aggregate đắt tiền trên mọi lần đọc.
+
 Unread là snapshot lúc read, và activity là timestamp của message cuối. Cả hai approximation
 đều được nói rõ để client không diễn giải chúng như transactionally exact counter.
 
 ## User surface
+
+User surface không chỉ là danh sách channel. Nó gồm pagination keyset ổn định, unread count, profile author được render trong history và hành vi khi identity hoặc membership thay đổi. Các endpoint phải dùng cùng vocabulary về environment, member và visibility; nếu không, mỗi route sẽ tạo ra một phiên bản khác nhau của “channel mà user được phép thấy”.
+
+Keyset cursor mang cả ordering key lẫn id dùng để phá hòa. Offset pagination sẽ bỏ hoặc lặp row nếu activity đổi giữa hai page, còn cursor theo `last_activity_at` tiếp tục từ chính vị trí mà trang trước đã quan sát.
 
 Endpoint listing trả channel visible của user, activity, unread count và cursor. Pagination
 phải stable: cursor mang ordering key để page tiếp theo không lặp hay bỏ channel khi có write
@@ -1954,6 +1974,10 @@ export class UsersController {
 ```
 
 ## Deletion vẫn giữ row
+
+Xóa user không có nghĩa là xóa tác giả khỏi lịch sử. Message cần tiếp tục nói trung thực rằng một người từng gửi nó; vì vậy user row được soft-delete bằng `deleted_at`, còn profile cá nhân được trả về theo shape tối thiểu. Xóa cứng row author sẽ làm history mồ côi hoặc buộc foreign key phải nói dối.
+
+Read path phải chủ động định nghĩa profile của user đã xóa: không trả email, display name hay avatar đã bị xóa, nhưng vẫn giữ id và dấu hiệu để client render author lịch sử một cách an toàn.
 
 Xóa user không xóa author của message lịch sử. `deleted_at` và profile đã clear giữ identity
 đủ để history trung thực mà không giữ personal data không cần thiết.
@@ -3513,6 +3537,8 @@ describe("a user's channel listing", () => {
 
 ## User record ở lần authentication đầu, điều trước đó không gì làm
 
+Authentication lần đầu cần tạo user record một cách idempotent. Hai request đồng thời với cùng subject không được tạo hai user, và một identity đã soft-delete không được vô tình hồi sinh với dữ liệu profile cũ. Upsert là điểm để đặt những quy tắc đó, thay vì để từng caller tự đoán row tồn tại nghĩa là gì.
+
 Authentication lần đầu materialize user record. Trước đó token có thể hợp lệ cho external id
 không có row; user surface cần row để profile, membership và ban có state nhất quán.
 
@@ -3713,6 +3739,8 @@ không có row; user surface cần row để profile, membership và ban có sta
 ```
 
 ## Ban, và tác động lên connection đang mở
+
+Ban không chỉ là từ chối token tiếp theo. Một socket đã mở trước khi ban xảy ra vẫn có thể publish, subscribe và đọc nếu gateway không nhận được revocation. Vì vậy write path tạo record durable trước, publish signal sau, và gateway đóng đúng connection khi nhận signal. Thứ tự này làm retry an toàn: signal bị mất có thể được phát lại từ record; không có record nào phải được suy ra từ một message Redis tạm thời.
 
 Ban không chỉ từ chối token mới. Gateway phải kiểm tra lại khi connection hiện hữu hành động,
 để user bị ban không tiếp tục gửi bằng socket đã mở.
@@ -4878,6 +4906,10 @@ BEGIN
 
 ## Attack shape thứ tư, và hai thứ nó không cover
 
+Isolation test không thể chỉ thử tenant A truy cập id của tenant B. Same-tenant authorization vẫn cần kiểm tra: một member bình thường không được gọi thao tác dành cho admin, và một channel private không trở nên visible chỉ vì cùng environment. Bốn shape tấn công khác nhau bắt những thiếu sót khác nhau trong guard.
+
+Test cũng cần “bait” từng table mà guard nói rằng nó dùng. Một table xuất hiện trong mảng guard nhưng không có row khiến query vẫn pass sẽ không chứng minh isolation; test phải làm câu trả lời đổi nếu predicate tenant bị bỏ đi.
+
 Same-tenant non-member attack bổ sung cho cross-tenant gauntlet. Nó kiểm tra authorization
 trong tenant, nhưng không thay thế control chứng minh member hợp lệ vẫn thành công.
 
@@ -4910,6 +4942,8 @@ vs   {"data":[{"external_id":"absent-0000…","status":"created",…}]}   (absen
 
 ## 404 không còn là signal
 
+Với resource scoped theo tenant, 404 thường là lựa chọn đúng cho cả “không tồn tại” lẫn “tồn tại nhưng không được thấy”. Phân biệt hai trường hợp ở response có thể biến endpoint thành oracle tiết lộ dữ liệu tenant khác. Client nhận một signal đơn giản: resource này không có trong thế giới mà token hiện tại được phép quan sát.
+
 Khi visibility predicate dùng chung, 404 có thể là channel absent hoặc private channel caller
 không thấy. Test phải so whole envelope và state, không suy nghĩa của refusal từ status.
 
@@ -4918,6 +4952,8 @@ AssertionError: expected 200 to be 404
 ```
 
 ## Table thứ ba của guard, và message cần nó
+
+Message route cần guard qua `channels`, `members` và `messages`, không chỉ một foreign key tiện tay. Mỗi join trả lời một phần khác của câu hỏi: channel thuộc environment nào, caller có còn là member không, và message có thực sự thuộc channel đó không. Bỏ một phần có thể tạo đường đi qua id hợp lệ nhưng scope sai.
 
 Table mới có `environment_id` được thêm vào sentinel guard cùng chapter tạo nó. Guard chỉ có
 giá trị khi bait và test drive table thật; chỉ thêm tên vào array không tạo protection.
@@ -4935,6 +4971,8 @@ record "old" has no field "id"
 ```
 
 ## Hai chương tốn gì, bằng con số
+
+Chi phí của surface này được đo cả trên đường đọc lẫn write path. Một index, một row read position và timestamp denormalized là những chi phí nhỏ, có thể dự đoán; đổi lại là tránh được aggregate theo toàn bộ message trong mỗi listing. Bảng số ở đây nhằm làm trade-off có thể kiểm chứng, không nhằm tạo cảm giác chính xác giả.
 
 Các con số dưới đây ghi rõ fence, test, migration và coverage thay đổi. Count là evidence
 cho scope, không phải thay thế cho behaviour assertion.
@@ -5082,6 +5120,8 @@ cho scope, không phải thay thế cho behaviour assertion.
 ```
 
 ## Column không có reader
+
+Một column và migration không phải capability cho đến khi có reader trả nó qua API, client dùng nó, và test quan sát behavior đó. Chương này giữ chuỗi bằng chứng từ schema đến handler, protocol và UI-facing response để không nhầm “dữ liệu đã tồn tại” với “người dùng đã nhận được tính năng”.
 
 Một column mới chỉ có ý nghĩa khi reader hoặc decision consult nó. Nếu chưa có reader, nó
 được ghi như debt thay vì được gọi là capability đã ship.
@@ -5238,6 +5278,8 @@ Một column mới chỉ có ý nghĩa khi reader hoặc decision consult nó. N
 ```
 
 ## Toàn bộ chương
+
+Kết quả là một user surface chịu được activity thay đổi, lịch sử có author đã xóa, pagination đang di chuyển, tenant isolation và ban xảy ra sau khi socket mở. Các diff phía dưới là implementation của contract đó; phần quan trọng là mọi shortcut đã bị đo, gọi tên và từ chối bằng một lý do có thể test.
 
 ```diff title="packages/test-harness/src/sentinel.sql"
 @@ -69,18 +69,30 @@ BEGIN
