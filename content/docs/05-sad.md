@@ -1,6 +1,6 @@
 # Relay — Software Architecture Document
 
-**Version:** 1.1 (draft)
+**Version:** 1.2 (draft)
 **Status:** For review
 **Companion documents:** `01-product-vision.md` · `02-personas.md` · `03-journey-map.md` · `04-srs.md`
 **Structure:** views-based (C4-influenced), with Architecture Decision Records
@@ -708,7 +708,7 @@ CREATE TABLE message_events (
 ENGINE = MergeTree
 PARTITION BY toYYYYMM(ts)                      -- DR-07
 ORDER BY (environment_id, ts)                  -- tenant-scoped range scans
-TTL ts + INTERVAL 90 DAY;                      -- DR-09
+TTL toDateTime(ts) + INTERVAL 90 DAY;          -- DR-09, see the note below
 
 CREATE MATERIALIZED VIEW daily_usage
 ENGINE = SummingMergeTree
@@ -723,6 +723,27 @@ FROM message_events
 WHERE event = 'created'
 GROUP BY environment_id, day;                  -- DR-10: billing never scans raw events
 ```
+
+**AMENDED IN REVISION 1.2, BY MEASUREMENT.** The TTL above read `TTL ts + INTERVAL 90
+DAY` from the first draft until chapter 4.2 tried to create the table. ClickHouse 25.3
+refuses it:
+
+    Code: 450. DB::Exception: TTL expression result column should have DateTime or
+    Date type, but has DateTime64(3, 'UTC'). (BAD_TTL_EXPRESSION)
+
+A TTL expression must yield `DateTime` or `Date`, and `ts` is `DateTime64(3, 'UTC')`.
+`toDateTime(ts)` is the narrowing the server wants. Amended rather than diverged from
+silently, per the governance clause.
+
+**AND FOUR COLUMNS ARE NULLABLE IN THE IMPLEMENTED SCHEMA.** `user_id`, `text_length`,
+`attachment_count` and `delivery_latency_ms` are published here as non-nullable and are
+`Nullable` in `relay-platform/analytics/0000_message_events.sql`, each with a comment
+saying why. The argument is one argument four times: **zero is a measurement and NULL is
+an absence.** A non-nullable `user_id` turns a deleted author's message into the zero UUID
+and invents an active user; a non-nullable `text_length` claims an empty message was sent
+where a tombstone preserved nothing; and `delivery_latency_ms` has no producer at all
+until FR-ANL-10, so every row would assert a delivery took 0 ms. The column list above is
+kept as the shape; chapter 4.2 carries the nullability and the measurements behind it.
 
 No message text anywhere in this store (DR-08 / FR-ANL-11) — the compliance erasure
 endpoint (FR-MOD-04) deletes analytical rows by `user_id` mutation, which is tolerable

@@ -1,0 +1,516 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figTwoOrderings, figWhereTheRowsGo, figTheBoundaryDay } from "./figures";
+
+export const metadata = {
+  title: "The store that was never listening — Building Relay",
+  description:
+    "ClickHouse has been in compose since chapter 1.2 with a green health check, and nothing outside its container could ever query it. This chapter makes it reachable, builds the analytical schema with a ledger of its own, and asks it the question that cost Postgres 586 ms.",
+  alternates: {
+    canonical: "/part-4/chapter-02/the-store-that-was-never-listening",
+    languages: {
+      en: "/part-4/chapter-02/the-store-that-was-never-listening",
+      vi: "/vi/part-4/chapter-02/the-store-that-was-never-listening",
+    },
+  },
+};
+
+<ChapterHeader id="4.2" />
+
+The previous chapter asked Postgres a question the dashboard will need every
+day — messages and unique active users per environment per day, over ninety
+days — and it cost 585.9 ms over a million rows. Then it added the index that
+should have fixed it and measured again. The index removed the join. It did not
+touch the sort, and the sort was 656 ms of the 698 ms plan.
+
+That is the sentence this chapter starts from. **You cannot index your way out
+of an aggregation.** An index finds rows; it does not stop a million of them
+having to be put in day order before they can be counted by day. The only thing
+that removes that sort is a table already stored in that order — and a table
+can only be stored in one order, which the operational one is already spending
+on something else.
+
+So there is a second store. It has been running since chapter 1.2.
+
+<Figure caption="The two questions want two different orderings, and one table cannot have both." code={figTwoOrderings} />
+
+## The check that could not fail
+
+Before anything is built, run the store you already have:
+
+```bash
+curl -s "http://localhost:${RELAY_CLICKHOUSE_HTTP_PORT:-8123}/ping"
+curl -s "http://localhost:${RELAY_CLICKHOUSE_HTTP_PORT:-8123}/?query=SELECT+1"
+```
+
+The first returns `Ok.` The second returns this:
+
+```
+Code: 194. DB::Exception: default: Authentication failed: password is incorrect,
+or there is no user with such name. ... (REQUIRED_PASSWORD)
+```
+
+ClickHouse has been in `compose.yaml` since the first chapter of Part 1. Its
+health check has been green every day since. And **nothing outside that
+container has ever been able to run a query against it.** The reason is in the
+image, not in this repository:
+
+```bash
+docker compose exec clickhouse cat /etc/clickhouse-server/users.d/default-user.xml
+```
+
+```xml
+<clickhouse>
+  <users>
+    <default>
+      <!-- User default is available only locally -->
+      <networks>
+        <ip>::1</ip>
+        <ip>127.0.0.1</ip>
+      </networks>
+    </default>
+  </users>
+</clickhouse>
+```
+
+The health check ran `/ping`, and `/ping` neither authenticates nor is
+network-restricted. It answers `Ok.` to anyone who can reach the port, which is
+exactly what makes it useless here: **a check that cannot fail for the reason
+you care about is not a check.** It was not lying about the container being up.
+It was answering a question nobody needed the answer to, for sixteen chapters,
+in a green tick.
+
+<Why>
+
+Notice which half of this the document got right and which half you only find by
+running it. The restriction in the image is a **network** restriction. The error
+a caller actually receives names a **password**. Both are true of the same
+refusal, and only one of them is the thing you will see in your terminal at
+two in the morning. When you write a health check, write down what the failure
+looks like from outside, not what the config file says.
+
+</Why>
+
+The fix adds a user rather than editing the image's file, and replaces the check
+with one that runs a query:
+
+```diff title="compose.yaml"
+@@ -61,16 +61,35 @@
+     image: clickhouse/clickhouse-server:25.3
+     # The analytical store rides its own path (CON-01): single node in v1,
+     # schema already cluster-shaped (ADR-08).
+     ports:
+       - "${RELAY_CLICKHOUSE_HTTP_PORT:-8123}:8123"
+       - "${RELAY_CLICKHOUSE_NATIVE_PORT:-9000}:9000"
++    environment:
++      # A NEW USER. This does not lift `default`'s restriction and is not meant to:
++      # the image ships `users.d/default-user.xml` limiting `default` to ::1 and
++      # 127.0.0.1, that file belongs to the image, and anyone "fixing" it is editing
++      # somebody else's file. `relay` answers from the host; `default` still does not.
++      CLICKHOUSE_USER: relay
++      CLICKHOUSE_PASSWORD: relay
++      # CREATES THE DATABASE. It does NOT make it the session's: `SELECT
++      # currentDatabase()` over HTTP as `relay` still answers `default`, so an
++      # unqualified CREATE TABLE builds the schema in `default` while this one sits
++      # empty. Every statement in `analytics/` names `relay_analytics` for that reason.
++      CLICKHOUSE_DB: relay_analytics
+     volumes:
+       - clickhouse-data:/var/lib/clickhouse
+     healthcheck:
+-      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8123/ping"]
++      # RUNS A QUERY, because the old check ran `/ping` — which neither authenticates
++      # nor is network-restricted. It was green from chapter 1.2 to this one while every
++      # query from outside the container was refused. A check that cannot fail for the
++      # reason you care about is not a check.
++      #
++      # `clickhouse-client` is in the image; `curl` is not.
++      test: ["CMD", "clickhouse-client", "--user", "relay", "--password", "relay",
++             "--query", "SELECT 1"]
+       interval: 5s
+       timeout: 3s
+       retries: 5
+       start_period: 15s
+ 
+   mailpit:
+```
+
+Then prove the new check can fail, because otherwise it is the old check with a
+longer command. Point it at a wrong password and bring the stack up: the
+container goes `unhealthy` and the probe reports `Code: 516. DB::Exception:
+relay: Authentication failed`. Put the password back, and it is healthy again.
+
+<Trap>
+
+**`CLICKHOUSE_DB` created nothing, and the container said so in a line nobody
+reads.** The entrypoint honours that variable only while initialising an *empty*
+data directory, and this volume has held a database since chapter 1.2:
+
+```
+clickhouse-1 | ClickHouse Database directory appears to contain a database;
+               Skipping initialization
+```
+
+`SHOW DATABASES` after the amendment lists `default`, `system`,
+`INFORMATION_SCHEMA`, `information_schema` — and no `relay_analytics`. The
+variable is still worth setting, because a reader starting from an empty volume
+gets the database from it. But **nothing may depend on it**, which is why the
+schema runner below creates the database itself, unconditionally, every run.
+
+</Trap>
+
+## The published DDL does not apply
+
+The architecture document has carried the analytical table since its first
+draft. Copy it out of `docs/05-sad.md` and paste it in unchanged:
+
+```
+Received exception from server (version 25.3.14):
+Code: 450. DB::Exception: TTL expression result column should have DateTime or
+Date type, but has DateTime64(3, 'UTC'). (BAD_TTL_EXPRESSION)
+```
+
+`TTL ts + INTERVAL 90 DAY` on a `DateTime64` column is refused. It needs
+`toDateTime(ts)`. The document is amended rather than quietly diverged from —
+the governance clause requires that, and the alternative is a specification that
+describes a schema nobody can create.
+
+That is the first of six divergences from the published DDL, and the other five
+are all about what a column means when nobody filled it.
+
+## Six divergences, and five of them are the same argument
+
+```sql title="analytics/0000_message_events.sql"
+-- SAD 6.2's raw event table, with every divergence from the published DDL commented.
+-- The document is amended to match (docs/05-sad.md, and the chapter says so).
+CREATE TABLE IF NOT EXISTS relay_analytics.message_events (
+    environment_id  UUID,
+    channel_id      UUID,
+    -- DIVERGENCE 1: SAD publishes UUID. `messages.user_id` is nullable -- a message whose
+    -- author was deleted has none -- and a NULL inserted into a non-nullable UUID becomes
+    -- the ZERO UUID without failing, inventing one active user per environment.
+    -- Nullable makes uniqExact ignore it, exactly as count(DISTINCT user_id) does.
+    user_id         Nullable(UUID),
+    ts              DateTime64(3, 'UTC'),
+    event           LowCardinality(String),   -- created|edited|deleted
+    -- DIVERGENCE 2 and 3: both are Nullable because the value is sometimes NOT KNOWN, and
+    -- 0 is a different claim. lengthUTF8(NULL) inserts 0 into a non-nullable column, and a
+    -- text_length of 0 says a zero-length message was sent. A tombstone preserves no text
+    -- and an unedited attachment-only message has none either.
+    text_length     Nullable(UInt32),
+    attachment_count Nullable(UInt8),
+    -- DIVERGENCE 4: SAD publishes UInt32, and NOTHING PRODUCES THIS COLUMN until
+    -- FR-ANL-10's chapter (FR-006a). Non-nullable, every row would read 0 ms -- a
+    -- measured claim about a delivery nobody timed. An absent producer writes NULL.
+    delivery_latency_ms Nullable(UInt32)
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(ts)                     -- DR-07
+ORDER BY (environment_id, ts)                 -- tenant-scoped range scans
+-- DIVERGENCE 5: SAD publishes `TTL ts + INTERVAL 90 DAY`, which this server refuses:
+--   Code: 450. TTL expression result column should have DateTime or Date type,
+--   but has DateTime64(3, 'UTC'). (BAD_TTL_EXPRESSION)
+TTL toDateTime(ts) + INTERVAL 90 DAY          -- DR-09
+```
+
+The sixth is that every statement names `relay_analytics`. Four of the other
+five are one argument repeated: **zero is a measurement and NULL is an absence,
+and a column that cannot say "I don't know" will lie rather than fail.** A
+`delivery_latency_ms` of 0 is a claim that a message was delivered
+instantaneously. A `text_length` of 0 is a claim that somebody sent an empty
+message. Neither is true; both are what a non-nullable column produces when the
+loader has nothing to give it.
+
+<Why>
+
+**`length()` is not `lengthUTF8()`, and `length()` is not `JSONLength()`.**
+Three of the load's eight column expressions were wrong the first time, and all
+three were wrong in the same way: the column's name implied a type the data does
+not arrive as. `postgresql()` delivers `jsonb` as a string, so `length(attachments)`
+returned **78** for a two-attachment row — the length of the JSON text.
+`length(text)` counts bytes where FR-EMJ-02 counts code points; on a corpus with
+emoji in it that is 24 against 18 on the same row. The names were plausible and
+the numbers came out, which is exactly why nothing caught it until something
+compared them.
+
+</Why>
+
+## A second store needs a ledger of its own
+
+The operational database has a migration runner. This one cannot use it —
+constitution III keeps the two paths apart, and `schema_migrations` is the
+operational path's own table. So `analytics/` is a directory of statements and
+`apply.mjs` is forty lines that apply them.
+
+`CREATE TABLE IF NOT EXISTS` is idempotent and **silent**: it cannot tell you
+whether it created the table or found it already there. That silence is the
+whole reason this script exists. A run that applies nothing has to say so:
+
+```
+$ node analytics/apply.mjs
+database relay_analytics ready
+applied 3: 0000_message_events.sql, 0001_daily_usage.sql, 0002_schema_applied.sql
+skipped nothing
+
+$ node analytics/apply.mjs
+database relay_analytics ready
+applied nothing
+skipped 3: 0000_message_events.sql, 0001_daily_usage.sql, 0002_schema_applied.sql
+```
+
+Three rules fall out of running it rather than designing it.
+
+**One statement per file, because the interface says so.** The HTTP interface
+rejects a multi-statement body with `Code: 62. DB::Exception: Syntax error
+(Multi-statements are not allowed)`. That is not a tidiness convention — and it
+happens to be the only rule under which a ledger keyed on filename means
+anything. One filename, one change, one row.
+
+**Every statement names the database.** This is the `CLICKHOUSE_DB` trap from
+earlier, made impossible instead of handled. An unqualified `CREATE TABLE`
+applies to `default` **successfully, with no error**, and the schema then exists
+somewhere nothing else looks. The runner refuses a file that does not name
+`relay_analytics`, and it refuses it by reading the statement rather than the
+file — a probe with `relay_analytics.` sitting in a comment is still refused.
+
+**A file that changed after it was applied is refused by name.** ClickHouse has
+no `ALTER` path for most of what these statements do, so re-applying is not
+available and skipping silently is worse:
+
+```
+apply failed: 0001_daily_usage.sql changed after it was applied
+              (ledger 385b775b5df80d89, file e676989c630ad7c9). ClickHouse has no
+              ALTER path for most of this; add a new statement file instead
+```
+
+<Trap>
+
+**The checksum catches a file that changed and caught nothing when one
+vanished.** Deleting a statement file left four ledger rows against three files,
+its table still in the store, and the runner reporting `skipped 3` without a
+word about any of it — because the run walks the *directory*, so a file that
+disappears simply stops being spoken about.
+
+Removing a statement file is a legitimate thing to do, so this reports rather
+than refuses. What it must not be is silent:
+
+```
+ledger names 1 file(s) no longer on disk: 0003_emoji_events.sql — their tables
+are still in relay_analytics and nothing here will drop them
+```
+
+**An instrument that walks one side of a relationship only ever tells you about
+that side.** It is worth asking, of every check you write, what it would fail to
+notice.
+
+</Trap>
+
+## Loading it, and what a store reconstructed from state cannot know
+
+ClickHouse reads Postgres itself, through the `postgresql()` table function, so
+the load is one `INSERT … SELECT` and this repository gains no dependency —
+`grep -c clickhouse pnpm-lock.yaml` is 0 before and after.
+
+The table holds **three rows per message, not one**. SAD's `event` column is
+`created|edited|deleted` and the rollup filters on it, so a load that labels
+everything `created` would inflate messages-sent by every deletion. The edit
+rows come from `message_edits`, one row per edit — not from `messages.edited_at`,
+which holds only the *latest* and would lose an event for every message edited
+more than once.
+
+And `text_length` is a different expression on each of the three:
+
+| event | the text it means | where that lives |
+|---|---|---|
+| `created` | the text as sent | the **earliest** edit's `prior_text`, else `messages.text` |
+| `edited` | the text **after** that edit | the **next** edit's `prior_text`, else `messages.text` |
+| `deleted` | nothing was written | NULL, always |
+
+`message_edits` records what a message *used to* say. So the text an edit
+produced is only ever in the row after it. For a message edited three times with
+prior lengths 47, 40 and 33 and a current text of 9, the store holds a `created`
+of 47 and edits of 40, 33 and 9 — each edit's result is the next one's memory.
+
+<Why>
+
+**Some of it cannot be recovered at all, and that is the argument for emitting
+events at the time rather than reconstructing them later.** A deletion preserves
+no prior text, so a message created and then deleted without ever being edited
+has no recoverable length: 15,727 of them in this corpus. And the messages that
+*were* edited once and then deleted are the sharp case — **the same rows,
+counted twice, with opposite outcomes.** That edit row is exactly what makes the
+creation length recoverable, and the deletion is exactly what destroys the
+edit's resulting one.
+
+Nothing in this chapter can fix that. An ingester that emitted each event when
+it happened would never have lost it. That ingester is two chapters away, and
+this table is what it will write into.
+
+</Why>
+
+## The question, asked again
+
+```
+                    store                  rows       best of 3   days
+   4.1   Postgres, ordered by id        1,000,000      585.9 ms     91
+   4.2   ClickHouse, (environment_id, ts)  1,241,071    13.22 ms     91
+```
+
+Forty-four times, and it is the same question: count per day, count distinct
+senders per day, one environment, ninety days. There is no join, because
+`environment_id` is on the row. There is no sort, because the rows are already
+in that order.
+
+The plan says where the work actually happens, and two of the three stages do
+none:
+
+```
+MinMax        Parts 4/4   Granules 154/154     skips nothing
+Partition     Parts 4/4   Granules 154/154     skips nothing
+PrimaryKey    Parts 4/4   Granules 131/154     skips 23
+```
+
+**The date predicate cannot exclude anything from this table, and the reason is
+the TTL.** Raw events expire at ninety days; the question asks about ninety
+days. Every row that survives already satisfies the date half of the query, so
+`MinMax` and the monthly partition have nothing to reject. The tenant half of
+`ORDER BY (environment_id, ts)` does all the work — which is the half you would
+have been least sure about, and you only know because you asked for the plan
+rather than the clock.
+
+<Trap>
+
+**The TTL is a schedule, not an event.** A small insert that lands in one part
+is cleaned on the way in — 120,000 rows over 120 days become 90,000 immediately,
+no error, no warning. This load lands in nine parts, and straight afterwards the
+table held **1,387,654 rows over 121 days with 146,582 already expired and still
+present.** After the merge: 1,241,071 over 91 days.
+
+So a row count taken the moment a load finishes is a number that shrinks
+overnight on its own. The loader forces the merge and prints both counts with
+the difference named, because the alternative is publishing a figure and being
+unable to reproduce it tomorrow.
+
+</Trap>
+
+## The rollup, and the one day that can never agree
+
+<Figure caption="Where the rollup's row count comes from, and what it actually buys." code={figWhereTheRowsGo} />
+
+DR-10 says metering never scans raw events, so there is a materialised view
+maintaining a daily per-tenant rollup. It is not refreshed by anything: rows
+inserted after it exists are included on the way in, and 1,241,029 raw rows
+become **363 rollup rows.**
+
+Read it with `sum()` and `GROUP BY`, and not because it reads better:
+
+```sql
+SELECT day, sum(messages), uniqMerge(active_users_state)
+  FROM relay_analytics.daily_usage
+ WHERE environment_id = ? AND day >= toDate(now() - INTERVAL 90 DAY)
+ GROUP BY day
+```
+
+`SummingMergeTree` holds **one physical row per key per INSERT** until a
+background merge collapses them. The whole corpus arrives in one statement, so
+it lands at one row per key and a bare `SELECT messages` looks perfectly
+correct. Three separate inserts of a thousand rows into one key then measured
+three physical rows, a bare read of **1000**, and a sum of **3000**. The row
+count per key is the number of inserts, not the number of events — so a
+dashboard written against a quiet afternoon is wrong on a busy one, and it is
+wrong by a plausible number.
+
+The cost is worth stating honestly. The rollup reads **315 rows** where the raw
+query reads 1,052,655, and it saves **19% of the time.** At a million rows this
+query is already dominated by something other than scanning. What changes is not
+the clock but the shape: 1,052,655 grows with the tenant and 315 grows with the
+calendar.
+
+<Figure caption="Why one day out of ninety-one can never reconcile." code={figTheBoundaryDay} />
+
+Now compare the rollup against the raw table, day by day, with the same ninety
+days on both sides:
+
+```
+days compared   91
+days agreeing   90
+days differing   1     2026-06-15: raw 6,220 · rollup 11,161 · difference 4,941
+```
+
+Ninety of ninety-one agree **exactly**. The one that does not is the oldest day
+in the window, and it is structural. **The TTL cuts at a timestamp and the
+rollup's finest grain is a day.** The view counted that day whole when it was
+inserted; the merge then removed the rows whose ninety days had elapsed. As
+`now()` advances, the gap moves continuously through that day.
+
+That is 4,941 of 1,004,877 — **0.49%**, against FR-ANL-06's requirement that
+metered totals agree with operational counts to within **0.1%**. DR-10 forbids
+reconciling against raw events. So the two clauses cannot both hold, and this
+reason does not depend on how big anyone's tenant is.
+
+There is a second reason, and it is the one you would find first if you only
+tested the distinct-user column. On this corpus:
+
+```
+uniqMerge(active_users_state)   5,000
+uniqExact(user_id)              5,000
+difference                          0      0.0000%
+```
+
+A perfect agreement — over a corpus holding exactly 5,000 users. `uniq` is
+exact up to about 65,000 distinct values and approximate above it:
+
+```
+distinct     uniq          error
+  60,000     60,000        0%
+  65,000     65,000        0%
+  70,000     70,359        0.5129%
+ 500,000    502,646        0.5292%
+```
+
+**The threshold is a cardinality, not a row count**, and this corpus is three
+orders of magnitude under it. The zero above is a fact about the corpus rather
+than about the reconciliation. Neither conflict is resolved here: there is no
+reconciliation job yet to test an amendment against, and amending a published
+clause without one is deciding before measuring. Both are filed.
+
+<SkipAhead>
+
+The platform changes in this chapter are `compose.yaml` and a new `analytics/`
+directory. `node analytics/apply.mjs` builds the schema, `--drop-all` removes
+it, and `scripts/scale/load-analytics.mjs --corpus corpus.json` fills it from a
+corpus built by `scripts/scale/corpus.mjs`.
+
+</SkipAhead>
+
+<ForwardRef>
+
+**Nothing writes to this store on the send path.** There is no ingester, no
+emission point, and no reconciliation job. `delivery_latency_ms` exists with no
+producer at all, and will keep writing NULL until FR-ANL-10's chapter builds one.
+The rollup has no TTL and therefore no retention policy — it grows at
+environments × days forever, and nothing here decides how long metering history
+is kept.
+
+The corpus this chapter measures is loaded from operational state in one shot.
+An ingester emits events as they happen, which is the only way the 15,727
+unrecoverable lengths above would ever have been recorded.
+
+</ForwardRef>
+
+<Checkpoint>
+
+A ClickHouse a query can reach, with a health check that fails when queries
+fail. Three statement files and a runner that says what it applied, what it
+skipped, and what it no longer recognises. A raw event table holding three rows
+per message, a rollup that never scans it, and four numbers: 13.22 ms against
+585.9, 315 rows against 1,052,655, 90 of 91 days agreeing, and 0.49% against a
+0.1% bound.
+
+No ingester, no producer for one column, and `schema_migrations` untouched —
+fifteen rows, ending where it ended three days before this chapter started.
+That state is this chapter's tag.
+
+</Checkpoint>
+
+<ChapterFooter id="4.2" />

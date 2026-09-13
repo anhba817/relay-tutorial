@@ -798,6 +798,19 @@ export const series: Part[] = [
         readerProducesVi:
           "Một corpus một triệu tin nhắn, câu truy vấn phân tích lần đầu được viết cho Postgres, và bốn con số cho thấy index lẽ ra phải sửa được nó lại tốn thêm 49% dung lượng mà đổi lại chỉ là nhiễu",
       },
+      {
+        id: "4.2",
+        path: "/part-4/chapter-02/the-store-that-was-never-listening",
+        title: "The store that was never listening",
+        status: "published",
+        readerProduces:
+          "A ClickHouse a query can reach, an analytical schema with a ledger of its own, and the same question answered in 13.22 ms against Postgres's 585.9 — with one day out of ninety-one that can never reconcile",
+        sourceDoc: "docs/04-srs.md, docs/05-sad.md",
+        readerMinutes: 60,
+        titleVi: "Kho dữ liệu chưa từng lắng nghe",
+        readerProducesVi:
+          "Một ClickHouse mà truy vấn chạm tới được, một schema phân tích với sổ ghi của riêng nó, và cùng một câu hỏi được trả lời trong 13,22 ms so với 585,9 ms của Postgres — cùng một ngày trong chín mươi mốt ngày không bao giờ đối soát được",
+      },
     ],
   },
   {
