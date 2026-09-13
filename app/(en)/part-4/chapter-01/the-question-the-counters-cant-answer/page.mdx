@@ -1,0 +1,358 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figTwoShapes, figWhereTheTimeIs, figWhatItCosts } from "./figures";
+
+export const metadata = {
+  title: "The question the counters can't answer — Building Relay",
+  description:
+    "Part 4 opens by asking Postgres a question the platform will need every day, measuring what it costs, adding the index that should fix it, and finding that the index costs half the table again and buys a difference smaller than the noise between two runs.",
+  alternates: {
+    canonical: "/part-4/chapter-01/the-question-the-counters-cant-answer",
+    languages: {
+      en: "/part-4/chapter-01/the-question-the-counters-cant-answer",
+      vi: "/vi/part-4/chapter-01/the-question-the-counters-cant-answer",
+    },
+  },
+};
+
+<ChapterHeader id="4.1" />
+
+Part 3 ended with a platform that meters. The quota chapter gave every
+environment a monthly count of messages sent, of distinct people who sent one,
+and of connection-minutes held open; it refuses a send when the count crosses a
+cap, and it emails somebody at fifty, eighty and a hundred per cent. Those
+counters are correct, they are cheap, and they are on the write path, which is
+where a counter has to be if a send is going to be refused synchronously.
+
+Now open the SRS at FR-ANL and read what the dashboard is going to ask for.
+Messages and unique active users **per tenant per day**. Usage attributable by
+application, environment, channel and day. Delivery-latency percentiles per
+tenant per hour. A queryable request log. Charts over selectable ranges up to
+ninety days.
+
+Ask, of Part 3's counters: which of those can they answer?
+
+One. *Am I over my cap this month?* The counters hold a single number per
+environment per period, and they hold it because that is the only number the
+refusal needs. Every other question in FR-ANL wants the same events sliced a
+different way, and there is no slicing a scalar.
+
+So this chapter does the obvious thing. It writes the analytical query against
+the database we already have, at a size worth measuring, and it finds out what
+that costs. Then it does the thing you are already thinking, which is to add the
+index, and it measures that too.
+
+Neither result is the one this chapter was planned around, and the chapter is
+better for it.
+
+## Two questions, two shapes
+
+The operational question has been the same since chapter 2.2: *give me the next
+fifty messages in this channel after cursor X.* Part 2 shaped `messages` for
+exactly that, and you watched it happen — chapter 2.4 measured a second index,
+found `UNIQUE (channel_id, sequence)` already served the ordering, and migration
+`0001` dropped the twin. The comment is still there:
+
+```
+// No dedicated (channel_id, sequence DESC) index: DR-01's unique
+// constraint above already supplies that ordering, and Postgres walks
+// it backward for newest-first pages. Chapter 2.4 measured it and
+// migration 0001 dropped the redundant twin (SAD §6.3, amended).
+```
+
+That was right. It is still right. This chapter is where the bill arrives.
+
+<Figure caption="The two questions want two different orderings, and one table cannot have both." code={figTwoShapes} />
+
+FR-ANL-05 and FR-ANL-09 want *messages and unique active users per environment
+per day, over ninety days.* Written against this schema for the first time, that
+is:
+
+```sql
+SELECT date_trunc('day', m.created_at) AS day,
+       count(*)                        AS messages,
+       count(DISTINCT m.user_id)       AS active_users
+FROM messages m JOIN channels c ON c.id = m.channel_id
+WHERE c.environment_id = $1
+  AND m.created_at >= now() - interval '90 days'
+GROUP BY 1;
+```
+
+A join and a scan, and both are forced. `messages` carries no `environment_id`,
+so the tenant is reached through `channels`. Nothing indexes `created_at`, so the
+date range is a scan. Compare the analytical store the SAD has been carrying
+since its first draft: `ORDER BY (environment_id, ts)` — the two columns the
+operational table orders by neither of.
+
+<Why>
+
+**CON-01, and why this is a measurement rather than an assertion.** The
+constitution's third principle says operational and analytical storage are
+physically separate and fail independently, and the first clause of it is that
+analytical queries must never execute against the operational database. This
+chapter executes one, deliberately, to show what the clause is for. It runs
+against a scratch database that serves no traffic and is dropped afterwards;
+nothing shipped at this chapter's tag executes it.
+
+</Why>
+
+## A corpus worth measuring against
+
+The test lane holds 303,885 messages across 31,685 environments — about ten
+each. Its busiest environment has 1,018. That is not a scale at which the
+question means anything, and this project has already been caught by that once:
+the chapter on what a user sees measured a listing query at 0.87 ms on the lane
+and 159 ms against a real corpus, and the lane's answer would have settled the
+question in favour of doing nothing.
+
+So the corpus is built rather than borrowed. `scripts/scale/corpus.mjs` creates
+its own database, migrates it with the platform's own runner, and writes a
+million messages into the subject environment's ninety-day window.
+
+<Trap>
+
+**The volume you ask for is not the volume the query sees, and the gap is two
+predicates deep.** Asking for a million messages in a database gives the query a
+third of that, because `WHERE c.environment_id = $1` excludes the neighbours.
+Asking for a million in the environment gives it three quarters of *that*,
+because the ninety-day window excludes thirty days of a hundred-and-twenty-day
+spread. Both were caught here, one analysis pass apart, two lines apart in the
+same table.
+
+The seeder now reports three message counts and the chapter quotes the third:
+
+```
+created.messages            1,600,000   every row in the database
+  environment_id = $1       1,333,334   the tenant predicate excludes the neighbours
+    >= now() - 90 days      1,000,000   the date predicate excludes a quarter
+```
+
+A duration published against the first would claim 1.6 million rows and measure
+one million.
+
+</Trap>
+
+## What it costs, and what it costs the neighbour
+
+Three runs of the query against that corpus: **611.2, 585.9, 586.5 ms.** It
+returns ninety-one rows — one per day — from a million.
+
+The plan is where the chapter turns.
+
+```
+GroupAggregate  (actual time=609.731..698.486)
+  ->  Sort  (actual time=608.870..656.611)
+        Sort Method: external merge  Disk: 33312kB
+        ->  Hash Join  (actual time=6.750..277.774)
+              ->  Seq Scan on messages m  (actual time=6.383..140)
+              ->  Seq Scan on channels c  (actual time=0.017..0.142)
+```
+
+The scan is about 140 ms. The join takes it to 277. And then the sort takes 656,
+spilling 33 MB to disk, because `count(DISTINCT user_id)` per day has to order a
+million rows by `(day, user_id)` before it can count anything.
+
+The other half of the plan was the send path. The chapter's hypothesis — the one
+it was planned around — was that an analytical query on the operational database
+taxes the writes beside it. So the harness runs a send loop at ten a second for
+sixty seconds, twice: once with the analytical query running continuously beside
+it, and once alone.
+
+```
+send p95, alone           20.5 ms      mean of two control loops
+send p95, beside          13.7 ms      102 analytical queries over the window
+NFR-PRF-02's target      150 ms
+```
+
+The send path is **faster** beside a hundred analytical queries than without
+them, reproducibly, on two different schemas, with four control loops agreeing
+inside 1.3 ms.
+
+<Trap>
+
+**That number was wrong twice before it was right, and both mistakes are more
+useful than the result.**
+
+The first version ran the analytical query **once** beside a sixty-second loop.
+At 600 ms that is about one per cent of the window: six of five hundred and
+ninety-nine sends had anything running next to them. It reported "no effect"
+from a measurement that could not have shown one.
+
+The second ran it continuously and reported the send path 7.9 ms faster — but
+the quiet loop ran first, on a cold cache, and the busy loop second, on a warm
+one. The comparison confounded *beside a query* with *second*.
+
+The third adds a warm-up whose results are discarded and a **second quiet loop
+after the busy one**. The two quiet loops agree within 0.7 ms, which is the only
+reason the number in the table above means anything. Ask of any before-and-after
+pair: what else changed between them?
+
+</Trap>
+
+## The index that should fix it
+
+The obvious objection to a 586 ms query is that it has no index. So: add the
+column the query wants, backfill it, index it, and measure again. On a copy —
+this never becomes a migration.
+
+```sql
+ALTER TABLE messages ADD COLUMN environment_id uuid;
+UPDATE messages m SET environment_id = c.environment_id
+  FROM channels c WHERE c.id = m.channel_id;
+CREATE INDEX ON messages (environment_id, created_at);
+```
+
+The join disappears. The query is rewritten to reach `environment_id` directly,
+and that is worth saying out loud: a faster query that is also a *different*
+query proves less than it looks like it proves.
+
+<Figure caption="Where the time actually is, before and after. The index removes the join; the sort is untouched." code={figWhereTheTimeIs} />
+
+```
+                    run 1     run 2     run 3
+baseline            585.9     603.4         -
+with the index      560.2         -     552.0
+```
+
+Three corpora of identical volumes. The baseline varies by 17.5 ms between two
+of them. The gap between the two *conditions* is 25.7 ms on one pairing and 51.4
+ms on another — comparable to the gap between two runs of the same condition. A
+single pairing would have reported "4.4% faster" as though it were a finding.
+
+**The index does not fix the query because the index is not where the time is.**
+It removes a 140 ms scan and a join; it leaves a 656 ms sort exactly where it
+was, spilling the same 33 MB to disk. No index removes that sort, because the
+question is a distinct count per day and the rows have to be ordered before they
+can be counted.
+
+## And what it costs to keep
+
+<Figure caption="The permanent cost of the fix, and the transient cost three earlier versions of this number included." code={figWhatItCosts} />
+
+```
+table before the column        178.6 MB
+after ALTER + backfill         381.9 MB
+after VACUUM FULL              203.4 MB
+
+the column                      24.8 MB   permanent
+the index                       62.0 MB   permanent
+the rewrite                    178.6 MB   transient, reclaimed
+```
+
+**86.8 MB permanent on a 178.6 MB table — forty-nine per cent more storage**, to
+buy a difference this measurement cannot separate from noise.
+
+<Trap>
+
+**That storage number was wrong three times, and each version conflated a
+different pair of things.**
+
+`+204 MB` was the column plus 1.6 million dead tuples, because `UPDATE` rewrites
+every row: publishing it would have been quoting a vacuum nobody ran. `+107 MB`
+was the new index plus the bloat of the old ones, same cause. `+4.3 MB` was the
+new index *minus* the compaction the `VACUUM FULL` had just done to the others —
+`messages_channel_id_sequence_unique` went 104 MB to 62 and `messages_pkey` 64 to
+48, and the subtraction hid a 62 MB index inside somebody else's saving.
+
+The right number came from asking for the thing itself:
+`pg_relation_size('messages_cf_idx')` is 62 MB. **A delta between two totals is
+not a measurement of the thing that changed, unless nothing else changed.**
+
+</Trap>
+
+## What the lane would have said
+
+The same query, against the test lane's busiest environment:
+
+```
+                        rows in environment    query      days returned
+lane, busiest env                    1,018     0.9 ms                 1
+the corpus                       1,000,000   585.9 ms                91
+```
+
+A factor of **651**. The predecessor's pair was 183, and this one is worse
+because the lane has grown sideways — more environments, not more messages in
+any one of them. The lane's answer to this question rounds to nothing, and a
+reader who measured there would conclude, correctly for their data and wrongly
+for the product, that there is no problem here at all.
+
+<Why>
+
+**FR-ANL-08 is the bar, and this chapter does not clear it.** The clause asks for
+analytical queries over ninety days of a single tenant's data to return within
+two seconds at p95. At 586 ms, one tenant with a million messages is inside
+that — and the tenant this platform is built for is not the one with a million
+messages. NFR-SCL-03 puts the platform at a thousand messages a second; ninety
+days of that is seven and a half billion rows, and FR-ANL-01 wants an event per
+**API request**, not per message. The query measured here is the easy case.
+
+</Why>
+
+## What this chapter argued, and what it did not
+
+The plan for this chapter said the analytical query would hurt the write path
+beside it, and that adding the index would fix the query while taxing every
+write. Neither happened. What the measurement found instead is narrower and
+harder to argue with:
+
+- **You cannot index your way out of an analytical question when the cost is the
+  aggregation.** The sort is 656 ms of a 586 ms query's 698 ms plan, and it is
+  there in both conditions.
+- **The fix costs 49% more storage** and buys a difference inside the run-to-run
+  spread.
+- **The lane cannot see any of this**, by a factor of 651.
+
+That is the OLAP argument, arrived at by trying to make a different one and
+failing. The answer is not a better index. It is a store that maintains the
+distinct count as rows arrive instead of sorting for it at read time — which is
+what the next chapter starts building, and why its table is ordered by the two
+columns this one's is ordered by neither of.
+
+<ForwardRef>
+
+This chapter built no ingester, no ClickHouse schema and no reconciliation. It
+also did not touch the emission path: the analytics stream, its subject grammar
+and the fire-and-forget tradeoff all arrived in Part 3's chapter on when to stop
+trying, and the ingester it was waiting for is two chapters away. Storage
+metering, the request log and the audit trail are all later in this part.
+
+</ForwardRef>
+
+<SkipAhead>
+
+Nothing in this chapter changes the platform. If you want the harness without
+reading the measurement, `scripts/scale/corpus.mjs` and `scripts/scale/measure.mjs`
+are the whole of it, and `--drop-all` cleans up after you.
+
+</SkipAhead>
+
+## What this chapter gives you
+
+- **Two questions, two shapes**: the operational table is ordered for a cursor
+  and the analytical one for a tenant and a time, and no single ordering serves
+  both.
+- **The cost is the aggregation, not the access path**: a distinct count per day
+  sorts every row it counts, and an index that removes a join leaves that sort
+  untouched.
+- **A measurement needs a control**: quiet-then-busy confounds the neighbour with
+  the cache, and one query beside a sixty-second loop covers one per cent of it.
+- **A delta is not a measurement** unless nothing else changed — three storage
+  numbers in a row said otherwise.
+- **The lane is the least representative instrument you have**, and here it is
+  wrong by 651×.
+
+<Checkpoint>
+
+Before starting the ClickHouse chapter you should have: `scripts/scale/corpus.mjs`
+building a million-message corpus whose in-window count is exact, refusing a
+second run against an existing corpus and refusing the lane's own database;
+`scripts/scale/measure.mjs` spawning the api at `PORT=0` against that corpus,
+reporting the query's plan beside its duration and stating its own hypothesis
+verdict; four numbers recorded with the corpus and the machine they were taken
+on; and no migration, no column and no index anywhere in the repository. That
+state is this chapter's tag.
+
+</Checkpoint>
+
+<ChapterFooter id="4.1" />

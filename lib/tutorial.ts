@@ -777,9 +777,28 @@ export const series: Part[] = [
   },
   {
     number: 4,
-    title: "The second data path",
-    titleVi: "Con đường dữ liệu thứ hai",
-    chapters: [],
+    // RENAMED. "The second data path" covered the analytics movements and stopped:
+    // this part also carries hosted media and the compliance lifecycle, and what
+    // holds the three together is that each moves data off the path everything else
+    // takes — ending with the chapter that has to find every path it went down.
+    // docs/12-part-4-structure.md is the structure record.
+    title: "Everywhere the data went",
+    titleVi: "Mọi ngả đường dữ liệu đã đi",
+    chapters: [
+      {
+        id: "4.1",
+        path: "/part-4/chapter-01/the-question-the-counters-cant-answer",
+        title: "The question the counters can't answer",
+        status: "published",
+        readerProduces:
+          "A million-message corpus, the analytical query written against Postgres for the first time, and four numbers showing the index that should fix it costs 49% more storage and buys noise",
+        sourceDoc: "docs/04-srs.md, docs/05-sad.md",
+        readerMinutes: 55,
+        titleVi: "Câu hỏi mà những bộ đếm không trả lời được",
+        readerProducesVi:
+          "Một corpus một triệu tin nhắn, câu truy vấn phân tích lần đầu được viết cho Postgres, và bốn con số cho thấy index lẽ ra phải sửa được nó lại tốn thêm 49% dung lượng mà đổi lại chỉ là nhiễu",
+      },
+    ],
   },
   {
     number: 5,
