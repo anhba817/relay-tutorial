@@ -1,0 +1,809 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figNobodyReading, figTwoDedups, figBatchesMove } from "./figures";
+
+export const metadata = {
+  title: "The consumer that was promised — Building Relay",
+  description:
+    "Something has been publishing one record per webhook delivery attempt since chapter 3.20, into a stream with seven-day retention that nothing has ever read. This chapter builds the consumer, and finds that the template written to prevent exactly this problem is the one thing it may not use.",
+  alternates: {
+    canonical: "/part-4/chapter-03/the-consumer-that-was-promised",
+    languages: {
+      en: "/part-4/chapter-03/the-consumer-that-was-promised",
+      vi: "/vi/part-4/chapter-03/the-consumer-that-was-promised",
+    },
+  },
+};
+
+<ChapterHeader id="4.3" />
+
+Ask the broker what it is holding:
+
+```bash
+curl -s 'localhost:8222/jsz?streams=1&consumers=1'
+```
+
+```
+ANALYTICS    messages     31  bytes  15,139  consumers 0
+DELIVERIES   messages     46  bytes  14,490  consumers 0
+EVENTS       messages     56  bytes  23,582  consumers 0
+```
+
+Thirty-one records, and no consumer. The webhook dispatcher chapter added
+`publishAttempt`, and it has written one record for every delivery attempt since
+— endpoint, status, latency, outcome — into a stream with seven-day retention
+that **nothing in this platform has ever read.**
+
+The stream's own comment, written then, says as much:
+
+> SEVEN DAYS, `discard: old`, and no acknowledgement anywhere: nothing consumes
+> this stream in this chapter.
+
+That was chapter 3.20. This is the chapter it meant.
+
+<Figure caption="A publisher, a stream, and nothing on the other end." code={figNobodyReading} />
+
+<Why>
+
+**All three streams read zero consumers, and only one of those zeros means
+anything.** The api, gateway and dispatcher sit behind a compose profile and were
+not running, so `EVENTS` and `DELIVERIES` show zero because their consumers are
+elsewhere. `ANALYTICS` shows zero because there is no such thing.
+
+A number that is right for two different reasons is evidence for neither. The
+claim that settles it is not in the broker at all — it is in the repository:
+
+```bash
+grep -rn 'ANALYTICS_STREAM' --include='*.ts' services packages | grep -v packages/protocol
+```
+
+Four references, one file, and all four **create or update** the stream. The one
+consumer runtime in the tree filters on `events.>`.
+
+</Why>
+
+## The template that describes this consumer, and forbids it
+
+Before writing a consumer, look at the one that exists. `runtime.ts` says why it
+is there:
+
+> a future consumer forgets to dedupe → double webhooks / double metering
+
+mitigated by *"a consumer template with dedup built in."* That future consumer is
+this one. So read what the dedup is:
+
+```ts
+return db.transaction(async (tx) => {
+  const claimed = await tx
+    .insert(consumedEvents)
+    .values({ consumer, eventId })
+    .onConflictDoNothing({ target: [consumedEvents.consumer, consumedEvents.eventId] })
+    .returning({ eventId: consumedEvents.eventId });
+  if (claimed.length === 0) return "duplicate";
+  await effect();
+  return "handled";
+});
+```
+
+A PostgreSQL transaction. Constitution III keeps the operational and analytical
+paths apart, and this consumer lives entirely on the analytical one: it reads a
+queue and writes ClickHouse, and it may not touch the operational database to do
+it.
+
+**The template written to stop a future consumer double-counting is the one thing
+that consumer cannot use.** The comment was right about the risk and could not
+have known which principle would bar the remedy. So the deduplication has to
+happen somewhere else, and finding out where is most of this chapter.
+
+## Three ways to not double-count, and two of them fail
+
+<Figure caption="The publisher's dedup id and the consumer's problem are not the same problem." code={figTwoDedups} />
+
+**The publisher already has a deduplication id**, `{delivery_id}:{attempt}`,
+chosen in the dispatcher chapter after the delivery id alone collapsed seven
+retries into one message. It is tempting to think that covers it. It does not:
+that id stops a *publisher* sending the same record twice. At-least-once delivery
+is about the *consumer* being handed the same record twice, which nothing on the
+publish side has anything to say about.
+
+**ClickHouse has a mechanism built for exactly this**, and it is the one to reach
+for first. `insert_deduplication_token` makes the server refuse a duplicate block
+at insert, with no read-time cost:
+
+```
+plain MergeTree, same token twice          1000 rows   the token did NOTHING
+non_replicated_deduplication_window = 100,
+  first insert                              500 rows
+  redelivery, same token                    500 rows   the block is refused
+```
+
+The first line is already a warning — the token without the window deduplicates
+nothing and reports no error — but the window is one setting away. The reason
+this design does not survive is the other end.
+
+<Figure caption="Why a token derived from a batch cannot be stable." code={figBatchesMove} />
+
+A token has to be the same on the retry. **JetStream batch boundaries are not:**
+
+```
+original  max_messages=5   seqs 1,2,3,4,5
+retry     max_messages=3   seqs 1,2,3
+retry     max_messages=10  seqs 4,5,1,2,3,6,7,8,9,10
+```
+
+The retry comes back out of order and interleaved with newer messages. A token
+built from that range differs every time, so the duplicate inserts — and DR-11's
+two-second bound makes it structural rather than unlucky, because with a time
+bound the grouping follows arrival timing and regroups even at a fixed size.
+
+<Trap>
+
+**A deduplication token keys on itself, not on what you are inserting.** The same
+token carrying five hundred *completely different* rows:
+
+```
+token tok-A, 500 rows 'first-*'     ->  500 rows
+token tok-A, 500 DIFFERENT rows     ->  500 rows   ·  'SECOND-' present: 0
+```
+
+All five hundred were dropped and the insert reported success. So a token that is
+not provably unique per batch is not weak deduplication — **it is silent data
+loss**, and it fails in the direction where nobody goes looking.
+
+</Trap>
+
+**The third way works because it does not care how records were grouped.** Put
+the record's own identity in the sorting key and let the engine collapse
+duplicates:
+
+```sql title="analytics/0003_webhook_attempts.sql"
+-- One row per webhook delivery attempt, shaped by what the publisher already sends rather
+-- than by a document: SAD 6.2 publishes `message_events` as *representative* and names
+-- `emoji_events`, and no table for delivery attempts is published anywhere. The chapter
+-- amends the SAD to publish this one.
+CREATE TABLE IF NOT EXISTS relay_analytics.webhook_attempts (
+    environment_id  UUID,
+    ts              DateTime64(3, 'UTC'),
+    delivery_id     UUID,
+    endpoint_id     UUID,
+    event_id        UUID,
+    attempt         UInt8,
+    -- NULLABLE BECAUSE THE VALUE IS SOMETIMES NOT KNOWN, AND 0 IS A DIFFERENT CLAIM.
+    -- The publisher spreads these in only when present: "an explicit `undefined` is not
+    -- the same as an absent key, and the difference is the whole meaning of 'nothing
+    -- answered'." A non-nullable `status` would write 0 and assert that an endpoint
+    -- answered with status zero. A timeout has no status; inventing one would make every
+    -- dashboard built on this lie in the same direction.
+    status          Nullable(UInt16),
+    error           Nullable(String),
+    -- How long the ENDPOINT took to answer. NOT `message_events.delivery_latency_ms`,
+    -- which is how long a message took to reach a client and still has no producer.
+    latency_ms      UInt32,
+    outcome         LowCardinality(String),   -- delivered|rescheduled|dead_lettered
+    -- THE ONLY THING BETWEEN A FIELD-NAME TYPO AND AN EMPTY TABLE.
+    --
+    -- The publisher's field is `attempted_at` and this column is `ts`. A JSONEachRow
+    -- insert whose keys do not match column names leaves the column AT ITS DEFAULT with
+    -- no error, and a DateTime64 default is the epoch -- which is older than the TTL
+    -- below, so the row is deleted at insert. Measured: 0 rows, before and after a merge.
+    -- The insert returns OK, the consumer acknowledges, the stream drains to zero, and
+    -- every instrument in the chain reports success over an empty table.
+    --
+    -- `input_format_skip_unknown_fields = 0` on the insert catches a RENAMED field
+    -- (Code: 117). It does not catch an ABSENT one -- a row with no `ts` at all takes the
+    -- default without complaint. This does.
+    CONSTRAINT ts_is_real CHECK ts > toDateTime64('2020-01-01 00:00:00', 3, 'UTC')
+)
+-- REPLACINGMERGETREE, AND THE SORTING KEY IS ALSO THE DEDUPLICATION KEY.
+--
+-- `(environment_id, ts)` is the tenant-then-time ordering chapter 4.2's argument is about;
+-- `(delivery_id, attempt)` is what makes a record unique -- the same pair the publisher
+-- already treats as identity. All four in the sorting key gets the range scans and the
+-- deduplication from one declaration, and it is safe because `ts` comes from
+-- `attempted_at`, a FIELD OF THE RECORD rather than the time it was consumed: the same
+-- record sorts to the same place however it was batched.
+--
+-- `insert_deduplication_token` would have been cheaper -- the server refuses the duplicate
+-- block at insert, with no read cost -- and it cannot be used. It needs a token stable
+-- across a redelivery, and JetStream batch boundaries are not: a retry with a different
+-- `max_messages` returned 4,5,1,2,3,6,7,8,9,10 where the original batch was 1,2,3,4,5.
+-- Worse, the token keys on ITSELF and not the content: the same token with 500 completely
+-- different rows dropped all 500 and reported success.
+--
+-- READS TAKE `FINAL`. The duplicate is physically present until a merge, so a bare
+-- SELECT count() over-counts. That is 4.2's rollup lesson one engine over: there the read
+-- contract became sum() with GROUP BY, here it is FINAL.
+ENGINE = ReplacingMergeTree
+PARTITION BY toYYYYMM(ts)                            -- DR-07, as message_events
+ORDER BY (environment_id, ts, delivery_id, attempt)
+TTL toDateTime(ts) + INTERVAL 90 DAY                 -- DR-09, and toDateTime because the
+                                                     -- published form is refused (Code: 450)
+```
+
+`(environment_id, ts)` is the tenant-then-time ordering the previous chapter was
+about. `(delivery_id, attempt)` is what makes a record unique — the same pair the
+publisher treats as identity. One declaration does both jobs, and it is safe
+because **`ts` comes from `attempted_at`, a field of the record** rather than the
+time it was consumed: the same record sorts to the same place however it arrives.
+
+## What that costs, and it is not nothing
+
+This is the previous chapter's rollup lesson one engine over. There the read
+contract became `sum()` with `GROUP BY`; here it is `FINAL`, because the duplicate
+is physically present until a merge collapses it.
+
+On the real table — thirty-six rows — `bare` and `FINAL` measured 1.4 ms against
+1.5 ms, which is noise wearing a number's clothes. On a million rows plus a
+hundred thousand redelivered duplicates it is visible:
+
+```
+                elapsed        rows_read      answer
+bare count()    0.84–0.91 ms           1      1,100,000   wrong by the duplicates
+FINAL           4.97–5.46 ms   1,200,000      1,000,000   right
+```
+
+**The bare count is answered from part metadata without reading a row.** That is
+exactly why it is free, and exactly why it cannot see a duplicate. The cost of
+correctness is four milliseconds and 1.2 million row reads on a query that was
+otherwise answered by one.
+
+## Why it batches, and why one bound is not enough
+
+An insert is almost entirely fixed cost. Sending one row and sending a hundred
+take the same time:
+
+```
+  rows      elapsed     per row
+     1      1.5 ms      1500 µs
+   100      1.5 ms        15 µs
+ 1,000      1.8 ms       1.8 µs
+10,000      3.2 ms       0.3 µs
+```
+
+Five thousand times cheaper per row at ten thousand than at one, and almost all of
+that is won by the first hundred. **The cost is in making the request, not in the
+rows**, which is the whole argument for batching and it takes one measurement
+rather than a paragraph of intuition.
+
+DR-11 says two seconds or ten thousand rows, and it takes **both** because each
+bound fails alone in a different direction. A row count with no timer never
+flushes for a quiet tenant: a customer sending forty webhooks an hour would wait
+ten and a half days to see the first batch. A timer with no ceiling has no bound
+on how large one insert can get under load, which is the failure that arrives
+exactly when you least want a surprise.
+
+The two bounds cross at **five thousand records per second** — ten thousand rows
+divided by two seconds. Below that the timer fires first and latency is capped at
+two seconds; above it the row count fires first and the timer never matters. So
+the pair is not belt-and-braces. It is one bound for the quiet case and one for
+the loud one, and a tenant crosses between them without anybody changing a
+setting.
+
+## The document had no table for this
+
+SAD §6.2 publishes `message_events` and labels it *representative*, then names a
+fifth table for emoji. **It names no table for delivery attempts at all** — while
+the publisher three chapters back has been writing one record per attempt the
+whole time. A store nobody specified is a store nobody can check.
+
+So the chapter publishes it, and the architecture document goes to revision 1.3
+carrying the same DDL this repository applies. The columns are not invented: each
+one is a field the publisher already sends, and the two that are `Nullable` are
+the two it sends **only when present**.
+
+<Why>
+
+`status` is absent when nothing answered. `error` is absent when there was no
+error. The publisher's own comment explains the distinction it is preserving —
+*"an explicit `undefined` is not the same as an absent key, and the difference is
+the whole meaning of 'nothing answered'"* — and a non-nullable column throws that
+away by writing `0`.
+
+Seven of the first thirty-one records drained here have no status. A
+non-nullable column would have asserted that seven endpoints replied with status
+zero, which is not a thing an endpoint can do.
+
+</Why>
+
+## The rename that fails by looking like success
+
+The publisher sends `attempted_at`. The column is `ts`. `JSONEachRow` matches
+JSON keys to **column names**, and an unmatched column takes its default:
+
+```
+absent ts      Code: 469. Constraint `ts_is_real` ... violated
+renamed key    Code: 117. Unknown field found while parsing JSONEachRow: attempted_at
+correct row    inserted · ts = 2026-09-14 10:00:00.500
+```
+
+```ts title="services/ingester/src/shape.ts"
+// What the publisher sends, and what the table takes. They are not the same shape, and the
+// difference is one rename that fails silently if it stops happening.
+//
+// `JSONEachRow` matches JSON keys to COLUMN NAMES. The publisher's field is `attempted_at`;
+// the column is `ts`. An unmatched column takes its DEFAULT with no error -- and a
+// DateTime64 default is the epoch, which is older than the table's ninety-day TTL, so the
+// row is deleted at insert. The insert returns OK, the consumer acknowledges, the stream
+// drains to zero, and the table stays empty while every instrument reports success.
+//
+// So the ingester SHAPES AND RENAMES rather than forwarding what it was given. Two server
+// settings and one table constraint stand behind this function, each catching a different
+// way of getting it wrong -- but the function is the thing that has to be right.
+
+/** The publisher's record, as it arrives on `analytics.webhook.attempt.{env}`. */
+export interface AttemptEvent {
+  delivery_id: string;
+  endpoint_id: string;
+  environment_id: string;
+  event_id: string;
+  attempt: number;
+  attempted_at: string;
+  /** Absent when nothing answered. A timeout has no status. */
+  status?: number;
+  /** Present when there was no status. */
+  error?: string;
+  latency_ms: number;
+  outcome: string;
+}
+
+/** One row of `relay_analytics.webhook_attempts`, keyed by column name. */
+export interface AttemptRow {
+  environment_id: string;
+  ts: string;
+  delivery_id: string;
+  endpoint_id: string;
+  event_id: string;
+  attempt: number;
+  status: number | null;
+  error: string | null;
+  latency_ms: number;
+  outcome: string;
+}
+
+const isString = (v: unknown): v is string => typeof v === "string" && v.length > 0;
+const isNumber = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
+
+/** Shape one record, or return null if it will never be valid.
+ *
+ * NULL MEANS TERMINATE, NOT RETRY. The consumer sets no redelivery limit, so a payload that
+ * cannot be parsed would otherwise come back until the stream's retention expires. The same
+ * bytes fail the same way every time; the api's own consumer runtime draws this line in the
+ * same words.
+ *
+ * An absent `status` or `error` becomes NULL rather than 0 or "". Zero is a measurement and
+ * NULL is an absence: a `status` of 0 asserts that an endpoint answered with status zero. */
+export function shape(raw: unknown): AttemptRow | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const e = raw as Partial<AttemptEvent>;
+
+  if (
+    !isString(e.environment_id) ||
+    !isString(e.attempted_at) ||
+    !isString(e.delivery_id) ||
+    !isString(e.endpoint_id) ||
+    !isString(e.event_id) ||
+    !isNumber(e.attempt) ||
+    !isNumber(e.latency_ms) ||
+    !isString(e.outcome)
+  ) {
+    return null;
+  }
+
+  return {
+    environment_id: e.environment_id,
+    // THE RENAME. Everything else is a copy; this is the line the table cannot survive
+    // being wrong, because being wrong about it looks exactly like success.
+    ts: e.attempted_at,
+    delivery_id: e.delivery_id,
+    endpoint_id: e.endpoint_id,
+    event_id: e.event_id,
+    attempt: e.attempt,
+    status: isNumber(e.status) ? e.status : null,
+    error: isString(e.error) ? e.error : null,
+    latency_ms: e.latency_ms,
+    outcome: e.outcome,
+  };
+}
+```
+
+Those two refusals are not decoration. A `DateTime64` default is the epoch, which
+is older than the ninety-day TTL above — so the row is **deleted at insert**. The
+insert returns OK, the consumer acknowledges, the stream drains to zero, and the
+table stays empty while every instrument in the chain reports success.
+
+<Trap>
+
+**Three guards, three different failures, and none of them is redundant.**
+
+`input_format_skip_unknown_fields = 0` turns a *renamed* field into an error. Its
+server default is **1**, which is precisely why this failure was invisible.
+
+`date_time_input_format = best_effort` is what parses the ISO-8601 string at all;
+the default `basic` refuses it outright. This is the loud one, and it is the least
+dangerous of the three for that reason.
+
+Neither covers an **absent** field — a row with no `ts` at all is not an unknown
+field, it is a missing one, and it takes the default without complaint. That is
+what `CONSTRAINT ts_is_real CHECK ts > '2020-01-01'` is for.
+
+</Trap>
+
+```ts title="services/ingester/src/clickhouse.ts"
+// The write side. Node's own `fetch` against the HTTP interface -- no client package, which
+// is what keeps `grep -c clickhouse pnpm-lock.yaml` at 0 by design rather than by luck.
+import type { AttemptRow } from "./shape.js";
+
+const DB = "relay_analytics";
+const TABLE = "webhook_attempts";
+
+// TWO SETTINGS, TWO DIFFERENT FAILURES, AND NEITHER IS OPTIONAL.
+//
+// `input_format_skip_unknown_fields=0` turns a RENAMED field into `Code: 117` instead of a
+// silent default. Its server default is 1, which is exactly why the failure it prevents was
+// invisible: the insert succeeds and the column takes the epoch.
+//
+// `date_time_input_format=best_effort` is what parses the ISO-8601 string at all. The
+// default `basic` refuses it outright -- `Code: 27. Cannot parse input: expected '"' before
+// 'Z"...'` -- which is the loud half of the pair, and the least dangerous.
+//
+// Neither covers an ABSENT field. The table's `CHECK ts_is_real` does.
+const SETTINGS = "input_format_skip_unknown_fields=0&date_time_input_format=best_effort";
+
+export interface ClickHouse {
+  insert(rows: AttemptRow[]): Promise<void>;
+  count(): Promise<number>;
+}
+
+export function createClickHouse({
+  host = process.env["RELAY_CLICKHOUSE_HOST"] ?? "localhost",
+  port = process.env["RELAY_CLICKHOUSE_HTTP_PORT"] ?? "8123",
+  user = process.env["RELAY_CLICKHOUSE_USER"] ?? "relay",
+  password = process.env["RELAY_CLICKHOUSE_PASSWORD"] ?? "relay",
+}: {
+  host?: string;
+  port?: string;
+  user?: string;
+  password?: string;
+} = {}): ClickHouse {
+  const auth = "Basic " + Buffer.from(`${user}:${password}`).toString("base64");
+
+  const post = async (query: string, body: string): Promise<string> => {
+    const url = `http://${host}:${port}/?${SETTINGS}&query=${encodeURIComponent(query)}`;
+    const res = await fetch(url, { method: "POST", headers: { Authorization: auth }, body });
+    const text = await res.text();
+    if (!res.ok) throw new Error(text.trim().split("\n")[0] ?? "clickhouse insert failed");
+    return text.trim();
+  };
+
+  return {
+    // One statement, one block. No deduplication token: the table is a ReplacingMergeTree
+    // keyed on (environment_id, ts, delivery_id, attempt), so a re-inserted record collapses
+    // regardless of how it was batched -- which a token cannot do, because JetStream batch
+    // boundaries are not stable across a redelivery.
+    async insert(rows: AttemptRow[]): Promise<void> {
+      if (rows.length === 0) return;
+      await post(
+        `INSERT INTO ${DB}.${TABLE} FORMAT JSONEachRow`,
+        rows.map((r) => JSON.stringify(r)).join("\n"),
+      );
+    },
+    // Reads take FINAL. The duplicate is physically present until a merge collapses it, so a
+    // bare count over-counts every redelivery -- by a plausible number.
+    async count(): Promise<number> {
+      return Number(await post(`SELECT count() FROM ${DB}.${TABLE} FINAL`, ""));
+    },
+  };
+}
+```
+
+## The store can be gone
+
+Stop ClickHouse and use the platform:
+
+```
+clickhouse                       stopped
+webhook walks attempted                5
+succeeded                              5
+failed                                 0
+ANALYTICS depth                   32 → 37
+```
+
+Five walks, five successes, and the stream grew by exactly five. **"No errors"
+from a run that sent nothing is the zero that proves nothing**, so the walks are
+counted and the stream's growth is the independent confirmation that the work
+happened at all.
+
+Run the ingester against the stopped store and nothing is acknowledged:
+
+```
+before   depth 37 · num_pending 6 · ack_pending 0
+run      ingester.batch_failed   TypeError: fetch failed
+after    depth 37 · num_pending 0 · ack_pending 5
+```
+
+Restart it, let `ack_wait` expire, and the backlog drains: 31 rows to 36.
+Thirty-seven published, one terminated as malformed, thirty-six written.
+
+<Why>
+
+**This consumer sets no redelivery limit, where the other two do.** The api's
+runtime gives up after five attempts and the dispatcher after ten, both at a
+thirty-second `ack_wait`. For a webhook endpoint that is sound — one that has
+failed ten times is probably gone.
+
+A store that is restarting is not an endpoint that is gone. At `max_deliver: 3`:
+
+```
+round 1: 1,2,3 delivered    round 4: NOTHING DELIVERED
+round 2: 1,2,3 delivered    consumer: num_pending 0 · ack_pending 0
+round 3: 1,2,3 delivered    STREAM still holds 3 messages
+```
+
+After the limit the consumer is never offered those records again, and reports
+nothing outstanding while the queue is still full. At five attempts and thirty
+seconds, **two and a half minutes of the store being down strands everything in
+flight.** So the queue's seven-day retention is the only bound — which makes
+poison handling load-bearing rather than tidy: **retry forever on transport,
+terminate at parse.**
+
+</Why>
+
+<Trap>
+
+**Neither obvious instrument detects a strand.** Stream depth stays high, which
+reads as accumulation. `num_pending` goes to zero, which reads as caught up. It is
+tempting to conclude the *disagreement* between them is the signal — and a clean
+drain of thirty-one records left `stream 31 · num_pending 0`, byte-identical to a
+strand, because `retention: Limits` keeps acknowledged messages until `max_age`.
+
+`num_redelivered` does not rescue it either. Five records that were definitely
+redelivered left that gauge at **0** once acknowledged: it counts *outstanding*
+redeliveries, not cumulative ones.
+
+**The rows written against the rows published is the only signal that works.**
+Both of the other two describe the consumer's present state, and a strand is a
+fact about the past.
+
+</Trap>
+
+## What the queue drops, and whether you can tell
+
+`discard: old` at one gibibyte drops the oldest records without telling anyone,
+and the obvious conclusion is that an ingester cannot know what it missed. It can:
+
+```
+first_seq  1        last_seq  37       messages  37
+```
+
+**`first_seq` is the instrument.** Discarding happens from the front, so
+`first_seq` advances. A consumer knows the sequence it last acknowledged; if
+`first_seq` has moved past it, the difference is exactly how many records went
+missing while it was away. Here `last_seq - first_seq + 1` equals `messages`, so
+nothing has been dropped.
+
+```ts title="services/ingester/src/main.ts"
+// The ingester — the consumer chapter 3.20 promised and did not build.
+//
+// `ANALYTICS` has carried one record per webhook delivery attempt since that chapter, with
+// seven-day retention and `discard: old`, and nothing has ever read it. The stream's own
+// comment says so: "no acknowledgement anywhere: nothing consumes this stream in this
+// chapter." This is the chapter it was waiting for.
+//
+// IT DOES NOT REUSE `createConsumerRuntime`, AND THAT IS THE ARGUMENT RATHER THAN AN
+// INCONVENIENCE. That runtime exists because "a future consumer forgets to dedupe → double
+// webhooks / double metering", mitigated by "a consumer template with dedup built in" -- and
+// the dedup it has built in is `claimEvent`, a PostgreSQL transaction. Constitution III
+// keeps the operational and analytical paths apart, so the template written to describe this
+// consumer is the one thing this consumer may not use. Deduplication happens in the table
+// instead, on the record's own key.
+import { AckPolicy, connect, type NatsConnection } from "nats";
+
+import { ALL_ANALYTICS_SUBJECT, ANALYTICS_STREAM } from "@relay/protocol";
+import { createLogger, type Logger } from "@relay/service-kit";
+
+import { createClickHouse, type ClickHouse } from "./clickhouse.js";
+import { shape, type AttemptRow } from "./shape.js";
+
+const DEFAULT_NATS_URL = "nats://localhost:4222";
+export const DURABLE = "analytics-ingester";
+
+// DR-11 publishes 2 s or 10,000 rows, and it takes BOTH because each bound fails alone: a
+// row count never flushes for a quiet tenant, and an interval has no ceiling under load.
+export const BATCH_ROWS = 10_000;
+export const BATCH_MS = 2_000;
+
+const ACK_WAIT_NS = 30 * 1_000_000_000;
+
+/** NO REDELIVERY LIMIT, AND THAT IS A DECISION ABOUT A DIFFERENT FAILURE.
+ *
+ * Both existing consumers set one -- MAX_DELIVER = 5 on the api's runtime, 10 on the
+ * dispatcher, each at a 30-second ack_wait. For a webhook endpoint that is sound: one that
+ * has failed ten times is probably gone, and retrying it forever helps nobody.
+ *
+ * A store that is restarting is not an endpoint that is gone. Measured at max_deliver 3: the
+ * message is delivered on rounds 1, 2 and 3 and NEVER AGAIN, while the stream still holds it
+ * and the consumer reports `num_pending 0`. At five attempts and thirty seconds, two and a
+ * half minutes of ClickHouse being down strands everything in flight -- and the loss hides
+ * from the instrument you would reach for, because stream depth stays high and consumer lag
+ * goes to zero.
+ *
+ * So the queue's seven-day retention is the only bound. That makes the poison case
+ * load-bearing rather than tidy: a payload that will never parse is terminated at the parse,
+ * or it comes back until the retention expires. Retry forever on transport, terminate at
+ * parse. One rule, two arms. */
+const MAX_DELIVER = -1;
+
+export interface IngestResult {
+  written: number;
+  malformed: number;
+}
+
+export async function ingestOnce({
+  nc,
+  store,
+  logger,
+  batchRows = BATCH_ROWS,
+  batchMs = BATCH_MS,
+  stream = ANALYTICS_STREAM,
+  durable = DURABLE,
+}: {
+  nc: NatsConnection;
+  store: ClickHouse;
+  logger: Logger;
+  batchRows?: number;
+  batchMs?: number;
+  /** The stream and durable are parameters so a test can use its own rather than
+   *  publishing probe records into the platform's. The defaults are the real ones. */
+  stream?: string;
+  durable?: string;
+}): Promise<IngestResult> {
+  const js = nc.jetstream();
+  const consumer = await js.consumers.get(stream, durable);
+
+  const rows: AttemptRow[] = [];
+  const pending: Array<{ ack: () => void }> = [];
+  let malformed = 0;
+
+  const messages = await consumer.fetch({ max_messages: batchRows, expires: batchMs });
+  for await (const m of messages) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(new TextDecoder().decode(m.data));
+    } catch {
+      parsed = null;
+    }
+    const row = shape(parsed);
+    if (row === null) {
+      // NAMED BY ITS SEQUENCE, NEVER BY ITS CONTENTS. The record carries `error` -- up to
+      // 2000 characters of a third-party endpoint's response, capable of echoing back
+      // anything -- and constitution VI keeps secrets, tokens and message content out of
+      // logs. The record survives in the stream for the retention window, so the sequence
+      // is enough to go and fetch it deliberately, which is the difference between an
+      // investigation and a leak.
+      malformed += 1;
+      logger.log("error", "ingester.malformed_record", { stream_sequence: m.seq });
+      m.term();
+      continue;
+    }
+    rows.push(row);
+    pending.push({ ack: () => m.ack() });
+  }
+
+  // ACKNOWLEDGE ONLY AFTER THE INSERT RETURNS. A record that was not written is not
+  // acknowledged, which is what makes the store being unreachable a delay rather than a loss.
+  await store.insert(rows);
+  for (const p of pending) p.ack();
+
+  return { written: rows.length, malformed };
+}
+
+export async function main(): Promise<void> {
+  const logger = createLogger("ingester");
+  const url = process.env["RELAY_NATS_URL"] ?? DEFAULT_NATS_URL;
+  const once = process.argv.includes("--once");
+
+  const nc = await connect({ servers: url });
+  const jsm = await nc.jetstreamManager();
+  await jsm.consumers.add(ANALYTICS_STREAM, {
+    durable_name: DURABLE,
+    ack_policy: AckPolicy.Explicit,
+    ack_wait: ACK_WAIT_NS,
+    max_deliver: MAX_DELIVER,
+    filter_subject: ALL_ANALYTICS_SUBJECT,
+  }).catch(() => undefined); // already there; leave it alone
+
+  const store = createClickHouse();
+  let running = true;
+  const stop = (): void => {
+    running = false;
+  };
+  process.once("SIGTERM", stop);
+  process.once("SIGINT", stop);
+
+  do {
+    try {
+      const { written, malformed } = await ingestOnce({ nc, store, logger });
+      if (written > 0 || malformed > 0) {
+        logger.log("info", "ingester.batch", { written, malformed });
+      }
+    } catch (error) {
+      // The store is unreachable, or the insert was refused. Nothing was acknowledged, so
+      // the broker will offer these records again -- forever, bounded only by retention.
+      logger.log("error", "ingester.batch_failed", { error: String(error) });
+      await new Promise((r) => setTimeout(r, BATCH_MS));
+    }
+  } while (running && !once);
+
+  await nc.close();
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main().catch((error: unknown) => {
+    process.stderr.write(`ingester failed: ${String(error)}\n`);
+    process.exit(1);
+  });
+}
+```
+
+```json title="services/ingester/package.json"
+{
+  "name": "@relay/ingester",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/main.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/main.js",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:integration": "vitest run --config vitest.integration.config.mts"
+  },
+  "dependencies": {
+    "@relay/protocol": "workspace:*",
+    "@relay/service-kit": "workspace:*",
+    "nats": "^2.29.3"
+  },
+  "devDependencies": {
+    "tsx": "^4.23.1"
+  }
+}
+```
+
+<SkipAhead>
+
+The platform changes are `analytics/0003_webhook_attempts.sql` and a new
+`services/ingester/`. `node analytics/apply.mjs` adds the table; the ingester runs
+with `--once` for a single batch or as a service for the loop.
+
+</SkipAhead>
+
+<ForwardRef>
+
+**No reconciliation job, no query surface, no latency percentiles.** FR-ANL-06's
+0.1% agreement, FR-ANL-07's searchable log and FR-ANL-10's percentiles are all
+later chapters.
+
+And `message_events.delivery_latency_ms` still has no producer.
+`webhook_attempts.latency_ms` is **not** that column — this one is how long an
+endpoint took to answer a webhook, that one is how long a message took to reach a
+client, and nothing yet writes it.
+
+</ForwardRef>
+
+<Checkpoint>
+
+A stream that something reads. A table whose sorting key is also its
+deduplication key, with three guards standing between a field-name typo and an
+empty table. An ingester that retries forever on transport and terminates at
+parse, and that names a malformed record by its stream sequence and never by its
+contents.
+
+Thirty-seven published, one terminated, thirty-six written; five walks with the
+store stopped, five successes; ten records replayed under three different
+groupings, still ten rows. That state is this chapter's tag.
+
+</Checkpoint>
+
+<ChapterFooter id="4.3" />

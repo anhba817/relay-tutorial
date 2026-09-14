@@ -811,6 +811,19 @@ export const series: Part[] = [
         readerProducesVi:
           "Một ClickHouse mà truy vấn chạm tới được, một schema phân tích với sổ ghi của riêng nó, và cùng một câu hỏi được trả lời trong 13,22 ms so với 585,9 ms của Postgres — cùng một ngày trong chín mươi mốt ngày không bao giờ đối soát được",
       },
+      {
+        id: "4.3",
+        path: "/part-4/chapter-03/the-consumer-that-was-promised",
+        title: "The consumer that was promised",
+        status: "published",
+        readerProduces:
+          "The ingester for a stream that has been filling since chapter 3.20 with nothing reading it — deduplicating on the record's own key, because the template built to prevent exactly this problem writes to the database this path may not touch",
+        sourceDoc: "docs/04-srs.md, docs/05-sad.md",
+        readerMinutes: 55,
+        titleVi: "Consumer đã được hứa hẹn",
+        readerProducesVi:
+          "Bộ nạp cho một stream đã đầy dần từ chương 3.20 mà chưa ai đọc — khử trùng lặp bằng chính khóa của bản ghi, bởi vì khuôn mẫu được xây để ngăn đúng vấn đề này lại ghi vào cơ sở dữ liệu mà đường dẫn này không được phép chạm tới",
+      },
     ],
   },
   {
