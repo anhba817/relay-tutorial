@@ -797,6 +797,7 @@ export const series: Part[] = [
         titleVi: "Câu hỏi mà những bộ đếm không trả lời được",
         readerProducesVi:
           "Một corpus một triệu tin nhắn, câu truy vấn phân tích lần đầu được viết cho Postgres, và bốn con số cho thấy index lẽ ra phải sửa được nó lại tốn thêm 49% dung lượng mà đổi lại chỉ là nhiễu",
+        translatedIn: ["vi"],
       },
       {
         id: "4.2",
@@ -810,6 +811,7 @@ export const series: Part[] = [
         titleVi: "Kho dữ liệu chưa từng lắng nghe",
         readerProducesVi:
           "Một ClickHouse mà truy vấn chạm tới được, một schema phân tích với sổ ghi của riêng nó, và cùng một câu hỏi được trả lời trong 13,22 ms so với 585,9 ms của Postgres — cùng một ngày trong chín mươi mốt ngày không bao giờ đối soát được",
+        translatedIn: ["vi"],
       },
       {
         id: "4.3",
@@ -823,6 +825,22 @@ export const series: Part[] = [
         titleVi: "Consumer đã được hứa hẹn",
         readerProducesVi:
           "Bộ nạp cho một stream đã đầy dần từ chương 3.20 mà chưa ai đọc — khử trùng lặp bằng chính khóa của bản ghi, bởi vì khuôn mẫu được xây để ngăn đúng vấn đề này lại ghi vào cơ sở dữ liệu mà đường dẫn này không được phép chạm tới",
+        translatedIn: ["vi"],
+      },
+      {
+        // REGISTERED LATE. This chapter shipped and was tagged `part4-ch4` with eight gates
+        // green, and `pnpm build` failed from that moment: `<ChapterHeader id="4.4" />` calls
+        // `getChapter`, which throws on an id this manifest does not hold. None of the eight
+        // gates renders a page, so nothing said so. Analysis pass 9 of feature 050 found it by
+        // running the build.
+        id: "4.4",
+        path: "/part-4/chapter-04/the-requests-that-belong-to-nobody",
+        title: "The requests that belong to nobody",
+        status: "published",
+        readerProduces:
+          "An analytical record for every API request, and the measurement that FR-ANL-01's \"every request\" and FR-ANL-07's \"per tenant\" are not the same population — 34 of 54 requests resolve to no tenant, and the gap is widest exactly where the traffic is",
+        sourceDoc: "docs/04-srs.md, docs/05-sad.md",
+        readerMinutes: 55,
       },
     ],
   },
