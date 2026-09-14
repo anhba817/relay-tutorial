@@ -1,6 +1,6 @@
 # Relay — Software Architecture Document
 
-**Version:** 1.2 (draft)
+**Version:** 1.3 (draft)
 **Status:** For review
 **Companion documents:** `01-product-vision.md` · `02-personas.md` · `03-journey-map.md` · `04-srs.md`
 **Structure:** views-based (C4-influenced), with Architecture Decision Records
@@ -748,6 +748,41 @@ kept as the shape; chapter 4.2 carries the nullability and the measurements behi
 No message text anywhere in this store (DR-08 / FR-ANL-11) — the compliance erasure
 endpoint (FR-MOD-04) deletes analytical rows by `user_id` mutation, which is tolerable
 precisely because it is rare and content-free.
+
+**AND THE DELIVERY-ATTEMPT TABLE, ADDED IN REVISION 1.3.** `message_events` above is
+labelled *representative* and this document named no table for FR-ANL-01's webhook delivery
+attempts, while `services/api/src/webhooks/analytics.ts` has been publishing one record per
+attempt since chapter 3.20. Chapter 4.3 built the consumer and this is the table it writes:
+
+```sql
+CREATE TABLE webhook_attempts (
+    environment_id  UUID,
+    ts              DateTime64(3, 'UTC'),   -- the publisher's `attempted_at`
+    delivery_id     UUID,
+    endpoint_id     UUID,
+    event_id        UUID,
+    attempt         UInt8,                  -- 1..7
+    status          Nullable(UInt16),       -- absent means nothing answered
+    error           Nullable(String),       -- absent means there was no error
+    latency_ms      UInt32,                 -- how long the ENDPOINT took
+    outcome         LowCardinality(String), -- delivered|rescheduled|dead_lettered
+    CONSTRAINT ts_is_real CHECK ts > toDateTime64('2020-01-01 00:00:00', 3, 'UTC')
+)
+ENGINE = ReplacingMergeTree
+PARTITION BY toYYYYMM(ts)                            -- DR-07
+ORDER BY (environment_id, ts, delivery_id, attempt)  -- ordering AND identity
+TTL toDateTime(ts) + INTERVAL 90 DAY;                -- DR-09
+```
+
+**The sorting key is also the deduplication key**, which is what makes the engine
+`ReplacingMergeTree` rather than `MergeTree`: JetStream delivers at least once and this
+store has no uniqueness constraint, so a redelivered record must collapse rather than
+double-count. `(delivery_id, attempt)` is the same pair the publisher treats as identity.
+**Reads take `FINAL`** — the duplicate is physically present until a merge.
+
+**`latency_ms` here is not `message_events.delivery_latency_ms`.** This is how long an
+endpoint took to answer a webhook; that is how long a message took to reach a client, and
+it still has no producer.
 
 A fifth table, `emoji_events` (DR-14), records emoji usage as `(environment_id, ts, kind,
 identifier, pack_id)` with the same partitioning and TTL. It deliberately omits `channel_id`
