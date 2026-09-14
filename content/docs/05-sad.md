@@ -1,6 +1,6 @@
 # Relay — Software Architecture Document
 
-**Version:** 1.3 (draft)
+**Version:** 1.4 (draft)
 **Status:** For review
 **Companion documents:** `01-product-vision.md` · `02-personas.md` · `03-journey-map.md` · `04-srs.md`
 **Structure:** views-based (C4-influenced), with Architecture Decision Records
@@ -181,7 +181,11 @@ attempts. Records every attempt as an analytical event (FR-WHK-06).
 **Analytics ingester** `[Phase 3]`
 Consumes everything, buffers, batch-inserts to ClickHouse every 2 s or 10k rows (DR-11).
 Deliberately dumb: no transformation beyond shaping, no business logic. If ClickHouse is
-down it stops consuming and the stream absorbs the backlog (NFR-REL-05, 24 h retention).
+down it stops consuming and the stream absorbs the backlog (NFR-REL-05). **How long it
+absorbs is a function of the record rate, not a constant**, and the stream is configured at
+seven days and 1 GiB rather than at 24 h. Measured at 320 bytes a record: 1 GiB holds
+3,355,443 of them, so seven days fits only up to 5.5 records/second and 24 hours only up to
+38.8. Above those rates `max_bytes` binds before `max_age` does.
 
 **Media worker** `[Phase 3]`
 Consumes `media.uploaded` events. Fetches the object, verifies size/type against the
@@ -749,6 +753,16 @@ No message text anywhere in this store (DR-08 / FR-ANL-11) — the compliance er
 endpoint (FR-MOD-04) deletes analytical rows by `user_id` mutation, which is tolerable
 precisely because it is rare and content-free.
 
+**AND THE API REQUEST LOG, ADDED IN REVISION 1.4.** `relay_analytics.api_requests` carries
+FR-ANL-07's 30-day retention beside `webhook_attempts`' 90 — a second table rather than more
+columns, because one `TTL` clause cannot express two retentions. Its `environment_id` is
+**nullable**, which is the one decision in it worth arguing: a large share of API requests
+resolve to no tenant, and the `platform` principal the dispatcher and gateway present carries
+no environment by design. Revision 1.4 also corrected this document's claim that the analytics
+stream absorbs 24 h; that window is a function of the record rate, and the same chapter made
+the rate constant by publishing a record for every request rather than for every webhook
+attempt.
+
 **AND THE DELIVERY-ATTEMPT TABLE, ADDED IN REVISION 1.3.** `message_events` above is
 labelled *representative* and this document named no table for FR-ANL-01's webhook delivery
 attempts, while `services/api/src/webhooks/analytics.ts` has been publishing one record per
@@ -916,7 +930,7 @@ which is the design (D5), bounded by 24 h retention (NFR-REL-08).
 | Gateway instance dies | Its connections only | Clients reconnect + resume; zero loss (Redis registry TTLs out) |
 | Redis lost | Presence + fan-out pause | Gateways buffer briefly, reconnect clients; Postgres unaffected |
 | JetStream lost | Webhooks, analytics, live dashboard pause | Outbox accumulates in Postgres; relay drains on recovery — *this is why the outbox is in Postgres, not fire-and-forget* |
-| ClickHouse lost | Dashboards stale | Ingester pauses; stream absorbs 24 h (NFR-REL-05) |
+| ClickHouse lost | Dashboards stale | Ingester pauses; the stream absorbs the backlog for a window set by the record rate — 24 h holds only up to 38.8 records/second at 320 bytes each (NFR-REL-05) |
 | Object storage lost | Media uploads/downloads fail; text messaging unaffected | Upload slots return a specific error; attachments render as temporarily unavailable; no Relay-side state to recover — storage provider's durability is the recovery |
 | Postgres lost | Full write outage | The one honest SPOF: managed HA + PITR (NFR-REL-06/07); reads could survive on replica but v1 does not attempt write continuity |
 

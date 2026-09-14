@@ -1,0 +1,917 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figTwoPopulations, figWhereTheRecordIsMade, figTheConsumerThatTerminates } from "./figures";
+
+export const metadata = {
+  title: "The requests that belong to nobody — Building Relay",
+  description:
+    "FR-ANL-01 wants an analytical event for every API request and FR-ANL-07 wants a queryable log per tenant. Those are not the same population, and the gap is widest exactly where the traffic is. Building the producer also finds that the consumer shipped last chapter destroys everything it sends.",
+  alternates: {
+    canonical: "/part-4/chapter-04/the-requests-that-belong-to-nobody",
+    languages: {
+      en: "/part-4/chapter-04/the-requests-that-belong-to-nobody",
+      vi: "/vi/part-4/chapter-04/the-requests-that-belong-to-nobody",
+    },
+  },
+};
+
+<ChapterHeader id="4.4" />
+
+Two clauses, written eleven apart, that sound like they describe one feature.
+
+FR-ANL-01: *the system shall emit an analytical event for every message send, connection open
+and close, **API request**, and webhook delivery attempt.* FR-ANL-07: *the system shall retain
+a queryable **API request log per tenant** for 30 days.*
+
+Last chapter built the consumer for the first of those. This chapter builds the producer for
+the second. It is the same stream, the same ingester, and a record with six more fields — which
+is why it looked like the small chapter of movement III when the part was planned.
+
+Then you write down what "every" means and what "per tenant" means and notice they are
+different sets.
+
+## Which requests have a tenant
+
+Ask the api. Five requests, five of the shapes it actually serves:
+
+```bash
+for r in "GET /healthz" "GET /v1/webhooks" "GET /v1/does-not-exist" \
+         "GET /v1/channels/abc123/messages" "POST /internal/dispatch/expand"; do
+  set -- $r
+  printf "%-6s %-34s -> %s\n" "$1" "$2" \
+    "$(curl -s -o /dev/null -w '%{http_code}' -X "$1" "localhost:4000$2")"
+done
+```
+
+```
+GET    /healthz                           -> 200
+GET    /v1/webhooks                       -> 401
+GET    /v1/does-not-exist                 -> 404
+GET    /v1/channels/abc123/messages       -> 401
+POST   /internal/dispatch/expand          -> 401
+```
+
+Every one of them is an API request. **Not one of them has a tenant.** A health check has no
+credential, a 404 matched no route, and a 401 is a request whose credential was refused —
+there is no environment to attribute any of them to.
+
+That is unsurprising for those four. The fifth is the one worth stopping on.
+
+`/internal/dispatch/expand` is the seam the dispatcher calls to fan a message out. It is
+authenticated — with a **platform** credential, and `services/api/src/auth/principal.ts` is
+explicit about what that means:
+
+```ts
+export interface PlatformPrincipal {
+  kind: "platform";
+  /** Which internal service presented it, for logs. Never the credential. */
+  service: string;
+  /** Present and always undefined, so the environment-scoped providers that read
+   *  `principal?.environmentId` keep compiling AND keep getting nothing. */
+  environmentId?: undefined;
+}
+```
+
+<Why title="Why the platform principal carries no tenant">
+The dispatcher serves every environment. Minting it an API key would have worked on the first
+try — and an `application` principal is scoped to exactly one environment by construction, so a
+dispatcher holding one either cannot serve other tenants or has been quietly granted
+cross-tenant reach through the credential type whose entire meaning is that it has none.
+
+The file says it in one line: *"That is not an omission — it is what stops it being usable
+anywhere a tenant is expected."* It is correct, it is load-bearing, and it means the busiest
+routes in this api produce requests with no tenant.
+</Why>
+
+<Figure caption="Two clauses, two populations. The overlap is smaller than either clause suggests." code={figTwoPopulations} />
+
+Measured over a stated workload — 20 authenticated requests, 8 unauthenticated, 5 unmatched, 18
+on the internal seam:
+
+```
+principal_kind  requests  tenantless  attributed  % tenantless
+application           20           0          20           0
+platform              18          18           0         100
+none                  16          16           0         100
+total                 54          34          20          63
+```
+
+**The 63% is a fact about that mix and nothing else.** Change the workload and it changes. What
+does not change with the workload is the middle row: `platform` is 100% tenantless *by
+construction*, and the dispatcher and gateway call that seam on every message and every
+connection.
+
+## What the constitution says about a record with no tenant
+
+Principle I, the non-negotiable one:
+
+> Every persisted operational and analytical record MUST carry a non-null tenant
+> (`environment_id`) identifier, directly or through a single foreign-key hop.
+
+Three readings are available and two of them are wrong.
+
+**Drop the tenantless requests.** FR-ANL-01's "every" becomes false for the highest-volume
+routes, silently, and the request log's count can never be reconciled against anything —
+which is the whole subject of FR-ANL-06.
+
+**Invent an environment for them.** Chapter 4.2 already measured what that costs: a NULL
+`user_id` inserted into a non-nullable column became the zero UUID, and produced one phantom
+active user per environment holding a deleted author's messages. A value meaning "unknown"
+inside the column principle I exists to protect is the failure, not the workaround.
+
+**The clause governs tenant data, and a record with no tenant is not tenant data.** This is
+the reading the chapter takes, and it is only worth anything if it is testable. It is: a
+record with no environment is reachable by no tenant-scoped filter. Over a stream holding six
+candidate tokens plus one real tenant's record, tenant A's exact filter saw **1** and tenant
+B's saw **0**; over a table holding both kinds, a tenant-scoped read returns that tenant's rows
+and **zero** tenantless ones.
+
+<Trap title="A validator with an escape hatch is a validator with a hole">
+`analyticsSubjectFor` refuses an environment id that is not a UUID, because the id becomes a
+dot-delimited subject token. The tempting fix for a tenantless record is to relax that
+refusal. Measured, with six candidate tokens published to one stream:
+
+```
+"_none"      published OK          "no.tenant"  published OK
+"-"          published OK          "*"          published OK
+```
+
+Every one was accepted. `no.tenant` produced a **five-token** subject where four were
+intended, and the four-token wildcard did not match it. `*` published a subject containing a
+literal asterisk. **Neither failed at publish time** — and a malformed token does not go to the
+wrong tenant, it goes where no intended filter reaches, which is the quiet direction.
+
+So the tenantless case gets its own function returning a constant `_none`, and the validator
+keeps its refusal.
+</Trap>
+
+## Where the record is made
+
+The producer is a middleware. It has to be: a Nest interceptor never runs for a request a
+guard refuses, and it never runs for a route that matched nothing — which is to say it misses
+every 401 and every 404, the requests an operator most wants in a request log.
+
+That much is obvious after one probe. The position in the chain is not.
+
+<Figure caption="Registered fourth, the producer never runs for a 429. Registered second, it does." code={figWhereTheRecordIsMade} />
+
+```ts
+consumer
+  .apply(
+    RequestContextMiddleware,
+    RequestLogMiddleware,
+    AuthenticateMiddleware,
+    RateLimitMiddleware,
+  )
+  .forRoutes("{*path}");
+```
+
+`RateLimitMiddleware` refuses a 429 with `res.statusCode = 429; res.end(...); return;` at two
+points and **never calls `next()`**. A middleware registered after it is never reached. So
+"register it after the one that mints the request id" — which is the natural instruction — puts
+the producer exactly where rate-limited requests are invisible to it.
+
+<Why title="Attach early, read late">
+Second in the chain, the producer runs before the principal exists. That sounds like the wrong
+place to read the principal from — and it would be, if it read it there.
+
+It does not. It **attaches** a `finish` listener on the way in and **reads** when the listener
+fires, which is after the response has been sent and therefore after `AuthenticateMiddleware`
+has run if it ran at all. The registration point and the read point are different moments, and
+the gap between them is what makes both the authenticated request and the refused one produce a
+correct record.
+</Why>
+
+## The layer that decided
+
+A row that says a request returned 401 does not say who decided that. The guard and the handler
+are indistinguishable from the producer's vantage point — same status, same `req.route`, same
+request properties:
+
+```
+/v1/fine         status=200 route=set  own keys=["body","route"]
+/v1/guard401     status=401 route=set  own keys=["body","route"]
+/v1/handler401   status=401 route=set  own keys=["body","route"]
+```
+
+So `refused_at` has four values and the producer can only observe two of them. `unmatched` and
+`handler` are inferred — no route, or a route and no stamp. `middleware` and `guard` are
+**stamped by the layer that refuses**, which costs one line in `CredentialGuard`, the only
+class implementing `CanActivate` in this api.
+
+<Trap title="The handler arm is an inference from silence">
+`refused_at` reads `handler` when nothing stamped. A guard added later that refuses without
+stamping is therefore recorded as `handler`: a plausible value, wrong, in a column nothing would
+flag.
+
+That is the shape of the fence-chain checker this project spent a feature on, where the answer
+meaning *clean* and the answer meaning *never looked* printed the same line. The answer here is
+045's: make the checker fail on an unknown member rather than trust its input. A test walks the
+api's source, finds every class implementing `CanActivate`, and fails if any of them lacks the
+stamp — and it was run red by deleting the stamp before it was trusted green.
+</Trap>
+
+## "Which endpoint is being rate-limited" is not a question this platform can answer
+
+It is the obvious first query against a request log, and the honest answer is that the
+granularity does not exist. Here is the limiter's entire knowledge of routes:
+
+```ts
+export function operationsFor(method: string, path: string): LimitedOperation[] {
+  if (!path.startsWith(PUBLIC_PREFIX)) return [];
+  if (method === "POST" && SEND_PATH.test(path)) return ["rest", "send"];
+  return ["rest"];
+}
+```
+
+Three values: outside `/v1/`, the send path, everything else. **The limiter does not limit per
+endpoint**, so a per-endpoint breakdown of its refusals describes a mechanism that is not there.
+
+And a 429 from the limiter has no route template at all, because `req.route` is set by the
+*router* and a middleware refusal ends the response before the router runs. The record carries
+`limited_operation` instead — `send`, `rest` or `signup`, the class the limiter actually decided
+on, taken from `refusal.operation` rather than from the array above, because the array says what
+was *counted* and the field says what *refused*.
+
+## And the consumer built last chapter destroys all of it
+
+The stream is `ANALYTICS`. The consumer is `analytics-ingester`, shipped in chapter 4.3, and its
+durable filters on `analytics.>` — the widest subject the grammar admits. Every record on the
+stream reaches it, and `shape()` understands exactly one record type.
+
+Publish one attempt record and one API request record, and run the consumer twice:
+
+```
+pass 1: written 1  malformed 1
+pass 2: written 0  malformed 0
+stream still holds 2 of 2 · consumer num_pending 0 · ack_pending 0
+```
+
+<Figure caption="`null` means terminate. The record is gone, and both instruments say the system is fine." code={figTheConsumerThatTerminates} />
+
+`written 1` is the positive control — the attempt record went through, so the probe measured a
+difference between record types rather than a broken consumer. The request record returned
+`null` from `shape()`, and `null` means `m.term()`: logged once at `error`, never redelivered.
+
+**Read the third line twice.** The stream reports both messages present, because
+`retention: Limits` keeps a terminated message. The consumer reports nothing pending. Depth says
+the record is there and lag says there is nothing to do, and one of them is gone for good.
+
+The repair is small and the reason it is small is the point: `route()` decides *what a record is*
+before anything tries to turn it into a row, so "not mine" stops being the same answer as
+"malformed". A record this consumer does not write is left on the stream and counted; a record
+that will never parse is still terminated. Retry forever on transport, terminate at parse.
+
+<Trap title="An absent `type` means attempt, and that is a compatibility rule rather than a default">
+The router keys on a `type` field the API request record carries. Chapter 3.20's attempt records
+do not have one and never will — 36 of them were on the stream when this chapter was written, 0
+carrying a `type`.
+
+A reader of anything durable cannot require a field its writer did not have. This project has
+paid for that once already, when a required `attachments` on the outbox schema terminated every
+in-flight `message.created` the previous binary had written.
+</Trap>
+
+## What the table could not say
+
+Two column types were wrong, and neither was found by reading.
+
+`endpoint` was `LowCardinality(String)`. A 404 has no endpoint and a middleware refusal has no
+endpoint *yet* — the router had not run — and neither is a route named the empty string. But:
+
+```
+                    LowCardinality(String)   Nullable(String)
+absent field                ''  (len 0)            NULL
+explicit ""                 ''  (len 0)            ""
+```
+
+The wire distinguishes absent from empty and the column could not. That is chapter 4.3's defect
+on a different column — a field the publisher omits takes the column's default silently — and
+none of the three guards 4.3 installed reaches it: the skip-unknown-fields setting catches an
+*unknown* field, not an absent one, and a `CHECK` cannot help because absent is legal here.
+
+`latency_ms` was `UInt32`, and every gate was green: lint, typecheck, 27 unit tests, the schema
+applied, the table verified against the data model with `SHOW CREATE`. Then the ingester met
+real traffic.
+
+```
+Code: 27. DB::Exception: Cannot parse input: expected ',' before: '.556,"principal_kind":...'
+```
+
+The producer measures with `process.hrtime.bigint()` and reports fractional milliseconds.
+Nothing in the type system connects a TypeScript `number` to an unsigned integer column.
+
+<Why title="Why rounding would have been the wrong fix">
+Rounding to whole milliseconds keeps `UInt32` and is one line. It also destroys the resolution
+the log exists for. Four real requests, after the column became `Float32`:
+
+```
+/healthz      GET  200  0.56   handler
+/v1/x         GET  404  0.921  unmatched
+/healthz      GET  200  0.41   handler
+/v1/webhooks  GET  401  2.29   guard
+```
+
+Three of four are under a millisecond. Under `UInt32` they read 0, and FR-ANL-10's percentiles
+would be computed over a column that had thrown its own resolution away.
+</Why>
+
+Nothing was lost while the column was wrong, and that is worth saying because it was not luck.
+The insert threw, so nothing was acknowledged, and the records sat on the stream until the
+column could take them: `pending 0 · redelivered 2`. Acknowledging only after the write returns
+is what makes a broken consumer a delay rather than a loss.
+
+## What it costs the response
+
+The claim is constitution III's: failure or backlog of the analytical pipeline must not affect
+API availability. It is verified by **inspection** — the publish is a `void` call inside a
+`finish` listener, so the response has already been sent — because a timing test passes on a
+fast broker whether or not the `await` is there.
+
+The measurement is evidence about this build rather than the claim itself. Two hundred requests
+each side, thirty discarded as warm-up, the same route and credential both times:
+
+```
+broker UP     n 200   mean 2.61 ms   p50 2.54   p95 3.13   p99 3.58
+broker DOWN   n 200   mean 2.45 ms   p50 2.36   p95 2.98   p99 3.69
+status codes, both runs:  200 x 200
+```
+
+**The broker-down run is faster.** Removing the publish removes background work and nothing
+else. Both sit two orders of magnitude under NFR-PRF-02's 150 ms, and the status codes are
+recorded beside the latencies because a response that is fast and wrong satisfies a timing
+assertion.
+
+<Checkpoint>
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' localhost:4000/v1/webhooks
+curl -s -X POST http://localhost:8123/ -u relay:relay --data-binary \
+  "SELECT ifNull(endpoint,'~absent'), method, status, latency_ms, principal_kind,
+          refused_at, isNull(environment_id) AS tenantless
+     FROM relay_analytics.api_requests FINAL ORDER BY ts DESC LIMIT 5 FORMAT TSV"
+```
+
+A 401 against `/v1/webhooks` should appear with `refused_at` of `guard`, its endpoint present,
+and `tenantless` of 1. `FINAL` is not decoration: a `ReplacingMergeTree` read without it is a
+read of whatever has not been merged yet.
+</Checkpoint>
+
+## The bill for a second producer on one stream
+
+`ANALYTICS` was sized when its only producer wrote one record per webhook delivery attempt — 36
+records in several days. It is one stream at 1 GiB with seven-day retention and `discard: old`.
+
+A request record occupies **320 bytes** on it.
+
+```
+1 GiB holds                     3,355,443 records
+7-day retention reached at      5.5 requests/second sustained
+24 h of absorption holds to     38.8 requests/second
+```
+
+So `max_bytes` becomes the binding constraint instead of `max_age` above about six requests a
+second, and under `discard: old` the eviction takes the oldest messages regardless of which
+producer wrote them: a busy tenant's request records evict a quiet tenant's webhook attempts,
+with no error at either end.
+
+<Trap title="The byte count includes the instrument">
+The first measurement read 313 bytes. The second, a different probe, read 315. The stream's byte
+accounting counts the **subject**, and the two probes' subjects differed by two characters —
+exactly the difference. Measured across three lengths against the same 1,000 records: 51
+characters gives 313.0, 53 gives 315.0, 58 gives 320.0.
+
+The real subject `analytics.api.request.{uuid}` is 58 characters, so 320 is the honest figure
+and every number derived from 313 was 2% light. A probe stream cannot take `analytics.>` at all
+— the broker refuses overlapping subjects — so a length-matched prefix is the only way to the
+real number without publishing into the live stream.
+</Trap>
+
+## The code
+
+Four files this chapter changed, as diffs against their state at the end of chapter 4.3.
+
+The router is the one worth reading closely. `shape` is untouched — it is still the attempt
+shaper, still at 100% branches — and `route` is a new function in front of it, so that deciding
+*what a record is* happens before anything tries to turn it into a row.
+
+```diff title="services/ingester/src/shape.ts"
+@@ -82,6 +82,144 @@ export function shape(raw: unknown): AttemptRow | null {
+     status: isNumber(e.status) ? e.status : null,
+     error: isString(e.error) ? e.error : null,
+     latency_ms: e.latency_ms,
+     outcome: e.outcome,
+   };
+ }
++
++/** The api's record, as it arrives on `analytics.api.request.{env|_none}`. */
++export interface RequestEvent {
++  type: string;
++  request_id: string;
++  ts: string;
++  method: string;
++  status: number;
++  latency_ms: number;
++  principal_kind: string;
++  refused_at: string;
++  /** Absent when the router did not run -- a 404 matched nothing, and a middleware refusal
++   *  ended the response before routing. Two different facts, separated by `refused_at`. */
++  endpoint?: string;
++  /** Absent when the request resolved to no tenant. Never null and never a sentinel. */
++  environment_id?: string;
++  /** Absent unless the rate limiter refused. */
++  limited_operation?: string;
++}
++
++/** One row of `relay_analytics.api_requests`, keyed by column name. */
++export interface RequestRow {
++  environment_id: string | null;
++  ts: string;
++  request_id: string;
++  endpoint: string | null;
++  method: string;
++  status: number;
++  latency_ms: number;
++  principal_kind: string;
++  refused_at: string;
++  limited_operation: string | null;
++}
++
++/** Shape one API request record, or return null if it will never be valid.
++ *
++ * `type` IS READ AND THEN DROPPED. The wire record has eleven fields and the table has ten:
++ * `type` is the router's discriminator and has no column. Forwarding it lands
++ * `Code: 117. Unknown field found while parsing JSONEachRow format: type` -- loud, because
++ * `input_format_skip_unknown_fields=0` is set, and the one place in this design where a
++ * spread fails loudly rather than open. The row is still built by naming every field:
++ * relying on a server setting to catch a shaping mistake is relying on it to be configured.
++ *
++ * ABSENT IS NULL, NOT "". The columns are `LowCardinality(Nullable(String))` because
++ * `LowCardinality(String)` cannot hold the difference -- measured, an absent field and an
++ * explicit empty string both land as ''. A 404 has no endpoint; a route named "" does not
++ * exist. */
++export function shapeRequest(raw: unknown): RequestRow | null {
++  if (typeof raw !== "object" || raw === null) return null;
++  const e = raw as Partial<RequestEvent>;
++
++  if (
++    !isString(e.request_id) ||
++    !isString(e.ts) ||
++    !isString(e.method) ||
++    !isNumber(e.status) ||
++    !isNumber(e.latency_ms) ||
++    !isString(e.principal_kind) ||
++    !isString(e.refused_at)
++  ) {
++    return null;
++  }
++
++  return {
++    environment_id: isString(e.environment_id) ? e.environment_id : null,
++    ts: e.ts,
++    request_id: e.request_id,
++    endpoint: isString(e.endpoint) ? e.endpoint : null,
++    method: e.method,
++    status: e.status,
++    latency_ms: e.latency_ms,
++    principal_kind: e.principal_kind,
++    refused_at: e.refused_at,
++    limited_operation: isString(e.limited_operation) ? e.limited_operation : null,
++  };
++}
++
++// ---------------------------------------------------------------------------
++// ROUTING (chapter 4.4). The stream carries more than one record type now.
++//
++// `shape` above is the ATTEMPT shaper, and it answers `null` for anything else — which the
++// consumer reads as "terminate". So until this chapter, publishing a second record type onto
++// `ANALYTICS` destroyed it: one error line carrying a stream sequence, `m.term()`, and it
++// never comes back. Measured at 049 phase 1, with an attempt record beside it as the control:
++//
++//     pass 1: written 1  malformed 1
++//     pass 2: written 0  malformed 0
++//     stream still holds 2 of 2 · consumer num_pending 0 · ack_pending 0
++//
++// BOTH INSTRUMENTS REPORT NOTHING WRONG. The stream says the record is there, because
++// `retention: Limits` keeps a terminated message; the consumer says there is nothing pending.
++// The only trace is the error line, and it carries a sequence and no type.
++//
++// So the decision "what is this record" is made BEFORE anything tries to turn it into a row,
++// and "not mine" stops being the same answer as "malformed". One is a record this consumer
++// does not write and must leave alone; the other will never parse and must not come back.
++// ---------------------------------------------------------------------------
++
++/** The wire's own discriminator. R11: the PAYLOAD says what the payload is, not the subject —
++ *  a router that parses subjects has to be right about tokens too, and a malformed token
++ *  publishes a subject one level deeper that no intended filter matches. */
++export const API_REQUEST_TYPE = "api.request";
++
++export type Shaped =
++  | { kind: "attempt"; row: AttemptRow }
++  | { kind: "request"; row: RequestRow }
++  | { kind: "malformed" }
++  | { kind: "unclaimed"; type: string };
++
++/** Decide what a record is.
++ *
++ * AN ABSENT `type` MEANS ATTEMPT, AND THAT IS A COMPATIBILITY RULE RATHER THAN A DEFAULT.
++ * Chapter 3.20's publisher has no `type` field and never will for the records already on the
++ * stream — 36 of them at this chapter's tag, 0 carrying one. A reader of anything durable
++ * cannot require a field its writer did not have; 043 paid for that lesson when a required
++ * `attachments` terminated every in-flight `message.created` written by the previous binary.
++ *
++ * A RECOGNISED TYPE WITH MISSING FIELDS IS STILL MALFORMED. Widening "not mine" must not
++ * swallow the parse arm: 048's rule is retry forever on transport, terminate at parse, and
++ * the poison case is what makes the unbounded redelivery safe. */
++export function route(raw: unknown): Shaped {
++  if (typeof raw !== "object" || raw === null) return { kind: "malformed" };
++
++  const type = (raw as { type?: unknown }).type;
++  if (type === undefined) {
++    const row = shape(raw);
++    return row === null ? { kind: "malformed" } : { kind: "attempt", row };
++  }
++  if (type === API_REQUEST_TYPE) {
++    const row = shapeRequest(raw);
++    return row === null ? { kind: "malformed" } : { kind: "request", row };
++  }
++
++  // Anything else is somebody's record and not this consumer's. Leaving it costs the stream's
++  // retention window; terminating it costs the record. Those are not comparable, and a
++  // consumer that does not recognise a type is the party with the least information.
++  return { kind: "unclaimed", type: typeof type === "string" ? type : String(type) };
++}
+```
+
+The consumer then keeps two buffers on one fetch and acknowledges only after **both** inserts
+return. If the second throws, nothing in the batch is acked and the whole batch is redelivered —
+which re-inserts rows the first call already wrote, and is safe because both tables collapse on
+the record's own key.
+
+```diff title="services/ingester/src/main.ts"
+@@ -9,27 +9,21 @@
+ // INCONVENIENCE. That runtime exists because "a future consumer forgets to dedupe → double
+ // webhooks / double metering", mitigated by "a consumer template with dedup built in" -- and
+ // the dedup it has built in is `claimEvent`, a PostgreSQL transaction. Constitution III
+ // keeps the operational and analytical paths apart, so the template written to describe this
+ // consumer is the one thing this consumer may not use. Deduplication happens in the table
+ // instead, on the record's own key.
+-import { AckPolicy, connect, type NatsConnection } from "nats";
++import { AckPolicy, connect } from "nats";
+ 
+ import { ALL_ANALYTICS_SUBJECT, ANALYTICS_STREAM } from "@relay/protocol";
+-import { createLogger, type Logger } from "@relay/service-kit";
++import { createLogger } from "@relay/service-kit";
+ 
+-import { createClickHouse, type ClickHouse } from "./clickhouse.js";
+-import { shape, type AttemptRow } from "./shape.js";
++import { createClickHouse } from "./clickhouse.js";
++import { BATCH_MS, DURABLE, ingestOnce } from "./ingest.js";
+ 
+ const DEFAULT_NATS_URL = "nats://localhost:4222";
+-export const DURABLE = "analytics-ingester";
+-
+-// DR-11 publishes 2 s or 10,000 rows, and it takes BOTH because each bound fails alone: a
+-// row count never flushes for a quiet tenant, and an interval has no ceiling under load.
+-export const BATCH_ROWS = 10_000;
+-export const BATCH_MS = 2_000;
+ 
+ const ACK_WAIT_NS = 30 * 1_000_000_000;
+ 
+ /** NO REDELIVERY LIMIT, AND THAT IS A DECISION ABOUT A DIFFERENT FAILURE.
+  *
+  * Both existing consumers set one -- MAX_DELIVER = 5 on the api's runtime, 10 on the
+@@ -46,76 +40,12 @@ const ACK_WAIT_NS = 30 * 1_000_000_000;
+  * So the queue's seven-day retention is the only bound. That makes the poison case
+  * load-bearing rather than tidy: a payload that will never parse is terminated at the parse,
+  * or it comes back until the retention expires. Retry forever on transport, terminate at
+  * parse. One rule, two arms. */
+ const MAX_DELIVER = -1;
+ 
+-export interface IngestResult {
+-  written: number;
+-  malformed: number;
+-}
+-
+-export async function ingestOnce({
+-  nc,
+-  store,
+-  logger,
+-  batchRows = BATCH_ROWS,
+-  batchMs = BATCH_MS,
+-  stream = ANALYTICS_STREAM,
+-  durable = DURABLE,
+-}: {
+-  nc: NatsConnection;
+-  store: ClickHouse;
+-  logger: Logger;
+-  batchRows?: number;
+-  batchMs?: number;
+-  /** The stream and durable are parameters so a test can use its own rather than
+-   *  publishing probe records into the platform's. The defaults are the real ones. */
+-  stream?: string;
+-  durable?: string;
+-}): Promise<IngestResult> {
+-  const js = nc.jetstream();
+-  const consumer = await js.consumers.get(stream, durable);
+-
+-  const rows: AttemptRow[] = [];
+-  const pending: Array<{ ack: () => void }> = [];
+-  let malformed = 0;
+-
+-  const messages = await consumer.fetch({ max_messages: batchRows, expires: batchMs });
+-  for await (const m of messages) {
+-    let parsed: unknown;
+-    try {
+-      parsed = JSON.parse(new TextDecoder().decode(m.data));
+-    } catch {
+-      parsed = null;
+-    }
+-    const row = shape(parsed);
+-    if (row === null) {
+-      // NAMED BY ITS SEQUENCE, NEVER BY ITS CONTENTS. The record carries `error` -- up to
+-      // 2000 characters of a third-party endpoint's response, capable of echoing back
+-      // anything -- and constitution VI keeps secrets, tokens and message content out of
+-      // logs. The record survives in the stream for the retention window, so the sequence
+-      // is enough to go and fetch it deliberately, which is the difference between an
+-      // investigation and a leak.
+-      malformed += 1;
+-      logger.log("error", "ingester.malformed_record", { stream_sequence: m.seq });
+-      m.term();
+-      continue;
+-    }
+-    rows.push(row);
+-    pending.push({ ack: () => m.ack() });
+-  }
+-
+-  // ACKNOWLEDGE ONLY AFTER THE INSERT RETURNS. A record that was not written is not
+-  // acknowledged, which is what makes the store being unreachable a delay rather than a loss.
+-  await store.insert(rows);
+-  for (const p of pending) p.ack();
+-
+-  return { written: rows.length, malformed };
+-}
+-
+ export async function main(): Promise<void> {
+   const logger = createLogger("ingester");
+   const url = process.env["RELAY_NATS_URL"] ?? DEFAULT_NATS_URL;
+   const once = process.argv.includes("--once");
+ 
+   const nc = await connect({ servers: url });
+@@ -135,15 +65,25 @@ export async function main(): Promise<void> {
+   };
+   process.once("SIGTERM", stop);
+   process.once("SIGINT", stop);
+ 
+   do {
+     try {
+-      const { written, malformed } = await ingestOnce({ nc, store, logger });
+-      if (written > 0 || malformed > 0) {
+-        logger.log("info", "ingester.batch", { written, malformed });
++      const r = await ingestOnce({ nc, store, logger });
++      // `unclaimed` is in the line because a record nobody claims is redelivered until the
++      // stream's retention expires, and the count is the only way anyone finds out that is
++      // happening. The two `written` figures are separate because one number cannot say
++      // which table moved.
++      if (r.written > 0 || r.malformed > 0 || r.unclaimed > 0) {
++        logger.log("info", "ingester.batch", {
++          written: r.written,
++          attempts: r.writtenAttempts,
++          requests: r.writtenRequests,
++          malformed: r.malformed,
++          unclaimed: r.unclaimed,
++        });
+       }
+     } catch (error) {
+       // The store is unreachable, or the insert was refused. Nothing was acknowledged, so
+       // the broker will offer these records again -- forever, bounded only by retention.
+       logger.log("error", "ingester.batch_failed", { error: String(error) });
+       await new Promise((r) => setTimeout(r, BATCH_MS));
+```
+
+```diff title="services/ingester/src/clickhouse.ts"
+@@ -1,12 +1,13 @@
+ // The write side. Node's own `fetch` against the HTTP interface -- no client package, which
+ // is what keeps `grep -c clickhouse pnpm-lock.yaml` at 0 by design rather than by luck.
+-import type { AttemptRow } from "./shape.js";
++import type { AttemptRow, RequestRow } from "./shape.js";
+ 
+ const DB = "relay_analytics";
+-const TABLE = "webhook_attempts";
++const ATTEMPTS = "webhook_attempts";
++const REQUESTS = "api_requests";
+ 
+ // TWO SETTINGS, TWO DIFFERENT FAILURES, AND NEITHER IS OPTIONAL.
+ //
+ // `input_format_skip_unknown_fields=0` turns a RENAMED field into `Code: 117` instead of a
+ // silent default. Its server default is 1, which is exactly why the failure it prevents was
+ // invisible: the insert succeeds and the column takes the epoch.
+@@ -17,13 +18,17 @@ const TABLE = "webhook_attempts";
+ //
+ // Neither covers an ABSENT field. The table's `CHECK ts_is_real` does.
+ const SETTINGS = "input_format_skip_unknown_fields=0&date_time_input_format=best_effort";
+ 
+ export interface ClickHouse {
+   insert(rows: AttemptRow[]): Promise<void>;
++  /** The second table (chapter 4.4). A separate call rather than a `table` parameter: the two
++   *  row shapes are different types and the compiler should say so at the call site. */
++  insertRequests(rows: RequestRow[]): Promise<void>;
+   count(): Promise<number>;
++  countRequests(): Promise<number>;
+ }
+ 
+ export function createClickHouse({
+   host = process.env["RELAY_CLICKHOUSE_HOST"] ?? "localhost",
+   port = process.env["RELAY_CLICKHOUSE_HTTP_PORT"] ?? "8123",
+   user = process.env["RELAY_CLICKHOUSE_USER"] ?? "relay",
+@@ -49,17 +54,31 @@ export function createClickHouse({
+     // keyed on (environment_id, ts, delivery_id, attempt), so a re-inserted record collapses
+     // regardless of how it was batched -- which a token cannot do, because JetStream batch
+     // boundaries are not stable across a redelivery.
+     async insert(rows: AttemptRow[]): Promise<void> {
+       if (rows.length === 0) return;
+       await post(
+-        `INSERT INTO ${DB}.${TABLE} FORMAT JSONEachRow`,
++        `INSERT INTO ${DB}.${ATTEMPTS} FORMAT JSONEachRow`,
++        rows.map((r) => JSON.stringify(r)).join("\n"),
++      );
++    },
++    // THE EMPTY GUARD IS LOAD-BEARING NOW, WHERE IT WAS TIDINESS BEFORE. One fetch feeds two
++    // tables, and the two producers differ by about two orders of magnitude -- so most
++    // batches carry requests and no attempts. Without this, every one of them would post an
++    // empty INSERT: a round trip and a part that never had to exist.
++    async insertRequests(rows: RequestRow[]): Promise<void> {
++      if (rows.length === 0) return;
++      await post(
++        `INSERT INTO ${DB}.${REQUESTS} FORMAT JSONEachRow`,
+         rows.map((r) => JSON.stringify(r)).join("\n"),
+       );
+     },
+     // Reads take FINAL. The duplicate is physically present until a merge collapses it, so a
+     // bare count over-counts every redelivery -- by a plausible number.
+     async count(): Promise<number> {
+-      return Number(await post(`SELECT count() FROM ${DB}.${TABLE} FINAL`, ""));
++      return Number(await post(`SELECT count() FROM ${DB}.${ATTEMPTS} FINAL`, ""));
++    },
++    async countRequests(): Promise<number> {
++      return Number(await post(`SELECT count() FROM ${DB}.${REQUESTS} FINAL`, ""));
+     },
+   };
+ }
+```
+
+The grammar gains the request log's pair and a separate function for the tenantless arm — the
+validator keeps its UUID refusal rather than gaining an exception:
+
+```diff title="packages/protocol/src/internal.ts"
+@@ -294,12 +294,43 @@ export function webhookAttemptSubject(environmentId: string): string {
+     WEBHOOK_ATTEMPT_ACTION.domain,
+     WEBHOOK_ATTEMPT_ACTION.action,
+     environmentId,
+   );
+ }
+ 
++/** The API request log's action (FR-ANL-07, chapter 4.4). */
++export const API_REQUEST_ACTION = { domain: "api", action: "request" };
++
++export function apiRequestSubject(environmentId: string): string {
++  return analyticsSubjectFor(
++    API_REQUEST_ACTION.domain,
++    API_REQUEST_ACTION.action,
++    environmentId,
++  );
++}
++
++/** The token for a request that resolved to no tenant.
++ *
++ * A SEPARATE FUNCTION, NOT A RELAXED ARGUMENT TO `analyticsSubjectFor`. That validator
++ * refuses a non-UUID because an environment id becomes a dot-delimited subject token, and
++ * the refusal is what keeps one tenant's records out of another tenant's filter. A validator
++ * with an escape hatch is a validator with a hole, and the hole is measurable: publishing a
++ * token of `no.tenant` produces a FIVE-token subject that the four-token wildcard does not
++ * match, and `*` publishes a subject containing a literal asterisk. Neither fails at publish
++ * time. A malformed token does not reach the wrong tenant -- it goes where no intended filter
++ * reaches, which is the quiet direction.
++ *
++ * `_none` cannot be a UUID, so no exact per-tenant filter matches it. Measured over a stream
++ * holding six candidate tokens plus one real tenant's record: tenant A's exact filter saw 1,
++ * tenant B's saw 0. */
++export const NO_TENANT_TOKEN = "_none";
++
++export function apiRequestSubjectWithoutTenant(): string {
++  return [ANALYTICS_SUBJECT_PREFIX, API_REQUEST_ACTION.domain, API_REQUEST_ACTION.action, NO_TENANT_TOKEN].join(".");
++}
++
+ // ---------------------------------------------------------------------------
+ // The dispatch contract (constitution IV).
+ //
+ // The dispatcher owns no database. "Only the API service writes to PostgreSQL…
+ // Other services obtain writes and backfill reads via the API service's internal
+ // endpoints." These are those endpoints, and they live here for the reason
+```
+
+Setting a per-environment rate limit in a test needed a repository function rather than a raw
+query, because the linter refuses `drizzle-orm` outside that layer — constitution I and ADR-16,
+caught by the rule rather than by review:
+
+```diff title="services/api/src/db/repository.ts"
+@@ -83,12 +83,32 @@ import {
+ 
+ export interface Environment {
+   id: string;
+   kind: "development" | "production";
+ }
+ 
++/** Set a per-environment rate-limit override (FR-RTL-04).
++ *
++ * The columns are nullable and null means "no override" rather than zero -- refuse-everything
++ * has to stay expressible. Written here rather than at a call site because the query engine
++ * lives in this layer only (constitution I, ADR-16), and a test reaching for `sql` directly
++ * is the lint rule firing rather than a shortcut.
++ */
++export async function setEnvironmentLimits(
++  db: Db,
++  {
++    environmentId,
++    restPerMinute,
++  }: { environmentId: string; restPerMinute: number | null },
++): Promise<void> {
++  await db
++    .update(environments)
++    .set({ restLimitPerMinute: restPerMinute })
++    .where(eq(environments.id, environmentId));
++}
++
+ export async function createEnvironment(
+   db: Db,
+   { name, kind = "development" }: { name: string; kind?: Environment["kind"] },
+ ): Promise<Environment> {
+   const organisationId = randomUUID();
+   const applicationId = randomUUID();
+```
+
+And the limiter stamps what it decided. Two lines, in the two places it refuses:
+
+```diff title="services/api/src/limits/rate-limit.middleware.ts"
+@@ -9,12 +9,13 @@ import type { RequestWithPrincipal } from "../auth/principal";
+ import { LOGGER } from "../logger";
+ import { remaining, resetAt, windowStart } from "./bucket";
+ import { clientAddress } from "./client-address";
+ import { COUNTER_STORE, LIMITS_DB } from "./limits.module";
+ import { authFailureThreshold, WINDOW_MS, type LimitedOperation } from "./policy";
+ import { authKey, counterKey, type CounterStore } from "./store";
++import { LIMITED_OPERATION, REFUSED_AT } from "../request-log/event";
+ 
+ /** Read once per call site so a test that freezes time sees one instant. */
+ const now0 = (): number => Date.now();
+ 
+ // The tenant limiter (FR-RTL-01…04).
+ //
+@@ -116,12 +117,16 @@ export class RateLimitMiddleware implements NestMiddleware {
+       const address = clientAddress(req);
+       const count = await this.store.increment(
+         authKey(address, windowStart(now0(), WINDOW_MS)) + ":signup",
+         now0(),
+       );
+       if (count !== null && count > authFailureThreshold()) {
++        // Its own family. `signup` is not a `DEFAULT_LIMITS` key -- that union is rest, send
++        // and connect, and `connect` is the gateway's, counted elsewhere entirely.
++        (req as unknown as Record<symbol, unknown>)[REFUSED_AT] = "middleware";
++        (req as unknown as Record<symbol, unknown>)[LIMITED_OPERATION] = "signup";
+         res.statusCode = 429;
+         res.setHeader("Retry-After", "60");
+         res.setHeader("content-type", "application/json");
+         res.end(
+           JSON.stringify({
+             code: "rate_limited",
+@@ -207,12 +212,22 @@ export class RateLimitMiddleware implements NestMiddleware {
+     } else {
+       res.setHeader("X-RateLimit-Remaining", String(nearest.remaining));
+       res.setHeader("X-RateLimit-Reset", String(nearest.resetSeconds));
+     }
+ 
+     if (refusal !== undefined) {
++      // STAMPED FOR THE REQUEST LOG, and it is `refusal.operation` -- the ONE operation that
++      // tripped -- not `operationsFor`'s array, which says what was COUNTED. The line below
++      // already narrows it to name the failure to the customer.
++      //
++      // AND IT IS NOT A ROUTE TEMPLATE. This limiter's whole route knowledge is three-valued:
++      // outside /v1/, the send path, everything else. So "which endpoint is being
++      // rate-limited" asks about a granularity that does not exist, and the operation class
++      // is the finest true answer about one of these refusals.
++      (req as unknown as Record<symbol, unknown>)[REFUSED_AT] = "middleware";
++      (req as unknown as Record<symbol, unknown>)[LIMITED_OPERATION] = refusal.operation;
+       const retryAfter = Math.max(1, refusal.resetSeconds - Math.floor(now / 1000));
+       res.setHeader("Retry-After", String(retryAfter));
+       res.setHeader("X-RateLimit-Remaining", "0");
+       // The message names WHICH limit was reached: "too many requests" and "too
+       // many messages" are different problems, one saying batch and the other
+       // saying slow down. Neither names a credential (NFR-SEC-06).
+```
+
+<ForwardRef>
+The query surface this log exists for — filters, search, and FR-ANL-10's latency percentiles —
+is movement IV's. This chapter makes the records exist and keeps them for thirty days.
+</ForwardRef>
+
+<ChapterFooter id="4.4" />
