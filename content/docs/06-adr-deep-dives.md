@@ -471,6 +471,30 @@ argument's tidiest line is no longer literally true, and a reader comparing it a
 presence to NATS KV and remove Redis entirely. That is a coherent architecture and a much
 larger decision; it belongs to a deployment review, not to the fan-out fabric's ADR.
 
+**AND THE GATEWAY HALF WENT IN CHAPTER 4.5, WHICH IS THE HALF THE MAPPING IS NAMED FOR.**
+FR-ANL-01 asks for an analytical event on every connection open and close, and the only
+producer that can see one is the gateway. It now holds a NATS client — five dependencies to
+six, none of them a broker before this.
+
+So the sentence two paragraphs up, *"fan-out on NATS gives the gateway two broker clients
+where it had one"*, describes a gateway that no longer exists: it has two. **NATS fan-out
+would now add none and remove none.** The cost this analysis rejected core NATS for has gone
+to zero on the side it was measured, and the paragraph above already recorded it arriving on
+the other side as *"relocated rather than avoided"*. Both halves of the clean mapping are
+spent, and it now describes no service in this platform.
+
+What survives is the half that never depended on an arithmetic: **Redis does not leave.**
+ADR-10 keeps presence as Redis keys with TTLs and rate-limit buckets follow, so a gateway
+without a Redis client is not a thing this design can produce — and a NATS-only proposal is
+still the larger decision v1.1 named, because it would have to move presence to NATS KV and
+delete a store from the deployment. **The refusal stands and its price does not.**
+
+The **Decision** below is untouched by that, and the **Revisit when** clauses are untouched
+too — the same two sentences the amendment above needed, for the same reason. What changed
+is the selection argument, twice now, from both directions. A reader who has followed this
+record from chapter 3.8 has watched a tidy line become a historical note in four moves, and
+the honest version of that is to say so rather than to keep the line.
+
 The Redis-down case (failure matrix): fan-out pauses, gateways detect and cycle clients,
 clients resume by cursor against Postgres. Degraded latency, zero loss — the design's
 claim, "Redis holds nothing that is a source of truth," is load-bearing here and audited

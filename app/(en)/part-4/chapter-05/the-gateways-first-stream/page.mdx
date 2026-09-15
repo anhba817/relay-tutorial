@@ -1,0 +1,1288 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import { figTwoCounters, figNeitherBalances, figTheBudget } from "./figures";
+
+export const metadata = {
+  title: "The gateway's first stream — Building Relay",
+  description:
+    "FR-ANL-01's last arm without a producer is connection open and close, and the only service that can see one is the gateway — which has never held a broker client. Giving it one spends the argument ADR-07 rejected NATS on, and the two connection counters turn out to disagree in opposite directions depending on how the process ends.",
+  alternates: {
+    canonical: "/part-4/chapter-05/the-gateways-first-stream",
+    languages: {
+      en: "/part-4/chapter-05/the-gateways-first-stream",
+      vi: "/vi/part-4/chapter-05/the-gateways-first-stream",
+    },
+  },
+};
+
+<ChapterHeader id="4.5" />
+
+FR-ANL-01 lists four things the system emits an analytical event for: message send,
+connection open and close, API request, and webhook delivery attempt. Three of them have
+producers now. This chapter builds the fourth, and the service that has to build it is the
+one service in this platform that has never held a broker client.
+
+The structure document says that in one line: *"the gateway has never touched NATS —
+verified, zero references in `services/gateway/src`."* That is true, and we checked it
+rather than believing it:
+
+```
+grep -rn "nats\|jetstream" --include=*.ts services/gateway/src   ->   0 matches
+grep -rn "nats\|jetstream" --include=*.ts services/ingester/src  ->  12 matches
+```
+
+The second line is the control. `grep` on this machine is ugrep rather than GNU grep, and
+a pattern that silently matches nothing under one engine and everything under another has
+caught this project before — so a zero is a claim about the corpus only when the same
+pattern, the same flags and the same engine can be shown to find something.
+
+## The gateway already reports connection data
+
+Here is what that one-line description leaves out, and it changes what the chapter is
+about. `meter.ts` has been computing connection-minutes since chapter 3.24 and shipping
+them to the API service every sixty seconds:
+
+```
+POST /internal/usage/connections
+  { connections: [ { connection_id, environment_id, period, minutes } ] }   1..5000 entries
+```
+
+So this is not *"the gateway has no way to report what it sees."* It is *"the gateway has
+one, it was built for a different question, and it goes through the service the analytical
+path is supposed to be independent of."*
+
+<Figure caption="Two counters of one quantity, and the reconciler between them is movement IV's." code={figTwoCounters} />
+
+The two are not redundant. A quota must refuse a connection **at the moment it is made**,
+which means its counter cannot live downstream of a lossy stream — that is `docs/12` §4's
+argument and it was settled before either side existed. An analytical record cannot refuse
+anything, which is exactly what makes it safe to lose. Two counters of one quantity is the
+right answer and the reconciler is the price.
+
+Each is unable to do what the other does, and that is worth saying plainly because the new
+one looks like a replacement. **The meter cannot tell you that a particular connection
+existed** — it reports minutes owed per period, and a socket that opened and closed is
+indistinguishable in it from a socket that was open a little longer. **The records cannot
+refuse a connection**, because by the time one is queryable the socket has been open for
+seconds.
+
+Two actions on one domain, built through the validator that already refuses a non-UUID —
+because an environment id becomes a subject token, and a token carrying a dot or a wildcard
+puts one tenant's records where another tenant's filter reaches them.
+
+```diff title="packages/protocol/src/internal.ts"
+@@ -325,12 +325,45 @@ export function apiRequestSubject(environmentId: string): string {
+ export const NO_TENANT_TOKEN = "_none";
+ 
+ export function apiRequestSubjectWithoutTenant(): string {
+   return [ANALYTICS_SUBJECT_PREFIX, API_REQUEST_ACTION.domain, API_REQUEST_ACTION.action, NO_TENANT_TOKEN].join(".");
+ }
+ 
++/** Connection open and close (FR-ANL-01, chapter 4.5) -- the last arm of that clause
++ *  without a producer.
++ *
++ *  TWO ACTIONS ON ONE DOMAIN, NOT ONE ACTION WITH THE EVENT IN THE PAYLOAD. A consumer
++ *  that wants only closes can filter `analytics.connection.closed.>` on the subject
++ *  rather than shaping every open to find out it did not want it, which is what a
++ *  subject grammar is for.
++ *
++ *  AND THERE IS NO `_none` ARM HERE. 4.4 needed one because a request can be made by
++ *  nobody. A connection event is emitted from `registry.add` and from `meter.closed`,
++ *  and the only function reaching either takes a non-optional `Identity` -- its call
++ *  site passes `result.identity` after the 429, 4001, 1011, 4003 and 4008 refusals have
++ *  each returned. An unauthenticated socket exists; an unauthenticated connection does
++ *  not, so there is no record for a tenantless arm to carry. */
++export const CONNECTION_OPENED_ACTION = { domain: "connection", action: "opened" };
++export const CONNECTION_CLOSED_ACTION = { domain: "connection", action: "closed" };
++
++export function connectionOpenedSubject(environmentId: string): string {
++  return analyticsSubjectFor(
++    CONNECTION_OPENED_ACTION.domain,
++    CONNECTION_OPENED_ACTION.action,
++    environmentId,
++  );
++}
++
++export function connectionClosedSubject(environmentId: string): string {
++  return analyticsSubjectFor(
++    CONNECTION_CLOSED_ACTION.domain,
++    CONNECTION_CLOSED_ACTION.action,
++    environmentId,
++  );
++}
++
+ // ---------------------------------------------------------------------------
+ // The dispatch contract (constitution IV).
+ //
+ // The dispatcher owns no database. "Only the API service writes to PostgreSQL…
+ // Other services obtain writes and backfill reads via the API service's internal
+ // endpoints." These are those endpoints, and they live here for the reason
+```
+
+The test for it is not fenced here. The chain has never published
+`packages/protocol/src/internal.test.ts` as a whole body, so a diff against it has nothing
+to amend — the checker says so in those words — and establishing a base for a 500-line test
+file is a cost this chapter should not pay for two assertions. `gaps.md` 050-6 records it.
+
+The refusal is asserted on both actions. A validator applied to one of a pair is the hole
+this grammar exists to close.
+
+```diff title="services/gateway/package.json"
+@@ -13,12 +13,13 @@
+   },
+   "dependencies": {
+     "@relay/protocol": "workspace:*",
+     "@relay/service-kit": "workspace:*",
+     "ioredis": "^6.0.0",
+     "jose": "^6.2.7",
++    "nats": "^2.29.3",
+     "ws": "^8.21.1"
+   },
+   "devDependencies": {
+     "@relay/api": "workspace:*",
+     "@types/ws": "^8.18.1",
+     "tsx": "^4.23.1"
+```
+
+```diff title="compose.yaml"
+@@ -166,12 +166,21 @@ services:
+     build:
+       context: .
+       dockerfile: services/gateway/Dockerfile
+     environment:
+       RELAY_API_URL: http://api:4000
+       RELAY_REDIS_URL: redis://redis:6379
++      # CONTAINER NAME, NOT localhost -- and this line is what makes chapter 4.5's
++      # producer reach anything. `createConnectionPublisher` defaults to
++      # `nats://localhost:4222`, which inside this container is the gateway's own
++      # loopback rather than the broker; and a connection-log publish failure is
++      # SWALLOWED by design (constitution III), so without this the records go nowhere
++      # and nothing says so. The api's entry carries the same note about Redis for the
++      # same reason: a missing address is harder to see than a wrong one, because there
++      # is no sentence to disagree with.
++      RELAY_NATS_URL: nats://nats:4222
+       PORT: "4001"
+       # The gateway's first credential of its own. Every other
+       # call it makes forwards the END USER's token; a usage report is nobody's
+       # user action, so it speaks for itself. Its own variable rather than the
+       # dispatcher's, because `PlatformPrincipal.service` has to stay true and
+       # because this service faces the public internet and that one does not.
+```
+
+The second of those is easy to leave out and impossible to see afterwards. The publisher's
+default is `nats://localhost:4222`, which inside the gateway's container is its own loopback
+rather than the broker — and a connection-log publish failure is swallowed by design, so the
+records would go nowhere and nothing would say so.
+
+## The close handler already refused to do this
+
+The obvious implementation is to publish from the close handler. That handler declined the
+same job two chapters ago, in writing:
+
+```ts
+// Handing over totals rather than reporting them. This handler is already
+// documented as the last place that should throw, and a mass disconnect would
+// turn one event into a burst of HTTP requests.
+meter.closed(connection, new Date());
+```
+
+Chapter 3.24 asked whether the close handler should report, and answered no. Its argument
+was about HTTP. Whether that argument survives a broker is a question with a number
+attached, and the number is this:
+
+```
+awaited, one at a time   : 2000 publishes in 574 ms  ->  0.2870 ms each
+core publish + flush     : 2000 publishes in   5 ms  ->  0.0025 ms each
+pipelined, 500 in flight : 2000 publishes in  52 ms  ->  0.0260 ms each
+```
+
+A JetStream publish waits for an acknowledgement. At 0.2870 ms each, a deploy that closes
+the ten thousand sockets NFR-SCL-01 allows serialises **2.87 seconds** of awaited publishes
+through close handlers. That is 3.24's burst argument arriving on a new transport, and its
+answer is the same one: hand over, and let a tick do the sending.
+
+Core NATS is ten times faster still and gives up the acknowledgement and the deduplication
+id — which is what this stream exists to keep, and why chapter 3.20 chose JetStream over
+core in the first place.
+
+<Trap title="Batched 500 per publish is not the same thing as 500 publishes in flight">
+The planning measurement for that third row read **0.0034 ms** and described itself as
+*"batched 500 per publish"*. Read one way that is 500 records inside one message, and three
+documents adopted it in that form before anyone asked which.
+
+It cannot be that. **One message carries one subject**, and the subject carries the
+tenant — so a flush spanning several tenants has no subject to go on. **One message carries
+one `Nats-Msg-Id`**, so a deduplication id per record cannot survive it, and a token derived
+from a batch is the silent data loss chapter 4.3 measured: the same token with 500 different
+rows dropped all 500 and reported success. And **the ingester's router takes one record per
+message** — handed an array it finds no `type`, shapes to `null`, and calls `m.term()`. Five
+hundred records destroyed and counted as one malformed.
+
+The correct reading is one message per record with 500 publishes in flight, and re-running
+the probe in the shape that ships gives **0.0260 ms, not 0.0034** — 7.6× slower, ten times
+core's cost rather than within 13% of it. The decision survives on the smaller margin, and
+the smaller margin is worth more than the number it replaced.
+</Trap>
+
+## The buffer is the design
+
+So records accumulate in the gateway and a tick publishes them, which is what `meter.ts`
+already does. Copying the meter's *shape* is easy; copying its *reasoning* takes one more
+read.
+
+The interval is **five seconds**, and the obvious number is the wrong one. FR-ANL-04 allows
+sixty seconds from the originating operation to the event being queryable, "under normal
+conditions", and the ingester's own batch bound spends up to two of them. `METER_INTERVAL_MS`
+is 60,000 — copying it would breach the clause before the record left the process. The meter
+feeds a monthly quota with no latency clause over it; this feeds a store that has one.
+
+The buffer is bounded at 4,000, which is the meter's number. It means the same thing only
+because of the rule underneath it:
+
+```
+A lost report is repaired by the next one ... a report that cannot be delivered is
+DROPPED rather than queued.
+
+WITH ONE EXCEPTION ... a connection that has CLOSED has no next report to repair a
+lost one, so its final total is retained until a report carrying it is accepted.
+```
+
+**Every connection event is in that exception.** An open is sent once and a close is sent
+once; neither has a later record carrying the same fact again. So the meter's special case
+is this producer's general rule: a record whose publish fails goes back in the buffer and
+goes again on the next tick. A buffer that emptied on every flush regardless of outcome
+could never reach the cap at all — an unreachable broker would drain it every five seconds
+into failures — and then the cap would be a bound on nothing.
+
+One message per record also means a flush of 500 has 500 answers rather than one, so the
+outcomes are collected per record. A flush that treated a partial failure as total loss
+would discard records the broker accepted; as total success, records it did not.
+
+```ts title="services/gateway/src/connection-log/event.ts"
+// FR-ANL-01's last arm: an analytical event when a connection opens and when it closes.
+//
+// THE FIRE-AND-FORGET ARGUMENT IS 3.20's AND THE SUBJECT GRAMMAR IS 4.3's. Neither is
+// re-derived here. What is new is that this producer BUFFERS, and the three paragraphs
+// below are the consequences of that one decision.
+import {
+  connectionClosedSubject,
+  connectionOpenedSubject,
+} from "@relay/protocol";
+import type { Logger } from "@relay/service-kit";
+
+import type { Connection } from "../registry.js";
+
+/** Five seconds, and the number is a budget rather than a preference.
+ *
+ * FR-ANL-04 allows 60 seconds from the originating operation to the event being
+ * queryable, "under normal conditions" -- and the ingester's own batch bound spends up
+ * to 2 of them (`docs/05-sad.md` §4; DR-11 itself names no interval and no row count).
+ *
+ * COPYING `METER_INTERVAL_MS` WOULD BREACH IT. The meter ticks every 60,000 ms and the
+ * whole posture of this module is *be like the meter*, so the obvious number is the
+ * wrong one: the meter feeds a monthly quota with no latency clause over it, and this
+ * feeds a store that has one.
+ *
+ * And the two pressures are less opposed than they look. The tick's win is removing the
+ * serial round trip from whatever accumulated, not waiting longer -- at 0.0034 ms a
+ * record the publish is effectively free at any interval, and the 2.3-second burst a
+ * deploy would cost is a property of publishing PER CLOSE, not of a short tick. So a
+ * short interval costs almost nothing and buys the whole budget. */
+export const FLUSH_INTERVAL_MS = 5_000;
+
+/** How many unpublished records to hold before dropping.
+ *
+ * `meter.ts` faced this and its cap is `MAX_RETAINED_CLOSED = 4_000`, bounded by closes
+ * since the last ACCEPTED report. THIS BOUND MEANS THE SAME THING, and only because of
+ * the retention rule below: a buffer that emptied on every flush regardless of outcome
+ * could never reach a cap at all, because an unreachable broker would drain it every
+ * five seconds into failures.
+ *
+ * AND IT IS TWO RECORDS PER CONNECTION, NOT ONE. The meter retains a closed entry per
+ * (connection, period); this retains an open AND a close. At NFR-SCL-01's 10,000
+ * sockets a full mass disconnect with the broker away overflows this, which is the
+ * case the drop counter exists to make visible rather than the case it prevents. */
+export const MAX_BUFFERED = 4_000;
+
+/** The wire shape. Snake case because it leaves the platform. */
+export interface ConnectionEvent {
+  type: "connection.opened" | "connection.closed";
+  connection_id: string;
+  environment_id: string;
+  user_external_id: string;
+  ts: string;
+  close_code?: number;
+  duration_ms?: number;
+}
+
+/** Which event, and what only a close carries.
+ *
+ * A DISCRIMINATED UNION RATHER THAN TWO OPTIONAL ARGUMENTS. An open has no close code
+ * and no duration, and this makes supplying one a type error rather than a field the
+ * shaper has to remember to omit -- a design in which a case cannot arise beats a
+ * branch that handles it. */
+export type ConnectionEventKind =
+  | { kind: "opened" }
+  | { kind: "closed"; at: Date; code: number };
+
+/** IDENTIFIERS, INSTANTS AND A CODE ONLY.
+ *
+ * Built by NAMING every field rather than by spreading the connection, and that is the
+ * point: `Connection` carries `identity.token` -- the bearer token the client presented
+ * at connect -- plus `buffer` (frames), `channelIds` and the socket itself. A spread
+ * would put any of them on a stream with seven-day retention. An allow-list fails
+ * closed when somebody adds a field; a spread fails open.
+ *
+ * The authority is constitution III's allow-list: the analytical store holds "only
+ * lengths, identifiers, and metadata", and a credential is none of the three. FR-ANL-11
+ * governs message text and NFR-SEC-06 governs application LOGS; neither reaches a
+ * record on a stream, which is why the rule is stated as an allow-list here.
+ *
+ * ABSENT, NOT EMPTY. `exactOptionalPropertyTypes` is on, so the close-only fields are
+ * spread in rather than assigned -- an explicit `undefined` is not an absent key, and
+ * 4.4 measured that a `LowCardinality(String)` column cannot tell the two apart. */
+export function toConnectionEvent(
+  connection: Connection,
+  event: ConnectionEventKind,
+): ConnectionEvent {
+  const base = {
+    connection_id: connection.id,
+    environment_id: connection.environmentId,
+    user_external_id: connection.identity.userExternalId,
+  };
+  if (event.kind === "opened") {
+    return {
+      type: "connection.opened",
+      ...base,
+      // FR-005a. THE CONNECTION'S OWN INSTANT, NOT THIS MOMENT. `openedAt` is stamped
+      // before the resume and before the ack "because the socket is already open and
+      // already costing a minute", and it is the field the meter reads. Two instants
+      // for one open would make the reconciliation disagree for a reason that is
+      // neither of the two the chapter explains.
+      ts: connection.openedAt.toISOString(),
+    };
+  }
+  return {
+    type: "connection.closed",
+    ...base,
+    ts: event.at.toISOString(),
+    close_code: event.code,
+    // Close minus open, in milliseconds. The interval's two endpoints are stated rather
+    // than implied: `openedAt` is the handshake, `at` is the socket's close.
+    //
+    // NOT THE METER'S QUANTITY. The meter charges every calendar minute a connection
+    // was open for any part of, so 00:00:59 to 00:01:01 is TWO connection-minutes and
+    // 2,000 ms. Different quantities sharing a name; the reconciliation compares
+    // buckets against buckets.
+    duration_ms: Math.max(0, event.at.getTime() - connection.openedAt.getTime()),
+  };
+}
+
+/** One record, addressed and keyed. The same three fields the api's outbox port uses,
+ *  for the same reason: which broker is a configuration detail. */
+export interface PublishableRecord {
+  subject: string;
+  /** `{connection_id}:{event}`, NOT the connection id alone. One connection produces
+   *  two records, and 3.20 learned exactly this with `{delivery}:{attempt}`: a delivery
+   *  id alone collapsed seven retries into one message. */
+  id: string;
+  payload: ConnectionEvent;
+}
+
+export function recordFor(event: ConnectionEvent): PublishableRecord {
+  const subject =
+    event.type === "connection.opened"
+      ? connectionOpenedSubject(event.environment_id)
+      : connectionClosedSubject(event.environment_id);
+  return {
+    subject,
+    id: `${event.connection_id}:${event.type === "connection.opened" ? "opened" : "closed"}`,
+    payload: event,
+  };
+}
+
+/** What the buffer needs of a publisher: ONE MESSAGE PER RECORD.
+ *
+ * Not 500 records in one message. One message carries one subject and the subject
+ * carries the tenant; one message carries one `Nats-Msg-Id` and the deduplication id is
+ * per record; and the ingester's `route()` takes one record per message -- handed an
+ * array it finds no `type`, shapes to null, and TERMINATES it. */
+export interface ConnectionPublisher {
+  publish(record: PublishableRecord): Promise<void>;
+  close(): Promise<void>;
+}
+
+export interface ConnectionLog {
+  /** Beside `registry.add`. */
+  opened(connection: Connection): void;
+  /** Beside `meter.closed`. Must not throw and must not be awaited. */
+  closed(connection: Connection, at: Date, code: number): void;
+  /** Exposed for the timer, for the shutdown flush, and for tests that drive their own
+   *  clock -- the same three reasons `meter.reportOnce` is. */
+  flushOnce(): Promise<void>;
+  /** How many records are waiting for an accepted publish. */
+  buffered(): number;
+  /** How many were discarded at the cap. Counted rather than silent. */
+  dropped(): number;
+  stop(): void;
+  /** Stop the tick, send what is left, and close the client -- in that order.
+   *
+   * ONE FABRIC WITH ONE CLOSE, because `main.test.ts` reads `main.ts`'s source and
+   * asserts that every module it builds is both passed into `attachSessions` and
+   * awaited in `shutdown()`. A publisher held as a second const would satisfy neither
+   * half, and the honest fix is for this module to own its publisher's lifetime rather
+   * than for the guard to gain an exemption. The flush is the work `sessions.close()`
+   * is ordered first to make possible. */
+  close(): Promise<void>;
+}
+
+export interface ConnectionLogOptions {
+  publisher: ConnectionPublisher;
+  logger: Logger;
+  intervalMs?: number;
+  maxBuffered?: number;
+}
+
+export function createConnectionLog({
+  publisher,
+  logger,
+  intervalMs = FLUSH_INTERVAL_MS,
+  maxBuffered = MAX_BUFFERED,
+}: ConnectionLogOptions): ConnectionLog {
+  let pending: PublishableRecord[] = [];
+  let discarded = 0;
+
+  /** A RECORD WHOSE PUBLISH FAILED GOES BACK, AND THAT IS THE METER'S RULE FOR ITS ONE
+   *  EXCEPTION APPLIED TO ALL OF THIS.
+   *
+   *  `meter.ts`: "a report that cannot be delivered is DROPPED rather than queued ...
+   *  WITH ONE EXCEPTION ... a connection that has CLOSED has no next report to repair a
+   *  lost one, so its final total is retained until a report carrying it is accepted."
+   *
+   *  Every connection event is in that exception. An open is sent once and a close is
+   *  sent once; there is no later record carrying the same fact again. So the meter's
+   *  special case is this producer's general rule. */
+  function enqueue(record: PublishableRecord): void {
+    if (pending.length >= maxBuffered) {
+      // OLDEST FIRST, and the argument does NOT transfer from the meter unchanged. The
+      // meter drops the oldest because under-counting is "the same direction as every
+      // other loss in this design" -- it is a bill, and billing for a socket nobody
+      // holds is the worse error. A connection log is not a bill: both directions lose
+      // a fact and neither is safe.
+      //
+      // Oldest anyway, for a different reason. Dropping the NEWEST discards the records
+      // describing the outage itself -- the opens and closes happening while the broker
+      // is away -- which is the window an operator opens this log to see. The oldest
+      // records are the ones most likely to have a neighbour that survived.
+      pending.shift();
+      discarded += 1;
+      logger.log("error", "connection_log.buffer_overflow", {
+        discarded,
+        buffered: pending.length,
+      });
+    }
+    pending.push(record);
+  }
+
+  function opened(connection: Connection): void {
+    enqueue(recordFor(toConnectionEvent(connection, { kind: "opened" })));
+  }
+
+  function closed(connection: Connection, at: Date, code: number): void {
+    enqueue(recordFor(toConnectionEvent(connection, { kind: "closed", at, code })));
+  }
+
+  async function flushOnce(): Promise<void> {
+    if (pending.length === 0) return;
+    const batch = pending;
+    pending = [];
+
+    // PIPELINED, ONE MESSAGE PER RECORD. Every publish goes out without awaiting the
+    // one before it and the acks are collected together: 0.229 ms each when awaited
+    // serially against 0.0034 ms pipelined, which is 2.3 seconds for a deploy that
+    // closes 10,000 sockets against 34 ms.
+    const outcomes = await Promise.allSettled(
+      batch.map((record) => publisher.publish(record)),
+    );
+
+    // PER RECORD, because one message per record means this flush has as many answers
+    // as it had records. The meter never faces this: it sends one report and gets one
+    // answer. A flush that treated a partial failure as total loss would discard
+    // records the broker accepted; as total success, records it did not.
+    // THE REJECTIONS THEMSELVES, NOT A PARALLEL LIST OF INDICES. An earlier version kept
+    // `failed` (the records) and looked the first reason up separately with
+    // `outcomes.find(...)`, which needed a `?? "unknown"` fallback for a case that cannot
+    // occur: inside `failed.length > 0` there is always a rejection. Coverage reported the
+    // file at 93.75% branches with that one arm uncovered, and the arm was not missing a
+    // test -- it was unreachable. **A design in which a case cannot arise beats a branch
+    // that handles it, because the branch is the thing that rots.** Pairing each record
+    // with its own outcome deletes the branch instead of testing it.
+    const rejected: Array<{ record: PublishableRecord; reason: unknown }> = [];
+    outcomes.forEach((outcome, i) => {
+      const record = batch[i];
+      if (outcome.status === "rejected" && record !== undefined) {
+        rejected.push({ record, reason: outcome.reason });
+      }
+    });
+    for (const { record } of rejected) enqueue(record);
+
+    if (rejected[0] !== undefined) {
+      // ONE LINE PER FLUSH, not per record, and it carries counts rather than payloads
+      // -- the shape `meter.report_failed` uses. No subject, no id, no record.
+      logger.log("error", "connection_log.publish_failed", {
+        attempted: batch.length,
+        failed: rejected.length,
+        buffered: pending.length,
+        error: String(rejected[0].reason),
+      });
+    }
+  }
+
+  // STOPPED, NOT unref'd -- the meter's pattern (`meter.ts:218`), cleared by `stop()`
+  // from shutdown. An unref'd timer lets the process exit with records still buffered.
+  const timer = setInterval(() => {
+    void flushOnce();
+  }, intervalMs);
+
+  return {
+    opened,
+    closed,
+    flushOnce,
+    buffered: () => pending.length,
+    dropped: () => discarded,
+    stop: () => clearInterval(timer),
+    async close(): Promise<void> {
+      clearInterval(timer);
+      // The last flush before the client goes. A record still buffered here is one a
+      // killed process would have lost, which is the difference between a clean stop
+      // and a kill that the chapter publishes as a number.
+      await flushOnce();
+      await publisher.close();
+    },
+  };
+}
+```
+
+```ts title="services/gateway/src/connection-log/publisher.ts"
+// The gateway's first broker client, and the count is the subject rather than a detail:
+// ADR-07 refuses core NATS for fan-out on an argument about how many client libraries
+// this service holds. It held five dependencies and none of them a broker; it holds six
+// now. The fan-out decision does not change -- ADR-10 keeps presence in Redis, so Redis
+// is mandatory here regardless -- but the sentence that PRICED it stops being true.
+import { connect, type NatsConnection } from "nats";
+
+import type { Logger } from "@relay/service-kit";
+
+import type { ConnectionPublisher, PublishableRecord } from "./event.js";
+
+export const DEFAULT_NATS_URL = "nats://localhost:4222";
+
+/** ONE CLIENT, CREATED ONCE, SHARED, CONNECTED LAZILY.
+ *
+ * LAZY BECAUSE A BROKER THAT IS DOWN AT BOOT MUST NOT COST A SOCKET. The gateway's job
+ * is terminating WebSockets; an analytical publisher that refused to start would make a
+ * dashboard's dependency into the product's, which is constitution III inverted. So the
+ * connection is attempted on the first flush and retried on the next one.
+ *
+ * AND IT DOES NOT CREATE THE STREAM. `ensureAnalyticsStream` belongs to the api. A
+ * gateway that ensured it would also ask for `replicas > 1` under `NODE_ENV=production`
+ * and be refused in non-clustered mode (049-2) -- so there is nothing here to retry and
+ * nothing to get wrong. A publish to a stream that does not exist comes back 503, which
+ * the buffer treats as any other failure: the record stays and goes again. */
+export function createConnectionPublisher({
+  url = process.env.RELAY_NATS_URL ?? DEFAULT_NATS_URL,
+  logger,
+}: {
+  url?: string;
+  logger: Logger;
+}): ConnectionPublisher {
+  let nc: NatsConnection | null = null;
+  let connecting: Promise<NatsConnection> | null = null;
+  let closed = false;
+
+  /** ONE IN-FLIGHT ATTEMPT, SHARED. A flush publishes up to `MAX_BUFFERED` records at
+   *  once and every one of them calls this; without the shared promise a cold start
+   *  would open four thousand connections to a broker that is already refusing one. */
+  async function client(): Promise<NatsConnection> {
+    if (closed) throw new Error("connection log publisher is closed");
+    if (nc !== null) return nc;
+    connecting ??= connect({ servers: url, name: "gateway-connection-log" })
+      .then((c) => {
+        nc = c;
+        connecting = null;
+        return c;
+      })
+      .catch((error: unknown) => {
+        connecting = null;
+        throw error;
+      });
+    return connecting;
+  }
+
+  return {
+    /** One JetStream message per record. The deduplication id goes on the message, so
+     *  a redelivered publish of the same record collapses inside the broker's window
+     *  and a `ReplacingMergeTree` keyed on the record's own key catches the rest. */
+    async publish(record: PublishableRecord): Promise<void> {
+      const c = await client();
+      await c
+        .jetstream()
+        .publish(record.subject, JSON.stringify(record.payload), {
+          msgID: record.id,
+        });
+    },
+    async close(): Promise<void> {
+      closed = true;
+      const c = nc;
+      nc = null;
+      if (c === null) {
+        // Nothing was ever opened, which is the ordinary case for a gateway that ran
+        // with the broker away. Saying so once beats a silent no-op.
+        logger.log("info", "connection_log.publisher_never_connected", {});
+        return;
+      }
+      // DRAIN RATHER THAN CLOSE. `drain()` waits for published messages to be flushed
+      // to the server; `close()` does not, and the last flush before a deploy is
+      // exactly the one worth keeping.
+      await c.drain();
+    },
+  };
+}
+```
+
+
+<Checkpoint>
+Stop the broker, open sixty connections and close them:
+
+```
+broker up     acked 60/60   p50 4.92 ms   mean 4.88
+broker down   acked 60/60   p50 5.42 ms   mean 5.58
+              buffered 139 · dropped 0
+```
+
+Every connection acked with the broker gone, and 139 records waited rather than vanished.
+The failures produce one log line per flush carrying counts and an error class — no token,
+no message content, no subject.
+</Checkpoint>
+
+The hand-overs take two different anchors, because the meter is asymmetric by design:
+there is no `meter.opened`. The `Meter` interface is `closed`, `reportOnce`, `retained`,
+`dropped` and `stop` — it learns about open connections by walking the registry, and only
+needs telling when one leaves.
+
+```diff title="services/gateway/src/session.ts"
+@@ -18,12 +18,13 @@ import {
+ } from "@relay/protocol";
+ import { newRequestId, type Logger } from "@relay/service-kit";
+ import { WebSocketServer, type WebSocket } from "ws";
+ 
+ import { ApiError, type ApiClient } from "./api-client.js";
+ import { authenticate, type Identity } from "./auth.js";
++import type { ConnectionLog } from "./connection-log/event.js";
+ import {
+   DEFAULT_HEARTBEAT_MS,
+   MAX_CONNECTIONS_PER_USER,
+   type Connections,
+ } from "./connections.js";
+ import type { Fanout } from "./fanout.js";
+@@ -267,12 +268,20 @@ export interface SessionServerOptions {
+   /** Optional for the reason `limits` and `fanout` are: 2.5's
+    * tests and a single-process dev run have no api credential, and a socket
+    * server that refused to start without one would be a worse default than an
+    * unmetered one. `main.ts` always supplies the interval; the meter itself is
+    * built here so its timer has the same owner as the heartbeat's. */
+   meterIntervalMs?: number;
++  /** FR-ANL-01's producer. Optional for the reason `limits`, `fanout` and `connections`
++   * are, and the reason matters more here than usual: for an analytical log "optional"
++   * means UNRECORDED, never unsafe. A gateway built without one serves sockets exactly
++   * as before, which is constitution III's independence expressed as a type.
++   *
++   * INJECTED ALREADY BUILT, like every other fabric, so its close has an owner in
++   * `main.ts` and the tests that call this function directly stay broker-free. */
++  connectionLog?: ConnectionLog;
+ }
+ 
+ // THE FOUR PRESENCE TIMINGS ARE NOT HERE, and an earlier draft of this chapter put
+ // them here. `fanout` and `presence` are INJECTED already built, and an injected thing
+ // carries its own configuration: a test that wants a hundred-millisecond grace period
+ // constructs `createPresence({ graceMs: 100, … })` and injects that, the way the
+@@ -295,12 +304,13 @@ export function attachSessions({
+   typing,
+   renewalIntervalMs = DEFAULT_RENEWAL_INTERVAL_MS,
+   connections,
+   heartbeatMs = DEFAULT_HEARTBEAT_MS,
+   limits,
+   meterIntervalMs = METER_INTERVAL_MS,
++  connectionLog,
+ }: SessionServerOptions): {
+   registry: Registry;
+   meter: Meter;
+   /** ASYNC AS OF THE CONNECTION CAP, and `releaseAll` below was the reason. Freeing
+    * the places this instance holds is a round trip to Redis that has to COMPLETE
+    * before `wss.close()`, or the deploy case the method exists for is a race it can
+@@ -954,12 +964,23 @@ export function attachSessions({
+       // reconnect storm a free window on every attempt.
+       openedAt: new Date(),
+       environmentId: identity.environmentId,
+     };
+ 
+     registry.add(connection);
++    // THE OPEN RECORD, BESIDE `registry.add` AND NOT INSIDE THE METER -- because there
++    // is no `meter.opened` to sit beside. The `Meter` interface is `closed`,
++    // `reportOnce`, `retained`, `dropped` and `stop`: it learns about OPEN connections
++    // by walking this registry and only needs telling when one leaves. So the two
++    // records take two different anchors, and this is the first.
++    //
++    // NOT AWAITED, AND IT CANNOT THROW. `opened` enqueues and returns; the tick does
++    // the sending. A publish from here would put an analytical fabric on the handshake
++    // path, which constitution III forbids and which R3 priced at 2.3 seconds for a
++    // deploy that closes ten thousand sockets.
++    connectionLog?.opened(connection);
+     // Subscriptions follow membership: the first local member of a channel
+     // makes this instance a subscriber, and the last one to leave releases
+     // it (reference-counted in the fabric).
+     const subscribing = Promise.all(
+       [...connection.channelIds].flatMap((channelId) => [
+         fanout?.subscribe(channelId),
+@@ -1140,13 +1161,26 @@ export function attachSessions({
+       // That is not a rounding error: it is the one thing the wall-clock-minute unit
+       // was chosen to charge (research R19).
+       //
+       // Handing over totals rather than reporting them. This handler is already
+       // documented as the last place that should throw, and a mass disconnect would
+       // turn one event into a burst of HTTP requests.
+-      meter.closed(connection, new Date());
++      const closedAt = new Date();
++      meter.closed(connection, closedAt);
++      // THE CLOSE RECORD, BESIDE `meter.closed` AND BEFORE `registry.remove` -- the
++      // same ordering constraint, for the same reason: the line below removes this
++      // connection from the registry, and a hand-over that read it afterwards would
++      // read nothing.
++      //
++      // ONE INSTANT FOR BOTH, not two calls to `new Date()`. The meter's minutes and
++      // this record's duration would otherwise disagree by however long the line
++      // between them took, which is a third cause in a comparison built to have two.
++      //
++      // AND THIS HANDLER IS DOCUMENTED AS THE LAST PLACE THAT SHOULD THROW. `closed`
++      // enqueues and returns; nothing it calls awaits a broker.
++      connectionLog?.closed(connection, closedAt, code);
+       registry.remove(connection.id);
+       // THIS HANDLER NOW CARRIES TWO ORDERING CONSTRAINTS, not none. Presence is told
+       // AFTER `registry.remove`, because it asks whether this was the user's last
+       // connection on this instance and must not count the one that is leaving. The
+       // unsubscribes come last.
+       //
+```
+
+```diff title="services/gateway/src/main.ts"
+@@ -6,12 +6,14 @@ import { createFanout } from "./fanout.js";
+ import { createMembership } from "./membership.js";
+ import { createPresence } from "./presence.js";
+ import { createConnections } from "./connections.js";
+ import { createTyping } from "./typing.js";
+ import { createGatewayLimits } from "./limits.js";
+ import { attachSessions } from "./session.js";
++import { createConnectionLog } from "./connection-log/event.js";
++import { createConnectionPublisher } from "./connection-log/publisher.js";
+ 
+ // The gateway — SAD §4.1: terminates WebSockets and never writes to the
+ // database (ADR-05). Chapter 1.4 stood up the HTTP half (health, request
+ // ids, structured logs); chapter 2.5 gives it the job it exists for, and
+ // 2.6 makes that job survive a second instance. The
+ // health payload still advertises the wire vocabulary, computed from
+@@ -79,12 +81,25 @@ export function createServer(logger?: Logger) {
+   const serviceCredential = process.env.RELAY_INTERNAL_CREDENTIAL_GATEWAY;
+   if (serviceCredential === undefined) {
+     log.log("info", "metering.disabled", {
+       reason: "RELAY_INTERNAL_CREDENTIAL_GATEWAY is not set",
+     });
+   }
++  // THE SIXTH DEPENDENCY, AND THE FIRST BROKER CLIENT THIS SERVICE HAS EVER HELD.
++  // ADR-07 refuses core NATS for fan-out on an argument about how many client libraries
++  // the gateway holds; this makes it six. The fan-out decision is untouched -- ADR-10
++  // keeps presence in Redis, so Redis is mandatory here regardless -- but the sentence
++  // that PRICED that refusal ("two broker clients where it had one, and remove none")
++  // stops being true, and `docs/06-adr-deep-dives.md` says so now.
++  //
++  // LAZY, so a broker that is down at boot costs no socket, and built here rather than
++  // inside `attachSessions` for the reason the other seven are: its close has an owner.
++  const connectionLog = createConnectionLog({
++    publisher: createConnectionPublisher({ logger: log }),
++    logger: log,
++  });
+   const sessions = attachSessions({
+     server,
+     api: createApiClient(
+       process.env.RELAY_API_URL ?? DEFAULT_API_URL,
+       serviceCredential,
+     ),
+@@ -98,12 +113,13 @@ export function createServer(logger?: Logger) {
+     // is admitted and no number moves — `**/main.ts` is excluded from the coverage
+     // ratchet, so no figure could show it. Registering `close()` below is the other
+     // half and neither substitutes for the other: without this line the cap is inert,
+     // without that one every gateway leaks a Redis client.
+     connections,
+     limits,
++    connectionLog,
+     // Overridable so `meter.itest.ts` can drive a spawned gateway without
+     // waiting a real minute per assertion. The two tests there are the ones an
+     // in-process gateway cannot run — a signal has to arrive at a process — and
+     // sixty seconds each would put them past the suite's timeout.
+     //
+     // Spread rather than assigned `undefined`: `exactOptionalPropertyTypes` is
+@@ -132,12 +148,23 @@ export function createServer(logger?: Logger) {
+    *
+    * `sessions` FIRST, because its close is the one with work to finish: a final usage
+    * report and the release of the places this instance holds. The fabrics it reports
+    * and publishes through have to still be open while it does that. */
+   async function shutdown(): Promise<void> {
+     await sessions.close();
++    // EIGHT NOW, AND THE ORDER IS THE ARGUMENT. `sessions` is first "because its close
++    // is the one with work to finish ... the fabrics it reports and publishes through
++    // have to still be open while it does that", and flushing this buffer is exactly
++    // that kind of work: the tick is stopped and the last records are sent here, not
++    // dropped.
++    //
++    // NOTHING WILL CATCH A MISSED CLOSE. `main.ts` is excluded from the coverage
++    // ratchet, so no figure could show a shutdown that closed seven of eight -- which
++    // is why the COUNT is recorded in `baseline.txt` before and after rather than
++    // trusted to a test.
++    await connectionLog.close();
+     await fanout.close();
+     await presence.close();
+     await membership.close();
+     await typing.close();
+     await connections.close();
+     await limits.close();
+```
+
+`shutdown()` closes eight things now where it closed seven, and `sessions` stays first
+because its close is the one with work to finish.
+
+## The two counters disagree, in opposite directions
+
+The reconciliation compares minute buckets derived from the records against minute buckets
+the meter reported — one quantity computed twice. Do not compare duration against minutes:
+the meter charges every calendar minute a connection was open for any part of, so a socket
+open from 00:00:59 to 00:01:01 is two seconds of wall clock and **two** connection-minutes.
+Measured over one run, that gap is 11,728 ms of wall clock against 11 connection-minutes —
+a factor of 56, and arithmetic rather than a defect.
+
+Three runs, buckets against buckets:
+
+```
+run   pairs   meter   derived   agree
+  1       8       8         8   yes
+  2      10      10        10   yes
+  3      10      11        11   yes
+```
+
+Run 3 is the one worth having. Ten connections owe eleven minutes because one socket crossed
+a calendar-minute boundary, and the derivation found the same eleven — which is what
+splitting by period means, and what the first two runs could not have shown.
+
+Those runs agree because they were scoped, and here is what happens without the scope.
+
+<Figure caption="Neither ending balances, and the meters go opposite ways." code={figNeitherBalances} />
+
+Five connections, held past one flush, and the process ended two ways. Both leave **five
+opens and no closes** in the records — because `sessions.close()` ends with `wss.close()`,
+which stops the server accepting and does *not* close established sockets. No per-socket
+close handler fires on either path. That is the deploy posture `releaseAll` was built around,
+not an oversight.
+
+But the meters diverge completely. On the clean stop `reportOnce` walks the registry, which
+still holds all five, and bills **five**. On the kill there is no final report at all, and it
+bills **zero**. So against the same records the meter over-reports on one path and
+under-reports on the other — and an unscoped comparison would have four explanations for a
+difference instead of two. Scoping to connections with both records present, over a window
+every one of them closed inside, is what leaves the comparison able to mean anything.
+
+```sql title="analytics/0005_connection_events.sql"
+-- FR-ANL-01's LAST ARM WITHOUT A PRODUCER: connection open and close.
+--
+-- A FOURTH TABLE, for the reason there is a third. `webhook_attempts` keeps 90 days and
+-- `api_requests` keeps 30 because FR-ANL-07 says so; one TTL clause cannot express two
+-- retentions, and one table cannot hold three column sets that overlap only on
+-- `environment_id` and `ts`.
+--
+-- `environment_id` IS NOT NULLABLE HERE, UNLIKE `api_requests`, and the difference between
+-- the two chapters is worth stating rather than inheriting. A request can be made by
+-- nobody: every 404, every 401, /healthz, and every call the dispatcher and gateway make on
+-- the internal seam, whose `platform` principal carries no environment by design. A
+-- CONNECTION cannot. `open()` is the only function that builds one and the only caller of
+-- `registry.add`; it takes a non-optional `Identity`, and its single call site is reached
+-- only after the 429 upgrade refusal, 4001, 1011, 4003, 4008 and the 4004 connection cap
+-- have each returned. An unauthenticated SOCKET exists; an unauthenticated CONNECTION does
+-- not. So there is no tenantless record to carry, no `_none` arm, and no
+-- `allow_nullable_key` setting either -- every column in the sorting key is non-nullable.
+CREATE TABLE IF NOT EXISTS relay_analytics.connection_events (
+    environment_id UUID,
+    ts             DateTime64(3, 'UTC'),
+    connection_id  UUID,
+    -- `opened` | `closed`.
+    event          LowCardinality(String),
+    -- ONLY ON A CLOSE, AND A NUMBER RATHER THAN A STRING. A close code is a small integer,
+    -- and a String column answers `WHERE close_code = 1000` with nothing and no error.
+    -- Measured: ClickHouse coerces a JSON number into a String column AND a JSON string
+    -- into a UInt16, so a type disagreement between producer and table lands silently in
+    -- whichever spelling the producer happened to send -- there is no loud direction.
+    --
+    -- AND IT IS NOT DRAWN FROM `CLOSE_CODES`. That registry holds 4001, 4002, 4003, 4004,
+    -- 4008 and 4009 -- the platform's own 4xxx range. A clean close is 1000 and an abnormal
+    -- one is 1006, and neither is in it, so `check:errors` does not guard this column's
+    -- vocabulary. What survives is the narrower claim: an integer the protocol defines,
+    -- not a sentence somebody writes.
+    close_code     Nullable(UInt16),
+    -- UInt64, NOT UInt32. Nothing caps a socket's lifetime -- the only lifetime control is
+    -- `MAX_MISSED_PINGS` on a 30-second ping, which ends a socket that has stopped
+    -- answering rather than one that has not -- and UInt32 milliseconds wraps at 49.7 days.
+    -- The cost is four bytes on a column that is null on every open record.
+    duration_ms    Nullable(UInt64),
+    -- NOT nullable. It comes from the same `Identity` as `environment_id`, and both fields
+    -- are declared `string` rather than `string | undefined`, so a connection event has
+    -- both or neither. (That `Identity` has a THIRD field, `token`, is why the producer
+    -- names every field rather than spreading: constitution III's allow-list -- "only
+    -- lengths, identifiers, and metadata" -- refuses a credential by construction.)
+    user_external_id String,
+    -- 048 measured that an unmatched column takes its DEFAULT with no error, that a
+    -- DateTime64 default is the epoch, and that the epoch is older than any TTL -- so the
+    -- row is deleted at insert while the insert returns OK and the stream drains to zero.
+    -- `input_format_skip_unknown_fields=0` catches a RENAMED field and cannot catch an
+    -- absent one. This can.
+    CONSTRAINT ts_is_real CHECK ts > toDateTime64('2020-01-01 00:00:00', 3, 'UTC')
+)
+ENGINE = ReplacingMergeTree
+PARTITION BY toYYYYMM(ts)                                  -- DR-07
+-- `event` LAST, AND IT IS THE ONE DECISION IN THIS FILE THAT CANNOT BE GUESSED. One
+-- connection produces TWO rows under one `connection_id`; without `event` in the key a
+-- ReplacingMergeTree collapses the open into the close and a reader sees half the story.
+-- Verified against the server: `count() FINAL` is 2, not 1. That is 4.3's lesson applied
+-- rather than re-learned -- idempotence is the record's own key, and this record's own key
+-- includes which event it is.
+ORDER BY (environment_id, ts, connection_id, event)
+-- `toDateTime(ts)`, not `ts` -- 047 measured `TTL ts + INTERVAL` on a DateTime64 refused
+-- with BAD_TTL_EXPRESSION, after the SAD had published the broken form since its first
+-- draft.
+--
+-- AND 90 IS A DEFAULT RATHER THAN A DERIVATION. FR-ANL-07 fixes 30 for the request log and
+-- nothing fixes this one; FR-ANL-05's metering window is the calendar month, so 90 matches
+-- `webhook_attempts` and DR-09's raw-event retention. Said out loud because a number nobody
+-- argued for reads like one somebody did.
+TTL toDateTime(ts) + INTERVAL 90 DAY
+```
+
+```diff title="services/ingester/src/shape.ts"
+@@ -184,16 +184,96 @@ export function shapeRequest(raw: unknown): RequestRow | null {
+ // ---------------------------------------------------------------------------
+ 
+ /** The wire's own discriminator. R11: the PAYLOAD says what the payload is, not the subject —
+  *  a router that parses subjects has to be right about tokens too, and a malformed token
+  *  publishes a subject one level deeper that no intended filter matches. */
+ export const API_REQUEST_TYPE = "api.request";
++export const CONNECTION_OPENED_TYPE = "connection.opened";
++export const CONNECTION_CLOSED_TYPE = "connection.closed";
++
++/** The gateway's record, as it arrives on `analytics.connection.{opened|closed}.{env}`. */
++export interface ConnectionEvent {
++  type: string;
++  connection_id: string;
++  environment_id: string;
++  user_external_id: string;
++  ts: string;
++  /** Close only. */
++  close_code?: number;
++  /** Close only. */
++  duration_ms?: number;
++}
++
++/** One row of `relay_analytics.connection_events`, keyed by column name. */
++export interface ConnectionRow {
++  environment_id: string;
++  ts: string;
++  connection_id: string;
++  event: string;
++  close_code: number | null;
++  duration_ms: number | null;
++  user_external_id: string;
++}
++
++/** Shape one connection record, or return null if it will never be valid.
++ *
++ * `type` IS READ, RENAMED AND DROPPED -- all three, which is one more than the request
++ * shaper does. The wire carries `type: "connection.opened"` because that is what `route()`
++ * discriminates on; the column is `event` and holds `opened`. So this function both drops a
++ * field the table has no column for and derives the column from it, and getting the derivation
++ * backwards is the failure that looks like success: `event` would hold the whole dotted string,
++ * `LowCardinality` would accept it without complaint, and every query filtering
++ * `event = 'opened'` would return nothing for ever.
++ *
++ * `environment_id` IS REQUIRED HERE, unlike the request shaper's. A connection event only
++ * exists after a handshake, so a record arriving without one is malformed rather than
++ * tenantless -- there is no `_none` arm on this grammar to fall back to.
++ *
++ * ABSENT IS NULL, NOT ZERO. A `close_code` of 0 is a claim that a socket closed with code
++ * zero, and a `duration_ms` of 0 that it lasted no time. An open record carries neither. */
++export function shapeConnection(raw: unknown): ConnectionRow | null {
++  if (typeof raw !== "object" || raw === null) return null;
++  const e = raw as Partial<ConnectionEvent>;
++
++  if (
++    !isString(e.environment_id) ||
++    !isString(e.ts) ||
++    !isString(e.connection_id) ||
++    !isString(e.user_external_id) ||
++    !isString(e.type)
++  ) {
++    return null;
++  }
++
++  // THE RENAME, AND IT IS A CLOSED SET RATHER THAN A SUFFIX. `e.type.split(".")[1]` would
++  // turn any `connection.*` record into a row with whatever word followed the dot, which is
++  // a shaper that cannot be wrong about a record it has never seen -- the wrong kind of
++  // robust. Two types, two events, and anything else is somebody else's record.
++  const event =
++    e.type === CONNECTION_OPENED_TYPE
++      ? "opened"
++      : e.type === CONNECTION_CLOSED_TYPE
++        ? "closed"
++        : null;
++  if (event === null) return null;
++
++  return {
++    environment_id: e.environment_id,
++    ts: e.ts,
++    connection_id: e.connection_id,
++    event,
++    close_code: isNumber(e.close_code) ? e.close_code : null,
++    duration_ms: isNumber(e.duration_ms) ? e.duration_ms : null,
++    user_external_id: e.user_external_id,
++  };
++}
+ 
+ export type Shaped =
+   | { kind: "attempt"; row: AttemptRow }
+   | { kind: "request"; row: RequestRow }
++  | { kind: "connection"; row: ConnectionRow }
+   | { kind: "malformed" }
+   | { kind: "unclaimed"; type: string };
+ 
+ /** Decide what a record is.
+  *
+  * AN ABSENT `type` MEANS ATTEMPT, AND THAT IS A COMPATIBILITY RULE RATHER THAN A DEFAULT.
+@@ -214,12 +294,19 @@ export function route(raw: unknown): Shaped {
+     return row === null ? { kind: "malformed" } : { kind: "attempt", row };
+   }
+   if (type === API_REQUEST_TYPE) {
+     const row = shapeRequest(raw);
+     return row === null ? { kind: "malformed" } : { kind: "request", row };
+   }
++  // The third arm (chapter 4.5). TWO TYPES, ONE ARM, because they are one table: the
++  // subject separates an open from a close for a consumer that wants only one, and this
++  // consumer wants both.
++  if (type === CONNECTION_OPENED_TYPE || type === CONNECTION_CLOSED_TYPE) {
++    const row = shapeConnection(raw);
++    return row === null ? { kind: "malformed" } : { kind: "connection", row };
++  }
+ 
+   // Anything else is somebody's record and not this consumer's. Leaving it costs the stream's
+   // retention window; terminating it costs the record. Those are not comparable, and a
+   // consumer that does not recognise a type is the party with the least information.
+   return { kind: "unclaimed", type: typeof type === "string" ? type : String(type) };
+ }
+```
+
+```diff title="services/ingester/src/clickhouse.ts"
+@@ -1,13 +1,14 @@
+ // The write side. Node's own `fetch` against the HTTP interface -- no client package, which
+ // is what keeps `grep -c clickhouse pnpm-lock.yaml` at 0 by design rather than by luck.
+-import type { AttemptRow, RequestRow } from "./shape.js";
++import type { AttemptRow, ConnectionRow, RequestRow } from "./shape.js";
+ 
+ const DB = "relay_analytics";
+ const ATTEMPTS = "webhook_attempts";
+ const REQUESTS = "api_requests";
++const CONNECTIONS = "connection_events";
+ 
+ // TWO SETTINGS, TWO DIFFERENT FAILURES, AND NEITHER IS OPTIONAL.
+ //
+ // `input_format_skip_unknown_fields=0` turns a RENAMED field into `Code: 117` instead of a
+ // silent default. Its server default is 1, which is exactly why the failure it prevents was
+ // invisible: the insert succeeds and the column takes the epoch.
+@@ -21,14 +22,19 @@ const SETTINGS = "input_format_skip_unknown_fields=0&date_time_input_format=best
+ 
+ export interface ClickHouse {
+   insert(rows: AttemptRow[]): Promise<void>;
+   /** The second table (chapter 4.4). A separate call rather than a `table` parameter: the two
+    *  row shapes are different types and the compiler should say so at the call site. */
+   insertRequests(rows: RequestRow[]): Promise<void>;
++  /** The third table (chapter 4.5). A third call for the reason there is a second: three row
++   *  shapes are three types, and a `table` parameter would let the compiler watch a
++   *  `ConnectionRow` go into `api_requests` without a word. */
++  insertConnections(rows: ConnectionRow[]): Promise<void>;
+   count(): Promise<number>;
+   countRequests(): Promise<number>;
++  countConnections(): Promise<number>;
+ }
+ 
+ export function createClickHouse({
+   host = process.env["RELAY_CLICKHOUSE_HOST"] ?? "localhost",
+   port = process.env["RELAY_CLICKHOUSE_HTTP_PORT"] ?? "8123",
+   user = process.env["RELAY_CLICKHOUSE_USER"] ?? "relay",
+@@ -69,16 +75,30 @@ export function createClickHouse({
+       if (rows.length === 0) return;
+       await post(
+         `INSERT INTO ${DB}.${REQUESTS} FORMAT JSONEachRow`,
+         rows.map((r) => JSON.stringify(r)).join("\n"),
+       );
+     },
++    // THE EMPTY GUARD MATTERS MORE WITH EVERY PRODUCER. One fetch now feeds three tables and
++    // the three rates differ by orders of magnitude -- roughly one connection pair per
++    // session against one request record per request -- so most batches carry requests and
++    // neither of the others. Without this, each of them posts an empty INSERT per batch.
++    async insertConnections(rows: ConnectionRow[]): Promise<void> {
++      if (rows.length === 0) return;
++      await post(
++        `INSERT INTO ${DB}.${CONNECTIONS} FORMAT JSONEachRow`,
++        rows.map((r) => JSON.stringify(r)).join("\n"),
++      );
++    },
+     // Reads take FINAL. The duplicate is physically present until a merge collapses it, so a
+     // bare count over-counts every redelivery -- by a plausible number.
+     async count(): Promise<number> {
+       return Number(await post(`SELECT count() FROM ${DB}.${ATTEMPTS} FINAL`, ""));
+     },
+     async countRequests(): Promise<number> {
+       return Number(await post(`SELECT count() FROM ${DB}.${REQUESTS} FINAL`, ""));
+     },
++    async countConnections(): Promise<number> {
++      return Number(await post(`SELECT count() FROM ${DB}.${CONNECTIONS} FINAL`, ""));
++    },
+   };
+ }
+```
+
+```diff title="services/ingester/src/main.ts"
+@@ -68,19 +68,28 @@ export async function main(): Promise<void> {
+ 
+   do {
+     try {
+       const r = await ingestOnce({ nc, store, logger });
+       // `unclaimed` is in the line because a record nobody claims is redelivered until the
+       // stream's retention expires, and the count is the only way anyone finds out that is
+-      // happening. The two `written` figures are separate because one number cannot say
+-      // which table moved.
++      // happening. The per-table figures are separate because one number cannot say which
++      // table moved.
++      //
++      // THREE NOW, AND THE THIRD WAS MISSING FOR A WHOLE PHASE. `IngestResult` gained
++      // `writtenConnections` with chapter 4.5's third arm and this line still reported two,
++      // so a batch carrying connection records logged `written: 3, attempts: 0, requests: 1`
++      // -- a total that does not add up, with the missing half invisible. Found by draining
++      // the real stream and then querying the table: 41 rows in `connection_events` that no
++      // log line had ever mentioned. **A reporter that omits an arm turns "one number cannot
++      // say which table moved" into three numbers that disagree.**
+       if (r.written > 0 || r.malformed > 0 || r.unclaimed > 0) {
+         logger.log("info", "ingester.batch", {
+           written: r.written,
+           attempts: r.writtenAttempts,
+           requests: r.writtenRequests,
++          connections: r.writtenConnections,
+           malformed: r.malformed,
+           unclaimed: r.unclaimed,
+         });
+       }
+     } catch (error) {
+       // The store is unreachable, or the insert was refused. Nothing was acknowledged, so
+```
+
+That last hunk is one line of substance and it was missing for a whole phase: the result
+gained a third count and the log line still reported two, so a batch carrying connection
+records printed a total that did not add up. It was found by draining the real stream and
+then querying the table — forty-one rows no log line had ever mentioned.
+
+## What a third producer costs the stream
+
+`ANALYTICS` holds 1 GiB for seven days, which is 1,775.4 bytes a second.
+
+<Figure caption="A connection pair costs what 2.35 requests cost." code={figTheBudget} />
+
+A connection pair is 750.8 bytes against a request record's 320, so the assumption that
+connection events are lower volume is right by count — measured here at 31 to 1 — and
+inverts by bytes for any session shorter than 2.35 requests. A client that connects,
+receives pushes and closes makes very few HTTP requests, which is the shape this platform is
+for. The ratio measured on this stack is a fact about health polls, not about a deployment.
+
+<Trap title="The figure that sized this stream is 26% lighter than the stream">
+Every crossover in this part is derived from 320 bytes a record, measured with a probe.
+The stream's own accounting over 3,992 real messages says **403.5 bytes** — 26.1% heavier,
+on traffic that is 97% request records. Recomputed honestly the seven-day crossover is
+**4.40 records a second, not 5.55**.
+
+Chapter 4.4 already corrected this figure once, when its first probe came in 2% light for
+using a shorter subject than production. It is still light, by a further quarter, and the
+likely reasons are the fields a real record carries that a fixture does not and the
+deduplication header the fixture omits. A probe is a model of the thing, and the stream is
+the thing.
+</Trap>
+
+## What it cost the record
+
+ADR-07 refuses core NATS as the fan-out fabric, and its v1.1 amendment says the refusal is
+*"deliberately weaker than the others: it is an argument about how many client libraries the
+gateway holds."* This chapter takes that count from five to six.
+
+The paragraph above that amendment — the one the decision was actually written with — is
+sharper:
+
+> core NATS pub/sub ... refused on dependency shape rather than mechanism: Redis is
+> mandatory for the gateway regardless, since ADR-10 puts presence in Redis with TTLs, so
+> fan-out on NATS would leave that service holding **two broker clients and remove none**.
+
+That sentence prices the refusal, and the price is now zero: the gateway holds two brokers
+anyway, so NATS fan-out would add none and remove none. What survives is that Redis does not
+leave, which ADR-10 decides and this record has always said.
+
+And the tidiest line goes with it. *"Choosing Redis keeps a clean mapping — gateway to Redis,
+api and workers to NATS."* Chapter 3.8 gave the API service a Redis client and 3.18 gave it a
+second, which that record already calls *"the cost this analysis rejected core NATS for
+imposing on the gateway, relocated rather than avoided."* This chapter takes the gateway
+half. Afterwards the mapping describes no service in this platform.
+
+<Why title="Amended, not superseded">
+The constitution says ADRs are immutable once accepted and that superseding requires a new
+ADR — and ADR-07 carries both forms already: two dated amendments, and two later ADRs that
+*extend* it. So precedent settles nothing and the rule names one option.
+
+A new ADR was the alternative, and it was declined. ADR-20 and ADR-22 extend this record
+because each carries a new payload whose recovery properties differ, which is a new decision
+every time. This chapter carries none: the fan-out decision is untouched and so are its
+revisit conditions. What changed is a fact one driver rested on, and a dated amendment is
+what that is for. Both documents that hold ADR-07 say so now — the summary and the argument.
+</Why>
+
+That fix is not fenced either, and for a different reason: the chain's replayed state of
+`packages/test-harness/src/bound-port.test.ts` already differs from the tree at line 36,
+before this chapter touched it. A hunk cannot anchor on a state that is not there, and
+regenerating the whole body is the trap that took a previous chapter from 111 problems to
+203. `gaps.md` 050-7.
+
+One entry, and it had been missing since chapter 4.3 created the file it exempts. The suite
+reported green from cache the whole time, because its cache key covers its own package and
+this test reads three others.
+
+
+<SkipAhead>
+If you are reading for the producer alone, the two files are
+`services/gateway/src/connection-log/event.ts` — the shaper, the buffer and its retention
+rule — and `publisher.ts`, which is one lazily-connected client and nothing else.
+</SkipAhead>
+
+<ForwardRef>
+The reconciliation job that compares these two counters on a schedule, and alerts when they
+drift, is movement IV's. This chapter makes both counters exist and publishes the reasons
+they will never agree exactly.
+</ForwardRef>
+
+<ChapterFooter id="4.5" />

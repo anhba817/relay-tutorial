@@ -1,6 +1,6 @@
 # Relay — Software Architecture Document
 
-**Version:** 1.4 (draft)
+**Version:** 1.5 (draft)
 **Status:** For review
 **Companion documents:** `01-product-vision.md` · `02-personas.md` · `03-journey-map.md` · `04-srs.md`
 **Structure:** views-based (C4-influenced), with Architecture Decision Records
@@ -171,6 +171,15 @@ reads backfill *through the API service's internal history endpoint*, not from P
 directly (single-writer/single-reader discipline, → ADR-04). Sends message frames received
 from clients to the API service over internal HTTP — the gateway never writes to the
 database (→ ADR-05).
+
+Meters connection-minutes and reports them to the API service every 60 seconds over
+`POST /internal/usage/connections`, for FR-RTL-05's monthly quota (chapter 3.24) — a
+synchronous counter that must be able to refuse a connection, which is why it cannot live
+downstream of a lossy stream. **Records every connection open and close as an analytical
+event (FR-ANL-01)**, buffered and published to `ANALYTICS` on a five-second tick (chapter
+4.5) — a second counter of the same quantity, kept apart on purpose, with the reconciler in
+movement IV. That is the gateway's first broker client and its sixth dependency; see
+ADR-07's third amendment for what it costs that record.
 
 **Webhook dispatcher** `[Phase 2]`
 Consumes `events.>` from JetStream with a durable consumer per environment shard. Filters
@@ -798,7 +807,49 @@ double-count. `(delivery_id, attempt)` is the same pair the publisher treats as 
 endpoint took to answer a webhook; that is how long a message took to reach a client, and
 it still has no producer.
 
-A fifth table, `emoji_events` (DR-14), records emoji usage as `(environment_id, ts, kind,
+**AND THE CONNECTION LOG, ADDED IN REVISION 1.5 (chapter 4.5).** `message_events` above is labelled
+*representative* and FR-ANL-01 names four arms — message send, connection open and close,
+API request, webhook delivery attempt. Three had tables; **connection open and close was the
+last one without a producer**, and the gateway is the only service that can see it:
+
+```sql
+CREATE TABLE connection_events (
+    environment_id   UUID,                   -- NOT nullable, unlike api_requests
+    ts               DateTime64(3, 'UTC'),
+    connection_id    UUID,
+    event            LowCardinality(String), -- opened | closed
+    close_code       Nullable(UInt16),       -- close only; a number, not a reason string
+    duration_ms      Nullable(UInt64),       -- close only; UInt32 ms wraps at 49.7 days
+    user_external_id String,
+    CONSTRAINT ts_is_real CHECK ts > toDateTime64('2020-01-01 00:00:00', 3, 'UTC')
+)
+ENGINE = ReplacingMergeTree
+PARTITION BY toYYYYMM(ts)                                 -- DR-07
+ORDER BY (environment_id, ts, connection_id, event)       -- ordering AND identity
+TTL toDateTime(ts) + INTERVAL 90 DAY;                     -- DR-09
+```
+
+**`event` IS IN THE SORTING KEY AND THAT IS THE ONE DECISION HERE WORTH ARGUING.** One
+connection produces TWO rows under one `connection_id`; without it the engine collapses the
+open into the close and a reader sees half the story. Verified against the server:
+`count() FINAL` is 2, not 1.
+
+**`environment_id` is NOT nullable here, where `api_requests` made it nullable**, and the
+difference is the two chapters' subjects. A request can be made by nobody — every 404, every
+401, and every call the internal seam makes under a `platform` principal. A connection
+cannot: the only function that builds one takes a non-optional identity, and every refusal
+path (429 on the upgrade, 4001, 1011, 4003, 4008, and the 4004 connection cap) returns
+before it. An unauthenticated **socket** exists; an unauthenticated **connection** does not.
+
+**The producer buffers and publishes on a tick, and that is a contract rather than an
+optimisation.** A publish per close costs 2.87 s of awaited acks for the 10,000 sockets
+NFR-SCL-01 allows, which is chapter 3.24's burst argument on a new transport; one message
+per record, pipelined, costs 0.026 ms each. A record whose publish fails is retained and
+retried rather than dropped — `meter.ts` drops a report that cannot be delivered *except*
+for a closed connection, which has no next report to repair the loss, and **every connection
+event is in that exception**.
+
+A sixth table, `emoji_events` (DR-14), records emoji usage as `(environment_id, ts, kind,
 identifier, pack_id)` with the same partitioning and TTL. It deliberately omits `channel_id`
 and `user_id`: per-tenant-per-day aggregates (FR-EMJ-11) need neither, and omitting them
 keeps the table outside the scope of the compliance-erasure mutation entirely — an
@@ -1148,6 +1199,41 @@ none); gateway-to-gateway mesh (O(n²) connections, discovery complexity).
 > a second monotonic counter per mailbox that every mutation has to maintain. Both
 > alternatives add a per-channel counter; this platform is already the first shape, and
 > chapter 3.23 chose to say so rather than to add one.
+
+> **Amended 2026-09-15 (chapter 4.5) — THE PRICE THIS RECORD PUT ON CORE NATS IS NOW
+> ZERO, AND THE CLEAN MAPPING IS BROKEN ON BOTH SIDES.**
+>
+> The **Decision** is untouched and so are the **Revisit when** clauses; this amends the
+> selection argument only, in the shape chapter 3.18 used when it did the same from the
+> api's side.
+>
+> Two lines above stop being true. The rejected list says core NATS was *"refused on
+> dependency shape rather than mechanism … so fan-out on NATS would leave that service
+> holding two broker clients and **remove none**"*, and v1.1 restates that as *"an
+> argument about how many client libraries the gateway holds"*. **Chapter 4.5 gives the
+> gateway a NATS client for FR-ANL-01's connection records — 5 dependencies to 6 — so it
+> holds two brokers already.** Fan-out on NATS would now add none and remove none: the
+> cost side of the refusal is zero, and what is left is that Redis does not leave, which
+> ADR-10 decides and this record has always said.
+>
+> **And the clean mapping is the thing that actually went.** *"Gateway to Redis, api and
+> workers to NATS"* lost its api half in 3.8 and 3.18 — the amendment below records that
+> cost as *"relocated rather than avoided"* — and this chapter takes the gateway half,
+> which is the half the mapping is named for. Afterwards it describes no service in this
+> platform. A reader comparing it against §4's component diagram deserves to be told so
+> rather than left to reconcile them.
+>
+> **AMENDED RATHER THAN SUPERSEDED, AND THE ALTERNATIVE IS NAMED.** Constitution VII says
+> ADRs are immutable once accepted and that superseding requires a new ADR, and ADR-07
+> carries both forms already: two dated amendments, and `extended by` ADR-20 and ADR-22.
+> The rejected alternative here was a new extending ADR. It was declined because **the
+> decision has not changed** — ADR-20 and ADR-22 extend this record because they carry new
+> payloads whose recovery properties differ, which is a new decision each time, and this
+> chapter carries none. VII's closing line, *"disagreement attacks the driver, not the
+> choice"*, describes a proposal to change the choice; nobody is proposing one. A fact a
+> driver rested on became false, which is what a dated amendment is for.
+>
+> The full argument is in `docs/06-adr-deep-dives.md`, amended with this.
 
 ### ADR-08 — ClickHouse single-node in v1, schema designed for cluster
 **Status:** accepted · **Drivers:** D5, D8, NFR-SCL-05

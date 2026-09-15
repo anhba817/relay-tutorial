@@ -842,6 +842,16 @@ export const series: Part[] = [
         sourceDoc: "docs/04-srs.md, docs/05-sad.md",
         readerMinutes: 55,
       },
+      {
+        id: "4.5",
+        path: "/part-4/chapter-05/the-gateways-first-stream",
+        title: "The gateway's first stream",
+        status: "published",
+        readerProduces:
+          "FR-ANL-01's last arm without a producer, built in the one service that had never held a broker client — and the measurement that neither a clean stop nor a kill balances the opens against the closes, with the two connection counters wrong in opposite directions",
+        sourceDoc: "docs/04-srs.md, docs/05-sad.md",
+        readerMinutes: 55,
+      },
     ],
   },
   {
