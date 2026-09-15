@@ -849,6 +849,36 @@ retried rather than dropped — `meter.ts` drops a report that cannot be deliver
 for a closed connection, which has no next report to repair the loss, and **every connection
 event is in that exception**.
 
+**AND THERE ARE TWO ROLLUPS, WHICH ONE TABLE COULD NOT HAVE BEEN** (chapter 4.6). DR-10 asks
+for daily per-tenant rollups *"so billing never scans raw events"*, and FR-ANL-09 asks for
+usage attributable by application, environment, channel and day. Putting channel in a single
+rollup's key satisfies the second and destroys the first, measured over a 248,155-row corpus
+across 91 days and 2,400 channels:
+
+| keyed | rows | a tenant's 91-day bill reads |
+|---|---|---|
+| `(environment_id, channel_id, day)` | 147,534 | 32,778 rows · 4 ms |
+| `(environment_id, day)` | 281 | — |
+| the raw table, same question | 248,155 | 32,768 rows · 3 ms |
+
+The channel-keyed table is fully merged — every row is a distinct key and `OPTIMIZE FINAL`
+changes nothing — so the 525× is the dimension's cost rather than a compaction artefact. A
+billing read against it touches more rows than the raw events it was supposed to replace.
+`daily_usage_billing` is keyed `(environment_id, day)` and is what billing reads;
+`daily_usage_v2` keeps the channel key and answers the attribution question. Neither is a
+compromise of the other.
+
+**AND A MATERIALISED VIEW IS A TRIGGER ON FUTURE INSERTS, NOT A QUERY OVER HISTORY.** On the
+day the first of these views was created the rollup answered **0** connection-minutes while
+the same expansion run directly against `connection_events` answered **56**, over records
+already in the table. Every deployment that applies these statements to a store holding data
+needs the backfill that follows them, and it will read as working without one, because every
+new record appears. **A backfill recovers only what still exists**: measured against the same
+corpus, the view counted 242,667 messages over 92 days and a backfill taken minutes later
+found 239,997 over 91 — the difference is one day the 90-day TTL had already removed. The
+rollups carry no TTL (FR-003a) precisely so they outlive the raw events, which means a rollup
+created late is permanently short by whatever has already expired.
+
 A sixth table, `emoji_events` (DR-14), records emoji usage as `(environment_id, ts, kind,
 identifier, pack_id)` with the same partitioning and TTL. It deliberately omits `channel_id`
 and `user_id`: per-tenant-per-day aggregates (FR-EMJ-11) need neither, and omitting them
