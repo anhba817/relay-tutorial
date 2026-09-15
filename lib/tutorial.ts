@@ -852,6 +852,16 @@ export const series: Part[] = [
         sourceDoc: "docs/04-srs.md, docs/05-sad.md",
         readerMinutes: 55,
       },
+      {
+        id: "4.6",
+        path: "/part-4/chapter-06/the-rollup-nobody-read",
+        title: "The rollup nobody read",
+        status: "published",
+        readerProduces:
+          "The rollup DR-10 asks for, after finding that the one already shipped is read by nothing and sits over a table nothing writes — and the measurement that put FR-ANL-09's channel dimension and DR-10's cheap read into separate tables, at 525x the rows and a billing query that touched more of them than the raw events it replaced",
+        sourceDoc: "docs/04-srs.md, docs/05-sad.md",
+        readerMinutes: 55,
+      },
     ],
   },
   {
