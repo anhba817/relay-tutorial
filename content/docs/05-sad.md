@@ -876,8 +876,30 @@ needs the backfill that follows them, and it will read as working without one, b
 new record appears. **A backfill recovers only what still exists**: measured against the same
 corpus, the view counted 242,667 messages over 92 days and a backfill taken minutes later
 found 239,997 over 91 — the difference is one day the 90-day TTL had already removed. The
-rollups carry no TTL (FR-003a) precisely so they outlive the raw events, which means a rollup
-created late is permanently short by whatever has already expired.
+rollups outlive the raw events on purpose — **DR-09's 25 months against the raw tables' 90
+days**, applied as `TTL toDateTime(day) + INTERVAL 25 MONTH` in chapter 4.6 — which means a
+rollup created late is permanently short by whatever has already expired. **This paragraph
+said "the rollups carry no TTL (FR-003a)" until chapter 4.7.** Both halves were wrong: 4.6
+gave them one in the same feature this paragraph was written in, and `FR-003a` is a
+feature-local id four features use to mean four different things, not a clause in the SRS.
+
+**AND THE ONE READER THAT CROSSES THE FENCE IS FR-ANL-06's RECONCILER (chapter 4.7).** It runs
+in the api, reads `daily_usage_billing` over HTTP and `usage_periods`/`usage_active_users`
+through the repository layer, compares one tenant and one period at a time, and writes
+nothing. It is the only component in this architecture that reads both stores, which
+constitution III appears to forbid and ADR-06 below has always assumed — *"the only strict
+consumer (metering) reconciles daily against Postgres"* is the trade-off that makes choosing
+NATS over Kafka acceptable. The reading that holds is that an auditor is not billing, metering
+or dashboard analytics; **an auditor confined to one side of a fence cannot check the fence.**
+SRS revision 1.14 records it, and the amendment is the constitution's.
+
+**AND THE COMPARISON IT CAN ACTUALLY MAKE IS NARROWER THAN THE CLAUSE READS.** Three of
+FR-ANL-05's four quantities cannot meet the 0.1% bound for reasons that are not defects —
+`uniq` is exact only to 65,536 distinct, the raw retention boundary makes the oldest day in
+any window disagree by up to 1.0989% depending on the time of day, and connection-minutes
+count different populations on the two sides. The fourth, stored message count, has no
+operational counterpart at all. The job reports `not-comparable` and `no-data` as verdicts of
+their own for exactly this reason.
 
 A sixth table, `emoji_events` (DR-14), records emoji usage as `(environment_id, ts, kind,
 identifier, pack_id)` with the same partitioning and TTL. It deliberately omits `channel_id`
