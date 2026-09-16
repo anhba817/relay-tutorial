@@ -862,6 +862,16 @@ export const series: Part[] = [
         sourceDoc: "docs/04-srs.md, docs/05-sad.md",
         readerMinutes: 55,
       },
+      {
+        id: "4.7",
+        path: "/part-4/chapter-07/the-job-that-checks-the-meter",
+        title: "The job that checks the meter",
+        status: "published",
+        readerProduces:
+          "FR-ANL-06's reconciliation job, and the finding that it cannot pass: two operational counters of the same quantity disagree by 0.2630% while 49 of 1,385 tenant-periods breach the bound, and three of the four quantities cannot meet 0.1% for reasons that are not defects — uniq's cliff at 65,536, a retention boundary that moves with the clock, and a connection ledger that counts a different population on each side",
+        sourceDoc: "docs/04-srs.md, docs/05-sad.md",
+        readerMinutes: 55,
+      },
     ],
   },
   {

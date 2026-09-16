@@ -1,0 +1,695 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import {
+  figWhichOperationalCount,
+  figTheVerdicts,
+  figWhereTheBoundCannotHold,
+} from "./figures";
+
+export const metadata = {
+  title: "The job that checks the meter — Building Relay",
+  description:
+    "FR-ANL-06 asks for metered totals to agree with counts derived from operational data to within 0.1%. Building the job that checks it turns up four reasons the platform cannot pass, three of which are nobody's fault, and one operational counter disagreeing with another.",
+  alternates: {
+    canonical: "/part-4/chapter-07/the-job-that-checks-the-meter",
+    languages: {
+      en: "/part-4/chapter-07/the-job-that-checks-the-meter",
+      vi: "/vi/part-4/chapter-07/the-job-that-checks-the-meter",
+    },
+  },
+};
+
+<ChapterHeader id="4.7" />
+
+The brief is one clause. FR-ANL-06: *"Metered totals shall agree with counts derived from
+operational data to within 0.1%, verified by a daily reconciliation job that raises an alert
+on breach."*
+
+Everything the job needs exists. The last chapter built the rollup billing reads; Part 3's
+quota chapter built the counters in Postgres. `docs/12` §4 already said the two are the same
+three quantities counted twice, on purpose, and that this chapter is the comparison between
+them. So it looks like an afternoon: read one side, read the other, divide.
+
+The job took an afternoon. Finding out what it is allowed to say took the rest of the
+chapter.
+
+## "Counts derived from operational data" is not one number
+
+The clause does not name a table, and this platform has two that answer the same question.
+`messages`, counted through `channels` for the tenant, is the record of what was actually
+stored. `usage_periods.messages_sent` is the counter the quota chapter increments inside the
+transaction that writes each message. Both are derived from operational data. They disagree:
+
+```text
+messages (through channels)          19,012
+usage_periods.messages_sent          18,962
+                                     0.2630%
+```
+
+Against a 0.1% bound, that is already a breach — before the analytical store is consulted at
+all. The first instinct is to pick the larger number and call the other one lossy. The second
+is better: ask which rows differ.
+
+<Figure caption="Two operational counts of the same quantity, and the clause chooses neither" code={figWhichOperationalCount} />
+
+Every disagreeing tenant is a test fixture, in five families, and there are two mechanisms
+pushing in opposite directions. A fixture that writes `INSERT INTO messages` directly bypasses
+the counter, so `messages` reads high — seven call sites do it, each for a state the
+repository can no longer produce. And `history-drift.itest.ts` issues a hard
+`DELETE FROM messages`, which removes a row the counter has already counted, so
+`usage_periods` reads high. It is the only family in the table leaning that way, and a single
+sentence about "fixtures writing raw SQL" would have flattened it.
+
+Neither mechanism is reachable from the shipped write path. `sendMessage` writes the message
+and increments the counter in one transaction, and the platform soft-deletes. **0 of 1,385
+tenant-periods disagree for a non-fixture reason.** So the answer is not to choose a
+counter — it is that a report which does not say which table it read is asserting the other
+one does not exist. The job names its source per quantity and publishes the gap to the
+alternative.
+
+<Trap title="The aggregate is the number nobody questions">
+
+0.2630% across the lane sounds like rounding. Underneath it, **49 of 1,385 tenant-periods
+are over the bound and one is wrong by everything it has.**
+
+A reconciler that sums both sides and divides once will report a figure inside every
+plausible tolerance on a platform where a fifth of its tenants are wrong. The comparison has
+to be per tenant and per period, and a sweep is a loop in the caller — which is also where a
+summary belongs, beside the shape rather than instead of it.
+
+</Trap>
+
+## Zero against zero is not agreement
+
+The obvious shape for the comparison is: fetch both numbers, divide, compare to 0.001. It is
+wrong twice before it reaches the division.
+
+The stored message count has no operational counterpart. Not "none for this tenant" — none in
+the platform. `usage_periods` carries messages and connection-minutes, `usage_active_users`
+carries the third, and nothing anywhere carries a stored total. A job that reports that as a
+100% discrepancy is blaming the analytical path for a column Postgres has never had.
+
+And a tenant with nothing on either side is not a tenant in agreement. Zero against zero
+divides to nothing, and the first green number this chapter could have published would have
+been a lie about a tenant that has never sent a message.
+
+<Figure caption="The verdict is decided from presence, before any arithmetic runs" code={figTheVerdicts} />
+
+Those two are not edge cases here. **Four environment ids appear in the rollup, and not one
+of them exists in Postgres at all** — they arrived on a stream, and nothing carries a foreign
+key across that boundary. **1,313 environments have operational usage and not one has a
+rollup row.** Every tenant in this platform is one-sided, so `not-comparable` and `no-data`
+are not the rare branches. They are the answer.
+
+Collapsing them into "missing data" would let the defect this movement exists to expose read
+as an absence of evidence.
+
+```ts title="services/api/src/metering/reconcile.ts"
+// FR-ANL-06's comparison, as arithmetic over two numbers.
+//
+// *"Metered totals shall agree with counts derived from operational data to within 0.1%,
+// verified by a daily reconciliation job that raises an alert on breach."*
+//
+// THIS FILE IS THE HALF THAT RUNS WITHOUT A STORE, AND `docs/12` §2.3 IS WHY. The lane's
+// largest membership set is five channels, and *"0.1% of a small number is an assertion that
+// cannot fail for its own reason"* — so the milestone splits into a planted drift the lane
+// checks every run, and the 0.1% figure measured once at a volume where it means something.
+// Separating the verdict from the gathering is what lets the first half run with no corpus,
+// no database and no broker.
+
+/** The threshold FR-ANL-06 names. A constant with its clause beside it, because a bare
+ *  `0.001` in an expression is a number somebody later adjusts to make a test pass. */
+export const RECONCILE_THRESHOLD = 0.001; // 0.1%, SRS FR-ANL-06
+
+export type Verdict = "pass" | "breach" | "not-comparable" | "no-data";
+
+export interface Comparison {
+  /** Rollup total, or null when the analytical side holds nothing for this tenant-period. */
+  analytical: number | null;
+  /** Operational total, or null when Postgres holds nothing for it. */
+  operational: number | null;
+  /** Does this quantity have an operational counterpart AT ALL?
+   *
+   * DISTINCT FROM `operational === null`, and the difference is the point. A tenant with no
+   * `usage_periods` row has a null total and a source that exists; **the stored message count
+   * has no operational source anywhere in this platform** and never will until somebody adds
+   * one. Collapsing the two would blame the analytical path for a column Postgres has never
+   * had. */
+  hasOperationalSource: boolean;
+}
+
+/** The verdict, decided from PRESENCE before any arithmetic runs.
+ *
+ * That ordering is deliberate: only a comparison with both sides present reaches a division,
+ * which is what stops a zero denominator from being a case anyone has to think about. */
+export function verdictFor(c: Comparison, threshold = RECONCILE_THRESHOLD): Verdict {
+  if (!c.hasOperationalSource) return "not-comparable";
+  if (c.analytical === null && c.operational === null) return "no-data";
+  // ONE-SIDED IS A BREACH, IN EITHER DIRECTION.
+  //
+  // Measured at this chapter's opening: 675 environments have operational usage rows and
+  // ZERO real ones have analytical rollup data, so every tenant in this platform is in the
+  // first state. Calling that "missing data" would let the defect this movement exists to
+  // expose read as an absence of evidence.
+  //
+  // And the other direction is not hypothetical either: the analytical store held four
+  // environment ids that exist in no Postgres row, because it is fed by a stream and nothing
+  // carries a foreign key across the boundary.
+  if (c.analytical === null || c.operational === null) return "breach";
+  const pct = differencePct(c);
+  return pct !== null && pct <= threshold ? "pass" : "breach";
+}
+
+/** The difference as a fraction, or null when either side is absent.
+ *
+ * NULL RATHER THAN ZERO WHEN A SIDE IS MISSING. A number computed against an absent
+ * counterpart reads as a measurement and is not one.
+ *
+ * `max(a, o)` AND NOT THE OPERATIONAL SIDE as the denominator: a tenant can hold analytical
+ * rows for a quantity whose operational total is zero, and dividing by that is a crash where
+ * a verdict belongs.
+ *
+ * AND BOTH-ZERO IS AGREEMENT, NOT A DIVISION. Two present sides that both read zero make the
+ * denominator zero too. This case is reachable — `usage_periods` holds 288 rows for 2026-08
+ * with `messages_sent = 0` — and it was not in the design: `data-model.md` specified the
+ * formula and the verdict ordering and never said what `0 / 0` means. It means they agree. */
+export function differencePct(c: Comparison): number | null {
+  if (c.analytical === null || c.operational === null) return null;
+  const denominator = Math.max(c.analytical, c.operational);
+  if (denominator === 0) return 0;
+  return Math.abs(c.analytical - c.operational) / denominator;
+}
+
+// ---------------------------------------------------------------------------
+// THE GATHERING (chapter 4.7, phase 3).
+//
+// Everything above is arithmetic and runs with no store. Everything below reads both of
+// them, which is the thing FR-ANL-06 asks for and constitution III's first sentence appears
+// to forbid — see the chapter, and `gaps.md`.
+// ---------------------------------------------------------------------------
+
+import type { Db } from "../db/client";
+import { operationalUsageFor } from "../db/usage-reads";
+import { nextPeriod } from "../quotas/period";
+import type { AnalyticalStore } from "./clickhouse";
+
+/** The four quantities FR-ANL-05 names. */
+export type Quantity =
+  | "messages"
+  | "activeUsers"
+  | "connectionMinutes"
+  | "storedMessages";
+
+export interface ReconcileRow {
+  environmentId: string;
+  period: string;
+  quantity: Quantity;
+  analytical: number | null;
+  operational: number | null;
+  /** WHICH TABLE, NAMED IN THE REPORT. Two operational candidates exist for messages and the
+   *  clause chooses neither, so a report that does not say which one it read is asserting the
+   *  other does not exist. */
+  operationalSource: string | null;
+  differencePct: number | null;
+  verdict: Verdict;
+}
+
+const DB_ANALYTICS = "relay_analytics";
+
+/** FR-ANL-06's comparison, for ONE tenant and ONE period.
+ *
+ * ONE TENANT PER CALL, AND THAT IS A CONSTRAINT RATHER THAN A CONVENIENCE. Measured at this
+ * chapter's opening: aggregated across tenants the two operational counters differ by
+ * 0.2694% — a number nobody would question — while 19 tenants breach and one is wrong by
+ * everything it has. A sweep is a loop in the caller, and the caller is where a summary
+ * belongs.
+ *
+ * IT WRITES NOTHING. Two invocations with the same arguments return the same report. */
+export async function reconcile(
+  db: Db,
+  store: AnalyticalStore,
+  { environmentId, period }: { environmentId: string; period: string },
+): Promise<ReconcileRow[]> {
+  // THE DAY RANGE IS HALF-OPEN, and the other spelling is wrong by one day. The caller passes
+  // a month — `periodOf`'s `YYYY-MM-01` — and the rollup is keyed by day, so
+  // `day >= period AND day < nextPeriod(period)`. `BETWEEN period AND nextPeriod(period)`
+  // puts 1 September into August, and **a reconciler's off-by-one does not crash: it reports
+  // drift.**
+  const until = nextPeriod(period);
+
+  // `count()` FIRST, AND IT IS NOT DECORATION. **A bare aggregate with no GROUP BY always
+  // returns exactly one row** — chapter 4.6 established that against the server and used it
+  // to delete a guard, and here the same fact means an empty result set is not reachable: a
+  // tenant with no rollup rows comes back as `0`, not as nothing. Without the count, "holds
+  // nothing" and "holds zero" are the same answer, and this report's whole point is that they
+  // are not.
+  const rollup = await store.query(
+    `SELECT count(), sum(messages), uniqMerge(active_users_state), sum(connection_minutes)
+       FROM ${DB_ANALYTICS}.daily_usage_billing
+      WHERE environment_id = toUUID('${environmentId}')
+        AND day >= toDate('${period}') AND day < toDate('${until}')
+      FORMAT TSV`,
+  );
+  // THE STORED COUNT IS A BALANCE, so it sums every delta up to the period's end rather than
+  // within it. A `BETWEEN` here reports the period's CHANGE in stored messages, which is a
+  // different question that reads as a plausible wrong answer.
+  const stored = await store.query(
+    `SELECT count(), sum(stored_delta) FROM ${DB_ANALYTICS}.daily_usage_billing
+      WHERE environment_id = toUUID('${environmentId}') AND day < toDate('${until}')
+      FORMAT TSV`,
+  );
+
+  // THE OPERATIONAL READ GOES THROUGH `db/usage-reads`, NOT THROUGH SQL HERE.
+  // `eslint.config.mjs` restricts `drizzle-orm` to `services/api/src/db/**` — "the query
+  // engine lives inside the repository layer only (constitution I, ADR-16)" — and the first
+  // version of this file failed lint on exactly that import.
+  const op = await operationalUsageFor(db, environmentId, period);
+
+  const rollupRow = rollup[0];
+
+  /** An analytical cell, absent when the tenant-period has no rollup rows at all.
+   *
+   *  THE COUNT DECIDES, NOT THE SUM. A first version read `rollup[0] === undefined` and never
+   *  fired: the server answers a bare aggregate with one row whatever the filter matches, so
+   *  every empty tenant reported `0` and every `no-data` verdict came back `breach`. */
+  const rows0 = rollupRow === undefined ? 0 : Number(rollupRow[0]);
+  const analytical = (i: number): number | null =>
+    rows0 === 0 || rollupRow === undefined ? null : Number(rollupRow[i + 1]);
+
+  const rows: Array<[Quantity, number | null, number | null, string | null, boolean]> = [
+    ["messages", analytical(0), op.messagesSent, "usage_periods", true],
+    // `activeUsers` is null when the tenant has no period row at all, and 0 when it has one
+    // with no users — the same distinction the rest of the report keeps.
+    [
+      "activeUsers",
+      analytical(1),
+      op.messagesSent === null ? null : op.activeUsers,
+      "usage_active_users",
+      true,
+    ],
+    ["connectionMinutes", analytical(2), op.connectionMinutes, "usage_periods", true],
+    // NO OPERATIONAL SOURCE ANYWHERE, and that is a fact about the platform rather than about
+    // this tenant. `usage_periods` carries messages and connection-minutes,
+    // `usage_active_users` carries the third, and nothing carries a stored total.
+    [
+      "storedMessages",
+      stored[0] === undefined || Number(stored[0][0]) === 0 ? null : Number(stored[0][1]),
+      null,
+      null,
+      false,
+    ],
+  ];
+
+  return rows.map(([quantity, a, o, source, hasSource]) => {
+    const c: Comparison = { analytical: a, operational: o, hasOperationalSource: hasSource };
+    return {
+      environmentId,
+      period,
+      quantity,
+      analytical: a,
+      operational: o,
+      operationalSource: source,
+      differencePct: differencePct(c),
+      verdict: verdictFor(c),
+    };
+  });
+}
+
+/** FR-ANL-06's *"raises an alert"*, as the only thing this platform can currently mean by it.
+ *
+ * THE LINE THAT DECIDES WHETHER THE ALERT FIRES LIVED IN A FILE NOTHING TESTS.
+ * `scripts/reconcile-usage.mjs` closed with `process.exit(breached.length > 0 ? 1 : 0)` — one
+ * expression, no test, and the whole of FR-008's observable behaviour. Moved here so a test can
+ * ask it directly instead of a human reading output.
+ *
+ * `not-comparable` and `no-data` DO NOT RAISE. A quantity with no operational counterpart is a
+ * gap in the platform and a tenant with nothing on either side is a tenant with nothing; a job
+ * that exits 1 for either would exit 1 every day, and a check that always fires stops being
+ * read. The gap is the chapter's subject and not this exit code's. */
+export function exitCodeFor(rows: readonly ReconcileRow[]): 0 | 1 {
+  return rows.some((r) => r.verdict === "breach") ? 1 : 0;
+}
+```
+
+## Two rules the job did not expect
+
+The Postgres read went inline in `metering/reconcile.ts` first, and lint refused it:
+
+```text
+'drizzle-orm' import is restricted from being used. The query engine lives inside the
+repository layer only (constitution I, ADR-16)
+```
+
+`eslint.config.mjs` exempts `services/api/src/db/**` and nothing else. The plan had put the
+job in the api *because* the api owns the repository, and had not noticed the wall between
+them. The read moved to a new file — not a method on `Repository`, because that class is
+scoped to one tenant by construction and this read takes the tenant as an argument.
+
+```ts title="services/api/src/db/usage-reads.ts"
+import { sql } from "drizzle-orm";
+
+import type { Db } from "./client";
+
+// THE OPERATIONAL HALF OF FR-ANL-06's COMPARISON, AND IT LIVES HERE BECAUSE OF A LINT RULE
+// THAT IS A CONSTITUTION CLAUSE.
+//
+// `eslint.config.mjs` restricts `drizzle-orm` to `services/api/src/db/**` — *"the query engine
+// lives inside the repository layer only (constitution I, ADR-16)"*. Chapter 4.7's reconciler
+// was written in `services/api/src/metering/` with its Postgres read inline and failed lint on
+// the import, which is the rule doing exactly its job: the plan had placed the job in the api
+// *because* the api owns the repository, and never noticed the wall between them.
+//
+// A NEW FILE RATHER THAN A METHOD ON `Repository`. That class is tenant-scoped around
+// `this.environmentId` and this read takes the tenant as an argument; and `repository.ts`
+// carries 24 titled fences in English and 23 in Vietnamese, both already stale, so every edit
+// to it adds to a debt no gate reports. This file carries none.
+//
+// READ-ONLY. The reconciler compares and writes nothing.
+
+export interface OperationalUsage {
+  /** Absent when the tenant has no `usage_periods` row for the period at all — which is not
+   *  the same as a row holding zero, and the reconciler reports the two differently. */
+  messagesSent: number | null;
+  connectionMinutes: number | null;
+  /** A COUNT OF ROWS, not a stored total: `usage_active_users` is
+   *  `(environment_id, period, user_id, first_seen_at)`, one row per user per period. So this
+   *  is the only quantity whose comparison puts an EXACT count against `uniqMerge`'s
+   *  approximate sketch, which is where 047-1's 0.51% lives. */
+  activeUsers: number;
+}
+
+export async function operationalUsageFor(
+  db: Db,
+  environmentId: string,
+  period: string,
+): Promise<OperationalUsage> {
+  // BOTH STATEMENTS NAME THE ENVIRONMENT. `usage_periods` and `usage_active_users` both carry
+  // feature 030's sentinel guard, and the api's integration lane sets
+  // `RELAY_HARNESS_BAIT: "on"` — unlike the gateway's, which carries none. A scoped statement
+  // never reaches a sentinel row and never raises; an unscoped one does both.
+  const periods = await db.execute(sql`
+    select messages_sent, connection_minutes
+      from usage_periods
+     where environment_id = ${environmentId}::uuid and period = ${period}::date`);
+  const active = await db.execute(sql`
+    select count(*)::int as n
+      from usage_active_users
+     where environment_id = ${environmentId}::uuid and period = ${period}::date`);
+
+  const row = periods.rows[0] as
+    | { messages_sent: string | number; connection_minutes: string | number }
+    | undefined;
+  return {
+    messagesSent: row === undefined ? null : Number(row.messages_sent),
+    connectionMinutes: row === undefined ? null : Number(row.connection_minutes),
+    activeUsers: Number((active.rows[0] as { n: number } | undefined)?.n ?? 0),
+  };
+}
+```
+
+The second rule was a fact the last chapter used to delete code. Two of the first seven
+integration tests failed:
+
+```text
+expected 'breach' to be 'no-data'
+expected +0 to be null
+```
+
+**A bare aggregate with no `GROUP BY` always returns exactly one row.** Chapter 4.6 asked the
+server that and used the answer to delete an unreachable guard. Here the same fact runs the
+other way: an empty result set is not reachable, so a tenant holding nothing came back as
+`0`, and "holds nothing" and "holds zero" became the same answer in a report whose whole point
+is that they are not. `count()` is the first column of both reads now, and the count decides
+absence.
+
+The store's own behaviour is worth one test of its own, because the arm that is unreachable
+for an aggregate is perfectly reachable otherwise:
+
+```text
+SELECT 1 WHERE 0        ->  []          an empty result set
+SELECT sum(1) WHERE 0   ->  [["0"]]     one row, always
+```
+
+## The planted drift
+
+`docs/12` §2.3 split this milestone in two before the chapter started, for a reason worth
+restating: *"0.1% of a small number is an assertion that cannot fail for its own reason."* The
+lane's tenants are small. So the lane does not measure agreement — it plants a disagreement,
+checks the job raises, removes it, and checks the job goes quiet.
+
+```js title="scripts/reconcile-usage.mjs"
+#!/usr/bin/env node
+// FR-ANL-06's daily job, as a thin caller. The comparison lives in
+// `services/api/src/metering/reconcile.ts`; this constructs the two handles and prints.
+//
+// ONE TENANT PER INVOCATION, because the function takes one. A sweep is a loop here, and it
+// would have to know two things a single call cannot meet: the analytical store holds
+// environment ids that exist in no Postgres row (four today, all test fixtures, because a
+// stream carries no foreign key), and `usage_periods` holds a `1999-01-01` period belonging
+// to `__sentinel__` applications planted by the lane's own guard.
+//
+// EXIT NON-ZERO ON ANY BREACH. That is the whole of what "raises an alert" can mean here:
+// this platform has no alerting integration, and the one notification path that exists is
+// `quotas/quota-email.ts`, whose failure mode is already visible in the lane as
+// `quotas.unaddressable: no member has an email address`. A notification with no recipient is
+// not an alert, and an exit code is not one either — the chapter says what a real one costs.
+import { createDb, createPool } from "../services/api/dist/db/client.js";
+import { createAnalyticalStore } from "../services/api/dist/metering/clickhouse.js";
+import { exitCodeFor, reconcile } from "../services/api/dist/metering/reconcile.js";
+
+function arg(name) {
+  const i = process.argv.indexOf(`--${name}`);
+  if (i === -1 || !process.argv[i + 1]) {
+    throw new Error(`--${name} is required`);
+  }
+  return process.argv[i + 1];
+}
+
+const environmentId = arg("environment");
+const period = arg("period");
+
+const db = createDb(createPool());
+const store = createAnalyticalStore();
+
+const rows = await reconcile(db, store, { environmentId, period });
+
+for (const r of rows) {
+  const pct = r.differencePct === null ? "     —" : `${(r.differencePct * 100).toFixed(4)}%`;
+  const a = r.analytical === null ? "absent" : String(r.analytical);
+  const o = r.operational === null ? "absent" : String(r.operational);
+  console.log(
+    `${r.quantity.padEnd(18)} analytical ${a.padStart(10)}  operational ${o.padStart(10)}` +
+      `  ${pct.padStart(9)}  ${r.verdict}` +
+      (r.operationalSource ? `  (${r.operationalSource})` : ""),
+  );
+}
+
+const breached = rows.filter((r) => r.verdict === "breach");
+if (breached.length > 0) {
+  console.error(
+    `reconcile: ${breached.length} breach(es) for ${environmentId} in ${period}: ` +
+      breached.map((r) => r.quantity).join(", "),
+  );
+}
+await db.$client.end?.();
+// THE VERDICT-TO-EXIT-CODE RULE IS NOT DECIDED HERE. It was, in one expression this lane never
+// ran; `exitCodeFor` is the same rule where a test can reach it.
+process.exit(exitCodeFor(rows));
+```
+
+Against a real environment, both halves:
+
+```text
+analytical  99,000 vs operational 100,000   connectionMinutes  1.0000%  breach   exit 1
+analytical 100,000 vs operational 100,000   connectionMinutes  0.0000%  pass     exit 0
+```
+
+The quantity is connection-minutes because it is the only one the repository can plant.
+`usage_periods.messages_sent` increments one at a time inside the transaction that writes a
+message, so an operational total of 100,000 messages costs 100,000 sends.
+`creditConnectionMinutes` takes the number as an argument — the gateway reports a total rather
+than a tick — so the same figure costs one call.
+
+<Trap title="Both obvious ways to plant a 0.1% drift pass">
+
+The difference is divided by `max(analytical, operational)`, which makes the threshold
+asymmetric in percent. Against an operational 100,000:
+
+```text
+analytical    difference       pct      verdict
+    99,900          -100   0.100000%    pass      "0.1% under"
+    99,899          -101   0.101000%    breach
+   100,100          +100   0.099900%    pass      "0.1% over"
+   100,101          +101   0.100898%    breach
+```
+
+Plant `operational * 1.001` to make the job fire and you get a pass, because the larger side
+is now the denominator. Plant `operational * 0.999` and you get a pass too, because the clause
+says *within* 0.1% and the comparison is `&le;`. **The smallest breaching drift is 101 in both
+directions**, and a drift chosen off the smaller side lands inside the threshold.
+
+Changing that `&le;` to `&lt;` turns exactly one test red, which is how you know the boundary
+cases sit on the bound rather than near it.
+
+</Trap>
+
+And the threshold only behaves like a threshold at volume. Walking the drift up one unit at a
+time against the real job, on 50 real lane environments:
+
+```text
+tenant volume   smallest breaching shortfall    that drift, as a %
+            9                              1            11.111111%
+          100                              1             1.000000%
+        1,000                              2             0.200000%
+       10,000                             11             0.110000%
+      100,000                            101             0.101000%
+```
+
+At the lane's real scale a tenant holds nine connection-minutes, and the smallest drift
+possible there is 11.11% — a hundred times the bound. Every drift breaches; none can sit
+inside the tolerance. A green 0.1% assertion at that size is a claim that nothing drifted at
+all, which is a different and much weaker claim than the one the clause makes.
+
+## Where the bound cannot hold, and why that is not a defect
+
+Three of the four quantities cannot meet 0.1%, and the job has to say so rather than publish a
+number that implies otherwise.
+
+<Figure caption="Three obstacles, one planted drift, and no averaging between them" code={figWhereTheBoundCannotHold} />
+
+**Unique active users.** `uniq` is a sketch. Asked directly, with no corpus — the error is a
+property of the sketch at a cardinality and nothing else:
+
+```text
+cardinality       uniq    uniqExact      error
+     65,000      65,000      65,000     0.0000%
+     65,536      65,536      65,536     0.0000%
+     65,537      65,909      65,537     0.5676%
+     70,000      70,449      70,000     0.6414%
+```
+
+The cliff is at 2^16 and it is **one distinct value wide**. One user past 65,536 and the error
+is 5.7 times the bound it has to sit under. `uniqMerge` over the rollup's aggregate state
+returns `uniq`'s figure at every point, so the rollup inherits the error rather than smoothing
+it. Chapter 4.2 filed this as "exact to about 65,000, off by 0.51% at 70,000" and loaded a
+corpus to find it; six cardinalities returning exactly zero is what makes the seventh a
+measurement rather than a reading.
+
+**The retention boundary.** The raw table's TTL cuts at a timestamp and a daily rollup's
+finest grain is a day, so the oldest day in any window is counted whole by the rollup and
+partly deleted from the source. Chapter 4.2 published 0.49% for this. It is not a number, it
+is a curve: a probe table with the same 90-day TTL lost its oldest day whole and **53 of the
+next day's 1,000** — exactly the rows lying before the server's wall clock, which read
+01:16:07 against 86-second row spacing. So the discrepancy is 0.0583% at that hour, **zero
+just after midnight, and 1.0989% just before the next one, on the same data.** 4.2's figure is
+one point on that curve, a run at about 10:48.
+
+The probe's control is worth keeping: straight after the insert all 92 days were present and
+nothing had been deleted. **The TTL is a schedule, not an event.**
+
+**Connection-minutes.** The meter bills every calendar minute during any part of which a
+connection was open — the unit chapter 4.6 settled. The analytical records bill only
+connections that closed, and **44 of 99 connections in the store hold an open and no close**,
+because `wss.close()` does not close established sockets. Chapter 4.5 measured that and
+decided it is correct: a mass disconnect on shutdown is worse than an unbalanced ledger. So
+this is a clause that cannot be met rather than a defect to fix, and the distinction matters
+enough to keep: one of these gets fixed by writing code, and three of them get fixed by
+amending a requirement.
+
+SRS revision 1.14 does that. FR-ANL-06 now states which operational table it means per
+quantity, that the comparison is per tenant, that absence has verdicts of its own, and where
+its own bound is unreachable.
+
+## The fence the auditor has to cross
+
+Constitution III: *"Analytical queries MUST NEVER execute against the operational database
+(PostgreSQL); billing, metering, and dashboard analytics read only from the analytical store
+(ClickHouse), fed via a durable queue."*
+
+FR-ANL-06 requires comparing the analytical store against PostgreSQL. Read literally, the two
+clauses cannot both hold, and the reconciler is the first component in this platform to read
+both stores — which is what this chapter's one line of configuration says out loud:
+
+```diff title="compose.yaml"
+@@ -144,12 +144,21 @@ services:
+       # Development values. Both are secrets in anything that is not a laptop,
+       # and the api refuses to start in production without the first.
+       RELAY_WEBHOOK_SECRET_KEY: ${RELAY_WEBHOOK_SECRET_KEY:-}
+       RELAY_INTERNAL_CREDENTIAL: ${RELAY_INTERNAL_CREDENTIAL:-rk_svc_local_development_credential_0000}
+       # The api verifies both service credentials, so it holds both.
+       RELAY_INTERNAL_CREDENTIAL_GATEWAY: ${RELAY_INTERNAL_CREDENTIAL_GATEWAY:-rk_svc_local_development_gateway_00000}
++      # Chapter 4.7. THE FIRST OPERATIONAL SERVICE TO READ THE ANALYTICAL STORE, and that
++      # is the subject rather than the plumbing: constitution III says billing, metering and
++      # dashboard analytics read only from ClickHouse, and FR-ANL-06 requires comparing them
++      # against Postgres. The reconciler is none of those three roles — it audits the
++      # boundary, and an auditor confined to one side of a fence cannot check the fence.
++      RELAY_CLICKHOUSE_HOST: clickhouse
++      RELAY_CLICKHOUSE_HTTP_PORT: "8123"
++      RELAY_CLICKHOUSE_USER: relay
++      RELAY_CLICKHOUSE_PASSWORD: relay
+       PORT: "4000"
+     ports:
+       - "${RELAY_API_PORT:-4000}:4000"
+     depends_on:
+       postgres: { condition: service_healthy }
+       nats: { condition: service_healthy }
+```
+
+The reading that makes both true is that **the reconciler is none of the three roles the
+clause names.** It is not billing, not metering and not a dashboard. It is an auditor, and an
+auditor confined to one side of a fence cannot check the fence.
+
+That reading was not written down anywhere. It is now — in SRS revision 1.14, and in the
+architecture's data view — but the amendment belongs to the constitution, which is the only
+document that can ratify it. Constitution VII requires a conflict *"resolved explicitly by
+amendment rather than silent divergence"*, and this is the second one in this family after the
+last chapter's.
+
+<Why title="The architecture had already assumed the answer">
+
+ADR-06 chose NATS over Kafka. Its accepted trade-off paragraph reads: *"weaker ecosystem for
+exactly-once sinks; mitigated because the only strict consumer (metering) reconciles daily
+against Postgres (FR-ANL-06)."*
+
+So the cross-store read is not an oversight that crept in with this chapter. **It is the
+mitigation that makes choosing NATS acceptable** — remove it and the ADR loses its argument
+against Kafka. The conflict has been written into an accepted decision since that document was
+drafted, and five features cited both documents without reading them beside each other.
+
+</Why>
+
+## What "raises an alert" can currently mean
+
+Nothing in these three repositories sends an alert. The job exits non-zero, and the line that
+decides it is now a function a test can call rather than an expression in a script nothing
+runs:
+
+```text
+exitCodeFor([... "pass", "breach" ...])                 -> 1
+exitCodeFor([... "not-comparable", "no-data" ...])      -> 0
+```
+
+The second case is the one worth arguing about. Every real tenant in this platform is
+currently in one of those two states, so a job that exits 1 for them exits 1 every day, and a
+check that always fires stops being read. The gap is the chapter's subject, not the exit
+code's.
+
+What exists instead of alerting is two mail paths — a quota crossing and a disabled webhook
+endpoint — sharing one transport whose default is `smtp://localhost:1025`, the development
+catcher. Their own failure mode is already in the lane as *no member has an email address*. A
+notification with no recipient is not an alert, and neither is an exit code. A real one needs
+a delivery target that is not a person's inbox, a deduplication key so a daily job breaching
+for thirty days sends one alert rather than thirty, and a severity that tells 0.2% from 100%.
+The platform has none of the three.
+
+<ForwardRef>
+The milestone at the end of this movement is where the planted drift becomes a gate that runs
+every time, and where the 0.1% figure is measured once at a volume that makes it mean
+something. This chapter built the instrument and found out what it is allowed to say; the
+milestone is where it has to keep saying it.
+</ForwardRef>
+
+<SkipAhead tag="part4-ch7" />
+
+<ChapterFooter id="4.7" />
