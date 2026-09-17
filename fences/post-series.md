@@ -33,6 +33,15 @@ this amendment should fold into it and disappear from here.
 config lives at the workspace root, and pnpm's isolated `node_modules` will not
 resolve a package's devDependency from above it.
 
+**And `test:integration` points at a script rather than at turbo, which chapter 4.9
+explains and cannot publish.** The flags it used to carry —
+`--concurrency=1 --filter=!@relay/outsider` — live inside
+`scripts/integration-gate.mjs` now, beside `--continue` and the suite count the gate
+reports. **This line is published here and nowhere else in the series**, and the
+appendix applies after every chapter, so a chapter hunk for it would be anchored on a
+pre-appendix state and then silently overwritten. A file can be free on the HEAD half
+of the fence checker and expensive on the APPLY half; this is the APPLY half.
+
 ```diff title="package.json"
 @@ -9,23 +9,27 @@
    "scripts": {
@@ -42,7 +51,7 @@ resolve a package's devDependency from above it.
      "typecheck": "turbo run typecheck",
      "test": "turbo run test",
 -    "test:integration": "turbo run test:integration --concurrency=1",
-+    "test:integration": "turbo run test:integration --concurrency=1 --filter=!@relay/outsider",
++    "test:integration": "node scripts/integration-gate.mjs",
 +    "test:outsider": "turbo run test:integration --filter=@relay/outsider",
 +    "coverage": "vitest run --config vitest.coverage.config.mts --coverage",
      "build": "turbo run build"
@@ -3258,3 +3267,26 @@ for two more features. Repaired here, and said out loud, because **a comment a c
 outlives the thing it describes** — which is the whole reason this file needed a test rather than a
 note.
 </Why>
+
+
+---
+
+## The platform credentials, in the lane that measures coverage (chapter 4.9)
+
+Chapter 4.9 configures `RELAY_INTERNAL_CREDENTIAL` and `RELAY_INTERNAL_CREDENTIAL_GATEWAY` in
+`services/api/vitest.integration.config.mts`, and publishes that hunk itself. **The coverage lane
+needs the same two variables and this appendix cannot publish them**, which is worth stating
+rather than leaving as an absence.
+
+`vitest.coverage.config.mts` has diverged from the chain since before Part 4 (`gaps.md` 048-3).
+The divergence is not cosmetic: **the chain's state for this file has no `env` block at all**,
+because the appendix hunk that would add it is itself one of the fourteen that no longer apply.
+So there is no anchor for a hunk adding two lines to that block, and a hunk that recreated the
+block would be a whole-file rewrite — the 111-to-203 trap feature 045 measured.
+
+The edit is in the repository and is described here in words:
+`RELAY_INTERNAL_CREDENTIAL: "rk_svc_local_development_credential_0000"` and
+`RELAY_INTERNAL_CREDENTIAL_GATEWAY: "rk_svc_local_development_gateway_00000"` join the four relay
+flags in that config's `env` block, for the reason chapter 4.9 gives about the other config: without
+them `pnpm coverage` fails `limits.itest.ts` and silently skips three cross-tenant attacks, in the
+run that measures constitution VI's own coverage bar.

@@ -882,6 +882,16 @@ export const series: Part[] = [
         sourceDoc: "docs/04-srs.md, docs/05-sad.md, docs/06-adr-deep-dives.md",
         readerMinutes: 60,
       },
+      {
+        id: "4.9",
+        path: "/part-4/chapter-09/milestone-the-meter-agrees",
+        title: "Milestone: the meter agrees",
+        status: "published",
+        readerProduces:
+          "An integration gate whose colour can change — 54 of 54 suites executing and reported, where a planted drift used to deepen a run that had been red since chapter 4.4 rather than turn it — and FR-ANL-06's agreement measured at 121,057 messages in one tenant-period, the first volume in this project where 0.1% is a threshold a whole number can sit either side of. Plus what the clause still lacks: no daily job runs anywhere, and the alert has no mechanism",
+        sourceDoc: "docs/04-srs.md, docs/05-sad.md, docs/06-adr-deep-dives.md, docs/13-metering-measurement-2026-09-17.md",
+        readerMinutes: 50,
+      },
     ],
   },
   {

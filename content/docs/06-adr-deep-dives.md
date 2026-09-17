@@ -1901,3 +1901,214 @@ it; or removing the surface and with it FR-DSH-03.
 
 **Not a reversal:** the store being slow. A page that takes a second and a half inside the
 deadline is the trade this record accepts, and the deadline is what bounds it.
+
+---
+
+## ADR-27 — The integration gate reports which suites ran, and every lane runs
+
+### Problem
+
+`docs/12` §2.3 asks movement IV to close with *"a CI gate that catches a planted drift on every
+run"*. The planted-drift suite was written at chapter 4.7 and the gate around it does not carry
+the signal that sentence assumes.
+
+Three separate facts, each measured at this feature's phase 1:
+
+**The gate was red, and had been on every run since chapter 4.4.** Six suites failed: five in
+`request-log.itest.ts`, which polls for a row only the ingester can write while `compose.yaml`
+ships no ingester (`gaps.md` 050-8), and one in `limits.itest.ts`, which asserts the lane has a
+platform credential configured and nothing configures one. A planted drift makes the run red;
+the run was already red. **The signal was not absent, it was indistinguishable.**
+
+**A run stopped at the first failure.** `--concurrency=1` means turbo stops scheduling when a
+task fails, so the gateway's 12 suites, the e2e journey, the ingester, the dispatcher and the
+harness went unexecuted whenever the api lane failed — which was every run.
+
+**And the line the gate printed counts tasks.** `Tasks: 8 successful, 10 total` for a run that
+planned 18: nine builds, nine test tasks, three of which are packages with no
+`test:integration` script and complete as successful no-ops. Worse, the total is not
+reproducible — three chapters' close-out runs against the same tree printed `7 of 9`, `8 of 10`
+and `7 of 11`, because which tasks were already in flight when the first failure arrived decides
+it. **A requirement cannot be written against a number that changes when nothing does.**
+
+### Options
+
+**A. Report suites, run every lane.** A small script in front of turbo: derive the suite count
+from the tree, pass `--continue`, parse each lane's own vitest summary, and refuse a run where a
+lane reported nothing or fewer suites ran than exist.
+
+**B. Raise `--concurrency`.** Lanes in parallel would also reach every lane. Feature 045
+measured the cost: the api lane's knee is two workers and the gateway's is four, against one
+PostgreSQL — raising turbo's concurrency stacks whole lanes on top of that.
+
+**C. Exclude the failing suites.** `package.json` already carries `--filter=!@relay/outsider`,
+so the shape has a precedent.
+
+**D. Leave it, and read the failures by eye.** What four chapters did.
+
+### What was measured
+
+**C cannot do the job, and the precedent is what misled three analysis passes.** `--filter`
+selects **packages**. `@relay/outsider` is its own package; the five red suites sit inside
+`@relay/api` **beside `reconcile.itest.ts` — the suite this gate exists to reach**. No filter
+expression keeps one and drops the other. Separating them needs a vitest `exclude`, a second
+config, or moving the file, each of which changes what `pnpm --filter @relay/api
+test:integration` means for everyone who runs it.
+
+**The ingester did not need a compose service, and the obvious fix would have been worse.**
+`services/ingester` has **no Dockerfile**, so it is a new image rather than a service
+definition; and `api`, `gateway` and `dispatcher` all carry `profiles: ["services"]`, so
+`docker compose up -d` starts the stores and nothing else. An ingester added beside them would
+not be running when the lane runs, and one added to the default profile would drain the
+analytics stream on every developer's machine for as long as the stack is up — changing the
+opening state of every analytical suite in the repository. **The suite spawns the process it
+needs and kills it afterwards**, which `consumer.itest.ts` and `outbox.itest.ts` already do for
+a Node child. Measured on the first run: the ingester drained 8 batches and **1,038 records**,
+which is the backlog the stream had been holding because nothing had ever consumed it; the
+second run drained 12.
+
+**One unset environment variable was costing more than the test that reported it.**
+`limits.itest.ts` fails loudly without `RELAY_INTERNAL_CREDENTIAL`. Three attacks in
+`isolation/gauntlet.itest.ts` — the suite constitution VI names as gating releases — read
+`if (dispatcher === undefined) return;` and **reported green without running**. The suite's own
+accounting test cannot catch it, because `attacked.add(...)` happens before the early return, so
+the check that exists to find unattacked routes is satisfied by the route that was skipped. Run
+with and without the variable, the same three green ticks:
+
+    expand reaches only the endpoints of the environment it names   1ms → 27ms
+    expand naming an environment that exists nowhere                0ms →  6ms
+    a connection billed to one environment cannot be re-billed      1ms → 33ms
+
+**And the gateway lane held a test that had never delivered the frame it published.**
+`typing.itest.ts`'s four-kind test publishes a presence payload of five fields;
+`presenceFabricSchema` is a `z.strictObject` of three, so `safeParse` fails and
+`presence.ts:284` logs `presence.invalid_payload`. The assertion passed anyway, at whatever rate
+the previous run's Redis key had expired — the gateway publishes a presence transition of its
+own when a connection opens, elected across instances by `SET … NX`, and **that** is the frame
+the test was counting. Alone it was 0 of 3 green. It also carried `await settle(400)` before
+publishing, a bet that four Redis SUBSCRIBEs finish in 400 ms; `PUBSUB NUMSUB` answers the same
+question as a condition. Both fixed, 23 of 23 three times, and the file got **10 seconds
+faster** because a test was no longer burning its arrival deadline.
+
+### Decision
+
+**A.** `pnpm test:integration` runs `scripts/integration-gate.mjs`, which derives the lane list
+and suite count from the tree, runs turbo with `--continue`, and prints what ran against what
+exists. It exits non-zero on three conditions: a lane failed, a lane reported no summary at all,
+or fewer suites executed than the tree holds.
+
+The six reds are resolved rather than excluded: the credential is configured in the lane's own
+config beside feature 030's relay flags, and the request-log suite starts its own ingester.
+
+### Consequences
+
+The gate is green on a clean tree for the first time since chapter 4.4, so a planted drift is
+now a **change** of colour rather than a continuation of one. Every lane runs on every push,
+which costs the wall-clock time of the lanes that used to be skipped.
+
+The suite count is a number a requirement can name, and it is checked in both directions: a lane
+that silently stops reporting fails the gate as loudly as a lane that fails.
+
+**What this does not fix is one level up.** `ci.yml`'s tutorial job ends with `pnpm
+check:fences`, which exits 1 at the standing 110 problems and has on every push since feature
+045. The workflow is red whatever this gate says. Nothing is stranded behind it — it is the last
+step of its job — but the workflow's own colour has not been a signal for nine chapters, and
+this ADR does not change that. **A milestone about a gate that cannot fail for its own reason
+should not stand inside one without saying so**: the series owns that decision, the options are
+a recorded baseline the checker compares against, `continue-on-error` with the count published,
+or a job of its own, and this chapter records the fact rather than choosing for the series.
+
+### Reversal condition
+
+If the lanes' combined wall-clock time under `--continue` becomes the reason people stop running
+the gate locally, split it: the api and gateway lanes on every push, the rest nightly. The
+suite-count report survives that split unchanged, because it reads the tree rather than the
+schedule.
+
+If vitest's summary line changes shape, the parser refuses the run rather than reporting a
+smaller number — that is deliberate, and the fix is the parser rather than the gate.
+
+---
+
+## ADR-28 — FR-ANL-06's daily job has no runner, and that is recorded rather than built
+
+### Problem
+
+Constitution III's fourth bullet: *"Metered totals MUST reconcile against operational counts to
+within 0.1%, **verified by a daily job that alerts on breach**."* SRS FR-ANL-06 says the same in
+its own words.
+
+**That sentence is three requirements and the platform has one.** The comparison exists —
+chapter 4.7 built it, and `scripts/reconcile-usage.mjs` runs it for one tenant and one period.
+The alert has no mechanism, recorded at SRS revision 1.14: the job exits non-zero, and the two
+mail paths share a transport that defaults to a local catcher. And **the daily job has no runner
+of any kind**, which nothing had written down until this feature looked:
+
+    reconcile-usage in relay-platform/package.json     0 occurrences
+                       relay-platform/turbo.json        0
+                       .github/workflows/ci.yml         0
+                       relay-tutorial/package.json      0
+                       any *.sh in either repository    0
+    ci.yml triggers    push, pull_request — no `schedule:`
+
+Five corpora, named because a zero from a grep is a claim about the corpus only if the corpus is
+named. Meanwhile the platform runs five background loops — `RELAY_OUTBOX_RELAY`,
+`RELAY_DELIVERY_RELAY`, `RELAY_QUOTA_RELAY`, `RELAY_NOTIFICATION_RELAY`,
+`RELAY_EVENT_CONSUMER` — so the pattern for recurring work exists and the reconciler is the one
+recurring job built as a script somebody runs by hand.
+
+### Options
+
+**A. A sixth background relay.** `RELAY_RECONCILE_RELAY`, beside the five the api already
+starts, sweeping tenants on a daily tick.
+
+**B. A `schedule:` trigger in `ci.yml`.** A cron in the workflow that runs the script against a
+deployment.
+
+**C. Record the absence, and state what the lane's gate actually verifies.**
+
+### What was measured
+
+**A's cost is already on the record, from the feature that measured the other five.** Feature
+030 found that nine suites booting `AppModule` in process started four background loops that
+swept the whole database while every other suite's fixtures sat in it — and a relay catches and
+logs its own errors, so the damage was a log line and a green lane. Every analytical suite would
+gain another flag to set. That is the price of a sixth loop, and it buys a daily sweep of every
+tenant on a platform where **every tenant is one-sided**: 2,440 `usage_periods` rows over 2,330
+environments, 7 `daily_usage_billing` rows over 4 environment ids, and **zero environments in
+both**. A daily job over today's data would report `no-data` for every tenant, every day.
+
+**B needs a deployment to run against**, and `ci.yml` has none: its three jobs build and test a
+checkout. A scheduled workflow would reconcile a corpus it had just built, which is what the
+lane already does per push.
+
+**And the gate is not the clause's "daily", which `docs/12` §2.3 substituted without saying
+so.** §2.3 offered *"the lane, every run"* in place of *"daily"*. A per-push check on a planted
+fixture runs **more often** than daily and **reads no real tenant** — it is a different claim,
+not a more frequent one. The planted-drift suite verifies that the comparison detects a drift;
+only a scheduled job against real data verifies that no drift exists.
+
+### Decision
+
+**C.** The schedule is recorded as absent, and the milestone's claims are scoped to what runs:
+the arithmetic is verified by the planted-drift suite on every push (FR-ANL-06's verification
+letter is `T`), and the 0.1% figure is published once, at a volume where 0.1% resolves, in
+`docs/13`.
+
+The constitution amendment this feature proposes decomposes the sentence, so that which of the
+three parts the platform has is a matter of record rather than of inference.
+
+### Consequences
+
+The clause is not discharged, and the platform says so in the two documents that govern it
+rather than letting a per-push fixture check stand in for a daily reconciliation of real
+tenants. **A milestone that claimed otherwise would be claiming the weaker of two different
+things.**
+
+### Reversal condition
+
+Build A the first time a tenant exists with both sides of the comparison populated by the
+platform itself rather than by a harness — that is, once the analytical path has a producer
+writing `message_events` in normal operation. Until then a daily sweep would report `no-data`
+for every tenant on the platform, and **a check that always fires stops being read** is the same
+argument in the other direction.

@@ -1834,6 +1834,60 @@ trade this record accepts.
 Full argument, the three rejected options and the measurements: ADR-26 in
 `06-adr-deep-dives.md`.
 
+### ADR-27 — The integration gate reports which suites ran, and every lane runs
+**Status:** accepted (2026-09-17) · **Drivers:** D8 · discharges constitution VI's gating clause ·
+supports FR-ANL-06's verification method (`T`)
+
+`pnpm test:integration` has been red on every run since chapter 4.4 and stopped scheduling at the
+first failure, so the gateway's twelve suites, the e2e journey, the ingester, the dispatcher and
+the harness went unexecuted — and **a planted drift in the reconciler could not change the gate's
+colour, because the gate was already that colour.** The line it printed counts turbo tasks, not
+suites: eighteen planned is nine builds and nine test tasks, three of which are packages with no
+integration script, and the total does not reproduce run to run (`7 of 9`, `8 of 10`, `7 of 11`
+across three chapters against the same tree).
+
+The gate now runs `scripts/integration-gate.mjs`: the lane list and suite count come from the
+tree, turbo runs with `--continue`, and each lane's own vitest summary is read back. It exits
+non-zero when a lane fails, when a lane reports no summary at all, or when fewer suites execute
+than the tree holds.
+
+The six failures are resolved rather than excluded, and **`--filter` could not have excluded
+them anyway** — it selects packages, and the five `request-log.itest.ts` reds sit inside
+`@relay/api` beside the reconciler's own suite. The lane configures the two platform credentials
+(which also turned on three isolation-gauntlet attacks that had been returning at their first
+line and reporting green), and `request-log.itest.ts` spawns the ingester it needs rather than
+the stack running one forever.
+
+**One level up is not fixed and is not claimed.** `ci.yml`'s tutorial job ends with
+`pnpm check:fences`, which exits 1 at the standing 110 problems on every push since feature 045.
+That decision belongs to the series and is recorded, not taken here.
+
+Full argument, the four rejected options and the measurements: ADR-27 in `06-adr-deep-dives.md`.
+
+### ADR-28 — FR-ANL-06's daily job has no runner, and that is recorded rather than built
+**Status:** accepted (2026-09-17) · **Drivers:** D5 · constrained by constitution III · amends
+nothing in FR-ANL-06's bound
+
+*"…within 0.1%, verified by a **daily job** that **alerts on breach**"* is three requirements.
+The comparison exists (chapter 4.7). The alert has no mechanism (SRS 1.14). And **the daily job
+has no runner at all** — zero occurrences of `reconcile-usage` in either repository's
+`package.json`, in `turbo.json`, in `ci.yml` or in any shell script, and `ci.yml` triggers on
+`push` and `pull_request` with no `schedule:`. The platform runs five background relays, so the
+pattern exists; this is the one recurring job built as a hand-run script.
+
+A sixth relay was costed rather than dismissed: feature 030 measured what the other five do to a
+test lane, and every analytical suite would gain another flag. What it would buy today is a
+daily sweep reporting `no-data` for every tenant, because **no environment in this platform has
+both sides of the comparison** — 2,440 `usage_periods` rows over 2,330 environments, 7 rollup
+rows over 4 environment ids, zero in both.
+
+So the absence is recorded and the milestone's claims are scoped to what runs. **`docs/12` §2.3
+substituted *"the lane, every run"* for *"daily"* without naming the substitution**, and a
+per-push check on a planted fixture runs more often than daily while reading no real tenant —
+a different claim rather than a stronger one.
+
+Full argument, the three options and the measurements: ADR-28 in `06-adr-deep-dives.md`.
+
 ## 10. Risks and technical debt register
 
 | # | Risk / debt | Exposure | Mitigation / trigger |

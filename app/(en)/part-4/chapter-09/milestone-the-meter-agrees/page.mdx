@@ -1,0 +1,859 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import {
+  figTheSignalWasIndistinguishable,
+  figWhatZeroPointOnePercentCanExpress,
+  figThreeObligationsOneMechanism,
+} from "./figures";
+
+export const metadata = {
+  title: "Milestone: the meter agrees — Building Relay",
+  description:
+    "The milestone makes two claims: a planted drift fails the build, and the 0.1% figure is measured once at a volume where 0.1% means something. Neither was true, and the reason for the first one was not the reason five documents gave.",
+  alternates: {
+    canonical: "/part-4/chapter-09/milestone-the-meter-agrees",
+    languages: {
+      en: "/part-4/chapter-09/milestone-the-meter-agrees",
+      vi: "/vi/part-4/chapter-09/milestone-the-meter-agrees",
+    },
+  },
+};
+
+<ChapterHeader id="4.9" />
+
+Movement IV closes on a milestone with two claims. A planted drift fails the build, every run.
+And the 0.1% agreement FR-ANL-06 asks for is measured once, at a volume where 0.1% is a real
+threshold rather than a rounding of nothing.
+
+Eight chapters built the parts. Chapter 4.2 built the store, 4.4 and 4.5 built the producers,
+4.6 built the rollup billing reads, 4.7 built the comparison and the test that plants a drift
+into it. This chapter assembles them and finds that **neither claim was true**, and that the
+reason for the first one is not the reason this project had written down five times.
+
+## The suite ran. The gate could not say so
+
+Every artifact in this feature — the structure document, the spec, the plan, the research notes,
+the task list — carried one sentence: *the planted-drift test has existed since chapter 4.7 and
+the gate has never reached it.* Fifteen analysis passes read that sentence and none of them ran
+the lane.
+
+The lane runs it. `reconcile.itest.ts` is one of the api's 33 integration suites, vitest runs
+every file it collects, and the suite passes in 4.5 seconds — sixteen tests, including the two
+that plant a drift at the bound and one unit past it.
+
+What was true is worse. `pnpm test:integration` had been **red on every run since chapter 4.4**,
+for six failures that have nothing to do with metering: five in `request-log.itest.ts`, which
+polls ClickHouse for a row only the ingester can write while `compose.yaml` ships no ingester,
+and one in `limits.itest.ts`, which asserts the lane has a platform credential configured and
+nothing configures one.
+
+So a planted drift did make the run red. The run was already red.
+
+<Figure
+  code={figTheSignalWasIndistinguishable}
+  caption="The signal was not absent — it was indistinguishable. A gate that is always red carries no information about what a change did to it, and --concurrency=1 meant 21 suites in five other lanes had not executed since chapter 4.4."
+/>
+
+That distinction is the whole chapter. *Absent* is a thing you notice: somebody goes to look for
+the test and it is not there. *Indistinguishable* is a green tick's opposite twin — the check
+runs, the check works, the check reports, and nothing downstream can tell its report apart from
+the noise it arrives in.
+
+<Trap>
+**The line four chapters read as a lane count.** `Tasks: 8 successful, 10 total` looks like a
+count of test lanes and is not one. Eighteen tasks planned is **nine builds and nine test
+tasks**, three of which — `@relay/config`, `@relay/protocol`, `@relay/service-kit` — have no
+`test:integration` script at all and complete as successful no-ops. And the total does not
+reproduce: three chapters' close-out runs against the same tree printed `7 of 9`, `8 of 10` and
+`7 of 11`, because `--concurrency=1` stops *scheduling* at the first failure and which tasks
+were already in flight decides the rest. **A requirement cannot be written against a number that
+changes when nothing does.**
+</Trap>
+
+## One unset variable, and the half that reported was the cheap half
+
+`limits.itest.ts` fails with a sentence somebody wrote for exactly this moment: *"the lane must
+configure a platform credential: expected undefined to be truthy"*. `RELAY_INTERNAL_CREDENTIAL`
+is set in `compose.yaml` for the containers and nowhere for the lane, which boots the api in
+process.
+
+That is the half that reports. The half that does not is in `isolation/gauntlet.itest.ts` — the
+cross-tenant suite constitution VI names as gating releases — where three attacks on the platform
+routes open like this — the excerpt is from `gauntlet.itest.ts` and is deliberately untitled,
+because in this series a titled fence is a claim about a whole file:
+
+```ts
+    it("expand reaches only the endpoints of the environment it names", async () => {
+      attacked.add("POST /internal/dispatch/expand");
+      if (dispatcher === undefined) return; // not configured in this lane
+```
+
+They return at the first line and report a green tick. And the suite's own accounting test — *"ran
+an attack for every route the classification says to attack"*, written to catch exactly this hole
+one level up — cannot see it, because `attacked.add(...)` happens **before** the early return. The
+check that exists to find unattacked routes is satisfied by the route that was skipped.
+
+Run with and without the variable, the same three ticks:
+
+```
+expand reaches only the endpoints of the environment it names     1ms  →  27ms
+expand naming an environment that exists nowhere creates nothing  0ms  →   6ms
+a connection billed to one environment cannot be re-billed        1ms  →  33ms
+```
+
+**Zero milliseconds is what a skipped attack looks like in a green suite.** The only instrument
+that separated the two was the duration column, and nothing reads that.
+
+<Why>
+**The credential goes in the lane's config, not in each suite.** Feature 030 made the same call
+about the four background relays and wrote the reason down: a convention nobody applies is not a
+property of the lane. Two configs run `.itest.ts` files here — `services/api/vitest.integration.config.mts`
+and `vitest.coverage.config.mts` — and the first version of this fix went into one of them. `pnpm
+coverage` stayed red on `limits.itest.ts` and kept the gauntlet quietly skipped, **in the run that
+measures constitution VI's own coverage bar**, until eight minutes of a coverage run said so. An
+amendment that fixes one file and leaves its twin standing is the defect rather than the file; the
+SRS recorded that shape about two of its own clauses three weeks earlier.
+</Why>
+
+```diff title="services/api/vitest.integration.config.mts"
+@@ -31,12 +31,37 @@ export default defineConfig({
+     env: {
+       RELAY_HARNESS_BAIT: "on",
+       RELAY_OUTBOX_RELAY: "off",
+       RELAY_EVENT_CONSUMER: "off",
+       // The quota relay, the fourth. Same reason as the other three.
+       RELAY_QUOTA_RELAY: "off",
++      // THE TWO PLATFORM CREDENTIALS, AND ONE MISSING VARIABLE WAS COSTING MORE THAN THE
++      // TEST THAT SAID SO (chapter 4.9).
++      //
++      // `limits.itest.ts` fails loudly without them — *"the lane must configure a platform
++      // credential: expected undefined to be truthy"* — and has since before Part 4. That is
++      // the visible half. The expensive half is `isolation/gauntlet.itest.ts`, where three
++      // attacks on the platform routes read `if (dispatcher === undefined) return;` and
++      // **report green without running**. The suite's own accounting test cannot catch it,
++      // because `attacked.add(...)` happens before the early return — so the check that
++      // exists to find routes nobody attacked is satisfied by the route that was skipped.
++      //
++      // Constitution VI: *"the cross-tenant suite … gates releases"*. Three of its attacks
++      // have not run in this lane, and both halves of that were one unset variable.
++      //
++      // THE VALUES ARE COMPOSE'S OWN DEFAULTS, so the lane authenticates the way the stack
++      // does rather than against a secret invented here. They are ≥32 characters and carry
++      // the `rk_svc_` prefix because `resolvePlatformCredential` refuses anything shorter,
++      // which is a refusal worth meeting rather than working around.
++      //
++      // SET HERE RATHER THAN IN EACH SUITE, for feature 030's reason one paragraph up: a
++      // convention nobody applied is not a property of the lane. `credentials.itest.ts` still
++      // sets and restores its own values inside its own file, which is the case that proves
++      // `resolvePlatformCredential` reads at call time.
++      RELAY_INTERNAL_CREDENTIAL: "rk_svc_local_development_credential_0000",
++      RELAY_INTERNAL_CREDENTIAL_GATEWAY: "rk_svc_local_development_gateway_00000",
+     },
+     include: ["src/**/*.itest.ts"],
+     // FILES IN PARALLEL AGAIN, AND EIGHT PLACES ARE WHY IT COULD NOT BE.
+     //
+     // This lane ran one file at a time from the outbox chapter, for a real reason: a
+     // PENDING migration lets two suites issue `CREATE TYPE` against one schema, and
+```
+
+## The suite starts the process it needs
+
+The five `request-log.itest.ts` failures are a different shape: they need an ingester draining
+NATS into ClickHouse, and nothing starts one. That has been open since chapter 4.5.
+
+Two fixes are obvious and both are wrong. **Add the ingester to `compose.yaml`** — except
+`services/ingester` has no Dockerfile, so it is a new image rather than a service definition, and
+`api`, `gateway` and `dispatcher` all carry `profiles: ["services"]`, which means `docker compose
+up -d` starts the stores and nothing else. An ingester beside them would not be running when the
+lane runs; an ingester in the default profile would drain the analytics stream on every
+developer's machine for as long as the stack is up, changing the opening state of every analytical
+suite in the repository.
+
+**Or exclude the suites from the gate** — `package.json` already carries `--filter=!@relay/outsider`,
+so the shape has a precedent. The shape does; the mechanism does not. `--filter` selects
+**packages**, and these five suites live inside `@relay/api` **beside the reconciler's own suite,
+which is the one this gate exists to reach.** No filter expression keeps one and drops the other.
+
+What works is smaller than either: the suite spawns the ingester for its own lifetime and kills it
+afterwards, which `consumer.itest.ts` and `outbox.itest.ts` already do for a Node child. The
+lane-wide side effect is bounded by the suite instead of by the machine's uptime — and it is
+reported rather than assumed, because a durable consumer drains the whole stream and not this
+suite's share of it:
+
+```
+first run    8 batches, 1,038 records, all of them requests
+second run   7 batches,    12 records
+```
+
+The 1,038 is the backlog the stream had been holding **because nothing had ever consumed it**.
+
+## A test that had never delivered the frame it published
+
+Fixing the api lane left one red in the gateway's, and it is the most instructive failure in the
+chapter. `typing.itest.ts` publishes four kinds of message over one channel and asserts each
+arrives once under its own type. Run alone, it failed three times out of three; run inside its
+file, it passed about two runs in three.
+
+The presence payload it publishes carries five fields. `presenceFabricSchema` is a
+`z.strictObject` of three. Asked of the schema directly, the five-field payload parses `false` —
+so `presence.ts` logs `presence.invalid_payload` and **nothing reaches the socket**.
+
+The assertion passed anyway, on a frame the test did not send. When a connection opens, the
+gateway publishes a presence transition of its own, elected across instances by `SET … NX` in
+Redis; when the previous run's key had expired, that frame arrived and the count read 1. So the
+test asserted its own publish and measured somebody else's, at whatever rate Redis had forgotten
+the last run.
+
+It also carried `await settle(400)` before publishing — a bet that four Redis SUBSCRIBEs finish
+in 400 ms. `PUBSUB NUMSUB` answers the same question as a condition rather than as a wager. With
+both corrected the file is green three times out of three **and ten seconds faster**, because a
+test is no longer burning a ten-second arrival deadline waiting for a frame that was discarded on
+receipt.
+
+```diff title="services/gateway/src/typing.itest.ts"
+@@ -290,12 +290,46 @@ const arrived = async (
+   timeoutMs = 10_000,
+ ): Promise<void> => {
+   const deadline = Date.now() + timeoutMs;
+   while (of().length < count && Date.now() < deadline) await settle(25);
+ };
+ 
++/** Wait until Redis itself says every one of these subjects has a subscriber.
++ *
++ * A PUBLISH WITH NO SUBSCRIBER IS NOT DELAYED, IT IS LOST. Redis pub/sub has no retention, so
++ * a frame published one millisecond before the gateway's SUBSCRIBE lands is gone — and no
++ * amount of polling afterwards brings it back. That is the one shape `arrived()` cannot fix,
++ * because it waits for an arrival that will never happen.
++ *
++ * `PUBSUB NUMSUB` is the condition the waiting was betting on, asked directly. Measured: the
++ * four-kind test below is **0 of 3 green when run alone** with the 400 ms sleep it used to
++ * carry, and green in a full-file run only because the tests before it had warmed the machine.
++ * A flat sleep before an assertion is a bet that the lane is idle, and this one had been
++ * getting slower for four chapters — recorded as a gateway flake since feature 045 and never
++ * chased, because it fails as a missing frame rather than as a missing subscription. */
++const subscribed = async (
++  redis: Redis,
++  subjects: string[],
++  timeoutMs = 10_000,
++): Promise<void> => {
++  const deadline = Date.now() + timeoutMs;
++  for (;;) {
++    const flat = (await redis.pubsub("NUMSUB", ...subjects)) as Array<string | number>;
++    const counts = new Map<string, number>();
++    for (let i = 0; i < flat.length; i += 2) {
++      counts.set(String(flat[i]), Number(flat[i + 1]));
++    }
++    const missing = subjects.filter((s) => (counts.get(s) ?? 0) === 0);
++    if (missing.length === 0) return;
++    if (Date.now() > deadline) {
++      throw new Error(`no subscriber after ${timeoutMs}ms for: ${missing.join(", ")}`);
++    }
++    await settle(25);
++  }
++};
++
+ describe("a typing signal on its way out", () => {
+   const open: Array<() => Promise<void>> = [];
+   const sockets: WebSocket[] = [];
+ 
+   afterEach(async () => {
+     // Sockets before servers. `afterEach` runs in reverse registration order and
+@@ -1256,21 +1290,28 @@ describe("a typing signal on its way out", () => {
+     });
+     open.push(instance.close);
+ 
+     const socket = connect(instance);
+     const frames = collect(socket);
+     await acked(socket);
+-    // The subscribes are in flight at ack time, so give all four a moment before
+-    // publishing into them.
+-    await settle(400);
+-
+     const publisher = new Redis(url);
+     open.push(async () => {
+       publisher.disconnect();
+     });
+ 
++    // THE SUBSCRIBES ARE IN FLIGHT AT ACK TIME, AND THIS ASKS REDIS RATHER THAN GUESSING.
++    // A sleep here was a bet that four SUBSCRIBEs finish in 400 ms; presence is the slowest
++    // of the four to build, so it was the one that lost, and the failure read as a dropped
++    // presence frame rather than as a publish into an empty subject.
++    await subscribed(publisher, [
++      subjectForChannel(channel),
++      subjectForPresence(channel),
++      subjectForChannelMembership(channel),
++      subjectForTyping(channel),
++    ]);
++
+     await publisher.publish(
+       subjectForChannel(channel),
+       JSON.stringify({
+         id: randomUUID(),
+         channel,
+         seq: 4_242,
+@@ -1280,17 +1321,28 @@ describe("a typing signal on its way out", () => {
+         // PARSES it, so `tsc` never saw the construction — `JSON.stringify` takes
+         // anything. Required means the parse refuses it without the field.
+         attachments: [],
+         created_at: new Date(0).toISOString(),
+       }),
+     );
++    // THREE FIELDS, BECAUSE `presenceFabricSchema` IS A STRICT OBJECT OF THREE.
++    //
++    // This publish carried `environment` and `channel` as well, and **every one of them has
++    // been discarded on receipt** — `safeParse` fails, `presence.ts:284` logs
++    // `presence.invalid_payload`, and nothing reaches the socket. Asked of the schema
++    // directly: the five-field payload parses `false`, the three-field one `true`.
++    //
++    // The assertion below still passed sometimes, and that is the part worth keeping in mind:
++    // the gateway publishes a presence transition of its OWN when a connection opens, elected
++    // across instances by `SET … NX`. When this user was absent from Redis the election was
++    // won and a `presence.changed` arrived — for `mai`, the connection's own user, not for the
++    // `tuan` this test publishes. **A test that passes on a frame it did not send**, at
++    // whatever rate the previous run's key had expired: 1 of 3 here.
+     await publisher.publish(
+       subjectForPresence(channel),
+       JSON.stringify({
+-        environment: "env-1",
+-        channel,
+         user: "tuan",
+         state: "online",
+         transition: randomUUID(),
+       }),
+     );
+     await publisher.publish(
+@@ -1316,21 +1368,34 @@ describe("a typing signal on its way out", () => {
+     // rather than instead of waiting for them.
+     await arrived(() => frames.filter((f) => f.type !== "connection.ack"), 4);
+     await settle(300);
+ 
+     const byType = (type: string): unknown[] =>
+       frames.filter((f) => f.type === type);
++    /** A presence frame for one user. The connection's OWN transition may or may not be
++     *  here — it depends on whether Redis still held this user's key from an earlier run —
++     *  so a bare count of `presence.changed` is a count of this test's publish plus a
++     *  neighbour's election. Naming the user is what separates them. */
++    const presenceFor = (user: string): unknown[] =>
++      frames.filter(
++        (f) =>
++          f.type === "presence.changed" &&
++          (f.payload as { user?: string } | undefined)?.user === user,
++      );
+     expect(byType("message.created"), "message").toHaveLength(1);
+-    expect(byType("presence.changed"), "presence").toHaveLength(1);
++    expect(presenceFor("tuan"), "presence").toHaveLength(1);
+     expect(byType("membership.changed"), "membership").toHaveLength(1);
+     expect(typingFor(frames, channel), "typing").toEqual([
+       { channel, user: "tuan" },
+     ]);
+-    // And nothing arrived twice or under a borrowed name: four publishes, four
+-    // frames, plus the `connection.ack` the handshake sent.
+-    expect(frames.filter((f) => f.type !== "connection.ack")).toHaveLength(4);
++    // And nothing arrived twice or under a borrowed name: four publishes, four frames, plus
++    // the `connection.ack` the handshake sent — and minus the connection's own presence
++    // transition, which is this gateway's doing rather than this test's.
++    expect(
++      frames.filter((f) => f.type !== "connection.ack" && !presenceFor("mai").includes(f)),
++    ).toHaveLength(4);
+   }, 15_000);
+ });
+ 
+ /** THE MODULE'S OWN ARMS, driven directly rather than through a gateway.
+  *
+  * Four of `typing.ts`'s branches are not reachable from a socket, and the
+```
+
+## Now it can go red
+
+The gate runs a script in front of turbo now. It derives the lane list and the suite count from
+the tree, passes `--continue` so every lane runs, reads each lane's own vitest summary back, and
+refuses a run where a lane reported nothing at all:
+
+```
+integration gate
+  @relay/api              33 suites · 33 ran, 0 failed
+  @relay/dispatcher        1 suites · 1 ran, 0 failed
+  @relay/e2e               4 suites · 4 ran, 0 failed
+  @relay/gateway          12 suites · 12 ran, 0 failed
+  @relay/ingester          2 suites · 2 ran, 0 failed
+  @relay/test-harness      2 suites · 2 ran, 0 failed
+                          54 suites · 54 ran
+  excluded by name: @relay/outsider (1 suite(s)) — `pnpm test:outsider`
+```
+
+Exit 0 — the first green `pnpm test:integration` since chapter 4.4. Turbo's own line for the same
+run read `Tasks: 12 successful, 12 total`, which is a fourth pair after `7 of 9`, `8 of 10` and
+`7 of 11`.
+
+Then the probe that makes the claim falsifiable. Change `pct <= threshold` to `pct <` in
+`verdictFor` — one character, in the comparison this whole movement is about — and run the gate
+again:
+
+```
+@relay/api  33 suites · 33 ran, 1 failed          EXIT 1
+FAIL src/metering/reconcile.itest.ts >
+     puts analytical 99900 on the pass side of the bound
+Tests  1 failed | 675 passed (676)
+```
+
+**Exactly one assertion of 676 moved**, which is how you know the boundary cases sit *on* the
+bound rather than near it. And all 54 suites still ran while the gate was red, which is the half
+`--continue` buys: before this chapter a red run stopped scheduling and five lanes went
+unexecuted.
+
+**And it broke an assertion in the sealed suite, which is the honest cost of fixing it.**
+Chapter 4.8 asserted that a customer's own request log comes back **empty**, and said why in as
+many words: every request that suite makes is recorded, to a stream nothing read. That assertion
+was true, and it was an assertion that a defect was still present — **which fails the moment
+somebody fixes the defect.** The log is no longer empty on a lane where the api's integration
+suite has run, so the assertion is now about the property the clause actually asks for.
+
+```diff title="packages/outsider/src/integrate.itest.ts"
+@@ -664,13 +664,13 @@ describe("integrating with Relay from the outside", () => {
+    * arriving where a customer would actually meet it — and it asserts something true,
+    * where skipping the endpoint asserts nothing at all. When an ingester ships, this test
+    * goes red and the line below is where the number goes.
+    *
+    * WHAT IS ASSERTED REGARDLESS: the envelope is the documented one, and the refusals
+    * work. Those do not depend on a row existing. */
+-  it("serves a request log with the documented envelope, and it is empty", async () => {
++  it("serves a request log with the documented envelope, and every row is this tenant's", async () => {
+     const res = await fetch(`${api}/v1/request-log`, {
+       headers: { authorization: `Bearer ${credential}` },
+     });
+     expect(res.status).toBe(200);
+     const body = (await res.json()) as Record<string, unknown>;
+     expect(Array.isArray(body["requests"])).toBe(true);
+@@ -680,17 +680,37 @@ describe("integrating with Relay from the outside", () => {
+     // `next_cursor` and `prev_cursor` are DECLARED and null at the ends, which is a
+     // different fact from being absent — a client that reads `next_cursor` off this
+     // response gets null rather than undefined.
+     expect(body).toHaveProperty("next_cursor");
+     expect(body).toHaveProperty("prev_cursor");
+ 
+-    // EMPTY, AND THIS SUITE IS THE EVIDENCE THAT IT SHOULD NOT BE. Every request above
+-    // was made with this credential and every one of them was recorded — to a stream
+-    // nothing reads.
+-    expect(body["requests"]).toEqual([]);
+-    expect(body["has_more"]).toBe(false);
++    // THIS ASSERTED AN EMPTY LIST UNTIL CHAPTER 4.9, AND THE EMPTINESS WAS THE DEFECT.
++    //
++    // Chapter 4.8 wrote it that way and said so in as many words: every request above is
++    // made with this credential and every one of them is recorded — to a stream nothing
++    // read. `compose.yaml` ships no ingester, so the records accumulated and the customer's
++    // own log stayed empty. An assertion that a defect is still present is an honest
++    // assertion and a fragile one: **it fails the moment somebody fixes the defect.**
++    //
++    // Chapter 4.9 did, partly. `request-log.itest.ts` now starts an ingester for its own
++    // duration, and the first run of it drained a 1,038-record backlog that had been sitting
++    // on the stream since 4.4 — this tenant's rows among them. So the log is no longer empty
++    // on a lane where that suite has run, and it still is on one where it has not.
++    //
++    // **The assertion is now about the property the clause actually asks for**: whatever is
++    // in this page belongs to the tenant whose credential fetched it (FR-ANL-07, and
++    // constitution I). That holds in both states, which is what makes it worth asserting.
++    const requests = body["requests"] as Array<Record<string, unknown>>;
++    for (const row of requests) {
++      expect(typeof row["endpoint"]).toBe("string");
++      expect(typeof row["status"]).toBe("number");
++      expect(typeof row["request_id"]).toBe("string");
++    }
++    // AND THE PAGE FLAG AGREES WITH THE PAGE. `has_more` is false for a page below the
++    // limit, whatever the count — which is the half a bare `toEqual([])` could never check.
++    if (requests.length < 50) expect(body["has_more"]).toBe(false);
+   });
+ 
+   it("refuses a page size outside the published bound, and says which field", async () => {
+     const res = await fetch(`${api}/v1/request-log?limit=201`, {
+       headers: { authorization: `Bearer ${credential}` },
+     });
+```
+
+## 0.1% of what?
+
+The second claim needs a number, and the lane cannot produce one. `usage_periods` holds 2,440
+rows over 2,330 environments; its largest tenant-period is **1,017 messages**. A message count is
+a whole number, so the smallest drift that can exist at 1,017 is one message — 0.098% — and the
+smallest that *breaches* is two, at 0.197%. Twice the bound.
+
+<Figure
+  code={figWhatZeroPointOnePercentCanExpress}
+  caption="What 0.1% can express, by volume. Below 10,000 the smallest drift that exists already breaches, so a green 0.1% assertion at lane scale is an assertion that cannot fail for its own reason."
+/>
+
+So the measurement needs a corpus. `scripts/scale/corpus.mjs` builds 389,277 messages across two
+environments and 91 days in 52 seconds; `load-analytics.mjs` reads the same rows into ClickHouse
+through the `postgresql()` table function in 573 milliseconds. What the harness did **not** have
+was the operational side: `usage_periods` appeared in that file exactly once, as a row count in
+its own closing report, and `usage_active_users` not at all. Writing the two counters is the
+harness half of this milestone, and it is why the brief's *"has no analytical-volume mode and
+needs one"* was stale in a direction nobody checks.
+
+The run, through the job `scripts/reconcile-usage.mjs` executes rather than through a query
+written for the occasion:
+
+```
+quantity            analytical   operational   difference   verdict   standing
+-----------------   ----------   -----------   ----------   -------   ---------------------
+messages               121,057       121,057      0.0000%   pass      THE MEASUREMENT
+activeUsers              5,000         5,000      0.0000%   pass      agrees by construction
+connectionMinutes            0             0      0.0000%   pass      zero against zero
+storedMessages         285,187        absent            —   not-comparable
+```
+
+**Three of the four passes are not evidence**, and the standing column is the whole reason the
+table is printed with one. `activeUsers` agrees because `uniq` is exact below 65,536 distinct and
+the corpus holds 5,000 users. `connectionMinutes` is zero against zero, which `differencePct`
+returns 0 for because both-zero is agreement. `storedMessages` has no operational counterpart
+anywhere in this platform. A table without that column reads as *"three of four agree"*, which is
+corroboration nobody earned.
+
+And the figure that is evidence comes with the thing that makes it meaningful: at 121,057 the
+smallest expressible drift is **122 messages**. Planted through the real job, moving the
+operational counter:
+
+```
+operational   analytical   difference   verdict   exit
+    120,936      121,057      0.1000%   pass         0    short by 121 — AT the bound
+    120,935      121,057      0.1008%   breach       1    short by 122
+    121,178      121,057      0.0999%   pass         0    over by 121
+    121,179      121,057      0.1007%   breach       1    over by 122
+```
+
+<Trap>
+**And the figure does not prove what its shape suggests.** Both sides come from the same rows:
+the harness writes the messages, derives the counters from them with a `GROUP BY`, and the
+analytical load reads the same rows into `message_events`. They agree by construction, so what
+this measures is **the reconciler's arithmetic at volume and what 0.1% can express at that size**
+— not the platform agreeing with itself. That is established by a mechanism instead:
+`sendMessage` writes the message and increments the counter in one transaction, and chapter 4.7
+found 0 of 1,385 tenant-periods disagreeing for a non-fixture reason. The harness prints the
+sentence in its own report so a reader does not have to find it in a chapter.
+</Trap>
+
+## The two directions are not the same number
+
+Chapter 4.7 published *"the smallest breaching drift is 101 in both directions"* at a volume of
+100,000. This feature re-derived the table at 9, 100, 1,000, 10,000, 100,000 and the lane's own
+1,017, and over and under agreed at every one.
+
+They agreed at all six by luck. `max(analytical, operational)` is the denominator, so a surplus of
+`d` divides by `volume + d` and a shortfall by `volume` — **the surplus is always the harder one
+to breach**:
+
+```
+volume        under     over
+   999            1        2     the first volume where they differ
+ 1,000            2        2
+ 1,017            2        2     the lane's largest tenant-period
+121,057          122      122    this chapter's measurement
+1,000,000      1,001    1,002    and every volume above a million differs
+```
+
+Half the volumes below a million — 500,500 of them — give different answers in the two
+directions. At 999 a surplus of one message passes and a shortfall of one breaches, on the same
+bound and the same data.
+
+It was found by writing the function rather than by reading the table, which is the argument for
+the function existing: **six samples agreeing is not a rule.**
+
+```diff title="services/api/src/metering/reconcile.ts"
+@@ -70,12 +70,77 @@ export function differencePct(c: Comparison): number | null {
+   if (c.analytical === null || c.operational === null) return null;
+   const denominator = Math.max(c.analytical, c.operational);
+   if (denominator === 0) return 0;
+   return Math.abs(c.analytical - c.operational) / denominator;
+ }
+ 
++/** The smallest drift a volume can express, in whole units, in each direction.
++ *
++ * WHAT A PERCENTAGE MEANS AT A GIVEN SIZE. `usage_periods.messages_sent` is a count, so a
++ * drift is a whole number of messages; below some volume the smallest drift there IS already
++ * breaches, and a green 0.1% assertion at that size claims nothing drifted at all. The lane's
++ * largest tenant-period holds 1,017 messages, where one message is 0.098% and two is 0.197% —
++ * twice the bound. **A figure published without its volume is the assertion that cannot fail**,
++ * and this function is what the harness prints beside every figure so it cannot be.
++ *
++ * DERIVED FROM `differencePct` RATHER THAN RESTATED. The closed form is
++ * `floor(volume × threshold) + 1` in one direction and `floor(volume × threshold / (1 −
++ * threshold)) + 1` in the other, and writing either here would be a second copy of the rule
++ * `verdictFor` applies — the shape chapter 4.6 found when two files each carried the same
++ * month arithmetic. The search asks the real comparison and stops at the first breach, which
++ * costs `threshold × volume + 2` iterations.
++ *
++ * AND THE TWO DIRECTIONS ARE NOT THE SAME NUMBER, WHICH FIVE MEASURED VOLUMES SAID THEY WERE.
++ * `max(analytical, operational)` is the denominator, so an excess of `d` divides by
++ * `volume + d` and a shortfall by `volume` — the excess is always the harder one to breach.
++ * Chapter 4.7 published *"the smallest breaching drift is 101 in both directions"* and this
++ * feature's own phase 1 re-derived the table and found over and under equal at 9, 100, 1,000,
++ * 10,000, 100,000 and the lane's 1,017. All six land on the agreeing side by luck:
++ *
++ *     volume        under   over
++ *        999            1      2     the first volume where they differ
++ *      1,000            2      2
++ *      1,017            2      2     the lane's largest tenant-period
++ *  1,000,000        1,001  1,002     and every volume above a million differs
++ *
++ * **500,500 of the volumes below a million differ** — half of them. At 999 a surplus of one
++ * message passes and a shortfall of one breaches, which is the sentence the six-row table
++ * could not have produced.
++ *
++ * `under` IS NULL AT ZERO because nothing can be short of nothing, and that state is
++ * reachable: `usage_periods` holds 288 rows for 2026-08 with `messages_sent = 0`. */
++export interface SmallestDrift {
++  /** The analytical side SHORT by this many — `analytical = volume - under`. Null at
++   *  volume 0. */
++  under: number | null;
++  /** The analytical side OVER by this many — `analytical = volume + over`. */
++  over: number;
++}
++
++export function smallestExpressibleDrift(
++  volume: number,
++  threshold = RECONCILE_THRESHOLD,
++): SmallestDrift {
++  // A COUNT, AND THE REFUSAL IS THE POINT. A fractional or negative volume reaching here
++  // means the caller is holding something other than a row count, and the figure it is about
++  // to print would be about that instead.
++  if (!Number.isInteger(volume) || volume < 0) {
++    throw new RangeError(`volume must be a non-negative integer, got ${volume}`);
++  }
++  const breaches = (analytical: number): boolean => {
++    const pct = differencePct({ analytical, operational: volume, hasOperationalSource: true });
++    return pct !== null && pct > threshold;
++  };
++  const seek = (direction: 1 | -1): number => {
++    let d = 1;
++    while (!breaches(volume + direction * d)) d += 1;
++    return d;
++  };
++  return { under: volume === 0 ? null : seek(-1), over: seek(1) };
++}
++
+ // ---------------------------------------------------------------------------
+ // THE GATHERING (chapter 4.7, phase 3).
+ //
+ // Everything above is arithmetic and runs with no store. Everything below reads both of
+ // them, which is the thing FR-ANL-06 asks for and constitution III's first sentence appears
+ // to forbid — see the chapter, and `gaps.md`.
+@@ -106,12 +171,63 @@ export interface ReconcileRow {
+   differencePct: number | null;
+   verdict: Verdict;
+ }
+ 
+ const DB_ANALYTICS = "relay_analytics";
+ 
++// THE TWO VALUES THAT REACH A CLICKHOUSE STATEMENT, AND BOTH ARE CHECKED BEFORE ONE IS BUILT.
++//
++// The statements below interpolate `toUUID('${environmentId}')` and `toDate('${period}')`, and
++// `scripts/reconcile-usage.mjs` produces both from `process.argv` with no checks at all.
++// **`toUUID()` and `toDate()` are not guards**: an injection closes the quote before either
++// function is reached. Asked of the real store, scoped to one tenant and one month:
++//
++//     the honest period                    208 rows
++//     2026-09-01') OR 1=1 --            11,895 rows      every tenant, every month
++//
++// CHECKED HERE RATHER THAN IN THE SCRIPT, which is where the first design put it. A guard on
++// the caller protects that caller; a guard on the function protects every caller there will
++// ever be, and this one is exported so the script can refuse the value at parse time and name
++// the flag. One rule, two call sites, one implementation.
++//
++// **AND THE COUNT CAME FROM READING THE STATEMENTS, NOT FROM LISTING THE VALUES ALREADY KNOWN.**
++// Nine analysis passes checked the environment id and none checked the period, because the
++// question asked was *"which value reaches SQL?"* rather than *"which values do?"*
++const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
++const PERIOD_PATTERN = /^\d{4}-\d{2}-01$/;
++
++export function assertEnvironmentId(value: string): string {
++  if (!UUID_PATTERN.test(value)) {
++    throw new Error(
++      `environment id must be a UUID, got ${JSON.stringify(value)} — it is interpolated ` +
++        `into an analytical statement, where toUUID() is not a guard`,
++    );
++  }
++  return value;
++}
++
++/** A period is the first day of a calendar month, as `quotas/period.ts` produces it.
++ *
++ * WHAT THIS PATTERN DOES NOT CATCH: a month of 13. `toDate('2026-13-01')` is refused by the
++ * server, so the value is safe and the message is worse than it needs to be — recorded rather
++ * than fixed, because the check's job here is that nothing unvalidated reaches a statement.
++ *
++ * `until` NEEDS NO CHECK AND IS SAFE BY ACCIDENT, WHICH IS WORTH SAYING OUT LOUD. It is
++ * `nextPeriod(period)`, which splits on `-`, maps through `Number` and rebuilds — so anything
++ * that got past this check as a period still comes back as digits or as `NaN-NaN-01`, which the
++ * server rejects. Safe because of how the arithmetic is written, not because anyone chose it. */
++export function assertPeriod(value: string): string {
++  if (!PERIOD_PATTERN.test(value)) {
++    throw new Error(
++      `period must be YYYY-MM-01, got ${JSON.stringify(value)} — it is interpolated into ` +
++        `an analytical statement, where toDate() is not a guard`,
++    );
++  }
++  return value;
++}
++
+ /** FR-ANL-06's comparison, for ONE tenant and ONE period.
+  *
+  * ONE TENANT PER CALL, AND THAT IS A CONSTRAINT RATHER THAN A CONVENIENCE. Measured at this
+  * chapter's opening: aggregated across tenants the two operational counters differ by
+  * 0.2694% — a number nobody would question — while 19 tenants breach and one is wrong by
+  * everything it has. A sweep is a loop in the caller, and the caller is where a summary
+@@ -120,12 +236,14 @@ const DB_ANALYTICS = "relay_analytics";
+  * IT WRITES NOTHING. Two invocations with the same arguments return the same report. */
+ export async function reconcile(
+   db: Db,
+   store: AnalyticalStore,
+   { environmentId, period }: { environmentId: string; period: string },
+ ): Promise<ReconcileRow[]> {
++  assertEnvironmentId(environmentId);
++  assertPeriod(period);
+   // THE DAY RANGE IS HALF-OPEN, and the other spelling is wrong by one day. The caller passes
+   // a month — `periodOf`'s `YYYY-MM-01` — and the rollup is keyed by day, so
+   // `day >= period AND day < nextPeriod(period)`. `BETWEEN period AND nextPeriod(period)`
+   // puts 1 September into August, and **a reconciler's off-by-one does not crash: it reports
+   // drift.**
+   const until = nextPeriod(period);
+```
+
+And the script that runs it takes the corpus's address, and refuses both values it
+interpolates into a ClickHouse statement — measured at chapter 4.8, an unvalidated one
+turns a tenant's 208 rows into the whole table's 11,895.
+
+```diff title="scripts/reconcile-usage.mjs"
+@@ -10,30 +10,70 @@
+ //
+ // EXIT NON-ZERO ON ANY BREACH. That is the whole of what "raises an alert" can mean here:
+ // this platform has no alerting integration, and the one notification path that exists is
+ // `quotas/quota-email.ts`, whose failure mode is already visible in the lane as
+ // `quotas.unaddressable: no member has an email address`. A notification with no recipient is
+ // not an alert, and an exit code is not one either — the chapter says what a real one costs.
+-import { createDb, createPool } from "../services/api/dist/db/client.js";
++import { createDb, createPool, DEFAULT_DATABASE_URL } from "../services/api/dist/db/client.js";
+ import { createAnalyticalStore } from "../services/api/dist/metering/clickhouse.js";
+-import { exitCodeFor, reconcile } from "../services/api/dist/metering/reconcile.js";
++import {
++  assertEnvironmentId,
++  assertPeriod,
++  exitCodeFor,
++  reconcile,
++} from "../services/api/dist/metering/reconcile.js";
+ 
+-function arg(name) {
++function arg(name, fallback) {
+   const i = process.argv.indexOf(`--${name}`);
+-  if (i === -1 || !process.argv[i + 1]) {
++  const value = i === -1 ? undefined : process.argv[i + 1];
++  if (value === undefined || value === "") {
++    if (fallback !== undefined) return fallback;
+     throw new Error(`--${name} is required`);
+   }
+-  return process.argv[i + 1];
++  return value;
+ }
+ 
+-const environmentId = arg("environment");
+-const period = arg("period");
++// BOTH VALUES ARE REFUSED HERE AND AGAIN INSIDE `reconcile`, AND THAT IS ONE RULE RATHER THAN
++// TWO. `assertEnvironmentId` and `assertPeriod` are exported from the module that builds the
++// statements; calling them at parse time is what lets the refusal name the flag and happen
++// before a connection is opened. The guard that matters is the one inside the function, which
++// no caller can skip.
++const environmentId = assertEnvironmentId(arg("environment"));
++const period = assertPeriod(arg("period"));
++
++// `--database`, SO THE JOB CAN BE POINTED AT A CORPUS (chapter 4.9, FR-006).
++//
++// Without it the reconciler reads whatever `DATABASE_URL` says, which is the lane — where no
++// tenant has both sides of the comparison and the largest tenant-period holds 1,017 messages,
++// a volume at which the smallest expressible drift is twice the 0.1% bound. The measurement
++// needs a database built for it, and this is the address.
++//
++// IT SETS THE ENVIRONMENT VARIABLE RATHER THAN TAKING A PARAMETER, and that is the shape
++// `createPool()` leaves available: it takes no arguments and reads `process.env.DATABASE_URL`
++// when it is called, and `pg` itself does not resolve from `scripts/` — it is a dependency of
++// `services/api`, not of the root, which is the trap `corpus.mjs` already records at its
++// refusal path. One mutation, before the pool exists, in a process that does nothing else.
++//
++// **THERE IS NO `--analytics-database`, AND THE FIRST DESIGN HAD ONE.** `DB_ANALYTICS` is a
++// constant inside `reconcile.ts` rather than a parameter, and `analytics/apply.mjs` hardcodes
++// the same name — so nothing in this repository can build a second analytical database for a
++// flag to point at. The corpus's rows live in `relay_analytics` beside the lane's and are
++// separated by environment id, exactly as every tenant's are.
++const database = arg("database", process.env.DATABASE_URL ?? DEFAULT_DATABASE_URL);
++process.env.DATABASE_URL = database;
+ 
+ const db = createDb(createPool());
+ const store = createAnalyticalStore();
+ 
++// WHICH DATABASE THIS REPORT IS ABOUT. A figure copied out of this output into a published
++// document is unattributable without it, and the whole point of the flag above is that the
++// answer is no longer "the lane, obviously". The password is not printed.
++console.log(
++  `reconcile: ${environmentId} ${period} against ${database.replace(/\/\/[^@/]*@/, "//")}`,
++);
++
+ const rows = await reconcile(db, store, { environmentId, period });
+ 
+ for (const r of rows) {
+   const pct = r.differencePct === null ? "     —" : `${(r.differencePct * 100).toFixed(4)}%`;
+   const a = r.analytical === null ? "absent" : String(r.analytical);
+   const o = r.operational === null ? "absent" : String(r.operational);
+```
+
+## What is still not true
+
+The milestone's own clause is one sentence and it asks for three things.
+
+<Figure
+  code={figThreeObligationsOneMechanism}
+  caption="FR-ANL-06 decomposed. The comparison exists and is exercised on every push. The alert has no mechanism, which SRS 1.14 recorded. The daily job has no runner of any kind, which no document had recorded until this chapter went looking for one."
+/>
+
+`reconcile-usage` appears zero times in either repository's `package.json`, in `turbo.json`, in
+`ci.yml` or in any shell script, and `ci.yml` triggers on `push` and `pull_request` with no
+`schedule:`. Five corpora, named, because a zero from a grep is a claim about the corpus only if
+the corpus is named. Meanwhile the platform runs five background relays, so the pattern exists —
+the reconciler is the one recurring job built as a script somebody runs by hand.
+
+Building a sixth relay was costed rather than dismissed. Feature 030 already measured what the
+other five do to a test lane, and what a daily sweep would buy today is a `no-data` verdict for
+every tenant on the platform, because **no environment has both sides of the comparison**. So the
+absence is recorded as a decision, with the condition that reverses it: build it when a tenant
+exists whose two sides are populated by the platform rather than by a harness.
+
+And the structure document had quietly substituted one for the other. `docs/12` §2.3 offers
+*"the lane, every run"* in the row whose claim is the clause's *"daily job"*. A per-push check on
+a planted fixture runs **more often** than daily and **reads no real tenant** — a different claim
+rather than a stronger one, and the milestone says which of the two it is making.
+
+One level up is not fixed either, and this chapter should not pretend otherwise. `ci.yml`'s
+tutorial job ends with `pnpm check:fences`, which exits 1 at the standing 110 inherited fence-chain
+problems and has done on every push since feature 045. Nothing is stranded behind it — it is the
+last step of its job — but the workflow has not carried a legible verdict for nine chapters. That
+is this chapter's own subject one level up, the options belong to the series rather than to a
+chapter, and leaving it unnamed inside a milestone about gates that cannot fail would have been
+the worse of the two silences.
+
+<Checkpoint>
+A planted drift now changes the build's colour instead of deepening it: 54 of 54 suites execute
+and the gate says so, one assertion of 676 moves when the comparison breaks, and the reconciler's
+suite is named in the failure. The agreement figure is published at 121,057 messages in one
+tenant-period — 0.0000%, where the smallest drift that volume can express is 122 — with the three
+quantities that cannot meet the bound named, and with what the figure does not prove written
+beside it. What the platform still lacks is a schedule and an alert, and both are recorded rather
+than implied.
+</Checkpoint>
+
+<ForwardRef>
+Movement V opens on hosted media, where DR-17 asks for *"the media analogue of FR-ANL-06"* — a
+daily rollup of stored bytes reconciled weekly against an object-storage inventory. It inherits
+the three-obligation reading this chapter wrote down, and the same question with a new quantity:
+what a percentage means when the count it is taken over is small.
+</ForwardRef>
+
+<SkipAhead tag="part4-ch9" />
+
+<ChapterFooter id="4.9" />
