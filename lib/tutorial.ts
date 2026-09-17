@@ -872,6 +872,16 @@ export const series: Part[] = [
         sourceDoc: "docs/04-srs.md, docs/05-sad.md",
         readerMinutes: 55,
       },
+      {
+        id: "4.8",
+        path: "/part-4/chapter-08/the-log-a-customer-can-search",
+        title: "The log a customer can search",
+        status: "published",
+        readerProduces:
+          "FR-ANL-07's query surface over the request log chapter 4.4 produced — tenant-scoped, paged on a composite cursor, filtered against the router's own route set — and the finding that the clause beside it cannot be built: FR-ANL-10 names a quantity this platform has never defined, over a column with 0 rows and 0 producers, and the function everyone would reach for reads the p99 at half its true value on the only real latency sample there is",
+        sourceDoc: "docs/04-srs.md, docs/05-sad.md, docs/06-adr-deep-dives.md",
+        readerMinutes: 60,
+      },
     ],
   },
   {

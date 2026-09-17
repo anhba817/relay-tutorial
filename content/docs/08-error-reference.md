@@ -504,3 +504,22 @@ does not.
 `request_id` from the response: it is in the log line for that request, and it is the
 fastest way to the cause.
 
+## analytics_unavailable
+
+**Status:** 503 · **Retryable:** yes, shortly
+
+The analytics service did not answer within the deadline. Everything else works: messages
+send, sockets stay open, webhooks deliver. What is unavailable is the store the request log
+is read from, and this code exists so that you can tell that apart from an empty log.
+
+An empty page would have been a claim about you — that your application made no requests in
+the window you asked about. This is a claim about the platform.
+
+**What to do:** retry shortly. The deadline is two seconds on the server and three on the
+client, so a request that fails this way failed quickly rather than hanging, and a retry a
+few seconds later usually succeeds. Nothing about the query needs changing: if the window,
+the filters and the cursor were wrong you would have had a `400` with the field named.
+
+**Not the same as `internal_error`.** A malformed analytical query — our mistake, not
+yours — answers `500 internal_error`, because retrying it would never help.
+

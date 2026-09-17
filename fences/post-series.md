@@ -2660,7 +2660,7 @@ name an environment alongside an identifier, so only those two can be told to ac
 while carrying something from another.
 
 ```diff title="services/api/src/isolation/gauntlet.itest.ts"
-@@ -1,15 +1,17 @@
+@@ -1,15 +1,18 @@
  import "reflect-metadata";
  
 +import { randomUUID } from "node:crypto";
@@ -2670,6 +2670,7 @@ while carrying something from another.
  import { afterAll, beforeAll, describe, expect, it } from "vitest";
  
  import { AppModule } from "../app.module";
++import { createAnalyticalStore } from "../metering/clickhouse";
  import { mintUserToken } from "../auth/user-token";
 -import { environmentSigningSecret, Repository } from "../db/repository";
 +import { environmentSigningSecret, Repository, usageFor } from "../db/repository";
@@ -2679,7 +2680,7 @@ while carrying something from another.
    listAttack,
    readAttack,
    rowsOf,
-@@ -23,12 +25,13 @@ import {
+@@ -23,12 +26,13 @@
    seedSameTenant,
    seedTwoTenants,
    type CollidingTenants,
@@ -2693,7 +2694,7 @@ while carrying something from another.
  
  // THE GAUNTLET (NFR-SEC-09, constitution I).
  //
-@@ -340,12 +343,28 @@ describe("the isolation gauntlet", () => {
+@@ -340,12 +344,28 @@
      // Whatever it answers, nothing of the victim's may appear in it.
      expect(serialised).not.toContain(t.victim.userId);
      expect(serialised).not.toContain(t.victim.channelId);
@@ -2722,13 +2723,26 @@ while carrying something from another.
    // found these before the classification did: `targets.itest.ts` went from 9 targets
    // to 11 and failed naming both as unclassified.
    it("POST /v1/channels/:channelId/members — refuses, and adds nobody", async () => {
-@@ -978,12 +997,235 @@ describe("the isolation gauntlet", () => {
+@@ -973,14 +993,293 @@
+       // zero from an unrecognised shape reads exactly like a count of zero from a
+       // correctly-scoped list. That is the one answer this block must never confuse
+       // with success, so the recogniser is asserted against both shapes it claims to
+       // handle and against one it does not.
+       expect(rowsOf([1, 2])).toHaveLength(2);
        expect(rowsOf({ data: [1] })).toHaveLength(1);
++      // The request log's envelope (chapter 4.8), added by name rather than derived.
++      expect(rowsOf({ requests: [1, 2, 3] })).toHaveLength(3);
        expect(rowsOf({ items: [1, 2, 3] })).toEqual([]);
        expect(rowsOf(null)).toEqual([]);
-     });
-   });
- 
++      // AND THIS LINE IS WHY THE SET IS NAMED RATHER THAN DERIVED. 4.8 replaced the
++      // lookup with "the first array-valued property" and this assertion went red: a
++      // body whose rows are under `data` but which carries some other array first would
++      // be counted from the wrong one, and a `count > 0` control satisfied by the wrong
++      // array is a false pass where an unknown shape is a loud failure.
++      expect(rowsOf({ cursors: [1, 2, 3], data: [1] })).toHaveLength(1);
++    });
++  });
++
 +  // ── the webhook surface (this chapter) ─────────────────────────────────────────
 +  //
 +  // WRITTEN BECAUSE THE LEDGER OWED THEM AND THE ACCOUNTING TEST COLLECTED. Eleven
@@ -2768,6 +2782,54 @@ while carrying something from another.
 +      // AND ITS OWN ENDPOINT IS THERE. A listing that returned nothing at all would
 +      // pass the leak check while being broken, which is the `list` shape's own trap.
 +      expect(verdict.count, "the attacker's own listing came back empty").toBeGreaterThan(0);
++    });
++
++    /** THE REQUEST LOG (chapter 4.8, FR-ANL-07, FR-029).
++     *
++     * `GET /v1/webhooks`'s argument, one surface over, and the isolation claim is
++     * STRONGER here than on any other `list`. 60.5% of `api_requests` carries no tenant
++     * at all — every 404, every 401, `/healthz`, signup, and every call the dispatcher
++     * and gateway make on the internal seam — so this attack has two things to show
++     * rather than one: no row from another environment appears in a 200, and **no
++     * tenantless row does either**. That is chapter 4.4's reading of constitution I
++     * asserted rather than argued: a record with no tenant is not tenant data, and it is
++     * unreachable from every tenant's query because it carries no tenant to match.
++     *
++     * AND THIS ATTACK PLANTS ITS OWN ROWS, WHICH NO OTHER ONE IN THIS FILE HAS TO.
++     * `compose.yaml` runs no ingester (`gaps.md` 050-8), so both tenants' logs are empty
++     * on a fresh lane — and an empty log passes the leak check for the same reason an
++     * empty page does: there is nothing in it to leak. Without the plant this test could
++     * not fail for its own reason, which is the class this suite exists to catch one
++     * level up.
++     *
++     * NOTHING IS DELETED AFTERWARDS, which is this fixture's own convention stated at the
++     * top of `fixtures.ts`: every row is scoped to an environment the fixture minted, and
++     * a teardown that reached wider would be a global operation asserting a local fact. */
++    it("GET /v1/request-log — a tenant's log holds its own rows, none of the victim's, and none of the platform's", async () => {
++      attacked.add("GET /v1/request-log");
++      const store = createAnalyticalStore();
++      const victimRequestId = randomUUID();
++      const tenantlessRequestId = randomUUID();
++      await store.query(
++        `INSERT INTO relay_analytics.api_requests
++           (environment_id, ts, request_id, endpoint, method, status, latency_ms, principal_kind, refused_at)
++         VALUES
++           (toUUID('${t.attacker.environmentId}'), now64(3), toUUID('${randomUUID()}'), '/v1/request-log', 'GET', 200, 1.5, 'application', 'handler'),
++           (toUUID('${t.victim.environmentId}'), now64(3), toUUID('${victimRequestId}'), '/v1/webhooks', 'GET', 200, 2.5, 'application', 'handler'),
++           (NULL, now64(3), toUUID('${tenantlessRequestId}'), '/healthz', 'GET', 200, 0.3, 'none', 'handler')`,
++      );
++      const verdict = await listAttack(
++        url,
++        t.attacker.credential,
++        { method: "GET", path: "/v1/request-log" },
++        [t.victim.environmentId, victimRequestId, tenantlessRequestId],
++      );
++      expect(verdict.status).toBe(200);
++      expect(verdict.leaked, `leaked: ${verdict.leaked.join(", ")}`).toEqual([]);
++      // AND ITS OWN ROW IS THERE. A listing that returned nothing at all would pass the
++      // leak check while being broken, which is the `list` shape's own trap — and here it
++      // is not hypothetical, because a log with no ingester behind it really is empty.
++      expect(verdict.count, "the attacker's own log came back empty").toBeGreaterThan(0);
 +    });
 +
 +    it("POST /v1/webhooks — a create by one tenant cannot appear in another's list", async () => {
@@ -2949,15 +3011,12 @@ while carrying something from another.
 +        (await usageFor(db, t.victim.environmentId, period)).connectionMinutes,
 +        "the victim's minutes moved",
 +      ).toBe(victimBefore);
-+    });
-+  });
-+
+     });
+   });
+ 
    // ── and the suite accounts for itself ───────────────────────────────────────────
    it("ran an attack for every route the classification says to attack", () => {
      const shouldAttack = CLASSIFICATIONS.filter((c) => c.shape !== "exempt").map(targetKey);
-     const missing = shouldAttack.filter((k) => !attacked.has(k));
-     // A classification saying `write` with no attack written for it is the same hole
-     // as a route with no classification, one level up. Named, because the useful half
 ```
 
 ## The teardown, and the process that holds the port

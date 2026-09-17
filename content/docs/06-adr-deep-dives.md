@@ -1791,3 +1791,113 @@ measurement is taken on that lane.
 - NFR-SCL-01 is raised beyond 10,000 per instance, which moves the projection;
 - Redis pub/sub is replaced for a reason unrelated to this record, at which point the threshold
   is about the replacement's costs and not these.
+
+## ADR-26 — The api serves a customer request from the analytical store
+
+### Problem
+
+FR-ANL-07 asks for a queryable API request log per tenant, and FR-DSH-03 asks the dashboard to
+search it — which EIR-DSH-02 then binds to *"only the same public API available to customers."*
+So the log has to be a public route, and the rows are in ClickHouse.
+
+That is new in a way the three earlier analytical chapters were not. Chapter 4.2 loaded the
+store from Postgres offline. Chapter 4.4 wrote to it from a fire-and-forget producer that blocks
+nothing. Chapter 4.7 read from it in a nightly job. **This chapter puts it on the request path,
+with a person waiting**, and neither ClickHouse client in the repository had a timeout: both
+call `fetch` with no `signal`, so a hung store held the caller until the operating system gave
+up.
+
+Constitution III's second sentence is a MUST about exactly this: *"failure or backlog of the
+analytical pipeline MUST NOT affect message delivery, real-time fan-out, or API availability."*
+A route that hangs on a slow store is the coupling that clause forbids, and until this chapter
+nothing in the platform could produce it.
+
+### Options
+
+**A. Serve it from the analytical store, with a deadline on both sides.** The store the
+producer already writes to, read with a client-side abort and a server-side execution limit.
+
+**B. Serve it from the analytical store with a client-side deadline only.** One change, in one
+place, no SQL involved.
+
+**C. Deduplicate with `LIMIT BY` rather than `FINAL`.** Cheaper on paper, since `FINAL` merges
+parts at read time.
+
+**D. Mirror the log into Postgres and serve it from there.** The operational store is already
+on the request path and already has a deadline story.
+
+### What was measured
+
+**B fails on its own terms, and the measurement is one line.** Aborting a `fetch` stops the
+client waiting; ClickHouse keeps executing. A tenant retrying a slow page therefore accumulates
+server-side work — the opposite of what a deadline is for. The server half needs no interface
+change:
+
+    SETTINGS max_execution_time = 1
+    → HTTP 408 · Code: 159. DB::Exception: Timeout exceeded: elapsed 1000.343075 ms,
+      maximum: 1000 ms. (TIMEOUT_EXCEEDED)    returned in 1.002 s
+
+**And the order of the two limits decides what the caller learns.** With the server's limit
+shorter, its refusal wins the race and the route receives `Code: 159` and an HTTP status to map.
+With the client's shorter, the route receives an `AbortError` carrying nothing, and a refusal
+that names no cause is the empty page this surface refuses to send. The route sets **2 seconds
+on the server and 3 on the client.**
+
+**C changes what `LIMIT` counts.** `LIMIT n BY key` returns up to *n* rows per key, so a page's
+size stops meaning the number of requests the caller asked for. And the problem it solves is
+real: measured on the lane before the reader was written, `api_requests` held **11,684 rows
+against 11,683 distinct keys** — one duplicate, across two active parts — so a read without
+`FINAL` returns that request twice and the repeat disappears whenever a merge happens to run.
+**the surface's promise that no row appears in two consecutive pages** would then pass or fail
+on merge timing.
+
+**What `FINAL` costs was measured against a table with parts**, because the obvious measurement
+is taken on a table that has just been merged and proves nothing. With merges stopped and six
+inserts planted:
+
+    7 parts, 12,895 rows     FINAL 3 ms     plain 2 ms     read_rows 12,895 both
+
+Three runs a side, identical every time.
+
+**D has nothing to serve.** The producer writes to ClickHouse and nowhere else; mirroring means
+a second producer on the request path, which is the coupling FR-ANL-02 forbids — *"never
+synchronously on the request path"* — and constitution III's first sentence forbids the
+analytical query against Postgres in any case.
+
+### Decision
+
+**A.** The route reads ClickHouse with `FINAL`, a server-side `max_execution_time` of 2 seconds
+and a client-side abort at 3, and refuses with **503 `analytics_unavailable`** when the store
+does not answer. The refusal is explicit rather than an empty page because an empty page is a
+claim about the tenant — that they made no requests — where the platform is what failed.
+
+### Consequences
+
+The platform now has a failure mode it did not have: a customer-facing route that can be
+unavailable while the rest of the API is fine. That is the point of the 503 rather than a
+side effect of it — constitution III's second clause is about exactly this distinction, and a
+surface that hid the difference would satisfy the clause by being unable to report on it.
+
+The store's error message never travels. `Code: 159. DB::Exception: … elapsed 1000.343075 ms` in
+a customer's support ticket is infrastructure detail, which is the argument `codes.ts` already
+makes about credentials (NFR-SEC-06).
+
+And the distinction the mapping turns on is **whose fault it is**. A timeout or no answer at all
+is the pipeline being unavailable, and the client should retry. A 404 or a syntax error from
+ClickHouse is the platform's statement being wrong, and telling a customer to retry a query that
+will never work is worse than telling them nothing — those stay `internal_error`.
+
+### Reversal condition
+
+**Reverse when the analytical store's availability appears in the API's error budget** — when
+`analytics_unavailable` stops being a rare answer on one route and becomes a number somebody
+reports. **The 503 `analytics_unavailable` refusal is the instrument** that makes that visible,
+and it shipped in the same
+chapter as the route so the signal exists before the decision needs reviewing.
+
+The options at that point, in the order they cost least: a cache in front of the read; a
+Postgres mirror of the log, which requires amending constitution III rather than reinterpreting
+it; or removing the surface and with it FR-DSH-03.
+
+**Not a reversal:** the store being slow. A page that takes a second and a half inside the
+deadline is the trade this record accepts, and the deadline is what bounds it.

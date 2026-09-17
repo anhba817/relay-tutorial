@@ -755,7 +755,12 @@ saying why. The argument is one argument four times: **zero is a measurement and
 an absence.** A non-nullable `user_id` turns a deleted author's message into the zero UUID
 and invents an active user; a non-nullable `text_length` claims an empty message was sent
 where a tombstone preserved nothing; and `delivery_latency_ms` has no producer at all
-until FR-ANL-10, so every row would assert a delivery took 0 ms. The column list above is
+and **still has none after FR-ANL-10's chapter**, so every row would assert a delivery took 0 ms.
+That sentence read *"until FR-ANL-10"* and the prediction was wrong: chapter 4.8 defined the
+quantity the clause was missing — commit to the frame written to a subscriber's socket — and
+recorded that building the producer means carrying both instants across a service boundary, the
+commit being the api's and the socket write the gateway's, on the busiest path in the platform.
+The clause names its quantity now; the column is still empty (`gaps.md` 048-2). The column list above is
 kept as the shape; chapter 4.2 carries the nullability and the measurements behind it.
 
 No message text anywhere in this store (DR-08 / FR-ANL-11) — the compliance erasure
@@ -771,6 +776,26 @@ no environment by design. Revision 1.4 also corrected this document's claim that
 stream absorbs 24 h; that window is a function of the record rate, and the same chapter made
 the rate constant by publishing a record for every request rather than for every webhook
 attempt.
+
+**AND IT HAS A READER NOW, WHICH IS WHAT MAKES IT A SURFACE.** `GET /v1/request-log` (chapter
+4.8, ADR-26) is the first customer-facing read of this store: a tenant-scoped page over
+`api_requests`, filtered by endpoint, status and a half-open time window, paged by an opaque
+cursor over `(ts, request_id)` and read with `FINAL`. The cursor cannot key on a sequence the
+way `messages` does — this table has no server-assigned ordinal — and 42 `(environment_id, ts)`
+pairs in the lane hold more than one row, so the pair is what makes a page boundary exact.
+
+**THREE THINGS THE READ HAS TO DO THAT THE SCHEMA DOES NOT SHOW.** `FINAL`, because a
+`ReplacingMergeTree` returns a redelivered request twice until a merge it cannot be made to
+wait for. A presence column per nullable column, because the HTTP interface writes NULL as the
+two characters `\N` and a reader taking the value alone reports an endpoint of `"\N"` —
+`endpoint` and `limited_operation` both, the second being NULL on 11,660 of 11,683 rows. And a
+deadline in two halves, because aborting a `fetch` leaves the query running (ADR-26).
+
+**AND THE PER-TENANT FILTER SKIPS NOTHING AT THIS SIZE.** Measured at chapter 4.8: a 50-row
+page reads the whole table, because the part is **Compact** and a compact part is one granule
+whatever `index_granularity` declares — built two ways, 11,695 rows in a Wide part taking two
+granules and the same rows in a Compact part taking one. The key is right and there is nothing
+for it to skip until the table crosses `min_bytes_for_wide_part`.
 
 **AND THE DELIVERY-ATTEMPT TABLE, ADDED IN REVISION 1.3.** `message_events` above is
 labelled *representative* and this document named no table for FR-ANL-01's webhook delivery
@@ -1759,6 +1784,55 @@ count would be wrong for half of all deployments.
 
 A sixth grammar is pre-approved at this scale; a seventh reopens the record. Full argument,
 options and the measurement table: ADR-25 in `06-adr-deep-dives.md`.
+
+### ADR-26 — The api serves a customer request from the analytical store
+**Status:** accepted (2026-09-17) · **Drivers:** D2, D5 · bounds ADR-06 · discharges FR-ANL-07,
+FR-DSH-03 · constrained by constitution III
+
+`GET /v1/request-log` reads ClickHouse **on the request path**, with a customer waiting. Chapter
+4.7 put the same store behind a nightly reconciler, where an unbounded wait costs a job that was
+slow anyway; this is the first time the platform's availability depends on the analytical store
+answering, and it invents a failure mode the platform did not have — **a 503 on a customer route
+because a store the customer has never heard of is slow.**
+
+Constitution III is why it is the analytical store and not the operational one: *"billing,
+metering, and dashboard analytics read only from the analytical store."* A customer-facing
+request log is dashboard analytics, and it is the clause's central case rather than an exception
+to it. The producer writes nowhere else — `api_requests` exists in ClickHouse and has no
+Postgres counterpart — so there is no second source to choose.
+
+**The rejected alternatives are measurements rather than opinions.**
+
+*A client-side deadline alone.* `AbortSignal.timeout` stops the caller waiting and **leaves the
+query running**: ClickHouse keeps executing, so a tenant retrying a slow page accumulates
+server-side work — the amplification a deadline exists to prevent. Measured: `SETTINGS
+max_execution_time = 1` on a long scan answers **HTTP 408 in 1.002 s** with `Code: 159 …
+(TIMEOUT_EXCEEDED)`. Both halves ship, and **the server's limit is the shorter one** so its
+refusal wins the race and the route receives a code it can map; the other ordering yields an
+`AbortError` carrying nothing.
+
+*`LIMIT BY` instead of `FINAL`.* It deduplicates without a merge and it changes what `LIMIT`
+counts, so a page's size stops meaning what the contract says. `FINAL` costs **3 ms against 2 ms
+at seven parts** — three runs a side, identical every time, the same rows read — and the table
+without it returns a redelivered request twice, which the surface's own test drives red.
+
+*Serving the log from Postgres.* Constitution III's first sentence forbids it, and there is
+nothing to serve: the record was never written there.
+
+**The reversal condition, which is the part an ADR is usually missing.** Undo this when **the
+analytical store's availability appears in the API's error budget** — that is, when
+`analytics_unavailable` stops being a rare answer on one route and starts being a number
+somebody reports. **The 503 `analytics_unavailable` refusal is the instrument** that makes it
+visible, and it was added in the
+same chapter as the route precisely so the signal exists before the decision needs reviewing. At
+that point the options are a cache in front of the read, a Postgres mirror of the log accepting
+constitution III's amendment, or removing the surface.
+
+What it does **not** reverse on: the store being slow. A slow page inside the deadline is the
+trade this record accepts.
+
+Full argument, the three rejected options and the measurements: ADR-26 in
+`06-adr-deep-dives.md`.
 
 ## 10. Risks and technical debt register
 
