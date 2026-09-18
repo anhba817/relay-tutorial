@@ -198,7 +198,15 @@ function applyHunks(state, body, where, problems) {
       });
       return null;
     }
-    text = text.replace(p, post.join("\n"));
+    // A FUNCTION REPLACEMENT, NOT A STRING ONE. `String.prototype.replace` reads
+    // `$$`, `$&`, `` $` ``, `$'` and `$<name>` in a string replacement as
+    // substitution patterns, so a post-image containing `$$` lands as a single
+    // `$`. `sentinel.sql`'s `DO $$ … END $$;` is the case in this repository:
+    // the published fence says `END $$;`, the chain replayed `END $;`, and the
+    // difference was filed for two features as a typo in the PROSE. It was the
+    // applier. Feature 055 found it by repairing the file and watching the last
+    // problem refuse to close.
+    text = text.replace(p, () => post.join("\n"));
   }
   return text.split("\n");
 }
