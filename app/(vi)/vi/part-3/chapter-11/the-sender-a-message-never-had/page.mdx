@@ -1339,6 +1339,102 @@ kiểu lại sau này, nên nó có một bài như thế. `FR-WHK-02` giao `mes
 `FR-WHK-03` thử lại trong hai giờ: một dòng cũ có thể rời khỏi nền tảng, rồi rời đi lần nữa, sau khi
 chương này ship.
 
+```ts title="services/api/src/outbox/event.test.ts"
+import { describe, expect, it } from "vitest";
+
+import { messageCreatedEvent, subjectFor } from "./event";
+
+// The envelope, Docker-free. What a consumer eventually receives
+// is decided here and nowhere else — the relay moves bytes, it does not author
+// them (ADR-04, research R7).
+
+const ENV = "3f2a0000-0000-0000-0000-000000000001";
+const MESSAGE = {
+  id: "57d5cdf0-e145-4bca-b7fa-a7a43e8ffbb6",
+  channel_id: "ce419dc5-b06e-441c-ab38-49451f87210e",
+  seq: 1,
+  user: "tuan",
+  text: "B2, north ramp",
+  created_at: "2026-08-08T13:31:09.229Z",
+};
+
+describe("subjectFor", () => {
+  it("puts the environment last, as SAD §6.1's example does", () => {
+    expect(subjectFor("message.created", ENV)).toBe(
+      `events.msg.created.${ENV}`,
+    );
+  });
+});
+
+describe("messageCreatedEvent", () => {
+  const build = () =>
+    messageCreatedEvent({
+      eventId: "8f14e45f-ceea-4f6a-9b2c-1d2e3f4a5b6c",
+      environmentId: ENV,
+      message: MESSAGE,
+    });
+
+  it("carries the five fields the contract promises", () => {
+    const { payload } = build();
+    expect(Object.keys(payload).sort()).toEqual([
+      "data",
+      "environment_id",
+      "id",
+      "occurred_at",
+      "type",
+    ]);
+    expect(payload.type).toBe("message.created");
+    expect(payload.environment_id).toBe(ENV);
+    expect(payload.id).toBe("8f14e45f-ceea-4f6a-9b2c-1d2e3f4a5b6c");
+  });
+
+  it("is deterministic — the same row rebuilds to the same bytes (invariant 10)", () => {
+    // The reason this holds is the reason it matters: nothing inside generates
+    // an id or reads the clock. The event id arrives from the transaction that
+    // wrote the row, so a republish after a crash sends the SAME deduplication
+    // key rather than a fresh one — and a key that changed on retry would make
+    // every consumer's dedupe useless.
+    expect(JSON.stringify(build())).toBe(JSON.stringify(build()));
+  });
+
+  it("takes occurred_at from the message, not from the clock", () => {
+    expect(build().payload.occurred_at).toBe(MESSAGE.created_at);
+  });
+
+  it("publishes the PUBLIC shape of a message, never internal identifiers", () => {
+    // Consumers are customers. They get external ids and the field names the
+    // REST API uses; `user_id` never crosses this boundary.
+    const { payload } = build();
+    expect(payload.data).toEqual(MESSAGE);
+    expect(JSON.stringify(payload)).not.toContain("user_id");
+    expect(JSON.stringify(payload)).not.toContain("environmentId");
+  });
+
+  it("addresses the event on the subject its environment owns", () => {
+    expect(build().subject).toBe(`events.msg.created.${ENV}`);
+  });
+
+  it("refuses to build an event with no id or no environment", () => {
+    // A payload missing its deduplication key is worse than no event: it looks
+    // deliverable and cannot be deduplicated.
+    expect(() =>
+      messageCreatedEvent({
+        eventId: "",
+        environmentId: ENV,
+        message: MESSAGE,
+      }),
+    ).toThrow(/event id/i);
+    expect(() =>
+      messageCreatedEvent({
+        eventId: "abc",
+        environmentId: "",
+        message: MESSAGE,
+      }),
+    ).toThrow(/environment/i);
+  });
+});
+```
+
 ```diff title="services/api/src/outbox/event.test.ts"
 @@ -88,6 +88,35 @@ describe("messageCreatedEvent", () => {
          environmentId: "",
@@ -1432,6 +1528,101 @@ này thêm sáu dòng chú thích vào danh sách ấy; danh sách dời tới m
 ký tự ngoài cửa sổ; phép tìm thấy danh sách *kế tiếp* thay vào đó rồi báo `[]`. **Một kết quả rỗng
 đã thoả mãn một khẳng định về việc mục nào là glob.** Giờ nó quét ngược từ chỗ quy tắc, và
 từ chối xanh trên một lần parse chẳng tìm ra mục nào cả.
+
+```ts title="packages/test-harness/src/driver-exempt.test.ts"
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+
+import { describe, expect, it } from "vitest";
+
+// THE DIRECTION `no-restricted-imports` CANNOT SEE.
+//
+// The rule catches an unlisted file that imports the driver — that is its job and
+// it does it loudly. What it cannot catch is a LISTED file that stopped importing
+// one: the exemption simply never fires, and nothing anywhere goes red. So the
+// list can only grow, and a stale entry holds a standing exemption over a file
+// that no longer needs one.
+//
+// There is no second list to compare against. What the list has to agree with is
+// the TREE, which makes the assertion here read the config's own text — and the
+// restricted module names are read out of the rule rather than restated, so
+// adding a third restricted module does not need this file edited.
+
+const ROOT = join(import.meta.dirname, "..", "..", "..");
+const CONFIG = join(ROOT, "eslint.config.mjs");
+
+function config(): string {
+  return readFileSync(CONFIG, "utf8");
+}
+
+/** The paths the config exempts from the driver rule, read off the `ignores` array
+ * after the DRIVER_EXEMPT marker. Parsed, not restated. */
+function exemptPaths(): string[] {
+  const text = config();
+  const marker = text.indexOf("// DRIVER_EXEMPT");
+  if (marker === -1) {
+    throw new Error(
+      "eslint.config.mjs has no DRIVER_EXEMPT marker — the shape this test reads changed",
+    );
+  }
+  const end = text.indexOf("]", marker);
+  return [...text.slice(marker, end).matchAll(/"([^"]+\.ts)"/g)].map((m) => m[1]!);
+}
+
+/** The module names the rule restricts, read off its `paths` entries. */
+function restricted(): string[] {
+  const text = config();
+  const block = /"no-restricted-imports":[\s\S]*?paths:\s*\[([\s\S]*?)\],\s*patterns:/.exec(text);
+  if (block === null) {
+    throw new Error(
+      "eslint.config.mjs's no-restricted-imports rule is not shaped the way this test reads it",
+    );
+  }
+  return [...block[1]!.matchAll(/name:\s*"([^"]+)"/g)].map((m) => m[1]!);
+}
+
+describe("the driver exemption is checked in both directions", () => {
+  it("parses a non-empty list of exempt paths and restricted modules", () => {
+    // Both parses failing open would make every assertion below vacuous, which is
+    // the way a check like this normally dies.
+    expect(exemptPaths().length, "no exempt paths parsed").toBeGreaterThan(0);
+    expect(restricted().length, "no restricted modules parsed").toBeGreaterThan(0);
+  });
+
+  it("names a file that exists, for every exempt path", () => {
+    for (const path of exemptPaths()) {
+      expect(existsSync(join(ROOT, path)), `${path} is exempt and absent`).toBe(true);
+    }
+  });
+
+  it("still imports a restricted module, for every exempt path", () => {
+    // THE STALE-ENTRY CHECK. A file that no longer touches the driver does not
+    // need the exemption, and leaving it listed means the next edit to that file
+    // may reach for `pg` and nothing will say so.
+    const modules = restricted();
+    for (const path of exemptPaths()) {
+      const text = readFileSync(join(ROOT, path), "utf8");
+      const uses = modules.filter(
+        (m) => text.includes(`from "${m}"`) || text.includes(`from "${m}/`),
+      );
+      expect(uses, `${path} is exempt from the driver rule and imports none of ${modules.join(", ")}`)
+        .not.toEqual([]);
+    }
+  });
+
+  it("exempts the repository layer as a directory and everything else by path", () => {
+    // The directory pattern is legitimate — `services/api/src/db` IS the layer the
+    // rule carves out. Any OTHER pattern would silently absorb the next file added
+    // under it, which is the thing this list exists instead of.
+    const text = config();
+    const start = text.indexOf("ignores: [", text.indexOf("no-restricted-imports") - 2000);
+    const globs = [...text.slice(start, text.indexOf("]", start)).matchAll(/"([^"]+)"/g)]
+      .map((m) => m[1]!)
+      .filter((g) => g.includes("*"));
+    expect(globs).toEqual(["services/api/src/db/**"]);
+  });
+});
+```
 
 ```diff title="packages/test-harness/src/driver-exempt.test.ts"
 @@ -76,17 +76,29 @@ describe("the driver exemption is checked in both directions", () => {
@@ -2328,6 +2519,111 @@ vẫn phải kế toán cho.
        expect(await res.json()).toMatchObject({ is_member: false });
 ```
 
+```ts title="services/api/src/messages/history.itest.ts"
+import { beforeAll, describe, expect, it } from "vitest";
+
+import {
+  createDb,
+  createPool,
+  DEFAULT_DATABASE_URL,
+  type Db,
+} from "../db/client";
+import { migrate } from "../db/migrate";
+import { createEnvironment, Repository } from "../db/repository";
+import { decodeCursor, encodeCursor } from "./cursor";
+
+// The history suite (chapter 2.4): offset drift staged and then retired,
+// cursor stability under live inserts, the exclusive-anchor seam, both
+// directions, and the page cap.
+
+const url = new URL(process.env.DATABASE_URL ?? DEFAULT_DATABASE_URL);
+if (!["localhost", "127.0.0.1"].includes(url.hostname)) {
+  throw new Error(
+    `integration tests refuse non-local databases (got host "${url.hostname}") — never point this suite at a shared database`,
+  );
+}
+
+const pool = createPool();
+const db: Db = createDb(pool);
+let repo: Repository;
+
+beforeAll(async () => {
+  await migrate(pool);
+  const env = await createEnvironment(db, { name: "history-itest" });
+  repo = new Repository(db, env.id);
+});
+
+async function seed(channelId: string, count: number, prefix: string) {
+  for (let i = 1; i <= count; i += 1) {
+    await repo.sendMessage(channelId, { text: `${prefix}-${i}` });
+  }
+}
+
+describe("history pagination (FR-MSG-09)", () => {
+  it("cursor pagination is stable under the same live inserts", async () => {
+    const channel = await repo.createChannel("hist-cursor", "public");
+    await seed(channel.id, 60, "m");
+    const page1 = await repo.listMessages(channel.id, { limit: 50 });
+    await seed(channel.id, 3, "live");
+    const page2 = await repo.listMessages(channel.id, {
+      beforeSeq: page1[page1.length - 1]!.seq,
+      limit: 50,
+    });
+    const seen = new Set(page1.map((m) => m.id));
+    expect(page2.filter((m) => seen.has(m.id))).toHaveLength(0);
+    // And nothing was skipped: the two pages are contiguous by sequence.
+    expect(page2[0]!.seq).toBe(page1[page1.length - 1]!.seq - 1);
+  });
+
+  it("the anchor is exclusive — the seam row appears exactly once", async () => {
+    const channel = await repo.createChannel("hist-seam", "public");
+    await seed(channel.id, 20, "m");
+    const page1 = await repo.listMessages(channel.id, { limit: 10 });
+    const seam = page1[page1.length - 1]!;
+    const page2 = await repo.listMessages(channel.id, {
+      beforeSeq: seam.seq,
+      limit: 10,
+    });
+    expect(page2.map((m) => m.seq)).not.toContain(seam.seq);
+    expect(page2[0]!.seq).toBe(seam.seq - 1);
+  });
+
+  it("reads newer as well as older — the catch-up direction 2.7 will reuse", async () => {
+    const channel = await repo.createChannel("hist-newer", "public");
+    await seed(channel.id, 10, "m");
+    const newer = await repo.listMessages(channel.id, {
+      afterSeq: 7,
+      limit: 10,
+    });
+    expect(newer.map((m) => m.seq)).toEqual([8, 9, 10]);
+  });
+
+  it("a foreign channel's history is empty, not forbidden", async () => {
+    const other = await createEnvironment(db, { name: "history-itest-other" });
+    const theirs = await new Repository(db, other.id).createChannel(
+      "hist-theirs",
+      "public",
+    );
+    await new Repository(db, other.id).sendMessage(theirs.id, {
+      text: "theirs",
+    });
+    expect(await repo.listMessages(theirs.id, { limit: 50 })).toEqual([]);
+  });
+
+  it("cursors survive the round trip the endpoint makes", async () => {
+    const channel = await repo.createChannel("hist-codec", "public");
+    await seed(channel.id, 3, "m");
+    const page = await repo.listMessages(channel.id, { limit: 2 });
+    const token = encodeCursor(page[page.length - 1]!.seq);
+    const next = await repo.listMessages(channel.id, {
+      beforeSeq: decodeCursor(token)!,
+      limit: 2,
+    });
+    expect(next[0]!.seq).toBe(1);
+  });
+});
+```
+
 ```diff title="services/api/src/messages/history.itest.ts"
 @@ -1,7 +1,9 @@
  import { beforeAll, describe, expect, it } from "vitest";
@@ -2430,6 +2726,145 @@ vẫn phải kế toán cho.
 +    expect(legacy?.user).toBeNull();
 +  });
  });
+```
+
+```ts title="services/api/src/messages/idempotency.itest.ts"
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { randomUUID } from "node:crypto";
+
+import {
+  createDb,
+  createPool,
+  DEFAULT_DATABASE_URL,
+  type Db,
+} from "../db/client";
+import { migrate } from "../db/migrate";
+import {
+  createEnvironment,
+  Repository,
+  type Environment,
+} from "../db/repository";
+
+// The idempotency suite (chapter 2.3): staged failure without keys,
+// enforced deduplication with keys, concurrent retries, and cross-channel
+// key namespacing. Requires the compose Postgres — *.itest.ts keeps it
+// out of the Docker-free unit lane.
+
+// Guardrail: integration tests run against the LOCAL compose stack only.
+const url = new URL(process.env.DATABASE_URL ?? DEFAULT_DATABASE_URL);
+if (!["localhost", "127.0.0.1"].includes(url.hostname)) {
+  throw new Error(
+    `integration tests refuse non-local databases (got host "${url.hostname}") — never point this suite at a shared database`,
+  );
+}
+
+const pool = createPool();
+const db: Db = createDb(pool);
+let env: Environment;
+let repo: Repository;
+
+beforeAll(async () => {
+  await migrate(pool);
+  env = await createEnvironment(db, { name: "idempotency-itest" });
+  repo = new Repository(db, env.id);
+});
+
+afterAll(async () => {
+  await pool.end();
+});
+
+describe("idempotency enforcement (FR-MSG-04, DR-03)", () => {
+  it("a retry WITHOUT a key duplicates the message — journey 4's failure, staged", async () => {
+    const channel = await repo.createChannel("idem-no-key", "public");
+    await repo.sendMessage(channel.id, { text: "B2, north ramp" });
+    // The ack was lost; the client cannot know. It retries:
+    await repo.sendMessage(channel.id, { text: "B2, north ramp" });
+    const rows = await repo.listMessagesRaw(channel.id);
+    // Two rows, seq 1 and 2, identical text. The dispatcher reads it twice.
+    expect(rows.filter((m) => m.text === "B2, north ramp")).toHaveLength(2);
+  });
+
+  it("a retry WITH a key returns the ORIGINAL message — the fix", async () => {
+    const channel = await repo.createChannel("idem-with-key", "public");
+    const key = randomUUID();
+    const first = await repo.sendMessage(channel.id, {
+      text: "B2, north ramp",
+      idempotencyKey: key,
+    });
+    // The ack was lost; the client retries with the same key:
+    const retry = await repo.sendMessage(channel.id, {
+      text: "B2, north ramp",
+      idempotencyKey: key,
+    });
+    // One row, ever.
+    const rows = await repo.listMessagesRaw(channel.id);
+    expect(rows.filter((m) => m.text === "B2, north ramp")).toHaveLength(1);
+    // The retry got the ORIGINAL message back — same id, same seq.
+    expect(retry.id).toBe(first.id);
+    expect(retry.seq).toBe(first.seq);
+    expect(retry.duplicate).toBe(true);
+  });
+
+  it("five concurrent sends with the SAME key produce exactly one row", async () => {
+    const channel = await repo.createChannel("idem-concurrent", "public");
+    const key = randomUUID();
+    const results = await Promise.all(
+      Array.from({ length: 5 }, () =>
+        repo.sendMessage(channel.id, {
+          text: "concurrent send",
+          idempotencyKey: key,
+        }),
+      ),
+    );
+    // Exactly one row in the database.
+    const rows = await repo.listMessagesRaw(channel.id);
+    expect(rows.filter((m) => m.text === "concurrent send")).toHaveLength(1);
+    // All five responses carry the same id and seq.
+    const ids = new Set(results.map((r) => r.id));
+    const seqs = new Set(results.map((r) => r.seq));
+    expect(ids.size).toBe(1);
+    expect(seqs.size).toBe(1);
+  });
+
+  it("a recognised duplicate consumes no sequence number", async () => {
+    const channel = await repo.createChannel("idem-no-burn", "public");
+    const key = randomUUID();
+    await repo.sendMessage(channel.id, { text: "once", idempotencyKey: key });
+    await repo.sendMessage(channel.id, { text: "once", idempotencyKey: key });
+    await repo.sendMessage(channel.id, { text: "once", idempotencyKey: key });
+    // Three sends, one row — and the NEXT message gets seq 2, not seq 4:
+    // a retry that wrote nothing spends nothing (FR-MSG-02 tolerates gaps,
+    // but there is no reason to manufacture them).
+    const next = await repo.sendMessage(channel.id, { text: "after" });
+    expect(next.seq).toBe(2);
+  });
+
+  it("the same key in DIFFERENT channels produces two rows — key namespace is the channel", async () => {
+    const channelA = await repo.createChannel("idem-ns-a", "public");
+    const channelB = await repo.createChannel("idem-ns-b", "public");
+    const key = randomUUID();
+    const a = await repo.sendMessage(channelA.id, {
+      text: "same key, different channel",
+      idempotencyKey: key,
+    });
+    const b = await repo.sendMessage(channelB.id, {
+      text: "same key, different channel",
+      idempotencyKey: key,
+    });
+    // Two distinct rows — the key's scope is (channel_id, key), not global.
+    expect(a.id).not.toBe(b.id);
+    expect(
+      (await repo.listMessagesRaw(channelA.id)).filter(
+        (m) => m.text === "same key, different channel",
+      ),
+    ).toHaveLength(1);
+    expect(
+      (await repo.listMessagesRaw(channelB.id)).filter(
+        (m) => m.text === "same key, different channel",
+      ),
+    ).toHaveLength(1);
+  });
+});
 ```
 
 ```diff title="services/api/src/messages/idempotency.itest.ts"
