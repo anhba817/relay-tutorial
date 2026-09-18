@@ -72,7 +72,6 @@ of the fence checker and expensive on the APPLY half; this is the APPLY half.
      "ws": "^8.21.1"
    }
  }
-\ No newline at end of file
 ```
 
 ---
@@ -395,7 +394,7 @@ enumerates what exists — so the comparison now strips the one field that
 legitimately differs.
 
 ```diff title="services/api/src/auth/credentials.itest.ts"
-@@ -14,12 +14,13 @@ import {
+@@ -14,12 +14,13 @@
    environmentSigningSecret,
    provisionOrganisation,
    Repository,
@@ -409,7 +408,7 @@ legitimately differs.
  // The refusals, over real HTTP against the compose Postgres.
  // Invariants 1-7, 9 and 11 of contracts/credentials.md live here; 8 and 12 are
  // pure and live in the unit lane; 10 needs a socket and lives in the gateway's
-@@ -404,32 +405,47 @@ describe("credentials", () => {
+@@ -404,32 +405,47 @@
      // `key.credential.split("_").at(-1)` was the secret only by luck, and MEASURED OVER
      // 200,000 MINTS it is luck that runs out both ways. The secret is base64url of 32
      // bytes and `_` IS IN THAT ALPHABET:
@@ -461,7 +460,7 @@ legitimately differs.
  
    it("signup hands over exactly one key, and only when it creates something", async () => {
      // R8: with no console session, signup is the only thing that can bootstrap
-@@ -616,7 +632,68 @@ describe("credentials", () => {
+@@ -616,7 +632,68 @@
        const body = (await res.json()) as { code?: string; message?: string };
        expect(body.code).toBe("wrong_credential_type");
        // And it must not quote the credential back (NFR-SEC-06).
@@ -530,7 +529,6 @@ legitimately differs.
 +    });
 +  });
  });
-\ No newline at end of file
 ```
 
 ---
@@ -883,472 +881,30 @@ restriction; the chapters that followed added rules to it without discussing the
 This one is lane hygiene, which no chapter teaches.
 
 ```diff title="eslint.config.mjs"
-@@ -1,11 +1,277 @@
- import eslint from "@eslint/js";
- import globals from "globals";
- import tseslint from "typescript-eslint";
- 
- // One lint config for the whole workspace (ADR-01's consequence made literal).
-+// ── THE RESTRICTION SETS, HOISTED SO THEY CAN BE COMPOSED ───────────────────────
-+//
-+// `no-restricted-imports` is ONE rule, and in flat config a later block REPLACES an
-+// earlier block's setting for it rather than merging. Everything below exists because
-+// of that sentence: a second block matching `**/*.itest.ts` — every one of which the
-+// `**/*.ts` block already matched — switches the first block's rule OFF for every
-+// integration test in the workspace, silently.
-+//
-+// MEASURED BEFORE IT WAS WRITTEN. `services/api/src/channels/channels.itest.ts` is on
-+// no exemption list. Given `import { sql } from "drizzle-orm"` it fails lint under a
-+// single block, and under a naively-added second block the only error left is
-+// `'sql' is defined but never used`.
-+const DRIVER_AND_ENGINE = {
-+  paths: [
-+    {
-+      name: "pg",
-+      message:
-+        "Raw database access is forbidden outside services/api/src/db (constitution I).",
-+    },
-+    {
-+      name: "drizzle-orm",
-+      message:
-+        "The query engine lives inside the repository layer only (constitution I, ADR-16).",
-+    },
-+    {
-+      name: "ioredis",
-+      message:
-+        "The counter store lives in services/api/src/limits and services/gateway/src/limits.ts only (constitution I). Its keys are per environment; an unrestricted client is a cross-tenant read.",
-+    },
-+  ],
-+  patterns: [
-+    {
-+      group: ["drizzle-orm/*"],
-+      message:
-+        "The query engine lives inside the repository layer only (constitution I, ADR-16).",
-+    },
-+  ],
-+};
-+
-+// The paths excused from the driver and the engine. Two data-access LAYERS as
-+// directories and everything else by path, each with the argument it needs.
-+const DRIVER_EXEMPT = [
-+    "services/api/src/db/**",
-+    "services/api/src/limits/**",
-+    // DRIVER_EXEMPT — every path below is exempt from all three restricted modules,
-+    // the driver's name on the marker notwithstanding: `driver-exempt.test.ts` reads
-+    // the module names out of the rule, so this list governs whatever the rule names.
-+    //
-+    // First the lane's own infrastructure. Reasons, one per path:
-+    //   global-setup.ts  installs the guard against a database vitest names
-+    //   setup.ts         rewrites the connection string to carry the exemption
-+    //   guard.itest.ts   holds one exempt client and one plain one, and the
-+    //                    difference between them is the whole test
-+    "packages/test-harness/src/global-setup.ts",
-+    "packages/test-harness/src/setup.ts",
-+    "packages/test-harness/src/guard.itest.ts",
-+  // AND THE LANE RESET'S OWN TEST, which arrives with the table it clears. It asserts
-+  // what the SCRIPT DID — a planted stale delivery gone, an organisation count unmoved
-+  // — and both are facts about rows the script reached through its own connection.
-+  // Going through the repository layer would mean asserting the script's effect against
-+  // the code the script does not use.
-+  "packages/test-harness/src/reset-lane.itest.ts",
-+    // AND TWO SUITES THAT WRITE A ROW THE TYPE SYSTEM FORBIDS.
-+    //
-+    //   backfill.itest.ts  asserts what `toFrame` does with a SENDERLESS message.
-+    //                      Those rows exist — every one written through the socket
-+    //                      before the sender was threaded looks like this — and the
-+    //                      repository can no longer produce one, because `userId` is
-+    //                      required. The fixture has to be raw SQL or the behaviour
-+    //                      has no test at all.
-+    //   history.itest.ts   reads the same row from the other end: a page whose
-+    //                      `user` comes back null. FR-MSG-15 made `sendMessage`
-+    //                      require a sender, so this suite lost the ability to build
-+    //                      its own fixture in the same change that gave it the case.
-+    //
-+    // This is the exemption's honest case: not "the repository is inconvenient" but
-+    // "the state under test is one the repository is now unable to reach". Both are
-+    // listed by path rather than reached through a shared helper, because a helper in
-+    // another file names none of these specifiers and this rule sees only imports —
-+    // an invisible exemption is worse than a listed one.
-+    "services/api/src/internal/backfill.itest.ts",
-+    "services/api/src/messages/history.itest.ts",
-+    // THE QUOTA CHAPTER'S PERIOD SUITE, and its case is the two above's in a third
-+    // shape: the state under test is one the repository cannot reach. `periodOf`
-+    // returns the month a timestamp falls in, and the property is that a row INSERTED
-+    // under that value is FOUND by it — which needs a `usage_periods` row written
-+    // directly, because every repository path that writes one derives the period from
-+    // the clock and so cannot disagree with the function under test.
-+    //
-+    // A suite that used the repository here would be asserting that `periodOf` equals
-+    // itself.
-+    "services/api/src/quotas/period.itest.ts",
-+    // AND THE QUOTA SUITE ITSELF, for a different reason from its sibling above.
-+    // `period.itest.ts` writes a row the repository cannot; this one READS the two
-+    // roll-up tables directly to check what a send left behind. Going through
-+    // `usageFor` would mean asserting the roll-up against the function that reads
-+    // it — the same circularity, one table over.
-+    "services/api/src/quotas/quotas.itest.ts",
-+    // AND THE CONNECTION-METERING CHAPTER'S, WHICH MAKES THE SAME CLAIM ONE
-+    // DIMENSION OVER: a credited minute survives a `FLUSHALL` of the counter store,
-+    // because a quota is about THIS MONTH and the rate limiter's store is allowed to
-+    // lose things. Proving that needs the flush, and the flush needs a raw client.
-+    //
-+    // LISTED RATHER THAN DODGED. Published's version reached for
-+    // `await import("ioredis")` inside the test, which this rule cannot see — an
-+    // exemption that is invisible, which the note at the top of this block calls
-+    // worse than a listed one. The static import puts it back under the rule and
-+    // this entry is the answer.
-+    "services/api/src/quotas/connections.itest.ts",
-+    // ── AND EVERY OTHER REDIS CLIENT, BY PATH, WITH THE ARGUMENT IT NEEDS ──
-+    //
-+    // The rule arrives here and TWELVE files older than it already import `ioredis`.
-+    // A missing exemption is not a silent one — this rule goes red on a chapter
-+    // nobody is editing — so all of them land in the commit that adds the rule.
-+    // FIVE DIFFERENT ARGUMENTS, and a blanket "the gateway's Redis files" would
-+    // erase all five distinctions the rule exists to make.
-+    //
-+    // (1) NO KEY IS TOUCHED AT ALL — these name a pub/sub SUBJECT and never a key,
-+    // which is the property, not whether they publish or subscribe. The subjects are
-+    // `chan:{channel_id}`, `member:{channel_id}` and `typing:{channel_id}`: a channel
-+    // UUID, and a subject is not readable at all, only listened to by whoever already
-+    // subscribed. There is no key here for a cross-tenant read to reach. (The api's
-+    // two publishers publish; the gateway's `membership.ts` only ever subscribes,
-+    // because the api publishes that fabric — and the argument is the same either
-+    // way.)
-+    "services/api/src/fanout/publisher.ts",
-+    "services/api/src/membership/publisher.ts",
-+    //
-+    // (2) THE COUNTER STORE'S OTHER HALF. `rl:{environment_id}:…` is the key shape
-+    // the whole restriction is about, and this file composes it — so it is exempt as
-+    // the rule's own subject, not against its reason. `limits.itest.ts` is listed
-+    // beside it for something the rule cannot express at all: its subject is that
-+    // the api and the gateway increment the SAME key, and the only way to check that
-+    // is to read the key with NEITHER of their code.
-+    "services/gateway/src/limits.ts",
-+    "services/gateway/src/limits.itest.ts",
-+    "services/gateway/src/fanout.ts",
-+    // `member:{env}:{user}` — the principal-addressed half of that fabric — DOES
-+    // carry an environment id, and that still does not make it the limiter's case:
-+    // a subject is not readable, and the id is composed from the repository's own
-+    // scope on the way out and from the authenticated connection's identity on the
-+    // way in, never read from a payload.
-+    "services/gateway/src/membership.ts",
-+    // `typing.ts` both publishes and subscribes and composes no key at all — the
-+    // environment travels INSIDE the payload, where the receiving gateway checks it
-+    // against the connection it is about to act on.
-+    "services/gateway/src/typing.ts",
-+    //
-+    // (2) KEYS ARE COMPOSED AND THEY ARE ENVIRONMENT-SCOPED — the limiter's own
-+    // argument rather than the publishers'. `presence:{env}:{user}` is exactly the
-+    // shape the restriction guards. Every key is composed from the environment id on
-+    // the authenticated connection's own identity; no path takes one from a client,
-+    // and there is no scan, `KEYS` or pattern read that could reach another tenant's.
-+    "services/gateway/src/presence.ts",
-+    //
-+    // (3) THE ENVIRONMENT COMES FIRST IN THE KEY, which is the strongest case on
-+    // this list rather than the weakest. `conn:{env}:{user}:{slot}` makes
-+    // constitution I structural in the key itself: reaching across a tenant needs a
-+    // caller to hand this module another environment's id, and the session layer
-+    // takes that from the api's verified identity. The other entries argue about
-+    // what they touch; this one cannot be wrong without being lied to.
-+    "services/gateway/src/connections.ts",
-+    //
-+    // (4) THE SUBJECT IS WHAT REACHES THE FABRIC, so the oracle cannot be either
-+    // service's own client. A spy on `createFanout` or on `createPresence` proves
-+    // that an object was asked to publish, not that a frame arrived — and these
-+    // suites' receive halves have rejection paths (a body that is not JSON, a body
-+    // that is JSON and not a transition) that no module-level API can produce,
-+    // because each only ever publishes payloads its own schema built.
-+    "services/api/src/fanout/fanout.itest.ts",
-+    "services/gateway/src/presence.itest.ts",
-+    "services/gateway/src/membership.itest.ts",
-+    "services/gateway/src/typing.itest.ts",
-+    //
-+    // (5) THE RAW CLIENT IS THE STIMULUS, NOT THE ORACLE — a fifth reason, and the
-+    // rule cannot express it. This suite's subject is delivery and it asserts on
-+    // sockets. It needs a client to CAUSE a membership change: `Membership` exposes
-+    // `onChange`, `subscribeChannel` and `watch` and no `publish`, because the api
-+    // publishes and the gateway only ever subscribes.
-+    "services/gateway/src/connections.itest.ts",
-+    //
-+    // `services/gateway/src/connections.test.ts` IS DELIBERATELY ABSENT, and the
-+    // ledger that owed these entries said to add it. It reads the module's own
-+    // source off disk and imports nothing restricted, so the exemption would be one
-+    // over nothing — and `driver-exempt.test.ts`'s stale-entry check is the half of
-+    // this list that goes red when a listed file stops needing it.
-+];
-+
-+// The suites that drive a global drain on purpose — derived by asking, not by
-+// remembering: these are exactly the `*.itest.ts` files in this tree that import one of
-+// the functions `GLOBAL_DRAINS` names, and `drain-exempt.test.ts` asserts that in both
-+// directions against the tree rather than against a second list.
-+const DRAIN_EXEMPT_TESTS = [
-+  // `outboxDepth` — the relay's whole subject IS a global drain.
-+  "services/api/src/outbox/outbox.itest.ts",
-+  // `drainDueDeliveries`, `sweepDisabledEndpoints`, `pendingDeliveryDepth`.
-+  "services/api/src/webhooks/deliveries.itest.ts",
-+  // `drainDueDeliveries`.
-+  "services/api/src/webhooks/attempts.itest.ts",
-+  //
-+  // THREE, AND PUBLISHED'S LIST IS SIX. `test-event.itest.ts`,
-+  // `notifications.itest.ts` and `dispatcher.itest.ts` are on it there and import
-+  // nothing restricted HERE: two name a drain only in prose explaining why they do not
-+  // call one, and the dispatcher's suite declares `drainDueDeliveries` as a property on
-+  // a stub it builds. Listing them would be three standing exemptions over nothing on
-+  // the list's first day — the failure mode this file's own note calls out, arriving
-+  // by inheritance rather than by drift.
-+  //
-+  // `drain-exempt.test.ts` found all three, which is the only reason the list is three
-+  // long. It reads the names out of `DRAIN_NAMES` below and asserts both directions
-+  // against the TREE.
-+];
-+
-+/** The six functions, and the two counts that cannot be bounded. Named once so the
-+ * two specifier spellings below cannot drift apart. */
-+const DRAIN_NAMES = [
-+  "drainOutbox",
-+  "drainDueDeliveries",
-+  "drainDisableNotifications",
-+  "drainQuotaNotifications",
-+  "sweepDisabledEndpoints",
-+  "outboxDepth",
-+  "pendingDeliveryDepth",
-+];
-+
-+const DRAIN_MESSAGE =
-+  "This claims or counts rows across EVERY environment. In an integration test that " +
-+  "is a local assertion about a global operation, or a global operation over a " +
-+  "neighbour's fixture. Scope the assertion to rows this test created, or add the " +
-+  "suite to DRAIN_EXEMPT_TESTS with its reason.";
-+
-+// THE GLOBAL ADMIN FUNCTIONS, RESTRICTED IN INTEGRATION TESTS.
-+//
-+// Six recorded instances of one fault: a test asserts a local fact about a global
-+// operation, or performs one and damages a neighbour's fixture. Each imported one of
-+// these and called it as though the database held only its own rows.
-+//
-+// The two `*Depth` functions are here for a different reason from the other five. They
-+// take no batch size and cannot — a count has nothing to bound — and a global count
-+// compared against itself is the instance that appeared twice in one file, four
-+// chapters apart.
-+//
-+// WHAT THIS DOES NOT CATCH, and must not be trusted to: an indirect call — a helper in
-+// another file that calls the function, imported here under an innocent name — and raw
-+// SQL, which names no import at all. Both are the sentinel trigger's job; it watches
-+// STATEMENTS rather than imports. A rule trusted further than it goes is worse than no
-+// rule.
-+//
-+// BOTH SPELLINGS, because `no-restricted-imports` matches the specifier as WRITTEN.
-+// `../db/repository` and `./repository` are two rules, and the second is the one a
-+// suite inside `services/api/src/db/` would use.
-+const GLOBAL_DRAINS = {
-+  paths: [
-+    {
-+      name: "../db/repository",
-+      importNames: DRAIN_NAMES,
-+      message: DRAIN_MESSAGE,
-+    },
-+    {
-+      name: "./repository",
-+      importNames: DRAIN_NAMES,
-+      message: DRAIN_MESSAGE,
-+    },
-+  ],
-+};
-+
- export default tseslint.config(
+@@ -273,13 +273,15 @@
    { ignores: ["**/node_modules/**", "**/dist/**", "**/coverage/**"] },
    eslint.configs.recommended,
    ...tseslint.configs.recommended,
    {
      // Dev scripts run on Node directly, outside any package's tsconfig —
-@@ -39,168 +305,145 @@ export default tseslint.config(
-     // file that imports the driver; nothing here can catch a LISTED file that stopped
-     // importing it, so the list can only grow and a stale entry holds a standing
-     // exemption forever. `driver-exempt.test.ts` reads this array and asserts each
-     // path exists and still imports a module the rule below restricts — with those
-     // module names read out of the rule rather than restated.
-     files: ["**/*.ts"],
--    ignores: [
--      "services/api/src/db/**",
--      "services/api/src/limits/**",
--      // DRIVER_EXEMPT — every path below is exempt from all three restricted modules,
--      // the driver's name on the marker notwithstanding: `driver-exempt.test.ts` reads
--      // the module names out of the rule, so this list governs whatever the rule names.
--      //
--      // First the lane's own infrastructure. Reasons, one per path:
--      //   global-setup.ts  installs the guard against a database vitest names
--      //   setup.ts         rewrites the connection string to carry the exemption
--      //   guard.itest.ts   holds one exempt client and one plain one, and the
--      //                    difference between them is the whole test
--      "packages/test-harness/src/global-setup.ts",
--      "packages/test-harness/src/setup.ts",
--      "packages/test-harness/src/guard.itest.ts",
--      // AND TWO SUITES THAT WRITE A ROW THE TYPE SYSTEM FORBIDS.
--      //
--      //   backfill.itest.ts  asserts what `toFrame` does with a SENDERLESS message.
--      //                      Those rows exist — every one written through the socket
--      //                      before the sender was threaded looks like this — and the
--      //                      repository can no longer produce one, because `userId` is
--      //                      required. The fixture has to be raw SQL or the behaviour
--      //                      has no test at all.
--      //   history.itest.ts   reads the same row from the other end: a page whose
--      //                      `user` comes back null. FR-MSG-15 made `sendMessage`
--      //                      require a sender, so this suite lost the ability to build
--      //                      its own fixture in the same change that gave it the case.
--      //
--      // This is the exemption's honest case: not "the repository is inconvenient" but
--      // "the state under test is one the repository is now unable to reach". Both are
--      // listed by path rather than reached through a shared helper, because a helper in
--      // another file names none of these specifiers and this rule sees only imports —
--      // an invisible exemption is worse than a listed one.
--      "services/api/src/internal/backfill.itest.ts",
--      "services/api/src/messages/history.itest.ts",
--      // THE QUOTA CHAPTER'S PERIOD SUITE, and its case is the two above's in a third
--      // shape: the state under test is one the repository cannot reach. `periodOf`
--      // returns the month a timestamp falls in, and the property is that a row INSERTED
--      // under that value is FOUND by it — which needs a `usage_periods` row written
--      // directly, because every repository path that writes one derives the period from
--      // the clock and so cannot disagree with the function under test.
--      //
--      // A suite that used the repository here would be asserting that `periodOf` equals
--      // itself.
--      "services/api/src/quotas/period.itest.ts",
--      // AND THE QUOTA SUITE ITSELF, for a different reason from its sibling above.
--      // `period.itest.ts` writes a row the repository cannot; this one READS the two
--      // roll-up tables directly to check what a send left behind. Going through
--      // `usageFor` would mean asserting the roll-up against the function that reads
--      // it — the same circularity, one table over.
--      "services/api/src/quotas/quotas.itest.ts",
--      // ── AND EVERY OTHER REDIS CLIENT, BY PATH, WITH THE ARGUMENT IT NEEDS ──
--      //
--      // The rule arrives here and TWELVE files older than it already import `ioredis`.
--      // A missing exemption is not a silent one — this rule goes red on a chapter
--      // nobody is editing — so all of them land in the commit that adds the rule.
--      // FIVE DIFFERENT ARGUMENTS, and a blanket "the gateway's Redis files" would
--      // erase all five distinctions the rule exists to make.
--      //
--      // (1) NO KEY IS TOUCHED AT ALL — these name a pub/sub SUBJECT and never a key,
--      // which is the property, not whether they publish or subscribe. The subjects are
--      // `chan:{channel_id}`, `member:{channel_id}` and `typing:{channel_id}`: a channel
--      // UUID, and a subject is not readable at all, only listened to by whoever already
--      // subscribed. There is no key here for a cross-tenant read to reach. (The api's
--      // two publishers publish; the gateway's `membership.ts` only ever subscribes,
--      // because the api publishes that fabric — and the argument is the same either
--      // way.)
--      "services/api/src/fanout/publisher.ts",
--      "services/api/src/membership/publisher.ts",
--      //
--      // (2) THE COUNTER STORE'S OTHER HALF. `rl:{environment_id}:…` is the key shape
--      // the whole restriction is about, and this file composes it — so it is exempt as
--      // the rule's own subject, not against its reason. `limits.itest.ts` is listed
--      // beside it for something the rule cannot express at all: its subject is that
--      // the api and the gateway increment the SAME key, and the only way to check that
--      // is to read the key with NEITHER of their code.
--      "services/gateway/src/limits.ts",
--      "services/gateway/src/limits.itest.ts",
--      "services/gateway/src/fanout.ts",
--      // `member:{env}:{user}` — the principal-addressed half of that fabric — DOES
--      // carry an environment id, and that still does not make it the limiter's case:
--      // a subject is not readable, and the id is composed from the repository's own
--      // scope on the way out and from the authenticated connection's identity on the
--      // way in, never read from a payload.
--      "services/gateway/src/membership.ts",
--      // `typing.ts` both publishes and subscribes and composes no key at all — the
--      // environment travels INSIDE the payload, where the receiving gateway checks it
--      // against the connection it is about to act on.
--      "services/gateway/src/typing.ts",
--      //
--      // (2) KEYS ARE COMPOSED AND THEY ARE ENVIRONMENT-SCOPED — the limiter's own
--      // argument rather than the publishers'. `presence:{env}:{user}` is exactly the
--      // shape the restriction guards. Every key is composed from the environment id on
--      // the authenticated connection's own identity; no path takes one from a client,
--      // and there is no scan, `KEYS` or pattern read that could reach another tenant's.
--      "services/gateway/src/presence.ts",
--      //
--      // (3) THE ENVIRONMENT COMES FIRST IN THE KEY, which is the strongest case on
--      // this list rather than the weakest. `conn:{env}:{user}:{slot}` makes
--      // constitution I structural in the key itself: reaching across a tenant needs a
--      // caller to hand this module another environment's id, and the session layer
--      // takes that from the api's verified identity. The other entries argue about
--      // what they touch; this one cannot be wrong without being lied to.
--      "services/gateway/src/connections.ts",
--      //
--      // (4) THE SUBJECT IS WHAT REACHES THE FABRIC, so the oracle cannot be either
--      // service's own client. A spy on `createFanout` or on `createPresence` proves
--      // that an object was asked to publish, not that a frame arrived — and these
--      // suites' receive halves have rejection paths (a body that is not JSON, a body
--      // that is JSON and not a transition) that no module-level API can produce,
--      // because each only ever publishes payloads its own schema built.
--      "services/api/src/fanout/fanout.itest.ts",
--      "services/gateway/src/presence.itest.ts",
--      "services/gateway/src/membership.itest.ts",
--      "services/gateway/src/typing.itest.ts",
--      //
--      // (5) THE RAW CLIENT IS THE STIMULUS, NOT THE ORACLE — a fifth reason, and the
--      // rule cannot express it. This suite's subject is delivery and it asserts on
--      // sockets. It needs a client to CAUSE a membership change: `Membership` exposes
--      // `onChange`, `subscribeChannel` and `watch` and no `publish`, because the api
--      // publishes and the gateway only ever subscribes.
--      "services/gateway/src/connections.itest.ts",
--      //
--      // `services/gateway/src/connections.test.ts` IS DELIBERATELY ABSENT, and the
--      // ledger that owed these entries said to add it. It reads the module's own
--      // source off disk and imports nothing restricted, so the exemption would be one
--      // over nothing — and `driver-exempt.test.ts`'s stale-entry check is the half of
--      // this list that goes red when a listed file stops needing it.
--    ],
-+    ignores: DRIVER_EXEMPT,
-+
-+    rules: {
-+      "no-restricted-imports": ["error", DRIVER_AND_ENGINE],
-+    },
-+  },
-+  {
-+    // ── AND THE UNION, WHICH IS THE WHOLE REASON THE SETS ARE NAMED ─────────────
-+    //
-+    // Every `*.itest.ts` the block above matched as `**/*.ts` is matched again here, so
-+    // this rule must be the UNION or the driver ban is switched off for all of them.
-+    // The two exemption lists are ignored here and given their own single rule below,
-+    // because `ignores` on the FIRST block cannot reach a rule the SECOND one sets.
-+    files: ["**/*.itest.ts"],
-+    ignores: [...DRAIN_EXEMPT_TESTS, ...DRIVER_EXEMPT],
+     // so the globals have to be declared rather than inferred (chapter 2.5).
+-    files: ["scripts/**/*.mjs"],
++    // `analytics/` is the same situation one directory over: chapter 4.2's schema runner
++    // talks to ClickHouse through Node's own `fetch` and runs outside every tsconfig.
++    files: ["scripts/**/*.mjs", "analytics/**/*.mjs"],
+     languageOptions: { globals: globals.nodeBuiltin },
+   },
+   {
+     // Isolation lives in data access, not in handlers (constitution I):
+     // only the repository layer may touch the driver.
+     //
+@@ -346,7 +348,104 @@
+     // on purpose; they are excused from nothing else.
+     files: DRAIN_EXEMPT_TESTS,
      rules: {
-       "no-restricted-imports": [
-         "error",
-         {
--          paths: [
--            {
--              name: "pg",
--              message:
--                "Raw database access is forbidden outside services/api/src/db (constitution I).",
--            },
--            {
--              name: "drizzle-orm",
--              message:
--                "The query engine lives inside the repository layer only (constitution I, ADR-16).",
--            },
-+          paths: [...DRIVER_AND_ENGINE.paths, ...GLOBAL_DRAINS.paths],
-+          patterns: DRIVER_AND_ENGINE.patterns,
-+        },
-+      ],
-+    },
-+  },
-+  {
-+    // The driver-exempt paths keep their exemption and gain the drain rule. Without
-+    // this block the union above would restore the ban they were excused from.
-+    files: DRIVER_EXEMPT,
-+    rules: {
-+      "no-restricted-imports": ["error", GLOBAL_DRAINS],
-+    },
-+  },
-+  {
-+    // And the drain-exempt suites get the driver rule alone. They drive a global drain
-+    // on purpose; they are excused from nothing else.
-+    files: DRAIN_EXEMPT_TESTS,
-+    rules: {
-+      "no-restricted-imports": ["error", DRIVER_AND_ENGINE],
-+    },
-+  },
+       "no-restricted-imports": ["error", DRIVER_AND_ENGINE],
+     },
+   },
 +  {
 +    // THE SEAL ON `packages/outsider` (FR-030, FR-034, research R12).
 +    //
@@ -1401,29 +957,23 @@ This one is lane hygiene, which no chapter teaches.
 +          paths: DRIVER_AND_ENGINE.paths,
 +          patterns: [
 +            ...DRIVER_AND_ENGINE.patterns,
-             {
--              name: "ioredis",
++            {
 +              group: ["@relay/*"],
-               message:
--                "The counter store lives in services/api/src/limits and services/gateway/src/limits.ts only (constitution I). Its keys are per environment; an unrestricted client is a cross-tenant read.",
++              message:
 +                "packages/outsider integrates from published documentation alone. It may not import workspace code — see the three levels in eslint.config.mjs.",
-             },
--          ],
--          patterns: [
-             {
--              group: ["drizzle-orm/*"],
++            },
++            {
 +              // NOT `/*` as a third entry here: minimatch matched `vitest/config` with
 +              // it, and a rule that refuses the test runner is a rule somebody turns
 +              // off. Absolute paths are covered by the syntax selector below, which
 +              // matches on the specifier itself.
 +              group: ["../*", "../../*"],
-               message:
--                "The query engine lives inside the repository layer only (constitution I, ADR-16).",
++              message:
 +                "packages/outsider may not reach outside itself. A relative path out of the package is the same import by another spelling.",
-             },
-           ],
-         },
-       ],
++            },
++          ],
++        },
++      ],
 +      "no-restricted-syntax": [
 +        "error",
 +        {
@@ -1450,10 +1000,9 @@ This one is lane hygiene, which no chapter teaches.
 +            "packages/outsider may not import by absolute path. See the three levels in eslint.config.mjs.",
 +        },
 +      ],
-     },
-   },
++    },
++  },
  );
-\ No newline at end of file
 ```
 
 ---
@@ -1498,16 +1047,13 @@ added lanes of their own, and 3.1 added the coverage lane. None of them is about
 what a shared database does to a suite that assumes it is alone.
 
 ```diff title="vitest.coverage.config.mts"
-@@ -18,8 +18,33 @@ import swc from "unplugin-swc";
- // would silently resolve nothing. It is harmless for the packages that use no
- // decorators.
- export default defineConfig({
+@@ -21,12 +21,37 @@
    test: {
-+    // Feature 030: the global-operation guard. `globalSetup` migrates and
-+    // then installs the trigger once per lane; `setupFiles` sets the
-+    // exemption for files on the harness's list and, where the lane carries
-+    // bait, plants it per file. This lane gets exemption
-+    // handling and NO bait: it holds no reader-shape fault, and planting
+     // Feature 030: the global-operation guard. `globalSetup` migrates and
+     // then installs the trigger once per lane; `setupFiles` sets the
+     // exemption for files on the harness's list and, where the lane carries
+     // bait, plants it per file. This lane gets exemption
+     // handling and NO bait: it holds no reader-shape fault, and planting
 +    // would change its workload for no return (feature 030).
 +    globalSetup: ["./packages/test-harness/src/global-setup.ts"],
 +    // FEATURE 030, MEASURED: nine suites in this lane import `AppModule`, and none
@@ -1528,11 +1074,20 @@ what a shared database does to a suite that assumes it is alone.
 +      RELAY_EVENT_CONSUMER: "off",
 +    },
 +    setupFiles: ["./packages/test-harness/src/setup.ts"],
-     include: [
-       "packages/*/src/**/*.test.ts",
-       "services/*/src/**/*.test.ts",
-       "packages/*/src/**/*.itest.ts",
-@@ -47,8 +72,12 @@ export default defineConfig({
++    // Feature 030: the global-operation guard. `globalSetup` migrates and
++    // then installs the trigger once per lane; `setupFiles` sets the
++    // exemption for files on the harness's list and, where the lane carries
++    // bait, plants it per file. This lane gets exemption
++    // handling and NO bait: it holds no reader-shape fault, and planting
+     // would change its workload for no return (FR-022).
+     globalSetup: ["./packages/test-harness/src/global-setup.ts"],
+     // FEATURE 030, MEASURED: nine suites in this lane import `AppModule`, and none
+     // of them set a relay flag. Each relay defaults to on when its flag is unset
+     // (`process.env.RELAY_OUTBOX_RELAY ?? "on"`), so those nine booted four
+     // background loops that sweep the whole database while every other suite's
+@@ -72,12 +97,16 @@
+         "packages/e2e/**",
+         // Entry points and framework wiring: reached by running the service,
          // not by asserting on it. Counting them measures how much of `main.ts`
          // a test happened to touch, which is not what "business logic" means.
          "**/main.ts",
@@ -1541,10 +1096,12 @@ what a shared database does to a suite that assumes it is alone.
 +        // counting how much of the harness a test touched measures the harness,
 +        // not the product.
 +        "packages/test-harness/src/**",
-       ],
-       thresholds: {
-         // Constitution VI, first clause: 70% of business logic. Set to what the
-         // constitution says, not to what the code achieves — a threshold tuned
+         // THE LANE'S OWN INFRASTRUCTURE IS NOT BUSINESS LOGIC. `include` is
+         // `packages/*/src/**`, so the harness arrived inside the measurement the
+         // moment it became a package. Its files run on every integration suite and
+         // would score near the top, raising the workspace figure while saying
+         // nothing about the product — the same dilution `**/*.module.ts` is
+         // excluded for.
 ```
 
 ---
@@ -1609,21 +1166,20 @@ column, are hygiene it never discusses. A chapter may only fence a change it
 explains.
 
 ```diff title="turbo.json"
-@@ -43,15 +43,28 @@
-         "RELAY_REDIS_PORT",
-         "RELAY_NATS_URL",
-         "RELAY_NATS_PORT",
-         "RELAY_OUTBOX_RELAY",
+@@ -47,15 +47,28 @@
          "RELAY_DELIVERY_RELAY",
          "RELAY_INTERNAL_CREDENTIAL",
+         "RELAY_INTERNAL_CREDENTIAL_GATEWAY",
+         "RELAY_METER_INTERVAL_MS",
+         "RELAY_AUTH_FAILURES_PER_MINUTE",
+         "RELAY_AUTH_KEY_PREFIX",
 +        "RELAY_INTERNAL_CREDENTIAL_GATEWAY",
 +        "RELAY_METER_INTERVAL_MS",
 +        "RELAY_AUTH_FAILURES_PER_MINUTE",
 +        "RELAY_AUTH_KEY_PREFIX",
          "RELAY_WEBHOOK_SECRET_KEY",
          "RELAY_EVENT_CONSUMER",
--        "RELAY_NATS_REPLICAS"
-+        "RELAY_NATS_REPLICAS",
+         "RELAY_NATS_REPLICAS",
 +        "RELAY_E2E_API_PORT",
 +        "RELAY_SMTP_URL",
 +        "RELAY_MAILPIT_URL",
@@ -1632,17 +1188,19 @@ explains.
 +        "RELAY_DOCS_BASE_URL",
 +        "RELAY_API_URL",
 +        "RELAY_WS_URL",
-+        "RELAY_DEMO_CREDENTIAL"
++        "RELAY_DEMO_CREDENTIAL",
+         "RELAY_QUOTA_RELAY"
        ]
      },
      "//#lint:root": {
        "inputs": [
          "**/*.{ts,mts,cts,mjs,js}",
-         "eslint.config.mjs",
 ```
 
 ```diff title="vitest.coverage.config.mts"
-@@ -41,8 +41,10 @@ export default defineConfig({
+@@ -39,12 +39,14 @@
+     // a property of the lane rather than a convention nobody applied.
+     env: {
        RELAY_OUTBOX_RELAY: "off",
        RELAY_DELIVERY_RELAY: "off",
        RELAY_NOTIFICATION_RELAY: "off",
@@ -1651,18 +1209,20 @@ explains.
 +      RELAY_QUOTA_RELAY: "off",
      },
      setupFiles: ["./packages/test-harness/src/setup.ts"],
-     include: [
-       "packages/*/src/**/*.test.ts",
+     // Feature 030: the global-operation guard. `globalSetup` migrates and
+     // then installs the trigger once per lane; `setupFiles` sets the
+     // exemption for files on the harness's list and, where the lane carries
+     // bait, plants it per file. This lane gets exemption
 ```
 
 ```diff title="packages/e2e/src/harness.ts"
-@@ -399,19 +399,35 @@ export async function boot({ gateways = 2 } = {}): Promise<System> {
-       "RELAY_NATS_PORT",
-       // The api decrypts webhook signing secrets and authenticates
-       // the dispatcher. Both are configuration, and a child that invents either
-       // would be a second source of truth for a credential.
-       "RELAY_WEBHOOK_SECRET_KEY",
-       "RELAY_INTERNAL_CREDENTIAL",
+@@ -406,19 +406,35 @@
+       // prefix. Forwarded for the reason this list exists at all — turbo runs
+       // tasks in STRICT env mode, so an undeclared variable reaches a child as
+       // `undefined` and the `??` behind it silently wins. A suite that raised the
+       // threshold would raise it in the parent and not in the api the child runs.
+       "RELAY_AUTH_FAILURES_PER_MINUTE",
+       "RELAY_AUTH_KEY_PREFIX",
 +      // The rate-limit chapter's other half: where the notification relay posts its SMTP.
 +      // The lane runs Mailpit on 11025 and the default is 1025, so an
 +      // unforwarded variable is not a missing feature — it is a mailer talking
@@ -1715,9 +1275,12 @@ a reader code the chapter never discusses.
   `Omit<ApiClient, "reportUsage">` so six stubs did not each grow a no-op.
 
 ```diff title="vitest.coverage.config.mts"
-@@ -271,6 +271,46 @@ export default defineConfig({
-           lines: 100,
-           statements: 100,
+@@ -583,12 +583,52 @@
+         "services/api/src/quotas/quota-relay.ts": {
+           branches: 100,
+           functions: 100,
+           lines: 96,
+           statements: 96,
          },
 +
 +        // The connection-metering chapter's three, pinned at what they measure, with a reason each.
@@ -1762,6 +1325,9 @@ a reader code the chapter never discusses.
        },
      },
    },
+   plugins: [
+     swc.vite({
+       module: { type: "es6" },
 ```
 
 ```diff title="services/gateway/src/resume.itest.ts"
@@ -1878,7 +1444,10 @@ lane *because* it needs a stack nobody in that lane starts. Coverage needs the s
 sentence and got it a feature late.
 
 ```diff title="vitest.coverage.config.mts"
-@@ -55,7 +55,23 @@
+@@ -79,13 +79,29 @@
+       "packages/*/src/**/*.itest.ts",
+       "services/*/src/**/*.itest.ts",
+     ],
      // The e2e journey spawns real services and is excluded on purpose: it
      // measures the system, not any file's branches, and its child processes'
      // coverage is not attributable here anyway.
@@ -1901,8 +1470,11 @@ sentence and got it a feature late.
 +      "packages/outsider/**",
 +    ],
      // Suites in one process would share a database in ways their authors did
-     // not design for — the outbox chapter's outbox suite learned that the hard way.
+     // not design for — the outbox chapter's suite learned that the hard way.
      fileParallelism: false,
+     testTimeout: 60_000,
+     hookTimeout: 60_000,
+     coverage: {
 ```
 
 ---
@@ -2165,10 +1737,13 @@ operand was **evaluated**, not when it went both ways, so a guard whose left sid
 reads as fully covered. Constitution VI's 100%-branch clause is stated in exactly this number.
 
 ```diff title="vitest.coverage.config.mts"
-@@ -467,6 +467,42 @@ export default defineConfig({
-           statements: 97,
-         },
- 
+@@ -309,12 +309,48 @@
+         // `analytics.ts` is here for a different reason: everything it does is
+         // decide what NOT to put on a stream. Its allow-list is the mechanism
+         // standing between a customer's payload and seven days of retention
+         // (FR-004, SC-006), and its `catch` is what stops an analytics outage
+         // becoming a delivery outage (contract invariant 4). Both are branches, and
+         // an unmeasured branch here fails silently in the direction nobody checks.
 +        // The attachment shape and the REST door's schemas, both at 100 on
 +        // all four metrics — which is why neither appears in the text reporter's table
 +        // and why this pin was written from `coverage-summary.json` instead.
@@ -2208,6 +1783,9 @@ reads as fully covered. Constitution VI's 100%-branch clause is stated in exactl
          "services/api/src/webhooks/disable.ts": {
            branches: 100,
            functions: 100,
+           lines: 100,
+           statements: 100,
+         },
 ```
 
 ## Feature 043 — fixing the review's findings
@@ -2306,7 +1884,7 @@ at 4710-4769 — an overlap the retired port map recorded and nobody could act o
 health probe also asked for `/health`, a route this api has never served.
 
 ```diff title="services/gateway/src/presence.itest.ts"
-@@ -91,13 +91,15 @@ interface ApiUnderTest {
+@@ -91,13 +91,15 @@
  }
  
  /** Two members of ONE channel, which no existing gateway fixture provides:
@@ -2323,7 +1901,7 @@ health probe also asked for `/health`, a route this api has never served.
        "the api is not built — run `pnpm build` before this lane " +
          "(the suite talks to the real service, not a stub)",
      );
-@@ -174,29 +176,51 @@ async function startApi(): Promise<ApiUnderTest> {
+@@ -174,29 +176,51 @@
    await otherRepo.addMember(elsewhere.id, stranger.id);
    const otherKey = await seeder.createApiKey(db, { environmentId: other.id });
  
@@ -2385,7 +1963,7 @@ health probe also asked for `/health`, a route this api has never served.
      credential: key.credential,
      subjects,
      outboxCount: async () => {
-       const result = (await pool.query("select count(*)::int as n from outbox")) as {
+       /** THIS ENVIRONMENT'S ROWS, NOT THE TABLE'S.
 ```
 
 `isolation.itest.ts` starts TWO api children, and its band came with a counter so the
@@ -2488,7 +2066,6 @@ generation.
      "unplugin-swc": "^1.5.9"
    }
  }
-\ No newline at end of file
 ```
 
 `drizzle.config.ts` goes with it. A config file for a retired tool is the thing that
