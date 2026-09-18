@@ -29,14 +29,82 @@
 // no chapter is made to lie.
 //
 // Usage: node scripts/check-fence-chain.mjs [--verbose]
+//        node scripts/check-fence-chain.mjs --dump <dir> [--at <page>]
+//
+// `--dump` writes the replayed state of every chained path, so a hunk can be
+// generated against the bytes the CHECK replays rather than against the working
+// tree. It is an OUTPUT MODE: no threshold, no exemption, no change to what the
+// checker accepts or to any exit code. Feature 055 (ADR-29).
+//
+// Two modes, because the failure classes need different states. `turbo.json`
+// replays to 62 lines at chapter 3.22 and 74 after the appendix, so a hunk
+// generated against the final state carries twelve lines of context that do not
+// exist where the hunk lives:
+//
+//   --dump <dir>              each path AFTER every chapter and the appendix.
+//                             Serves the appendix hunks and the HEAD divergences.
+//                             This is the ENGLISH chain — the appendix loop
+//                             mutates en.state only, and the vi chain is replayed
+//                             after it, so the two ends differ (050-3).
+//   --dump <dir> --at <page>  each path AS THAT PAGE IS REACHED, before its own
+//                             fences apply. Serves a chapter's own hunks.
+//                             <page> is the path the problem line prints, which
+//                             begins app/(en)/ or app/(vi)/vi/ — so the locale is
+//                             inside the argument and there is no --locale flag.
 
-import { readdirSync, readFileSync, existsSync, statSync } from "node:fs";
+import {
+  readdirSync,
+  readFileSync,
+  existsSync,
+  statSync,
+  mkdirSync,
+  writeFileSync,
+} from "node:fs";
 import { join, dirname, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const APP_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const PLATFORM = join(APP_ROOT, "..", "relay-platform");
 const VERBOSE = process.argv.includes("--verbose");
+
+/** Flags, found BY NAME rather than by position. `pnpm check:fences -- --dump X`
+ * forwards a literal `--` ahead of the flag; `pnpm check:fences --dump X` does
+ * not. Both reach here, so neither argv[0] nor any offset means anything. */
+const ARGV = process.argv.slice(2);
+const flagValue = (name) => {
+  const i = ARGV.indexOf(name);
+  return i >= 0 && i + 1 < ARGV.length ? ARGV[i + 1] : null;
+};
+const DUMP_DIR = flagValue("--dump");
+const DUMP_AT = flagValue("--at");
+if (ARGV.includes("--dump") && !DUMP_DIR) {
+  console.error("check-fence-chain: --dump needs a directory");
+  process.exit(2);
+}
+if (ARGV.includes("--at") && !DUMP_AT) {
+  console.error("check-fence-chain: --at needs a page path");
+  process.exit(2);
+}
+if (DUMP_AT && !DUMP_DIR) {
+  console.error("check-fence-chain: --at means nothing without --dump");
+  process.exit(2);
+}
+
+/** Write a replayed state out, one file per path, at the path itself.
+ *
+ * THE TRAILING NEWLINE IS PART OF THE CONTRACT. `fileLines()` reads the tree and
+ * drops a final empty element, so the check compares arrays with no trailing
+ * blank on either side. A dump that omits the newline reads one line short of the
+ * tree and looks like a divergence that does not exist — which cost feature 055's
+ * own analysis two wrong measurements before it was written down. */
+function writeState(state, dir, label) {
+  for (const [path, lines] of state) {
+    const file = join(dir, path);
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, lines.join("\n") + "\n");
+  }
+  console.error(`check-fence-chain: dumped ${state.size} paths — ${label}`);
+}
 
 /** Titles that name no real file — prose illustrations, not fences. */
 const NOT_A_FILE = (title) =>
@@ -135,13 +203,16 @@ function applyHunks(state, body, where, problems) {
   return text.split("\n");
 }
 
-function replay(locale, problems) {
+function replay(locale, problems, stopBefore = null) {
   const state = new Map();
   const source = new Map();
   const deleted = new Map();
   const perChapter = new Map();
   for (const page of pages(locale)) {
     const rel = relative(APP_ROOT, page.path);
+    // `--at` stops BEFORE the named page's own fences, which is the state its
+    // hunks are written against. Stopping after would include them.
+    if (stopBefore && rel === stopBefore) break;
     const list = [];
     for (const f of fencesIn(page.path)) {
       const where = `${rel}:${f.line}`;
@@ -199,6 +270,15 @@ const problems = [];
 if (!existsSync(PLATFORM)) {
   console.error("check-fence-chain: relay-platform not found — skipping");
   process.exit(0);
+}
+
+// `--at` is a SEPARATE replay with its own throwaway problem list, so the dump
+// cannot add to, remove from or reorder what the check reports. The check below
+// then runs exactly as it would without the flag.
+if (DUMP_DIR && DUMP_AT) {
+  const locale = DUMP_AT.startsWith("app/(vi)") ? "vi" : "en";
+  const at = replay(locale, [], DUMP_AT);
+  writeState(at.state, DUMP_DIR, `the ${locale} chain as ${DUMP_AT} is reached`);
 }
 
 const en = replay("en", problems);
@@ -260,6 +340,12 @@ if (existsSync(POST_SERIES)) {
       en.source.set(f.title, where);
     }
   }
+}
+
+// The final-state dump goes HERE and not earlier: the appendix has applied, and
+// it applies to en.state only. There is no equivalent vi end state to write.
+if (DUMP_DIR && !DUMP_AT) {
+  writeState(en.state, DUMP_DIR, "the en chain after every chapter and the appendix");
 }
 
 // HEAD: the chain's end state must be the repository, byte for byte.
