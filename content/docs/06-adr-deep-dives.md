@@ -2112,3 +2112,114 @@ platform itself rather than by a harness — that is, once the analytical path h
 writing `message_events` in normal operation. Until then a daily sweep would report `no-data`
 for every tenant on the platform, and **a check that always fires stops being read** is the same
 argument in the other direction.
+
+---
+
+## ADR-29 — A fence claims a file or declares it is not one, and the checker can print its own state
+
+**Status:** accepted (2026-09-18) · feature 055
+
+### What was actually wrong
+
+`pnpm check:fences` reported 110 problems and had done since feature 045. The tutorial job in
+`ci.yml` ends with that command, so **the workflow was red on every push for nine chapters** and
+its result carried no information: a chapter that broke something and a chapter that broke
+nothing produced the same colour.
+
+The number was not 110 defects. Measured at the opening: **47 targets**, of which 36 are platform
+files and 11 are phrases naming none; the Vietnamese half mirrors the English half exactly with
+**zero vi-only** problems; and one file held 16 of the 110 with one hunk explaining nine of them.
+
+### The two changes, which are one decision
+
+A titled fence is a claim that the file *is* these bytes. Everything here follows from taking
+that literally.
+
+**Eleven fences claimed a file and named none.** *"the ladder against the registry"*, *"the typo,
+now"*, *"42P01"*, *"run 11 of 20"* — all eleven `lang=text`, all eleven command output: two
+checker reports, a `tsc` TS2345, two Postgres errors, two catalogue refusals, a vitest assertion,
+three source locations, a JSON gauntlet report. They were read before they were declared, and
+there was no twelfth candidate.
+
+The repair is `(excerpt)` in the title, which `NOT_A_FILE` at `check-fence-chain.mjs:42` already
+skips in both the chapter loop and the appendix loop, and which **222 titles in this series
+already carried** — 111 in each locale. It is applying a convention, not inventing one.
+
+**And the chain's state is not the repository's, so a hunk cannot be written against the tree.**
+`vitest.coverage.config.mts` replays to 318 lines where the tree holds 1,182 and **has no `env`
+block at all**. `turbo.json` replays to 62 lines at chapter 3.22 and 74 after the appendix. A
+hunk generated with `git diff` against the working tree carries context that does not exist
+where the hunk lives, and is rejected for a reason neither tool explains.
+
+So the checker gained `--dump <dir> [--at <page>]`:
+
+| mode | what it writes | which class it serves |
+|---|---|---|
+| `--dump <dir>` | each path after every chapter and the appendix | the appendix hunks and the HEAD divergences |
+| `--dump <dir> --at <page>` | each path as that page is reached, before its own fences | a chapter's own hunks |
+
+There is no `--locale` flag: a page path begins `app/(en)/` or `app/(vi)/vi/`, so the chain is
+inside the argument copied off the problem line, and a flag could only disagree with it. A bare
+`--dump` writes the English chain and prints that it did, because the appendix mutates `en.state`
+only and the two chains end 9 paths and 13 lines of `turbo.json` apart.
+
+**This is an output mode.** No threshold, no exemption, no change to any exit code, and `--at`
+runs a separate replay with its own throwaway problem list so the dump cannot add to, remove from
+or reorder what the check reports. Verified: the count is 110 with the flag, without it, and with
+the `--` that `pnpm check:fences -- --dump X` forwards.
+
+### Rejected alternatives
+
+**Teach the checker that `lang=text` is never a file.** One line, and it exempts a class without
+anybody reading its members. The eleven were read; a twelfth that looked like a listing would
+have been caught by reading and missed by a predicate.
+
+**Retitle the eleven to real paths.** It makes the claim false rather than absent — there is no
+file whose contents are a Postgres error message.
+
+**Remove the titles.** That moves them into the 360 fences no gate reads at all, which is one
+step further out than the class they are in now.
+
+**A separate script importing the checker's internals.** `check-fence-chain.mjs` is a top-level
+program with no exports, so this means refactoring it into a module: more change for the same
+result.
+
+**Keep making throwaway copies, as fence-chain rule 1a says.** Feature 054 did this twice and
+deleted it each time, which is right for a single use. Fifty regenerations is a different shape —
+and the copy has a failure mode that argument alone would have missed. **The checker resolves
+`relay-platform` from its own file location, so the identical file run from another directory
+prints `relay-platform not found — skipping` and exits 0 having replayed nothing.** The copy rule
+1a asks for is one `cp` away from being a silent no-op, which is `check-lane-scope.py`'s failure
+inside the rule cited to justify it.
+
+### What the repair found, and one of it was in the instrument
+
+**The applier corrupted `$$`.** `applyHunks` used `text.replace(pre, post)` with a string
+replacement, and `String.prototype.replace` reads `$$`, `$&`, `` $` ``, `$'` and `$<name>` in a
+string replacement as substitution patterns. `packages/test-harness/src/sentinel.sql` is
+`DO $$ … END $$;` twice over, so **the chain replayed `DO $ … END $;`** — and that difference was
+filed for two features as a typo in the published listing. The listing says `END $$;`. A reader
+copying it is fine.
+
+Fixed with a function replacement, `text.replace(p, () => post.join("\n"))`, which is not subject
+to substitution. **It was causing APPLY failures as well**: with the applier corrected and the
+original published hunk restored, chapter 3.23's fence applies untouched, so two of the 42 "bad
+hunks" were never bad. This is a bug fix rather than a decision, and it is recorded here because
+it changed a shared gate.
+
+**A count of 110 was neither 110 defects nor an upper bound on them.** 42 bad hunks were cleared
+by 24 repair operations, so 18 were shadows — one appendix hunk cleared five at once. And ten
+files could not be compared to the repository at all, because **a checker reports the first
+failure per file** and a file with a broken hunk never reached its HEAD comparison.
+`session.itest.ts` turned out to be 1,322 lines behind; `turbo.json` and `packages/e2e/src/harness.ts`
+had been diverging invisibly.
+
+### Reversal condition
+
+If a later feature teaches the checker to distinguish command output from a file by something
+other than the title — a `lang` allow-list read from a declared set, say, with its members
+listed and checked — the eleven declarations become redundant and should be removed in that
+change.
+
+If `--dump` is used fewer than five times in a year, fold it back into a throwaway copy and
+delete the flag. The argument for it is fifty uses, not elegance.

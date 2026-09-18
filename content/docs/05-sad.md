@@ -1888,6 +1888,43 @@ a different claim rather than a stronger one.
 
 Full argument, the three options and the measurements: ADR-28 in `06-adr-deep-dives.md`.
 
+### ADR-29 — A fence claims a file or declares it is not one, and the checker can print its own state
+**Status:** accepted (2026-09-18) · **Drivers:** D1 · constitution VI's quickstart clause ·
+changes no threshold, no exemption and no exit code
+
+`pnpm check:fences` had reported **110 problems since feature 045**, and `ci.yml`'s tutorial job
+ends with that command, so its result reflected nothing for nine chapters. Feature 054 costed
+five ways out. This is the one taken: **repair the chain**, and change what the checker can
+*print* rather than what it *accepts*.
+
+Two changes, and they are one decision about what a titled fence claims.
+
+**A title is a whole-body claim, so a block that is not a file says so.** Eleven fences carried a
+prose phrase — *"the typo, now"*, *"42P01"* — and all eleven are `lang=text` command output. The
+checker already skips a title containing `(excerpt)`, in both its loops, and **222 titles in the
+series already carried it**. Declaring these eleven applies a convention rather than inventing
+one. Rejected: teaching the checker that `lang=text` is never a file, which exempts a class
+without anybody reading its members; retitling to a real path, which would make the claim false
+rather than absent; removing the titles, which moves them into the 360 fences no gate reads at
+all.
+
+**And a hunk must be generated against the state the checker replays, so the checker can write
+that state out.** `--dump <dir> [--at <page>]` adds an output mode: no threshold, no exemption,
+no change to any exit code, and `--at` replays separately so the dump cannot alter what the check
+reports. It exists because the chain's state is not the repository's — `vitest.coverage.config.mts`
+replays to 318 lines where the tree holds 1,182 — so a hunk written with `git diff` is rejected
+for reasons neither tool explains. Rejected: a separate script importing the checker's internals,
+which is a top-level program with no exports; and the throwaway copy fence-chain rule 1a asks
+for, which **exits 0 having replayed nothing when it is run from anywhere else**, because the
+platform path is resolved from the script's own location.
+
+**Reversal condition.** If a later feature teaches the checker to distinguish a command-output
+fence from a file fence by something other than its title, the eleven declarations become
+redundant and should be removed in that change. If `--dump` is used fewer than five times in a
+year, fold it back into a throwaway and delete the flag.
+
+Full argument, the measurements and what the repair cost: ADR-29 in `06-adr-deep-dives.md`.
+
 ## 10. Risks and technical debt register
 
 | # | Risk / debt | Exposure | Mitigation / trigger |
