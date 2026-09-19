@@ -194,32 +194,61 @@ where a more specific code exists — `wrong_credential_type`, `wrong_credential
 **What to do:** nothing the client can retry. This is a change of credential or of
 permission.
 
-## media_not_available
+## media_not_attachable
 
 **Status:** 422 · **Retryable:** no
 
-The attachment named `{"type": "media", "media_id": …}`, and Relay does not host media yet.
-Attach an `http` or `https` URL instead: `{"type": "url", "kind": "image", "url": "…"}`.
+The attachment named `{"type": "media", "media_id": …}` and this sender cannot attach that
+object. Three conditions answer with this code and they are deliberately
+indistinguishable: the object belongs to another environment, it belongs to another user
+of your environment, or no object has that id.
 
-**This is not a mistake in your request**, which is why it is not `invalid_request`.
-FR-MSG-11 publishes both ways to attach and only one of them is built, so a developer
-reading the clause and sending a `media_id` has done exactly what the contract describes.
-An `invalid_request` would send them to check their JSON, and there is nothing there to
-find.
+**One answer for three reasons, on purpose.** Telling you which one you hit would tell you
+whether somebody else's object exists — you could probe ids and learn which are real. The
+platform will not do that, so a media object you cannot attach and a media object that was
+never created look the same from outside.
 
-**Status 422 and not 400** for the same reason: the request is well-formed and understood,
-and what cannot be done is the thing it asks for.
+**This is not a mistake in your request**, which is why it is not `invalid_request`. The id
+is well-formed and the field is published in FR-MSG-11; what cannot be done is the thing
+the request asks for, which is what a 422 means. A malformed `media_id` — anything that is
+not a UUID — is a different answer: `invalid_request` with a 400 and
+`field: "attachments.<n>.media_id"`.
 
-**Over a WebSocket the code is `invalid_frame`**, carrying this same sentence in its
-`message`. The gateway validates the frame before the API sees it and answers with the one
-code every malformed frame gets, so the sentence is what distinguishes this case there.
+**An API key's object can be attached by any user of that tenant.** A slot taken by your
+backend records no uploader, which means the tenant uploaded it rather than nobody, and a
+user token of that tenant may attach it. The refusal is for another *user's* object, not
+for one your own server created.
 
-**What to do:** send the attachment as a URL you host, using the `url` arm — Relay stores a
-reference and never fetches it. If your media is already in Relay-hosted storage, there is
-nothing to wait for in your code: that half of FR-MSG-11 is not built, and this code is how
-you can tell.
+**Over a WebSocket the code is `invalid_frame`** when the gateway's own schema refuses the
+frame, and this code when the API does — the gateway forwards any 4xx the API names.
 
-When hosted media ships, this code stops being emitted and this section goes with it.
+**What to do:** stop using that id. Request your own upload slot with
+`POST /v1/media`, `PUT` the bytes to the URL it returns, and attach the `media_id` that
+came back. Retrying this request unchanged will fail identically, however long you wait —
+none of the three conditions resolves on its own.
+
+## unprocessable_request
+
+**Status:** 422 · **Retryable:** no
+
+The request was understood and cannot be carried out. This is the fallback a 422 gets when
+the thing that raised it did not name a more specific code, so it carries only what the
+status itself supports: your request was well-formed, the server read it, and what it asks
+for is not possible.
+
+**Nothing in the platform throws this today**, and it exists for the same reason
+`service_unavailable` does — so that the next refusal to forget its own code answers with
+something a client can act on rather than with `internal_error`. A 422 calling itself an
+internal error tells you the server broke when in fact it understood you perfectly.
+
+**If you are seeing this, the specific code is missing rather than you.** The request is
+not malformed — that would be `invalid_request` and a 400 — and it is not a permission
+problem, which would be a 403. Something about the state of what you asked for makes it
+impossible.
+
+**What to do:** do not repeat the request unchanged; it will fail the same way. Read the
+`message`, which carries whatever the thrower did say, and the `request_id`, which is what
+support needs to tell you which refusal you hit.
 
 ## webhook_endpoint_limit_reached
 

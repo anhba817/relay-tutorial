@@ -8409,3 +8409,1117 @@ same way — by a broker that had never run this project.
      const run = randomUUID().slice(0, 8);
 ```
 
+
+## Chapter 4.11 — the half of the union that was refused
+
+Fourteen files this chapter edited and does not publish. The eight it does publish carry
+the argument; these carry the rest of the same change, and a chapter that printed all
+twenty-two would have shown a reader 1,576 diff lines to make one point about a predicate.
+
+**Seven of the fourteen are test files.** The chapter quotes the assertions that matter in
+prose, which is the form a reader can follow; the hunks are here because the chain still has
+to replay them byte for byte.
+
+**And three are relays the compiler named rather than the author.** `session.ts`,
+`resume.ts` and `zod-validation.pipe.ts` changed because a forwarded value met a strict
+type, not because this chapter had anything to teach about them.
+
+```diff title="packages/outsider/src/integrate.itest.ts"
+@@ -373,12 +373,108 @@
+       "https://example.test/outside-first.png",
+       "https://example.test/outside-second.mp4",
+     ]);
+     socket.close();
+   });
+ 
++  /** T032e. **HOSTED MEDIA, FROM OUTSIDE, WITH NOTHING BUT A PUBLISHED CREDENTIAL.**
++   *
++   * The test above delivers two attachments and types its frames
++   * `attachments?: { url?: string }[]` — the old assumption written into a type, on the
++   * one instrument in this repository that boots what customers run. A chapter whose
++   * headline claim is that a second arm now works end to end, and which left this suite
++   * url-only, would have proven the claim everywhere except where it is worth proving.
++   *
++   * THE WHOLE SEQUENCE IS PUBLISHED SURFACE: `POST /v1/media` for a slot, a `PUT` to the
++   * URL that comes back, `POST …/messages` naming the id, and a socket that was open
++   * before any of it. No workspace import, no internal route, no fixture reaching into
++   * Postgres — the same constraint every other test in this file holds itself to.
++   *
++   * AND THE PUT GOES WHERE THE API SIGNED. The upload URL names an origin this process
++   * must be able to reach, which is a property of the deployment and not of the client:
++   * the host is inside the SigV4 signature, so a URL signed for the compose network
++   * would be unusable from here. That is what `RELAY_MINIO_INTERNAL_ENDPOINT` exists to
++   * keep apart, and this test is the only thing outside the api that would notice. */
++  it("uploads a file and attaches it, from outside, in order beside a url (FR-021, SC-002d)", async () => {
++    const socket = new WebSocket(`${ws}/v1/ws?token=${token}`);
++    const frames: { type: string; payload?: { text?: string; attachments?: unknown[] } }[] = [];
++    socket.addEventListener("message", (event) => {
++      frames.push(JSON.parse(String(event.data)) as { type: string });
++    });
++    socket.addEventListener("error", () => undefined);
++    await new Promise<void>((resolve, reject) => {
++      socket.addEventListener("open", () => resolve());
++      socket.addEventListener("close", (event) =>
++        reject(new Error(`closed ${(event as CloseEvent).code}`)),
++      );
++      setTimeout(() => reject(new Error(`no socket at ${ws} within 10s`)), 10_000);
++    });
++
++    const waitFor = async (
++      predicate: (f: { type: string }) => boolean,
++      what: string,
++    ): Promise<{ type: string; payload?: { attachments?: unknown[] } }> => {
++      const deadline = Date.now() + 10_000;
++      for (;;) {
++        const found = frames.find(predicate);
++        if (found) return found;
++        if (Date.now() > deadline) {
++          throw new Error(`no ${what}; saw ${frames.map((f) => f.type).join(", ") || "nothing"}`);
++        }
++        await new Promise((r) => setTimeout(r, 50));
++      }
++    };
++
++    const slot = await post(
++      "/v1/media",
++      { filename: "outside.png", mime_type: "image/png", bytes: 11 },
++      credential,
++    );
++    expect(slot.status, "the platform refused a slot to a published credential").toBe(201);
++    const mediaId = slot.body["media_id"] as string;
++
++    // THE BYTES GO STRAIGHT TO THE STORE AND NOT THROUGH RELAY, which is ADR-13's whole
++    // claim and is invisible from in-workspace tests that never leave the process.
++    const uploaded = await fetch(slot.body["upload_url"] as string, {
++      method: "PUT",
++      body: new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0]),
++    });
++    expect(uploaded.status, "the presigned URL was not usable from outside").toBe(200);
++
++    const text = `outside media ${randomUUID()}`;
++    const posted = await post(
++      `/v1/channels/${channelId}/messages`,
++      {
++        text,
++        user: "outside-bot",
++        idempotency_key: randomUUID(),
++        attachments: [
++          { type: "url", kind: "image", url: "https://example.test/outside-url.png" },
++          { type: "media", media_id: mediaId },
++        ],
++      },
++      credential,
++    );
++    expect(posted.status).toBe(201);
++
++    const delivered = (await waitFor(
++      (f) =>
++        f.type === "message.created" &&
++        (f as { payload?: { text?: string } }).payload?.text === text,
++      "message.created carrying a hosted attachment",
++    )) as { payload: { attachments: unknown[] } };
++
++    // BOTH ARMS, IN ORDER, ON THE SOCKET. The url arm proves nothing new; what it does is
++    // hold the order claim, which one attachment cannot show.
++    expect(delivered.payload.attachments).toEqual([
++      { type: "url", kind: "image", url: "https://example.test/outside-url.png" },
++      { type: "media", media_id: mediaId },
++    ]);
++    socket.close();
++  });
++
+   /** T100a — **the first `socket.send` in this file's history.**
+    *
+    * `grep -c "\.send(" packages/outsider/src/integrate.itest.ts` read **0** across
+    * eleven tests before this one: ten REST, and one socket test whose title says
+    * "sent over REST" because the fan-out chapter corrected it. This file is the only
+    * check in the repository that uses the public surface as a customer does —
+```
+
+```diff title="packages/protocol/src/codes.test.ts"
+@@ -237,16 +237,34 @@
+   // answer of its own.
+   //
+   // `invalid_request` IS THE WRONG ANSWER FOR `media_id`, and that is the whole
+   // argument. Every other refusal in this pipe is about a body the contract does not
+   // allow; `media_id` is in FR-MSG-11 and the caller made no mistake. A 400 saying
+   // "invalid" tells them to fix a request that is already correct.
+-  it("names the unhosted-media refusal apart from a malformed request", () => {
+-    expect(ERROR_CODES).toHaveProperty("media_not_available");
+-    expect(ERROR_CODES.media_not_available).not.toBe(ERROR_CODES.invalid_request);
+-    expect(ERROR_CODES.media_not_available).toMatch(/media/);
++  it("names the unattachable-media refusal apart from a malformed request", () => {
++    expect(ERROR_CODES).toHaveProperty("media_not_attachable");
++    expect(ERROR_CODES.media_not_attachable).not.toBe(ERROR_CODES.invalid_request);
++    expect(ERROR_CODES.media_not_attachable).toMatch(/media/);
++  });
++
++  // THE CODE THIS ONE REPLACED IS GONE, ASSERTED RATHER THAN ASSUMED. `codes.ts`
++  // instructed its own deletion — *"at which point it is deleted, not repurposed"* — and
++  // "we removed it" is not a property anything checks. `check:errors` compares the
++  // registry against the reference in both directions and would catch a leftover
++  // section; nothing but this catches a leftover ENTRY that no section documents.
++  it("has deleted `media_not_available` rather than repurposing it", () => {
++    expect(ERROR_CODES).not.toHaveProperty("media_not_available");
++  });
++
++  // A FALLBACK STILL NEEDS A SENTENCE A CLIENT CAN ACT ON. Nothing throws an unnamed
++  // 422 today; this exists for the next thrower that forgets, and a code whose message
++  // said only "unprocessable" would restate the status and tell them nothing.
++  it("gives the 422 rung a message that says what to do", () => {
++    expect(ERROR_CODES).toHaveProperty("unprocessable_request");
++    expect(ERROR_CODES.unprocessable_request).not.toBe(ERROR_CODES.internal_error);
++    expect(ERROR_CODES.unprocessable_request).toMatch(/understood/);
+   });
+ });
+ 
+ describe("the five refusals this chapter's webhook surface adds", () => {
+   // NAMED, NOT COUNTED, for the reason the blocks above give — and here the names were
+   // decided somewhere else. `docs/08-error-reference.md` published a section for each of
+```
+
+```diff title="packages/protocol/src/internal.ts"
+@@ -1,15 +1,16 @@
+ import { z } from "zod";
+ 
+ import {
+   attachmentSchema,
++  forwardedAttachmentSchema,
+   MAX_ATTACHMENTS,
+   refineTextAndAttachments,
+ } from "./attachments.js";
+ 
+-import { messageSchema } from "./frames.js";
++import { forwardedMessageSchema } from "./frames.js";
+ 
+ // The INTERNAL service contract (chapter 2.5) — distinct from the wire
+ // contract above it. `frames.ts` is what a customer's client speaks;
+ // this is what the gateway and the API service speak to each other over
+ // the internal HTTP hop (ADR-05).
+ //
+@@ -64,13 +65,21 @@
+    *     schema without the field   value carries the key   refused
+    *     field REQUIRED             key absent              refused
+    *     field optional             key absent              accepted, FR-022 broken
+    *
+    * Only the required field and `sendMessage`'s return landing together is honest,
+    * which is why they are one phase. */
+-  attachments: z.array(attachmentSchema),
++  // AND PERMISSIVE ELEMENTS ON THE RESPONSE, WHERE THE REQUEST ABOVE STAYS STRICT
++  // (FR-018b). The asymmetry is the point. `:34` is the api judging a gateway's request
++  // and refuses an arm it does not know — an old api answering a new gateway's media arm
++  // with a 422 loses nothing. This is the GATEWAY parsing the api's answer
++  // (`api-client.ts:247`), and its own comment says what a refusal costs: *"every socket
++  // send would close 1011."* The message is already committed by then, so the client
++  // loses its acknowledgement and its connection, and an idempotent retry fails the same
++  // way.
++  attachments: z.array(forwardedAttachmentSchema),
+   created_at: z.iso.datetime(),
+   /** True when 2.3's idempotency index recognised a retry. The PUBLIC api
+    * still hides this (a client cannot tell a retry from a first send);
+    * an internal caller needs it, because storage being idempotent does
+    * not make delivery idempotent — chapter 2.6's trap. */
+   duplicate: z.boolean().optional(),
+@@ -109,13 +118,17 @@
+  * `truncated` is per channel, because the ceiling is per channel: one
+  * flooded channel must not force the others onto the history endpoint. */
+ export const internalBackfillResponseSchema = z.strictObject({
+   channels: z.record(
+     z.string().min(1),
+     z.strictObject({
+-      messages: z.array(messageSchema),
++      // FORWARDED, NOT JUDGED (FR-018d). The gateway parses this page at
++      // `api-client.ts:218` and hands every message straight to a socket; a refusal
++      // reaches `session.ts:1361` as `degrade("backfill_failed")`, which loses the
++      // resume for every client whose cursor precedes the media message.
++      messages: z.array(forwardedMessageSchema),
+       truncated: z.boolean(),
+     }),
+   ),
+ });
+ 
+ // ---------------------------------------------------------------------------
+```
+
+```diff title="packages/protocol/src/revision.ts"
+@@ -1,9 +1,9 @@
+ import { z } from "zod";
+ 
+-import { messageDeletedPayloadSchema, messageSchema } from "./frames.js";
++import { forwardedMessageSchema, messageDeletedPayloadSchema } from "./frames.js";
+ 
+ /** THE FIFTH SUBJECT GRAMMAR, and the argument for it is ADR-24.
+  *
+  * `chan:{channel_id}` carries a wire frame's payload — `fanout.ts:18` says so in its own
+  * words — and that payload is a `Message`. Two things follow, and the second is fatal:
+  *
+@@ -56,11 +56,16 @@
+  * loudly on the other instead of being dropped.
+  *
+  * THE WIRE FRAMES ARE NOT EDITED BY THIS FILE. `message.updated` carries a `Message` and
+  * `message.deleted` carries an identity with no text; this schema is what gets them from
+  * the api to a gateway that holds the socket. */
+ export const revisionFabricSchema = z.discriminatedUnion("kind", [
+-  z.strictObject({ kind: z.literal("updated"), message: messageSchema }),
++  // `forwardedMessageSchema` AND NOT `messageSchema` (FR-018d). The arm above says a
++  // field added on one side of a rolling deploy must fail loudly on the other, and that
++  // is right about this schema's OWN fields — `kind` and `message` are the contract.
++  // It is wrong about an attachment, which `fanout.ts:98` never reads and hands to a
++  // socket untouched: a refusal there is `fanout.invalid_payload` and a dropped edit.
++  z.strictObject({ kind: z.literal("updated"), message: forwardedMessageSchema }),
+   z.strictObject({ kind: z.literal("deleted"), message: messageDeletedPayloadSchema }),
+ ]);
+ 
+ export type RevisionFabric = z.infer<typeof revisionFabricSchema>;
+```
+
+```diff title="services/api/src/consumer/consumer.itest.ts"
+@@ -292,12 +292,64 @@
+     await runtime.stop();
+ 
+     expect(seen.filter((id) => id === eventId)).toHaveLength(1);
+     expect(await timesHandled(db, durable, eventId)).toBe(1);
+   }, 120_000);
+ 
++  it("invariant 3a: an envelope carrying an attachment arm this binary does not know is HANDLED, not terminated (FR-018, SC-002b)", async () => {
++    // WHAT A REFUSAL COSTS HERE, WHICH IS WHY THIS TEST EXISTS. `runtime.ts:163` parses
++    // with `safeParse` and `:204` answers a failure with `message.term()` — redelivery
++    // stops for good. So an envelope a NEWER instance committed and acknowledged is
++    // DESTROYED by an older one during a rolling deploy, over a field the consumer never
++    // reads: `grep -c attachments services/api/src/consumer/` is 0.
++    //
++    // THE ARM IS AN UNKNOWN ONE AND NOT THE MEDIA ARM, AND THAT IS A CORRECTION TO THIS
++    // TASK'S OWN PREMISE. It was written as *"an envelope carrying { type: 'media' }
++    // parses rather than being terminated"*, and that was the right probe while the media
++    // arm refused. This chapter made the media arm ACCEPT — so a media attachment now
++    // parses under the strict union too, and a test using one would pass with or without
++    // the permissive reader. It would assert nothing. What discriminates the two is an
++    // arm from a writer newer than this binary, which is the case the reader exists for.
++    const environmentId = ENV();
++    const durable = `${RUN}-future-arm-${Date.now()}`;
++    const seen: string[] = [];
++    const eventId = await publish(environmentId, {
++      data: {
++        id: randomUUID(),
++        channel_id: randomUUID(),
++        seq: 1,
++        user: "tuan",
++        text: "a photo and something this binary has never heard of",
++        created_at: new Date().toISOString(),
++        attachments: [
++          { type: "media", media_id: randomUUID() },
++          { type: "audio_clip", clip_id: randomUUID(), duration_ms: 1200 },
++        ],
++      },
++    });
++
++    const runtime = runtimeFor(
++      db,
++      durable,
++      async (event) => {
++        seen.push(event.id);
++      },
++      silent,
++      environmentId,
++    );
++    for (let i = 0; i < 20 && !seen.includes(eventId); i++) {
++      await runtime.pollOnce();
++    }
++    await runtime.stop();
++
++    // HANDLED, which is the whole claim. A terminated message is never handled and never
++    // comes back, so `seen` staying empty is exactly what the defect looks like.
++    expect(seen).toContain(eventId);
++    expect(await timesHandled(db, durable, eventId)).toBe(1);
++  }, 120_000);
++
+   it("invariant 4: a kill between handling and acknowledgement is redelivered — and handled once (SC-003)", async () => {
+     // The chapter's centrepiece. The walk claims the event (which commits the
+     // effect), prints its marker, and is SIGKILLed before it acknowledges.
+     // The broker is entitled to redeliver — it never heard an acknowledgement —
+     // and the ledger is what makes the redelivery safe.
+     //
+```
+
+```diff title="services/api/src/isolation/gauntlet.itest.ts"
+@@ -148,12 +148,87 @@
+     expect(verdict.foreign.status).toBe(404);
+     // THE STATE READ IS THE POINT: a 404 that completed the write is the case no
+     // status code reveals.
+     expect(verdict.stateChanged, "the victim's messages moved").toBe(false);
+   });
+ 
++  // A FORGED `media_id` ON THE SAME ROUTE, WHICH IS A SECOND BOUNDARY ON ONE PATH.
++  //
++  // The attack above forges a CHANNEL id; this forges a MEDIA id and leaves the channel
++  // honest. They are different walls: the first is `channels.environment_id` and the
++  // second is `media_objects.environment_id`, checked in a different query by different
++  // code, and a platform could hold one and not the other. Naming the route is not
++  // covering it — and neither is attacking it once.
++  //
++  // AND THE ATTACK PLANTS A ROW FOR EACH TENANT, WHICH NO OTHER ONE IN THIS FILE HAS TO.
++  // Both tenants' `media_objects` are otherwise empty, and **an empty table passes a leak
++  // check for the same reason an empty page does** — 4.8's finding, which cost that
++  // chapter a real hole. The victim's row is what the attacker must not reach; the
++  // attacker's own is the control that says the send path works at all when the id is
++  // theirs, so a refusal here cannot be the media feature simply being broken.
++  it("POST /v1/channels/:channelId/messages — a forged media_id is refused, and writes nothing", async () => {
++    attacked.add("POST /v1/channels/:channelId/messages");
++
++    const plant = async (t: { environmentId: string }): Promise<string> => {
++      const id = randomUUID();
++      await db.execute(
++        `INSERT INTO media_objects
++           (id, environment_id, filename, mime_type, declared_bytes, object_key, state)
++         VALUES ('${id}', '${t.environmentId}', 'g.png', 'image/png', 1, 'g/${id}', 'pending')`,
++      );
++      return id;
++    };
++    const victims = await plant(t.victim);
++    const attackers = await plant(t.attacker);
++
++    // THE CONTROL FIRST. If the attacker cannot attach its OWN object, the refusal below
++    // says nothing about tenancy — it says the feature is broken, and the pair would
++    // agree on that just as happily.
++    const control = await fetch(`${url}/v1/channels/${t.attacker.channelId}/messages`, {
++      method: "POST",
++      headers: {
++        authorization: `Bearer ${t.attacker.credential}`,
++        "content-type": "application/json",
++      },
++      body: JSON.stringify({
++        text: "my own object",
++        user: t.attacker.botExternalId,
++        attachments: [{ type: "media", media_id: attackers }],
++      }),
++    });
++    expect(control.status, "the attacker could not attach its own object").toBe(201);
++
++    const from = (mediaId: string) => ({
++      text: "from the attacker",
++      user: t.attacker.botExternalId,
++      attachments: [{ type: "media", media_id: mediaId }],
++    });
++    const verdict = await writeAttack(
++      url,
++      t.attacker.credential,
++      {
++        method: "POST",
++        path: `/v1/channels/${t.attacker.channelId}/messages`,
++        body: from(victims),
++      },
++      {
++        method: "POST",
++        path: `/v1/channels/${t.attacker.channelId}/messages`,
++        body: from(randomUUID()),
++      },
++      () => t.victim.repo.listMessages(t.victim.channelId, { limit: 50 }),
++    );
++
++    // THE VICTIM'S OBJECT AND AN INVENTED ONE ANSWER IDENTICALLY. That is the property:
++    // an attacker holding a real id it does not own learns nothing that distinguishes it
++    // from an id nobody has, so the route cannot be used to test whether an object exists.
++    expect(verdict.differences, verdict.differences.join("; ")).toEqual([]);
++    expect(verdict.foreign.status).toBe(422);
++    expect(verdict.stateChanged, "the victim's messages moved").toBe(false);
++  });
++
+   // ── the revisions chapter's three routes ────────────────────────────────────────
+   //
+   // WRITTEN BECAUSE THE ACCOUNTING TEST AT THE BOTTOM OF THIS FILE ASKED FOR THEM. The
+   // classification went in with the routes; the attacks did not, and the run that
+   // followed named all three by path. That is the direction published Part 3 never
+   // checked — a `write` classification with no attack written for it is the same hole as
+```
+
+```diff title="services/api/src/messages/messages.itest.ts"
+@@ -205,25 +205,23 @@
+         attachments: [{ ...png(0), url: bad }],
+       });
+       expect(res.status, bad).toBe(400);
+       expect(((await res.json()) as { field: string }).field, bad).toBe("attachments.0.url");
+     });
+ 
+-    // FR-016, AND CHAPTER 4.10 IS WHY THIS TEST NOW EXISTS SEPARATELY. Hosted media
+-    // makes a `media_id` a real thing: `POST /v1/media` issues one, a row carries it,
+-    // and a client can upload against the URL it comes with. So the obvious next move
+-    // is to make this arm accept — and it would ship FR-MED-06's surface with none of
+-    // FR-MED-06's checks. Nothing here verifies that the id belongs to this environment,
+-    // that the uploader is the sender, or that the object is `ready` rather than
+-    // `pending`, and an attachment that names a `pending` slot would render as a broken
+-    // image in every client that received it.
++    // FR-001 AND FR-008a, AND BOTH OF THESE WERE REFUSAL TESTS UNTIL THIS CHAPTER.
++    // They are CONVERTED rather than deleted, which is the rule 4.10's FR-016 test
++    // earned: *"we did not add it" is not a property anything checks*, and the mirror
++    // of that is that "we did add it" needs the test that used to prove the opposite.
++    // Each one keeps its subject and changes its expectation.
+     //
+-    // `codes.ts:207` already decided this: *"§4.14 replaces the ARM rather than this
+-    // code"*. The replacement is the next chapter's, and until then the honest answer to
+-    // a real id is the same as the answer to a made-up one.
+-    it("refuses a media_id that really exists, which is FR-016's whole point", async () => {
++    // THE FIRST ASSERTED THAT A REAL ID IS REFUSED, and a real id is now the accept
++    // path. Its old comment argued the refusal from what 4.10 had not built —
++    // *"nothing here verifies that the id belongs to this environment, that the
++    // uploader is the sender"* — and this chapter is what built those.
++    it("accepts a media_id that really exists, which is FR-001's whole point", async () => {
+       const slot = await fetch(`${url}/v1/media`, {
+         method: "POST",
+         headers: { "content-type": "application/json", authorization: `Bearer ${credential}` },
+         body: JSON.stringify({ filename: "real.png", mime_type: "image/png", bytes: 64 }),
+       });
+       expect(slot.status, "the slot route did not issue an id to test with").toBe(201);
+@@ -231,51 +229,53 @@
+ 
+       const res = await send({
+         text: "hosted media, with an id this platform really minted",
+         user: "courier",
+         attachments: [{ type: "media", media_id }],
+       });
+-      expect(res.status).toBe(422);
+-      const body = (await res.json()) as Record<string, unknown>;
+-      expect(body.code).toBe("media_not_available");
+-      // AND THE ID IS NOT ECHOED BACK AS IF IT WERE THE PROBLEM. The refusal is about
+-      // the arm, not about this id — a message naming the id would read as "that one is
+-      // wrong, try another", which is the opposite of what FR-016 says.
+-      expect(String(body.message)).not.toContain(media_id);
++      expect(res.status).toBe(201);
++      // AND IT COMES BACK AS SENT. `state` is not on the wire — FR-013 — so what a
++      // reader gets is the two keys the client wrote and nothing the platform knows
++      // about the object. The slot is `pending` and will stay `pending` until movement
++      // VI, and a client cannot tell from this payload.
++      const body = (await res.json()) as { attachments: unknown[] };
++      expect(body.attachments).toEqual([{ type: "media", media_id }]);
+     });
+ 
+-    it("answers a media_id with its own code and a 422 (FR-003a)", async () => {
++    // THE SECOND SENT `"m_1"`, WHICH IS NOW A 400 AT THE SCHEMA AND WAS A 422 AT THE
++    // ARM. Same input, different layer: the arm used to refuse every `media_id` with
++    // its own code, and now the only thing wrong with `"m_1"` is that it is not a UUID.
++    //
++    // THIS IS THE TEST THAT WOULD HAVE BEEN A 500 (research R3, FR-008a). With the old
++    // `z.string().min(1)` and an accepting arm, `"m_1"` reaches the lookup, Postgres
++    // answers `invalid input syntax for type uuid`, and the filter calls it
++    // `internal_error` — a 500 any caller could produce with one request. The UUID at
++    // the door is what makes it a 400, and this test is why the tightening is not
++    // merely tidy.
++    it("answers a malformed media_id with a 400 naming the field (FR-008a)", async () => {
+       const res = await send({
+         text: "hosted media",
+         user: "courier",
+         attachments: [{ type: "media", media_id: "m_1" }],
+       });
+-      // 422 AND NOT 400: the request is understood and well-formed, and what cannot be
+-      // done is the thing it asks for.
+-      expect(res.status).toBe(422);
++      // 400 AND NOT 422: the id is malformed, so the caller really did send something
++      // the contract does not allow — which is the one thing `invalid_request` is for.
++      // The 422 next door is for an id that is well-formed and not attachable.
++      expect(res.status).toBe(400);
+       const body = (await res.json()) as Record<string, unknown>;
+-      // THE BODY, NOT ONLY THE STATUS. A 422 is the easy half: `ProtocolErrorFilter`
+-      // derives a code from the status for 400, 401, 403 and 404 only, so every OTHER
+-      // status ships a body calling itself `internal_error` while the status line reads
+-      // correctly. A test that asserts the status and the message text passes through
+-      // exactly that — which is a finding the webhook chapter owns, on a suite this tree
+-      // does not have yet. What is asserted here instead is the code itself.
+-      expect(body.code).toBe("media_not_available");
+-      // DERIVED, NOT SPELLED. `codes.test.ts` owns the URL RULE — one assertion, in the
+-      // package that builds the URL — and restating its shape here would be a second
+-      // copy of it in a route test, which is how the two drift. What this test is about
+-      // is that the envelope names THIS code: a 422 whose `docs_url` points at
+-      // `invalid_request` is the failure, not the separator.
+-      expect(body.docs_url).toBe(docsUrl("media_not_available"));
+-      expect(String(body.message)).toMatch(/hosted media is not available/i);
+-      // `attachments.0` AND NOT `attachments.0.type`. The refinement refuses the ARM, so
+-      // zod's path stops at the object — and that is the honest field: nothing is wrong
+-      // with the `type` key, the whole attachment names a transport the platform cannot
+-      // serve yet. A caller with ten links is told which one, which is what the path is
+-      // for.
+-      expect(body.field).toBe("attachments.0");
++      expect(body.code).toBe("invalid_request");
++      expect(body.docs_url).toBe(docsUrl("invalid_request"));
++      // `attachments.0.media_id` AND NOT `attachments.0`. The old refusal was the ARM's
++      // — a `.refine` over the whole object, so zod's path stopped at the attachment.
++      // This one is the FIELD's, and the path says which key of which attachment. A
++      // caller with ten of them is told exactly where to look.
++      expect(body.field).toBe("attachments.0.media_id");
++      // AND NOT A 500. The assertion is worth stating separately because the failure
++      // this replaces was not "the wrong status" — it was a body calling itself an
++      // internal error for a request the caller got wrong.
++      expect(body.code).not.toBe("internal_error");
+     });
+   });
+ 
+   // T029, T031 and T032a. THE REST DOOR, END TO END.
+   describe("attachments through the send and history routes (SC-001)", () => {
+     const png = (n: string) => ({
+```
+
+```diff title="services/api/src/messages/zod-validation.pipe.ts"
+@@ -6,17 +6,39 @@
+ // Boundary validation (chapter 2.2). safeParse, never parse: a throw
+ // from deep inside a library is not an error shape anyone can rely on.
+ //
+ // THROUGH `protocolError` AND NOT `BadRequestException`, and that switch is owed to the
+ // errors chapter rather than to this one. That chapter built the typed thrower and
+ // rewired `session.ts` and the filter to it; this pipe kept the untyped exception, and
+-// nothing noticed because both produce the same 400 envelope. What forced it here is a
+-// code that is NOT 400: `media_not_available` cannot travel as a `BadRequestException`
+-// at all, so the one call site that never needed typing is the one that now proves it.
+-// 1.4's ProtocolErrorFilter still turns the throw into the EIR-API-04 envelope on the
+-// way out — one error shape, one home, unchanged since the skeleton.
++// nothing noticed because both produce the same 400 envelope. What forced it here was a
++// schema that needed a status other than 400 — the media arm, which refused with its own
++// 422 from 3.24 until §4.14 made it accept. 1.4's ProtocolErrorFilter still turns the
++// throw into the EIR-API-04 envelope on the way out — one error shape, one home,
++// unchanged since the skeleton.
++//
++// WHAT THE MECHANISM IS FOR, WHICH IS NOT THE SAME AS WHO USED IT. The `protocolCode`
++// branch below lets a SCHEMA name a refusal the pipe would otherwise call
++// `invalid_request` with a 400. That is the right answer whenever a field is published
++// in the contract and the caller made no mistake, and it is the only way to say so from
++// a schema: `@Body(new ZodValidationPipe(...))` runs before the handler, so a controller
++// check cannot reach the decision.
++//
++// NOTHING USES IT TODAY, SAID PLAINLY RATHER THAN LEFT TO BE DISCOVERED. Its one
++// producer was `attachments.ts`'s `params: { protocolCode: "media_not_available" }`,
++// removed by the chapter that made the arm accept. `grep -rn protocolCode` across
++// `packages/` and `services/` finds this file and nothing else.
++//
++// KEPT, AND THE PRECEDENT CUTS BOTH WAYS. 4.10 added a `service_unavailable` rung to the
++// error filter with nothing throwing it, on the grounds that a general extension point
++// with a stated role outlives its last caller. 4.6 went the other way and reached
++// 100/100/100/100 on `metering.ts` by DELETING two arms — and 044's rule is that a design
++// in which a case cannot arise beats a branch that handles it, *because the branch is the
++// thing that rots*. What decides it here is that this arm is one `params:` key from
++// reachable, where `metering.ts`'s were unreachable by construction. The cost of keeping
++// it is stated too: this file carries no coverage pin, so nothing reports the arm as
++// uncovered either way.
+ export class ZodValidationPipe<T> implements PipeTransform<unknown, T> {
+   constructor(private readonly schema: ZodType<T>) {}
+ 
+   transform(value: unknown): T {
+     const result = this.schema.safeParse(value);
+     if (!result.success) {
+@@ -32,22 +54,24 @@
+       //
+       // Named here rather than in the filter because only the pipe knows the
+       // path. Zod's `path` is an array — `["metadata", "blob"]` — and it joins
+       // with dots, which is what a developer reading their own request body sees.
+       // An empty path means the whole body failed (a non-object, say), and then
+       // there is no field to name and the key is omitted rather than sent empty.
+-      /** A SCHEMA MAY NAME ITS OWN REFUSAL (FR-003a).
++      /** A SCHEMA MAY NAME ITS OWN REFUSAL — the mechanism, with no current user.
++       *
++       * Everything else here is `invalid_request` and 400, which is right for a body the
++       * contract does not allow. It is wrong for a field the contract DOES publish, where
++       * the caller made no mistake and the honest answer is a code of its own.
+        *
+-       * Everything here is `invalid_request` and 400, which is right for a body the
+-       * contract does not allow. It is wrong for a field the contract DOES publish and
+-       * the platform cannot serve yet — `media_id` in FR-MSG-11 — where the caller made
+-       * no mistake and the honest answer is a code of its own.
++       * The alternative is a check in the controller and it cannot work: this pipe runs
++       * before the handler, so a schema refusal has already become a 400 by the time any
++       * handler code could look. Whichever layer refuses first has to carry the code.
+        *
+-       * The alternative was a check in the controller, and it cannot work: this pipe runs
+-       * before the handler, so a media arm is already refused with a 400 by the time any
+-       * handler code could look. Whichever layer refuses first has to carry the code. */
++       * The header of this file records who used it, why nothing does now, and the two
++       * precedents that disagree about whether it should still be here. */
+       // `params` IS ON THE ISSUE AT RUNTIME AND NOT ON ITS TYPE. Measured against the
+       // pinned zod 4.4.3: a `refine` with `params` produces an issue whose keys are
+       // `code, path, params, message`, and `$ZodIssue` declares only the first, third
+       // and fourth. Narrowed through `unknown` rather than asserted, so a zod upgrade
+       // that drops the field is a silent no-op here rather than a runtime throw.
+       const named =
+```
+
+```diff title="services/api/src/outbox/event.ts"
+@@ -1,7 +1,7 @@
+-import { attachmentSchema, type Attachment } from "@relay/protocol";
++import { forwardedAttachmentSchema, type ForwardedAttachment } from "@relay/protocol";
+ 
+ import { subjectFor } from "@relay/protocol";
+ import { z } from "zod";
+ 
+ // The event envelope. Built in ONE place, complete, inside the
+ // transaction that caused it — so the relay is a mover of bytes and never an
+@@ -29,14 +29,26 @@
+    * below carries no `text` because a payload with a text field can carry the words
+    * somebody asked to have removed; an attachment URL is exactly as recoverable, so the
+    * absence there is the same decision and not an omission.
+    *
+    * NOT OPTIONAL. `consumer/runtime.ts` answers a failed parse with `message.term()`,
+    * which stops redelivery for good — so a branch that has not been widened is a row
+-   * destroyed rather than retried, and an optional field hides the day that happens. */
+-  attachments: Attachment[];
++   * destroyed rather than retried, and an optional field hides the day that happens.
++   *
++   * AND THE ELEMENT IS WIDER THAN `Attachment`, WHICH THE COMPILER ASKED FOR RATHER THAN
++   * BEING TOLD (FR-018). Making the schema permissive left this hand-written interface
++   * narrow, and `runtime.ts:166` stopped compiling: *"Type '{ [x: string]: unknown; type:
++   * string; }' is missing the following properties … kind, url."* The honest fix is the
++   * type, not a cast. A consumer reading a durable queue really can be handed an arm its
++   * binary does not know — that is the whole reason the schema accepts one — and a type
++   * that denies it would put the lie one layer further in.
++   *
++   * IT COSTS NOTHING HERE BECAUSE NOTHING READS AN ATTACHMENT. `grep -c attachments
++   * services/api/src/consumer/` is 0. The day something does, this type is what makes the
++   * compiler ask which arm it is holding. */
++  attachments: ForwardedAttachment[];
+   created_at: string;
+ }
+ 
+ /** A DELETION as a consumer receives it (FR-019, FR-020).
+  *
+  * NO `text`, AND NO `text: null` EITHER. The frame `packages/protocol/src/frames.ts`
+@@ -367,13 +379,19 @@
+       //
+       // FOUND BY THE CLOSE-OUT COVERAGE LANE, six red tests in `consumer.itest.ts`, after
+       // eleven analysis passes and eleven phases. The comment above argues NOT OPTIONAL
+       // from `message.term()`, and that argument is correct about the producer and
+       // inverts about the reader: the same sentence that makes a missing branch loud at
+       // compile time makes a missing key fatal at runtime.
+-      attachments: z.array(attachmentSchema).default([]),
++      // AND PERMISSIVE ELEMENTS, BECAUSE THIS READER FORWARDS THEM (FR-018). The
++      // consumer never looks at an attachment — `grep -c attachments
++      // services/api/src/consumer/` is 0 — and `runtime.ts:204` answers a failed parse
++      // with `message.term()`, which stops redelivery for good. So a new arm the current
++      // binary does not know would destroy a message that a NEWER instance committed and
++      // acknowledged, during a rolling deploy, by validating a field it ignores.
++      attachments: z.array(forwardedAttachmentSchema).default([]),
+       created_at: z.iso.datetime(),
+     }),
+   }),
+   // The union is exhaustive over `OUTBOX_EVENT_TYPES`, and this file's own
+   // comment above says why that matters: `consumer/runtime.ts:163` answers a failed
+   // parse with `message.term()`, which stops redelivery for good. A type added to the
+@@ -406,13 +424,19 @@
+       //
+       // FOUND BY THE CLOSE-OUT COVERAGE LANE, six red tests in `consumer.itest.ts`, after
+       // eleven analysis passes and eleven phases. The comment above argues NOT OPTIONAL
+       // from `message.term()`, and that argument is correct about the producer and
+       // inverts about the reader: the same sentence that makes a missing branch loud at
+       // compile time makes a missing key fatal at runtime.
+-      attachments: z.array(attachmentSchema).default([]),
++      // AND PERMISSIVE ELEMENTS, BECAUSE THIS READER FORWARDS THEM (FR-018). The
++      // consumer never looks at an attachment — `grep -c attachments
++      // services/api/src/consumer/` is 0 — and `runtime.ts:204` answers a failed parse
++      // with `message.term()`, which stops redelivery for good. So a new arm the current
++      // binary does not know would destroy a message that a NEWER instance committed and
++      // acknowledged, during a rolling deploy, by validating a field it ignores.
++      attachments: z.array(forwardedAttachmentSchema).default([]),
+       created_at: z.iso.datetime(),
+     }),
+   }),
+   z.strictObject({
+     ...envelope,
+     type: z.literal("message.deleted"),
+```
+
+```diff title="services/gateway/src/fanout.itest.ts"
+@@ -153,12 +153,59 @@
+     // The last holder leaving DOES close it.
+     await g2.fanout.unsubscribe(CHANNEL);
+     await g1.fanout.publish(messageOn(CHANNEL, 5));
+     await expect(nextDelivery(g2, 300)).rejects.toThrow("deadline");
+   });
+ 
++  // ── THE DELIVERY PATH IS A FORWARDING READER, AND A REFUSAL HERE IS A LOST MESSAGE ──
++  //
++  // These two are the complement of the test directly below, and the pair is the whole
++  // design: an attachment ARM this binary does not know is forwarded, and a payload that
++  // is not a message is still dropped. One test alone would be satisfied by a reader that
++  // accepts everything.
++  //
++  // WHAT A REFUSAL COSTS, WHICH IS WHY THESE ARE NOT THEORETICAL. `fanout.ts`'s failure
++  // arm is `logger.log("error", "fanout.invalid_payload"); return` — no retry, no dead
++  // letter. The api has already committed the message and answered the sender 201, so an
++  // old gateway meeting a new api's arm during a rolling deploy delivers nothing to any
++  // socket it holds and says so only in a log line that names the subject, not the reason.
++  //
++  // AN UNKNOWN ARM AND NOT THE MEDIA ARM. The media arm accepts as of this chapter, so it
++  // no longer tells a strict reader from a permissive one.
++  it("forwards a message carrying an attachment arm it does not know (FR-018d, SC-002e)", async () => {
++    await g2.fanout.subscribe(CHANNEL);
++    const future = { type: "audio_clip", clip_id: "c", duration_ms: 1200 };
++    await g1.fanout.publish({
++      ...messageOn(CHANNEL, 11),
++      attachments: [{ type: "media", media_id: "3f7c1a2e-0b5d-4c8a-9e61-7a0d2b4f6c81" }, future],
++    });
++
++    const [channelId, message] = await nextDelivery(g2);
++    expect(channelId).toBe(CHANNEL);
++    expect(message.seq).toBe(11);
++    // FORWARDED WHOLE, not stripped. The reader does not read an attachment, so it must
++    // not edit one either — a gateway that dropped the unknown arm would hand the client
++    // a message that is missing something, which is worse than the message not arriving
++    // because nothing reports it.
++    expect(message.attachments).toHaveLength(2);
++    expect(message.attachments[1]).toEqual(future);
++  });
++
++  it("forwards an EDIT carrying an arm it does not know (FR-018d)", async () => {
++    await g2.fanout.subscribe(CHANNEL);
++    const future = { type: "audio_clip", clip_id: "c", duration_ms: 1200 };
++    await g1.fanout.publishRevision({
++      kind: "updated",
++      message: { ...messageOn(CHANNEL, 12), attachments: [future] },
++    });
++
++    const [channelId, revision] = await nextRevision(g2);
++    expect(channelId).toBe(CHANNEL);
++    expect(revision.kind).toBe("updated");
++  });
++
+   it("drops a payload the contract does not allow instead of forwarding it", async () => {
+     await g2.fanout.subscribe(CHANNEL);
+     // Something else — an older instance, a stray script, a compromised
+     // dependency — puts junk on the subject. It must not reach a client.
+     const raw = instance();
+     await raw.fanout.publish(messageOn(CHANNEL, 6));
+```
+
+```diff title="services/gateway/src/fanout.ts"
+@@ -1,13 +1,14 @@
+ import {
+-  messageCreatedSchema,
++  forwardedMessageSchema,
+   subjectForChannel,
+   subjectForChannelRevision,
+   isChannelRevisionSubject,
+   revisionFabricSchema,
+   type RevisionFabric,
++  type ForwardedMessage,
+   type Message,
+ } from "@relay/protocol";
+ import type { Logger } from "@relay/service-kit";
+ // A NAMED import, not a default: ioredis is CommonJS, the gateway is ESM,
+ // and without esModuleInterop a default import of a CJS module hands you
+ // the module.exports namespace — which is not constructable. TypeScript
+@@ -45,13 +46,17 @@
+   /** Register the delivery callback. Set by the session layer at wiring
+    * time — the fabric knows how to receive, the sessions know who to
+    * hand it to. */
+   onDelivery(handler: (channelId: string, message: Message) => void): void;
+   /** Publish a committed message to its channel's subject. A failure here
+    * costs delivery latency, never durability. */
+-  publish(message: Message): Promise<void>;
++  /** `ForwardedMessage`, BECAUSE A PUBLISHER SERIALISES AND DOES NOT INTERPRET. The
++   * gateway builds this payload from the api's send response, which may carry an
++   * attachment arm this binary does not know during a rolling deploy. Nothing here
++   * reads one — `publish` stringifies and hands it to Redis. */
++  publish(message: ForwardedMessage): Promise<void>;
+   /** ADR-24. Register the revision callback — an edit or a deletion of a
+    * message that already exists.
+    *
+    * A SECOND CALLBACK ON THE SAME MODULE, not a second module. The revision subject's
+    * subscription lifetime is IDENTICAL to the message subject's: the same channels, the
+    * same reference counts, subscribed and dropped at the same moments. A module of its own
+@@ -103,18 +108,31 @@
+       deliverRevision(revision.data.message.channel, revision.data);
+       return;
+     }
+     // The fabric is inside the trust boundary, and frames are STILL
+     // validated: "inside" is one compromised dependency away from
+     // "outside", and a malformed payload must not reach a client.
+-    const message = messageCreatedSchema.shape.payload.safeParse(parsed);
++    // `forwardedMessageSchema` AND NOT `messageCreatedSchema.shape.payload` (FR-018d).
++    //
++    // THIS IS THE LINE THAT DROPS A COMMITTED MESSAGE. The failure arm below is a log
++    // line and a `return`: no retry, no dead letter, and the sender already holds its
++    // 201. An old gateway meeting a new api's media arm would deliver nothing to any
++    // socket on this instance and say so only in a log that names the subject, not the
++    // reason.
++    //
++    // THE VALIDATION IS KEPT, and the comment above says why: "inside" is one
++    // compromised dependency away from "outside". What loosens is the attachment
++    // ELEMENT, which this function never reads — it passes `message.data` whole to
++    // `deliver`. Every other field stays strict, so a malformed payload is still
++    // refused here rather than at a client.
++    const message = forwardedMessageSchema.safeParse(parsed);
+     if (!message.success) {
+       logger.log("error", "fanout.invalid_payload", { subject });
+       return;
+     }
+-    deliver(message.data.channel, message.data);
++    deliver(message.data.channel, message.data as Message);
+   });
+ 
+   return {
+     onDelivery(handler) {
+       deliver = handler;
+     },
+```
+
+```diff title="services/gateway/src/resume.ts"
+@@ -82,15 +82,19 @@
+ }
+ 
+ /** The backfill's high-water mark per channel: the last sequence the
+  * client is about to have. Channels absent from the backfill keep their
+  * presented cursor as the mark — nothing new arrived, so anything buffered
+  * is genuinely new. */
++// TYPED BY WHAT IT READS, WHICH IS ONE FIELD. This took `Message[]` and touches only
++// `seq`; when the backfill page became `ForwardedMessage[]` — a relay may be handed an
++// attachment arm it does not know — the narrower type was the honest fix rather than
++// widening this to a second concrete message type it also does not read.
+ export function highWaterMarks(
+   cursors: Record<string, number>,
+-  backfilled: Record<string, { messages: Message[] }>,
++  backfilled: Record<string, { messages: { seq: number }[] }>,
+ ): Record<string, number> {
+   const marks: Record<string, number> = { ...cursors };
+   for (const [channelId, page] of Object.entries(backfilled)) {
+     const last = page.messages[page.messages.length - 1];
+     if (last) marks[channelId] = last.seq;
+   }
+```
+
+```diff title="services/gateway/src/session.itest.ts"
+@@ -410,17 +410,93 @@
+     expect(refusal.payload.code).toBe("invalid_frame");
+     // T041a: the frame contract has published `field` since chapter 1.3 and the gateway
+     // had never set it. The joined path is what a developer reading their own frame sees.
+     expect(refusal.payload.field).toBe("payload.attachments");
+   }, 20_000);
+ 
+-  it("refuses a media_id and SAYS hosted media is unavailable (FR-003a)", async () => {
+-    // THE MESSAGE, BECAUSE THE CODE IS THE SAME ONE EVERY MALFORMED FRAME GETS. A one-arm
+-    // union would also refuse this — with "Invalid discriminator value. Expected 'url'",
+-    // which is the sentence FR-003a forbids by name. This assertion is the only thing
+-    // that can tell the two-arm schema from a one-arm one on this door.
++  // CONVERTED, NOT DELETED (FR-001b). This asserted *"refuses a media_id and SAYS hosted
++  // media is unavailable"* from 3.24 until this chapter, and its subject — what the
++  // SOCKET door does with a media attachment — is the same subject now that the arm
++  // accepts. A deleted test takes its question with it; this one keeps the question and
++  // changes the answer.
++  //
++  // THE FRAME IS STILL REFUSED AND THE REASON HAS MOVED ONE LAYER. `m_1` used to fail the
++  // arm's unconditional refinement; it now fails `z.uuid()`. Both are the gateway's own
++  // schema rather than the api's, so the code is still `invalid_frame` — `sendError`
++  // fixes it at the call site — and what changed is the sentence. Asserting the sentence
++  // is the only thing that can tell a schema that refuses for the right reason from one
++  // that refuses for any reason at all.
++  // ── THE SOCKET DOOR ACCEPTS, AND IT IS A DIFFERENT DOOR (FR-001a, SC-002a) ──────────
++  //
++  // ONE UNION, THREE DOORS, AND NO ARTIFACT MENTIONED THIS ONE UNTIL ANALYSIS PASS 2.
++  // `messageSendSchema` embeds `attachmentSchema` in the gateway and
++  // `internalSendRequestSchema` embeds it again in the api, so a socket send crosses the
++  // union twice and neither crossing is the REST route the rest of this chapter tests.
++  // The arm accepting at the REST door says nothing about this one.
++  it("commits a media attachment sent over the socket (FR-001a, SC-002a)", async () => {
++    // THE SLOT COMES FROM THE API, over its own route and with the same credential the
++    // harness holds. The gateway has no media surface at all — it forwards.
++    const slot = await fetch(`${api.url}/v1/media`, {
++      method: "POST",
++      headers: {
++        authorization: `Bearer ${api.credential}`,
++        "content-type": "application/json",
++      },
++      body: JSON.stringify({ filename: "s.png", mime_type: "image/png", bytes: 512 }),
++    });
++    expect(slot.status, "the api did not issue a slot to attach").toBe(201);
++    const { media_id } = (await slot.json()) as { media_id: string };
++
++    const socket = connect(await mintToken("tuan", 3600));
++    await firstFrame(socket, "connection.ack");
++    socket.send(
++      JSON.stringify({
++        type: "message.send",
++        payload: {
++          idem_key: randomUUID(),
++          channel: api.channelId,
++          text: "a photo, over the socket",
++          attachments: [{ type: "media", media_id }],
++        },
++      }),
++    );
++
++    // THE ACK IS THE CLAIM. A frame that the gateway's schema refused would answer
++    // `error` instead, and a frame the api refused would too — so an ack means the union
++    // accepted at both crossings and the row committed.
++    const ack = (await firstFrame(socket, "message.ack")) as { payload: { seq: number } };
++    expect(ack.payload.seq).toBeGreaterThan(0);
++  }, 20_000);
++
++  // AND A FOREIGN ID GETS THE API'S OWN CODE, NOT `invalid_frame`. The split matters: the
++  // gateway's schema refuses SHAPES and the api refuses FACTS, and a socket client that
++  // saw `invalid_frame` for a well-formed id it simply does not own would be told to fix
++  // its JSON. `session.ts`'s send catch forwards any 4xx whose `code` passes
++  // `isErrorCode`, which is what makes the api's vocabulary reach this door at all.
++  it("forwards the api's own refusal for a foreign media_id (T032c)", async () => {
++    const socket = connect(await mintToken("tuan", 3600));
++    await firstFrame(socket, "connection.ack");
++    socket.send(
++      JSON.stringify({
++        type: "message.send",
++        payload: {
++          idem_key: randomUUID(),
++          channel: api.channelId,
++          text: "somebody else's object",
++          attachments: [{ type: "media", media_id: randomUUID() }],
++        },
++      }),
++    );
++    const refusal = (await firstFrame(socket, "error")) as {
++      payload: { code: string };
++    };
++    expect(refusal.payload.code).toBe("media_not_attachable");
++    expect(refusal.payload.code).not.toBe("invalid_frame");
++  }, 20_000);
++
++  it("refuses a malformed media_id at the frame, and says which field (FR-008a)", async () => {
+     const socket = connect(await mintToken("tuan", 3600));
+     await firstFrame(socket, "connection.ack");
+     socket.send(
+       JSON.stringify({
+         type: "message.send",
+         payload: {
+@@ -431,17 +507,18 @@
+         },
+       }),
+     );
+     const refusal = (await firstFrame(socket, "error")) as {
+       payload: { code: string; message: string };
+     };
+-    // `invalid_frame` AND NOT `media_not_available`: `sendError` fixes its code at the
+-    // call site, so the REST door answers with the code and the socket answers with the
+-    // sentence. T039 records that split.
+     expect(refusal.payload.code).toBe("invalid_frame");
+-    expect(refusal.payload.message).toMatch(/hosted media is not available/i);
++    // AND NOT THE OLD SENTENCE. A gateway still carrying 3.24's schema would answer
++    // "hosted media is not available yet" here and pass every other assertion in this
++    // file, which is exactly the regression this line exists to catch.
++    expect(refusal.payload.message).not.toMatch(/hosted media is not available/i);
++    expect(refusal.payload.message).toMatch(/uuid/i);
+   }, 20_000);
+ 
+   it("commits TWO attachments sent over the socket, in order (FR-001, FR-006)", async () => {
+     const socket = connect(await mintToken("tuan", 3600));
+     await firstFrame(socket, "connection.ack");
+     socket.send(
+```
+
+```diff title="services/gateway/src/session.ts"
+@@ -6,12 +6,13 @@
+   ALL_CHANNELS,
+   CLOSE_CODES,
+   docsUrl,
+   frameSchema,
+   type ErrorCode,
+   type Frame,
++  type RelayedFrame,
+   type Message,
+   type RevisionFabric,
+   type TypingFabric,
+   isErrorCode,
+   type MembershipFabric,
+   type PresenceFabric,
+@@ -112,13 +113,13 @@
+  * code the coverage ratchet would have to be told to ignore — and this chapter's
+  * pins are 100/100/100/100. */
+ function isInboundFrame(frame: Frame): frame is Extract<Frame, { type: InboundFrameType }> {
+   return INBOUND_FRAME_TYPES.has(frame.type as InboundFrameType);
+ }
+ 
+-function send(socket: WebSocket, frame: Frame): void {
++function send(socket: WebSocket, frame: RelayedFrame): void {
+   socket.send(JSON.stringify(frame));
+ }
+ 
+ /** EIR-API-04's envelope, wearing its WebSocket clothes.
+  *
+  * `request_id` ARRIVED IN THE RATE-LIMIT CHAPTER, and the gateway had none to give — it
+```
+
+**And `codes.ts` is here rather than in the chapter**, placed after the two hunks above that
+already amend it. The chapter’s own hunk applied cleanly to the chain’s END state and failed at
+chapter 4.11, because that is a different state: the appendix runs after every chapter, so a file
+it touches has one shape a reader sees and another the chain replays. Chapter 4.8 paid for this
+exact sentence with a hunk that was right about a state that was wrong.
+
+```diff title="packages/protocol/src/codes.ts"
+@@ -178,37 +178,54 @@
+   // ONLY THE AUTHOR EVER SEES IT. `editMessage` checks authorship first, so a stranger
+   // is refused for not having written the message whether or not it still says
+   // anything — this code cannot tell anybody that a message they could not otherwise
+   // see exists.
+   message_deleted:
+     "this message has been deleted; its text cannot be changed, and its history is unaffected",
+-  /** MEDIA THAT DOES NOT EXIST YET, AND ITS OWN CODE (FR-003, FR-003a).
++  /** A MEDIA OBJECT THIS SENDER CANNOT ATTACH, AND ONE ANSWER FOR THREE REASONS.
+    *
+-   * FR-MSG-11 publishes two ways to attach: an external URL and a `media_id` naming
+-   * something the platform hosts. This chapter builds the first. **A customer reading
+-   * that clause will send the second**, and the refusal they get decides whether they
+-   * conclude they made a mistake or that the feature is not here yet.
+-   *
+-   * `invalid_request` WOULD SAY THE WRONG THING. It means the caller sent something the
+-   * contract does not allow, and `media_id` is in the published contract — so the honest
+-   * answer is that the platform cannot serve it, not that the field is wrong. That is
+-   * the same distinction chapter 2.8 drew between a 404 and a 403.
+-   *
+-   * 422 AND NOT 400. The body is well-formed and the request is understood; what cannot
+-   * be done is the thing it asks for. `ProtocolErrorFilter` derives a code from the
+-   * status for 400/401/403/404 and answers `internal_error` for everything else, so a
+-   * 422 MUST supply this code explicitly through `protocolError` — an unnamed 422 ships
+-   * a body calling itself an internal error. The webhook chapter has five of those still
+-   * open, on a service this tree has not built yet; this is the first 422 in the platform
+-   * that names its own code, and it names it because the schema raises it.
+-   *
+-   * §4.14 REPLACES THE ARM RATHER THAN THIS CODE. When hosted media ships, the
+-   * `{ type: "media" }` arm starts accepting and this entry describes a state the
+-   * platform no longer has — at which point it is deleted, not repurposed. */
+-  media_not_available:
+-    "hosted media is not available yet; attach an http or https url instead",
++   * `media_not_available` STOOD HERE AND IS GONE, on its own entry's instruction —
++   * *"§4.14 replaces the arm rather than this code … at which point it is deleted, not
++   * repurposed."* The arm accepts now, so the state that code described does not exist,
++   * and a code kept past its condition is a vocabulary the platform has to keep meaning.
++   *
++   * THE NAME IS THE OPERATION, NOT THE CAUSE. Three conditions land here — the object
++   * belongs to another environment, it belongs to another user of this one, or no object
++   * has that id — and **a client does the same thing about all three**: stop using that
++   * id and upload one of its own. A code that named the cause would be an existence
++   * oracle, telling a caller which of the three it hit and therefore whether somebody
++   * else's object exists (FR-005).
++   *
++   * ITS NEAR-NEIGHBOURS, AND WHY IT IS NONE OF THEM. Not `not_found` — that is a route
++   * this api does not serve, and the route here is fine. Not `forbidden` — that is a
++   * permission a caller could be granted, and no grant makes another tenant's object
++   * attachable. Not `invalid_request` — the id is well-formed, which is exactly what
++   * makes this a 422 and not a 400.
++   *
++   * 422, AND THE THROWER NAMES IT. The body is understood and what it asks for cannot be
++   * done. `ProtocolErrorFilter` now has a 422 rung (`unprocessable_request`), so an
++   * unnamed one is no longer `internal_error` — but a fallback says only what the status
++   * supports, and this code says which id the caller should stop using. */
++  media_not_attachable:
++    "this media object cannot be attached by this sender; upload your own and attach that id",
++  /** THE 422 RUNG'S FALLBACK, WITH NO THROWER — AND THAT IS THE POINT.
++   *
++   * `ProtocolErrorFilter`'s ladder carried 400, 401, 402, 403, 404, 413, 415 and 503, so
++   * **any 422 that forgot to name itself answered `internal_error`** — the filter's own
++   * *"lie the client cannot act on"*, the third time that comment has been earned.
++   * Nothing throws an unnamed 422 today: `channel_member_limit_exceeded` names itself and
++   * `media_not_attachable` above names itself. This is for the next thrower that does
++   * not, which is the shape `service_unavailable` took at 4.10 with nothing throwing it
++   * either.
++   *
++   * IT CARRIES ONLY WHAT THE STATUS SUPPORTS, because a fallback cannot know why. Two
++   * facts: the request was understood, and the thing it asked for cannot be done. A
++   * client's action is to stop repeating it unchanged — which is the honest instruction
++   * when the server has not said more. */
++  unprocessable_request:
++    "the request was understood but cannot be carried out; repeating it unchanged will not help",
+   // ── THE WEBHOOK REFUSALS (THIS CHAPTER) ─────────────────────────────────────
+   //
+   // FIVE CODES THE ERROR REFERENCE ALREADY PUBLISHED AND THIS REGISTRY DID NOT HAVE.
+   // `docs/08-error-reference.md` carries a section for each — status, retryability and
+   // the field — and `webhooks.service.ts` threw a bare `UnprocessableEntityException`
+   // for every one of them. `ProtocolErrorFilter` derives a code from the status for
+```

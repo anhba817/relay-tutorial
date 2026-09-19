@@ -902,6 +902,16 @@ export const series: Part[] = [
         sourceDoc: "docs/04-srs.md, docs/05-sad.md, docs/06-adr-deep-dives.md",
         readerMinutes: 55,
       },
+      {
+        id: "4.11",
+        path: "/part-4/chapter-11/the-half-of-the-union-that-was-refused",
+        title: "The half of the union that was refused",
+        status: "published",
+        readerProduces:
+          "The `{ type: \"media\" }` arm accepting, at all three doors that parse it, with one predicate inside the send's own transaction: the object belongs to this tenant, and for a user token it was uploaded by the sender or by the tenant itself. Three conditions get one answer, because naming which one failed would tell a caller whether somebody else's object exists. Plus the five forwarding readers that had to learn the new arm before the producer shipped — one of them drops a committed message with nothing but a log line — and the database's own refusal published as the evidence that FR-MED-06's `ready` state cannot be reached yet",
+        sourceDoc: "docs/04-srs.md, docs/05-sad.md, docs/08-error-reference.md",
+        readerMinutes: 55,
+      },
     ],
   },
   {

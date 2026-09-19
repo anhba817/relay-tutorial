@@ -1,0 +1,1004 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import {
+  figThreeConditionsOneAnswer,
+  figFiveReadersThatForward,
+  figTheStateTheDatabaseRefuses,
+} from "./figures";
+
+export const metadata = {
+  title: "The half of the union that was refused — Building Relay",
+  description:
+    "The media arm starts accepting. The predicate is four lines of SQL; the chapter is everything around it — three conditions that must give one answer, five readers that had to learn the new shape before the producer shipped, and a state the clause names that the database will not hold.",
+  alternates: {
+    canonical: "/part-4/chapter-11/the-half-of-the-union-that-was-refused",
+    languages: {
+      en: "/part-4/chapter-11/the-half-of-the-union-that-was-refused",
+      vi: "/vi/part-4/chapter-11/the-half-of-the-union-that-was-refused",
+    },
+  },
+};
+
+<ChapterHeader id="4.11" />
+
+Chapter 3.24 published a discriminated union with two arms and built one of them. The second
+arm parsed its own shape, matched its own discriminator, and then refused unconditionally:
+
+```ts
+.refine(() => false, {
+  message: "hosted media is not available yet — attach an http or https url instead",
+  params: { protocolCode: "media_not_available", status: 422 },
+});
+```
+
+That arm existed so the refusal could be honest. A one-arm union answers `{"type":"media"}`
+with *"Invalid discriminator value. Expected 'url'"*, which tells a developer their field is
+wrong when the field is published in the specification and they have done exactly what it
+describes. The second arm let the platform say something true instead: not yet.
+
+This chapter deletes those four lines. What follows is everything else that had to move.
+
+## The predicate is the small part
+
+FR-MED-06 reads: *"A message may attach a `media_id` in state `pending` or `ready`, provided
+the media object belongs to the same environment and (for user tokens) was uploaded by the
+sending user. Attaching another tenant's or user's media shall fail."*
+
+Three conditions. One query, inside the transaction that writes the message:
+
+```diff title="services/api/src/db/repository.ts"
+@@ -1,9 +1,9 @@
+ import { randomUUID } from "node:crypto";
+ 
+-import { and, asc, desc, eq, gt, inArray, isNull, lt, sql, type SQL } from "drizzle-orm";
++import { and, asc, desc, eq, gt, inArray, isNull, lt, or, sql, type SQL } from "drizzle-orm";
+ 
+ import type { Attachment } from "@relay/protocol";
+ 
+ import {
+   DEFAULT_LIMITS,
+   type LimitedOperation,
+@@ -2331,12 +2331,33 @@
+ /** An application credential named a person (FR-007, FR-007a).
+  *
+  * ITS OWN CLASS, NOT A `ChannelNotFoundError`, because the two say different things and
+  * the service maps them to different codes. Carries the sender's INTERNAL id and never
+  * the customer's identifier: the message on the wire names neither the person asked for
+  * nor the bots that would have been accepted (SC-005). */
++/** A media attachment this sender cannot attach (FR-001 through FR-005, FR-MED-06).
++ *
++ * ONE CLASS FOR THREE CONDITIONS, and that is the requirement rather than a shortcut.
++ * The object may belong to another environment, to another user of this one, or to
++ * nothing at all — and the service maps all three to one code and one message, because
++ * distinguishing them would tell a caller whether somebody else's object exists. A
++ * repository that threw three classes would be handing the service the material for an
++ * existence oracle and trusting it not to use it.
++ *
++ * IT CARRIES THE INDEX AND NOT THE ID. The refusal's `field` is
++ * `attachments.<n>.media_id`, so a caller with ten attachments is told which one — the
++ * same courtesy the schema's own path gives. The ID is deliberately absent: echoing it
++ * back reads as *"that one is wrong, try another"*, and a caller who can enumerate is
++ * exactly who this refusal is for. */
++export class MediaNotAttachableError extends Error {
++  constructor(readonly index: number) {
++    super("a media attachment names an object this sender cannot attach");
++    this.name = "MediaNotAttachableError";
++  }
++}
++
+ export class SenderNotPermittedError extends Error {
+   constructor(readonly userId: string) {
+     super("an application credential may send only as a bot user");
+     this.name = "SenderNotPermittedError";
+   }
+ }
+@@ -4303,12 +4324,26 @@
+       // config toggled on one environment: 0.56ms per send at 32-way concurrency.
+       // The joined read is about 1.2ms of that and US1 needs it whether or not a
+       // cap exists. An earlier uncontrolled benchmark reported 273% and sent three
+       // separate hypotheses chasing what turned out to be warm-up (T033).
+       const quota = await this.assertWithinQuota(tx, period, userId, senderIsPerson);
+ 
++      // FR-MED-06, LAST AMONG THE REFUSALS AND STILL INSIDE THE TRANSACTION (FR-011).
++      //
++      // AFTER THE BAN, THE CHANNEL AND THE QUOTA, for the reason the ban's own comment
++      // gives about order: a refusal naming a fact about a resource must not be reachable
++      // for a caller who could not otherwise get this far. Everything above has already
++      // established that this sender may write to this channel, so a media refusal here
++      // tells them only about objects in their own environment — which is what the
++      // predicate is scoped to anyway.
++      //
++      // BEFORE THE INSERT, which is the half SC-003 asserts: nothing is written, no
++      // outbox row is queued, and `channels.last_sequence` does not move. The sequence is
++      // computed on the next line and a refusal never reaches it.
++      await this.assertAttachableMedia(tx, attachments, userId, senderMustBeBot);
++
+       const seq = channel.lastSequence + 1;
+       const id = randomUUID();
+ 
+       const insert = tx.insert(messages).values({
+         id,
+         channelId: channel.id,
+@@ -5046,12 +5081,128 @@
+    * THE ACTIVE-USER CHECK ONLY BITES ON A NEW SENDER. A tenant at its user cap is
+    * not cut off from the users it already has — the cap is on how many distinct
+    * people may send in a month, not on how much they may say. So a sender already
+    * counted this period passes, and only the one who would be the next new face
+    * is refused. Getting this backwards would suspend a whole tenant the moment
+    * their last allowed user sent their second message. */
++  /** FR-MED-06's predicate, asked of the rows rather than reasoned about (FR-002 to
++   * FR-005, FR-010, FR-011).
++   *
++   * INSIDE THE CALLER'S TRANSACTION, WHICH IS FR-011 AND NOT A PREFERENCE. `tx` is passed
++   * in rather than `this.db` used, so the read and the insert that follows it are one
++   * unit: a refusal writes no message row, no outbox row and does not advance the
++   * channel's sequence, and an object deleted a millisecond after the check cannot leave
++   * a message pointing at nothing.
++   *
++   * ONE QUERY AND NOT N, WITH THE DIFFERENCE TAKEN IN ORDER. A lookup per attachment
++   * would be up to ten round trips inside a write transaction for a question one `IN`
++   * answers. What the single query costs is that "which one failed" becomes a set
++   * difference — and the difference has to preserve POSITION, because the refusal's
++   * `field` is `attachments.<n>.media_id`. `wanted` carries the index alongside the id
++   * for exactly that reason, and the first gap in order is the one reported.
++   *
++   * THE THREE CLAUSES, IN THE CLAUSE'S OWN ORDER (`data-model.md` §2):
++   *
++   *     environment_id = this tenant                       FR-002
++   *     AND (the caller is an application credential
++   *          OR user_id IS NULL                            the tenant uploaded it
++   *          OR user_id = the sending user)                FR-003
++   *     AND state IN ('pending', 'ready')                  FR-010
++   *
++   * A NULL `user_id` PASSES FOR A USER TOKEN, and the specification assumed the
++   * opposite. It means an API key took the slot — the tenant's own backend — and 4.10's
++   * controller wrote the column nullable for this question: *"a photo sent by a person
++   * and an attachment uploaded by a customer's backend are the same operation."* Under
++   * the strict reading they are not the same at all: one produces an object any user of
++   * the tenant can attach and the other produces one nobody can, which makes the
++   * nullability pointless because any sentinel would do.
++   *
++   * `state IN ('pending', 'ready')` IS WRITTEN IN FULL AND ONLY ONE ARM CAN OCCUR. The
++   * column's CHECK constraint is `state = 'pending'` — 4.10 wrote it that way on purpose,
++   * because verification is movement VI's and a schema admitting a state nothing produces
++   * is a schema making a claim it cannot keep. So `'ready'` is unreachable today and the
++   * predicate says it anyway: the clause names both, and a predicate that named one would
++   * have to be found and widened by whoever builds the scanner.
++   *
++   * CONSTITUTION VI ASKS FOR 100% BRANCH COVERAGE OF TENANT ISOLATION, AND THIS IS THAT
++   * CLAUSE MET RATHER THAN PINNED — with the per-arm evidence, because the percentage
++   * cannot carry it. `repository.ts` is pinned at 92 branches and measures 92.91 across
++   * hundreds of them, so an uncovered arm HERE would pass the ratchet with room to spare.
++   * The pin is not the instrument; each arm was deleted and the suite re-run:
++   *
++   *     the three SQL clauses      no JavaScript branch at all. 048 recorded the same
++   *                                clause as unmeasurable for a sorting key; a WHERE is
++   *                                the same shape from a different direction.
++   *     `senderMustBeBot ? …`      forced to the user predicate -> exactly ONE test red,
++   *                                "lets an API key attach a USER's object". Nothing else
++   *                                moved, and that is the finding: an API key's own slot
++   *                                records `user_id IS NULL`, which the user predicate
++   *                                admits — so a suite without that one case would have
++   *                                passed with this arm deleted.
++   *     `refused !== undefined`    never fires -> five red, every refusal test.
++   *     `wanted.length === 0`      deleted -> **17 of 17 still pass.** It is an
++   *                                optimisation and not a behavioural branch: with no
++   *                                media the `IN` is empty, nothing comes back, and
++   *                                nothing is refused. Kept because most sends carry no
++   *                                media and none of them should pay a round trip.
++   *
++   * A COVERAGE NUMBER WOULD HAVE CALLED ALL FOUR "COVERED" and told nobody that one of
++   * them does nothing observable.
++   *
++   * A ROW THAT DOES NOT MATCH AND A ROW THAT DOES NOT EXIST ARE THE SAME OUTCOME
++   * (FR-005). The query returns what passes; anything asked for and not returned is
++   * refused, with no way for the caller — or for this method — to tell which clause it
++   * failed or whether the row is there at all. */
++  private async assertAttachableMedia(
++    tx: Db,
++    attachments: Attachment[] | undefined,
++    senderUserId: string,
++    /** `senderMustBeBot`, THREADED UNCHANGED, AND THE ALTERNATIVE IS THE VIOLATION.
++     *
++     * The predicate needs one fact — whether the caller is an application credential —
++     * and `sendMessage` already takes it under a name about the SENDER. Passing a second
++     * boolean called `callerIsApplication` would read better here and would be the thing
++     * research R5 forbids: *"the repository must not learn what a credential is."* Two
++     * booleans that are always equal is also two things to keep in step. So the existing
++     * constraint is reused and the mismatch between its name and this use is written
++     * down rather than hidden — a send whose sender must be software is, in this
++     * platform, exactly a send an application credential made. */
++    senderMustBeBot: boolean,
++  ): Promise<void> {
++    const wanted = (attachments ?? []).flatMap((attachment, index) =>
++      attachment.type === "media" ? [{ index, id: attachment.media_id }] : [],
++    );
++    if (wanted.length === 0) return;
++
++    const attachable = await tx
++      .select({ id: mediaObjects.id })
++      .from(mediaObjects)
++      .where(
++        and(
++          inArray(
++            mediaObjects.id,
++            wanted.map((w) => w.id),
++          ),
++          eq(mediaObjects.environmentId, this.environmentId),
++          senderMustBeBot
++            ? undefined
++            : or(
++                isNull(mediaObjects.userId),
++                eq(mediaObjects.userId, senderUserId),
++              ),
++          inArray(mediaObjects.state, ["pending", "ready"]),
++        ),
++      );
++
++    const passed = new Set(attachable.map((row) => row.id));
++    // IN ORDER, so ten attachments with the third one foreign name the third. `find`
++    // walks `wanted`, which was built by walking the array the caller sent.
++    const refused = wanted.find((w) => !passed.has(w.id));
++    if (refused !== undefined) throw new MediaNotAttachableError(refused.index);
++  }
++
+   private async assertWithinQuota(
+     tx: Db,
+     period: string,
+     /** `string`, NOT `string | undefined`, and the narrowing is the sender chapter's.
+      * Its one caller is `sendMessage`, whose `userId` is required — so the optional
+      * type here bought an arm nothing could take, and the arm below it read
+```
+
+The query runs before the insert, so a refusal writes no message row, queues no outbox event
+and does not advance `channels.last_sequence`. That is three figures and each can move without
+the others — a row count alone would pass against a platform that inserted and rolled back
+while the sequence kept its increment, and a gap in the sequence is what a client's resume
+cursor reads as a lost message.
+
+One `IN` rather than a lookup per attachment, because ten round trips inside a write
+transaction is a real cost for a question one query answers. What the single query costs is
+that *which one failed* becomes a set difference — and the difference has to preserve
+position, because the refusal names `attachments.<n>.media_id` and a caller sending ten
+attachments should be told which one to stop using.
+
+## Three conditions, one answer
+
+<Figure caption="The send path, with the two refusals it can produce and the reason three conditions collapse into one." code={figThreeConditionsOneAnswer} />
+
+The clause names three ways to fail and the platform gives them one code, one message and one
+field. That looks like laziness and is the opposite.
+
+A refusal that distinguished *"that object belongs to another tenant"* from *"no object has
+that id"* would answer a question the caller has no right to ask. Feed it identifiers and the
+different answers map out which ones are real; the route becomes an oracle for the existence
+of other people's objects, and nothing about the 422 status tells you it happened. So the
+three conditions are indistinguishable by construction: the query returns the ids that pass,
+and everything else is refused the same way.
+
+That property has to be tested as a property, not as three assertions that happen to agree:
+
+```ts
+const bodies: Record<string, unknown>[] = [];
+for (const id of [foreign, someoneElses, nobodys]) {
+  const res = await send({ text: "x", attachments: [media(id)] }, tokenA);
+  expect(res.status, id).toBe(422);
+  const body = (await res.json()) as Record<string, unknown>;
+  delete body.request_id;
+  bodies.push(body);
+}
+expect(bodies[1]).toEqual(bodies[0]);
+expect(bodies[2]).toEqual(bodies[0]);
+```
+
+The comparison is over the whole body rather than the code, because the message and the field
+leak just as well as a code does.
+
+## The specification's own assumption, settled against it
+
+The specification for this chapter carried one flagged assumption, and research settled it the
+other way.
+
+Chapter 4.10 stores `user_id` as NULL when an API key takes a slot — the tenant's own backend
+uploading on a user's behalf. FR-MED-06 says a user token may attach media *"uploaded by the
+sending user"*, and a NULL was not uploaded by the sending user. The strict reading refuses it.
+
+Read the clause's two sentences together and the second is narrower than the first:
+*"Attaching another tenant's or **user's** media shall fail."* A NULL `user_id` is neither. And
+4.10's own controller wrote down what the nullable column was for:
+
+> *"A photo sent by a person and an attachment uploaded by a customer's backend are the same
+> operation, and the difference shows up one chapter later, when FR-MED-06 asks whether the
+> sender uploaded it."*
+
+Under the strict reading those two operations are not the same at all: one produces an object
+any user of the tenant can attach, and the other produces one nobody can. Answering *"NULL
+always fails"* makes the nullability pointless, because any sentinel would have done.
+
+So the predicate admits three cases rather than two, and the clause gains a sentence saying so.
+This is the second chapter running where `research.md` settled the specification's assumption
+against the specification, which is worth saying plainly: the assumption is written down at the
+start **so that it can be attacked**, and a research phase that only ever confirms is a
+research phase that is not reading.
+
+## The tightening that prevents a 500
+
+The old arm took `media_id: z.string().min(1)`. It never mattered, because every value was
+refused anyway. The moment the arm accepts, that shape reaches a UUID column:
+
+```
+invalid input syntax for type uuid
+```
+
+The driver raises, and `ProtocolErrorFilter` has no rung for it, so the wire sees
+`internal_error` and a 500 — a server error any caller can produce with one request and a
+three-character string.
+
+<Trap>
+
+**A loose validator is free until something downstream is strict.** `z.string().min(1)` was
+correct for two chapters and became a caller-triggered 500 the moment the value was used. The
+lesson is not "validate harder"; it is that **the cost of a loose schema is paid by whoever
+makes it reachable**, which is usually not the chapter that wrote it. When you make a refused
+path work, re-read what its inputs were allowed to be.
+
+Narrowing it is safe here for a reason worth stating rather than assuming: no durable row and
+no queued envelope carries a media attachment, because the arm refused every one for
+twenty-six chapters. There is no stored `media_id` this stricter schema could now reject. A
+chapter tightening the same field a year from now would not have that luxury.
+
+</Trap>
+
+`media_id` is `z.uuid()` now, and a malformed one is a 400 naming
+`attachments.0.media_id` — which is what it always was.
+
+```diff title="packages/protocol/src/attachments.ts"
+@@ -65,36 +65,33 @@
+       }
+       return (ATTACHMENT_SCHEMES as readonly string[]).includes(parsed.protocol);
+     },
+     { message: "url must use the http or https scheme" },
+   );
+ 
+-/** The arm §4.14 will replace. It parses the shape so the DISCRIMINATOR matches — that
+- * is what makes zod run this arm's refinement instead of answering with its own generic
+- * message — and then refuses unconditionally. */
+-const mediaArm = z
+-  .strictObject({
+-    type: z.literal("media"),
+-    media_id: z.string().min(1),
+-  })
+-  .refine(() => false, {
+-    message:
+-      "hosted media is not available yet — attach an http or https url instead (FR-MSG-11 §4.14)",
+-    /** THE SCHEMA NAMES ITS OWN REFUSAL, and that is what puts FR-003a on both doors
+-     * with one mechanism.
+-     *
+-     * `ZodValidationPipe` answers every validation failure with `invalid_request` and a
+-     * 400, which is right for a malformed body and wrong here: `media_id` is published
+-     * in FR-MSG-11, so the honest answer is that the platform cannot serve it yet — its
+-     * own code, and a 422 because the request is understood.
+-     *
+-     * Checking for a media arm in the CONTROLLER cannot work: `@Body(new
+-     * ZodValidationPipe(...))` runs before the handler, so the schema has already
+-     * refused with a 400 and control never arrives. The pipe reads this instead. */
+-    params: { protocolCode: "media_not_available", status: 422 },
+-  });
++/** The arm §4.14 fills. It refused unconditionally from 3.24 until this chapter, with a
++ * `.refine(() => false)` and a `protocolCode` that named its own 422 — both gone, because
++ * the state they described does not exist any more.
++ *
++ * `media_id` IS A UUID HERE AND WAS `z.string().min(1)`, AND THE TIGHTENING IS WHAT STOPS
++ * A CALLER-TRIGGERED 500. The looser shape let `not-a-uuid` past the schema and into the
++ * lookup, where Postgres answers `invalid input syntax for type uuid`, the driver raises,
++ * and `ProtocolErrorFilter` calls it `internal_error` — a 500 any caller could produce
++ * with one request. Measured before it was changed (research R3). A UUID at the door
++ * makes it a 400 naming the field, which is what it always was.
++ *
++ * NARROWING A SHAPE NOTHING WAS ACCEPTING IS SAFE BY ORDERING, NOT BY DESIGN. No durable
++ * row and no queued envelope carries a media attachment, because the arm refused every
++ * one for twenty-six chapters — so there is no stored `media_id` that this stricter
++ * schema could now reject. **A reader of anything durable cannot require a field its
++ * writer did not have**, and the reason that rule does not bite here is that the writer
++ * never wrote one. It would bite a chapter that tightened this a year from now. */
++const mediaArm = z.strictObject({
++  type: z.literal("media"),
++  media_id: z.uuid(),
++});
+ 
+ const urlArm = z.strictObject({
+   type: z.literal("url"),
+   // FR-002. Three kinds, and a fourth is a refusal rather than a passthrough.
+   kind: z.enum(["image", "audio", "video"]),
+   url: urlWithAllowedScheme,
+@@ -103,12 +100,49 @@
+ /** `strictObject` on both arms, so an unknown key is a refusal rather than a silent
+  * drop — the argument `membershipFabricSchema` and `revisionFabricSchema` both make: a
+  * field added on one side of a rolling deploy fails loudly on the other instead of
+  * vanishing. */
+ export const attachmentSchema = z.discriminatedUnion("type", [urlArm, mediaArm]);
+ 
++/** THE SAME UNION FOR A READER THAT FORWARDS RATHER THAN JUDGES, and it is one export
++ * because there were nearly four copies of it.
++ *
++ * **Strict where the value is judged, permissive where it is forwarded.** A door that
++ * decides whether to accept a request uses `attachmentSchema` and refuses an arm it does
++ * not know — that is what a request schema is for. A reader that hands the value onward
++ * without interpreting it must not refuse a shape its own writer may produce, because
++ * the two sides deploy separately and the reader is the older binary exactly when it
++ * matters.
++ *
++ * WHAT IT COSTS TO GET THIS WRONG, measured per door rather than argued:
++ *
++ *     outbox envelope     `message.term()` — the message is destroyed AFTER the send
++ *                         was acknowledged, and redelivery never brings it back
++ *     send response       the gateway closes the socket 1011; the message is committed,
++ *                         so the client loses its acknowledgement and an idempotent
++ *                         retry fails identically
++ *     fanout delivery     `logger.log("error", "fanout.invalid_payload"); return` — the
++ *                         frame is dropped, the sender already has its 201, and no
++ *                         socket on that instance ever sees it
++ *
++ * FIVE READERS USE THIS AND THEY WERE FOUND ONE PER ANALYSIS PASS — the outbox at pass 3,
++ * the send response at pass 4, and the three that reach the union through `messageSchema`
++ * at pass 6, after a table written to prevent exactly that recorded `messageSchema` as
++ * *"parsed by nothing at runtime."* It is parsed by the delivery path.
++ *
++ * THE OBJECT STAYS STRICT AND ONLY THE ELEMENT LOOSENS. A new key on the ENVELOPE is a
++ * contract change between two versions of one service and should be loud; a new
++ * attachment ARM is payload this reader never looks at. `z.looseObject` with the
++ * discriminator required is the narrowest thing that accepts a future arm: a payload
++ * with no `type` is still a refusal, so the reader can still tell an attachment from
++ * garbage. */
++export const forwardedAttachmentSchema = z.union([
++  attachmentSchema,
++  z.looseObject({ type: z.string() }),
++]);
++
+ /** The type the read paths cast the column to. `messages.attachments` is a bare
+  * `jsonb()` with no `.$type<>()`, so drizzle infers `unknown` on select and every read
+  * site says what it is with `sql<Attachment[] | null>`. That is a cast and not a check;
+  * `data-model.md` argues why the claim lives per read site rather than once in the
+  * schema. */
+ export type Attachment = z.infer<typeof attachmentSchema>;
+@@ -148,6 +182,14 @@
+     // error's `field`, and a caller who sent neither is most likely to have sent text
+     // they thought was non-empty. Naming the pair would give a field no request has.
+     path: ["text"],
+     message: "text must not be empty unless the message carries at least one attachment",
+   });
+ }
++
++/** What a forwarding reader is handed: a known arm, or one it does not know yet.
++ *
++ * NAMED SO A READER THAT STARTS LOOKING AT ATTACHMENTS HAS TO NARROW. Nothing reads one
++ * today — the outbox consumer, the fanout deliverer and the backfill page all pass the
++ * array through untouched — and this type is what will make the compiler ask "which arm
++ * is this?" on the day something does. */
++export type ForwardedAttachment = z.infer<typeof forwardedAttachmentSchema>;
+```
+
+## Five readers had to learn the shape before the producer shipped
+
+This is the part of the chapter that was not in the plan.
+
+A discriminated union is one definition, and the platform parses it in ten places. Seven name
+the schema directly. Three more reach it by embedding `messageSchema`, which carries an
+attachment array of its own. Of those ten, **five are readers that forward the value without
+ever looking at it** — and every one of them would have refused an arm it did not recognise.
+
+<Figure caption="Every reader that forwards an attachment without interpreting it, and what a refusal costs at each one." code={figFiveReadersThatForward} />
+
+The costs are not the same, and the worst one is the quietest:
+
+```
+outbox envelope   message.term() — the message is destroyed AFTER the send was acknowledged
+send response     the gateway closes the socket 1011; the message is committed, so the
+                  client loses its acknowledgement and an idempotent retry fails identically
+fanout delivery   logger.log("error", "fanout.invalid_payload"); return
+                  the frame is DROPPED, the sender already holds its 201, and no socket
+                  on that instance ever sees the message
+```
+
+That third one is the delivery path. During a rolling deploy — a new api, an old gateway — a
+message carrying a media attachment commits, answers the sender `201`, and reaches nobody. The
+only trace is a log line that names the subject and not the reason.
+
+The rule these five share is one this series has paid for twice before:
+
+> **Strict where the value is judged, permissive where it is forwarded.** A door deciding
+> whether to accept a request refuses an arm it does not know; that is what a request schema
+> is for. A reader handing a value onward must not refuse a shape its own writer may produce,
+> because the two sides deploy separately and the reader is the older binary exactly when it
+> matters.
+
+So there is one permissive element schema, exported once and used at all five sites:
+
+```diff title="packages/protocol/src/frames.ts"
+@@ -1,10 +1,11 @@
+ import { z } from "zod";
+ 
+ import {
+   attachmentSchema,
++  forwardedAttachmentSchema,
+   MAX_ATTACHMENTS,
+   refineTextAndAttachments,
+ } from "./attachments.js";
+ 
+ // The wire contract, one home (ADR-01). Every frame is a JSON object with a
+ // `type` discriminator and a `payload` (EIR-WS-02). Schemas are the single
+@@ -114,12 +115,39 @@
+ });
+ 
+ // The six real-time event kinds (FR-RTM-05). The kinds are the SRS's; the
+ // `noun.verb` spellings are this chapter's recorded decision, following the
+ // documents' own connection.ack / message.send naming.
+ 
++/** `messageSchema` FOR A READER THAT FORWARDS THE MESSAGE ON (FR-018d).
++ *
++ * `messageSchema` above stays strict, and that is deliberate: it is what the api BUILDS,
++ * `Message` is inferred from it, and its `attachments` field is required precisely so the
++ * compiler names every construction site. Widening it would undo the thing it was made
++ * required for.
++ *
++ * THREE READERS REACH THE ATTACHMENT UNION THROUGH IT, AND NONE OF THEM LOOKS AT AN
++ * ATTACHMENT. `fanout.ts:109` parses a delivered `message.created`, `fanout.ts:98` parses
++ * a revision, and `api-client.ts:218` parses a backfill page — all three in the GATEWAY,
++ * all three reading a payload the **api** produced, across a boundary the two services
++ * deploy independently. An old gateway meeting a new api's media arm answers:
++ *
++ *     fanout        logger.log("error", "fanout.invalid_payload"); return
++ *                   -> the frame is DROPPED. The message is committed and the sender
++ *                      already holds its 201; no socket on that instance ever sees it.
++ *     backfill      parse throws -> degrade("backfill_failed"); the resume is lost and
++ *                   the client re-pages history over REST
++ *
++ * THE TABLE SAID THIS FIELD WAS PARSED BY NOTHING. `data-model.md` §4b enumerated the
++ * seven sites that name `attachmentSchema`, asked *"who parses this?"* of each, and got
++ * "nothing at runtime" for `messageSchema` — because nothing parses it under that name.
++ * The question that finds these is one level up: what is this schema embedded in? */
++export const forwardedMessageSchema = messageSchema.extend({
++  attachments: z.array(forwardedAttachmentSchema),
++});
++
+ export const messageCreatedSchema = z.strictObject({
+   type: z.literal("message.created"),
+   payload: messageSchema,
+ });
+ 
+ export const messageUpdatedSchema = z.strictObject({
+@@ -270,6 +298,35 @@
+ 
+ /** Parse anything the wire delivers. Hostile input is an expected value, not
+  * an exception: this returns zod's safeParse result and never throws. */
+ export function parseFrame(raw: unknown) {
+   return frameSchema.safeParse(raw);
+ }
++
++/** A MESSAGE AS A RELAY HANDS IT ON, rather than as the api built it. */
++export type ForwardedMessage = z.infer<typeof forwardedMessageSchema>;
++
++/** WHAT THE GATEWAY CAN PUT ON A SOCKET, which is not the same set as what the api can
++ * build (FR-018d).
++ *
++ * `Frame` above is the CONTRACT — every frame this platform intends to send, with the
++ * attachment union closed, and it is what a client validates against and what
++ * `frameSchema` parses. This type is narrower in purpose and wider in one field: the two
++ * frames that carry a message, as a process that RELAYS one must type them.
++ *
++ * THE GATEWAY DOES NOT BUILD THESE MESSAGES, IT FORWARDS THEM. They arrive from the api
++ * — over Redis for a live delivery, over HTTP for a backfill page — and the gateway
++ * writes them to a socket without reading an attachment. During a rolling deploy the
++ * thing it forwards may carry an arm its own binary does not know, which is the whole
++ * reason `forwardedMessageSchema` exists; a relay typed as if it had built the value
++ * would have to either refuse it or lie about it, and refusing it drops a committed
++ * message.
++ *
++ * THE PUBLISHED CONTRACT IS UNCHANGED, deliberately. Widening `messageCreatedSchema`
++ * would tell every client that this platform intends to send arms it has not published,
++ * which is not what is happening — what is happening is that two versions of the server
++ * are briefly disagreeing, and the honest place to say so is the type of the process
++ * standing between them. */
++export type RelayedFrame =
++  | Exclude<Frame, { type: "message.created" } | { type: "message.updated" }>
++  | { type: "message.created"; payload: ForwardedMessage }
++  | { type: "message.updated"; payload: ForwardedMessage };
+```
+
+The object stays strict and only the element loosens. A new key on the *envelope* is a
+contract change between two versions of one service and should be loud; a new attachment
+*arm* is payload the reader never reads. And `z.looseObject({ type: z.string() })` is the
+narrowest thing that accepts a future arm — a payload with no `type` is still refused, so the
+reader can still tell an attachment from garbage.
+
+<Why>
+
+**Why not widen `messageSchema` itself?** Because it is what the api *builds*, and its
+`attachments` field is required precisely so the compiler names every construction site.
+Widening it would undo the thing it was made required for. The reader sites take a variant;
+the published contract a client validates against does not change, because what is happening
+is not *"this platform intends to send arms it has not published"* — it is *"two versions of
+the server briefly disagree"*, and the honest place to say that is the type of the process
+standing between them.
+
+</Why>
+
+The compiler then named seven places where a forwarded value met a strict one, and each was
+fixed by widening a type rather than casting past it. Two got something better: `highWaterMarks`
+is now typed by what it actually reads, which is one field, and the gateway's `send` takes a
+relayed frame rather than the published one.
+
+## The state the clause names and the database will not hold
+
+FR-MED-06 permits `pending` or `ready`. The column's constraint is `CHECK (state = 'pending')`,
+written by chapter 4.10 on purpose: verification is a later chapter's, and a schema that admits
+a state nothing produces is a schema making a claim it cannot keep.
+
+<Figure caption="The clause names two states; the schema permits one, and the refusal is published rather than described." code={figTheStateTheDatabaseRefuses} />
+
+The predicate says `state IN ('pending', 'ready')` anyway. The clause names both, and a
+predicate that named one would have to be found and widened by whoever builds the scanner.
+
+What the chapter can do about the unreachable half is publish the refusal:
+
+```
+violates check constraint "media_objects_state_check"
+```
+
+The text is the assertion, not the throw. *"The insert failed"* would pass against a typo in
+the column list, a missing environment, or a closed pool — three things that are not evidence
+of anything. And the CHECK is not widened so a fixture can plant `ready`: that would buy a
+green assertion about a transition no code performs.
+
+## What the coverage number could not tell us
+
+The constitution asks for 100% branch coverage of tenant isolation. The predicate is a
+tenant-isolation mechanism, and the number is the wrong instrument for it: three of its clauses
+are SQL and carry no JavaScript branch at all, while the JavaScript around them lives in a file
+with hundreds of branches, pinned at 92 and measuring 92.91. An uncovered arm here clears that
+pin with room to spare.
+
+So each arm was deleted and the suite re-run. Two of the four answers were surprises:
+
+```
+senderMustBeBot ? …    forced to the user predicate -> exactly ONE test red
+refused !== undefined  never fires -> five red, every refusal test
+wanted.length === 0    deleted -> 17 of 17 STILL PASS
+```
+
+The credential arm turned out to discriminate almost nothing. An API key's own slot records
+`user_id IS NULL`, and the user predicate admits NULL — so forcing the user predicate on an
+application credential changes nothing for its own objects. The suite as written would have
+passed with that arm removed. The one case that moves is an API key attaching a *user's*
+object, which the clause permits by qualifying the uploader rule with *"(for user tokens)"*.
+That test did not exist until the probe asked what the arm was for.
+
+And the early return has no behavioural consequence at all: with no media attachments the `IN`
+is empty, nothing comes back, and nothing is refused. It stays because most sends carry no
+media and none of them should pay a round trip — but it is an optimisation wearing a branch's
+clothes, and **a coverage number would have called all four arms covered without telling anyone
+that one of them does nothing observable.**
+
+## The registry loses a code and gains two
+
+`media_not_available` described a state the platform no longer has, and its own registry entry
+instructed its deletion rather than its reuse. Deleting a published error code is a real
+decision — it is vocabulary a client may be matching on — and the entry made it in advance,
+which is the only time that decision is cheap.
+
+The entry, and the two that replace it — an excerpt rather than the whole hunk, for a reason
+worth naming: `fences/post-series.md` already amends this file twice, and the appendix applies
+after every chapter. A titled fence here would be written against a state no reader ever sees,
+which is how a correct hunk fails for somebody else’s reason. The replay lives in the appendix
+with the other two; this is what changed.
+
+```ts
+-  media_not_available:
+-    "hosted media is not available yet; attach an http or https url instead",
++  media_not_attachable:
++    "this media object cannot be attached by this sender; upload your own and attach that id",
++  unprocessable_request:
++    "the request was understood but cannot be carried out; repeating it unchanged will not help",
+```
+
+The replacement names the operation rather than the cause, because all three conditions have
+the same remedy: stop using that id and upload one of your own. And the second addition is a
+rung rather than a code anybody throws:
+
+```diff title="services/api/src/protocol-error.filter.ts"
+@@ -58,12 +58,21 @@
+     // a 415 is a media type nothing accepts, a 413 is a declared size over its cap, and
+     // a 402 is a quota. The 503 is the one that does not generalise — the two throwers
+     // that raise it name a specific store, `analytics_unavailable` and
+     // `media_storage_unavailable`, and neither is true of a 503 from somewhere else —
+     // so `service_unavailable` carries only what the status itself supports.
+     //
++    // AND A NINTH RUNG AT 422, FROM HOSTED MEDIA'S SECOND HALF (FR-009a). The ladder
++    // carried eight statuses and 422 was not one of them, so any 422 that forgot to name
++    // itself answered `internal_error` — the same lie this comment records three times
++    // above, on the one status this platform raises most deliberately. Nothing throws an
++    // unnamed 422 today and that is the argument FOR the rung: `media_not_attachable`
++    // names itself and `channel_member_limit_exceeded` names itself twice, so the rung is
++    // for the next thrower that does not. `unprocessable_request` carries only what the
++    // status supports, because a fallback cannot know which 422 it is standing in for.
++    //
+     // A NAMED CODE STILL WINS. These are what a thrower gets for saying nothing, not a
+     // replacement for saying something.
+     const ladder: ErrorCode =
+       status === 400
+         ? "invalid_request"
+         : status === 401
+@@ -75,15 +84,17 @@
+               : status === 404
+                 ? "not_found"
+                 : status === 413
+                   ? "media_too_large"
+                   : status === 415
+                     ? "media_type_not_allowed"
+-                    : status === 503
+-                      ? "service_unavailable"
+-                      : "internal_error";
++                    : status === 422
++                      ? "unprocessable_request"
++                      : status === 503
++                        ? "service_unavailable"
++                        : "internal_error";
+     // `field` travels the way `code` does — the thrower names it, because only the
+     // thrower knows it. Omitted rather than null when there is nothing to name: a key
+     // that is always present and usually empty teaches a client to ignore it.
+     const field =
+       typeof response === "object" &&
+       response !== null &&
+```
+
+The ladder carried eight statuses and 422 was not among them, so any 422 that forgot to name
+itself answered `internal_error` — the same lie the filter's own comment records three times.
+Nothing throws an unnamed 422 today, and that is the argument *for* the rung: it is for the
+next thrower that forgets.
+
+```diff title="services/api/src/messages/messages.service.ts"
+@@ -13,12 +13,13 @@
+   MessageDeletedError,
+   MessageNotFoundError,
+   NotMessageAuthorError,
+   Repository,
+   type MessageRow,
+   type MessageWithSender,
++  MediaNotAttachableError,
+   SenderNotPermittedError,
+ } from "../db/repository";
+ import { protocolError } from "../protocol-error";
+ import { QuotaExceededError } from "../quotas/quota.error";
+ import { decodeCursor, encodeCursor } from "./cursor";
+ import type { EditMessageBody, HistoryQuery, SendMessageBody } from "./messages.schema";
+@@ -114,12 +115,38 @@
+         throw protocolError(
+           "sender_not_permitted",
+           "an application credential may send only as a bot user; name one in `user`",
+           HttpStatus.FORBIDDEN,
+         );
+       }
++      // FR-MED-06's REFUSAL, AND THE FIELD IS THE WHOLE COURTESY (FR-004, FR-005).
++      //
++      // ONE CODE AND ONE MESSAGE FOR THREE CONDITIONS — another tenant's object, another
++      // user's, and one that does not exist. The repository already threw one class for
++      // all three; this is the half a caller sees, and the two halves have to agree or
++      // the indistinguishability is a property of neither. The message says what to do
++      // and names nothing: no id, no tenant, no hint about which clause failed.
++      //
++      // 422, WHICH IS WHY THE LADDER GAINED A RUNG THIS CHAPTER. The id is well-formed —
++      // a malformed one is refused at the schema with a 400 — and the request is
++      // understood. `protocolError` names the code explicitly here, so the rung is not
++      // what produces this answer; it is what produces an answer for the next thrower
++      // that forgets.
++      //
++      // AND THE INDEX TRAVELS. `field` is `attachments.<n>.media_id`, taken from the
++      // error rather than recomputed, so a caller sending ten attachments is told which
++      // one to stop using. The schema's own refusals use the same path shape, so a client
++      // reading `field` does not need to know which layer refused it.
++      if (error instanceof MediaNotAttachableError) {
++        throw protocolError(
++          "media_not_attachable",
++          "this media object cannot be attached by this sender; upload your own and attach that id",
++          HttpStatus.UNPROCESSABLE_ENTITY,
++          `attachments.${error.index}.media_id`,
++        );
++      }
+       if (error instanceof UserBannedError) {
+         throw protocolError(
+           "user_banned",
+           "this user is banned in this environment and cannot send messages",
+           HttpStatus.FORBIDDEN,
+         );
+```
+
+## The store had two addresses and one field
+
+One more thing turned up before any of this was written, in a place nothing had looked.
+
+The composed api answered **503 `media_storage_unavailable` to every slot request.** Not
+sometimes — always, and it had since the previous chapter shipped. `compose.yaml` names every
+store the api talks to by its service name, and named MinIO nowhere, while `depends_on` waited
+on it. So the api fell back to `http://localhost:9100`, which inside that container is that
+container:
+
+```
+from inside the api container   localhost:9100 -> ECONNREFUSED
+                                minio:9000     -> 200
+from the host                   localhost:9100 -> 200
+```
+
+Nothing caught it because every media test runs the api as a host process, where the default is
+correct. The composed api is exercised by exactly one suite, and that suite had never asked for
+a slot.
+
+The fix is not one line, because the store has two consumers that want different addresses. The
+presigned URL is handed to a *client*, which is outside the network; the api's own reachability
+probe runs *inside* it. And the host is part of the SigV4 signature, so a URL signed for one
+origin is refused at the other.
+
+```diff title="services/api/src/media/store.ts"
+@@ -4,21 +4,40 @@
+ //
+ // Every other call is made by the CLIENT against a URL this service signs (ADR-13).
+ // The exception is creating the bucket, which has to happen once before any slot can
+ // be issued and which nothing else in the stack does.
+ 
+ export interface StoreConfig {
++  /** WHERE THE CLIENT REACHES THE STORE. This is the origin signed into an upload URL,
++   * and the client is outside this process by construction (ADR-13). */
+   endpoint: string;
++  /** WHERE THIS SERVICE REACHES THE STORE, and it is a second field because the host is
++   * inside the signature.
++   *
++   * `X-Amz-SignedHeaders: host` — a URL signed for one origin is refused at another, so
++   * the two consumers of this config cannot share one address once they disagree. They
++   * agreed until the api ran anywhere but the host: `compose.yaml` publishes MinIO on
++   * `localhost:9100` for the client and reaches it as `minio:9000` from inside the
++   * network, and the composed api answered **503 to every slot request** because the
++   * default put its own probe at `localhost:9100`, which inside that container is that
++   * container. Measured: `localhost:9100 -> ECONNREFUSED`, `minio:9000 -> 200`, from a
++   * shell in the api while the same store answered 200 to the host.
++   *
++   * DEFAULTS TO `endpoint`, so every lane that runs the api as a host process is
++   * unchanged and nothing has to know this field exists until the two addresses differ. */
++  internalEndpoint: string;
+   accessKey: string;
+   secretKey: string;
+   bucket: string;
+ }
+ 
+ export function storeConfig(env: NodeJS.ProcessEnv = process.env): StoreConfig {
++  const endpoint = env.RELAY_MINIO_ENDPOINT ?? "http://localhost:9100";
+   return {
+-    endpoint: env.RELAY_MINIO_ENDPOINT ?? "http://localhost:9100",
++    endpoint,
++    internalEndpoint: env.RELAY_MINIO_INTERNAL_ENDPOINT ?? endpoint,
+     accessKey: env.RELAY_MINIO_ACCESS_KEY ?? "relay",
+     secretKey: env.RELAY_MINIO_SECRET_KEY ?? "relay-secret",
+     bucket: env.RELAY_MINIO_BUCKET ?? "relay-media",
+   };
+ }
+ 
+@@ -34,13 +53,20 @@
+  * comment said *"on boot, every boot"* and **nothing called it on boot** — only test
+  * `beforeAll` hooks did. Every local run passed because the bucket already existed from
+  * the first one; CI's fresh volume is what said so, with two suites that never touch
+  * this file answering 503 to a slot request. A comment describing behaviour no code
+  * performs is the defect this chapter keeps finding in other people's files. */
+ export async function ensureBucket(config: StoreConfig): Promise<"created" | "exists"> {
+-  const url = presign({ method: "PUT", ...config, expiresIn: 60 });
++  // `internalEndpoint`, NOT `endpoint`. This is the one call the api makes itself, so it
++  // signs for the address the api can reach rather than the one the client is given.
++  const url = presign({
++    method: "PUT",
++    ...config,
++    endpoint: config.internalEndpoint,
++    expiresIn: 60,
++  });
+   const res = await fetch(url, { method: "PUT" });
+   if (res.ok) return "created";
+ 
+   const body = await res.text();
+   if (body.includes("BucketAlreadyOwnedByYou")) return "exists";
+ 
+@@ -82,13 +108,20 @@
+  * accepts the connection and then hangs would otherwise hold the request open until the
+  * client gave up, turning a refusal this function exists to produce into a timeout the
+  * client has to interpret. Two seconds: long enough for a loaded store on a shared
+  * machine, short enough that a slot request never becomes the slowest thing in the api.
+  */
+ export async function storeReady(config: StoreConfig): Promise<boolean> {
+-  const url = presign({ method: "HEAD", ...config, expiresIn: 60 });
++  // `internalEndpoint` for the same reason `ensureBucket` uses it: this probe is the api
++  // asking the store a question, not a URL anybody else will hold.
++  const url = presign({
++    method: "HEAD",
++    ...config,
++    endpoint: config.internalEndpoint,
++    expiresIn: 60,
++  });
+   try {
+     const res = await fetch(url, { method: "HEAD", signal: AbortSignal.timeout(2_000) });
+     if (res.ok) return true;
+     if (res.status !== 404) return false;
+     await ensureBucket(config);
+     return true;
+```
+
+```diff title="compose.yaml"
+@@ -196,12 +196,31 @@
+       # against Postgres. The reconciler is none of those three roles — it audits the
+       # boundary, and an auditor confined to one side of a fence cannot check the fence.
+       RELAY_CLICKHOUSE_HOST: clickhouse
+       RELAY_CLICKHOUSE_HTTP_PORT: "8123"
+       RELAY_CLICKHOUSE_USER: relay
+       RELAY_CLICKHOUSE_PASSWORD: relay
++      # TWO ADDRESSES FOR ONE STORE, AND THE OMISSION OF BOTH COST A PERMANENT 503.
++      #
++      # The block above says "container names, not localhost" and MinIO was the one
++      # service it did not name, while `depends_on` below waits on it — a dependency
++      # declared and an address forgotten. `store.ts` then fell back to
++      # `http://localhost:9100`, which inside this container is this container, so
++      # `storeReady` was refused and FR-017 answered `media_storage_unavailable` to
++      # every slot request. Measured from a shell in here: `localhost:9100 ->
++      # ECONNREFUSED`, `minio:9000 -> 200`, with the same store answering 200 on the
++      # host. Nothing caught it because every media suite runs the api as a host
++      # process, where the default is correct.
++      #
++      # THEY DIFFER BECAUSE THE HOST IS INSIDE THE SIGNATURE. `X-Amz-SignedHeaders:
++      # host`, so a URL signed for one origin is refused at the other. The client is
++      # outside this network and gets the published port; the api is inside it and
++      # reaches the same store by service name. Splitting them is the only way both
++      # requests are signed for where they are actually sent.
++      RELAY_MINIO_ENDPOINT: http://localhost:9100
++      RELAY_MINIO_INTERNAL_ENDPOINT: http://minio:9000
+       PORT: "4000"
+     ports:
+       - "${RELAY_API_PORT:-4000}:4000"
+     depends_on:
+       postgres: { condition: service_healthy }
+       nats: { condition: service_healthy }
+```
+
+They had coincided until now only because the api had always run on the host.
+
+## Checkpoint
+
+<Checkpoint>
+
+```bash
+cd relay-platform
+RELAY_POSTGRES_PORT=15432 docker compose up -d --wait
+pnpm build && pnpm test && pnpm test:integration
+```
+
+A slot, an upload, and a message that attaches it:
+
+```bash
+MEDIA=$(curl -s -X POST localhost:4000/v1/media \
+  -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"filename":"holiday.jpg","mime_type":"image/jpeg","bytes":2097152}')
+curl -s -X PUT "$(jq -r .upload_url <<<"$MEDIA")" --data-binary @holiday.jpg
+curl -s -X POST "localhost:4000/v1/channels/$CHANNEL/messages" \
+  -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d "{\"text\":\"look\",\"attachments\":[{\"type\":\"media\",\"media_id\":\"$(jq -r .media_id <<<"$MEDIA")\"}]}"
+```
+
+**Expected**: `201`, and reading the message back returns the attachment exactly as sent — no
+state, no filename, nothing the platform knows about the object. Three ids that are not yours
+— another tenant's, another user's, and one nobody has — return three identical `422` bodies.
+
+</Checkpoint>
+
+<ForwardRef>
+
+The object is still `pending` and nothing verifies it. FR-MED-03's scan, FR-MED-07's
+`media.updated` event and FR-MED-09's rejection marker are movement VI's, and all three need
+the state this schema currently refuses to hold. FR-MED-08's signed delivery is a later chapter
+too: a `media_id` in a message is not yet a URL anybody can fetch.
+
+</ForwardRef>
+
+<ChapterFooter id="4.11" />
