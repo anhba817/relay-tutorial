@@ -8295,3 +8295,117 @@ neither.
     * is the safe direction while degraded, and the cap makes that a bounded
     * population rather than everybody. */
 ```
+
+---
+
+## The dispatcher's two streams, and a `ready()` that never forced anything (`gaps.md` 056-9)
+
+Splitting the CI job made `pnpm test:integration` run there for the first time since
+2026-09-13, and **`dispatcher.itest.ts` failed all sixteen of its tests** with
+`NatsError: consumer not found`. Neither belongs to a chapter: the chapters are right, and
+what was wrong is a precondition every local run inherited from the run before it.
+
+`main.ts` declines to define `EVENTS` and `DELIVERIES`, for a reason worth keeping — *"two
+definitions of one stream is a drift waiting for the day they disagree"* — so its
+`consumers.add` carries a `.catch(() => undefined)` and the poll loop retries. That is right
+in production and not enough in a test: `DeliverPolicy.New` means a consumer created after
+the publish never sees it. And a healthy api is not the same as the streams existing, because
+the api creates them from publishers whose connections are **lazy**, and this lane runs with
+`RELAY_OUTBOX_RELAY=off` and `RELAY_EVENT_CONSUMER=off`.
+
+So the suite calls the api's own two creators, out of the `dist` it already loads — not a
+second definition, which is what the objection is actually about. Reproduced both ways
+against a broker with both streams deleted: **16 failed without it, 16 passed with it.**
+
+And `ready()`'s own comment said *"force the consumers into existence"*, which
+`connection_()` cannot promise. It says what it does now. **A comment that describes
+behaviour no code performs** is the defect chapter 4.10 filed as `gaps.md` 056-10, found the
+same way — by a broker that had never run this project.
+
+```diff title="services/dispatcher/src/main.ts"
+@@ -280,16 +280,30 @@
+       }
+       await new Promise((resolve) => setTimeout(resolve, 200));
+     }
+   }
+ 
+   return {
+-    /** Force the consumers into existence without processing anything. A suite
+-     * using `DeliverPolicy.New` must create its position BEFORE it publishes, or
+-     * the message it is about to send lands before the consumer exists and is
+-     * never seen. */
++    /** Connect, and ATTEMPT the consumers, without processing anything. A caller
++     * using `DeliverPolicy.New` needs its position to exist before it publishes,
++     * or the message it is about to send lands before the consumer does and is
++     * never seen.
++     *
++     * IT ATTEMPTS RATHER THAN FORCES, AND THE DIFFERENCE COST SIXTEEN TESTS. This
++     * comment used to say *"force the consumers into existence"*, which
++     * `connection_()` cannot promise: its `consumers.add` carries
++     * `.catch(() => undefined)` because neither stream is this service's to
++     * define, so on a broker where the api has not yet published there is nothing
++     * to add a consumer to and this returns having created none. Production is
++     * fine — the poll loop retries and nothing is due yet — and a test that
++     * publishes on the next line is not. `dispatcher.itest.ts` ensures both
++     * streams itself, out of the api's own `dist`, for exactly that reason.
++     *
++     * A comment that describes behaviour no code performs is the defect chapter
++     * 4.10 filed as `gaps.md` 056-10; this is the same sentence shape, and it was
++     * found the same way — by a broker that had never run this project. */
+     async ready(): Promise<void> {
+       await connection_();
+     },
+     start() {
+       if (running) return;
+       running = true;
+```
+
+```diff title="services/dispatcher/src/dispatcher.itest.ts"
+@@ -366,12 +366,45 @@
+     secondUrl = await second.listen();
+ 
+     apiPort = Number(process.env["RELAY_DISPATCHER_ITEST_API_PORT"] ?? 4131);
+     child = spawnApi(apiPort, CREDENTIAL);
+     apiUrl = `http://127.0.0.1:${apiPort}`;
+     await waitForHealth(`${apiUrl}/healthz`);
++
++    // THE TWO STREAMS, FORCED INTO EXISTENCE BEFORE ANY CONSUMER IS ASKED FOR — AND THIS
++    // SUITE FAILED SIXTEEN WAYS WITHOUT IT ON A BROKER THAT HAD NEVER SEEN THEM.
++    //
++    // `main.ts` declines to define them, for a reason worth keeping: *"The DELIVERIES
++    // stream is created by the API SERVICE, which publishes to it. The dispatcher only
++    // consumes, so it does not define the stream — two definitions of one stream is a
++    // drift waiting for the day they disagree."* Its `consumers.add` therefore carries a
++    // `.catch(() => undefined)` and the poll loop retries, which is right in production
++    // and not enough here: `DeliverPolicy.New` means a consumer created after the publish
++    // never sees it, so `dispatcher.ready()` returning without a consumer is a suite that
++    // publishes into nothing and then reads `NatsError: consumer not found`.
++    //
++    // AND THE API BEING HEALTHY IS NOT THE SAME AS THE STREAMS EXISTING. The api creates
++    // them from its own publishers, whose connections are LAZY — and this lane runs with
++    // `RELAY_OUTBOX_RELAY=off` and `RELAY_EVENT_CONSUMER=off`, so nothing in a healthy api
++    // has published yet. Every local run passed because a broker that has run this project
++    // once already has both streams; CI's fresh JetStream is what said so.
++    //
++    // SO THE SUITE CALLS THE API'S OWN CREATORS, out of the `dist` it already loads. Not a
++    // second definition — the same two functions the api runs — which is what `main.ts`'s
++    // objection is actually about. `ingest.itest.ts`, `attempts.itest.ts` and
++    // `connection-log.itest.ts` each ensure their own stream in `beforeAll` for the same
++    // reason; this one had been relying on a neighbour having done it.
++    const publisher = require_(join(API_DIST, "outbox", "jetstream.publisher.js")) as {
++      ensureStream: (nc: NatsConnection) => Promise<void>;
++    };
++    const deliveries = require_(join(API_DIST, "webhooks", "delivery-relay.js")) as {
++      ensureDeliveriesStream: (nc: NatsConnection) => Promise<void>;
++    };
++    nats ??= await connect({ servers: NATS_URL });
++    await publisher.ensureStream(nats);
++    await deliveries.ensureDeliveriesStream(nats);
+     // A per-run position, and only messages published after it exists. Sharing
+     // the production durable would hand this suite every delivery every earlier
+     // run left behind — and a batch of twenty-five is quickly all backlog, which
+     // is exactly how this suite first failed. Chapter 2.1 did the same for
+     // environments, 2.6 for subjects, the broker chapter for its own durables.
+     const run = randomUUID().slice(0, 8);
+```
+
