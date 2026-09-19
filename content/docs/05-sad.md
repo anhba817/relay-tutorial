@@ -1925,6 +1925,46 @@ year, fold it back into a throwaway and delete the flag.
 
 Full argument, the measurements and what the repair cost: ADR-29 in `06-adr-deep-dives.md`.
 
+### ADR-30 — Relay signs its own presigned URLs
+**Status:** accepted (2026-09-19) · **Drivers:** D3 · ADR-13 · NFR-SCL-01's memory budget ·
+dependency count moves by **zero**
+
+ADR-13 chose the pattern — clients upload straight to object storage against a URL Relay signs,
+so media bytes never transit Relay compute. It did not say what does the signing, and hosted
+media is the chapter that has to.
+
+**`node:crypto`, twenty-eight lines.** AWS Signature Version 4 for a presigned URL is five
+HMAC-SHA256 rounds over a canonical request, and every input is a string Relay already has. The
+`UNSIGNED-PAYLOAD` literal is what makes it work without the body: the client sends bytes Relay
+never sees, so the signature cannot cover them.
+
+**Rejected: `@aws-sdk/client-s3` + `@aws-sdk/s3-request-presigner`.** Two packages and their
+transitive tree for one function, on a service with a 160 MB working-set budget that was
+measured at 157. The SDK is the right answer for a codebase that also lists, copies, tags and
+multipart-uploads; this one signs a PUT and a HEAD.
+
+**Rejected: `minio`.** One package rather than two, and a smaller tree — but it binds the
+signature to one vendor's client at the moment the platform is choosing a store it can replace.
+The canonical-request algorithm is S3's and is what every compatible store implements; a client
+library is an implementation of it with a name attached.
+
+**What the decision is not.** It is not a claim that signing is easy. A wrong signature is a
+bare `403 SignatureDoesNotMatch` with no indication of which field was wrong, and a consistently
+wrong one passes every unit test you can write about shape. The acceptance is a running store
+answering nine questions — signed PUT 200, signed GET 200, **unsigned GET 403**, expired refused
+from the store's own clock, tampered 403 — and those nine are an integration suite rather than a
+one-off probe for that reason.
+
+**And the cost that is not the dependency.** A presigned URL needs no contact with the store, so
+the api never learns the store is down and FR-017's refusal needed a round trip built for it:
+**+1.524 ms at p50, +24.1%** on the happy path, 200 samples a side.
+
+**Reversal condition.** If a later chapter needs listing, copying, lifecycle rules or multipart
+uploads, the SDK's tree stops being overhead for one function and this decision should be
+re-taken as a whole rather than extended one signer at a time.
+
+Full argument, the three options and the measurements: ADR-30 in `06-adr-deep-dives.md`.
+
 ## 10. Risks and technical debt register
 
 | # | Risk / debt | Exposure | Mitigation / trigger |

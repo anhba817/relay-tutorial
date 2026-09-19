@@ -2223,3 +2223,119 @@ change.
 
 If `--dump` is used fewer than five times in a year, fold it back into a throwaway copy and
 delete the flag. The argument for it is fifty uses, not elegance.
+
+---
+
+## ADR-30 — Relay signs its own presigned URLs
+
+**Status:** accepted · 2026-09-19 · chapter 4.10, feature 056
+
+### The decision ADR-13 left open
+
+ADR-13 settled the shape: a client uploads straight to object storage against a URL Relay signs,
+and media bytes never transit Relay compute. It is the reason a 100 MB video costs the api a
+request and a row rather than a request, a buffer and a second request. What it did not settle
+is what produces the signature, because no chapter needed one until this one.
+
+Three options, and the dependency count is not the whole of the argument.
+
+### Option A — `@aws-sdk/client-s3` and `@aws-sdk/s3-request-presigner`
+
+The default answer, and the right one for most codebases. Two packages, a transitive tree in the
+dozens, and a maintained implementation of an algorithm that is genuinely unforgiving.
+
+What argues against it here is the ratio. This platform's use of object storage, today and for
+the two chapters that follow, is: create one bucket at boot, sign a PUT, sign a HEAD. It does not
+list, copy, tag, set lifecycle rules, or multipart-upload. `services/api` carries a 160 MB
+working-set budget (SRS revision 1.9) that was measured at 157, and a dependency tree is memory
+before it is anything else.
+
+### Option B — `minio`
+
+One package instead of two, a smaller tree, and an API shaped like the store this chapter
+provisions.
+
+What argues against it is the direction the platform is trying to keep open. The whole point of
+choosing an S3-compatible store is that the store is replaceable; a vendor's client library is an
+implementation of the S3 canonical-request algorithm with that vendor's name attached, and
+binding the signature to it at the moment the platform is choosing a replaceable store is the
+wrong trade in the wrong place. MinIO is the development store, not the production one.
+
+### Option C — `node:crypto`, and it is what shipped
+
+Signature Version 4 for a presigned URL is five HMAC-SHA256 rounds over a canonical request:
+date, region, service, `aws4_request`, then the string to sign. Every input is a string the api
+already holds. Written out with the comments the repository's style asks for, it is **twenty-eight
+lines of logic** and the dependency count moves by **zero**.
+
+Two details carry more weight than their size suggests.
+
+**`UNSIGNED-PAYLOAD`** is what makes the presigned form possible at all. The signature cannot
+cover a body Relay never sees, so the canonical request names that literal in the payload-hash
+position and the store accepts it for a presigned URL specifically.
+
+**The canonical URI differs between a bucket operation and an object operation** — `/{bucket}`
+against `/{bucket}/{key}` — and the signature is computed over it. The chapter's first probe
+created a bucket with `mkdir` on the container's volume and therefore never signed a bucket
+operation, which is why four of the suite's nine assertions are about the bucket.
+
+### The acceptance is a running store, not a string
+
+A signature that is consistently wrong passes every unit test you can write about it. The URL has
+a stable shape, the same inputs give the same output, the query parameters are in canonical
+order — and none of that is a claim the store will accept it. The failure mode is a bare
+`403 SignatureDoesNotMatch` with no indication of which field was wrong.
+
+So the signer's acceptance is nine questions asked of a running MinIO, as an integration suite
+rather than a probe run once:
+
+    create the bucket                          created, then exists
+    signed HEAD on the bucket                  200
+    unsigned LIST of the bucket                403
+    signed PUT of an object, no credentials    200
+    signed GET, same object                    200, same bytes
+    unsigned GET of that object                403
+    expired URL                                403 · Request has expired
+    one character of the signature changed     403 · SignatureDoesNotMatch
+    signed with the wrong secret               403
+
+The two unsigned 403s are the ones the design rests on, and the expiry is refused by the store's
+own clock — which is what lets the api publish `expires_at` without keeping a second record of
+it.
+
+**And the tampered-signature assertion was a flake before it was evidence.** It replaced the
+signature's first character with `f`, a no-op whenever that character already was `f`: measured
+over 4,096 signings, **255 of them, 6.23%**. On those runs the probe sent a valid URL and the
+store's honest 200 read as a tampered signature being accepted. A probe that may not have altered
+anything has to assert that it did.
+
+### The cost that is not the dependency
+
+A presigned URL needs no contact with the store. That is the design's whole economy and it is
+also the reason FR-017 needed something built for it: the api never opens a socket, so it never
+learns the store is down, and a slot issued into an outage is byte-identical to a good one.
+
+`docs/05-sad.md:1062` requires the opposite — *"Object storage lost … Upload slots return a
+specific error"* — so `storeReachable()` performs a signed HEAD on the bucket before anything is
+written, with a two-second timeout because *cannot be reached* includes *does not answer*.
+
+    slot request, probe on     min 6.266   p50 7.859   p95 9.007   max 10.135 ms
+    slot request, probe off    min 4.849   p50 6.335   p95 7.260   max 10.350 ms
+    the probe alone, n=200     min 0.944   p50 1.062   p95 1.194   max  1.958 ms
+
+**+1.524 ms at p50, +24.1%**, 200 samples a side, the same binary minutes apart. Two thirds of it
+is the round trip and the rest is the second signing. That is the price of the clause and it is
+published rather than described, because the alternative design — issue the slot and let the
+client discover the outage — costs the client a wasted upload and a URL it cannot distinguish
+from one it mistyped.
+
+### Reversal condition
+
+If a later chapter needs listing, copying, lifecycle rules, server-side copy or multipart
+uploads, the SDK's tree stops being overhead for one function. At that point this decision should
+be re-taken as a whole rather than extended one hand-written signer at a time: a codebase with
+one signed operation and a codebase with eight are different arguments, and the second one is the
+SDK's.
+
+If the production store turns out not to be S3-compatible, neither option B nor option C
+survives, and that is a store decision rather than a signing one.
