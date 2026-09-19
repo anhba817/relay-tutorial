@@ -7562,3 +7562,545 @@ because the chapter that added it changed no fence.
           BEFORE UPDATE OR DELETE ON %1$I FOR EACH ROW
           WHEN (__is_sentinel(OLD.environment_id))
 ```
+
+---
+
+## Nine files hosted media edits that no chapter can anchor (chapter 4.10)
+
+Chapter 4.10 edits seventeen fenced files. It publishes eight of the hunks itself; these nine
+are here, and the reason is the one thing this appendix makes visible.
+
+A chapter's hunk is applied **at that chapter**, against the state the chain has reached by
+then. This file is applied **after every chapter**. So a hunk whose anchor lines were added
+HERE has no context a chapter can match — at any width. `turbo.json` reaches chapter 4.10 with
+67 lines where this appendix leaves 75; `codes.ts` with 324 where it leaves 429;
+`vitest.coverage.config.mts` with 567 where it leaves 1,182. In each of them the lines this
+chapter's change sits between are this file's own.
+
+**Two of the ten that did stay in the chapter needed a narrower window for the same reason.**
+`-U6` reaches appendix-added lines and `-U2` or `-U3` does not, which is the documented repair:
+keep the chapter's change and trim the context the chain does not carry. These seven have no
+width that works, because the change is not *near* the appendix's lines — it is *between* them.
+
+And two of the seven anchor in their first hunk and not their second, which would let half of
+each file's change live in the chapter. Both go here whole: a file whose two edits are made in
+one commit and shown in two places is worse for a reader than a file shown once in the wrong
+place.
+
+What they do, briefly, so the entry is readable without the chapter:
+
+- **`codes.ts`** gains hosted media's four refusal codes and `service_unavailable`, the 503
+  ladder's fallback.
+- **`app.module.ts`** registers `MediaModule`. Without it the route does not exist and every
+  test in the chapter gets a 404 that reads as a routing bug.
+- **`targets.ts`** classifies `POST /v1/media` for the cross-tenant gauntlet, which found it
+  unclassified on the build that registered the module.
+- **`sentinel.ts`** and **`sentinel.sql`** add `media_objects` to the harness's
+  global-operation guard: the table's name in the list, and the bait row that proves the guard
+  is armed. The third edit of that set, the accounting case, is in the chapter.
+- **`turbo.json`** adds the store's four environment variables to the `test:integration`
+  task's key, which is what makes a media suite's result depend on the address it ran against.
+- **`vitest.coverage.config.mts`** gets the same four variables and the chapter's five
+  per-file coverage pins.
+- **`gauntlet.itest.ts`** and **`guard.itest.ts`** are the last two, and they are here for a
+  different reason worth separating from the other seven. Both anchor perfectly well at
+  chapter 4.10 — and putting them there breaks this file's **own** older hunks for the same
+  two paths, which were written against a state that no longer exists once the chapter's
+  change lands first. A hunk that works and unanchors somebody else's is still a broken
+  chain. They go last, after the hunks they would otherwise have invalidated.
+
+```diff title="packages/protocol/src/codes.ts"
+@@ -259,12 +259,35 @@
+   // the dimension, the figures and the resume date, because a close reason is a short
+   // string with nowhere to put them. ONE entry rather than two: the quota chapter
+   // registered this and the metering chapter's port arrived registering it again, and
+   // a duplicate key is a `codes.test.ts` failure rather than a second meaning.
+   quota_exceeded:
+     "a monthly quota is exhausted; the message names the dimension, the figures and the date it resumes",
++  // ── HOSTED MEDIA'S FOUR REFUSALS, AND THREE OF THEM ARE PERMANENT ──────────────
++  //
++  // FR-MED-02 names three conditions and the brief counted four. The fourth is the
++  // SAD's degradation row — *"Object storage lost … Upload slots return a specific
++  // error"* — which FR-MED-02 does not carry, and it is the only one of the four a
++  // client should retry. That asymmetry is the whole reason they are four codes and
++  // not one: transcode, compress and free space are all wasted advice for the store
++  // being briefly unreachable, and retrying is wasted advice for the other three.
++  //
++  // NONE OF THEM IS `quota_exceeded`, for the argument this file already makes twice.
++  // `channel_member_limit_exceeded` below says *"NOT `quota_exceeded`. That is a
++  // monthly, billable, resets-on-a-date refusal whose message promises a resume
++  // date"* — and a storage cap does not reset on a date. It is a LEVEL: the figure
++  // falls when objects are deleted and not when the month turns, which is why
++  // FR-RTL-05 had to be amended rather than stretched to cover it.
++  media_type_not_allowed:
++    "that media type is not accepted; the message names the type, and the accepted set is in the reference",
++  media_too_large:
++    "the declared size exceeds the limit for its kind; the message names both figures",
++  media_storage_exhausted:
++    "this environment's stored bytes would exceed its limit; delete media or raise the cap — waiting does not help",
++  media_storage_unavailable:
++    "the media store cannot be reached; nothing was reserved and the same request will succeed once it recovers",
+   webhook_endpoint_limit_reached:
+     "this environment already holds the maximum number of webhook endpoints; delete one, or use another environment",
+   webhook_url_invalid: "the url is not a valid absolute URL — send scheme, host and path",
+   webhook_url_insecure:
+     "the url must use https; a signature over a plaintext channel protects the body, not the reader",
+   webhook_url_private_address:
+@@ -359,12 +382,33 @@
+   //
+   // ONLY FOR A STORE THAT DID NOT ANSWER. A 404 or a syntax error from ClickHouse means
+   // the PLATFORM's statement is wrong, and telling a customer to retry a query that will
+   // never work is worse than telling them nothing. Those stay `internal_error`.
+   analytics_unavailable:
+     "the analytics service did not answer in time; the rest of the API is unaffected and this request is worth retrying",
++
++  /** THE 503 LADDER'S FALLBACK, AND THE ONLY CODE HERE NOTHING THROWS (FR-018).
++   *
++   * `ProtocolErrorFilter` derives a code from the status when a thrower does not name
++   * one, and its own comment calls the `internal_error` fallback *"a lie the client
++   * cannot act on"* — twice, about the 400 chapter 2.2 fixed and the 403 the
++   * credentials chapter fixed. Hosted media adds 415, 413, 402 and 503 to the
++   * platform, and three of those four have a code the ladder can honestly use.
++   *
++   * 503 DOES NOT, AND THAT IS WHY THIS EXISTS. Both of the platform's 503s today name
++   * a specific store — `analytics_unavailable` and `media_storage_unavailable` — and
++   * neither generalises to a 503 from somewhere else. Mapping the ladder to either
++   * would tell a client that the store it names is down when it may be fine.
++   *
++   * SO IT SAYS LESS, ON PURPOSE. The two specific codes stay the right answer for the
++   * two throwers that know which dependency failed; this one carries the only two
++   * facts the status alone supports — something the request needed did not answer,
++   * and retrying is reasonable. A named code always wins over the ladder, so adding
++   * this takes nothing away from either. */
++  service_unavailable:
++    "a dependency this request needed did not answer; the rest of the API is unaffected and the request can be retried",
+ } as const;
+ 
+ export type ErrorCode = keyof typeof ERROR_CODES;
+ 
+ /** Whether a string the api sent is a code this registry defines.
+  *
+```
+
+```diff title="services/api/src/app.module.ts"
+@@ -6,12 +6,13 @@
+ import { APP_FILTER } from "@nestjs/core";
+ 
+ import { AuthModule } from "./auth/auth.module";
+ import { AuthenticateMiddleware } from "./auth/authenticate.middleware";
+ import { HealthController } from "./health.controller";
+ import { InternalModule } from "./internal/internal.module";
++import { MediaModule } from "./media/media.module";
+ import { MessagesModule } from "./messages/messages.module";
+ import { ChannelsModule } from "./channels/channels.module";
+ // Registered here for the reason `ChannelsModule` is: without this
+ // line the module is compiled, exported, imported by nothing, and none of the user
+ // routes exist. The file appeared in no task until an enumeration asked which
+ // chapter fences it.
+@@ -53,12 +54,17 @@
+     LimitsModule,
+     // Chapter 4.8's read surface. Registered here for the reason `ChannelsModule` and
+     // `UsersModule` are: without this line the module compiles, is imported by nothing,
+     // and the route does not exist — which `pnpm build` would not notice and the
+     // cross-tenant gauntlet would, because it derives its targets from the router.
+     RequestLogModule,
++    // HOSTED MEDIA, AND THIS LINE IS THE WHOLE OF WHETHER THE ROUTE EXISTS. A module
++    // written, tested and never registered gives a 404 that reads as a routing bug
++    // rather than as a missing import — chapter 4.6's `Unknown chapter id`, one
++    // repository over.
++    MediaModule,
+   ],
+   controllers: [HealthController],
+   providers: [
+     { provide: LOGGER, useFactory: apiLogger },
+     { provide: APP_FILTER, useClass: ProtocolErrorFilter },
+     RequestContextMiddleware,
+```
+
+```diff title="services/api/src/isolation/targets.ts"
+@@ -405,12 +405,39 @@
+   // `accepts: "application"` MATCHES THE DECORATOR AND THE TWO ARE NOT COMPARED BY
+   // ANYTHING. The controller declares `@Accepts("application")`; this field tells the
+   // gauntlet which credential to attack with, so a `"user"` here would send it at the
+   // route with a token the guard refuses at the door and the handler would never run.
+   { method: "GET", path: "/v1/request-log", accepts: "application", shape: "list" },
+ 
++  // ── THE UPLOAD SLOT (chapter 4.10, FR-MED-01), AND THE DERIVATION FOUND IT EIGHTH ──
++  //
++  // Run before this entry existed: `44 derived, 37 attacked, 6 exempt` with
++  // `unclassified: ["POST /v1/media"]`. Eight chapters, eight times, and the list has
++  // never once been ahead of the derivation.
++  //
++  // `credential` AND NOT `write`, WHICH IS THE ONE DECISION HERE THAT COULD GO EITHER
++  // WAY. It writes a row, so `write` is the tempting shape — but a `write` attack forges
++  // a tenant-owned identifier from another environment, and this request body is
++  // `{ filename, mime_type, bytes }`. **There is no identifier in it to forge.** That is
++  // `POST /auth/dev-token`'s sentence word for word, and the shape's own definition eight
++  // hundred lines up: *"the shape a foreign-identifier attack cannot express"*.
++  //
++  // AND WHAT THE ATTACK SHOWS INSTEAD IS THE OBJECT KEY. `media.service.ts:71` builds it
++  // as `${environment}/${id}`, from the repository's environment — which came off the
++  // principal the guard resolved, not off anything the caller sent. So the claim is that
++  // two tenants asking the identical question get keys under different prefixes, and
++  // neither can name the other's: the tenant is in the URL the client uploads to, chosen
++  // by the server, one layer below the request.
++  //
++  // `either`, BECAUSE THE CONTROLLER SAYS `@Accepts("application", "user")` and FR-MED-01
++  // says *"on request (user token or API key)"*. The read-position route is the precedent
++  // and it is attacked in both blocks; so is this one. A `"user"` here would understate
++  // which attacks apply, and this project has a record of a route that was named and not
++  // covered.
++  { method: "POST", path: "/v1/media", accepts: "either", shape: "credential" },
++
+   // ── credential, internal, end-user token ─────────────────────────────────────
+   //
+   // `credential` AND NOT `read`, WHICH IS THE SIBLING ROUTE'S ARGUMENT VERBATIM. The
+   // backstop asks what this connection may hear and changes nothing, so `read` is the
+   // tempting shape — but a `read` attack forges an IDENTIFIER, and this route takes
+   // none: no body, no path parameter, no query. Its only tenant-scoped input is the
+```
+
+```diff title="packages/test-harness/src/sentinel.ts"
+@@ -66,12 +66,15 @@
+   quotaPeriod: string;
+   quotaNotificationId: string;
+   /** The connection-metering chapter's, and the fifth guarded table's. Keyed
+    * `(connection_id, period)`, so the bait needs an id of its own rather than
+    * borrowing the sentinel's user or channel. */
+   usageConnectionId: string;
++  /** Hosted media's, and the sixth guarded table's. Keyed on its own `id`, so the
++   * bait needs one rather than borrowing the sentinel's user or channel. */
++  mediaObjectId: string;
+   /** `__sentinel__:<owner>`, on every row, so a failure says whose it is. */
+   name: string;
+ }
+ 
+ /** A v4-shaped uuid derived from a string. Deterministic, so a file's sentinel is
+  * the same on every run and the delete-then-insert in `plant` is exact. */
+@@ -95,12 +98,13 @@
+     environmentId: id("environment"),
+     userId: id("user"),
+     channelId: id("channel"),
+     quotaPeriod: "1999-01-01",
+     quotaNotificationId: id("quota-notification"),
+     usageConnectionId: id("usage-connection"),
++    mediaObjectId: id("media-object"),
+     name: `__sentinel__:${owner}`,
+   };
+ }
+ 
+ /** The shared sentinel this feature does NOT have, kept as a named export so a
+  * reader looking for one finds this comment instead. */
+@@ -150,12 +154,13 @@
+   // The subject the plant below writes, not the one it used to: a cleanup keyed on
+   // a stale subject leaves every row it was meant to remove.
+   await q(`DELETE FROM outbox         WHERE subject = $1`, [`events.${s.name}.bait`]);
+   await q(`DELETE FROM read_positions WHERE environment_id = $1`, [s.environmentId]);
+   // The quota chapter's three, and they come before `users` for the reason the note
+   // above gives: `usage_active_users` references it.
++  await q(`DELETE FROM media_objects       WHERE environment_id = $1`, [s.environmentId]);
+   await q(`DELETE FROM usage_connections   WHERE environment_id = $1`, [s.environmentId]);
+   await q(`DELETE FROM quota_notifications WHERE environment_id = $1`, [s.environmentId]);
+   await q(`DELETE FROM usage_active_users  WHERE environment_id = $1`, [s.environmentId]);
+   await q(`DELETE FROM usage_periods       WHERE environment_id = $1`, [s.environmentId]);
+   await q(`DELETE FROM channels       WHERE environment_id = $1`, [s.environmentId]);
+   await q(`DELETE FROM users          WHERE environment_id = $1`, [s.environmentId]);
+@@ -286,12 +291,34 @@
+     `INSERT INTO usage_connections (connection_id, period, environment_id, minutes)
+      VALUES ($1, $2, $3, 0)
+      ON CONFLICT (connection_id, period) DO UPDATE SET minutes = EXCLUDED.minutes`,
+     [s.usageConnectionId, s.quotaPeriod, s.environmentId],
+   );
+ 
++  // AND HOSTED MEDIA'S. The sixth guarded table, and the first whose row describes
++  // something OUTSIDE the database: a slot the platform agreed to, for an object in a
++  // store Relay never touches (ADR-13).
++  //
++  // IT REUSES THE SENTINEL'S USER, which is the `read_positions` argument — the row
++  // only has to exist for the WHEN clause to have something to test — and it also
++  // exercises the nullable side by being the case where `user_id` is PRESENT. The
++  // absent case belongs to a test rather than to bait.
++  //
++  // `DO UPDATE` on `declared_bytes` for the reason the two rows above give: the id is
++  // derived from the owner, so the key is the same on every run for ever, and a
++  // fixture that guarantees only existence guarantees whatever the first run wrote.
++  // Here the VALUE matters: the storage quota is a `sum(declared_bytes)` over this
++  // table, so a bait row of an unknown size would move a figure a test asserts.
++  await q(
++    `INSERT INTO media_objects
++       (id, environment_id, user_id, filename, mime_type, declared_bytes, object_key)
++     VALUES ($1, $2, $3, 'bait.jpg', 'image/jpeg', 1, $4)
++     ON CONFLICT (id) DO UPDATE SET declared_bytes = EXCLUDED.declared_bytes`,
++    [s.mediaObjectId, s.environmentId, s.userId, `sentinel/${s.environmentId}/bait.jpg`],
++  );
++
+   // DRAIN BAIT: unpublished events. `outbox` carries no environment_id — it is
+   // platform bookkeeping — so the subject is what identifies these, and it is also
+   // why the trigger cannot guard them (data-model.md). The count is `BAIT_ROWS` and
+   // not one, because a single row cannot tell a batch that ignored its limit from
+   // one that honoured it.
+   //
+```
+
+```diff title="packages/test-harness/src/sentinel.sql"
+@@ -180,13 +180,20 @@
+     -- above.
+     --
+     -- AND ITS BAIT NEEDS NO `delivered_at` CONCESSION. Nothing drains this table: the
+     -- credit path looks a row up by its own key and the reporting path reads one
+     -- environment. It is the first guarded table since `read_positions` whose bait can
+     -- sit there claimable because there is no claim to be made.
+-    'usage_connections'
++    'usage_connections',
++    -- HOSTED MEDIA'S, AND IT IS THE FIRST GUARDED TABLE WHOSE ROWS DESCRIBE SOMETHING
++    -- OUTSIDE THE DATABASE. `media_objects` carries `environment_id` written by the api
++    -- from the authenticated identity, so the WHEN clause compiles like every name
++    -- above — but the row is a claim about an object in a store Relay never touches
++    -- (ADR-13). A cross-environment delete here would orphan bytes rather than lose
++    -- them, which is a different failure from the others and refused the same way.
++    'media_objects'
+   ] LOOP
+     EXECUTE format('DROP TRIGGER IF EXISTS __sentinel_guard_%1$s ON %1$I', t);
+     EXECUTE format(
+       'CREATE TRIGGER __sentinel_guard_%1$s
+          BEFORE UPDATE OR DELETE ON %1$I FOR EACH ROW
+          WHEN (__is_sentinel(OLD.environment_id))
+```
+
+```diff title="turbo.json"
+@@ -58,13 +58,17 @@
+         "RELAY_MAILPIT_URL",
+         "RELAY_NOTIFICATION_RELAY",
+         "RELAY_QUOTA_RELAY",
+         "RELAY_DOCS_BASE_URL",
+         "RELAY_API_URL",
+         "RELAY_WS_URL",
+-        "RELAY_DEMO_CREDENTIAL"
++        "RELAY_DEMO_CREDENTIAL",
++        "RELAY_MINIO_ENDPOINT",
++        "RELAY_MINIO_ACCESS_KEY",
++        "RELAY_MINIO_SECRET_KEY",
++        "RELAY_MINIO_BUCKET"
+       ]
+     },
+     "//#lint:root": {
+       "inputs": [
+         "**/*.{ts,mts,cts,mjs,js}",
+         "eslint.config.mjs",
+```
+
+```diff title="vitest.coverage.config.mts"
+@@ -35,12 +35,23 @@
+     // env; it did not look at the suites that boot the app in process.
+     //
+     // A relay catches and logs its own errors, so the guard's refusal inside one is
+     // a log line and a green lane. Setting the flags here makes the quiet database
+     // a property of the lane rather than a convention nobody applied.
+     env: {
++      // THE OBJECT STORE, IN BOTH LANES THAT RUN `.itest.ts` FILES. Chapter 4.9 put a
++      // credential in one of these two configs and not the other, and `pnpm coverage`
++      // stayed red — keeping three cross-tenant attacks skipped in the run that measures
++      // constitution VI's own coverage bar — until eight minutes of a coverage run said
++      // so. The media suites reach a real store; without these they reach nothing and
++      // the refusal they get is `media_storage_unavailable`, which is a correct answer
++      // to the wrong question.
++      RELAY_MINIO_ENDPOINT: "http://localhost:9100",
++      RELAY_MINIO_ACCESS_KEY: "relay",
++      RELAY_MINIO_SECRET_KEY: "relay-secret",
++      RELAY_MINIO_BUCKET: "relay-media",
+       RELAY_OUTBOX_RELAY: "off",
+       RELAY_DELIVERY_RELAY: "off",
+       RELAY_NOTIFICATION_RELAY: "off",
+       RELAY_EVENT_CONSUMER: "off",
+       // The quota relay, the fourth. Same reason as the other three.
+       RELAY_QUOTA_RELAY: "off",
+@@ -1167,12 +1178,88 @@
+         "services/api/src/request-log/request-log.controller.ts": {
+           branches: 100,
+           functions: 100,
+           lines: 100,
+           statements: 100,
+         },
++
++        // ── hosted media (chapter 4.10) ──────────────────────────────────────────
++        //
++        // AND THREE OF THESE FIVE FILES DO NOT APPEAR IN THE TEXT TABLE AT ALL. v8's
++        // text reporter omits a file at 100/100/100/100, so a sweep for "which new files
++        // is the report showing" finds `media.service.ts` and `store.ts` and concludes
++        // the other three were never measured. They were: `coverage-summary.json` lists
++        // all five. **Read the json summary when the question is which files were seen**
++        // — the table answers a different question, which is which files have a gap.
++        //
++        // The signer. 100/100/100/100, and it is a pure function over strings with no
++        // clock and no I/O — `presign.test.ts` drives every branch and `presign.itest.ts`
++        // asks the store whether the bytes are right, which is a different question that
++        // no coverage number can answer.
++        "services/api/src/media/presign.ts": {
++          branches: 100,
++          functions: 100,
++          lines: 100,
++          statements: 100,
++        },
++        // The MIME table. 100/100/100/100, including the arm that only exists because
++        // `ALLOWED_TYPES[mimeType]` on a plain object literal answers for `constructor`:
++        // `kindOf("constructor")` returned a FUNCTION, which is truthy, so one declared
++        // type defeated the type refusal — and then `KIND_CAPS[thatFunction]` is
++        // `undefined`, `bytes > undefined` is false, and it defeated the size refusal
++        // too. `Object.hasOwn` is the fix and `kinds.test.ts` pins the case.
++        "services/api/src/media/kinds.ts": {
++          branches: 100,
++          functions: 100,
++          lines: 100,
++          statements: 100,
++        },
++        // The route. 100/100/100/100, and its one branch is the tenancy one —
++        // `principal.kind === "user"` decides whether the row records an uploader.
++        // Constitution VI's 100%-branch clause names tenant isolation, and this is the
++        // second Part 4 chapter to MEET it rather than pin around it (049 was the first).
++        // Both arms are driven over HTTP by `media.itest.ts`: an API key's slot has no
++        // user and a user token's does, asserted as a pair so that neither passes against
++        // a column that is always the same.
++        "services/api/src/media/media.controller.ts": {
++          branches: 100,
++          functions: 100,
++          lines: 100,
++          statements: 100,
++        },
++        // The slot service. 100 / 92.85 / 100 / 100, raised from 83.33 / 66.66 / 100 /
++        // 83.33 at the end of phase 3 — the three uncovered lines then were the three
++        // `throw`s, and phases 4 and 5 are the chapters that drive them.
++        //
++        // 92.85 IS 13 OF 14 AND THE FOURTEENTH IS ATTRIBUTED TO LINE 32, WHICH IS
++        // `@Injectable()`. Every branch this file writes has both arms driven over HTTP:
++        // the three refusals, the store probe, and the user resolution in each direction.
++        // v8 counts something in the decorator's own output and there is no source line
++        // to cover — the same shape as 045's note that a `binary-expr` arm counts as
++        // covered when the operand was merely evaluated. Pinned at 92 rather than
++        // measured down to nothing, and named rather than left as a mystery.
++        "services/api/src/media/media.service.ts": {
++          branches: 92,
++          functions: 100,
++          lines: 100,
++          statements: 100,
++        },
++        // The store client. 100 / 100 / 100 / 100, from 77.77 / 53.84 / 100 / 85.71.
++        //
++        // WHAT CLOSED IT WAS A SERVER, NOT A MOCK. `ensureBucket`'s throw needs a store
++        // that answers something other than 200 or 409, and a running MinIO cannot be
++        // asked for that on demand — so `store.test.ts` stands up an HTTP server that
++        // answers to order and drives the 403, the 500, and the 409 that is NOT
++        // `BucketAlreadyOwnedByYou`. That last one is the case a status-only check reads
++        // as success: another tenant of the same store owning the bucket.
++        "services/api/src/media/store.ts": {
++          branches: 100,
++          functions: 100,
++          lines: 100,
++          statements: 100,
++        },
+       },
+     },
+   },
+   plugins: [
+     swc.vite({
+       module: { type: "es6" },
+```
+
+```diff title="services/api/src/isolation/gauntlet.itest.ts"
+@@ -360,12 +360,60 @@
+     const serialised = JSON.stringify(body ?? "");
+     expect(serialised).not.toContain(t.victim.channelId);
+     expect(serialised).not.toContain(t.victim.userId);
+     expect(serialised).not.toContain(t.victim.environmentId);
+   });
+ 
++  // ── the upload slot (chapter 4.10, FR-MED-01) ──────────────────────────────────
++  //
++  // `credential` SHAPE, SO THE ATTACK IS THE OBJECT KEY. `{ filename, mime_type, bytes }`
++  // carries no tenant-owned identifier — there is nothing to forge — and the tenant
++  // reaches the key through the principal the guard resolved. What a leak would look
++  // like is one tenant's signed URL pointing inside another's prefix, because the URL is
++  // handed to a client that Relay does not control and the store enforces only the
++  // signature, never the tenancy.
++  //
++  // BOTH CREDENTIAL CLASSES, because `targets.ts` files this route as `accepts: "either"`
++  // and the controller declares `@Accepts("application", "user")`. Attacking with one
++  // would cover half the door.
++  it("POST /v1/media — two tenants get keys under their own prefixes, both credential classes", async () => {
++    attacked.add("POST /v1/media");
++    const ask = async (credential: string) => {
++      const res = await fetch(`${url}/v1/media`, {
++        method: "POST",
++        headers: { authorization: `Bearer ${credential}`, "content-type": "application/json" },
++        body: JSON.stringify({ filename: "x.png", mime_type: "image/png", bytes: 32 }),
++      });
++      expect(res.status).toBe(201);
++      return (await res.json()) as { media_id: string; upload_url: string };
++    };
++
++    const byKey = await ask(t.attacker.credential);
++    const byToken = await ask(attackerToken);
++    const victim = await ask(t.victim.credential);
++
++    // THE ATTACKER'S TWO URLS NAME THE ATTACKER'S ENVIRONMENT AND NOTHING ELSE.
++    for (const slot of [byKey, byToken]) {
++      const key = decodeURIComponent(new URL(slot.upload_url).pathname);
++      expect(key).toContain(`/${t.attacker.environmentId}/`);
++      expect(key).not.toContain(t.victim.environmentId);
++      // and the whole URL, because a query parameter is part of what the store reads
++      expect(slot.upload_url).not.toContain(t.victim.environmentId);
++    }
++
++    // A NON-VACUOUS CONTROL: the victim's own slot really does sit under a different
++    // prefix, so "not the victim's" above is isolation rather than an empty string.
++    const victimKey = decodeURIComponent(new URL(victim.upload_url).pathname);
++    expect(victimKey).toContain(`/${t.victim.environmentId}/`);
++    expect(victimKey).not.toContain(t.attacker.environmentId);
++
++    // AND THE ROWS ARE THE ATTACKER'S. Three slots, three distinct ids, and the two
++    // credential classes wrote into the same environment as each other.
++    expect(new Set([byKey.media_id, byToken.media_id, victim.media_id]).size).toBe(3);
++  });
++
+   // ── the two routes this chapter added ──────────────────────────────────────────
+   //
+   // A chapter that adds an endpoint attacks it in the same chapter. The derivation
+   // found these before the classification did: `targets.itest.ts` went from 9 targets
+   // to 11 and failed naming both as unclassified.
+   it("POST /v1/channels/:channelId/members — refuses, and adds nobody", async () => {
+```
+
+```diff title="packages/test-harness/src/guard.itest.ts"
+@@ -206,12 +206,32 @@
+     values: (s) => [s.usageConnectionId, s.quotaPeriod, s.environmentId],
+     touch: `minutes = minutes`,
+     mark: `minutes = $1`,
+     read: `SELECT minutes AS v FROM usage_connections WHERE environment_id = $1`,
+     marked: (n) => String(n),
+   },
++  // HOSTED MEDIA'S, AND ITS MARK IS THE COLUMN THE QUOTA READS. `declared_bytes` is
++  // what `sum()` runs over for the storage cap, so marking it is marking the figure
++  // the chapter is about — and `filename` would have done just as well for the
++  // mechanism while saying nothing about what the table is for.
++  media_objects: {
++    plant: `INSERT INTO media_objects
++              (id, environment_id, user_id, filename, mime_type, declared_bytes, object_key)
++            VALUES ($1, $2, $3, 'bait.jpg', 'image/jpeg', 1, $4)
++            ON CONFLICT (id) DO NOTHING`,
++    values: (s) => [
++      s.mediaObjectId,
++      s.environmentId,
++      s.userId,
++      `sentinel/${s.environmentId}/bait.jpg`,
++    ],
++    touch: `declared_bytes = declared_bytes`,
++    mark: `declared_bytes = $1`,
++    read: `SELECT declared_bytes AS v FROM media_objects WHERE environment_id = $1`,
++    marked: (n) => String(n),
++  },
+ };
+ 
+ let admin: pg.Client;
+ let plain: pg.Client;
+ 
+ beforeAll(async () => {
+```

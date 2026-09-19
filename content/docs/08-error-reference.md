@@ -523,3 +523,100 @@ the filters and the cursor were wrong you would have had a `400` with the field 
 **Not the same as `internal_error`.** A malformed analytical query — our mistake, not
 yours — answers `500 internal_error`, because retrying it would never help.
 
+
+## media_type_not_allowed
+
+**Status:** 415 · **Retryable:** no
+
+The `mime_type` you declared when asking for an upload slot is not one Relay hosts. The
+accepted set is ten types, and it is deliberately short: four image types (`image/jpeg`,
+`image/png`, `image/gif`, `image/webp`), four audio (`audio/mpeg`, `audio/mp4`,
+`audio/ogg`, `audio/wav`) and two video (`video/mp4`, `video/webm`).
+
+The message names the type you sent, so a client that builds the value from a file
+extension or from a browser's `File.type` can log the exact string that was refused rather
+than guessing which of several uploads failed.
+
+**What to do:** transcode, or do not offer the file. Retrying the same request will get the
+same answer, because nothing about the platform's state decides this one — the list is
+fixed in the build. If the type you need is a reasonable one to host, that is a request for
+the list, not a bug in your integration.
+
+**Not the same as `media_too_large`.** That one is about the size of a type Relay does
+accept, and the remedy there is to compress rather than to convert.
+
+## media_too_large
+
+**Status:** 413 · **Retryable:** no
+
+The `bytes` you declared exceeds the limit for that kind of media. The caps are per kind
+rather than global: 10 MB for an image, 25 MB for audio, 100 MB for video. A 25 MB audio
+file is accepted where a 25 MB image is not, and the kind is derived from the `mime_type`
+in the same request.
+
+The message names both figures — what you declared and what the cap is — because the
+remedy is to compress and a client cannot compress to an unknown target.
+
+**What to do:** compress, re-encode at a lower bitrate, or resize. Retrying unchanged will
+fail identically; nothing on the platform side moves this limit for a single request.
+
+**Note that the figure is the one you declared.** Relay refuses on your number before the
+file exists, so a client that under-declares gets a slot and then has to deal with the
+store's own limits at upload time. Declare the real size.
+
+**Not the same as `media_storage_exhausted`.** That one is about your account's total, not
+about this one file.
+
+## media_storage_exhausted
+
+**Status:** 402 · **Retryable:** no
+
+The bytes already committed for this environment, plus the size you declared, would exceed
+the environment's storage cap. The message names both figures: what is committed now and
+what the cap is.
+
+**What to do:** delete media you no longer need, or raise the cap. **Waiting does not
+help**, and that is the part worth reading twice. Relay's other quotas are monthly flows —
+messages sent, active users, connection-minutes — and their refusals promise you a date
+when sending resumes. Storage is not a flow. It is a level: the figure falls when objects
+are deleted and the first of the month changes nothing about it.
+
+**Not the same as `quota_exceeded`.** That code carries a resume date in its message, and
+for this one that date would be a lie.
+
+## media_storage_unavailable
+
+**Status:** 503 · **Retryable:** yes, shortly
+
+Relay could not reach the object store when you asked for a slot. Nothing is wrong with
+your request — the type was accepted, the size was inside its cap, and no bytes were
+committed against your quota.
+
+This is the only one of the four media refusals worth retrying, which is why it has its own
+code. The other three are permanent for the request that caused them: transcode, compress,
+free space. Retrying those wastes a round trip and, worse, a client that cannot tell them
+apart will either retry all four or abandon all four.
+
+**What to do:** retry in a few seconds. Relay asks the store whether it is answering before
+it issues a slot, precisely so that you never receive an upload URL that cannot be used —
+the alternative is a signed URL that looks perfectly good and fails at upload time, which
+is much harder to diagnose from the client.
+
+**Not the same as `service_unavailable`.** This code names the object store specifically.
+
+## service_unavailable
+
+**Status:** 503 · **Retryable:** yes, shortly
+
+Something the request needed did not answer. This is the general form: where Relay knows
+which dependency failed it says so — `analytics_unavailable` for the analytical store,
+`media_storage_unavailable` for object storage — and this code is what you get when the
+status is all that is known.
+
+**What to do:** retry in a few seconds, and treat a run of these as an incident rather than
+as something to fix in your integration. Nothing about the request needs changing: a
+malformed request answers `400` with the offending field named, and a request the platform
+got wrong answers `500 internal_error`, which retrying will not help.
+
+**Not the same as `internal_error`.** A `500` means the platform did something wrong and
+the same request will go wrong again. A `503` means the platform could not try.

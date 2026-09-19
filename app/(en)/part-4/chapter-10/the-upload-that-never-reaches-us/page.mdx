@@ -1,0 +1,1483 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import {
+  figThePathTheBytesTake,
+  figFourRefusalsOneOfThemTransient,
+  figALevelNotAFlow,
+} from "./figures";
+
+export const metadata = {
+  title: "The upload that never reaches us — Building Relay",
+  description:
+    "A photo reaches Relay's storage without a byte passing through Relay. Signing the URL costs no dependency; the interesting costs are elsewhere — a round trip that exists only to produce a refusal, a quota that is a level rather than a flow, and a race a transaction does not fix.",
+  alternates: {
+    canonical: "/part-4/chapter-10/the-upload-that-never-reaches-us",
+    languages: {
+      en: "/part-4/chapter-10/the-upload-that-never-reaches-us",
+      vi: "/vi/part-4/chapter-10/the-upload-that-never-reaches-us",
+    },
+  },
+};
+
+<ChapterHeader id="4.10" />
+
+Movement V opens on hosted media, and the first chapter of it is about a request that hands
+back a URL.
+
+A client wants to send a photo. It asks Relay for an upload slot, declaring three things — a
+filename, a MIME type and a size — and Relay answers with an identifier and a URL good for
+fifteen minutes. The client uploads to that URL, and the file never passes through Relay. ADR-13
+decided that before the first line of this platform was written and `docs/05-sad.md` has named an
+object store since the first draft; what the platform never had is a container, a route, or a
+signature.
+
+<Figure
+  code={figThePathTheBytesTake}
+  caption="Four steps, and Relay is in two of them: it signs a URL and writes a row, and the bytes travel on a connection it never sees."
+/>
+
+The store itself is a container, and adding it is the smallest change in the chapter.
+`docs/05-sad.md:1002` has named `minio/minio` since the first draft and that image answers
+`pull access denied` on this machine; the one that exists is `quay.io/minio/minio`, 241 MB.
+
+```diff title="compose.yaml"
+@@ -89,12 +89,55 @@
+              "--query", "SELECT 1"]
+       interval: 5s
+       timeout: 3s
+       retries: 5
+       start_period: 15s
+ 
++  minio:
++    # OBJECT STORAGE, WHICH ADR-13 DECIDED AND NOTHING PROVISIONED. Media bytes never
++    # transit Relay compute: the api signs a URL and the client uploads straight here.
++    # `docs/05-sad.md:1002` has named MinIO since the first draft and the container was
++    # never added, so this is the decision arriving nine chapters after the diagram.
++    #
++    # THE REGISTRY IS PART OF THE NAME. `docker run minio/minio` fails on Docker Hub
++    # with `pull access denied … repository does not exist or may require 'docker
++    # login'`, and the SAD's sentence predates that. Four images were tried;
++    # `quay.io/minio/minio` and `chrislusf/seaweedfs` and `adobe/s3mock` pull, and
++    # `bitnami/minio` does not.
++    image: quay.io/minio/minio:latest
++    command: server /data
++    ports:
++      # 9100, NOT MINIO'S CONVENTIONAL 9000, AND THE COLLISION WAS REAL. ClickHouse has
++      # published `${RELAY_CLICKHOUSE_NATIVE_PORT:-9000}:9000` since chapter 1.2, so the
++      # two services cannot both start: the loser dies with `Bind for 127.0.0.1:9000
++      # failed: port is already allocated` and `docker compose up -d` exits 1.
++      #
++      # The container port stays 9000 — that is MinIO's, and the health check below is
++      # inside the container. Only the host side moves, because the host side is the
++      # hand-maintained table and chapter 1.2's is the one that was there first.
++      - "${RELAY_MINIO_PORT:-9100}:9000"
++    environment:
++      MINIO_ROOT_USER: relay
++      MINIO_ROOT_PASSWORD: relay-secret
++    volumes:
++      - minio-data:/data
++    healthcheck:
++      # AUTHENTICATES, for the reason the ClickHouse check above gives. `/minio/health/live`
++      # answers 200 to anyone who can reach the port and says nothing about whether a
++      # credentialed call works — the same shape as the `/ping` that was green for sixteen
++      # chapters while every real query was refused.
++      #
++      # `mc` is in the image and `wget` and `nc` are not, so this is the available way to
++      # ask a question only a working store can answer.
++      test: ["CMD", "sh", "-c",
++             "mc alias set probe http://127.0.0.1:9000 relay relay-secret && mc ls probe"]
++      interval: 5s
++      timeout: 3s
++      retries: 5
++      start_period: 10s
++
+   mailpit:
+     image: axllent/mailpit:v1.28
+     # An SMTP server that accepts everything and delivers nothing,
+     # with an HTTP API for reading what it caught.
+     #
+     # WHY A CONTAINER RATHER THAN A FAKE. FR-WHK-07 says an email must not contain a
+@@ -160,12 +203,18 @@
+     ports:
+       - "${RELAY_API_PORT:-4000}:4000"
+     depends_on:
+       postgres: { condition: service_healthy }
+       nats: { condition: service_healthy }
+       redis: { condition: service_healthy }
++      # AND THE OBJECT STORE, because the api reaches it on every slot request — unlike
++      # `clickhouse`, which is absent from this list because the api never touches it at
++      # boot. Without the condition the api can accept traffic before the store answers,
++      # and the first slot request is refused with `media_storage_unavailable`: correct,
++      # and indistinguishable from a real outage.
++      minio: { condition: service_healthy }
+     healthcheck:
+       test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:4000/healthz"]
+       interval: 5s
+       timeout: 3s
+       retries: 5
+       start_period: 20s
+@@ -220,6 +269,7 @@
+       nats: { condition: service_healthy }
+ 
+ volumes:
+   postgres-data:
+   nats-data:
+   clickhouse-data:
++  minio-data:
+```
+
+## The part that costs nothing, measured first
+
+A presigned URL is an HTTP request with the authorisation moved into the query string. You
+compute the signature the store would have computed, put it in the URL, and hand the URL to
+somebody with no credentials at all. The store checks the signature and does not care who sent
+it.
+
+The version most projects reach for is a vendor SDK, and the argument for one is usually
+"signing is fiddly and getting it wrong is a security bug". Both halves are true. What it leaves
+out is how much of the SDK you need: the AWS algorithm is five HMAC-SHA256 rounds over a
+canonical request, and the platform already has `node:crypto`.
+
+Written out, it is twenty-eight lines. **The dependency count moves by zero.**
+
+```ts title="services/api/src/media/presign.ts"
+import { createHash, createHmac } from "node:crypto";
+
+// SigV4, IN TWENTY-EIGHT LINES AND NO DEPENDENCY.
+//
+// ADR-13 says media bytes never transit Relay compute: the api brokers access to a
+// store it never touches. The broker's whole job is producing this string, and the
+// obvious way to produce it is `@aws-sdk/client-s3` plus `@aws-sdk/s3-request-presigner`
+// — two packages and a transitive tree for a signature with a published algorithm.
+// Chapter 4.2 set the precedent in the other direction: ClickHouse is reached with
+// Node's own `fetch` and `apply.mjs` has no driver. ADR-30 carries the argument.
+//
+// WHAT IT COSTS: the canonical request is unforgiving and its failure mode is a bare
+// 400 with no indication of which field was wrong. So the test that matters is the one
+// against a running store (`presign.itest.ts`), not one against an expected string.
+
+/** The five HMAC rounds AWS calls a signing key. */
+function signingKey(secret: string, date: string, region: string): Buffer {
+  let key: Buffer | string = `AWS4${secret}`;
+  for (const part of [date, region, "s3", "aws4_request"]) {
+    key = createHmac("sha256", key).update(part).digest();
+  }
+  return key as Buffer;
+}
+
+export interface PresignOptions {
+  /** `PUT` for an upload or a bucket create, `GET` for a read, `HEAD` to probe. */
+  method: "GET" | "PUT" | "HEAD";
+  /** Origin only — `http://localhost:9100`. */
+  endpoint: string;
+  bucket: string;
+  /** Empty for a BUCKET operation, which is a different canonical URI: `/{bucket}`
+   * with no key segment and no trailing slash. The first probe of this chapter
+   * created its bucket with `mkdir` and so never exercised this path. */
+  key?: string;
+  accessKey: string;
+  secretKey: string;
+  region?: string;
+  /** Seconds. FR-003 says 15 minutes for an upload slot, and the STORE enforces it —
+   * a URL past its expiry is refused with `AccessDenied · Request has expired` from
+   * the store's own clock, with nothing asked of us. */
+  expiresIn?: number;
+  /** Injectable for the tests; the signature is a function of this instant. */
+  now?: Date;
+}
+
+export function presign(options: PresignOptions): string {
+  const {
+    method,
+    endpoint,
+    bucket,
+    key = "",
+    accessKey,
+    secretKey,
+    region = "us-east-1",
+    expiresIn = 900,
+    now = new Date(),
+  } = options;
+
+  const host = new URL(endpoint).host;
+  const amzDate = now.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
+  const date = amzDate.slice(0, 8);
+  const scope = `${date}/${region}/s3/aws4_request`;
+
+  // ORDER MATTERS AND `URLSearchParams` PRESERVES INSERTION ORDER. The canonical query
+  // string is the signed parameters sorted by name, and these five already are.
+  const query = new URLSearchParams({
+    "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
+    "X-Amz-Credential": `${accessKey}/${scope}`,
+    "X-Amz-Date": amzDate,
+    "X-Amz-Expires": String(expiresIn),
+    "X-Amz-SignedHeaders": "host",
+  });
+
+  // SEGMENT BY SEGMENT. `encodeURIComponent` on the whole path would escape the
+  // separators too, and a key with a slash in it is the normal case here.
+  const uri = key
+    ? `/${bucket}/${key.split("/").map(encodeURIComponent).join("/")}`
+    : `/${bucket}`;
+
+  const canonical = [
+    method,
+    uri,
+    query.toString(),
+    `host:${host}\n`,
+    "host",
+    // The client sends the bytes, so we cannot hash them. This literal is what makes
+    // a presigned URL possible at all.
+    "UNSIGNED-PAYLOAD",
+  ].join("\n");
+
+  const toSign = [
+    "AWS4-HMAC-SHA256",
+    amzDate,
+    scope,
+    createHash("sha256").update(canonical).digest("hex"),
+  ].join("\n");
+
+  const signature = createHmac("sha256", signingKey(secretKey, date, region))
+    .update(toSign)
+    .digest("hex");
+  query.set("X-Amz-Signature", signature);
+
+  return `${endpoint}${uri}?${query}`;
+}
+```
+
+A consistently wrong signature passes every unit test you can write about it: the URL has a
+stable shape, the same inputs give the same output, and none of that says the store will accept
+it. So the first thing built here was not the route — it was nine questions asked of a running
+store:
+
+| what was asked | what the store said |
+| --- | --- |
+| create the bucket | `created`, and `exists` the second time |
+| a signed HEAD on the bucket | `200` |
+| an unsigned LIST of the bucket | `403` |
+| a signed PUT of an object, no credentials on the request | `200` |
+| a signed GET, same object | `200`, same bytes |
+| an unsigned GET of that object | `403` |
+| a URL whose expiry has passed | `403 · Request has expired` |
+| a URL with one character of the signature changed | `403 · SignatureDoesNotMatch` |
+| a URL signed with the wrong secret | `403` |
+
+The two 403s in the middle are the ones the feature exists for. An unsigned GET being refused is
+what makes a signed one mean anything, and a store answering `Request has expired` from its own
+clock is what lets the api publish an expiry without keeping one.
+
+<Trap>
+The tampered-signature test replaced the first character of the signature with `f`. Which is a
+no-op whenever that character already **is** `f`.
+
+A signature is 64 hexadecimal digits. Measured over 4,096 signings: sixteen distinct first
+characters, `f` on 255 of them — **6.23%**. On those runs the probe sent a perfectly valid URL,
+the store answered `200` as it should, and the test reported *the store accepted a tampered
+signature*. It passed three consecutive runs before it failed once.
+
+The fix is two lines: map the character to a different one, and assert that the tampered URL is
+not equal to the signed one. **A probe that may not have altered anything has to say so** — the
+assertion that the mutation happened is as much a part of the test as the assertion about the
+answer.
+</Trap>
+
+## And a presigned URL needs no contact with the store, which is the problem
+
+Signing is arithmetic. The api opens no socket to the store, which is what makes the design
+cheap — and it means the api never learns the store is down. A slot issued into an outage is
+byte-identical to a good one, and the client finds out at upload time holding a URL nobody can
+use, with no way to tell that from a URL it mistyped.
+
+`docs/05-sad.md:1062` asks for the opposite, in a degradation table nobody had opened while this
+chapter was planned: *"Object storage lost … Upload slots return a specific error."*
+
+So the api asks: a signed HEAD on the bucket, before anything is written, with a two-second
+timeout because *cannot be reached* includes *does not answer*. **That round trip exists only to
+produce a refusal**, and it is the honest cost of the clause:
+
+| | p50 | p95 |
+| --- | --- | --- |
+| slot request, with the probe | 7.859 ms | 9.007 ms |
+| slot request, without it | 6.335 ms | 7.260 ms |
+| the probe alone, n=200 | 1.062 ms | 1.194 ms |
+
+**+1.524 ms, +24.1%**, 200 samples a side, the same binary minutes apart. The probe's own
+1.062 ms is two thirds of that and the rest is the second signing.
+
+Both of the api's own calls to the store live in one file. `ensureBucket` runs on every boot and
+is safe to because the store has a *name* for the second attempt — `BucketAlreadyOwnedByYou`,
+409 — so "already there" and "went wrong" are distinguishable without a flag. A 409 that is
+**not** that name is another tenant owning the bucket, which is fatal rather than idempotent, and
+a check on the status alone reads it as success.
+
+```ts title="services/api/src/media/store.ts"
+import { presign } from "./presign";
+
+// WHERE THE OBJECT STORE IS, AND THE ONE CALL THE API MAKES TO IT DIRECTLY.
+//
+// Every other call is made by the CLIENT against a URL this service signs (ADR-13).
+// The exception is creating the bucket, which has to happen once before any slot can
+// be issued and which nothing else in the stack does.
+
+export interface StoreConfig {
+  endpoint: string;
+  accessKey: string;
+  secretKey: string;
+  bucket: string;
+}
+
+export function storeConfig(env: NodeJS.ProcessEnv = process.env): StoreConfig {
+  return {
+    endpoint: env.RELAY_MINIO_ENDPOINT ?? "http://localhost:9100",
+    accessKey: env.RELAY_MINIO_ACCESS_KEY ?? "relay",
+    secretKey: env.RELAY_MINIO_SECRET_KEY ?? "relay-secret",
+    bucket: env.RELAY_MINIO_BUCKET ?? "relay-media",
+  };
+}
+
+/** Create the bucket, or confirm it is already ours.
+ *
+ * ON BOOT, EVERY BOOT, WITH THE SIGNER THIS MODULE ALREADY HAS. The alternatives were
+ * an entrypoint script and a migration-like runner; both add a moving part for one
+ * idempotent call. What makes running it unconditionally safe is that the store has a
+ * NAME for the second attempt — `BucketAlreadyOwnedByYou`, 409 — rather than a generic
+ * failure, so "already there" and "went wrong" are distinguishable without a flag. */
+export async function ensureBucket(config: StoreConfig): Promise<"created" | "exists"> {
+  const url = presign({ method: "PUT", ...config, expiresIn: 60 });
+  const res = await fetch(url, { method: "PUT" });
+  if (res.ok) return "created";
+
+  const body = await res.text();
+  if (body.includes("BucketAlreadyOwnedByYou")) return "exists";
+
+  // ANYTHING ELSE IS FATAL AND SAYS SO. A store the api cannot write to is a store
+  // every slot request will fail against, and failing at boot is the loud version.
+  throw new Error(
+    `media: cannot create bucket ${config.bucket} — HTTP ${res.status}: ${body.slice(0, 200)}`,
+  );
+}
+
+/** Whether the store will answer a signed, credentialed request right now (FR-017).
+ *
+ * A PRESIGNED URL NEEDS NO CONTACT WITH THE STORE, WHICH IS THE WHOLE PROBLEM. Signing
+ * is five HMAC rounds over strings; the api never opens a socket, so it never learns
+ * that the store is down and a slot issued into an outage looks identical to a good
+ * one. The client finds out, at upload time, holding a URL nobody can use.
+ *
+ * `docs/05-sad.md:1062` asks for the opposite — *"Object storage lost … Upload slots
+ * return a specific error"* — so this round trip exists only to produce a refusal. That
+ * is a real cost on the happy path and it is written down rather than hidden: one signed
+ * HEAD on the bucket per slot request.
+ *
+ * A HEAD ON THE BUCKET AND NOT A GET ON AN OBJECT. The bucket always exists (boot
+ * created it) and a HEAD returns no body, so the question is exactly "is the store
+ * answering credentialed requests" and nothing else. An object GET would conflate a
+ * missing key with a missing store.
+ *
+ * AND A TIMEOUT, BECAUSE "CANNOT BE REACHED" INCLUDES "DOES NOT ANSWER". A store that
+ * accepts the connection and then hangs would otherwise hold the request open until the
+ * client gave up, turning a refusal this function exists to produce into a timeout the
+ * client has to interpret. Two seconds: long enough for a loaded store on a shared
+ * machine, short enough that a slot request never becomes the slowest thing in the api.
+ */
+export async function storeReachable(config: StoreConfig): Promise<boolean> {
+  const url = presign({ method: "HEAD", ...config, expiresIn: 60 });
+  try {
+    const res = await fetch(url, { method: "HEAD", signal: AbortSignal.timeout(2_000) });
+    return res.ok;
+  } catch {
+    // CONNECTION REFUSED, DNS FAILURE, TIMEOUT — all the same answer to the caller.
+    // Distinguishing them here would be a second vocabulary for one refusal, and the
+    // client's action is identical in every case.
+    return false;
+  }
+}
+```
+
+<Why>
+Where the probe goes in the sequence is a decision with a visible consequence, and both
+candidate positions are defensible.
+
+It sits after the type and size checks and before the reservation. That is the only position
+that keeps FR-009 — *a refusal writes no row* — without a compensating delete: a probe after the
+insert would have to un-reserve the bytes it had just committed, and a probe first would spend a
+round trip on `application/x-msdownload`.
+
+The consequence is that a tenant over quota **and** whose store is down is told the store is
+down; retrying then produces `media_storage_exhausted`, so that client learns both facts in two
+requests. The other order tells them to delete media when nothing could have been stored anyway
+— permanent advice about a transient state, which is the failure the fourth code exists to
+prevent.
+</Why>
+
+## Four refusals a client can tell apart
+
+FR-MED-02 names three conditions: a MIME type outside the accepted ten, a declared size over its
+kind's cap, and the environment's storage quota. `docs/12` counted four. The fourth turned out
+to be the degradation row above, and it is now FR-017.
+
+<Figure
+  code={figFourRefusalsOneOfThemTransient}
+  caption="Four codes rather than one, because a client acts on them differently — and three of the four are permanent, which is what the fourth exists to carry."
+/>
+
+None of them is `quota_exceeded`, and the registry had already made that argument twice for
+other codes: it is a monthly, billable, resets-on-a-date refusal whose message promises a resume
+date. A storage cap does not reset on a date, so the objection applies one dimension over.
+
+The caps are per kind — 10 MB for an image, 25 MB for audio, 100 MB for video — which takes two
+requests to demonstrate and one to hide, because a single size test passes against a global cap
+as well. The test asks for 25 MB of audio and 25 MB of image and gets a `201` and a `413`.
+
+<Trap>
+The MIME lookup was a plain object literal, and `ALLOWED_TYPES[mimeType]` inherits from
+`Object.prototype`.
+
+`kindOf("constructor")` returned a **function**. Truthy, so it passed the type refusal. Then
+`KIND_CAPS[thatFunction]` is `undefined`, and `bytes > undefined` is `false`, so it passed the
+size refusal too.
+
+**One declared MIME type, at any size, walked past both of FR-MED-02's first two conditions.**
+`Object.hasOwn` is the fix and it is one line, pinned in the unit tests because the next person
+to write a lookup over user input will reach for the same bracket.
+</Trap>
+
+```ts title="services/api/src/media/kinds.ts"
+// WHAT MAY BE UPLOADED, AND HOW BIG — FR-MED-02's first two refusals, in one place.
+//
+// ONE TABLE, READ BY BOTH. The refusal asks "is this type allowed" and the cap asks
+// "how big may this kind be", and those are two questions about one fact. Two lists
+// would disagree the first time somebody adds a format to one of them, and the way
+// they would disagree is silent: a type allowed with no cap, or a cap for a type
+// nothing accepts.
+
+export type MediaKind = "image" | "audio" | "video";
+
+/** The ten FR-MED-02 permits, each mapped to its kind. */
+export const ALLOWED_TYPES: Readonly<Record<string, MediaKind>> = {
+  "image/jpeg": "image",
+  "image/png": "image",
+  "image/gif": "image",
+  "image/webp": "image",
+  "audio/mpeg": "audio",
+  "audio/mp4": "audio",
+  "audio/ogg": "audio",
+  "audio/wav": "audio",
+  "video/mp4": "video",
+  "video/webm": "video",
+};
+
+/** Per-kind caps, in bytes. FR-MED-02: image 10 MB, audio 25 MB, video 100 MB. */
+export const KIND_CAPS: Readonly<Record<MediaKind, number>> = {
+  image: 10 * 1024 * 1024,
+  audio: 25 * 1024 * 1024,
+  video: 100 * 1024 * 1024,
+};
+
+/** The kind a declared type belongs to, or `null` if the type is not allowed.
+ *
+ * ONE FUNCTION FOR BOTH REFUSALS, so a type that is not in the table can never reach
+ * the size check and find no cap there.
+ *
+ * `Object.hasOwn`, AND IT IS NOT DEFENSIVENESS — IT WAS MEASURED. The first version
+ * was `ALLOWED_TYPES[mimeType] ?? null`, and an object literal inherits from
+ * `Object.prototype`, so `kindOf("constructor")` returned a FUNCTION. Truthy, so the
+ * type refusal never fired; and then `KIND_CAPS[thatFunction]` is `undefined`, and
+ * `bytes > undefined` is `false`, so the SIZE refusal never fired either.
+ *
+ * **One declared MIME type of `constructor` defeated both of FR-MED-02's first two
+ * refusals**, at any size. TypeScript types this map `Record<string, MediaKind>` and
+ * says the return is a `MediaKind`; the runtime disagreed. The test that found it was
+ * written to check exactly this and went red on the first run. */
+export function kindOf(mimeType: string): MediaKind | null {
+  return Object.hasOwn(ALLOWED_TYPES, mimeType) ? ALLOWED_TYPES[mimeType]! : null;
+}
+```
+
+The service refuses in the clause's order, and the two cheap facts come before anything that
+needs a read or a socket.
+
+```ts title="services/api/src/media/media.service.ts"
+import { randomUUID } from "node:crypto";
+
+import { HttpStatus, Injectable } from "@nestjs/common";
+
+import { Repository } from "../db/repository";
+import { protocolError } from "../protocol-error";
+import { KIND_CAPS, kindOf } from "./kinds";
+import { presign } from "./presign";
+import { storeConfig, storeReachable, type StoreConfig } from "./store";
+
+/** What a caller declares. Nothing here is verified — FR-MED-03 is a later chapter,
+ * and the quota arithmetic below is over these numbers rather than over bytes. */
+export interface SlotRequest {
+  filename: string;
+  mime_type: string;
+  bytes: number;
+}
+
+export interface Slot {
+  media_id: string;
+  state: "pending";
+  upload_url: string;
+  expires_at: string;
+}
+
+/** FR-MED-01's fifteen minutes. The STORE enforces it — a URL past its expiry comes
+ * back `AccessDenied · Request has expired` from the store's own clock — and
+ * `expires_at` below is published so a client can decide whether to reuse the URL
+ * rather than so anything here can check it. */
+const SLOT_SECONDS = 900;
+
+@Injectable()
+export class MediaService {
+  private readonly store: StoreConfig = storeConfig();
+
+  constructor(private readonly repo: Repository) {}
+
+  async createSlot(input: SlotRequest, userExternalId?: string): Promise<Slot> {
+    // ORDER MATTERS AND IT IS THE CLAUSE'S. Type, then size, then quota: the first two
+    // are facts about the request and the third needs a read, so refusing in this order
+    // means a request that was never going to be accepted does not touch the database.
+    const kind = kindOf(input.mime_type);
+    if (kind === null) {
+      throw protocolError(
+        "media_type_not_allowed",
+        `'${input.mime_type}' is not an accepted media type`,
+        HttpStatus.UNSUPPORTED_MEDIA_TYPE,
+        "mime_type",
+      );
+    }
+
+    const cap = KIND_CAPS[kind];
+    if (input.bytes > cap) {
+      throw protocolError(
+        "media_too_large",
+        `${input.bytes} bytes exceeds the ${cap}-byte limit for ${kind}`,
+        HttpStatus.PAYLOAD_TOO_LARGE,
+        "bytes",
+      );
+    }
+
+    // THE STORE, ASKED BEFORE ANYTHING IS WRITTEN (FR-017).
+    //
+    // AFTER THE TWO FREE REFUSALS AND BEFORE THE ONE THAT WRITES, which is the only
+    // position that satisfies FR-009 without a compensating delete. A probe placed
+    // after the reservation would have to un-reserve the bytes it just committed; a
+    // probe placed first would spend a round trip on `application/x-evil`.
+    //
+    // AND IT MEANS A TENANT OVER QUOTA WITH A DOWN STORE IS TOLD THE STORE IS DOWN,
+    // which is the one ordering consequence worth naming. Retrying will then produce
+    // `media_storage_exhausted` and the client will have learned both facts in two
+    // requests instead of one. The opposite order tells a client to delete media when
+    // nothing could have been stored anyway — permanent advice about a transient
+    // state, which is the failure this code exists to prevent.
+    if (!(await storeReachable(this.store))) {
+      throw protocolError(
+        "media_storage_unavailable",
+        "the object store is not reachable; this is temporary and the request can be retried",
+        HttpStatus.SERVICE_UNAVAILABLE,
+      );
+    }
+
+    // THE USER, RESOLVED BEFORE THE TRANSACTION AND LEFT NULL FOR AN API KEY.
+    // FR-MED-06's chapter asks whether the sender uploaded it, and cannot ask that of
+    // a row that wrote something else in place of the absence.
+    const user =
+      userExternalId === undefined
+        ? null
+        : await this.repo.getUserByExternalId(userExternalId);
+
+    const id = randomUUID();
+    const objectKey = `${this.repo.environment}/${id}`;
+
+    // ONE CALL, AND THE TRANSACTION IS THE REPOSITORY'S. The check reads what the
+    // insert writes, so they are one statement's worth of work — and the query engine
+    // lives in `db/` because a lint rule says so in constitution I's words. The first
+    // version of this method held the drizzle query and was refused by it, which is
+    // chapter 4.7's finding arriving one chapter later.
+    const reserved = await this.repo.reserveMediaSlot({
+      id,
+      userId: user?.id ?? null,
+      filename: input.filename,
+      mimeType: input.mime_type,
+      declaredBytes: input.bytes,
+      objectKey,
+    });
+
+    if (!reserved.reserved) {
+      throw protocolError(
+        "media_storage_exhausted",
+        `this environment has ${reserved.committed} of ${reserved.cap} stored bytes ` +
+          `committed; ${input.bytes} more would exceed the limit`,
+        HttpStatus.PAYMENT_REQUIRED,
+      );
+    }
+
+    // DERIVED, NOT STORED (FR-003). Two sources of truth for one expiry would be one
+    // too many, and the store is the authoritative one.
+    const upload_url = presign({
+      method: "PUT",
+      ...this.store,
+      key: objectKey,
+      expiresIn: SLOT_SECONDS,
+    });
+
+    return {
+      media_id: id,
+      state: "pending",
+      upload_url,
+      expires_at: new Date(Date.now() + SLOT_SECONDS * 1000).toISOString(),
+    };
+  }
+
+}
+```
+
+```ts title="services/api/src/media/media.controller.ts"
+import { Body, Controller, Post, Req, UseGuards } from "@nestjs/common";
+
+import { Accepts, CredentialGuard } from "../auth/credential.guard";
+import type { RequestWithPrincipal } from "../auth/principal";
+import { MediaService, type SlotRequest } from "./media.service";
+
+// THE UPLOAD SLOT (FR-MED-01). One route, and the bytes do not come through it.
+//
+// `Accepts("application", "user")` — BOTH, which is FR-MED-01's own wording: "on
+// request (user token or API key)". A photo sent by a person and an attachment
+// uploaded by a customer's backend are the same operation, and the difference shows
+// up one chapter later, when FR-MED-06 asks whether the sender uploaded it. That
+// question needs the row to remember which of the two asked, which is why `user_id`
+// is nullable rather than filled in with something.
+@Controller("v1/media")
+@UseGuards(CredentialGuard)
+@Accepts("application", "user")
+export class MediaController {
+  constructor(private readonly media: MediaService) {}
+
+  /** 201 with the id and the URL. The URL is derived and never stored: the store
+   * enforces its own expiry, and two records of when it lapses would be one too
+   * many (constitution IV, one level down). */
+  @Post()
+  create(@Body() body: SlotRequest, @Req() req: RequestWithPrincipal) {
+    // SOFT, the way `messages.controller.ts` reads it: the guard has already refused
+    // anything without a principal, so the optional chain is a branch that cannot go
+    // both ways — and an unreachable arm in a file the ratchet pins at 100% is a
+    // coverage failure with no fix but a comment.
+    const actingUser =
+      req.principal?.kind === "user" ? req.principal.userExternalId : undefined;
+    return this.media.createSlot(body, actingUser);
+  }
+}
+```
+
+<Trap>
+`MediaModule` declared the service and did not provide the repository it injects. It compiled, it
+typechecked, it linted, and the first request said `Nest can't resolve dependencies of the
+MediaService (?)`.
+
+Three other modules carry the same two providers — a default-scoped `DB` and a **request-scoped**
+`Repository` built from the principal the guard resolved. Request-scoped is not decoration: a
+default-scoped one would be constructed once, at boot, against whichever tenant happened to be
+first. Constitution I broken by a lifetime.
+
+Only a running application asks this question.
+</Trap>
+
+```ts title="services/api/src/media/media.module.ts"
+import { Module, Scope } from "@nestjs/common";
+import { REQUEST } from "@nestjs/core";
+
+import { AuthModule } from "../auth/auth.module";
+import { createDb, createPool, type Db } from "../db/client";
+import { Repository } from "../db/repository";
+import { MediaController } from "./media.controller";
+import { MediaService } from "./media.service";
+import type { RequestWithTenant } from "../messages/request-with-tenant";
+
+// Hosted media's module (FR-MED-01, FR-MED-02).
+//
+// REGISTERED IN `app.module.ts`, WHICH IS A TASK NO REQUIREMENT NAMES. Without that
+// line the route does not exist and every test in this chapter gets a 404 that reads
+// as a routing bug. Chapter 4.6 shipped the same omission in the tutorial's manifest
+// and `pnpm build` said `Error: Unknown chapter id: 4.6`; its record reads
+// *"registering the chapter is a task no requirement had named"*.
+//
+// AND THE REPOSITORY IS PROVIDED HERE, PER MODULE, which is this api's shape rather
+// than this chapter's choice — `users`, `channels` and `webhooks` each carry the same
+// two providers. A module that declares a service without them compiles, typechecks
+// and lints, and fails at the first request with `Nest can't resolve dependencies of
+// the MediaService (?)`. **Only a running app asks the question.**
+//
+// REQUEST-SCOPED, because the environment id comes off the principal the guard put on
+// this request. A default-scoped repository would be built once, at boot, against
+// whichever tenant happened to be first — constitution I broken by a lifetime.
+@Module({
+  imports: [AuthModule],
+  controllers: [MediaController],
+  providers: [
+    {
+      provide: "DB",
+      useFactory: (): Db => createDb(createPool()),
+      scope: Scope.DEFAULT,
+    },
+    {
+      provide: Repository,
+      scope: Scope.REQUEST,
+      inject: ["DB", REQUEST],
+      useFactory: (db: Db, req: RequestWithTenant) =>
+        new Repository(db, req.principal?.environmentId ?? ""),
+    },
+    MediaService,
+  ],
+})
+export class MediaModule {}
+```
+
+### The ladder the filter falls through
+
+Three of the four statuses were new to this platform: 415, 413 and 503, alongside a 402 the
+quota path already used. `ProtocolErrorFilter` derives a code from the status when a thrower does
+not name one, and it had rungs for 400, 401, 403 and 404 — everything else falling through to
+`internal_error`, which its own comment calls **"a lie the client cannot act on"**, once about a
+400 an earlier chapter fixed and once about a 403 after that.
+
+Four statuses with no rungs is four more of the same, so the ladder gained four. Three of them
+were obvious, because each status has exactly one meaning in this platform. The 503 was not: both
+of the platform's 503 throwers name a specific store, and neither `analytics_unavailable` nor
+`media_storage_unavailable` is true of a 503 from somewhere else. That rung takes a new code,
+`service_unavailable`, which carries only what the status itself supports — **the one code in the
+registry that nothing throws**, because that is what a fallback is.
+
+```diff title="services/api/src/protocol-error.filter.ts"
+@@ -45,22 +45,45 @@
+     // stops compiling here instead of reaching a customer.
+     //
+     // AND `named` IS CHECKED AGAINST THE REGISTRY RATHER THAN TRUSTED. A thrower can
+     // put any string in `code` — `protocolError` makes that hard, not impossible,
+     // because `HttpException` is still public — and this filter is the last place that
+     // can notice before the string becomes a URL.
++    //
++    // FOUR MORE RUNGS, FROM HOSTED MEDIA (FR-018). 415, 413, 402 and 503 are the
++    // statuses that chapter introduced, and without entries here each one answers
++    // `internal_error` for any thrower that forgets to name its code — the third and
++    // fourth instances of the lie this comment already records twice.
++    //
++    // THE FIRST THREE HAVE EXACTLY ONE MEANING IN THIS PLATFORM and the ladder says it:
++    // a 415 is a media type nothing accepts, a 413 is a declared size over its cap, and
++    // a 402 is a quota. The 503 is the one that does not generalise — the two throwers
++    // that raise it name a specific store, `analytics_unavailable` and
++    // `media_storage_unavailable`, and neither is true of a 503 from somewhere else —
++    // so `service_unavailable` carries only what the status itself supports.
++    //
++    // A NAMED CODE STILL WINS. These are what a thrower gets for saying nothing, not a
++    // replacement for saying something.
+     const ladder: ErrorCode =
+       status === 400
+         ? "invalid_request"
+         : status === 401
+           ? "unauthorized"
+-          : status === 403
+-            ? "forbidden"
+-            : status === 404
+-              ? "not_found"
+-              : "internal_error";
++          : status === 402
++            ? "quota_exceeded"
++            : status === 403
++              ? "forbidden"
++              : status === 404
++                ? "not_found"
++                : status === 413
++                  ? "media_too_large"
++                  : status === 415
++                    ? "media_type_not_allowed"
++                    : status === 503
++                      ? "service_unavailable"
++                      : "internal_error";
+     // `field` travels the way `code` does — the thrower names it, because only the
+     // thrower knows it. Omitted rather than null when there is nothing to name: a key
+     // that is always present and usually empty teaches a client to ignore it.
+     const field =
+       typeof response === "object" &&
+       response !== null &&
+```
+
+The probe for a ladder is the part worth copying. A thrower that names its code never reaches the
+ternary, so a test that goes through `protocolError` proves the path that was never broken. This
+one throws an **unnamed** `HttpException` at each of the eight statuses and asserts two things
+per rung: the code it gives, and separately that the code is not `internal_error`. The second
+assertion looks redundant and is not — *every rung answers something* is satisfied by a ladder
+that answers `internal_error` everywhere. Deleting the 415 rung turns three assertions red.
+
+## Storage is a level, and three clauses had to agree about it
+
+FR-RTL-05 read *"configurable monthly quotas on messages sent, unique active persons, and
+connection-minutes"*. Three quantities, none of them storage — while FR-MED-02 refuses an upload
+on *"the environment's storage quota"* and FR-MED-12 says stored bytes are *"included in quota
+enforcement (FR-RTL-05)"*. Two clauses citing a third for something it does not define.
+
+The missing word is `monthly`, and it is the part that would have been implemented wrong.
+
+<Figure
+  code={figALevelNotAFlow}
+  caption="The three existing dimensions accumulate inside a calendar month. Stored bytes do not accumulate — they are a level that falls when objects are deleted, and the first of the month is not an event in their life."
+/>
+
+Put stored bytes in `usage_periods` and two things break. A delete has to subtract, which
+`creditFor`'s own comment forbids in as many words — *"the one thing this function must never do
+is subtract from a bill"*. And the row resets on the 1st, so a tenant holding 100 GB starts every
+month at zero and is allowed another hundred.
+
+So the **cap** is configuration and joins `quota_config` beside the other three; the
+**accounting** is `sum(declared_bytes)` over the tenant's media rows. SRS revision 1.17 says
+which kind each of the four is, and adds the sentence the refusal depends on: a storage quota
+must not promise a resume date. The platform's other three do promise one, in the sentence
+`QuotaExceededError` builds, which is why `media_storage_exhausted` exists as its own code rather
+than reusing that class — for this dimension, the date in that sentence would be false.
+
+A sum over rows rather than a counter is constitution IV: the rows already say what is committed,
+and the first thing that goes wrong with a counter is a delete path that forgets to decrement.
+The cost is a sum per slot request on the environment index, and this chapter has no corpus at a
+scale where that number would mean anything — so it is stated as a cost rather than measured into
+a claim.
+
+```sql title="services/api/migrations/0015_media_objects.sql"
+-- Hosted media, the slot: FR-MED-01 and FR-MED-02, movement V's first chapter.
+--
+-- A row here is a slot the platform AGREED TO, written before any byte exists.
+-- ADR-13 says media bytes never transit Relay compute, so this table is the whole
+-- of what the platform holds about an upload: what was declared, whose it is, and
+-- where the object will live if it arrives.
+--
+-- A REFUSED REQUEST WRITES NOTHING. The three permanent refusals — the MIME type,
+-- the per-kind size cap, the storage quota — happen before the insert, so this is
+-- not a log of attempts. That matters because the storage quota is a SUM over this
+-- table, and a table that recorded refusals would count bytes nobody was allowed
+-- to upload.
+--
+-- `state` IS `pending` AND ONLY `pending`, ENFORCED. `ready` and `rejected` arrive
+-- with FR-MED-03's verification and FR-MED-04's scan. A CHECK that accepted them
+-- now would be a schema claiming states nothing in the platform can reach, which
+-- is the shape chapter 4.8 found in a column with zero producers.
+
+CREATE TABLE media_objects (
+  id              uuid PRIMARY KEY,
+  environment_id  uuid NOT NULL REFERENCES environments(id),
+  -- NULLABLE ON PURPOSE: an API key has no user. FR-MED-06 later asks whether the
+  -- sender uploaded it, and cannot ask that if absence is written as anything else.
+  user_id         uuid REFERENCES users(id),
+  filename        text NOT NULL,
+  mime_type       text NOT NULL,
+  declared_bytes  bigint NOT NULL,
+  state           text NOT NULL DEFAULT 'pending',
+  object_key      text NOT NULL,
+  created_at      timestamptz NOT NULL DEFAULT now(),
+
+  CONSTRAINT media_objects_state_check CHECK (state = 'pending'),
+  CONSTRAINT media_objects_declared_bytes_check CHECK (declared_bytes > 0)
+);
+
+-- The storage quota reads this: `sum(declared_bytes)` for one environment, taken
+-- inside the same transaction that inserts the next row.
+CREATE INDEX media_objects_environment_idx ON media_objects (environment_id);
+
+-- THE SENTINEL GUARD IS NOT SET UP HERE, AND THAT IS NOT AN OVERSIGHT. The guard
+-- lives in `packages/test-harness/src/sentinel.sql`, which is lane infrastructure
+-- rather than schema: this table joins its array there, together with the bait
+-- `plant()` leaves and the case in `guard.itest.ts`. The three go together — a name
+-- in the array with no bait installs a trigger that can never match, and reads
+-- exactly like protection.
+--
+-- The array's own rule is that a table joins in the chapter that creates it. That
+-- rule is not what the tree does, and it is worth measuring rather than repeating:
+-- SEVEN of the TWELVE tables carrying `environment_id` are guarded today. `api_keys`
+-- and the four webhook tables are not. This one joins; the five are filed.
+```
+
+```diff title="services/api/src/db/schema.ts"
+@@ -1098,6 +1098,54 @@
+       t.period,
+       t.dimension,
+       t.threshold,
+     ),
+   ],
+ );
++
++// ── HOSTED MEDIA: THE RECORD OF AN UPLOAD THAT HAS NOT HAPPENED YET ──────────
++//
++// A row exists the moment a slot is ISSUED, before any byte is uploaded. That is
++// the point of ADR-13: bytes never transit Relay compute, so the platform's record
++// of an upload is older than the upload and is the only thing it will ever hold
++// about one.
++//
++// A REFUSED REQUEST WRITES NOTHING (FR-MED-02). This is not a log of attempts —
++// it is the set of slots the platform agreed to, which is also what the storage
++// quota is a sum over.
++export const mediaObjects = pgTable(
++  "media_objects",
++  {
++    // OPAQUE, AND NOT A PATH INTO THE STORE. `object_key` is where the bytes live
++    // and this is what a client holds; keeping them separate is what lets the
++    // storage layout change without breaking a published contract.
++    id: uuid("id").primaryKey(),
++    environmentId: uuid("environment_id")
++      .notNull()
++      .references(() => environments.id),
++    // NULLABLE, BECAUSE AN API KEY HAS NO USER. FR-MED-06's chapter distinguishes
++    // the two cases — a user token's media belongs to that user — and it cannot
++    // make that distinction if the absence is written as something else.
++    userId: uuid("user_id").references(() => users.id),
++    filename: text("filename").notNull(),
++    mimeType: text("mime_type").notNull(),
++    // WHAT THE CALLER SAID, NOT WHAT ARRIVED. FR-MED-03 verifies the object and is
++    // a later chapter, so every quota sum in this one is over declarations.
++    declaredBytes: bigint("declared_bytes", { mode: "number" }).notNull(),
++    state: text("state").notNull().default("pending"),
++    objectKey: text("object_key").notNull(),
++    createdAt: timestamp("created_at", { withTimezone: true })
++      .notNull()
++      .defaultNow(),
++  },
++  (t) => [
++    // `pending` ALONE, AND THAT IS THE CHAPTER'S SCOPE. `ready` and `rejected`
++    // arrive with the verification and scanning clauses; a CHECK that accepted
++    // them now would be a schema claiming a state nothing can reach.
++    check("media_objects_state_check", sql`${t.state} = 'pending'`),
++    check("media_objects_declared_bytes_check", sql`${t.declaredBytes} > 0`),
++    // THE QUOTA'S OWN READ. Committed bytes are a sum over this index rather than
++    // a counter on `environments`, which would be a second source of truth for
++    // something these rows already say (constitution IV).
++    index("media_objects_environment_idx").on(t.environmentId),
++  ],
++);
+```
+
+The cap itself is a fourth key in `quota_config`, and the parser and the column's CHECK constraint
+have to move together. Postgres has no `ALTER CONSTRAINT` for a CHECK expression, so the whole
+thing is dropped and restated — **twelve clauses now, where the previous rebuild restated nine.**
+A restatement that omits a dimension silently stops constraining it, and the loss is invisible
+from TypeScript: every parser test still passes while the database quietly starts accepting rows
+it used to refuse.
+
+```sql title="services/api/migrations/0016_storage_quota.sql"
+-- ---------------------------------------------------------------------------
+-- The fourth quota dimension: stored bytes (chapter 4.10, FR-MED-02, FR-RTL-05).
+-- ---------------------------------------------------------------------------
+--
+-- A DIMENSION THAT IS NOT A MONTHLY FLOW, WHICH IS WHY NOTHING IS ADDED TO
+-- `usage_periods` HERE. The other three are flows: that table is keyed on a
+-- calendar month and `creditFor` accumulates within one, never subtracting --
+-- its own comment says *"the one thing this function must never do is subtract
+-- from a bill"*. Stored bytes are a LEVEL. The figure falls when objects are
+-- deleted and it does not reset on the 1st, so a `usage_periods` column would
+-- have to subtract on delete and would hand a tenant holding 100 GB a fresh
+-- 100 GB every month.
+--
+-- So the CAP is configuration and joins `quota_config` below; the ACCOUNTING is
+-- `sum(declared_bytes)` over `media_objects`, which 0015 created. SRS FR-RTL-05
+-- is amended in the same feature to say which of the four kinds it means, because
+-- FR-MED-02 and FR-MED-12 both cite it for a quantity it did not define.
+--
+-- ---------------------------------------------------------------------------
+-- DROPPED AND REBUILT WHOLE, NOT APPENDED TO.
+-- ---------------------------------------------------------------------------
+--
+-- There is no `ALTER CONSTRAINT` for a CHECK expression, so 0014 dropped and
+-- restated every dimension and this does the same with four. **A restatement
+-- that omits one silently stops constraining it**, which is the same silent loss
+-- `config.ts` warns about from the parser's side: the constraint would accept a
+-- config the parser rejects, `capsFor` fails closed, and the cap would quietly
+-- become no cap. The two have to move together, which is why the schema change
+-- and the parser change are one feature and one commit.
+--
+-- Three clauses per dimension, the shape 0014 counted: one that the value is an
+-- object, and one each for `hard` and `soft` being a non-negative integer
+-- written as digits. Twelve clauses now, where 0013 had six.
+
+ALTER TABLE environments
+  DROP CONSTRAINT environments_quota_config_shape;
+
+ALTER TABLE environments
+  ADD CONSTRAINT environments_quota_config_shape CHECK (
+    jsonb_typeof(quota_config) = 'object'
+    AND (quota_config -> 'messages' IS NULL
+         OR jsonb_typeof(quota_config -> 'messages') = 'object')
+    AND (quota_config -> 'active_users' IS NULL
+         OR jsonb_typeof(quota_config -> 'active_users') = 'object')
+    AND (quota_config -> 'connection_minutes' IS NULL
+         OR jsonb_typeof(quota_config -> 'connection_minutes') = 'object')
+    AND (quota_config -> 'storage_bytes' IS NULL
+         OR jsonb_typeof(quota_config -> 'storage_bytes') = 'object')
+    AND (quota_config #>> '{messages,hard}' IS NULL
+         OR quota_config #>> '{messages,hard}' ~ '^[0-9]+$')
+    AND (quota_config #>> '{messages,soft}' IS NULL
+         OR quota_config #>> '{messages,soft}' ~ '^[0-9]+$')
+    AND (quota_config #>> '{active_users,hard}' IS NULL
+         OR quota_config #>> '{active_users,hard}' ~ '^[0-9]+$')
+    AND (quota_config #>> '{active_users,soft}' IS NULL
+         OR quota_config #>> '{active_users,soft}' ~ '^[0-9]+$')
+    AND (quota_config #>> '{connection_minutes,hard}' IS NULL
+         OR quota_config #>> '{connection_minutes,hard}' ~ '^[0-9]+$')
+    AND (quota_config #>> '{connection_minutes,soft}' IS NULL
+         OR quota_config #>> '{connection_minutes,soft}' ~ '^[0-9]+$')
+    AND (quota_config #>> '{storage_bytes,hard}' IS NULL
+         OR quota_config #>> '{storage_bytes,hard}' ~ '^[0-9]+$')
+    AND (quota_config #>> '{storage_bytes,soft}' IS NULL
+         OR quota_config #>> '{storage_bytes,soft}' ~ '^[0-9]+$')
+  );
+```
+
+```diff title="services/api/src/quotas/config.ts"
+@@ -31,12 +31,25 @@
+     messages: capsSchema.optional(),
+     active_users: capsSchema.optional(),
+     // This is the key the comment below predicted, and adding it
+     // costs what the comment said plus three clauses in the migration's CHECK
+     // rather than one line — 0010 counts the difference.
+     connection_minutes: capsSchema.optional(),
++    // HOSTED MEDIA'S, AND IT IS A DIFFERENT KIND OF QUANTITY FROM THE THREE ABOVE.
++    //
++    // Those are FLOWS: `usage_periods` is keyed on a calendar month and `creditFor`
++    // accumulates within one, never subtracting. Stored bytes are a LEVEL — the
++    // figure falls when objects are deleted, and it does not reset on the 1st. Put it
++    // in that monthly row and two things break: a delete would have to subtract, which
++    // `creditFor`'s own comment forbids, and a tenant holding 100 GB would start every
++    // month at zero and be allowed another 100.
++    //
++    // So the CAP is configuration and sits here with the other caps, and the
++    // ACCOUNTING is `sum(declared_bytes)` over `media_objects` rather than a row in
++    // `usage_periods`. SRS FR-RTL-05 is amended to say which of the four it means.
++    storage_bytes: capsSchema.optional(),
+   })
+   // `.strict()` so a dimension nobody implemented is a parse failure rather than
+   // a silently ignored cap — which is also why a new key has to land HERE and in
+   // the migration together: the constraint would accept a `connection_minutes`
+   // config that this parser rejected, and `capsFor` fails closed, so the cap
+   // would silently become no cap.
+```
+
+The two gates do different jobs and the fourth dimension needs both, which one probe shows in two
+lines: `{"disk_inodes":{"hard":10}}` is **accepted by the column** and refused by the parser. The
+constraint enumerates the dimensions it knows and cannot express *and nothing else*; `.strict()`
+can. Skip the parser half and an unimplemented dimension is stored, `capsFor` fails closed, and
+the cap silently becomes no cap.
+
+```diff title="services/api/src/quotas/quota.error.ts"
+@@ -19,18 +19,31 @@
+  * connects, so telling a developer at 3am that "sends resume on the first" names
+  * the wrong operation. */
+ const NOUN: Record<Dimension, string> = {
+   messages: "message",
+   active_users: "active user",
+   connection_minutes: "connection-minute",
++  storage_bytes: "stored byte",
+ };
+ 
+ const RESUMES: Record<Dimension, string> = {
+   messages: "sends",
+   active_users: "sends",
+   connection_minutes: "connections",
++  // AND THIS ONE RESUMES ON NOTHING, WHICH THIS MAP CANNOT SAY. The other three are
++  // monthly flows and the sentence they build promises a date. Stored bytes are a
++  // LEVEL: the figure falls when media is deleted and the first of the month changes
++  // nothing, so "uploads resume on the 1st" would be false.
++  //
++  // `media_storage_exhausted` exists because of exactly this. Hosted media refuses
++  // with its own code and never reaches `QuotaError`, and this entry is here because
++  // `Record<Dimension, string>` demands one rather than because a caller reads it —
++  // the comment above says the compiler catching a missing dimension is the point,
++  // and it caught this one. If a caller ever does reach it, "uploads" is the operation
++  // and the date in the sentence is the part that would be wrong.
++  storage_bytes: "uploads",
+ };
+ 
+ /** Raised by the repository when a send would exceed a hard cap.
+  *
+  * NOT AN HTTP CONCERN. The repository layer does not know what status a caller
+  * will map this to, and it holds the four things the message has to name:
+```
+
+### A transaction is not a lock
+
+The check reads a sum and then writes a row, which is the shape every quota in every system has,
+and it is a race. Postgres defaults to READ COMMITTED: two concurrent slot requests, each inside
+its own transaction, both read the same sum, both find room, and both insert. Atomic, and wrong.
+
+Getting a test to show that was harder than fixing it.
+
+The first version fired ten slot requests with `Promise.all` and asserted that one was issued. It
+passed — with the lock and without it, every run. Each transaction is a sum and an insert a
+millisecond apart, and the read-then-write windows simply never overlapped. **A race test that
+cannot lose the race is an assertion that cannot fail**, and this one would have gone green over
+the unserialised version the chapter exists to warn about.
+
+So the interleave is written by hand, on two connections, with both transactions reading before
+either writes:
+
+```text
+plain SELECT        B blocked: no    B saw sum=0     B inserted     committed 1,200
+SELECT FOR UPDATE   B blocked: yes   B saw sum=600   B refused      committed   600
+                                                                    against a cap of 1,000
+```
+
+```diff title="services/api/src/db/repository.ts"
+@@ -14,12 +14,13 @@
+   applications,
+   channels,
+   consumedEvents,
+   environments,
+   humans,
+   members,
++  mediaObjects,
+   messageEdits,
+   readPositions,
+   memberships,
+   messages,
+   organisations,
+   outbox,
+@@ -2492,12 +2493,109 @@
+    * deferral justified by one caller's opinion of why the code exists. */
+   get environment(): string {
+     return this.environmentId;
+   }
+ 
+   // ---------------------------------------------------------------------
++  // Hosted media. The slot's whole database half, in one method, because the
++  // check reads what the insert writes.
++  // ---------------------------------------------------------------------
++
++  /** Reserve a slot, or report why not.
++   *
++   * ONE TRANSACTION. The storage cap is a sum over `media_objects` and the insert
++   * adds to that sum, so unserialised two slots race the same remaining allowance
++   * and both are issued — the read-then-write quota check a reader would copy out of
++   * a chapter. `serializable` rather than a lock because the read is an aggregate
++   * over a whole tenant's rows and there is no single row to lock.
++   *
++   * IT RETURNS FACTS AND NEVER A REFUSAL. The caller turns `refused` into
++   * `media_storage_exhausted`; a repository that threw an HTTP error would be the
++   * query layer deciding a protocol question. The numbers come back with it because
++   * the message names them.
++   *
++   * AND IT IS HERE RATHER THAN IN `media/` BECAUSE THE LINT RULE IS A CONSTITUTION
++   * CLAUSE. The first version of this chapter's service imported `drizzle-orm` and
++   * was refused: *"the query engine lives inside the repository layer only
++   * (constitution I, ADR-16)"*. Chapter 4.7 hit the identical wall and its record
++   * says why the plan walks into it — the api owns the repository, so putting a
++   * query "in the api" feels like putting it here. */
++  async reserveMediaSlot(input: {
++    id: string;
++    userId: string | null;
++    filename: string;
++    mimeType: string;
++    declaredBytes: number;
++    objectKey: string;
++  }): Promise<
++    { reserved: true } | { reserved: false; committed: number; cap: number }
++  > {
++    return this.db.transaction(async (tx) => {
++      // THE LOCK FIRST, AND IT IS THE SAME STATEMENT AS THE CAP READ.
++      //
++      // A TRANSACTION IS NOT ENOUGH ON ITS OWN, which is the part a reader copying this
++      // will get wrong. Postgres defaults to READ COMMITTED: two concurrent slot
++      // requests both run `sum(declared_bytes)`, both see the same committed figure,
++      // both find room, and both insert. Wrapping a read and a write in BEGIN/COMMIT
++      // makes them atomic, not serialised — nothing about the transaction stops the
++      // other one reading the same number.
++      //
++      // `FOR UPDATE` on the environment row is what serialises them, and the row was
++      // going to be read anyway for the cap, so the lock costs no extra statement. It
++      // is held for the rest of the transaction, which is one sum and one insert.
++      //
++      // PER TENANT, WHICH IS THE WHOLE POINT. Two tenants' slot requests never wait on
++      // each other; two of one tenant's do, in the order the database picks. That is the
++      // narrowest lock that makes the arithmetic true — an advisory lock on a hash of
++      // the environment id would do the same job and collide between tenants for free.
++      //
++      // The alternative is SERIALIZABLE isolation, which turns the race into a
++      // serialisation failure the caller has to retry. That moves the problem to every
++      // call site instead of solving it here, and this repository has one call site.
++      const [env] = await tx
++        .select({ quotaConfig: environments.quotaConfig })
++        .from(environments)
++        .where(eq(environments.id, this.environmentId))
++        .for("update");
++      // `storage_bytes` resolves like the other three dimensions, and an absent cap
++      // stays absent rather than becoming `Infinity` or `-1` somewhere up the stack.
++      const cap = capsFor(env?.quotaConfig, "storage_bytes").caps.hard;
++
++      // A SUM OVER THE ROWS, NOT A COUNTER ON `environments` (constitution IV). The rows
++      // already say what is committed; a counter would be a second source of truth for
++      // it, and the first thing that goes wrong with one is a delete path that forgets
++      // to decrement. The cost is a sum per slot request over one tenant's media rows,
++      // on the index `media_objects_environment_idx` — and this chapter has no corpus at
++      // a scale where that number would mean anything, so it is stated as a cost rather
++      // than measured into a claim.
++      const [sum] = await tx
++        .select({
++          committed: sql<string>`coalesce(sum(${mediaObjects.declaredBytes}), 0)`,
++        })
++        .from(mediaObjects)
++        .where(eq(mediaObjects.environmentId, this.environmentId));
++      const committed = Number(sum?.committed ?? 0);
++
++      if (cap !== null && committed + input.declaredBytes > cap) {
++        return { reserved: false as const, committed, cap };
++      }
++
++      await tx.insert(mediaObjects).values({
++        id: input.id,
++        environmentId: this.environmentId,
++        userId: input.userId,
++        filename: input.filename,
++        mimeType: input.mimeType,
++        declaredBytes: input.declaredBytes,
++        objectKey: input.objectKey,
++      });
++      return { reserved: true as const };
++    });
++  }
++
++  // ---------------------------------------------------------------------
+   // Webhook endpoints. Scoped like everything else on this class:
+   // the environment comes from the constructor and never from a caller, so a
+   // handler cannot ask for another tenant's endpoints even by accident
+   // (constitution I).
+   //
+   // Every read here excludes soft-deleted rows. That is the whole contract of
+```
+
+`SELECT … FOR UPDATE` on the environment row serialises them per tenant, and it costs no extra
+statement because the cap is on that row anyway. Two tenants never wait on each other; two of one
+tenant's requests do.
+
+<Trap>
+The obvious test for "does the reservation take the lock" measures a different lock.
+
+Hold the environment row with `FOR UPDATE` from outside, call the real method, watch it wait. It
+waits — **and it waits with the explicit lock deleted.** `media_objects.environment_id` is a
+foreign key, so the INSERT takes `FOR KEY SHARE` on the parent row all by itself, and
+`FOR KEY SHARE` conflicts with `FOR UPDATE`. The probe was measuring the foreign key.
+
+`FOR NO KEY UPDATE` is the discriminator. Postgres's row-lock conflict table puts `FOR UPDATE` in
+conflict with it and `FOR KEY SHARE` not in conflict with it, so a holder in that mode blocks
+exactly the lock the method asks for and nothing the foreign key does. Under that mode the test
+goes red the moment `.for("update")` is removed, which the first version could not manage in
+either direction.
+</Trap>
+
+### Nine of this chapter's seventeen edits are in the appendix, and the reason is structural
+
+Seventeen fenced files changed and eight of the hunks are above; the other nine are in
+`fences/post-series.md`, structurally rather than editorially. A chapter's hunk is applied **at
+that chapter** and the appendix **after every chapter**, so a hunk whose anchor lines the
+appendix added has no context a chapter can match — `codes.ts` reaches here at 324 lines where
+the appendix leaves it at 429, and the change is between those lines rather than near them.
+
+Two of the eight that stayed needed `-U2` and `-U3` for the milder version of that: **keep the
+change and trim the context the chain does not carry.** Two more moved for the opposite reason,
+having anchored here perfectly well and broken the appendix's own older hunks for the same
+paths by doing so.
+
+## What the chapter does not fix, and says so
+
+### Three accounting directions, and the derivation found the route first
+
+The isolation gauntlet derives its targets from the running router, and the classification list
+beside it is hand-maintained. On the build that registered the module the derivation said
+`44 derived, 37 attacked, 6 exempt` with `unclassified: ["POST /v1/media"]` — **the eighth time
+in this project, and the list has never once been ahead of the derivation.**
+
+Adding the entry turns that suite green and the gauntlet red the other way: *classified but
+never attacked*. Naming a route is not covering it.
+
+`credential` and not `write` is the one decision here that could have gone either way. It writes a
+row, so `write` is the tempting shape — but a `write` attack forges a tenant-owned identifier from
+another environment, and this request body is `{ filename, mime_type, bytes }`. **There is nothing
+in it to forge.** What the attack shows instead is the object key: `${environment}/${id}`, built
+from the principal the guard resolved rather than from anything the caller sent.
+
+A new table also joins the harness's global-operation guard, which is three edits that go
+together: the name in the guard's list, the bait row that proves the guard is armed, and the case
+in the accounting suite. Any one alone leaves a table the guard silently ignores.
+
+And the lane needs the store's address in **both** configs that run integration files. An earlier
+chapter put a credential in one of the two and the coverage run stayed red for eight minutes
+before anything said so — a coverage run is where constitution VI's own bar is measured, so the
+config that measures it is the one that must not be forgotten.
+
+```diff title="services/api/vitest.integration.config.mts"
+@@ -26,12 +26,23 @@
+     // A relay catches and logs its own errors, so the guard's refusal raised inside
+     // one is a log line and a green lane. Setting the flags here makes the quiet
+     // database a property of the lane rather than a convention nobody applied — and
+     // the list is exactly the relays that exist, because `setup.ts` refuses a name
+     // no module reads.
+     env: {
++      // THE OBJECT STORE, IN BOTH LANES THAT RUN `.itest.ts` FILES. Chapter 4.9 put a
++      // credential in one of these two configs and not the other, and `pnpm coverage`
++      // stayed red — keeping three cross-tenant attacks skipped in the run that measures
++      // constitution VI's own coverage bar — until eight minutes of a coverage run said
++      // so. The media suites reach a real store; without these they reach nothing and
++      // the refusal they get is `media_storage_unavailable`, which is a correct answer
++      // to the wrong question.
++      RELAY_MINIO_ENDPOINT: "http://localhost:9100",
++      RELAY_MINIO_ACCESS_KEY: "relay",
++      RELAY_MINIO_SECRET_KEY: "relay-secret",
++      RELAY_MINIO_BUCKET: "relay-media",
+       RELAY_HARNESS_BAIT: "on",
+       RELAY_OUTBOX_RELAY: "off",
+       RELAY_EVENT_CONSUMER: "off",
+       // The quota relay, the fourth. Same reason as the other three.
+       RELAY_QUOTA_RELAY: "off",
+       // THE TWO PLATFORM CREDENTIALS, AND ONE MISSING VARIABLE WAS COSTING MORE THAN THE
+```
+
+
+**A slot nobody uploads to holds its declared bytes forever.** The row is written `pending` and
+the quota counts it; nothing ever takes it back. FR-MED-10's twenty-four-hour sweep is about
+*unreferenced* media — objects that were uploaded and then orphaned by a tombstone — and a slot
+nobody used was never referenced, so that clause does not reach it. Reading the two as one is the
+mistake worth naming. The reclaim needs a decision this chapter cannot make alone: how long a
+slot lives, and whether the row is deleted or moved to a third state. It also needs the
+verification a later chapter builds, because today `state` is `pending` whether the client
+uploaded or not.
+
+The attachment arm is tested against an id this platform really minted, which the old test could
+not do — it used `"m_1"`, and a refusal that rejects anything unparseable passes that. Still 422,
+still `media_not_available`, and the message does not echo the id back: *that one is wrong, try
+another* is the opposite of what the clause means.
+
+```diff title="services/api/src/messages/messages.itest.ts"
+@@ -205,12 +205,47 @@
+         attachments: [{ ...png(0), url: bad }],
+       });
+       expect(res.status, bad).toBe(400);
+       expect(((await res.json()) as { field: string }).field, bad).toBe("attachments.0.url");
+     });
+ 
++    // FR-016, AND CHAPTER 4.10 IS WHY THIS TEST NOW EXISTS SEPARATELY. Hosted media
++    // makes a `media_id` a real thing: `POST /v1/media` issues one, a row carries it,
++    // and a client can upload against the URL it comes with. So the obvious next move
++    // is to make this arm accept — and it would ship FR-MED-06's surface with none of
++    // FR-MED-06's checks. Nothing here verifies that the id belongs to this environment,
++    // that the uploader is the sender, or that the object is `ready` rather than
++    // `pending`, and an attachment that names a `pending` slot would render as a broken
++    // image in every client that received it.
++    //
++    // `codes.ts:207` already decided this: *"§4.14 replaces the ARM rather than this
++    // code"*. The replacement is the next chapter's, and until then the honest answer to
++    // a real id is the same as the answer to a made-up one.
++    it("refuses a media_id that really exists, which is FR-016's whole point", async () => {
++      const slot = await fetch(`${url}/v1/media`, {
++        method: "POST",
++        headers: { "content-type": "application/json", authorization: `Bearer ${credential}` },
++        body: JSON.stringify({ filename: "real.png", mime_type: "image/png", bytes: 64 }),
++      });
++      expect(slot.status, "the slot route did not issue an id to test with").toBe(201);
++      const { media_id } = (await slot.json()) as { media_id: string };
++
++      const res = await send({
++        text: "hosted media, with an id this platform really minted",
++        user: "courier",
++        attachments: [{ type: "media", media_id }],
++      });
++      expect(res.status).toBe(422);
++      const body = (await res.json()) as Record<string, unknown>;
++      expect(body.code).toBe("media_not_available");
++      // AND THE ID IS NOT ECHOED BACK AS IF IT WERE THE PROBLEM. The refusal is about
++      // the arm, not about this id — a message naming the id would read as "that one is
++      // wrong, try another", which is the opposite of what FR-016 says.
++      expect(String(body.message)).not.toContain(media_id);
++    });
++
+     it("answers a media_id with its own code and a 422 (FR-003a)", async () => {
+       const res = await send({
+         text: "hosted media",
+         user: "courier",
+         attachments: [{ type: "media", media_id: "m_1" }],
+       });
+```
+
+
+<Trap>
+The quota counts what the client **said**.
+
+`declared_bytes` is the number in the request body, and nothing checks it against the object,
+because verification is a later chapter. So a client that declares 1 KB and uploads 90 MB is
+inside its cap and over it at the same time — and the same client is refused for declaring 11 MB
+of image while quietly storing whatever it likes.
+
+What that leaves is not nothing: both limits are correct against an honest client and against a
+buggy one, which is most of what either is for, and the store enforces its own limits on the
+object itself. But the error reference says *"the declared size exceeds the limit for its kind"*,
+and the word `declared` is doing real work in that sentence. It refuses a declaration, not a
+file.
+</Trap>
+
+## Two things the lane taught, neither of them about media
+
+**Two services in `compose.yaml` claimed host port 9000.** ClickHouse has published its native
+port there since chapter 1.2 and this chapter's MinIO service took the same one, so they cannot
+both start — `Bind for 127.0.0.1:9000 failed: port is already allocated`, exit 1. Nobody noticed
+for two phases, because nothing in those phases touches the analytical store: the stack had been
+running without ClickHouse for thirty-two hours behind green health checks. The port moved to
+9100 on the host and stayed 9000 in the container, because the host side is the hand-maintained
+table and chapter 1.2's claim was there first. Eleven ports in that file are allocated by hand
+and nothing checks that they are distinct.
+
+There is a second quiet failure inside the first. A stopped container restarted while its port is
+taken comes back **running, healthy, and publishing nothing** — not even the port that was free —
+because the health check runs a client inside the container, and `docker compose up -d` printed
+`Started` and exited 0. That is chapter 4.2's `/ping` finding one layer out: a green health check
+is a claim about the inside of the container.
+
+**And a test took a shared service away from its neighbours.** The truest way to test FR-017 is
+to stop the store, so the first version did: `docker compose stop minio`, ask for a slot, assert
+the code, start it again. The lane runs two files at a time. While the media suite had the store
+stopped, the isolation gauntlet — in a different directory, in a file that never mentions media
+storage — asked for a slot and got a 503 where it expected a 201. Two runs in three.
+
+An earlier chapter found eight *assertions* scoped wider than their own subject and built an
+instrument that finds them by reading SQL. This is an **action** scoped wider than its own test,
+and no instrument here sees it: `execFileSync("docker", …)` is not SQL. The endpoint moves now
+instead of the store, to a port the kernel refuses, for the duration of one request.
+
+<Why>
+Moving the endpoint rather than the store sounds like the weaker test, and the distinction is
+between *unreachable* and *stubbed*. Nothing is mocked: the api runs the same `fetch` against the
+same signer and the connection is genuinely refused, by the kernel instead of by the absence of a
+container. The two differ only in the hang case, which the two-second timeout covers.
+
+The version that did **not** work is worth a sentence, because it looks like it should. A second
+Nest application was compiled while the variable was moved, and it answered `201`. `MediaService`
+depends on a request-scoped `Repository`, so Nest makes the service request-scoped too, and the
+store's address is read on every request rather than at boot. The variable has to be wrong at the
+moment of the request, not at the moment of the wiring.
+</Why>
+
+<Checkpoint>
+A client can upload a photo to Relay's storage without a byte reaching Relay, proven by the api's
+own request log: five slot requests logged, nothing for the upload. The signer is twenty-eight
+lines of `node:crypto` and the dependency count is unchanged. Four refusals carry four codes and
+the only transient one is the only one whose message says to retry. The storage cap is enforced
+against a sum over the tenant's rows, serialised per tenant, with FR-RTL-05 amended to say why it
+is not a monthly quota. What is recorded rather than closed: an unused slot never gives its bytes
+back, and the arithmetic is over declarations.
+</Checkpoint>
+
+<ForwardRef>
+The next chapter is the other half of FR-MSG-11 — the `{ type: "media" }` attachment arm, which
+still refuses with `media_not_available` and refuses a `media_id` this platform really minted.
+Making it accept needs the three checks this chapter deliberately did not build: that the id
+belongs to this environment, that the uploader is the sender, and that the object is `ready`
+rather than `pending`.
+</ForwardRef>
+
+<SkipAhead tag="part4-ch10" />
+
+<ChapterFooter id="4.10" />

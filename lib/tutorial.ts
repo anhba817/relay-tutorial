@@ -892,6 +892,16 @@ export const series: Part[] = [
         sourceDoc: "docs/04-srs.md, docs/05-sad.md, docs/06-adr-deep-dives.md, docs/13-metering-measurement-2026-09-17.md",
         readerMinutes: 50,
       },
+      {
+        id: "4.10",
+        path: "/part-4/chapter-10/the-upload-that-never-reaches-us",
+        title: "The upload that never reaches us",
+        status: "published",
+        readerProduces:
+          "An upload slot: one route that signs a fifteen-minute URL in twenty-eight lines of node:crypto, adding no dependency, so a client uploads a photo straight to object storage and the api's own request log shows the slot request and nothing else. Four refusals with four codes, only one of them transient. A storage quota enforced against a sum over the tenant's rows and serialised per tenant, with FR-RTL-05 amended to say why stored bytes are a level and not a monthly flow",
+        sourceDoc: "docs/04-srs.md, docs/05-sad.md, docs/06-adr-deep-dives.md",
+        readerMinutes: 55,
+      },
     ],
   },
   {
