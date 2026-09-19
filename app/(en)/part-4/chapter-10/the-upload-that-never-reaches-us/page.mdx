@@ -25,21 +25,53 @@ export const metadata = {
 Movement V opens on hosted media, and the first chapter of it is about a request that hands
 back a URL.
 
-A client wants to send a photo. It asks Relay for an upload slot, declaring three things — a
-filename, a MIME type and a size — and Relay answers with an identifier and a URL good for
-fifteen minutes. The client uploads to that URL, and the file never passes through Relay. ADR-13
-decided that before the first line of this platform was written and `docs/05-sad.md` has named an
-object store since the first draft; what the platform never had is a container, a route, or a
-signature.
+A client wants to send a photo. It asks Relay for an upload slot, declaring a filename, a MIME
+type and a size, and Relay answers with an identifier and a URL good for fifteen minutes. The
+client uploads to that URL and the file never passes through Relay. ADR-13 decided that before
+the first line of this platform was written and `docs/05-sad.md` has named an object store since
+the first draft; what the platform never had is a container, a route, or a signature.
 
 <Figure
   code={figThePathTheBytesTake}
   caption="Four steps, and Relay is in two of them: it signs a URL and writes a row, and the bytes travel on a connection it never sees."
 />
 
-The store itself is a container, and adding it is the smallest change in the chapter.
+The store is a container, and adding it is the smallest change in the chapter.
 `docs/05-sad.md:1002` has named `minio/minio` since the first draft and that image answers
 `pull access denied` on this machine; the one that exists is `quay.io/minio/minio`, 241 MB.
+
+A container is two edits. `infra.test.ts` asserts the service list **in both directions** —
+every registered service appears in `compose.yaml`, and every compose service is registered —
+and the second direction was added by the chapter that provisioned the fifth container, whose
+comment reads *"a container added to compose and never registered here was invisible"*. It
+caught the sixth.
+
+```diff title="packages/config/src/infra.ts"
+@@ -12,13 +12,23 @@
+   "nats",
+   "clickhouse",
+   // The fifth, and the only one that is not a store: Mailpit
+   // catches the SMTP the notification relay sends so a test can read what was
+   // RECEIVED rather than what was passed (FR-021).
+   "mailpit",
++  // The sixth, and hosted media's (ADR-13, chapter 4.10). The api signs a URL and
++  // the CLIENT uploads to it, so this container is reachable from outside the
++  // network in a way the stores are not — and its host port is 9100, not MinIO's
++  // conventional 9000, because ClickHouse's native port has published 9000 since
++  // this file was written.
++  "minio",
+ ] as const;
+ 
+ export const DURABLE_VOLUMES = [
+   "postgres-data",
+   "nats-data",
+   "clickhouse-data",
++  // Objects outlive the process that wrote them by definition; a media store that
++  // forgot its bucket on `compose down` would make every `media_id` in Postgres
++  // point at nothing.
++  "minio-data",
+ ] as const;
+```
 
 ```diff title="compose.yaml"
 @@ -89,12 +89,55 @@
@@ -310,8 +342,8 @@ produce a refusal**, and it is the honest cost of the clause:
 Both of the api's own calls to the store live in one file. `ensureBucket` runs on every boot and
 is safe to because the store has a *name* for the second attempt — `BucketAlreadyOwnedByYou`,
 409 — so "already there" and "went wrong" are distinguishable without a flag. A 409 that is
-**not** that name is another tenant owning the bucket, which is fatal rather than idempotent, and
-a check on the status alone reads it as success.
+**not** that name is another tenant owning the bucket: fatal rather than idempotent, and a check
+on the status alone reads it as success.
 
 ```ts title="services/api/src/media/store.ts"
 import { presign } from "./presign";
@@ -1342,10 +1374,9 @@ config that measures it is the one that must not be forgotten.
 the quota counts it; nothing ever takes it back. FR-MED-10's twenty-four-hour sweep is about
 *unreferenced* media — objects that were uploaded and then orphaned by a tombstone — and a slot
 nobody used was never referenced, so that clause does not reach it. Reading the two as one is the
-mistake worth naming. The reclaim needs a decision this chapter cannot make alone: how long a
-slot lives, and whether the row is deleted or moved to a third state. It also needs the
-verification a later chapter builds, because today `state` is `pending` whether the client
-uploaded or not.
+mistake worth naming. The reclaim needs a decision this chapter cannot make alone — how long a
+slot lives, and whether the row is deleted or moved to a third state — and the verification a
+later chapter builds, because today `state` is `pending` whether the client uploaded or not.
 
 The attachment arm is tested against an id this platform really minted, which the old test could
 not do — it used `"m_1"`, and a refusal that rejects anything unparseable passes that. Still 422,
@@ -1412,35 +1443,32 @@ because verification is a later chapter. So a client that declares 1 KB and uplo
 inside its cap and over it at the same time — and the same client is refused for declaring 11 MB
 of image while quietly storing whatever it likes.
 
-What that leaves is not nothing: both limits are correct against an honest client and against a
-buggy one, which is most of what either is for, and the store enforces its own limits on the
-object itself. But the error reference says *"the declared size exceeds the limit for its kind"*,
-and the word `declared` is doing real work in that sentence. It refuses a declaration, not a
-file.
+That is not nothing: both limits are correct against an honest client and a buggy one, which is
+most of what either is for, and the store enforces its own limits on the object. But the error
+reference says *"the declared size exceeds the limit for its kind"*, and `declared` is doing real
+work in that sentence. It refuses a declaration, not a file.
 </Trap>
 
 ## Two things the lane taught, neither of them about media
 
 **Two services in `compose.yaml` claimed host port 9000.** ClickHouse has published its native
-port there since chapter 1.2 and this chapter's MinIO service took the same one, so they cannot
-both start — `Bind for 127.0.0.1:9000 failed: port is already allocated`, exit 1. Nobody noticed
-for two phases, because nothing in those phases touches the analytical store: the stack had been
-running without ClickHouse for thirty-two hours behind green health checks. The port moved to
-9100 on the host and stayed 9000 in the container, because the host side is the hand-maintained
-table and chapter 1.2's claim was there first. Eleven ports in that file are allocated by hand
-and nothing checks that they are distinct.
+port there since chapter 1.2 and MinIO took the same one, so they cannot both start —
+`Bind for 127.0.0.1:9000 failed: port is already allocated`, exit 1. Nobody noticed for two
+phases, because nothing in those phases touches the analytical store: **the stack had been
+running without ClickHouse for thirty-two hours behind green health checks.** Eleven ports in
+that file are allocated by hand and nothing checks that they are distinct.
 
 There is a second quiet failure inside the first. A stopped container restarted while its port is
 taken comes back **running, healthy, and publishing nothing** — not even the port that was free —
 because the health check runs a client inside the container, and `docker compose up -d` printed
-`Started` and exited 0. That is chapter 4.2's `/ping` finding one layer out: a green health check
-is a claim about the inside of the container.
+`Started` and exited 0. Chapter 4.2's `/ping` finding one layer out: a green health check is a
+claim about the inside of the container.
 
 **And a test took a shared service away from its neighbours.** The truest way to test FR-017 is
-to stop the store, so the first version did: `docker compose stop minio`, ask for a slot, assert
-the code, start it again. The lane runs two files at a time. While the media suite had the store
-stopped, the isolation gauntlet — in a different directory, in a file that never mentions media
-storage — asked for a slot and got a 503 where it expected a 201. Two runs in three.
+to stop the store, so the first version did: `docker compose stop minio`, ask, assert, start
+again. The lane runs two files at a time, and while the media suite had the store stopped the
+isolation gauntlet — a different directory, a file that never mentions media storage — asked for
+a slot and got a 503 where it expected a 201. Two runs in three.
 
 An earlier chapter found eight *assertions* scoped wider than their own subject and built an
 instrument that finds them by reading SQL. This is an **action** scoped wider than its own test,
