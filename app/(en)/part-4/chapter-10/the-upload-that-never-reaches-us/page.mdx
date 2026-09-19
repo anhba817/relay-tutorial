@@ -40,11 +40,10 @@ The store is a container, and adding it is the smallest change in the chapter.
 `docs/05-sad.md:1002` has named `minio/minio` since the first draft and that image answers
 `pull access denied` on this machine; the one that exists is `quay.io/minio/minio`, 241 MB.
 
-A container is two edits. `infra.test.ts` asserts the service list **in both directions** —
-every registered service appears in `compose.yaml`, and every compose service is registered —
-and the second direction was added by the chapter that provisioned the fifth container, whose
-comment reads *"a container added to compose and never registered here was invisible"*. It
-caught the sixth.
+A container is two edits. `infra.test.ts` asserts the service list **in both directions**, and
+the second direction was added by the chapter that provisioned the fifth container, whose comment
+reads *"a container added to compose and never registered here was invisible"*. It caught the
+sixth.
 
 ```diff title="packages/config/src/infra.ts"
 @@ -12,13 +12,23 @@
@@ -166,10 +165,10 @@ compute the signature the store would have computed, put it in the URL, and hand
 somebody with no credentials at all. The store checks the signature and does not care who sent
 it.
 
-The version most projects reach for is a vendor SDK, and the argument for one is usually
-"signing is fiddly and getting it wrong is a security bug". Both halves are true. What it leaves
-out is how much of the SDK you need: the AWS algorithm is five HMAC-SHA256 rounds over a
-canonical request, and the platform already has `node:crypto`.
+The version most projects reach for is a vendor SDK, and the argument is usually "signing is
+fiddly and getting it wrong is a security bug". Both halves are true. What it leaves out is how
+much of the SDK you need: the AWS algorithm is five HMAC-SHA256 rounds over a canonical request,
+and the platform already has `node:crypto`.
 
 Written out, it is twenty-eight lines. **The dependency count moves by zero.**
 
@@ -339,11 +338,12 @@ produce a refusal**, and it is the honest cost of the clause:
 **+1.524 ms, +24.1%**, 200 samples a side, the same binary minutes apart. The probe's own
 1.062 ms is two thirds of that and the rest is the second signing.
 
-Both of the api's own calls to the store live in one file. `ensureBucket` runs on every boot and
-is safe to because the store has a *name* for the second attempt — `BucketAlreadyOwnedByYou`,
-409 — so "already there" and "went wrong" are distinguishable without a flag. A 409 that is
-**not** that name is another tenant owning the bucket: fatal rather than idempotent, and a check
-on the status alone reads it as success.
+Both of the api's own calls to the store live in one file, and the second calls the first. A HEAD
+that answers **404** is not a refusal — it is a reachable store with no bucket, which is what a
+fresh volume looks like — so that arm creates it and carries on. Creating is safe to do
+unconditionally because the store has a *name* for the second attempt,
+`BucketAlreadyOwnedByYou`, 409; a 409 that is **not** that name is another tenant owning the
+bucket, fatal rather than idempotent, and a check on the status alone reads it as success.
 
 ```ts title="services/api/src/media/store.ts"
 import { presign } from "./presign";
@@ -372,11 +372,18 @@ export function storeConfig(env: NodeJS.ProcessEnv = process.env): StoreConfig {
 
 /** Create the bucket, or confirm it is already ours.
  *
- * ON BOOT, EVERY BOOT, WITH THE SIGNER THIS MODULE ALREADY HAS. The alternatives were
- * an entrypoint script and a migration-like runner; both add a moving part for one
- * idempotent call. What makes running it unconditionally safe is that the store has a
- * NAME for the second attempt — `BucketAlreadyOwnedByYou`, 409 — rather than a generic
- * failure, so "already there" and "went wrong" are distinguishable without a flag. */
+ * WITH THE SIGNER THIS MODULE ALREADY HAS. The alternatives were an entrypoint script
+ * and a migration-like runner; both add a moving part for one idempotent call. What
+ * makes running it unconditionally safe is that the store has a NAME for the second
+ * attempt — `BucketAlreadyOwnedByYou`, 409 — rather than a generic failure, so "already
+ * there" and "went wrong" are distinguishable without a flag.
+ *
+ * AND ITS CALLER IS `storeReady` BELOW, NOT A BOOT HOOK. An earlier version of this
+ * comment said *"on boot, every boot"* and **nothing called it on boot** — only test
+ * `beforeAll` hooks did. Every local run passed because the bucket already existed from
+ * the first one; CI's fresh volume is what said so, with two suites that never touch
+ * this file answering 503 to a slot request. A comment describing behaviour no code
+ * performs is the defect this chapter keeps finding in other people's files. */
 export async function ensureBucket(config: StoreConfig): Promise<"created" | "exists"> {
   const url = presign({ method: "PUT", ...config, expiresIn: 60 });
   const res = await fetch(url, { method: "PUT" });
@@ -392,7 +399,7 @@ export async function ensureBucket(config: StoreConfig): Promise<"created" | "ex
   );
 }
 
-/** Whether the store will answer a signed, credentialed request right now (FR-017).
+/** Whether the store can accept an upload right now (FR-017).
  *
  * A PRESIGNED URL NEEDS NO CONTACT WITH THE STORE, WHICH IS THE WHOLE PROBLEM. Signing
  * is five HMAC rounds over strings; the api never opens a socket, so it never learns
@@ -404,10 +411,18 @@ export async function ensureBucket(config: StoreConfig): Promise<"created" | "ex
  * is a real cost on the happy path and it is written down rather than hidden: one signed
  * HEAD on the bucket per slot request.
  *
- * A HEAD ON THE BUCKET AND NOT A GET ON AN OBJECT. The bucket always exists (boot
- * created it) and a HEAD returns no body, so the question is exactly "is the store
- * answering credentialed requests" and nothing else. An object GET would conflate a
+ * A HEAD ON THE BUCKET AND NOT A GET ON AN OBJECT. The bucket is the thing an upload
+ * needs to exist, and a HEAD returns no body — so the question is exactly "will this
+ * store take a PUT under this prefix" and nothing else. An object GET would conflate a
  * missing key with a missing store.
+ *
+ * AND A 404 IS NOT A REFUSAL, IT IS THE FIRST REQUEST. A reachable store with no bucket
+ * answers 404, which is what a fresh volume looks like — so that arm creates the bucket
+ * and carries on. This is the only place that creates it: putting it in a boot hook
+ * leaves a store that was down at boot permanently bucketless, and putting it on every
+ * request would need `CreateBucket` on a credential that may only be granted
+ * `PutObject`. Here it is asked for exactly once per store, on the first slot request
+ * that finds it missing.
  *
  * AND A TIMEOUT, BECAUSE "CANNOT BE REACHED" INCLUDES "DOES NOT ANSWER". A store that
  * accepts the connection and then hangs would otherwise hold the request open until the
@@ -415,15 +430,18 @@ export async function ensureBucket(config: StoreConfig): Promise<"created" | "ex
  * client has to interpret. Two seconds: long enough for a loaded store on a shared
  * machine, short enough that a slot request never becomes the slowest thing in the api.
  */
-export async function storeReachable(config: StoreConfig): Promise<boolean> {
+export async function storeReady(config: StoreConfig): Promise<boolean> {
   const url = presign({ method: "HEAD", ...config, expiresIn: 60 });
   try {
     const res = await fetch(url, { method: "HEAD", signal: AbortSignal.timeout(2_000) });
-    return res.ok;
+    if (res.ok) return true;
+    if (res.status !== 404) return false;
+    await ensureBucket(config);
+    return true;
   } catch {
-    // CONNECTION REFUSED, DNS FAILURE, TIMEOUT — all the same answer to the caller.
-    // Distinguishing them here would be a second vocabulary for one refusal, and the
-    // client's action is identical in every case.
+    // CONNECTION REFUSED, DNS FAILURE, TIMEOUT, AND A BUCKET THAT WOULD NOT CREATE —
+    // all the same answer to the caller. Distinguishing them here would be a second
+    // vocabulary for one refusal, and the client's action is identical in every case.
     return false;
   }
 }
@@ -541,7 +559,7 @@ import { Repository } from "../db/repository";
 import { protocolError } from "../protocol-error";
 import { KIND_CAPS, kindOf } from "./kinds";
 import { presign } from "./presign";
-import { storeConfig, storeReachable, type StoreConfig } from "./store";
+import { storeConfig, storeReady, type StoreConfig } from "./store";
 
 /** What a caller declares. Nothing here is verified — FR-MED-03 is a later chapter,
  * and the quota arithmetic below is over these numbers rather than over bytes. */
@@ -607,7 +625,7 @@ export class MediaService {
     // requests instead of one. The opposite order tells a client to delete media when
     // nothing could have been stored anyway — permanent advice about a transient
     // state, which is the failure this code exists to prevent.
-    if (!(await storeReachable(this.store))) {
+    if (!(await storeReady(this.store))) {
       throw protocolError(
         "media_storage_unavailable",
         "the object store is not reachable; this is temporary and the request can be retried",
@@ -1467,8 +1485,8 @@ claim about the inside of the container.
 **And a test took a shared service away from its neighbours.** The truest way to test FR-017 is
 to stop the store, so the first version did: `docker compose stop minio`, ask, assert, start
 again. The lane runs two files at a time, and while the media suite had the store stopped the
-isolation gauntlet — a different directory, a file that never mentions media storage — asked for
-a slot and got a 503 where it expected a 201. Two runs in three.
+isolation gauntlet — a file that never mentions media storage — got a 503 where it expected a
+201. Two runs in three.
 
 An earlier chapter found eight *assertions* scoped wider than their own subject and built an
 instrument that finds them by reading SQL. This is an **action** scoped wider than its own test,
