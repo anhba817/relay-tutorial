@@ -7697,6 +7697,21 @@ What they do, briefly, so the entry is readable without the chapter:
  // line the module is compiled, exported, imported by nothing, and none of the user
  // routes exist. The file appeared in no task until an enumeration asked which
  // chapter fences it.
+@@ -24,13 +25,13 @@
+ import { TenancyModule } from "./tenancy/tenancy.module";
+ import { LOGGER, apiLogger } from "./logger";
+ import { ProtocolErrorFilter } from "./protocol-error.filter";
+ import { LimitsModule } from "./limits/limits.module";
+ import { RateLimitMiddleware } from "./limits/rate-limit.middleware";
+ import { RequestContextMiddleware } from "./request-context.middleware";
+-import { RequestLogMiddleware } from "./request-log/request-log.middleware";
++import { RequestLogMiddleware, requestLogEnabled } from "./request-log/request-log.middleware";
+ import { RequestLogModule } from "./request-log/request-log.module";
+ import { ANALYTICS_PUBLISHER } from "./webhooks/analytics";
+ import { createJetStreamPublisher, ensureAnalyticsStream } from "./outbox/jetstream.publisher";
+ import type { Publisher } from "./outbox/publisher";
+ 
+ // The application described as a module graph — ADR-15's convention for the
 @@ -53,12 +54,17 @@
      LimitsModule,
      // Chapter 4.8's read surface. Registered here for the reason `ChannelsModule` and
@@ -7715,6 +7730,40 @@ What they do, briefly, so the entry is readable without the chapter:
      { provide: LOGGER, useFactory: apiLogger },
      { provide: APP_FILTER, useClass: ProtocolErrorFilter },
      RequestContextMiddleware,
+@@ -94,16 +100,29 @@
+     // REQUEST LOG IS SECOND, NOT LAST, AND THE POSITION IS LOAD-BEARING.
+     // `RateLimitMiddleware` refuses a 429 with `res.end(); return;` and never calls
+     // `next()`, so a producer registered after it never runs -- and a rate-limited request
+     // is exactly the one an operator opens a request log to find. Second, it attaches its
+     // `finish` listener before anything can short-circuit, and reads `req.principal` when
+     // the listener fires rather than when it is attached. Attach early, read late.
++    //
++    // AND `RELAY_REQUEST_LOG=off` TAKES IT OUT OF THE CHAIN RATHER THAN SHORT-CIRCUITING
++    // INSIDE IT. The unit lane sets it: `pnpm test` is the Docker-free gate and this
++    // producer is the only thing in the chain that reaches a broker, so with it registered
++    // the gate has needed a running NATS since the chapter that added it.
+     consumer
+       .apply(
+-        RequestContextMiddleware,
+-        RequestLogMiddleware,
+-        AuthenticateMiddleware,
+-        RateLimitMiddleware,
++        ...(requestLogEnabled()
++          ? ([
++              RequestContextMiddleware,
++              RequestLogMiddleware,
++              AuthenticateMiddleware,
++              RateLimitMiddleware,
++            ] as const)
++          : ([
++              RequestContextMiddleware,
++              AuthenticateMiddleware,
++              RateLimitMiddleware,
++            ] as const)),
+       )
+       .forRoutes("{*path}");
+   }
+ }
 ```
 
 ```diff title="services/api/src/isolation/targets.ts"
@@ -8104,3 +8153,80 @@ What they do, briefly, so the entry is readable without the chapter:
  
  beforeAll(async () => {
 ```
+
+---
+
+## Two files the chapter-4.10 follow-up touched (`gaps.md` 056-9, 056-10)
+
+Neither belongs to a chapter. Both come from closing gaps that chapter opened and recorded,
+in work that publishes no chapter of its own.
+
+**`services/api/vitest.config.mts`** switches the request-log producer off for the unit
+lane. `ci.yml` calls `pnpm test` *"the Docker-free gate, exactly as chapter 1.1 defined
+it"*, and it had needed a running broker with the `ANALYTICS` stream since the chapter that
+added that producer: point the api at a broker that is not there and
+`main.test.ts > logs exactly one structured line per request` goes red, because the
+producer's failure path logs a second line through the logger that test captures. Off in
+the lane's own config rather than in CI, because the claim is about the lane and not about
+one runner — **408 of 408 with every store pointed at a closed port.** The switch itself is
+in `request-log.middleware.ts`, which carries no fence.
+
+**`services/api/src/limits/auth-limiter.ts`** gains a clause. Its comment said *"this one
+runs on every request that presents a credential"* — a claim about when a symbol runs, with
+nothing named that runs it. It now names `AuthenticateMiddleware` and the `{*path}` that
+`AppModule.configure()` applies it to, which one `grep` can check and which goes visibly
+stale if the symbol moves. That is the convention `gaps.md` 056-10 exists for: the same
+sentence shape, unverified, is how `ensureBucket` came to say *"on boot, every boot"* while
+nothing called it at boot.
+
+```diff title="services/api/vitest.config.mts"
+@@ -8,12 +8,26 @@
+ // node's). The config is .mts for the same reason: inside a
+ // `"type": "commonjs"` package a .ts config would be loaded as CommonJS,
+ // which vitest refuses.
+ export default defineConfig({
+   test: {
+     include: ["src/**/*.test.ts"],
++    // THE DOCKER-FREE GATE, MADE DOCKER-FREE AGAIN.
++    //
++    // `ci.yml` calls `pnpm test` *"the Docker-free gate, exactly as chapter 1.1 defined
++    // it"* and it stopped being one when the request-log producer joined the middleware
++    // chain: every booted api opened a broker connection, and `main.test.ts > logs exactly
++    // one structured line per request` counted the producer's own failure line as a second
++    // line. Measured — `RELAY_NATS_URL=nats://127.0.0.1:1` turns it red locally, and in CI
++    // the broker is reachable while the stream is not, which is the same two lines with
++    // `NatsError: 503` in the second.
++    //
++    // SET HERE RATHER THAN IN CI, because the claim is about the lane and not about one
++    // runner. A variable in `ci.yml` would leave every developer's `pnpm test` depending on
++    // a broker they were told they did not need.
++    env: { RELAY_REQUEST_LOG: "off" },
+   },
+   plugins: [
+     swc.vite({
+       module: { type: "es6" },
+       jsc: { transform: { legacyDecorator: true, decoratorMetadata: true } },
+     }),
+```
+
+```diff title="services/api/src/limits/auth-limiter.ts"
+@@ -57,14 +57,15 @@
+     }
+   }
+ 
+   /** Has this address already spent its allowance?
+    *
+    * READS WITHOUT COUNTING. A check that also writes would refuse on its own
+-   * questions, and this one runs on every request that presents a credential —
+-   * including the valid ones.
++   * questions, and this one is called from `AuthenticateMiddleware`, which
++   * `AppModule.configure()` applies to `{*path}` — so it runs on every request that
++   * presents a credential, including the valid ones.
+    *
+    * When the shared store is unreachable it answers from the in-process count,
+    * which is the whole point: the guarantee gets weaker, not absent. A key the
+    * fallback could not admit answers `true` — refusing an address we cannot track
+    * is the safe direction while degraded, and the cap makes that a bounded
+    * population rather than everybody. */
+```
+
