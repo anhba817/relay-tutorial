@@ -1,0 +1,700 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import {
+  figWhoMayHoldIt,
+  figTheIndexThatIsNotUsed,
+  figThreeScopesNothingSees,
+} from "./figures";
+
+export const metadata = {
+  title: "A link that expires, and who may hold it — Building Relay",
+  description:
+    "One route hands out a signed URL for an hour. The clause says to check channel membership, and doing that would refuse a user the photo in a message whose text they can read. The index built for the lookup turns out not to help the lookup, and three tenancy predicates guard the route while no test can see any of them.",
+  alternates: {
+    canonical: "/part-4/chapter-12/a-link-that-expires-and-who-may-hold-it",
+    languages: {
+      en: "/part-4/chapter-12/a-link-that-expires-and-who-may-hold-it",
+      vi: "/vi/part-4/chapter-12/a-link-that-expires-and-who-may-hold-it",
+    },
+  },
+};
+
+<ChapterHeader id="4.12" />
+
+FR-MED-08 is one sentence with two halves:
+
+> Media objects shall be readable only via signed delivery URLs with a validity of 1 hour,
+> issued only to callers authorised to read a referencing message. Object storage shall not be
+> publicly readable.
+
+**The second half shipped two chapters ago and has a test with this clause's name on it.**
+`presign.itest.ts:53` is titled *"refuses an unsigned GET of that object — FR-MED-08's
+precondition"*, and it asks a running MinIO from outside the container: a signed GET answers
+200, an unsigned one 403, a tampered one 403. Re-proving that here would be claiming chapter
+4.10's work.
+
+What is left is *authorised to read a referencing message* — and the platform had no way to ask
+that question. Nothing counted references to a media object. Chapter 4.11 filed that as a gap
+the moment it created the first references there had ever been.
+
+## Reading the clause literally would make the photo harder to reach than the message
+
+The clause's original wording carried a parenthesis: *"(channel membership or API key)"*. Take
+it at face value and the route checks membership. That is the wrong implementation, and the
+reason is not subtle once you look at how this platform already answers the same question.
+
+History has authorised reads since the channel chapter:
+
+```ts
+if (channel?.type === "private" && !(await this.isMember(channelId, userId))) {
+  return [];
+}
+```
+
+**Membership is checked for `private` channels only.** A public channel's messages are readable
+by any user of the environment — that is what makes it public. On the development lane there
+are **11,557 public channels against 1,016 private**, so the case a membership check breaks is
+not an edge case, it is the ordinary one.
+
+A delivery route demanding membership would refuse a user the photo in a message whose text
+they can read, whose author they can see and whose attachment count they already know. It would
+implement the clause's words while contradicting the design note printed underneath it: *media
+access control inherits channel membership rather than inventing a parallel ACL system.*
+
+The predicate that satisfies the note is the one that already exists.
+
+```ts
+async channelVisibleTo(channelId: string, userId?: string): Promise<boolean> {
+  // …
+  if (!channel) return false;
+  if (channel.type !== "private" || userId === undefined) return true;
+  return this.isMember(channelId, userId);
+}
+```
+
+Three cases in three lines, and the third is the clause's own *"or API key"* arm: `userId`
+absent means the tenant is reading, which sees everything it owns. Nothing new is written, so
+there is no parallel ACL to drift.
+
+<Why title="Why reuse rather than copy">
+An access rule that appears twice is a rule that will disagree with itself. This one is already
+the subject of a fix: the leak `channelVisibleTo` was written to close was a private channel
+answering `200, empty page` where an absent one answered `404`, which announced that the
+channel existed. A second copy written here would have to learn that lesson again, and the
+second copy is always the one nobody remembers to update.
+
+The SRS note says the design is satisfied *"rather than inventing a parallel ACL system"* —
+that is a claim about what the code does not contain, and the only way to keep such a claim
+true is to have nothing to keep in step.
+</Why>
+
+## The route
+
+```diff title="services/api/src/media/media.controller.ts"
+@@ -1,10 +1,12 @@
+-import { Body, Controller, Post, Req, UseGuards } from "@nestjs/common";
++import { Body, Controller, Get, Param, Post, Req, UseGuards } from "@nestjs/common";
++import { z } from "zod";
+ 
+ import { Accepts, CredentialGuard } from "../auth/credential.guard";
+ import type { RequestWithPrincipal } from "../auth/principal";
++import { protocolError } from "../protocol-error";
+ import { MediaService, type SlotRequest } from "./media.service";
+ 
+ // THE UPLOAD SLOT (FR-MED-01). One route, and the bytes do not come through it.
+ //
+ // `Accepts("application", "user")` — BOTH, which is FR-MED-01's own wording: "on
+ // request (user token or API key)". A photo sent by a person and an attachment
+@@ -28,7 +30,45 @@
+     // both ways — and an unreachable arm in a file the ratchet pins at 100% is a
+     // coverage failure with no fix but a comment.
+     const actingUser =
+       req.principal?.kind === "user" ? req.principal.userExternalId : undefined;
+     return this.media.createSlot(body, actingUser);
+   }
++
++  /** A signed GET for an object the caller may read (FR-MED-08). 200 with a URL and an
++   * expiry, or 404 — the same 404 for an object of another tenant, an object referenced
++   * only where the caller cannot read, and an id no object has.
++   *
++   * THE PATH PARAMETER IS VALIDATED, AND NO OTHER ROUTE IN THIS API DOES THAT. Measured
++   * against the composed api before this route existed:
++   *
++   *     GET /v1/channels/not-a-uuid/messages
++   *     500 {"code":"internal_error","message":"unexpected internal error"}
++   *
++   * A malformed uuid reaches the driver, Postgres answers `invalid input syntax for type
++   * uuid`, and the filter has no rung for it — a caller-triggered 500 on sixteen shipped
++   * routes, thirteen taking `channelId` and three taking `messageId`. It is chapter
++   * 4.11's research R3 exactly, which found the same defect in a request BODY, measured
++   * it, and fixed it with `z.uuid()` — while nobody looked at the path. The other sixteen
++   * are recorded in `gaps.md` with their measurement rather than repaired here, because a
++   * chapter about signed delivery that rewrites three controllers is teaching two things
++   * badly.
++   *
++   * NOT THROUGH `ZodValidationPipe`, AND THE REASON IS ITS `field`. That pipe names the
++   * field from the zod issue's `path`, which is empty for a scalar and then omitted — so
++   * the reuse would answer 400 without saying which parameter was wrong. The check is
++   * three lines here and names `mediaId`. */
++  @Get(":mediaId")
++  deliver(@Param("mediaId") mediaId: string, @Req() req: RequestWithPrincipal) {
++    if (!z.uuid().safeParse(mediaId).success) {
++      throw protocolError(
++        "invalid_request",
++        "mediaId must be a uuid",
++        400,
++        "mediaId",
++      );
++    }
++    const actingUser =
++      req.principal?.kind === "user" ? req.principal.userExternalId : undefined;
++    return this.media.deliver(mediaId, actingUser);
++  }
+ }
+```
+
+```diff title="services/api/src/media/media.service.ts"
+@@ -1,9 +1,9 @@
+ import { randomUUID } from "node:crypto";
+ 
+-import { HttpStatus, Injectable } from "@nestjs/common";
++import { BadRequestException, HttpStatus, Injectable } from "@nestjs/common";
+ 
+ import { Repository } from "../db/repository";
+ import { protocolError } from "../protocol-error";
+ import { KIND_CAPS, kindOf } from "./kinds";
+ import { presign } from "./presign";
+ import { storeConfig, storeReady, type StoreConfig } from "./store";
+@@ -20,12 +20,28 @@
+   media_id: string;
+   state: "pending";
+   upload_url: string;
+   expires_at: string;
+ }
+ 
++export interface Delivery {
++  url: string;
++  expires_at: string;
++}
++
++/** FR-MED-08's one hour, against the upload slot's fifteen minutes.
++ *
++ * THE URL OUTLIVES THE AUTHORISATION THAT PRODUCED IT AND NOTHING HERE CAN FIX THAT. A
++ * caller issued a URL at minute 0 and removed from the channel at minute 1 holds a
++ * working link until minute 60: the store checks a signature and has never heard of a
++ * channel. Shortening the window trades one exposure for another — a URL that expires
++ * while a page is still rendering is a broken image — and revocation would mean the api
++ * standing in front of the bytes, which is what ADR-13 was decided against. The clause
++ * names the hour, so the hour is what ships and the window is published as a cost. */
++const DELIVERY_SECONDS = 3600;
++
+ /** FR-MED-01's fifteen minutes. The STORE enforces it — a URL past its expiry comes
+  * back `AccessDenied · Request has expired` from the store's own clock — and
+  * `expires_at` below is published so a client can decide whether to reuse the URL
+  * rather than so anything here can check it. */
+ const SLOT_SECONDS = 900;
+ 
+@@ -128,7 +144,59 @@
+       state: "pending",
+       upload_url,
+       expires_at: new Date(Date.now() + SLOT_SECONDS * 1000).toISOString(),
+     };
+   }
+ 
++  /** A signed GET for an object this caller may read, or a refusal (FR-MED-08).
++   *
++   * THE SIGNER NEEDED NO CHANGE AND THAT IS ASSERTED RATHER THAN ARRANGED. `presign` has
++   * taken `"GET"` since chapter 4.10, and `presign.itest.ts:53` — titled "FR-MED-08's
++   * precondition" — already proves the other half of this clause from outside the
++   * container: a signed GET answers 200, an unsigned one 403, a tampered one 403. Half of
++   * what this chapter was asked for was built two chapters ago, and re-proving it would
++   * claim work somebody else did.
++   *
++   * THE EXTERNAL ID IS RESOLVED BEFORE THE PREDICATE SEES IT. `req.principal.userExternalId`
++   * is `tuan` or `delivery-bot`; `channelVisibleTo` reaches `isMember`, which compares
++   * against `members.user_id`, a `uuid` column. Handing one straight through is a
++   * caller-triggered 500 where a tenant's ids are not UUID-shaped — and something worse
++   * where they are, because no parse fails, `isMember` simply returns false, and every
++   * private channel silently refuses every member while every public one still works.
++   *
++   * `endpoint` AND NOT `internalEndpoint` (4.11's FR-026). This URL is handed to a client
++   * outside the network and the host is inside the SigV4 signature, so signing with the
++   * api's own address produces a URL the store refuses rather than one that is slow. */
++  async deliver(mediaId: string, userExternalId?: string): Promise<Delivery> {
++    let userId: string | undefined;
++    if (userExternalId !== undefined) {
++      const user = await this.repo.getUserByExternalId(userExternalId);
++      if (!user) throw new BadRequestException("unknown user");
++      userId = user.id;
++    }
++
++    const objectKey = await this.repo.readableMediaObjectKey(mediaId, userId);
++    // ONE ANSWER FOR THREE CONDITIONS — another environment's object, an object
++    // referenced only where this caller cannot read, and an id no object has. The
++    // precedent is `channelVisibleTo`'s own: the leak it was written to close was a
++    // private channel answering `200, empty page` where an absent one answered 404, and
++    // the fix was to make both answer identically. A refusal that names its cause reports
++    // whether somebody else's object exists.
++    if (objectKey === undefined) {
++      throw protocolError(
++        "not_found",
++        "no such media object",
++        HttpStatus.NOT_FOUND,
++      );
++    }
++
++    return {
++      url: presign({
++        method: "GET",
++        ...this.store,
++        key: objectKey,
++        expiresIn: DELIVERY_SECONDS,
++      }),
++      expires_at: new Date(Date.now() + DELIVERY_SECONDS * 1000).toISOString(),
++    };
++  }
+ }
+```
+
+Two fields come back and nothing else:
+
+```json
+{ "url": "http://localhost:9100/relay-media/<env>/<id>?X-Amz-Algorithm=…&X-Amz-Expires=3600&…",
+  "expires_at": "2026-09-20T04:04:11.000Z" }
+```
+
+`expires_at` exists so a client need not parse `X-Amz-Date` and add `X-Amz-Expires` — the same
+courtesy the upload slot gives. There is no `state`. Every object is `pending` until the
+verification chapter, so a state here would be a constant wearing a field's name, and a client
+that branched on it would break on the day the field started meaning something. The test asserts
+the absence with `Object.keys(body).sort()`, which turns a third field into a failure rather
+than a review comment.
+
+<Figure code={figWhoMayHoldIt} caption="One route, four refusals, one answer. The buffer counts are from the development lane's busiest tenant: 1,018 messages across ten channels." />
+
+## The lookup, and why it is two queries instead of one
+
+```diff title="services/api/src/db/repository.ts"
+@@ -5526,12 +5526,109 @@
+       );
+     if (!channel) return false;
+     if (channel.type !== "private" || userId === undefined) return true;
+     return this.isMember(channelId, userId);
+   }
+ 
++  /** The `object_key` of a media object this caller may read, or `undefined` (FR-MED-08).
++   *
++   * Three questions, and each refusal is the same refusal: does this environment own an
++   * object with that id, which of this environment's channels carry a message referencing
++   * it, and may this caller see any of them.
++   *
++   * TWO QUERIES AND NOT ONE, WHICH IS THE OPPOSITE OF WHAT THE PLAN SAID. The design this
++   * chapter was planned with was a single three-way join — `media_objects` to `messages`
++   * on containment to `channels` — and it is the shape that makes the new GIN index
++   * unusable. The containment operand is built from `o.id`, a value from the other side of
++   * the join, so the planner cannot look it up; it narrows to the tenant's channels and
++   * applies containment as a join filter over every message they hold. Measured on the
++   * lane's busiest tenant, 1,018 messages:
++   *
++   *     one joined query, a hit     Nested Loop, `Rows Removed by Join Filter: 1017`
++   *                                 86 buffers · 1.109 ms · the index unused
++   *     two queries, a hit           3 + 17 buffers · 0.034 + 0.077 ms
++   *                                 `Bitmap Index Scan on messages_attachments_gin`
++   *
++   * Splitting it makes the containment operand a bound value, which is the only form the
++   * index can serve. The scope survives the split — step two still names this environment
++   * — and so does the reason for reading the object row at all: `object_key` is what
++   * `presign` signs, and reading it is what makes the object's own `environment_id` a
++   * check this route performs rather than one it inherits from the send path.
++   *
++   * AND THE SMALL TENANT HID IT. The same one-query plan costs 14 buffers on a
++   * nine-message environment, which is what the analysis passes measured. Its cost is the
++   * tenant's message count; the two-query cost is not.
++   *
++   * `channelVisibleTo` IS REUSED RATHER THAN REWRITTEN, and that is FR-MED-08's note
++   * being satisfied by construction. The clause says media access "inherits channel
++   * membership rather than inventing a parallel ACL system" — a second predicate written
++   * here would be a parallel ACL however faithfully it copied the first. It also answers
++   * the clause's own "or API key" arm, because `userId === undefined` means the tenant is
++   * reading and sees everything it owns.
++   *
++   * AND READING THE CLAUSE LITERALLY WOULD HAVE BEEN STRICTER THAN THE MESSAGE. FR-MED-08
++   * says "channel membership"; this platform checks membership for `private` channels
++   * only, so a membership test would refuse a user the photo in a message whose text they
++   * can read. 11,557 public channels against 1,016 private on this lane. */
++  async readableMediaObjectKey(
++    mediaId: string,
++    userId?: string,
++  ): Promise<string | undefined> {
++    const [object] = await this.db
++      .select({ objectKey: mediaObjects.objectKey })
++      .from(mediaObjects)
++      .where(
++        and(
++          eq(mediaObjects.id, mediaId),
++          eq(mediaObjects.environmentId, this.environmentId),
++        ),
++      );
++    if (!object) return undefined;
++
++    for (const channelId of await this.channelsReferencingMedia(mediaId)) {
++      if (await this.channelVisibleTo(channelId, userId)) return object.objectKey;
++    }
++    return undefined;
++  }
++
++  /** Every channel of this environment holding a message that references this object.
++   *
++   * EVERY REFERENCING CHANNEL, NOT THE FIRST AND NOT EVERY REFERENCE. FR-MED-08's
++   * singular — "the referencing message" — does not describe this platform: FR-MSG-11 has
++   * allowed the same id twice since 3.24, and forwarding a photo is the ordinary way one
++   * object acquires a second reference. Authorisation is a disjunction over them, so a
++   * query that stopped at the first row would refuse a caller whose channel happened to be
++   * second — a correctness bug that presents as flakiness.
++   *
++   * `DISTINCT` BOUNDS IT BY CHANNEL. A photo forwarded into one channel a hundred times is
++   * one authorisation question, not a hundred, and a private channel costs two queries per
++   * question rather than one.
++   *
++   * SCOPED HERE AND NOT ONLY IN THE CALLER. `channelVisibleTo` refuses another tenant's
++   * channel afterwards, so the predicate below is redundant for correctness — and without
++   * it this is the only read in this file that would scan every tenant's rows. A query
++   * whose safety depends on a later call is a query somebody will reuse without it. */
++  private async channelsReferencingMedia(mediaId: string): Promise<string[]> {
++    const rows = await this.db
++      .selectDistinct({ id: channels.id })
++      .from(messages)
++      .innerJoin(channels, eq(channels.id, messages.channelId))
++      .where(
++        and(
++          // THE OPERAND IS A BOUND VALUE, WHICH IS WHAT THE INDEX NEEDS. Built here
++          // rather than in SQL from a joined column: `jsonb_build_array(...)` over
++          // `o.id` is an expression the planner cannot look up.
++          sql`${messages.attachments} @> ${JSON.stringify([
++            { type: "media", media_id: mediaId },
++          ])}::jsonb`,
++          eq(channels.environmentId, this.environmentId),
++        ),
++      );
++    return rows.map((row) => row.id);
++  }
++
+   async channelExists(channelId: string): Promise<boolean> {
+     const rows = await this.db
+       .select({ id: channels.id })
+       .from(channels)
+       .where(
+         and(
+```
+
+The obvious shape is one query. Start at the object, join the messages that contain its id,
+join their channels, and hand back everything at once — a single round trip, a single plan, and
+the object's own `environment_id` checked on the way past. That is what this chapter planned to
+build and it is what three separate analysis passes converged on, each for a good reason:
+scope the read so it never crosses tenants, join `media_objects` so the `object_key` comes from
+the row rather than being reconstructed.
+
+Running it is what took it apart.
+
+<Figure code={figTheIndexThatIsNotUsed} caption="The same question, two shapes. Measured with EXPLAIN (ANALYZE, BUFFERS) and bound parameters on a tenant holding 1,018 messages." />
+
+**The containment operand is built from `o.id`, a column on the other side of the join.** A GIN
+index is looked up with a value; the planner does not have `o.id` until it has read the
+`media_objects` row, so it cannot use the index for that predicate at all. What it does instead
+is narrow to the tenant's channels, walk every message they hold, and apply containment as a
+join filter: `Rows Removed by Join Filter: 1017`, with the new index sitting there unused.
+
+Split the question in two and the operand becomes a bound value, which is the only form the
+index can serve. **20 buffers against 86, 0.111 ms against 1.109.**
+
+Both of the analysis passes' repairs survive the split. Step two still names the environment,
+so this is not the one read in `repository.ts` that crosses tenants — `grep -c 'environmentId,
+this.environmentId'` in that file returns **44**, and a query whose safety depends on a later
+call is a query somebody will reuse without the later call. Step one still reads the object row,
+so the object's own `environment_id` is checked here rather than inherited from a predicate in
+a different route, in a different chapter, at a different moment.
+
+## The index, and the opposite conclusion from chapter 4.1
+
+```sql title="services/api/migrations/0017_media_reference_index.sql"
+-- Chapter 4.12 — the reference lookup, and the index that is not the point.
+--
+-- FR-MED-08 issues a signed URL "only to callers authorised to read the referencing
+-- message", so the route has to find which messages reference a `media_id`. That question
+-- lives in `messages.attachments`, a jsonb column nothing has ever queried: every index on
+-- this table today is `(channel_id, sequence)`, `(channel_id, idempotency_key)` or the
+-- primary key.
+--
+-- `jsonb_path_ops` AND NOT THE DEFAULT `jsonb_ops`. The only operator this route uses is
+-- containment -- `attachments @> '[{"type":"media","media_id":"…"}]'` -- which is the one
+-- class `jsonb_path_ops` supports, and the reason it is the smaller of the two.
+--
+-- ON THE WHOLE COLUMN, NOT A PARTIAL INDEX ON THE MEDIA ARM. A partial index
+-- (`WHERE attachments @> '[{"type":"media"}]'`) would be smaller still and would make the
+-- planner's choice depend on the query's predicate matching the index's own -- which works
+-- until somebody writes the query slightly differently and gets a sequential scan with no
+-- error.
+--
+-- `CREATE INDEX` AND NOT `CREATE INDEX CONCURRENTLY`, AND THE CHOICE IS NOT OPEN.
+-- `migrate.ts:46` issues `BEGIN` around every file in this directory, and the server
+-- refuses: `CREATE INDEX CONCURRENTLY cannot run inside a transaction block`. Asked of
+-- Postgres rather than reasoned about. The cost is a lock that blocks writes to `messages`
+-- for the duration of the build -- milliseconds on a lane, a deploy-shaped number on a
+-- table with a million rows, and a table this platform expects to be large.
+CREATE INDEX messages_attachments_gin
+  ON messages USING gin (attachments jsonb_path_ops);
+```
+
+```diff title="services/api/src/db/schema.ts"
+@@ -410,12 +412,24 @@
+       .on(t.channelId, t.idempotencyKey)
+       .where(sql`${t.idempotencyKey} IS NOT NULL`),
+     // No dedicated (channel_id, sequence DESC) index: DR-01's unique
+     // constraint above already supplies that ordering, and Postgres walks
+     // it backward for newest-first pages. Chapter 2.4 measured it and
+     // migration 0001 dropped the redundant twin (SAD §6.3, amended).
++    //
++    // THE FIRST NON-BTREE INDEX IN THIS SCHEMA (chapter 4.12, migration 0017).
++    // `grep -c 'using('` here was 0 before this line: every other entry is a
++    // plain btree or a unique constraint, so there was no local shape to copy.
++    // `jsonb_path_ops` supports containment and nothing else, which is the only
++    // operator the media delivery route uses and the reason it is the smaller
++    // of the two operator classes.
++    //
++    // THE MIGRATION IS THE SOURCE OF TRUTH (ADR-16: forward-only, hand-reviewed
++    // SQL). This declaration exists so the next generator run does not propose
++    // to drop an index the migration created.
++    index("messages_attachments_gin").using("gin", t.attachments.op("jsonb_path_ops")),
+   ],
+ );
+ 
+ // WHAT A MESSAGE USED TO SAY (FR-MSG-07). Published in SAD §6.1
+ // since the SAD was written and built here — the absence note above named this
+ // chapter as its arrival.
+```
+
+Chapter 4.1 measured an index for an analytical query and concluded that it *"buys a gap inside
+the run-to-run spread for +49% storage"*, and that **you cannot index your way out of an
+analytical question when the cost is the aggregation.** This chapter's index buys 4.3× fewer
+buffers for **1.62%** — 136 kB against an 8,376 kB table.
+
+Both are right, and publishing only one of them would teach the wrong rule. The transferable
+lesson is not *indexes help* or *indexes do not help*; it is **which kind of cost you are looking
+at.** 4.1's query spent 656 ms of a 698 ms plan in a sort; no index removes a sort over the rows
+you asked for. This chapter's query spends its time finding one row by a value, which is the one
+thing an index is.
+
+And there is a third thing in the pair that neither chapter would have found alone: **the query
+has to be written so the planner can use the index before any of that is true.** The one-query
+shape above has the index and does not use it. A storage figure and a speedup figure are both
+measurements of a query, and the query is the part that moves.
+
+<Trap title="`CREATE INDEX CONCURRENTLY` is not available here, and the reason is three lines away">
+The plan listed *"is the index created `CONCURRENTLY`?"* as an open question. It is not open —
+the migration runner decides it:
+
+```
+BEGIN;
+CREATE INDEX CONCURRENTLY … ;
+ERROR:  CREATE INDEX CONCURRENTLY cannot run inside a transaction block
+```
+
+`migrate.ts:46` wraps every file in `BEGIN` so a failed migration leaves nothing behind, and
+that guarantee is incompatible with the one statement that builds an index without blocking
+writes. Asked of the server rather than quoted from the manual.
+
+So the cost is a lock, and the honest thing is to say which one: asked of `pg_locks` from inside
+the building transaction, `CREATE INDEX` takes a **`ShareLock`** on `messages`. Reads continue;
+writes wait. **23.301 ms** on 68,112 rows, which is nothing — and a deploy-shaped number on a
+table with a hundred million, which is what this platform expects.
+
+The first version of that probe reported `ShareLock` *and* `AccessExclusiveLock`, which was the
+probe measuring its own `DROP INDEX` teardown. The migration contains no `DROP`. Asking again
+with a `CREATE` alone gave the `ShareLock` by itself.
+</Trap>
+
+<Trap title="The refusal is the cheap case, and the planning document said the opposite">
+This chapter's research measured the reference lookup before the route existed and wrote down a
+good sentence: *the refusal is the expensive case, because an id nobody references has to be
+searched for through the whole table before the platform can say no — so the cheapest request to
+make is the one that costs the most to answer, which is the shape an attacker probes with.*
+
+It is true of the query that was measured and false of the query that shipped. Step one is a
+primary-key lookup, so an id no object has dies in **3 buffers** with the rest of the plan
+marked `never executed`. Sampled end to end, 120 alternating pairs, three runs:
+
+```
+run   grant p50   refusal p50   refusal against grant
+  1     5.512        4.253            -22.8%
+  2     5.558        4.255            -23.4%
+  3     5.517        4.234            -23.3%
+```
+
+**The commonest refusal is 23% faster than the grant.** The only refusal that costs what a grant
+costs is the one where the object exists in your tenant and nothing references it.
+
+The sentence was not careless — it was written about a real measurement of a real query. It
+stopped being true when the query changed, and nothing in a document notices that.
+</Trap>
+
+## Four refusals, one answer
+
+Three conditions get the same 404 — another environment's object, an object referenced only
+where the caller cannot read, and an id no object has — and this chapter adds a fourth: an
+object with **no referencing message at all**, refused even to the credential that uploaded it.
+
+That fourth one was specified the other way. The specification assumed the permissive reading,
+on the sensible grounds that a client should be able to preview the file it just uploaded.
+Research settled it against the specification for two reasons, and the second is the one that
+decides it. The weak reason: the only party who could want those bytes is the one that just
+uploaded them, and it is holding the file. The decisive reason: **granting the uploader access
+is a second authorisation rule that does not follow a message**, which is the parallel ACL the
+clause's own note forbids. And FR-MED-10 hard-deletes unreferenced objects after 24 hours, so it
+would be a read path to a thing the platform has already decided to destroy.
+
+<Why title="Why the test compares whole bodies">
+The code is not the oracle. A message that said *"that object belongs to another environment"*
+would leak existence exactly as well as a distinct code does, and so would an extra field, and
+so would a different `docs_url`. So the assertion is over the whole body with `request_id`
+removed — the one field allowed to differ — for all four conditions at once.
+
+Asserting `status === 404` four times would pass against four different bodies. This is the same
+discipline chapter 4.11 built for attaching, one route over, and it is the reason this chapter
+adds no error code: `check:errors` reads **34 codes, 34 sections** at the close, unchanged.
+A chapter that adds a route usually adds vocabulary, so the unchanged number is worth asserting
+rather than assuming.
+</Why>
+
+## Three tenancy predicates, and nothing can see any of them
+
+Constitution VI's 100%-branch clause names tenant isolation, and this is tenant-isolation code.
+The file it lives in is pinned at 92% branches against hundreds, so the pin is not the
+instrument — chapter 4.11 established that the way to answer the clause is to delete each arm
+and re-run.
+
+<Figure code={figThreeScopesNothingSees} caption="Every mutation run against both suites. Only the last one turns anything red." />
+
+**The gauntlet is the suite the constitution names as gating releases**, and it reports nothing
+when either of this chapter's two environment predicates is deleted. Removing the third —
+`channelVisibleTo`'s own — turns five *other* tests red and leaves the media read attack green,
+because this chapter's two catch it.
+
+The tempting conclusion is that two of the three are dead code. This project has form for
+exactly that move: chapter 4.6 reached 100/100/100/100 on a file by deleting two unreachable
+arms, and 4.11 deleted an early return after finding it left 17 of 17 passing — *an optimisation
+wearing a branch's clothes.* Both were arms whose removal changed nothing.
+
+These are arms whose removal changes nothing **today, because of each other.** The reference
+lookup is a private method one refactor away from a caller that does not ask `channelVisibleTo`
+afterwards, and the convention it would be breaking is measurable: 44 reads in that file carry
+the environment predicate, so an exception is what somebody copies.
+
+What the probe measured is the defence, not the arm. **A single-mutation test reports a
+redundant safety predicate exactly as it reports dead code, and the difference is not in the
+number.**
+
+## The route the derivation found before the list did
+
+```ts
+// ── THE DELIVERY URL (chapter 4.12, FR-MED-08), AND THE DERIVATION FOUND IT NINTH ──
+//
+// `read` AND NOT `credential`, WHICH IS THE OPPOSITE CALL FROM ITS SIBLING ONE ENTRY
+// UP AND FOR THE SAME REASON. `POST /v1/media` is `credential` because its body carries
+// no identifier a foreign tenant could forge. This route's whole input IS an
+// identifier: a `media_id` in the path, minted by the platform for one environment.
+{ method: "GET", path: "/v1/media/:mediaId", accepts: "either", shape: "read" },
+```
+
+That excerpt is untitled on purpose, and the reason is the appendix. The line this entry
+follows — `POST /v1/media`'s own — is not in the chain at this chapter: it arrives from
+`fences/post-series.md`, which applies after every chapter. A `diff` hunk anchored on a line
+the appendix adds has nothing to match here, so the amendment lives there instead, placed after
+the hunk that creates its anchor. Chapter 4.8 found that shape and 4.11 paid it on `codes.ts`;
+this is the third time, and the rule is the same: **check which state a hunk is written against
+before blaming the hunk.**
+
+For the ninth time, the gauntlet's target list derived from the running router named the new
+route before anybody added it: `45 derived, 38 attacked, 6 exempt`, with
+`unclassified: ["GET /v1/media/:mediaId"]`. Adding the entry turned that green and turned the
+gauntlet red with *"classified but never attacked"* — naming a route is not covering it.
+
+The classification is `read` and not `credential`, which is the opposite call from its sibling
+one entry up and for the same reason. `POST /v1/media` takes `{ filename, mime_type, bytes }`:
+there is no identifier in it to forge. This route's *entire* input is an identifier.
+
+**And the attack plants a referenced object rather than a row.** Chapter 4.11's write attack
+inserts a bare `media_objects` row for each tenant, which is enough to forge an attachment. It
+is not enough here: an object with no referencing message is refused to everybody, so a bare
+plant would fail the attacker's own control for this chapter's reason rather than for tenancy —
+and a control that fails for the wrong reason is worse than no control, because the refusal
+underneath it then proves nothing.
+
+## The 500 that sixteen routes still answer
+
+The route validates its path parameter. No other route in this api does, and that is not a
+tidiness observation:
+
+```
+GET /v1/channels/not-a-uuid/messages       500 internal_error
+GET /v1/channels/not-a-uuid                500 internal_error
+GET /v1/channels/<a random uuid>/messages  404 not_found          ← the control
+```
+
+A malformed uuid reaches the driver, Postgres answers `invalid input syntax for type uuid`, and
+the error filter has no rung for it. **A caller-triggered 500, reachable by anyone with a
+credential**, on 13 routes taking `channelId` and 3 taking `messageId`.
+
+It is chapter 4.11's own finding at a different address. That chapter found the identical defect
+in a request *body*, measured it, and fixed it with `z.uuid()` — and nobody looked at the path.
+
+This chapter does not fix the other sixteen, and the reason is a bill rather than a principle:
+those three controllers carry **30 titled code fences** between them, so a one-line change per
+route is thirty diff hunks, each anchored against the chain's state at its own chapter, in a
+chapter about signed delivery. What makes that a decision rather than an excuse is that the
+measurement goes into the gap record with the route counts, so the next chapter to open a
+controller inherits a number rather than a suspicion.
+
+<Trap title="What the URL cannot promise">
+A caller issued a URL at minute 0 and removed from the channel at minute 1 holds a working link
+until **minute 60**. The store checks a signature; it has never heard of a channel.
+
+Nothing in this chapter can close that. Shortening the window trades one exposure for another —
+a URL that expires while a page is still rendering is a broken image — and the clause names the
+hour. Revocation would mean the api standing in front of the bytes on every read, which is
+exactly what ADR-13 decided against when it chose presigned URLs over a proxy.
+
+It is the same shape as chapter 4.10's finding that a slot issued into a storage outage is
+byte-identical to a good one: signing is arithmetic, and arithmetic does not know what has
+happened since.
+</Trap>
+
+## What it costs the tenant, counted rather than exempted
+
+`operationsFor` returns `["rest"]` for every `/v1` path, so a client rendering a gallery of fifty
+images asks for fifty URLs and spends fifty of the tenant's rate budget.
+
+A batch endpoint would spend one. It loses on the refusal: `{"delivered": {…}, "refused":
+["a","b"]}` is an existence oracle by construction, telling a caller which of fifty ids the
+platform recognises and will not serve — precisely the distinction this chapter spent a phase
+collapsing into one 404. A batch that refuses the whole request when any id fails avoids the
+oracle and is worse than fifty singles, because one unreadable photo returns no URLs at all.
+
+Left counted, for chapter 4.8's reason: an exemption list is a hand-maintained table, and this
+project deletes those rather than growing them.
+
+<ForwardRef>
+The state a client would need to render a placeholder — `ready`, `rejected` — arrives with
+movement VI's verification chapter, and so does the sweep that deletes unreferenced objects. This
+route already refuses those objects; what it cannot do is tell a client whether the bytes behind
+a `pending` id ever arrived, because the api never contacts the store on this path and therefore
+does not know.
+</ForwardRef>
+
+<Checkpoint>
+A `media_id` is a URL for an hour, to a caller who can read a message carrying it — and the same
+404 to everybody else, whether the object belongs to another tenant, sits in a channel they
+cannot see, is referenced by nothing, or does not exist.
+</Checkpoint>
+
+<ChapterFooter id="4.12" />

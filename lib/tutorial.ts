@@ -912,6 +912,16 @@ export const series: Part[] = [
         sourceDoc: "docs/04-srs.md, docs/05-sad.md, docs/08-error-reference.md",
         readerMinutes: 55,
       },
+      {
+        id: "4.12",
+        path: "/part-4/chapter-12/a-link-that-expires-and-who-may-hold-it",
+        title: "A link that expires, and who may hold it",
+        status: "published",
+        readerProduces:
+          "`GET /v1/media/:mediaId`, which answers a signed one-hour URL to a caller who may read a message referencing the object and the same 404 to everybody else. The authorisation rule is the platform's own `channelVisibleTo` rather than the membership check the clause's words describe — a literal reading would refuse a user the photo in a message whose text they can read. Plus the index that does not help the query it was built for, because the joined form the analysis passes produced cannot use it; the three tenancy predicates no single-mutation probe can see; and the caller-triggered 500 on sixteen shipped routes that this route is the first to escape",
+        sourceDoc: "docs/04-srs.md, docs/05-sad.md, docs/12-part-4-structure.md",
+        readerMinutes: 50,
+      },
     ],
   },
   {

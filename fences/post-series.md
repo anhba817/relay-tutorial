@@ -7801,6 +7801,24 @@ What they do, briefly, so the entry is readable without the chapter:
 +  // covered.
 +  { method: "POST", path: "/v1/media", accepts: "either", shape: "credential" },
 +
++  // ── THE DELIVERY URL (chapter 4.12, FR-MED-08), AND THE DERIVATION FOUND IT NINTH ──
++  //
++  // Run before this entry existed: `45 derived, 38 attacked, 6 exempt` with
++  // `unclassified: ["GET /v1/media/:mediaId"]`. Nine chapters, nine times. 4.11 was the
++  // one chapter that added no route and so broke no streak; this one resumes it.
++  //
++  // `read` AND NOT `credential`, WHICH IS THE OPPOSITE CALL FROM ITS SIBLING ONE ENTRY
++  // UP AND FOR THE SAME REASON. `POST /v1/media` is `credential` because its body carries
++  // no identifier a foreign tenant could forge. This route's whole input IS an
++  // identifier: a `media_id` in the path, minted by the platform for one environment.
++  // That is `read`'s definition — a foreign identifier presented by a caller who should
++  // not be able to name it.
++  //
++  // `either`, matching `@Accepts("application", "user")` on the class, and both arms are
++  // attacked: an application credential of the wrong tenant and a user token of the wrong
++  // tenant reach the same predicate by different paths.
++  { method: "GET", path: "/v1/media/:mediaId", accepts: "either", shape: "read" },
++
    // ── credential, internal, end-user token ─────────────────────────────────────
    //
    // `credential` AND NOT `read`, WHICH IS THE SIBLING ROUTE'S ARGUMENT VERBATIM. The
@@ -9522,4 +9540,100 @@ exact sentence with a hunk that was right about a state that was wrong.
    // `docs/08-error-reference.md` carries a section for each — status, retryability and
    // the field — and `webhooks.service.ts` threw a bare `UnprocessableEntityException`
    // for every one of them. `ProtocolErrorFilter` derives a code from the status for
+```
+
+### `services/api/src/isolation/gauntlet.itest.ts` — the cross-tenant gauntlet, after chapter 4.12 attacked the delivery route.
+
+Placed **last**, and anchored on the state this file itself produces. Chapter 4.12 adds a
+forged-`media_id` READ beside 4.11's forged-`media_id` write — the same identifier against a
+different verb, refused by three predicates the write path does not use. The attack plants a
+*referenced* object for each tenant rather than a bare row, because an object nothing
+references is refused to everybody and a bare plant would fail the attacker's own control for
+this chapter's reason instead of for tenancy.
+
+```diff title="services/api/src/isolation/gauntlet.itest.ts"
+@@ -483,12 +483,83 @@
+ 
+     // AND THE ROWS ARE THE ATTACKER'S. Three slots, three distinct ids, and the two
+     // credential classes wrote into the same environment as each other.
+     expect(new Set([byKey.media_id, byToken.media_id, victim.media_id]).size).toBe(3);
+   });
+ 
++  // A FORGED `media_id` IN A READ (chapter 4.12, FR-MED-08). The same id against a
++  // different verb, and a platform could hold one and not the other: the write path
++  // refuses through `assertAttachableMedia` inside `sendMessage`'s transaction, and this
++  // path refuses through three predicates none of which that one uses.
++  //
++  // AND IT PLANTS A REFERENCED OBJECT FOR EACH TENANT, WHICH IS TWO STEPS RATHER THAN
++  // ONE. A planted `media_objects` row is not enough here: an object with no referencing
++  // message is refused to everybody, so a bare plant would make the attacker's control
++  // fail for this chapter's own reason rather than for tenancy. Each tenant's object is
++  // uploaded and attached through its own routes, which is also what makes the control
++  // meaningful.
++  it("GET /v1/media/:mediaId — a foreign object reads as an absent one", async () => {
++    attacked.add("GET /v1/media/:mediaId");
++
++    const referenced = async (tenant: {
++      credential: string;
++      channelId: string;
++      botExternalId: string;
++    }): Promise<string> => {
++      const slot = await fetch(`${url}/v1/media`, {
++        method: "POST",
++        headers: {
++          authorization: `Bearer ${tenant.credential}`,
++          "content-type": "application/json",
++        },
++        body: JSON.stringify({ filename: "g.png", mime_type: "image/png", bytes: 16 }),
++      });
++      expect(slot.status, "the fixture could not get a slot").toBe(201);
++      const { media_id } = (await slot.json()) as { media_id: string };
++      const sent = await fetch(`${url}/v1/channels/${tenant.channelId}/messages`, {
++        method: "POST",
++        headers: {
++          authorization: `Bearer ${tenant.credential}`,
++          "content-type": "application/json",
++        },
++        body: JSON.stringify({
++          text: "an object worth reading",
++          user: tenant.botExternalId,
++          attachments: [{ type: "media", media_id }],
++        }),
++      });
++      expect(sent.status, "the fixture could not attach its own object").toBe(201);
++      return media_id;
++    };
++
++    const victims = await referenced(t.victim);
++    const mine = await referenced(t.attacker);
++
++    // THE CONTROL FIRST, AND BOTH CREDENTIAL CLASSES. If the attacker cannot read its
++    // OWN object the refusal below says the feature is broken, not that the boundary
++    // holds — and an empty `media_objects` passes a leak check for the same reason an
++    // empty page does.
++    for (const credential of [t.attacker.credential, attackerToken]) {
++      const control = await fetch(`${url}/v1/media/${mine}`, {
++        headers: { authorization: `Bearer ${credential}` },
++      });
++      expect(control.status, "the attacker could not read its own object").toBe(200);
++    }
++
++    for (const credential of [t.attacker.credential, attackerToken]) {
++      const verdict = await readAttack(
++        url,
++        credential,
++        { method: "GET", path: `/v1/media/${victims}` },
++        { method: "GET", path: `/v1/media/${randomUUID()}` },
++      );
++      expect(verdict.differences, JSON.stringify(verdict, null, 2)).toEqual([]);
++      expect(verdict.foreign.status).toBe(404);
++    }
++  });
++
+   // ── the two routes this chapter added ──────────────────────────────────────────
+   //
+   // A chapter that adds an endpoint attacks it in the same chapter. The derivation
+   // found these before the classification did: `targets.itest.ts` went from 9 targets
+   // to 11 and failed naming both as unclassified.
+   it("POST /v1/channels/:channelId/members — refuses, and adds nobody", async () => {
 ```
