@@ -9637,3 +9637,158 @@ this chapter's reason instead of for tenancy.
    // to 11 and failed naming both as unclassified.
    it("POST /v1/channels/:channelId/members — refuses, and adds nobody", async () => {
 ```
+
+### `vitest.coverage.config.mts` — the ratchet, after chapter 4.12 raised the media service's branch pin.
+
+92 to 94 against a measured 95. The gap is 045's: `session.ts` measured 87.80 and 85.36 on
+identical code twenty minutes apart, so a pin set at the observation is a pin that will go red
+for no change and teach the next person to lower it. Both numbers are in the comment, which is
+the convention that makes the headroom auditable rather than arbitrary.
+
+```diff title="vitest.coverage.config.mts"
+@@ -1223,25 +1223,31 @@
+         "services/api/src/media/media.controller.ts": {
+           branches: 100,
+           functions: 100,
+           lines: 100,
+           statements: 100,
+         },
+-        // The slot service. 100 / 92.85 / 100 / 100, raised from 83.33 / 66.66 / 100 /
+-        // 83.33 at the end of phase 3 — the three uncovered lines then were the three
+-        // `throw`s, and phases 4 and 5 are the chapters that drive them.
++        // The slot service AND the delivery route. 100 / 95 / 100 / 100, from 92.85 when
++        // it held the slot alone — chapter 4.12 added `deliver`, whose every branch has
++        // both arms driven over HTTP, and the file's proportion of covered arms rose with
++        // it. Raised from 92 to 94 rather than to the measured 95: `session.ts` measured
++        // 87.80 and 85.36 on identical code twenty minutes apart, about one function of
++        // forty, and a ratchet pinned at the observation is a ratchet that teaches people
++        // to lower ratchets. Both numbers are here, which is the convention 045 wrote.
+         //
+-        // 92.85 IS 13 OF 14 AND THE FOURTEENTH IS ATTRIBUTED TO LINE 32, WHICH IS
+-        // `@Injectable()`. Every branch this file writes has both arms driven over HTTP:
+-        // the three refusals, the store probe, and the user resolution in each direction.
+-        // v8 counts something in the decorator's own output and there is no source line
+-        // to cover — the same shape as 045's note that a `binary-expr` arm counts as
+-        // covered when the operand was merely evaluated. Pinned at 92 rather than
+-        // measured down to nothing, and named rather than left as a mystery.
++        // THE FOURTEENTH ARM IS ATTRIBUTED TO LINE 32, WHICH IS `@Injectable()`. v8 counts
++        // something in the decorator's own output and there is no source line to cover —
++        // the same shape as 045's note that a `binary-expr` arm counts as covered when the
++        // operand was merely evaluated.
++        //
++        // AND THE KEY WAS PROBED IN BOTH DIRECTIONS (T039). Demanding an impossible 101
++        // produced `ERROR: Coverage for branches (95%) does not meet
++        // "services/api/src/media/media.service.ts" threshold (101%)`, which is how this
++        // config says the key binds to a file. A pin whose key matches nothing is silent.
+         "services/api/src/media/media.service.ts": {
+-          branches: 92,
++          branches: 94,
+           functions: 100,
+           lines: 100,
+           statements: 100,
+         },
+         // The store client. 100 / 100 / 100 / 100, from 77.77 / 53.84 / 100 / 85.71.
+         //
+```
+
+### `packages/outsider/src/integrate.itest.ts` — the sealed suite, after chapter 4.12 fetched a media object's bytes from outside.
+
+Three hunks: a `get` helper (eleven tests reached the api through `post` alone), the delivery
+fetch itself, and a correction. **The correction is the interesting one.** The request-log test
+asserted `typeof row["endpoint"] === "string"`, and chapter 4.8 had already measured the
+opposite on this platform: NULL on 31 real rows, 23 rate-limited and 8 unmatched, because a
+request the router never matched has no route to name. The seal survived because its own rows
+all match a route; what exposed it was 4.12 measuring the malformed-path-param class against
+the same tenant, which put an unmatched-route row in that log.
+
+```diff title="packages/outsider/src/integrate.itest.ts"
+@@ -86,12 +86,23 @@
+       headers: { "content-type": "application/json", authorization: `Bearer ${auth}` },
+       body: JSON.stringify(body),
+     });
+     return { status: res.status, body: (await res.json()) as Record<string, unknown> };
+   };
+ 
++  /** The read twin of `post`, added by chapter 4.12 for the delivery route. Eleven
++   *  tests reached the api through `post` alone and the two that needed a GET built
++   *  their own `fetch`; a third would have been the point at which the shape was a
++   *  convention nobody had written down. */
++  const get = async (path: string, auth: string) => {
++    const res = await fetch(`${api}${path}`, {
++      headers: { authorization: `Bearer ${auth}` },
++    });
++    return { status: res.status, body: (await res.json()) as Record<string, unknown> };
++  };
++
+   beforeAll(() => {
+     ({ api, ws, credential } = required());
+   });
+ 
+   it("reaches the platform at all", async () => {
+     // Before anything else, and separately, so a platform that is not there says
+@@ -467,12 +478,33 @@
+     // hold the order claim, which one attachment cannot show.
+     expect(delivered.payload.attachments).toEqual([
+       { type: "url", kind: "image", url: "https://example.test/outside-url.png" },
+       { type: "media", media_id: mediaId },
+     ]);
+     socket.close();
++
++    // AND THE BYTES COME BACK, FROM OUTSIDE (chapter 4.12, SC-010). The frame above
++    // carries an id and nothing else; a client holding it has to ask for a URL, and
++    // this is the only test in the repository that asks as a customer does — over the
++    // published surface, from a process that started nothing, through a URL whose host
++    // was chosen by the api and has to be reachable from here.
++    //
++    // THAT LAST PART IS THE PROPERTY WORTH HAVING. `RELAY_MINIO_INTERNAL_ENDPOINT`
++    // exists because the host is inside the SigV4 signature, so the address the api
++    // probes the store on and the address it signs for a client cannot be one field. A
++    // delivery URL signed with the internal one is refused rather than slow, and nothing
++    // inside the workspace would notice.
++    const link = await get(`/v1/media/${mediaId}`, credential);
++    expect(link.status, "the platform refused a delivery URL for its own attachment").toBe(200);
++    expect(typeof link.body["expires_at"]).toBe("string");
++
++    const bytes = await fetch(link.body["url"] as string);
++    expect(bytes.status, "the delivery URL was not usable from outside").toBe(200);
++    expect(new Uint8Array(await bytes.arrayBuffer())).toEqual(
++      new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0]),
++    );
+   });
+ 
+   /** T100a — **the first `socket.send` in this file's history.**
+    *
+    * `grep -c "\.send(" packages/outsider/src/integrate.itest.ts` read **0** across
+    * eleven tests before this one: ten REST, and one socket test whose title says
+@@ -792,15 +824,29 @@
+     // on the stream since 4.4 — this tenant's rows among them. So the log is no longer empty
+     // on a lane where that suite has run, and it still is on one where it has not.
+     //
+     // **The assertion is now about the property the clause actually asks for**: whatever is
+     // in this page belongs to the tenant whose credential fetched it (FR-ANL-07, and
+     // constitution I). That holds in both states, which is what makes it worth asserting.
++    //
++    // AND `endpoint` IS NULLABLE, WHICH THIS ASSERTION DENIED UNTIL CHAPTER 4.12. It read
++    // `typeof row["endpoint"]` must be `"string"`, and chapter 4.8 had already measured
++    // the opposite on the platform's own data: NULL on 31 real rows — 23 rate-limited and
++    // 8 unmatched — because a request the router never matched has no route to name. That
++    // chapter built the reader to answer `null` rather than the `\N` ClickHouse writes,
++    // and wrote two tests for it. The seal here went on asserting a string.
++    //
++    // It survived because this suite's rows are the ones this suite made, and every one of
++    // them matches a route. What exposed it was 4.12 measuring the malformed-path-param
++    // class against this same tenant: `GET /v1/channels/not-a-uuid/members` is an
++    // unmatched route, so the demo tenant's log gained a row with no endpoint and the seal
++    // went red for a fact the platform publishes.
+     const requests = body["requests"] as Array<Record<string, unknown>>;
+     for (const row of requests) {
+-      expect(typeof row["endpoint"]).toBe("string");
++      expect(["string", "object"]).toContain(typeof row["endpoint"]);
++      if (row["endpoint"] !== null) expect(typeof row["endpoint"]).toBe("string");
+       expect(typeof row["status"]).toBe("number");
+       expect(typeof row["request_id"]).toBe("string");
+     }
+     // AND THE PAGE FLAG AGREES WITH THE PAGE. `has_more` is false for a page below the
+     // limit, whatever the count — which is the half a bare `toEqual([])` could never check.
+     if (requests.length < 50) expect(body["has_more"]).toBe(false);
+```
