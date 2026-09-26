@@ -7316,110 +7316,6 @@ hunks is what let the chain say how far behind it was.
  beforeAll(async () => {
 ```
 
-### `packages/protocol/src/internal.ts` — the media worker's seam, in the shared protocol.
-
-90 differing lines, 1 hunk. The five schemas chapter 4.13's two internal routes speak. They sit in the appendix rather than in the chapter because the chapter's argument is about what a worker does with bytes, and a reader who wants the wire format wants it whole.
-
-```diff title="packages/protocol/src/internal.ts"
-@@ -530,6 +530,96 @@
- export type InternalUsageReportRequest = z.infer<
-   typeof internalUsageReportRequestSchema
- >;
- export type InternalUsageReportResponse = z.infer<
-   typeof internalUsageReportResponseSchema
- >;
-+
-+// ---------------------------------------------------------------------------
-+// The media worker's seam (4.13)
-+// ---------------------------------------------------------------------------
-+
-+/** One object the worker has not reached a verdict on yet.
-+ *
-+ * NO `environment_id`, AND THAT IS THE POINT. The route it comes from takes no
-+ * tenant parameter either — a worker that could ask for one tenant's objects
-+ * would be a route worth forging. The worker never needs the tenant, because
-+ * everything it does is addressed by object key and reported back by id. */
-+export const internalMediaPendingItemSchema = z.strictObject({
-+  id: z.string().uuid(),
-+  object_key: z.string().min(1),
-+  /** What the CLIENT said this is, which is the whole subject of FR-MED-03. The
-+   * worker's job is to find out whether it is true. */
-+  mime_type: z.string().min(1),
-+  declared_bytes: z.number().int().nonnegative(),
-+});
-+
-+export const internalMediaPendingResponseSchema = z.strictObject({
-+  objects: z.array(internalMediaPendingItemSchema),
-+});
-+
-+/** Why an object was refused, to the platform.
-+ *
-+ * TWO VALUES, AND THE CUSTOMER SEES NEITHER. FR-005 requires a scan failure and
-+ * a declaration mismatch to be distinguishable; the API's own refusal says only
-+ * that the object is not attachable, because telling a caller which of the two
-+ * happened tells an attacker whether their payload was recognised. */
-+export const mediaRejectionReasonSchema = z.enum([
-+  "declaration_mismatch",
-+  "scan_failed",
-+]);
-+
-+/** THERE IS NO `retry` ARM, AND ITS ABSENCE IS A DECISION. A transient failure —
-+ * the store unreachable, the scanner down — sends nothing at all, so the object
-+ * stays `pending` and the next sweep finds it. A verdict meaning "we could not
-+ * tell" is a row somebody later reads as a fact. */
-+export const internalMediaVerdictRequestSchema = z.discriminatedUnion(
-+  "verdict",
-+  [
-+    z.strictObject({
-+      verdict: z.literal("ready"),
-+      /** The STORE's count, not the client's. `content-length` on a signed
-+       * `HEAD` is the number the store will serve, which is what makes it
-+       * worth recording beside `declared_bytes` rather than instead of it. */
-+      verified_bytes: z.number().int().nonnegative(),
-+      /** Read from the bytes. The store's `content-type` is the client's own
-+       * claim echoed back, so it is not evidence of anything. */
-+      verified_type: z.string().min(1),
-+      /** Present for the kinds a 64 KiB prefix answers for, absent for the
-+       * rest — FR-MED-04 is recorded PARTLY MET rather than pretended. */
-+      width: z.number().int().positive().optional(),
-+      height: z.number().int().positive().optional(),
-+      duration_ms: z.number().int().nonnegative().optional(),
-+    }),
-+    z.strictObject({
-+      verdict: z.literal("rejected"),
-+      reason: mediaRejectionReasonSchema,
-+      /** Optional on this arm: a scan failure knows nothing about the type,
-+       * and a mismatch that failed on size alone knows no type either. */
-+      verified_bytes: z.number().int().nonnegative().optional(),
-+      verified_type: z.string().min(1).optional(),
-+    }),
-+  ],
-+);
-+
-+/** `applied` false means the row was not `pending` any more and this verdict
-+ * changed nothing — a second worker got there first, which is an ordinary
-+ * outcome rather than an error. `state` is what the row holds now, so a worker
-+ * that lost the race can log what won. */
-+export const internalMediaVerdictResponseSchema = z.strictObject({
-+  applied: z.boolean(),
-+  state: z.enum(["pending", "ready", "rejected"]),
-+});
-+
-+export type InternalMediaPendingItem = z.infer<
-+  typeof internalMediaPendingItemSchema
-+>;
-+export type InternalMediaPendingResponse = z.infer<
-+  typeof internalMediaPendingResponseSchema
-+>;
-+export type MediaRejectionReason = z.infer<typeof mediaRejectionReasonSchema>;
-+export type InternalMediaVerdictRequest = z.infer<
-+  typeof internalMediaVerdictRequestSchema
-+>;
-+export type InternalMediaVerdictResponse = z.infer<
-+  typeof internalMediaVerdictResponseSchema
-+>;
-```
-
 ### `services/api/src/internal/internal.module.ts` — the verification controller, registered.
 
 4 differing lines, 2 hunks. A controller nobody registers is a route that does not exist — which an analysis pass has found in this repository once already.
@@ -10222,7 +10118,7 @@ still a broken chain** — chapter 4.10 found the shape and paid it twice.
      const text = `outside media ${randomUUID()}`;
      const posted = await post(
        `/v1/channels/${channelId}/messages`,
-@@ -490,13 +512,30 @@
+@@ -490,21 +512,40 @@
      //
      // THAT LAST PART IS THE PROPERTY WORTH HAVING. `RELAY_MINIO_INTERNAL_ENDPOINT`
      // exists because the host is inside the SigV4 signature, so the address the api
@@ -10253,6 +10149,224 @@ still a broken chain** — chapter 4.10 found the shape and paid it twice.
  
      const bytes = await fetch(link.body["url"] as string);
      expect(bytes.status, "the delivery URL was not usable from outside").toBe(200);
-     expect(new Uint8Array(await bytes.arrayBuffer())).toEqual(
+-    expect(new Uint8Array(await bytes.arrayBuffer())).toEqual(
+-      new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0]),
+-    );
++    // AGAINST THE SAME ARRAY THAT WAS UPLOADED, not a second copy of it. This read
++    // `new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0])` — the old fixture,
++    // written out twice — and when the upload became a real PNG the assertion kept
++    // comparing against eleven bytes that were no longer sent anywhere.
++    expect(new Uint8Array(await bytes.arrayBuffer())).toEqual(png);
+   });
+ 
+   /** T100a — **the first `socket.send` in this file's history.**
+    *
+    * `grep -c "\.send(" packages/outsider/src/integrate.itest.ts` read **0** across
+    * eleven tests before this one: ten REST, and one socket test whose title says
 ```
 
+### `packages/protocol/src/internal.ts` — the media worker's seam, in the shared protocol.
+
+6 differing lines, 1 hunk. The five schemas chapter 4.13's two internal routes speak, **and this block moved here from its place in chapter order**. An earlier entry in this document amends the same file, and a hunk for it written against the end state cannot also apply before that entry runs — the same rule the two blocks above are here for.
+
+```diff title="packages/protocol/src/internal.ts"
+@@ -530,6 +530,102 @@
+ export type InternalUsageReportRequest = z.infer<
+   typeof internalUsageReportRequestSchema
+ >;
+ export type InternalUsageReportResponse = z.infer<
+   typeof internalUsageReportResponseSchema
+ >;
++
++// ---------------------------------------------------------------------------
++// The media worker's seam (4.13)
++// ---------------------------------------------------------------------------
++
++/** One object the worker has not reached a verdict on yet.
++ *
++ * NO `environment_id`, AND THAT IS THE POINT. The route it comes from takes no
++ * tenant parameter either — a worker that could ask for one tenant's objects
++ * would be a route worth forging. The worker never needs the tenant, because
++ * everything it does is addressed by object key and reported back by id. */
++export const internalMediaPendingItemSchema = z.strictObject({
++  id: z.string().uuid(),
++  object_key: z.string().min(1),
++  /** What the CLIENT said this is, which is the whole subject of FR-MED-03. The
++   * worker's job is to find out whether it is true. */
++  mime_type: z.string().min(1),
++  declared_bytes: z.number().int().nonnegative(),
++  /** The ordering column, returned so the worker can ask for the next page.
++   *
++   * A KEYSET CURSOR AND NOT AN OFFSET. The batch is ordered by `created_at` over a
++   * partial index keyed on it, so `after` is a range scan; an offset would make the
++   * database walk past everything already seen, on every page. */
++  created_at: z.string(),
++});
++
++export const internalMediaPendingResponseSchema = z.strictObject({
++  objects: z.array(internalMediaPendingItemSchema),
++});
++
++/** Why an object was refused, to the platform.
++ *
++ * TWO VALUES, AND THE CUSTOMER SEES NEITHER. FR-005 requires a scan failure and
++ * a declaration mismatch to be distinguishable; the API's own refusal says only
++ * that the object is not attachable, because telling a caller which of the two
++ * happened tells an attacker whether their payload was recognised. */
++export const mediaRejectionReasonSchema = z.enum([
++  "declaration_mismatch",
++  "scan_failed",
++]);
++
++/** THERE IS NO `retry` ARM, AND ITS ABSENCE IS A DECISION. A transient failure —
++ * the store unreachable, the scanner down — sends nothing at all, so the object
++ * stays `pending` and the next sweep finds it. A verdict meaning "we could not
++ * tell" is a row somebody later reads as a fact. */
++export const internalMediaVerdictRequestSchema = z.discriminatedUnion(
++  "verdict",
++  [
++    z.strictObject({
++      verdict: z.literal("ready"),
++      /** The STORE's count, not the client's. `content-length` on a signed
++       * `HEAD` is the number the store will serve, which is what makes it
++       * worth recording beside `declared_bytes` rather than instead of it. */
++      verified_bytes: z.number().int().nonnegative(),
++      /** Read from the bytes. The store's `content-type` is the client's own
++       * claim echoed back, so it is not evidence of anything. */
++      verified_type: z.string().min(1),
++      /** Present for the kinds a 64 KiB prefix answers for, absent for the
++       * rest — FR-MED-04 is recorded PARTLY MET rather than pretended. */
++      width: z.number().int().positive().optional(),
++      height: z.number().int().positive().optional(),
++      duration_ms: z.number().int().nonnegative().optional(),
++    }),
++    z.strictObject({
++      verdict: z.literal("rejected"),
++      reason: mediaRejectionReasonSchema,
++      /** Optional on this arm: a scan failure knows nothing about the type,
++       * and a mismatch that failed on size alone knows no type either. */
++      verified_bytes: z.number().int().nonnegative().optional(),
++      verified_type: z.string().min(1).optional(),
++    }),
++  ],
++);
++
++/** `applied` false means the row was not `pending` any more and this verdict
++ * changed nothing — a second worker got there first, which is an ordinary
++ * outcome rather than an error. `state` is what the row holds now, so a worker
++ * that lost the race can log what won. */
++export const internalMediaVerdictResponseSchema = z.strictObject({
++  applied: z.boolean(),
++  state: z.enum(["pending", "ready", "rejected"]),
++});
++
++export type InternalMediaPendingItem = z.infer<
++  typeof internalMediaPendingItemSchema
++>;
++export type InternalMediaPendingResponse = z.infer<
++  typeof internalMediaPendingResponseSchema
++>;
++export type MediaRejectionReason = z.infer<typeof mediaRejectionReasonSchema>;
++export type InternalMediaVerdictRequest = z.infer<
++  typeof internalMediaVerdictRequestSchema
++>;
++export type InternalMediaVerdictResponse = z.infer<
++  typeof internalMediaVerdictResponseSchema
++>;
+```
+
+### `vitest.coverage.config.mts` — the media worker's nine coverage pins.
+
+76 differing lines, 1 hunk. Last, because this document carries twelve earlier hunks for this file and a change placed among them unanchors the ones after it.
+
+```diff title="vitest.coverage.config.mts"
+@@ -420,12 +420,88 @@
+           branches: 71,
+           functions: 100,
+           lines: 71,
+           statements: 72,
+         },
+ 
++        // ── THE MEDIA WORKER (chapter 4.13) ──────────────────────────────────
++        //
++        // PINNED BELOW THE MEASURED FIGURE, not at it. `session.ts` measured 87.80 and
++        // 85.36 functions on identical code twenty minutes apart, so a floor at the
++        // observation goes red for no change to the code — and the fix is then to lower
++        // it, which is a ratchet that teaches people to lower ratchets.
++        //
++        // AND EVERY KEY HERE WAS PROBED BOTH WAYS. A per-file threshold whose key
++        // matches no file is SILENT: no error, no warning, nothing. Each of these was
++        // set to an impossible figure once and confirmed to fire.
++        "services/media-worker/src/sniff.ts": {
++          // Ten magic numbers, every arm deleted in turn and every one turning at
++          // least one test red. Nothing here is unreachable.
++          branches: 100,
++          functions: 100,
++          lines: 100,
++          statements: 100,
++        },
++        "services/media-worker/src/fixtures.ts": {
++          branches: 100,
++          functions: 100,
++          lines: 100,
++          statements: 100,
++        },
++        "services/media-worker/src/dimensions.ts": {
++          // The four readers' unreachable arms are the width/height bounds on formats
++          // whose fixtures cannot express them — a GIF's size field is 16 bits, so
++          // `> MAX_DIMENSION` is dead for that format and live for PNG.
++          branches: 86,
++          functions: 100,
++          lines: 83,
++          statements: 84,
++        },
++        "services/media-worker/src/sweep.ts": {
++          branches: 90,
++          functions: 100,
++          lines: 96,
++          statements: 96,
++        },
++        "services/media-worker/src/verify.ts": {
++          branches: 86,
++          functions: 100,
++          lines: 100,
++          statements: 95,
++        },
++        "services/media-worker/src/store.ts": {
++          branches: 86,
++          functions: 100,
++          lines: 100,
++          statements: 90,
++        },
++        "services/media-worker/src/scan.ts": {
++          // The lowest of the six, and the reason is socket error handling: a
++          // connection that times out mid-conversation needs a scanner that accepts
++          // and then stops answering, which no fixture in this repository provides.
++          branches: 84,
++          functions: 81,
++          lines: 86,
++          statements: 87,
++        },
++        "services/media-worker/src/api-client.ts": {
++          // 50% branches, and it is the honest figure. Every `if` in this file is a
++          // status check, and the suites reach 200, 404 and 422 but not the 5xx arms —
++          // which are covered in `sweep.test.ts` against a fake client rather than here.
++          branches: 49,
++          functions: 100,
++          lines: 100,
++          statements: 77,
++        },
++        "services/api/src/internal/media.controller.ts": {
++          branches: 89,
++          functions: 100,
++          lines: 93,
++          statements: 93,
++        },
++
+         "services/dispatcher/src/expand.ts": {
+           branches: 92,
+           functions: 100,
+           lines: 100,
+           statements: 92,
+         },
+```
