@@ -1,0 +1,1009 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import {
+  figTheEventWithNoProducer,
+  figTheSweepIsFree,
+  figScanSizeType,
+  figTheGateCannotShipAlone,
+} from "./figures";
+
+export const metadata = {
+  title: "The only service that reads the bytes — Building Relay",
+  description:
+    "A fifth service verifies every uploaded object against what the client declared and streams it through a virus scanner. The event the architecture document says it consumes has no producer, the specification priced the alternative wrong, and the delivery gate that depends on all of it turns ten tests red if it ships one week early.",
+  alternates: {
+    canonical: "/part-4/chapter-13/the-only-service-that-reads-the-bytes",
+    languages: {
+      en: "/part-4/chapter-13/the-only-service-that-reads-the-bytes",
+      vi: "/vi/part-4/chapter-13/the-only-service-that-reads-the-bytes",
+    },
+  },
+};
+
+<ChapterHeader id="4.13" />
+
+Three chapters have now moved a photo across this platform without anybody looking at it. The
+slot route signs a URL and never contacts the store. The send route checks that an object
+belongs to the sender's tenant. The delivery route checks who may hold a link. **Not one of
+them has opened the file.**
+
+FR-MED-03 and FR-MED-04 are where that ends:
+
+> Uploaded media shall be verified against the declared MIME type and size; objects that
+> contradict their declaration shall be rejected.
+>
+> Every uploaded object shall be virus-scanned before it is deliverable, with rejection
+> deleting the object and retaining only the audit record.
+
+This is the first service in the platform that handles a customer's bytes. It is also, and this
+is the part the chapter is about, the first one that cannot be built the way the architecture
+document says.
+
+## The event the worker consumes does not exist
+
+`docs/05-sad.md` describes a media worker that consumes `media.uploaded` from the broker. It is
+a sensible design and there is nothing wrong with the sentence. What there is, is no producer:
+
+```bash
+$ grep -rn 'media\.uploaded' relay-platform/ docs/ specs/ | wc -l
+0
+```
+
+Zero, everywhere. And the reason is a decision this series made three chapters ago and was
+right to make. ADR-13 says the bytes never transit Relay compute: the client takes a presigned
+URL and PUTs straight to the object store. **So the only two parties that know the upload
+finished are the client and the store.** The api signed a string and went back to serving
+requests.
+
+<Figure caption="The upload nobody reports. Chapter 4.10's decision, arriving here as a hole." code={figTheEventWithNoProducer} />
+
+Chapter 4.10 published that property as a cost — *"the api never opens a socket, so it never
+learns the store is down"* — and it was a cost then. Here it is the shape of the problem.
+
+## The specification had an answer, and it priced the alternative wrong
+
+The specification for this chapter assumed the client would tell us. It considered a sweep —
+the worker asking the api, on a timer, which objects have no verdict yet — and rejected it in
+one line: *91.6% of the work would be spent on objects that hold nothing.*
+
+That figure is right. Most rows in `media_objects` are slots somebody took and never used, and
+a sweep probes every one of them on every pass. The question the sentence does not answer is
+what that costs.
+
+```text
+p50    1.094 ms
+mean   1.412 ms
+p95    1.714 ms
+404s   166 of 200
+```
+
+The lane holds **3,292 objects in `pending`**. Probing every one of them, serially, with no
+concurrency at all, is **4.2 seconds**. On a five-second timer that is a background process
+using most of one core's worth of *network waiting* and no measurable CPU.
+
+**The waste is free.** And once it is free, the argument inverts completely, because of what
+the other clause says.
+
+<Trap title="An optimisation may make a mechanism faster. It must not be able to make it wrong.">
+FR-MED-04 is *"every uploaded object shall be virus-scanned"*. If the scan is triggered by a
+client notice, then an object is scanned when the client chooses to send one — and a client
+that wants their file unscanned simply does not send it. The clause would be satisfied by
+well-behaved callers and silently unsatisfied by exactly the callers it exists for.
+
+So the sweep is the mechanism. A notice, if one is ever added, is an optimisation that reduces
+latency and **must not change any answer**, because the sweep will find the object anyway.
+That is a different kind of design from *"a notice, with a sweep as a fallback"*, and the
+difference is which one you can delete.
+</Trap>
+
+<Figure caption="Why the sweep wins, and what it costs instead." code={figTheSweepIsFree} />
+
+Bucket notifications — the store calling a webhook when a PUT completes — were the third
+option, and they were rejected rather than forgotten. ADR-30 refused the AWS SDK on direction
+rather than on size: a vendor client is a coupling taken at the moment the platform is choosing
+a replaceable store. A bucket-notification configuration is that same coupling one layer down,
+in the one component whose job is to be independent of which store you bought.
+
+## What the sweep costs is latency, and here is the number
+
+This is the half a chapter is tempted to leave out.
+
+```text
+sweep interval 1,000 ms      min   244 ms    p50 1,073 ms    max 1,099 ms
+sweep interval 5,000 ms      min 3,163 ms    p50 5,080 ms    max 5,098 ms
+```
+
+**The work is seven milliseconds of a five-second answer.** Everything else is the object
+waiting for the next poll. A client notice would have removed all of it.
+
+And the start instant is not ours either. Nothing in this platform observes the moment a PUT
+finishes, so the only record of it is the store's own `last-modified` header — which arrives on
+the round trip the sweep is already making, at **one-second resolution**, because an HTTP date
+has no sub-second field. The design that was rejected would have given an exact instant. That
+is what it costs, stated rather than rounded away.
+
+## The order is scan, size, type — and only one of them is unconditional
+
+The worker's probe has three questions and getting their order right took five analysis passes,
+because each earlier fix was pairwise and left the pair it did not touch unsaid.
+
+<Figure caption="One object, from a signed HEAD to a verdict." code={figScanSizeType} />
+
+The scan runs first, on every object that has bytes, **whatever the declaration says**. The
+reason is the clause's own word: *every uploaded object*. An object declaring one byte while
+holding five megabytes is at least as worth scanning as one whose type is wrong, and reading
+*every* one way for the type check and another way for the size check would be reading it
+selectively.
+
+What that costs is streaming up to the video cap for an object that is going to be refused —
+and a caller who wants 100 MB streamed can simply upload a valid 100 MB video, so the worst
+case is the cap either way.
+
+There is a fourth outcome, and it is the one FR-009 is about:
+
+```ts
+// services/media-worker/src/verify.ts
+if (result.outcome === "unavailable") return null;
+```
+
+**A scanner that could not answer produces no verdict at all.** Not `rejected`, which would
+destroy a customer's photo to record an outage; not `ready`, which would let an unscanned
+object through. The row stays `pending` and the next sweep finds it. There is deliberately no
+`retry` verdict in the contract — a row saying *"we could not tell"* is one somebody later
+reads as a fact.
+
+## The store's headers are the client's claim, echoed back
+
+The obvious way to verify a declaration is to ask the store. The store knows how many bytes it
+holds and what content type the object has. Half of that is true.
+
+```text
+HEAD content-length:  12            the store's own count
+HEAD content-type:    image/png     the client's own claim, stored and returned
+```
+
+**`content-length` is evidence and `content-type` is not.** A worker that compared
+`declared_bytes` against `content-length` and `mime_type` against `content-type` would have
+verified half the declaration and, for the other half, verified the declaration against itself.
+
+So the type comes from the bytes. FR-MED-02 allows ten types and the worker reads all ten from
+their magic numbers — four image formats, four audio, two video. The reader is eighty lines and
+adds no dependency, on the same ratio ADR-30 used for SigV4: `sharp` is a native binary with an
+image-processing surface this platform never touches.
+
+<Why title="Why WAV and WebP are the interesting pair">
+Both files begin `RIFF`. A reader that stopped at those four bytes would call every WAV a WebP
+and every WebP a WAV, and both are in FR-MED-02's list — so the mistake would be invisible in a
+test suite that only checked PNG and JPEG.
+
+The discriminator is at byte 8, and the way to know the check is load-bearing is to delete it:
+removing either arm turns **two** tests red rather than one, because each format's own test
+fails and so does the test that tells them apart.
+</Why>
+
+## The dimensions are twenty-four bytes of four thousand
+
+FR-MED-04 asks for dimensions and duration. This chapter ships one of them, and says which.
+
+A PNG's width and height are at fixed offsets 16 and 20, in the `IHDR` chunk the format requires
+to be first — **24 bytes of a 4,722-byte file**. GIF's are at 6 and 10, little-endian. WebP's
+are in the first chunk after the RIFF header, 24-bit little-endian and minus one. JPEG is the
+only one that walks: it is a sequence of marker segments and the size lives in whichever `SOF`
+marker the encoder used, of which there are thirteen and they are not contiguous.
+
+So the probe fetches the first 64 KiB with a ranged GET and reads a header. It never decodes a
+pixel.
+
+Duration is a different animal: four unrelated container parsers, with MP3 variable bitrate as a
+genuinely hard case, because a VBR file's length is not in its header and computing it means
+walking every frame. **FR-MED-04 is recorded PARTLY MET**, on the precedent FR-MED-07 set two
+chapters ago — *unmet by decision, not by oversight*. What a client gives up is a scrubber
+length before playback.
+
+<Trap title="JavaScript's `<<` is signed, and it surfaced as a 400 three layers away">
+The PNG reader assembled a 32-bit big-endian integer the obvious way:
+
+```js
+(b[at] << 24) | (b[at + 1] << 16) | (b[at + 2] << 8) | b[at + 3]
+```
+
+`<<` is a **signed** 32-bit operation in JavaScript. Bytes `ff 00 00 0a` read **-16,777,206**
+rather than 4,278,190,090. The verdict route's schema says `z.number().int().positive()`, so the
+api answered **400** — and the worker, which treats a failed verdict as something to try again,
+re-streamed the same eight objects through ClamAV every second for as long as it ran, with the
+log saying exactly what was wrong and nothing acting on it.
+
+Three fixes, and only the first is the bug. `>>> 0` makes the read unsigned. A plausibility
+bound makes a header this reader cannot check — it has seen 64 KiB — answer *"the bytes do not
+say"* rather than a number, **refused rather than clamped**, because recording a million for an
+image claiming four billion would be a figure the platform invented. And a 4xx from the verdict
+route now stops the worker retrying that object, because a 400 is the worker's own bug and no
+amount of waiting fixes it.
+
+**No unit test would have produced the input.** Every fixture in the dimension suite is a header
+this repository wrote, with numbers somebody chose. The bytes that broke it came from
+`randomFillSync`, in a measurement script written to time something else entirely.
+</Trap>
+
+## The scanner is a program we talk to, not a program we are
+
+ClamAV's `INSTREAM` is `zINSTREAM\0`, then a four-byte big-endian length before each chunk, then
+a zero length to end. Twenty-two lines, no client library.
+
+It is worth sending the test string through it before trusting anything:
+
+```text
+EICAR alone, 68 bytes          stream: Eicar-Test-Signature FOUND
+EICAR + one newline            stream: Eicar-Signature FOUND      a DIFFERENT entry
+EICAR + 200 spaces             stream: OK
+EICAR + 1 KiB of zeros         stream: OK
+EICAR inside a PNG, either end stream: OK
+```
+
+**The signature matches the file, not a substring.** Which means something about this platform:
+`ALLOWED_TYPES` contains no text type, so **no object can both satisfy FR-MED-03 and trip the
+scanner**. The test one would naturally write — *"a file that is a valid PNG and also a virus"*
+— cannot be written. That is not a gap in the suite; it is the reason the scan has to run before
+the declaration check rather than after it.
+
+The second line is worth its own sentence. A reader that matched on the signature's *name*
+rather than on the word `FOUND` would have called the 69-byte case clean.
+
+<Trap title="A liveness probe passes against a signature database thirteen days old">
+Every health check in `compose.yaml` asks *is it up*: `pg_isready`, `redis-cli ping`, `wget
+/healthz`. ClamAV answers `zPING` with `PONG` the moment `clamd` starts. It also downloads
+355,678 signatures **after** that, and here is what it reports while it does:
+
+```text
+t≈12s   ClamAV 1.5.4/28122/Sun Sep 13 06:26:25 2026   13 days old
+t≈20s   ClamAV 1.5.4/28122/Sun Sep 13 06:26:25 2026   13 days old
+t≈25s   ClamAV 1.5.4/28122/Sun Sep 13 06:26:25 2026   13 days old
+t≈30s   ClamAV 1.5.4/28135/Sat Sep 26 06:24:13 2026    0 days old
+```
+
+`docker compose up -d --wait` would return at twelve seconds and the worker would start scanning
+against definitions from a fortnight ago. So this container's health check reads the third field
+of `zVERSION` and refuses a database older than seven days.
+
+**And the EICAR test cannot catch this.** That signature lives in `main.cvd` at version 63,
+reported *up-to-date* in both readings; the staleness is entirely in `daily.cld`. Measured at
+every point in the window above: `Eicar-Test-Signature FOUND`, identically. **The test that
+proves the scanner runs is structurally unable to prove it is current** — which is why the
+health check is a separate thing and not a detail of the scanner test.
+
+This platform has now found the same shape four times: chapter 4.2's `/ping` that answered while
+every query was refused, 4.9's unset credential that made three attacks return at their first
+line, 4.10's bucket that nothing created, and this. *A check that cannot fail for the reason you
+care about is not a check.*
+</Trap>
+
+## The gate could not have shipped last chapter
+
+ADR-14 says no signed URL until the object is `ready`. Chapter 4.12 built the route that hands
+out signed URLs and did **not** add that clause, and the reason was measured rather than
+deferred by taste:
+
+```text
+delivery.itest.ts      10 of 76 RED, including the isolation gauntlet's own control
+media_objects_state_check   CHECK (state = 'pending')   — one permitted value
+```
+
+An object could not be `ready`, because the column refused the word. **The transition and the
+gate ship together or the gate ships broken.**
+
+<Figure caption="Why one line of SQL waited a chapter." code={figTheGateCannotShipAlone} />
+
+Applied here, with migration `0018` widening the constraint to three states and the worker
+producing them, the clause turned **ten** red again — and they are not the same ten. The old ten
+were *there is no such state*; these are *the fixtures do not produce it*. Same arithmetic,
+entirely different defect, and the difference is the whole of what this chapter built.
+
+## The fixtures did not rot; the platform grew a check
+
+That second ten is the most useful thing in the chapter, so it is worth being precise about.
+
+```text
+delivery.itest.ts     declares 1024, uploads 42 bytes of ASCII       both checks fail
+integrate.itest.ts    declares 11, uploads 11 — the PNG signature
+                      plus three zeros, with no IHDR                 size passes, type fails
+attach.itest.ts       declares 1024, uploads NOTHING                 invisible to this chapter
+```
+
+Every one of them was correct when it was written. Chapter 4.10's slot route records what the
+caller *said*, in its own words — *"not what arrived"* — so `bytes: 1024` beside 42 bytes was a
+true statement about the platform until this chapter. **The fixtures did not rot. The platform
+grew something that reads the bytes.**
+
+The third row is the distinction worth keeping. A fixture that lies about bytes it never sends
+is invisible here: the store answers 404, the sweep reads *not yet*, and the object stays
+`pending` — which the attachment predicate admits. Only a fixture that actually uploads can
+contradict itself.
+
+<Why title="Why the repaired suites write `ready` directly instead of waiting for the worker">
+Nine tests in the delivery suite need an object in `ready`, and the only thing that produces one
+is the media worker. The suite could spawn it, or poll for it. Either makes **a delivery test
+fail when the scanner is down** — and that test would then be reporting somebody else's outage
+under a name about authorisation.
+
+So the fixture states the precondition rather than producing it, and the end-to-end path lives
+where it belongs: the worker's own suite runs it against a real store and a real scanner, and
+the sealed suite runs it against the composed stack from outside. That one is a poll now, which
+is a real cost of the gate and was one of the things the packaging decision was made with in
+front of it.
+</Why>
+
+## Two constitution arguments, and one of them nobody had written down
+
+Constitution VII is engaged twice by this chapter. Only one had been noticed.
+
+**The one everybody saw** is `docs/12` §7.3: this platform is TypeScript, and a virus scanner is
+not. The answer is that **a program Relay addresses over a socket is not a program Relay is
+implemented in** — the platform already speaks to Postgres, Redis, NATS, MinIO and ClickHouse,
+in four languages that are not TypeScript, and none of them is a violation. What VII would
+forbid is writing this worker in Go: a second language in the build, a second test runner, a
+second dependency manifest. ADR-32 says so and names the case ADR-01 named in advance.
+
+**The one nobody saw** is VII's other clause — *new services require justification against the
+"deliberately not a separate service" table*. The SAD has that table, with three merge criteria,
+and the media worker fails all three: a different datastore (the object store, which no other
+process opens), no shared transactions (ADR-04 keeps it off Postgres entirely), and CPU-bound
+work off the request path. ADR-31 is that argument, with a reversal condition, which is what
+makes the table a test something could fail rather than a decoration.
+
+Constitution IV is engaged too, and the plan's own checklist caught it: `media_objects.state`
+gains a second writer. The api writes `pending` and never touches the column again; the worker's
+verdict can only move a row *out* of `pending`. The transitions are disjoint, and that is a
+property of the statement rather than of anybody's discipline:
+
+```sql
+UPDATE media_objects SET state = $verdict, … WHERE id = $id AND state = 'pending'
+```
+
+Two workers racing one object resolve there: the second updates no rows and is told so. No
+lease, no heartbeat, no `locked_until` column and nothing to reap when a worker dies holding
+one.
+
+## What is specified and not built
+
+`media_events` is in the SRS with four values — `uploaded`, `ready`, `rejected`, `deleted` — and
+DR-17 builds stored-bytes-per-tenant by summing its deltas. It has no table and no producer, and
+this chapter declined to start it. The reason is arithmetic rather than scope: this chapter owns
+`ready` and `rejected`, `uploaded` belongs to the slot route and `deleted` to the reap that has
+not been written. **A producer here would fill the table with exactly the two values DR-17's sum
+does not read** — which is chapter 4.6's finding rebuilt deliberately, and the way to avoid it is
+to build the producer and the consumer in one chapter.
+
+<ForwardRef>
+The reap is FR-MED-10: objects with no referencing message, destroyed after 24 hours. It is the
+producer of `deleted`, and it is the chapter where `media_events` becomes worth building.
+</ForwardRef>
+
+## The diffs
+
+Five files carry this chapter's own change. The rest — the protocol schemas, the module
+registration, the three registries a container joins and the four suites repaired for the gate —
+are in the series appendix, because a reader following along needs the argument and not the
+bookkeeping.
+
+### The states the column may now hold
+
+Migration `0018` widens the constraint that has permitted one value since chapter 4.10, and adds
+the six columns a process that has read the bytes can fill. The partial index is its own file,
+`0019`, because the Postgres runner keys `schema_migrations` on **filename alone** and would skip
+an edited `0018` without a word.
+
+```diff title="services/api/src/db/schema.ts"
+@@ -1145,19 +1145,61 @@
+     declaredBytes: bigint("declared_bytes", { mode: "number" }).notNull(),
+     state: text("state").notNull().default("pending"),
+     objectKey: text("object_key").notNull(),
+     createdAt: timestamp("created_at", { withTimezone: true })
+       .notNull()
+       .defaultNow(),
++    // WHAT THE WORKER LEARNED, IN COLUMNS RATHER THAN A JSONB BLOB (chapter 4.13,
++    // migration 0018). FR-MED-05's thumbnails want dimensions and FR-MED-12 meters
++    // stored bytes; both are later chapters in this movement and both want a number
++    // they can filter and sum, where a blob makes each one a `->>` and a cast.
++    //
++    // EVERY ONE IS NULLABLE AND THAT IS THE RECORD OF WHICH QUESTIONS WERE ASKED.
++    // Dimensions are null for audio, `duration_ms` for images, and all of them for an
++    // object that was rejected before the probe ran. 4.10 made the same argument for
++    // `user_id` and 4.11 then depended on it.
++    width: integer("width"),
++    height: integer("height"),
++    // NULL FOR EVERYTHING TODAY, AND SAID RATHER THAN DISCOVERED. Chapter 4.13 ships
++    // image dimensions and not audio or video duration: MP4 keeps it in an `mvhd` atom,
++    // WebM in `Segment/Info/Duration`, Ogg in a granule position and MP3 in a header a
++    // VBR stream may not have. FR-MED-04 is recorded PARTLY MET on FR-MED-07's SRS 1.18
++    // precedent — unmet by decision, not by oversight.
++    durationMs: integer("duration_ms"),
++    // THE FACTS BESIDE THE DECLARATION. `declared_bytes` and `mime_type` are what the
++    // caller said, which the comment eight lines up has admitted since 4.10; this is what
++    // the bytes are. Keeping both is what makes a refusal auditable after the object is
++    // deleted, because the row is all that survives it.
++    verifiedBytes: bigint("verified_bytes", { mode: "number" }),
++    verifiedType: text("verified_type"),
++    // A CLOSED SET OF TWO AND NOT A CHECK CONSTRAINT: `declaration_mismatch` and
++    // `scan_failed`. A CHECK would be a fourth thing to widen every time a reason
++    // arrives; the set lives in the protocol package where a reader can see it.
++    rejectedReason: text("rejected_reason"),
+   },
+   (t) => [
+-    // `pending` ALONE, AND THAT IS THE CHAPTER'S SCOPE. `ready` and `rejected`
+-    // arrive with the verification and scanning clauses; a CHECK that accepted
+-    // them now would be a schema claiming a state nothing can reach.
+-    check("media_objects_state_check", sql`${t.state} = 'pending'`),
++    // THREE VALUES SINCE CHAPTER 4.13, AND `pending` ALONE BEFORE IT. 4.10 wrote the
++    // one-value version deliberately — "a CHECK that accepted them now would be a schema
++    // claiming a state nothing can reach" — and the verification chapter is what makes
++    // the claim keepable. The constraint's job is unchanged: a fourth value still fails,
++    // and `attach.itest.ts` asserts that by name using `scanning`, which is the value
++    // this chapter argued against making a state.
++    check(
++      "media_objects_state_check",
++      sql`${t.state} IN ('pending', 'ready', 'rejected')`,
++    ),
+     check("media_objects_declared_bytes_check", sql`${t.declaredBytes} > 0`),
+     // THE QUOTA'S OWN READ. Committed bytes are a sum over this index rather than
+     // a counter on `environments`, which would be a second source of truth for
+     // something these rows already say (constitution IV).
+     index("media_objects_environment_idx").on(t.environmentId),
++    // THE SWEEP'S OWN READ, AND IT IS THE ORDERING THAT COSTS (migration 0019). The
++    // worker asks for `pending` rows oldest-first in batches; the predicate matches
++    // nearly everything, so what the index buys is the `ORDER BY` — 93 buffers and a
++    // top-N heapsort against 4 buffers and an index scan, measured for a 50-row batch.
++    // Partial, so it shrinks to the size of the backlog as objects resolve rather than
++    // staying the size of the table.
++    index("media_objects_pending_age")
++      .on(t.createdAt)
++      .where(sql`${t.state} = 'pending'`),
+   ],
+ );
+```
+
+### The verdict, the gate, and one comment that stopped being true
+
+`pendingMediaObjects` is the sweep's batch and `recordMediaVerdict` is the compare-and-set. The
+third hunk is ADR-14's gate; the fourth excludes rejected rows from the storage quota, by taking
+the row out of the sum rather than zeroing the column the audit record is made of. The last one
+corrects chapter 4.11's note, which said `'ready'` was unreachable and addressed the sentence to
+*"whoever builds the scanner"*.
+
+```diff title="services/api/src/db/repository.ts"
+@@ -1,9 +1,22 @@
+ import { randomUUID } from "node:crypto";
+ 
+-import { and, asc, desc, eq, gt, inArray, isNull, lt, or, sql, type SQL } from "drizzle-orm";
++import {
++  and,
++  asc,
++  desc,
++  eq,
++  gt,
++  inArray,
++  isNull,
++  lt,
++  ne,
++  or,
++  sql,
++  type SQL,
++} from "drizzle-orm";
+ 
+ import type { Attachment } from "@relay/protocol";
+ 
+ import {
+   DEFAULT_LIMITS,
+   type LimitedOperation,
+@@ -488,12 +501,116 @@
+     super(`connection ${connectionId} was first reported for another environment`);
+     this.name = "ConnectionEnvironmentConflictError";
+     this.connectionId = connectionId;
+   }
+ }
+ 
++/** The media worker's batch: objects whose verdict nobody has reached yet (FR-001).
++ *
++ * UNSCOPED, LIKE THE DISPATCHER'S READS AND FOR THE SAME REASON. One worker serves every
++ * environment, so it takes the tenant from the row it finds rather than from a principal
++ * — and the route above it takes no tenant parameter at all, which is the isolation
++ * property to assert rather than a scope to add. A route that could be asked for one
++ * tenant's objects would be a route worth forging.
++ *
++ * OLDEST FIRST, SO A FAILING OBJECT DOES NOT STARVE THE QUEUE BEHIND IT — and so the
++ * 24-hour reap boundary FR-MED-10 will own is approached from the right end.
++ *
++ * AND THE ORDER IS WHAT COSTS, NOT THE FILTER. Every row matches `state = 'pending'`
++ * today, so the predicate selects the table; `media_objects_pending_age` (migration 0019)
++ * is a PARTIAL index on `created_at`, and it took a 50-row batch from a top-N heapsort
++ * over 3,158 rows at 93 buffers to an index scan at 4. */
++export async function pendingMediaObjects(
++  db: Db,
++  limit: number,
++): Promise<
++  Array<{
++    id: string;
++    objectKey: string;
++    mimeType: string;
++    declaredBytes: number;
++  }>
++> {
++  return db
++    .select({
++      id: mediaObjects.id,
++      objectKey: mediaObjects.objectKey,
++      mimeType: mediaObjects.mimeType,
++      declaredBytes: mediaObjects.declaredBytes,
++    })
++    .from(mediaObjects)
++    .where(eq(mediaObjects.state, "pending"))
++    .orderBy(mediaObjects.createdAt)
++    .limit(limit);
++}
++
++/** What a verdict does to the row (FR-MED-03, FR-MED-04).
++ *
++ * `applied` false means the object was not `pending` any more. A second `ready` for a
++ * `ready` object is an ordinary retry and answers 200; a verdict for a `rejected` object
++ * is refused by the caller, because the bytes are gone and letting it through would move
++ * a state whose object no longer exists.
++ *
++ * ONE STATEMENT, AND THE `pending` PREDICATE IS THE LOCK. `UPDATE … WHERE state =
++ * 'pending'` is how two workers racing one object resolve: the second one updates zero
++ * rows and learns it lost. That is the whole of plan open question 6's answer and it
++ * needs no lease, because the transition itself is the compare-and-set.
++ *
++ * AND THE WORKER NEVER TOUCHES POSTGRES (ADR-04) — this runs inside the api, called by a
++ * route on the internal seam, exactly as `creditConnectionMinutes` is. */
++export async function recordMediaVerdict(
++  db: Db,
++  input: {
++    id: string;
++    verdict: "ready" | "rejected";
++    verifiedBytes?: number;
++    verifiedType?: string;
++    width?: number;
++    height?: number;
++    durationMs?: number;
++    reason?: "declaration_mismatch" | "scan_failed";
++  },
++): Promise<{ applied: boolean; state: string | null; objectKey: string | null }> {
++  const [updated] = await db
++    .update(mediaObjects)
++    .set({
++      state: input.verdict,
++      verifiedBytes: input.verifiedBytes ?? null,
++      verifiedType: input.verifiedType ?? null,
++      width: input.width ?? null,
++      height: input.height ?? null,
++      durationMs: input.durationMs ?? null,
++      rejectedReason: input.reason ?? null,
++    })
++    .where(and(eq(mediaObjects.id, input.id), eq(mediaObjects.state, "pending")))
++    .returning({
++      state: mediaObjects.state,
++      // THE KEY COMES BACK FROM THE UPDATE, not from a read before it. A rejection
++      // deletes the bytes and the caller needs the key to do that; fetching it
++      // separately would open a window in which the row moved between the two
++      // statements and the delete addressed somebody else's object.
++      objectKey: mediaObjects.objectKey,
++    });
++
++  if (updated)
++    return { applied: true, state: updated.state, objectKey: updated.objectKey };
++
++  // NOT `pending`: either somebody got there first, or the object does not exist. The
++  // caller needs to tell those apart, so the current state comes back rather than a
++  // bare false.
++  const [row] = await db
++    .select({ state: mediaObjects.state, objectKey: mediaObjects.objectKey })
++    .from(mediaObjects)
++    .where(eq(mediaObjects.id, input.id));
++  return {
++    applied: false,
++    state: row?.state ?? null,
++    objectKey: row?.objectKey ?? null,
++  };
++}
++
+ export async function creditConnectionMinutes(
+   db: Db,
+   entries: ReadonlyArray<{
+     connectionId: string;
+     environmentId: string;
+     period: string;
+@@ -2585,18 +2702,35 @@
+       // already say what is committed; a counter would be a second source of truth for
+       // it, and the first thing that goes wrong with one is a delete path that forgets
+       // to decrement. The cost is a sum per slot request over one tenant's media rows,
+       // on the index `media_objects_environment_idx` — and this chapter has no corpus at
+       // a scale where that number would mean anything, so it is stated as a cost rather
+       // than measured into a claim.
++      //
++      // AND THE VERIFICATION CHAPTER IS WHERE THE DELETE PATH ARRIVED, WHICH IS THE
++      // SENTENCE ABOVE BEING TESTED. A rejected object's bytes are destroyed, so they
++      // must stop counting — and the way they stop counting is that the ROW leaves the
++      // sum, not that its `declared_bytes` is zeroed. Zeroing would destroy the fact
++      // FR-MED-03 is about: what the client claimed, which is the audit record
++      // FR-MED-04 says to keep. SRS 1.17 made committed bytes a sum over rows precisely
++      // so a delete needs no subtraction, and this is that decision paying out.
++      //
++      // `pending` STILL COUNTS. An object under verification is bytes the store is
++      // holding, so a tenant cannot open a thousand unverified slots to get around the
++      // cap — and if it turns out bad, the next sum has already stopped charging.
+       const [sum] = await tx
+         .select({
+           committed: sql<string>`coalesce(sum(${mediaObjects.declaredBytes}), 0)`,
+         })
+         .from(mediaObjects)
+-        .where(eq(mediaObjects.environmentId, this.environmentId));
++        .where(
++          and(
++            eq(mediaObjects.environmentId, this.environmentId),
++            ne(mediaObjects.state, "rejected"),
++          ),
++        );
+       const committed = Number(sum?.committed ?? 0);
+ 
+       if (cap !== null && committed + input.declaredBytes > cap) {
+         return { reserved: false as const, committed, cap };
+       }
+ 
+@@ -5113,28 +5247,45 @@
+    * controller wrote the column nullable for this question: *"a photo sent by a person
+    * and an attachment uploaded by a customer's backend are the same operation."* Under
+    * the strict reading they are not the same at all: one produces an object any user of
+    * the tenant can attach and the other produces one nobody can, which makes the
+    * nullability pointless because any sentinel would do.
+    *
+-   * `state IN ('pending', 'ready')` IS WRITTEN IN FULL AND ONLY ONE ARM CAN OCCUR. The
+-   * column's CHECK constraint is `state = 'pending'` — 4.10 wrote it that way on purpose,
+-   * because verification is movement VI's and a schema admitting a state nothing produces
+-   * is a schema making a claim it cannot keep. So `'ready'` is unreachable today and the
+-   * predicate says it anyway: the clause names both, and a predicate that named one would
+-   * have to be found and widened by whoever builds the scanner.
++   * `state IN ('pending', 'ready')` IS WRITTEN IN FULL AND BOTH ARMS NOW OCCUR. 4.10's
++   * CHECK constraint was `state = 'pending'`, so for two chapters `'ready'` was
++   * unreachable and this comment said so, adding that a predicate naming one arm *"would
++   * have to be found and widened by whoever builds the scanner."* Migration `0018` widens
++   * the constraint to the three states and nothing here needed widening — which is the
++   * only reason that sentence was worth writing. It is corrected rather than left
++   * standing: a comment describing behaviour no code performs is the defect this movement
++   * has now found in `store.ts`, in `docs/07` §6, in `docs/12` row 11 and in a test's
++   * deadline.
++   *
++   * AND `'rejected'` IS OUTSIDE THE SET, WHICH IS FR-MED-06's REFUSAL ARRIVING FOR FREE.
++   * The predicate was written against a three-state world before that world existed, so
++   * a verified-bad object becomes unattachable with no clause added — the set was always
++   * "the two states an attachment may be in", and the third one just started happening.
+    *
+    * CONSTITUTION VI ASKS FOR 100% BRANCH COVERAGE OF TENANT ISOLATION, AND THIS IS THAT
+    * CLAUSE MET RATHER THAN PINNED — with the per-arm evidence, because the percentage
+    * cannot carry it. `repository.ts` is pinned at 92 branches and measures 92.91 across
+    * hundreds of them, so an uncovered arm HERE would pass the ratchet with room to spare.
+    * The pin is not the instrument; each arm was deleted and the suite re-run:
+    *
+    *     the three SQL clauses      no JavaScript branch at all. 048 recorded the same
+    *                                clause as unmeasurable for a sorting key; a WHERE is
+    *                                the same shape from a different direction.
++   *                                RE-RUN AT 4.13 rather than inherited, because the
++   *                                original run was made when only one state could
++   *                                occur, and it is no longer true. Deleting the
++   *                                whole clause -> ONE red, the `rejected` refusal.
++   *                                Narrowing it to `['pending']` -> ONE red, the
++   *                                `ready` attach. Both arms are now separately
++   *                                covered, where at 4.11 neither could be: the
++   *                                recorded result was about a platform that has
++   *                                stopped existing.
+    *     `senderMustBeBot ? …`      forced to the user predicate -> exactly ONE test red,
+    *                                "lets an API key attach a USER's object". Nothing else
+    *                                moved, and that is the finding: an API key's own slot
+    *                                records `user_id IS NULL`, which the user predicate
+    *                                admits — so a suite without that one case would have
+    *                                passed with this arm deleted.
+@@ -5577,12 +5728,28 @@
+       .select({ objectKey: mediaObjects.objectKey })
+       .from(mediaObjects)
+       .where(
+         and(
+           eq(mediaObjects.id, mediaId),
+           eq(mediaObjects.environmentId, this.environmentId),
++          // ADR-14's DELIVERY GATE: NO SIGNED URL UNTIL `ready` (FR-012).
++          //
++          // A FOURTH CONDITION AND THE SAME ANSWER. An object still under verification
++          // and an object the scanner refused both answer exactly as a foreign one and
++          // an absent one do — the caller learns that they cannot have it and nothing
++          // about why, which is the same discipline the three conditions above were
++          // written with.
++          //
++          // AND IT COULD NOT HAVE SHIPPED ALONE. `research.md` R4 measured this clause
++          // against 4.12's route BEFORE the state machine existed: **10 of 76 tests
++          // red**, including the isolation gauntlet's own control, because
++          // `media_objects_state_check` permitted one value and no object could ever
++          // be `ready`. The transition and the gate ship together or the gate ships
++          // broken — which is why this line is in the verification chapter and not in
++          // the one that built the route.
++          eq(mediaObjects.state, "ready"),
+         ),
+       );
+     if (!object) return undefined;
+ 
+     for (const channelId of await this.channelsReferencingMedia(mediaId)) {
+       if (await this.channelVisibleTo(channelId, userId)) return object.objectKey;
+```
+
+### Deleting the bytes and keeping the row
+
+The second call the api makes to the store directly, and the comment at the top of that file
+said there was only one until this chapter.
+
+```diff title="services/api/src/media/store.ts"
+@@ -129,6 +129,47 @@
+     // CONNECTION REFUSED, DNS FAILURE, TIMEOUT, AND A BUCKET THAT WOULD NOT CREATE —
+     // all the same answer to the caller. Distinguishing them here would be a second
+     // vocabulary for one refusal, and the client's action is identical in every case.
+     return false;
+   }
+ }
++
++/** Remove an object's bytes, keeping the row that records it existed.
++ *
++ * THE SECOND CALL THE API MAKES TO THE STORE DIRECTLY, and the comment at the top of
++ * this file said there was only one until the verification chapter. FR-MED-04 asks for
++ * *"deletion of the object, retaining only the audit record"*, which is two actions in
++ * two places: this one, and leaving `media_objects` alone.
++ *
++ * WHY NOT THE WORKER. It holds the bytes in memory already and could sign nothing at
++ * all if it deleted them itself — but then a worker that crashed between the delete and
++ * the verdict would leave a `pending` row for an object the store no longer has, and
++ * the next sweep would read that 404 as *"not uploaded yet"* and wait forever. The api
++ * deletes only after the verdict is recorded, so the row and the bytes disagree in one
++ * direction only: a `rejected` row whose bytes are still there is repaired by the next
++ * call, and there is no state in which a `pending` row has no bytes it could get.
++ *
++ * S3 DELETE IS IDEMPOTENT AND ANSWERS 204 FOR A KEY THAT WAS NEVER THERE, so a retry
++ * needs no branch. What this returns is whether the store said so — a `false` is worth
++ * a log line and is not worth failing the verdict over, because the row is already
++ * `rejected` and the object is already unattachable. */
++export async function deleteObject(
++  config: StoreConfig,
++  key: string,
++): Promise<boolean> {
++  const url = presign({
++    method: "DELETE",
++    ...config,
++    endpoint: config.internalEndpoint,
++    key,
++    expiresIn: 60,
++  });
++  try {
++    const res = await fetch(url, {
++      method: "DELETE",
++      signal: AbortSignal.timeout(2_000),
++    });
++    return res.ok;
++  } catch {
++    return false;
++  }
++}
+```
+
+### A third internal credential
+
+The worker holds its own, not the dispatcher's, because `Principal.service` is what every log
+line and every request-log row reports — and filing the only service that reads customer bytes
+under another service's name is a thing you find out about during an incident. The second half
+of the hunk corrects a comment that claimed the widened union would stop the build; it does not,
+measured, and the protection it describes lives in `credential.guard.ts`.
+
+```diff title="services/api/src/auth/authenticate.middleware.ts"
+@@ -53,20 +53,49 @@
+  * header, trusted only for logging. The credentials chapter spent itself removing exactly
+  * that — the gateway used to send an environment header and a user header it had
+  * invented — and "it is only for logs" is the sentence under which an asserted
+  * header survives a review. */
+ export const PLATFORM_CREDENTIAL_ENV = "RELAY_INTERNAL_CREDENTIAL";
+ export const GATEWAY_CREDENTIAL_ENV = "RELAY_INTERNAL_CREDENTIAL_GATEWAY";
++export const WORKER_CREDENTIAL_ENV = "RELAY_INTERNAL_CREDENTIAL_WORKER";
+ const PLATFORM_PREFIX = "rk_svc_";
+ 
+ /** Which variable belongs to which service. The dispatcher's keeps its original
+  * name: renaming it would be a deployment change this chapter has not earned. */
+-const PLATFORM_SERVICES: ReadonlyArray<readonly [string, string]> = [
++const PLATFORM_SERVICES = [
+   [PLATFORM_CREDENTIAL_ENV, "dispatcher"],
+   [GATEWAY_CREDENTIAL_ENV, "gateway"],
+-];
++  // THE MEDIA WORKER'S OWN, AND REUSING THE DISPATCHER'S WOULD HAVE BEEN INVISIBLE
++  // (chapter 4.13). Two of that chapter's artifacts said it would hold
++  // `RELAY_INTERNAL_CREDENTIAL` "as the dispatcher does", and neither asked what the
++  // credential SAYS: the row below is what `Principal.service` reports, so the only
++  // component that reads a customer's bytes would have logged as the service that never
++  // touched them.
++  [WORKER_CREDENTIAL_ENV, "media-worker"],
++] as const satisfies ReadonlyArray<readonly [string, string]>;
++
++/** The internal services that exist, DERIVED FROM THE LIST ABOVE rather than
++ * retyped beside it (FR-044).
++ *
++ * `as const` is doing the work: without it `(typeof PLATFORM_SERVICES)[number][1]`
++ * widens to `string` and a route could declare a service nobody deploys.
++ *
++ * AND THIS COMMENT CLAIMED A COMPILER BEHAVIOUR IT DOES NOT HAVE, UNTIL CHAPTER 4.13
++ * RAN IT. It read: "adding a third internal service widens this union on its own and
++ * every route that must now decide about it stops compiling." **It does not.** A third
++ * entry was added and `tsc --noEmit` exited 0: this union appears in three positions and
++ * every one is `readonly PlatformService[]`, where a new member is purely additive. An
++ * existing route goes on admitting exactly what it admitted. Three of that chapter's
++ * artifacts repeated the sentence before anybody ran it.
++ *
++ * WHAT DOES FORCE THE DECISION IS ONE FILE OVER. `credential.guard.ts` types `AcceptSpec`
++ * so that a bare `@Accepts("platform")` does not compile — a platform route must name
++ * its callers — and `["media-worker"]` is unwriteable until this list holds the row. That
++ * is a hard dependency, and it is a different mechanism from the one this comment
++ * described. */
++export type PlatformService = (typeof PLATFORM_SERVICES)[number][1];
+ 
+ /** Constant-time-ish: compare lengths first, then every byte. A platform
+  * credential is a shared secret, and an early-exit compare on a shared secret is
+  * the one place a timing signal is worth the two lines to remove. */
+ function secretMatches(presented: string, configured: string): boolean {
+   if (presented.length !== configured.length) return false;
+```
+
+### Two containers, with opposite answers to the same question
+
+The worker is profiled and the scanner is not. The worker **writes** — an unprofiled one sweeps
+every `pending` object in the lane during every test suite, rewriting fixtures other tests
+planted, which is the widest possible version of an action scoped past its own test. The scanner
+writes nothing and has to be up when a bare `docker compose up -d --wait` is all that ran.
+
+```diff title="compose.yaml"
+@@ -160,12 +160,68 @@
+       test: ["CMD", "/mailpit", "readyz"]
+       interval: 5s
+       timeout: 3s
+       retries: 5
+ 
+ 
++  clamav:
++    image: clamav/clamav:1.5
++    # The seventh container, and the only one that reads a customer's bytes
++    # (chapter 4.13). Constitution VII asks a new container to justify itself and
++    # FR-MED-04 is the justification: *"every uploaded object shall be
++    # virus-scanned"*, which is not a thing this workspace can write in TypeScript.
++    #
++    # NOT PROFILED, WHICH IS THE OPPOSITE ANSWER FROM THE WORKER'S. The worker
++    # WRITES — an unprofiled one would sweep every `pending` object in the lane
++    # during every suite, rewriting fixtures other tests planted. This container
++    # mutates nothing, and the worker's own suites need it up when a bare
++    # `docker compose up -d --wait` is all that ran.
++    #
++    # A REAL SCANNER RATHER THAN A FAKE, for mailpit's reason one clause over: a
++    # stub records what the sender passed, and the question FR-MED-04 asks is what
++    # a scanner DID with the bytes. The measurements this chapter publishes — that
++    # EICAR plus two hundred spaces is `OK`, that the signature matches the file
++    # and not a substring — are unavailable from anything we could write.
++    ports:
++      - "${RELAY_CLAMAV_PORT:-3310}:3310"
++    healthcheck:
++      # THE DATE, NOT A PING, AND THE WINDOW IS MEASURED.
++      #
++      # `zPING` answers `PONG` from a scanner whose signature database is thirteen
++      # days old, because `freshclam` downloads 355,678 signatures AFTER clamd
++      # starts answering. Measured on this image: `28122/Sun Sep 13` at twelve,
++      # sixteen, twenty and twenty-five seconds, `28135/Sat Sep 26` at thirty. A
++      # liveness probe passes at twelve, `--wait` returns, and the worker starts
++      # scanning against definitions from a fortnight ago.
++      #
++      # That is chapter 4.2's `/ping`, 4.9's unset credential and 4.10's bucket for
++      # the fourth time — *a check that cannot fail for the reason you care about
++      # is not a check* — and this one has a measured window rather than a
++      # hypothesis. `clamdscan -V` asks the DAEMON, so it reports the database the
++      # daemon has loaded rather than what is on disk.
++      #
++      # SEVEN DAYS. ClamAV publishes daily; a bound of one would go red on any
++      # machine that starts the stack before freshclam's first run of the day, and
++      # a bound of thirty would pass the window this check exists to catch.
++      test:
++        - CMD-SHELL
++        - >-
++          V=$$(clamdscan -V) &&
++          D=$$(echo "$$V" | cut -d/ -f3) &&
++          B=$$(date -D "%a %b %d %H:%M:%S %Y" -d "$$D" +%s) &&
++          [ $$(( ($$(date +%s) - $$B) / 86400 )) -le 7 ]
++      interval: 5s
++      timeout: 10s
++      # LONGER THAN THE OTHERS, because this is not "is it up" — it is "has
++      # freshclam finished", and the answer is a 355,678-signature download that is
++      # bandwidth-bound and unbounded on a slow link. Twenty retries at five
++      # seconds is 100 s of grace after the start period.
++      retries: 20
++      start_period: 30s
++
++
+   # --- the services (the webhook dispatcher chapter) -----------------------
+   # Behind `--profile services`, for the reason above.
+ 
+   api:
+     profiles: ["services"]
+     build:
+@@ -185,14 +241,17 @@
+       # RELAY_SMTP_URL joins in the transport phase, with the container it names.
+       RELAY_REDIS_URL: redis://redis:6379
+       # Development values. Both are secrets in anything that is not a laptop,
+       # and the api refuses to start in production without the first.
+       RELAY_WEBHOOK_SECRET_KEY: ${RELAY_WEBHOOK_SECRET_KEY:-}
+       RELAY_INTERNAL_CREDENTIAL: ${RELAY_INTERNAL_CREDENTIAL:-rk_svc_local_development_credential_0000}
+-      # The api verifies both service credentials, so it holds both.
++      # The api verifies every service credential, so it holds all three. This comment
++      # said "both" for two chapters and the media worker is the third (4.13) — the list
++      # grows with the SERVICES, not with the routes.
+       RELAY_INTERNAL_CREDENTIAL_GATEWAY: ${RELAY_INTERNAL_CREDENTIAL_GATEWAY:-rk_svc_local_development_gateway_00000}
++      RELAY_INTERNAL_CREDENTIAL_WORKER: ${RELAY_INTERNAL_CREDENTIAL_WORKER:-rk_svc_local_development_worker_000000}
+       # Chapter 4.7. THE FIRST OPERATIONAL SERVICE TO READ THE ANALYTICAL STORE, and that
+       # is the subject rather than the plumbing: constitution III says billing, metering and
+       # dashboard analytics read only from ClickHouse, and FR-ANL-06 requires comparing them
+       # against Postgres. The reconciler is none of those three roles — it audits the
+       # boundary, and an auditor confined to one side of a fence cannot check the fence.
+       RELAY_CLICKHOUSE_HOST: clickhouse
+@@ -284,11 +343,47 @@
+     extra_hosts:
+       - "host.docker.internal:host-gateway"
+     depends_on:
+       api: { condition: service_healthy }
+       nats: { condition: service_healthy }
+ 
++  # THE ONLY SERVICE THAT READS THE BYTES (chapter 4.13).
++  #
++  # PROFILED, AND THE DECISION IS THE OPPOSITE OF THE SCANNER'S. Six services start on a
++  # bare `docker compose up -d --wait` and this is not one of them, because the worker
++  # MUTATES SHARED LANE STATE: an unprofiled worker sweeps every `pending` object in the
++  # lane during every suite, deleting bytes and flipping states for fixtures other tests
++  # planted. That is 056-5's *action scoped wider than its own test* at maximum scale —
++  # 4.10's version stopped one container and made `gauntlet.itest.ts` answer 503 in a
++  # file that never mentions media. The scanner, when it arrives, is unprofiled for the
++  # complementary reason: it mutates nothing.
++  #
++  # THE COST IS SC-010. Only a worker inside the composed profile moves an object to
++  # `ready`, so the sealed suite's media test polls `--profile services` rather than
++  # asserting against a bare stack.
++  media-worker:
++    profiles: ["services"]
++    build:
++      context: .
++      dockerfile: services/media-worker/Dockerfile
++    environment:
++      RELAY_API_URL: http://api:4000
++      # ITS OWN CREDENTIAL, NOT THE DISPATCHER'S. `authenticate.middleware.ts` maps
++      # `RELAY_INTERNAL_CREDENTIAL` to the literal `"dispatcher"`, and `Principal.service`
++      # is what every log line and request-log row reports — so sharing it would file the
++      # only service that reads customer bytes under another service's name.
++      RELAY_INTERNAL_CREDENTIAL_WORKER: ${RELAY_INTERNAL_CREDENTIAL_WORKER:-rk_svc_local_development_worker_000000}
++      # ONE ADDRESS, NOT TWO. The api needs both because it signs URLs a client will
++      # hold; the worker signs only for itself, so it has no use for the published one.
++      RELAY_MINIO_INTERNAL_ENDPOINT: http://minio:9000
++      RELAY_MINIO_ACCESS_KEY: relay
++      RELAY_MINIO_SECRET_KEY: relay-secret
++      RELAY_MINIO_BUCKET: relay-media
++    depends_on:
++      api: { condition: service_healthy }
++      minio: { condition: service_healthy }
++
+ volumes:
+   postgres-data:
+   nats-data:
+   clickhouse-data:
+   minio-data:
+```
+
+<Checkpoint>
+A photo uploaded through the published slot route reaches `ready` on its own, with its
+dimensions in the row, and a delivery URL is refused until it does. A file that contradicts its
+declaration by one byte is rejected, its bytes deleted and its row kept. An infected file is
+rejected with a different reason and the same outcome. A scanner that is down leaves the object
+`pending` rather than guessing, and a scanner whose signature database is a fortnight old is
+reported unhealthy by a container that answers `PONG` perfectly well.
+</Checkpoint>
+
+<ChapterFooter id="4.13" />

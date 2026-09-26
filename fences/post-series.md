@@ -7316,41 +7316,308 @@ hunks is what let the chain say how far behind it was.
  beforeAll(async () => {
 ```
 
-### `services/api/src/auth/authenticate.middleware.ts` — the authenticate middleware, after the platform-services table was typed.
+### `packages/protocol/src/internal.ts` — the media worker's seam, in the shared protocol.
 
-15 differing lines, 1 hunk.
+90 differing lines, 1 hunk. The five schemas chapter 4.13's two internal routes speak. They sit in the appendix rather than in the chapter because the chapter's argument is about what a worker does with bytes, and a reader who wants the wire format wants it whole.
 
-```diff title="services/api/src/auth/authenticate.middleware.ts"
-@@ -57,16 +57,27 @@
- export const PLATFORM_CREDENTIAL_ENV = "RELAY_INTERNAL_CREDENTIAL";
- export const GATEWAY_CREDENTIAL_ENV = "RELAY_INTERNAL_CREDENTIAL_GATEWAY";
- const PLATFORM_PREFIX = "rk_svc_";
- 
- /** Which variable belongs to which service. The dispatcher's keeps its original
-  * name: renaming it would be a deployment change this chapter has not earned. */
--const PLATFORM_SERVICES: ReadonlyArray<readonly [string, string]> = [
-+const PLATFORM_SERVICES = [
-   [PLATFORM_CREDENTIAL_ENV, "dispatcher"],
-   [GATEWAY_CREDENTIAL_ENV, "gateway"],
--];
-+] as const satisfies ReadonlyArray<readonly [string, string]>;
+```diff title="packages/protocol/src/internal.ts"
+@@ -530,6 +530,96 @@
+ export type InternalUsageReportRequest = z.infer<
+   typeof internalUsageReportRequestSchema
+ >;
+ export type InternalUsageReportResponse = z.infer<
+   typeof internalUsageReportResponseSchema
+ >;
 +
-+/** The internal services that exist, DERIVED FROM THE LIST ABOVE rather than
-+ * retyped beside it (FR-044).
++// ---------------------------------------------------------------------------
++// The media worker's seam (4.13)
++// ---------------------------------------------------------------------------
++
++/** One object the worker has not reached a verdict on yet.
 + *
-+ * `as const` is doing the work: without it `(typeof PLATFORM_SERVICES)[number][1]`
-+ * widens to `string` and a route could declare a service nobody deploys. With it,
-+ * adding a third internal service widens this union on its own and every route
-+ * that must now decide about it stops compiling — which is the connection-metering chapter's lesson
-+ * from `Dimension`, where adding a config key widened a type and the two-way
-+ * ternary underneath it was the thing the compiler could not see. */
-+export type PlatformService = (typeof PLATFORM_SERVICES)[number][1];
++ * NO `environment_id`, AND THAT IS THE POINT. The route it comes from takes no
++ * tenant parameter either — a worker that could ask for one tenant's objects
++ * would be a route worth forging. The worker never needs the tenant, because
++ * everything it does is addressed by object key and reported back by id. */
++export const internalMediaPendingItemSchema = z.strictObject({
++  id: z.string().uuid(),
++  object_key: z.string().min(1),
++  /** What the CLIENT said this is, which is the whole subject of FR-MED-03. The
++   * worker's job is to find out whether it is true. */
++  mime_type: z.string().min(1),
++  declared_bytes: z.number().int().nonnegative(),
++});
++
++export const internalMediaPendingResponseSchema = z.strictObject({
++  objects: z.array(internalMediaPendingItemSchema),
++});
++
++/** Why an object was refused, to the platform.
++ *
++ * TWO VALUES, AND THE CUSTOMER SEES NEITHER. FR-005 requires a scan failure and
++ * a declaration mismatch to be distinguishable; the API's own refusal says only
++ * that the object is not attachable, because telling a caller which of the two
++ * happened tells an attacker whether their payload was recognised. */
++export const mediaRejectionReasonSchema = z.enum([
++  "declaration_mismatch",
++  "scan_failed",
++]);
++
++/** THERE IS NO `retry` ARM, AND ITS ABSENCE IS A DECISION. A transient failure —
++ * the store unreachable, the scanner down — sends nothing at all, so the object
++ * stays `pending` and the next sweep finds it. A verdict meaning "we could not
++ * tell" is a row somebody later reads as a fact. */
++export const internalMediaVerdictRequestSchema = z.discriminatedUnion(
++  "verdict",
++  [
++    z.strictObject({
++      verdict: z.literal("ready"),
++      /** The STORE's count, not the client's. `content-length` on a signed
++       * `HEAD` is the number the store will serve, which is what makes it
++       * worth recording beside `declared_bytes` rather than instead of it. */
++      verified_bytes: z.number().int().nonnegative(),
++      /** Read from the bytes. The store's `content-type` is the client's own
++       * claim echoed back, so it is not evidence of anything. */
++      verified_type: z.string().min(1),
++      /** Present for the kinds a 64 KiB prefix answers for, absent for the
++       * rest — FR-MED-04 is recorded PARTLY MET rather than pretended. */
++      width: z.number().int().positive().optional(),
++      height: z.number().int().positive().optional(),
++      duration_ms: z.number().int().nonnegative().optional(),
++    }),
++    z.strictObject({
++      verdict: z.literal("rejected"),
++      reason: mediaRejectionReasonSchema,
++      /** Optional on this arm: a scan failure knows nothing about the type,
++       * and a mismatch that failed on size alone knows no type either. */
++      verified_bytes: z.number().int().nonnegative().optional(),
++      verified_type: z.string().min(1).optional(),
++    }),
++  ],
++);
++
++/** `applied` false means the row was not `pending` any more and this verdict
++ * changed nothing — a second worker got there first, which is an ordinary
++ * outcome rather than an error. `state` is what the row holds now, so a worker
++ * that lost the race can log what won. */
++export const internalMediaVerdictResponseSchema = z.strictObject({
++  applied: z.boolean(),
++  state: z.enum(["pending", "ready", "rejected"]),
++});
++
++export type InternalMediaPendingItem = z.infer<
++  typeof internalMediaPendingItemSchema
++>;
++export type InternalMediaPendingResponse = z.infer<
++  typeof internalMediaPendingResponseSchema
++>;
++export type MediaRejectionReason = z.infer<typeof mediaRejectionReasonSchema>;
++export type InternalMediaVerdictRequest = z.infer<
++  typeof internalMediaVerdictRequestSchema
++>;
++export type InternalMediaVerdictResponse = z.infer<
++  typeof internalMediaVerdictResponseSchema
++>;
+```
+
+### `services/api/src/internal/internal.module.ts` — the verification controller, registered.
+
+4 differing lines, 2 hunks. A controller nobody registers is a route that does not exist — which an analysis pass has found in this repository once already.
+
+```diff title="services/api/src/internal/internal.module.ts"
+@@ -10,12 +10,13 @@
+ } from "../outbox/jetstream.publisher";
+ import type { Publisher } from "../outbox/publisher";
+ import { ANALYTICS_PUBLISHER } from "../webhooks/analytics";
+ import { BackfillController } from "./backfill.controller";
+ import { InternalController } from "./internal.controller";
+ import { DispatchController } from "./dispatch.controller";
++import { MediaVerificationController } from "./media.controller";
+ import { MembershipsController } from "./memberships.controller";
+ import { SessionController } from "./session.controller";
+ import { UsageController } from "./usage.controller";
  
- /** Constant-time-ish: compare lengths first, then every byte. A platform
-  * credential is a shared secret, and an early-exit compare on a shared secret is
-  * the one place a timing signal is worth the two lines to remove. */
- function secretMatches(presented: string, configured: string): boolean {
-   if (presented.length !== configured.length) return false;
+ // The internal routes reuse MessagesModule's providers wholesale — the
+ // request-scoped Repository, the guard, the service. One write path, two
+@@ -38,12 +39,15 @@
+     // REGISTERED HERE, and a controller nobody registers is a route that does not
+     // exist — which an analysis pass has found in this repository once already.
+     MembershipsController,
+     // And this chapter's, for the same reason and in the same place: `app.module.ts`
+     // carries only `HealthController` and already imports this module.
+     UsageController,
++    // The media worker's two routes. Fourth controller in a row registered here with
++    // the same note attached, which is how a convention earns the word.
++    MediaVerificationController,
+   ],
+   providers: [
+     {
+       provide: "DB",
+       useFactory: (): Db => createDb(createPool()),
+       scope: Scope.DEFAULT,
+```
+
+### `packages/config/src/infra.ts` — ClamAV joins the named infrastructure.
+
+8 differing lines, 1 hunk. Seventh container, and the both-directions assertion in `infra.test.ts` is what makes this file impossible to forget.
+
+```diff title="packages/config/src/infra.ts"
+@@ -18,12 +18,20 @@
+   // The sixth, and hosted media's (ADR-13, chapter 4.10). The api signs a URL and
+   // the CLIENT uploads to it, so this container is reachable from outside the
+   // network in a way the stores are not — and its host port is 9100, not MinIO's
+   // conventional 9000, because ClickHouse's native port has published 9000 since
+   // this file was written.
+   "minio",
++  // The seventh, and the first that reads a customer's bytes (chapter 4.13).
++  // FR-MED-04's scanner: a signature engine is not a thing this workspace can write
++  // in TypeScript, and constitution VII's justification is the clause itself.
++  //
++  // IN THE DEFAULT PROFILE, unlike the media worker that talks to it. This container
++  // mutates nothing; the worker writes, and an unprofiled worker would rewrite every
++  // `pending` fixture in the lane during every suite.
++  "clamav",
+ ] as const;
+ 
+ export const DURABLE_VOLUMES = [
+   "postgres-data",
+   "nats-data",
+   "clickhouse-data",
+```
+
+### `packages/config/src/infra.test.ts` — and the media worker joins the list of containers that are OURS.
+
+6 differing lines, 1 hunk. The registry every artifact in feature 059 misidentified: `INFRA_SERVICES` names the *infrastructure*, and a container of Relay's own goes in `ours`. The assertion caught it on the first run.
+
+```diff title="packages/config/src/infra.test.ts"
+@@ -39,13 +39,17 @@
+     // naming the local infrastructure while every test still passed. This chapter
+     // added a fifth container and the gap is how it nearly went unnoticed.
+     //
+     // The services behind `--profile services` are Relay's own and are not
+     // infrastructure, so they are excluded by name rather than by pattern: a
+     // list is auditable and a pattern would silently absorb the next container.
+-    const ours = new Set(["api", "gateway", "dispatcher"]);
++    // AND THE MEDIA WORKER IS THE FOURTH (4.13). This is the list T018 of that
++    // chapter's tasks said was `INFRA_SERVICES` — it is not: a new container of
++    // OURS goes here, and a new container of the INFRASTRUCTURE'S goes there. The
++    // task named the wrong file and the both-directions assertion said so in one run.
++    const ours = new Set(["api", "gateway", "dispatcher", "media-worker"]);
+     // Only the `services:` block. Volume names sit at the same indentation one
+     // block down, and a match that swept the whole file would report
+     // `postgres-data` as an unregistered service.
+     const services = compose.slice(0, compose.indexOf("\nvolumes:"));
+     const declared = [...services.matchAll(/^ {2}([a-z][a-z0-9-]*):$/gm)]
+       .map((match) => match[1] as string)
+```
+
+### `packages/test-harness/src/bound-port.test.ts` — the media worker declares that it binds nothing.
+
+7 differing lines, 1 hunk. Derived from the filesystem, so this entry becomes mandatory the moment `services/media-worker/src/main.ts` exists. The ingester's arrived two chapters late and turbo's cache hid the red.
+
+```diff title="packages/test-harness/src/bound-port.test.ts"
+@@ -56,12 +56,19 @@
+     "services/ingester/src/main.ts",
+     "the same shape as the dispatcher and for the same reason: it fetches from JetStream " +
+       "and inserts into ClickHouse over HTTP, so it has no listener, no PORT and no " +
+       "address to read back. It arrived in chapter 4.3 and this entry did not, which is " +
+       "the half the derivation cannot supply on its own",
+   ],
++  [
++    "services/media-worker/src/main.ts",
++    "a polling sweep with no inbound surface: it asks the api for a batch, reads the " +
++      "object store over HTTP and posts a verdict back, so nothing ever connects TO it. " +
++      "Written in the same commit as the file, because the ingester's entry was not and " +
++      "turbo's cache hid the red for two chapters",
++  ],
+ ];
+ 
+ const LISTENERS = serviceMains().filter(
+   (rel) => !BINDS_NOTHING.some(([name]) => name === rel),
+ );
+ 
+```
+
+### `services/api/src/isolation/targets.ts` — both seam routes classified, as `exempt` with reasons.
+
+38 differing lines, 1 hunk. The derivation named them before the list did, which is the eleventh time.
+
+```diff title="services/api/src/isolation/targets.ts"
+@@ -378,12 +378,50 @@
+   // is the platform and reaching every tenant is what a platform credential is for.
+   //
+   // The derivation found this route unclassified on the build that added it. That is
+   // the sixth time in this repository, and the list has never once been ahead of it.
+   { method: "POST", path: "/internal/usage/connections", accepts: "platform", shape: "write" },
+ 
++  // ── THE MEDIA WORKER'S SEAM (chapter 4.13), AND THE DERIVATION FOUND BOTH ────────
++  //
++  // Run before these two entries existed: `unclassified: ["GET /internal/media/pending",
++  // "POST /internal/media/:mediaId/verdict"]`. **The eleventh time in this repository,
++  // and the list has still never been ahead of the derivation.** The task that predicted
++  // this said so in advance for the first time — earlier versions of it hedged that the
++  // derivation *"may report nothing"* and called a green run the finding, which is
++  // backwards: a green run here would mean the derivation could not see `/internal`
++  // routes, and nine of them were already classified.
++  //
++  // BOTH ARE `exempt`, AND FOR A STRONGER REASON THAN `material`'s. Those three take one
++  // opaque id and derive the tenant from the row; these take **no tenant-shaped input at
++  // all**. `pending` has no parameters — the batch is the platform's oldest objects,
++  // whoever owns them — and `verdict` takes one object id and a finding about bytes. One
++  // worker serves every environment, so there is nothing for a forged request to widen.
++  //
++  // THAT IS THE ISOLATION PROPERTY STATED AS THE THING IT IS, and it is the reason the
++  // routes look alarming and are not: everywhere else in this platform a cross-tenant
++  // read is the defect, and here it is the contract. What makes it safe is not a
++  // predicate, it is the absence of a parameter — which `gauntlet.itest.ts` shows by
++  // presenting another tenant's object id to a route that cannot be told whose it is.
++  {
++    method: "GET",
++    path: "/internal/media/pending",
++    accepts: "platform",
++    shape: "exempt",
++    because:
++      "no parameters of any kind beyond a batch size: the route returns the platform's oldest unverified objects across every tenant by design (ADR-04, one worker serves all), so there is no foreign identifier to pair with a named tenant and nothing a forged request could widen.",
++  },
++  {
++    method: "POST",
++    path: "/internal/media/:mediaId/verdict",
++    accepts: "platform",
++    shape: "exempt",
++    because:
++      "one opaque object id and a finding about its bytes, as `material` above: the tenant comes from the row and the caller never says which environment it means. The credential is its only guard, and it is the worker's own rather than the dispatcher's.",
++  },
++
+   // ── THE REQUEST LOG (chapter 4.8, FR-ANL-07), AND THE DERIVATION FOUND IT FIRST ──
+   //
+   // Run before this entry existed: `43 derived, 36 attacked, 6 exempt` with
+   // `unclassified: ["GET /v1/request-log"]` and `CLASSIFICATIONS.length` 42 against 43.
+   // That is the seventh time in this repository, and the list has still never been ahead
+   // of the derivation. The classification is what changed in answer to it, never the
+```
+
+### `services/api/src/isolation/targets.itest.ts` — and named in the assertion that catches a route classified and never built.
+
+4 differing lines, 1 hunk. The other direction: the accounting test catches a route added and never classified; this one catches the reverse.
+
+```diff title="services/api/src/isolation/targets.itest.ts"
+@@ -172,12 +172,16 @@
+       "POST /internal/usage/connections",
+       "GET /internal/memberships",
+       "POST /internal/dispatch/expand",
+       "POST /internal/dispatch/material",
+       "POST /internal/dispatch/outcome",
+       "POST /internal/dispatch/replay",
++      // And the media worker's seam (chapter 4.13). The derivation named both before
++      // the classification did, which is the eleventh time.
++      "GET /internal/media/pending",
++      "POST /internal/media/:mediaId/verdict",
+     ];
+     const keys = derived.map(targetKey);
+     const missing = ADDED.filter((k) => !keys.includes(k));
+     expect(missing, `classified here and not on the router: ${missing.join(", ")}`)
+       .toEqual([]);
+   });
 ```
 
 ### `packages/e2e/src/harness.ts` — the e2e harness. Same story: the divergence was behind an APPLY failure.
@@ -9792,3 +10059,200 @@ the same tenant, which put an unmatched-route row in that log.
      // limit, whatever the count — which is the half a bare `toEqual([])` could never check.
      if (requests.length < 50) expect(body["has_more"]).toBe(false);
 ```
+
+## Placed last, because they would otherwise unanchor the appendix's own older hunks
+
+Chapter 4.13's changes to these two files anchor perfectly well where the other
+appendix entries sit, and applying them there breaks hunks written earlier in this
+same document for the same files. **A hunk that works and unanchors somebody else's is
+still a broken chain** — chapter 4.10 found the shape and paid it twice.
+
+### `services/api/src/isolation/gauntlet.itest.ts` — the seam's credential guard, and one fixture that now needs `ready`.
+
+67 differing lines, 2 hunks. The new test is deliberately not an attack — both routes are `exempt`, so it shows the guard the exemption rests on instead. The fixture change is ADR-14's gate reaching a file that never mentions verification.
+
+```diff title="services/api/src/isolation/gauntlet.itest.ts"
+@@ -525,12 +525,23 @@
+           text: "an object worth reading",
+           user: tenant.botExternalId,
+           attachments: [{ type: "media", media_id }],
+         }),
+       });
+       expect(sent.status, "the fixture could not attach its own object").toBe(201);
++      // AND `ready`, BECAUSE ADR-14's GATE ARRIVED WITH THE VERIFICATION CHAPTER. Its
++      // own `research.md` R4 measured this clause before the state machine existed and
++      // named **this control** among the ten it turned red — the object was `pending`,
++      // the gate refused it, and the attacker could not read its own object. The
++      // fixture states the precondition rather than spawning a worker to produce it:
++      // a tenancy attack that fails when the scanner is down is reporting somebody
++      // else's outage.
++      await db.execute(
++        `UPDATE media_objects SET state = 'ready', verified_bytes = 16, ` +
++          `verified_type = 'image/png' WHERE id = '${media_id}'`,
++      );
+       return media_id;
+     };
+ 
+     const victims = await referenced(t.victim);
+     const mine = await referenced(t.attacker);
+ 
+@@ -554,12 +565,68 @@
+       );
+       expect(verdict.differences, JSON.stringify(verdict, null, 2)).toEqual([]);
+       expect(verdict.foreign.status).toBe(404);
+     }
+   });
+ 
++  // THE MEDIA WORKER'S SEAM (chapter 4.13), AND IT IS NOT AN ATTACK ON THE ROUTE.
++  //
++  // `targets.ts` classifies both seam routes `exempt`, so nothing here calls
++  // `attacked.add` — an exempt route that this file attacked would be counted twice by
++  // the accounting test and would also be a claim the classification does not make.
++  //
++  // WHAT IT SHOWS INSTEAD IS THE GUARD THAT MAKES THE EXEMPTION TRUE. The verdict route
++  // is deliberately cross-tenant: one worker serves every environment, the tenant comes
++  // from the row, and there is no parameter a forged request could widen. **So the thing
++  // that must hold is that no tenant credential reaches it at all** — and that is
++  // testable with exactly the credentials this file already holds. A route whose safety
++  // rests entirely on its credential is a route whose credential check is worth
++  // asserting where the attacks live, not only in the suite that owns the feature.
++  it("the media seam refuses every TENANT credential, and changes nothing", async () => {
++    const slot = await fetch(`${url}/v1/media`, {
++      method: "POST",
++      headers: {
++        authorization: `Bearer ${t.victim.credential}`,
++        "content-type": "application/json",
++      },
++      body: JSON.stringify({ filename: "v.png", mime_type: "image/png", bytes: 16 }),
++    });
++    expect(slot.status, "the fixture could not get the victim a slot").toBe(201);
++    const { media_id } = (await slot.json()) as { media_id: string };
++
++    for (const credential of [t.attacker.credential, attackerToken]) {
++      const read = await fetch(`${url}/internal/media/pending`, {
++        headers: { authorization: `Bearer ${credential}` },
++      });
++      expect(read.status).toBe(403);
++
++      const write = await fetch(`${url}/internal/media/${media_id}/verdict`, {
++        method: "POST",
++        headers: {
++          authorization: `Bearer ${credential}`,
++          "content-type": "application/json",
++        },
++        body: JSON.stringify({
++          verdict: "rejected",
++          reason: "scan_failed",
++        }),
++      });
++      expect(write.status).toBe(403);
++    }
++
++    // AND THE VICTIM'S OBJECT IS UNTOUCHED. A 403 that had already destroyed the bytes
++    // would be a refusal after the fact, which is the shape `writeAttack` exists to
++    // catch everywhere else in this file.
++    const [row] = (
++      (await db.execute(
++        `SELECT state FROM media_objects WHERE id = '${media_id}'`,
++      )) as unknown as { rows: { state: string }[] }
++    ).rows;
++    expect(row!.state).toBe("pending");
++  });
++
+   // ── the two routes this chapter added ──────────────────────────────────────────
+   //
+   // A chapter that adds an endpoint attacks it in the same chapter. The derivation
+   // found these before the classification did: `targets.itest.ts` went from 9 targets
+   // to 11 and failed naming both as unclassified.
+   it("POST /v1/channels/:channelId/members — refuses, and adds nobody", async () => {
+```
+
+### `packages/outsider/src/integrate.itest.ts` — the sealed suite uploads a real PNG, and SC-010 becomes a poll.
+
+45 differing lines, 2 hunks. Its old fixture declared eleven bytes and uploaded eleven — the PNG signature plus three zeros, with no `IHDR`. Size right, bytes not a PNG. And the delivery assertion now waits for the worker, which is the cost of the gate.
+
+```diff title="packages/outsider/src/integrate.itest.ts"
+@@ -432,25 +432,47 @@
+           throw new Error(`no ${what}; saw ${frames.map((f) => f.type).join(", ") || "nothing"}`);
+         }
+         await new Promise((r) => setTimeout(r, 50));
+       }
+     };
+ 
++    // A REAL PNG, AND THE OLD FIXTURE IS WHY IT HAD TO BECOME ONE.
++    //
++    // This uploaded `[137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0]` — the PNG signature plus
++    // three zeros, with no `IHDR` — and declared 11 bytes for it. **The size was right
++    // and the bytes were not a PNG**, which was invisible until the platform grew
++    // something that reads them: the slot route records *"what the caller said, not what
++    // arrived"*. Under FR-MED-03 that object is `rejected` and never delivers.
++    //
++    // BUILT FROM BYTES RATHER THAN IMPORTED. This package declares no `@relay/*`
++    // dependency and no workspace path may be reached from here, so the fixture is a
++    // literal — which is also the honest shape for a suite claiming to know nothing
++    // about how the platform is built. A 1×1 greyscale PNG with a stored (uncompressed)
++    // deflate block, 67 bytes.
++    const png = new Uint8Array([
++      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
++      0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
++      0x08, 0x00, 0x00, 0x00, 0x00, 0x3a, 0x7e, 0x9b, 0x55, 0x00, 0x00, 0x00,
++      0x0a, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x60, 0x00, 0x00, 0x00,
++      0x02, 0x00, 0x01, 0x48, 0xaf, 0xa4, 0x71, 0x00, 0x00, 0x00, 0x00, 0x49,
++      0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
++    ]);
++
+     const slot = await post(
+       "/v1/media",
+-      { filename: "outside.png", mime_type: "image/png", bytes: 11 },
++      { filename: "outside.png", mime_type: "image/png", bytes: png.length },
+       credential,
+     );
+     expect(slot.status, "the platform refused a slot to a published credential").toBe(201);
+     const mediaId = slot.body["media_id"] as string;
+ 
+     // THE BYTES GO STRAIGHT TO THE STORE AND NOT THROUGH RELAY, which is ADR-13's whole
+     // claim and is invisible from in-workspace tests that never leave the process.
+     const uploaded = await fetch(slot.body["upload_url"] as string, {
+       method: "PUT",
+-      body: new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0]),
++      body: png,
+     });
+     expect(uploaded.status, "the presigned URL was not usable from outside").toBe(200);
+ 
+     const text = `outside media ${randomUUID()}`;
+     const posted = await post(
+       `/v1/channels/${channelId}/messages`,
+@@ -490,13 +512,30 @@
+     //
+     // THAT LAST PART IS THE PROPERTY WORTH HAVING. `RELAY_MINIO_INTERNAL_ENDPOINT`
+     // exists because the host is inside the SigV4 signature, so the address the api
+     // probes the store on and the address it signs for a client cannot be one field. A
+     // delivery URL signed with the internal one is refused rather than slow, and nothing
+     // inside the workspace would notice.
+-    const link = await get(`/v1/media/${mediaId}`, credential);
++    // AND IT IS A POLL NOW, BECAUSE ADR-14's GATE PUT A PROCESS BETWEEN THE UPLOAD AND
++    // THE LINK. *"No signed URL until `ready`"*, and the only thing that produces `ready`
++    // is the media worker — so this assertion stopped being about the delivery route
++    // alone and became the one test in the repository that exercises upload, sweep,
++    // scan, verdict and delivery end to end, from outside. **That is a real cost of the
++    // gate** and it is the one the packaging decision was made with in front of it: the
++    // unpackaged shape the ingester has would have made this unsatisfiable.
++    //
++    // THE DEADLINE IS THE SWEEP INTERVAL PLUS THE WORK. Measured at five-second polling:
++    // p50 5,080 ms from upload to `ready`, of which 7 ms is the work. Thirty seconds is
++    // six intervals, so a failure here means the worker is not running rather than that
++    // it was slow.
++    const deadline = Date.now() + 30_000;
++    let link = await get(`/v1/media/${mediaId}`, credential);
++    while (link.status === 404 && Date.now() < deadline) {
++      await new Promise((r) => setTimeout(r, 500));
++      link = await get(`/v1/media/${mediaId}`, credential);
++    }
+     expect(link.status, "the platform refused a delivery URL for its own attachment").toBe(200);
+     expect(typeof link.body["expires_at"]).toBe("string");
+ 
+     const bytes = await fetch(link.body["url"] as string);
+     expect(bytes.status, "the delivery URL was not usable from outside").toBe(200);
+     expect(new Uint8Array(await bytes.arrayBuffer())).toEqual(
+```
+

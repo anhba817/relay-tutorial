@@ -227,6 +227,13 @@ endpoints. Server-side sessions via OAuth (FR-TEN-01).
 This table is the answer to "why only six services?" — each merge is a decision with a
 stated reversal condition, which is more defensible than either extreme.
 
+**And it has answered a candidate the other way once.** Chapter 4.13's media worker fails all
+three merge criteria — a different datastore, no shared transactions, CPU-bound work off the
+request path — so it ships as a service rather than as a module. **ADR-31** is that argument,
+written against this table's own columns and carrying its own reversal condition, which is what
+makes the table load-bearing rather than decorative: a row that can only ever say *"stays
+merged"* is not a test anything could fail.
+
 ---
 
 ## 5. Runtime view
@@ -1203,6 +1210,20 @@ writes *and* backfill reads. **Trade-off:** one extra intra-cluster hop on the s
 two services and testing it twice. **Revisit:** if backfill volume ever dominates API-service
 load, grant the gateway a read-only replica path — reads don't threaten invariants.
 
+**AND `media_objects.state` HAS TWO WRITERS FROM CHAPTER 4.13, WHICH IS NOT A BREACH AND IS
+WORTH WRITING DOWN** — constitution IV names exactly this shape, so the argument goes here
+rather than being inferred from the fact that nothing broke. **The worker does not touch
+Postgres**: it posts a verdict to `/internal/media/:mediaId/verdict` and the api performs the
+write, so ADR-04's letter is untouched. What it is second writer *of* is the column's meaning.
+
+The api writes `pending` at slot time and never writes that column again. The worker's verdict
+writes `ready` or `rejected` and can only move a row out of `pending` — the statement is
+`UPDATE … WHERE state = 'pending'`, so a second verdict for a resolved object updates nothing
+and is told so. **The transitions are disjoint**: nothing but the slot route creates a row,
+nothing but a verdict leaves `pending`, and no path returns to it. That is what makes two
+writers safe here, and it is a property of the statements rather than of anybody's discipline —
+which is why the predicate is in the `UPDATE` and not in a comment above it.
+
 ### ADR-05 — Sends travel through the WebSocket, writes through the API
 **Status:** accepted · **Drivers:** D3, journey 4
 
@@ -1964,6 +1985,70 @@ uploads, the SDK's tree stops being overhead for one function and this decision 
 re-taken as a whole rather than extended one signer at a time.
 
 Full argument, the three options and the measurements: ADR-30 in `06-adr-deep-dives.md`.
+
+### ADR-31 — The media worker is a fifth service, argued against §4.2's own table
+
+**Status:** Accepted · **Date:** 2026-09-26 · **Chapter:** 4.13
+
+**Context.** FR-MED-03 and FR-MED-04 require every uploaded object to be verified against its
+declaration and virus-scanned. Constitution VII asks a new service to justify itself against
+§4.2's *"deliberately not a separate service"* table, and **no artifact in this feature had
+named that clause** until the plan's constitution check was re-read — VII was engaged twice and
+only the language half (§7.3) was written down.
+
+**Decision.** A fifth service, `services/media-worker`, packaged as a container behind
+`--profile services`.
+
+**The argument, against §4.2's three merge criteria, all of which fail:**
+
+| §4.2's criterion | The media worker |
+|---|---|
+| Same datastore | **No.** It opens the object store, which no other process in this platform opens. The api signs URLs for it and never contacts it except to probe reachability and create a bucket. |
+| Same transactions | **No.** It holds none. ADR-04 keeps it off Postgres entirely: its two questions travel the internal seam as HTTP, exactly as the dispatcher's do. |
+| A network hop is pure latency | **No.** The work is CPU-bound and off the request path. Streaming 100 MB through a signature engine costs 204 ms — measured — and the client is not waiting for it. |
+
+**And the merge would have a cost the table's other rows do not.** The api would hold the
+scanner's socket and stream customer bytes through its own heap, which is the process that also
+serves every tenant's requests. `docs/11` measures the gateway at 157 MB against a 160 MB
+budget; buffering one 100 MB object costs **142.7 MB of RSS** — measured, 1.4× the object — so
+a merged verifier would put a variable, caller-controlled allocation inside the request path's
+process.
+
+**Revisit when:** the scan is no longer the dominant cost. It is 52% of the work at 4 KiB and
+97.7% at 100 MB today. If verification became a header read — a store that scanned on write, or
+a scanner that took a URL rather than a stream — the CPU criterion would flip and this should be
+re-taken rather than extended.
+
+**What this does not claim.** The worker is not horizontally scaled today and needs no lease to
+become so: `UPDATE … WHERE state = 'pending'` is a compare-and-set, so a second instance loses
+the race and is told it lost. That is a property of the seam rather than of the packaging.
+
+### ADR-32 — A program Relay addresses over a socket is not a program Relay is implemented in
+
+**Status:** Accepted · **Date:** 2026-09-26 · **Chapter:** 4.13
+
+**Context.** Constitution VII says this platform is TypeScript, and `docs/12` §7.3 asks whether
+a virus scanner breaks that. ADR-01 named the case in advance.
+
+**Decision.** ClamAV is a container this platform speaks to over TCP, and the clause is not
+engaged. The worker that talks to it is TypeScript.
+
+**The line.** Relay already addresses five programs it is not written in — Postgres (C), Redis
+(C), NATS (Go), MinIO (Go) and ClickHouse (C++) — in four languages. Each is reached over a
+socket with a documented protocol and none of them is a violation of VII, because **the clause
+governs what Relay is implemented in and not what Relay talks to.** ClamAV's `INSTREAM` is the
+same relationship: `zINSTREAM\0`, a four-byte length before each chunk, a zero length to end.
+Twenty-two lines, no client library, on ADR-30's ratio.
+
+**What VII would forbid** is writing the media worker itself in Go — a second language in the
+build, a second test runner, a second dependency manifest and a second set of people who can
+change it. That is the case the clause is about, and this decision does not approach it.
+
+**Revisit when:** a verification step cannot be expressed as a conversation with a separate
+program. Duration probing is the near case — four container parsers with MP3 VBR as a genuinely
+hard one — and if it ever needs `ffprobe`, that is a sixth such program and not a sixth
+language. What would engage VII is needing to *link* one.
+
 
 ## 10. Risks and technical debt register
 

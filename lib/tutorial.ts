@@ -922,6 +922,16 @@ export const series: Part[] = [
         sourceDoc: "docs/04-srs.md, docs/05-sad.md, docs/12-part-4-structure.md",
         readerMinutes: 50,
       },
+      {
+        id: "4.13",
+        path: "/part-4/chapter-13/the-only-service-that-reads-the-bytes",
+        title: "The only service that reads the bytes",
+        status: "published",
+        readerProduces:
+          "A fifth service that sweeps for unverified objects, streams each one through ClamAV, checks the declared size against the store\'s own count and the declared type against the bytes, and posts a verdict back over the internal seam. The event the architecture document says it consumes has no producer and cannot have one, because the client uploads straight to the store — so the sweep the specification rejected as wasteful turns out to cost 4.2 seconds for the whole backlog, and the clause it satisfies cannot be made contingent on a client choosing to send a notice. Plus ADR-14\'s delivery gate, which turns ten tests red if it ships a chapter early; a health check that reads the scanner\'s signature-database date, because a liveness probe passes against one thirteen days old; and three test fixtures that were true statements about the platform until it grew something that reads the bytes",
+        sourceDoc: "docs/04-srs.md, docs/05-sad.md, docs/12-part-4-structure.md",
+        readerMinutes: 55,
+      },
     ],
   },
   {
