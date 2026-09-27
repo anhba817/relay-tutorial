@@ -10370,3 +10370,94 @@ still a broken chain** — chapter 4.10 found the shape and paid it twice.
            statements: 92,
          },
 ```
+
+### `services/gateway/src/limits.itest.ts` — the window instant, pinned.
+
+43 differing lines, 2 hunks. **The appendix and not chapter 3.22, because no chapter owns
+this.** The suite's own comment already records the boundary — `windowsSince` sums across it
+so a straddling test still counts ten sends as ten — and that fix reached the half the test
+READS. It could not reach the half the platform DOES: the limiter keys on the same wall-clock
+minute, so three sends against a limit of two with a boundary between the second and the third
+make the third the first request of a new window, and it is allowed. **No sum recovers a 429
+that never happened.**
+
+Two of the five tests read a count and were already safe. The three that read the platform's
+own answer — a 429, and an `x-ratelimit-remaining` of exactly `14` — were not, and CI produced
+`expected 201 to be 429` on 2026-09-27, absent from the next run on identical code.
+
+**It does not sleep to the next boundary**, which that same comment records as a fix whose
+failure mode was worse than the fault. It waits only when the window is nearly over and only
+for the sliver that is left, so the wait is bounded by the headroom rather than by the window.
+Run red with the boundary forced — `expected 201 to be 429` with the pin off, green with it on.
+
+```diff title="services/gateway/src/limits.itest.ts"
+@@ -256,12 +256,44 @@
+     const last = Math.floor(Date.now() / 60_000) * 60_000;
+     const out: number[] = [];
+     for (let w = first; w <= last; w += 60_000) out.push(w);
+     return out;
+   };
+ 
++  /** THE OTHER HALF OF THE BOUNDARY, AND `windowsSince` CANNOT REACH IT.
++   *
++   * That helper made COUNTING boundary-proof: ten sends are ten sends however the minute
++   * falls across them, because the test sums both keys. **What it cannot make
++   * boundary-proof is the PLATFORM.** The limiter keys on the same wall-clock minute, so
++   * three sends against a limit of two with a boundary between the second and the third
++   * make the third the FIRST request of a new window — and it is allowed. No sum fixes
++   * that: the 429 the test is about never happened.
++   *
++   * Two of the five tests here read a COUNT and were already safe. The other three read
++   * the platform's own answer — a 429, and an `x-ratelimit-remaining` header — and none
++   * of them was. **The earlier fix closed the half it could see**, which is why the
++   * comment above reads as complete.
++   *
++   * MEASURED: CI, 2026-09-27, `expected 201 to be 429` on the refusal test, absent from
++   * the next run on identical code.
++   *
++   * AND IT DOES NOT SLEEP TO THE NEXT BOUNDARY, which the comment above records as a fix
++   * whose failure mode was worse than the fault — a 5-second timeout that said nothing
++   * about what it was waiting for. **This waits only when the window is nearly over, and
++   * then only for the sliver that is left**: the wait is bounded by `needMs` rather than
++   * by the window. At 3 s that is 5% of runs waiting at most 3 s, against a longest
++   * measured test of **143 ms** — twenty times the burst it has to cover.
++   *
++   * In `beforeEach` rather than in the three tests that need it, so a sixth test cannot
++   * bring the class back by being written without it. */
++  const pinWindow = async (needMs = 3_000): Promise<void> => {
++    const leftInWindow = 60_000 - (Date.now() % 60_000);
++    if (leftInWindow >= needMs) return;
++    await new Promise((resolve) => setTimeout(resolve, leftInWindow + 20));
++  };
++
+   let testStartedAt = Date.now();
+ 
+   const count = async (operation: string): Promise<number> => {
+     let total = 0;
+     for (const w of windowsSince(testStartedAt)) {
+       total += Number((await redis.get(key(operation, w))) ?? 0);
+@@ -329,18 +361,17 @@
+       limits,
+     });
+     await new Promise<void>((resolve) => server.listen(0, resolve));
+     url = `ws://127.0.0.1:${(server.address() as AddressInfo).port}`;
+   }, 60_000);
+ 
+-  beforeEach(() => {
+-    // Where `count()` starts summing, and where `afterEach` starts deleting.
+-    testStartedAt = Date.now();
+-  });
+-
+-  beforeEach(() => {
++  beforeEach(async () => {
++    // THE PIN COMES FIRST, so `testStartedAt` is the instant the traffic actually
++    // starts rather than the instant before a wait — `count()` sums from it, and a
++    // window it names but never wrote to would be a wasted `GET` on every read.
++    await pinWindow();
+     // Where `count()` starts summing, and where `afterEach` starts deleting.
+     testStartedAt = Date.now();
+   });
+ 
+   afterEach(async () => {
+     for (const socket of sockets.splice(0)) socket.close();
+```
