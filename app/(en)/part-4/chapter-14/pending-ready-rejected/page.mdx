@@ -1,0 +1,341 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import {
+  figOneSchemaTwoRules,
+  figTheStateIsReadNotStored,
+  figWhyThisSubject,
+  figTheTwoHalves,
+} from "./figures";
+
+export const metadata = {
+  title: "Pending, ready, rejected — Building Relay",
+  description:
+    "A placeholder becomes real without polling. The clause is two sentences and neither was met — one of them because a single schema was serving both the door a sender writes to and the payload the platform builds. Plus a subject question answered by arithmetic somebody had already written down, and four tests that predicted their own expiry.",
+  alternates: {
+    canonical: "/part-4/chapter-14/pending-ready-rejected",
+    languages: {
+      en: "/part-4/chapter-14/pending-ready-rejected",
+      vi: "/vi/part-4/chapter-14/pending-ready-rejected",
+    },
+  },
+};
+
+<ChapterHeader id="4.14" />
+
+The worker from the last chapter is running. It sweeps for objects nobody has verified, streams
+each one through a scanner, and writes `ready` or `rejected` into a column. Every state the
+platform can hold now exists and something produces all three.
+
+**No client can see any of it.**
+
+A message carrying a photo comes back from history as `{"type": "media", "media_id": "…"}` —
+an identifier and nothing else. The object behind it might be verified, might be rejected,
+might still be in a queue. A UI showing that message has one thing it can do, which is show a
+placeholder and ask again in a few seconds. And again.
+
+The clause that fixes this is one row in the requirements, and reading it carefully is most of
+the chapter:
+
+> **FR-MED-07.** Real-time and history delivery shall include each attachment's state. A
+> `media.updated` event shall be delivered on the referencing channels when a pending attachment
+> becomes `ready` or `rejected`, so clients can replace placeholders without polling.
+
+## Two sentences, and the second one is the famous one
+
+Every artifact that has cited this clause for three chapters has cited the second sentence. The
+SRS records it as *unmet with a reachable subject*: the states exist, the event does not, a
+producer is missing. That is true.
+
+**The first sentence was also unmet, and nothing had recorded it.** Before this chapter, an
+attachment's shape was `{ type, media_id }` on every door in the platform. There was no field
+for a state to go in.
+
+That matters more than it sounds, because the two sentences are not two halves of one feature.
+They fail in different circumstances, and one of them cannot be repaired by the other.
+
+<Why title="Why the event is not enough on its own">
+
+FR-MED-06 permits attaching an object in `pending` **or** `ready`. A backend that uploads a
+photo, waits for it to be verified, and then sends the message is doing something completely
+ordinary — and for that message **no transition remains to announce**. The object was already
+terminal when the reference came into being.
+
+On the development lane, **538 of the 1,589 referenced media objects are in exactly that
+position**: already `ready` or already `rejected` before anything attached them. A client that
+learned states only from events would hold a placeholder for every one of them, for ever.
+
+So the state on the attachment is the mechanism and the event is an optimisation over it. That
+is the same shape the last chapter recorded for the upload sweep: *the sweep is the mechanism
+and a notice is an optimisation that must not change any answer.*
+
+</Why>
+
+<Figure code={figTheTwoHalves} caption="Three ways a client ends up without a frame, and one floor underneath all of them." />
+
+## One schema was doing two jobs that contradict each other
+
+The obvious way to add a state is to put a field on the attachment shape. There is one export
+called `attachmentSchema` and it looks like the place.
+
+It is four places. Three of them are doors a client writes to — the REST send body, the socket
+`message.send` frame, and the internal send seam — and the fourth is `messageSchema`, which is
+**the payload the api builds**. One schema, two rules that cannot both be obeyed:
+
+- a sender must **not** be able to declare what state an object is in, because the sender does
+  not decide that;
+- a delivered attachment must **always** carry one, because a reader with no state is back to
+  polling.
+
+<Figure code={figOneSchemaTwoRules} caption="Four users of one schema, and only one of them is outbound." />
+
+The file already knew this distinction existed. It says so about a different field, one union
+away:
+
+```ts
+      /** OPTIONAL here and required on the outbound `messageSchema`, which is not an
+       * inconsistency: a caller may send none, and a payload the platform BUILDS must
+       * always say. */
+      attachments: z.array(attachmentSchema).max(MAX_ATTACHMENTS).optional(),
+```
+
+So the chapter adds a third shape rather than a field: `deliveredAttachmentSchema`, with `state`
+**required**, and `messageSchema.attachments` points at it. The url arm is shared and unchanged —
+nothing uploaded a URL and nothing scanned it, and giving it a state for symmetry would be a
+field that is always the same value.
+
+<Trap title="Required is what makes the compiler name the doors">
+
+There is a temptation to make `state` optional so nothing breaks. It is the wrong instinct here,
+and the reason is not tidiness.
+
+Required means `tsc` names every site that builds a message. That list **is** the set of doors,
+derived rather than remembered — and this project has a long record of hand-written lists being
+wrong in both directions. The first version of this chapter's own specification named three
+doors. An analysis pass replaced that with six. The compiler named two, and one more that it is
+structurally unable to see, because that door's return type is inferred rather than annotated.
+
+Optional would have compiled immediately and shipped with an unknown number of doors serving
+`undefined`.
+
+</Trap>
+
+## The state is read when the message is served
+
+`messages.attachments` is a `jsonb` column holding what the sender declared. It would be easy to
+write the state in there too, and then a verdict would be a write across every message
+referencing the object.
+
+<Figure code={figTheStateIsReadNotStored} caption="The verdict touches one row. The message it changes the meaning of is never rewritten." />
+
+Reading at serve time costs one extra statement per page. Not one per message — the page's
+distinct media ids are collected first and fetched with a single lookup on the primary key,
+scoped by environment. The previous chapter measured what the per-row shape costs when the
+operand is not a value the planner already has: **1,042 buffers against 84.**
+
+And a test has to hold this property, because both designs produce a correct-looking answer:
+
+```ts
+    const columnBefore = await db.execute(
+      `select attachments::text as a from messages where id = '${messageId}'`,
+    );
+
+    const verdict = await recordMediaVerdict(db, { id, verdict: "ready", … });
+    expect(verdict.applied, "the compare-and-set refused a pending object").toBe(true);
+
+    expect(await stateInHistory(messageId)).toBe("ready");
+    const columnAfter = await db.execute(
+      `select attachments::text as a from messages where id = '${messageId}'`,
+    );
+    expect(columnAfter.rows[0]).toEqual(columnBefore.rows[0]);
+```
+
+Asserting the new state twice would pass against a platform that rewrote every message. The
+byte-identical column is what separates the two.
+
+## The question a review left open two parts ago
+
+The second sentence needs a subject to publish on, and this platform has five of them — one per
+real-time kind, each argued individually. A review objected to the shape rather than to any
+instance: *one subject grammar per real-time kind is becoming a default rather than a measured
+decision.*
+
+The answer to that objection is **ADR-25**, and it is a number:
+
+> Consolidate onto a typed envelope when either holds: per-channel SUBSCRIBEs would exceed
+> **six**, or a gateway instance's projected subject count exceeds **250,000**.
+
+So the question is not *should media get a subject*. It is *run the rule*.
+
+<Figure code={figWhyThisSubject} caption="Four shapes. Two are refused by rules this platform already wrote, and the cheapest dies on a field that does not exist." />
+
+A sixth grammar is **permitted** — six does not exceed six — and it spends the entire remaining
+headroom on a kind whose subscribers are exactly the subscribers of a subject that already
+exists. `fanout.ts` subscribes `chan:{channel}` and `revision:{channel}` in one call under one
+reference count, with a comment calling them *co-extensive by construction*.
+
+The cheapest option is more interesting than the chosen one. A media transition changes what a
+message **shows**, and the state is read at serve time — so re-delivering the affected message as
+`message.updated` would need no new subject, no new frame, and no client changes at all.
+
+It dies on a field that does not exist. `messageSchema` is `{id, channel, seq, user, text,
+attachments, created_at}` — **there is no `edited_at`** — so a client receiving `message.updated`
+cannot tell an attachment resolving from an author editing. Every verified photo would render
+its message as *edited*, by somebody who did not touch it.
+
+That is ADR-24's own objection to putting edits on `chan:`, arriving one level up: *the receiver
+has no way to know.*
+
+**ADR-33** takes the third arm.
+
+<Why title="What it costs, said rather than absorbed">
+
+The subject is called `revision:` and now carries something that is not a message revision. Its
+contract becomes *something changed about what this channel's messages show* — an edit, a
+deletion, or an attachment resolving.
+
+The name stays, because renaming a subject is a wire change and a fence-chain change across
+every chapter that publishes the file. What does not stay is the silence: the module says so in
+its own header, because a name that has quietly widened is worse than one that has widened on
+the record.
+
+And there was a second cost this chapter's research missed on the first pass. Reusing a subject
+means reusing its **publisher**, and `publishRevision` derived its subject from
+`revision.message.channel` — which the new arm does not have. Eight sites across two services
+reached through `.message` for the subject, the routing key or a log field. They became eight
+one-line calls to a function in the module that owns the grammar, with an exhaustive `switch`
+inside, so a fourth arm is a type error in one place rather than a subject somebody forgot.
+
+</Why>
+
+## The producer had four things missing, and none of them was the producer
+
+The verdict route is the obvious place to publish from. It already distinguishes *a transition
+happened* from *a verdict arrived* — the compare-and-set returns `applied`, and a stale worker's
+second verdict updates no rows.
+
+It also turned out to be the place in the api with the fewest things wired to it.
+
+**It had no tenant.** `recordMediaVerdict` is a module-level function on a raw database handle,
+deliberately outside the tenant-scoped repository, because its caller is a worker rather than a
+tenant — and a worker's principal carries no environment by design. The fan-out query is scoped
+by environment. There was nothing to scope it with, and the returning list did not carry one.
+
+**It had no publisher.** `MessagesModule` declares the fabric client and deliberately does not
+export it, so the internal module's controllers had nothing to inject. That failure is a runtime
+one: `Nest can't resolve dependencies`, on the first request, after lint, typecheck and every
+unit test pass. Chapter 4.10 recorded the same shape in its own words — *only a running app asks
+that question* — which is why the first test in the producer's suite exists only to make one
+request and check it is not a 500.
+
+**And the publisher it eventually got needs closing.** A second Redis client in one process
+leaks its connection on shutdown without an `OnModuleDestroy` of its own.
+
+<Trap title="A query that does not need its tenant predicate still needs it">
+
+`media_id` is a primary key. An unscoped lookup of the channels referencing an object returns
+exactly the right rows, every time, in every test.
+
+It would also be a read of a shared table with no tenant predicate — which constitution I
+forbids in the data-access layer, and which this project has a checker for precisely because the
+query working is not the question.
+
+The environment travels out of the verdict's own `RETURNING` list so the question can be asked
+properly. And the query body did not get copied: `Repository.channelsReferencingMedia` now
+delegates to the scoped function, so the delivery gate from the last chapter and this chapter's
+fan-out ask the same predicate rather than two that agree today.
+
+</Trap>
+
+## Deleting each arm, one at a time
+
+Constitution VI wants 100% branch coverage of tenant isolation, and the previous chapter measured
+what that number is worth here: an SQL clause carries no JavaScript branch, so a coverage report
+counts a deleted predicate as covered.
+
+So each arm was deleted individually and the suites re-run:
+
+```text
+arm                                  what turned red
+----------------------------------   -----------------------------------------
+the `applied` gate                   1 — the duplicate-verdict test, exactly
+the environment predicate            1 — and the gauntlet stayed GREEN at 60
+the per-channel loop                 1 — the N = 2 test, and nothing else
+the `ready`/`rejected` guard         NOTHING
+the buffering skip (gateway)         1 — the revision buffering test
+```
+
+The second row is 4.12's finding reproduced without modification. **Deleting the tenant scope
+leaves the suite the constitution names as gating releases entirely green**, and leaves the
+delivery gate green too. One test catches it, and it is the test written to ask that exact
+question.
+
+The fourth row is the interesting one. The guard cannot fire: `announce` runs only when the
+compare-and-set applied, and one that applied set the state to the verdict. It stays because it
+is what narrows a `string | null` to the two values the fabric accepts, and deleting it needs a
+cast — a claim the compiler stops checking.
+
+<Why title="Two kinds of arm that turn nothing red">
+
+Chapter 4.11 found an early return whose deletion left seventeen of seventeen tests passing, and
+called it *an optimisation wearing a branch's clothes*.
+
+This is the other kind: **a type narrowing wearing a runtime guard's clothes**. Unreachable when
+the program runs, load-bearing when it compiles.
+
+The probe cannot tell them apart — both show up as an arm nothing notices. What tells them apart
+is asking, of the arm that turned nothing red, *what would have to change for this to fire*. If
+the answer is "a caller that does not exist", it is dead code. If the answer is "nothing, because
+the compiler is the caller", it is a narrowing, and the honest move is to say so in the file
+rather than let a future reader see an uncovered line and delete it.
+
+</Why>
+
+## Four tests that predicted their own expiry
+
+Three chapters ago, when the media arm was first accepted, its author wrote assertions like this
+one:
+
+```ts
+    // EXACTLY AS SENT, which is FR-013 and is a claim about what is ABSENT. No `state`,
+    // no filename, nothing the platform knows about the object — the slot is `pending`
+    // and stays `pending` until movement VI, and a client cannot tell from this payload.
+    const body = (await res.json()) as { attachments: unknown[] };
+    expect(body.attachments).toEqual([{ type: "media", media_id: id }]);
+```
+
+This is movement VI. Four such assertions went red — the send response, history, the edit
+response, and a fourth a directory away in `messages.itest.ts` that the media suite alone did not
+find.
+
+They were not stale. They were true statements about a platform that then grew a field, which is
+the same thing the previous chapter's delivery gate did to ten fixtures one week earlier. The
+repair keeps `toEqual` on the whole array rather than loosening to a property check, because
+FR-013's claim is about what is **absent** and only whole-array equality can hold that.
+
+<Checkpoint title="What works now">
+
+- Every door that returns a message returns each media attachment's current state, read when the
+  message is served.
+- A verdict publishes one frame per channel holding a message that references the object — zero
+  channels is success and is the common case, because 4,725 of the lane's 5,403 objects are
+  referenced by nothing.
+- A duplicate verdict publishes nothing, because the frame follows the state change rather than
+  the request.
+- A client that never receives a frame still reports the right state.
+
+</Checkpoint>
+
+<ForwardRef title="What is still missing">
+
+**A rejection still renders however a client decides to render it.** FR-MED-09 wants an explicit
+rejection marker, never a broken link, and that is the milestone chapter's subject.
+
+**And during a rolling deploy, transitions vanish on un-upgraded instances.** A gateway that has
+not been restarted fails to parse the new arm and drops the frame, logging the subject and not
+the reason. The floor repairs it on the client's next read — which is the argument for having a
+floor, and the reason this window is written down rather than discovered.
+
+</ForwardRef>
+
+<ChapterFooter id="4.14" />

@@ -932,6 +932,16 @@ export const series: Part[] = [
         sourceDoc: "docs/04-srs.md, docs/05-sad.md, docs/12-part-4-structure.md",
         readerMinutes: 55,
       },
+      {
+        id: "4.14",
+        path: "/part-4/chapter-14/pending-ready-rejected",
+        title: "Pending, ready, rejected",
+        status: "published",
+        readerProduces:
+          "The state machine's other half: every door that serves a message now serves the state its media object is in right now, read when the message is served rather than stored on it, and a frame goes out to every channel referencing the object when a verdict lands. The clause is two sentences and neither was met — the event everybody quotes, and a first sentence nobody had noticed was also unmet, because one schema was serving both the door a sender writes to and the payload the platform builds. Plus the subject question a review left open two parts ago, answered by arithmetic somebody had already written down; the cheapest shape available, killed by a field that does not exist; and four tests that asserted the absence this chapter fills, under a comment saying it would last until movement VI",
+        sourceDoc: "docs/04-srs.md, docs/05-sad.md, docs/06-adr-deep-dives.md, docs/12-part-4-structure.md",
+        readerMinutes: 45,
+      },
     ],
   },
   {

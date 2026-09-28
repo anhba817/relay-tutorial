@@ -10522,3 +10522,1285 @@ Run red with the boundary forced — `expected 201 to be 429` with the pin off, 
    afterEach(async () => {
      for (const socket of sockets.splice(0)) socket.close();
 ```
+
+## Chapter 4.14 — the attachment's state, and the frame that announces it
+
+**Fifteen files, placed last for the reason this section exists.** Seven of them already carry
+appendix hunks from earlier chapters, and a hunk written at chapter 4.14's own state would be
+written against a state no reader sees — the appendix applies after every chapter, so a file it
+touches has one shape at chapter N and another at the end (4.8's finding, paid again by 4.11 and
+4.12). Generating all fifteen against the END state is one rule rather than two, and it is why
+these are here rather than in the chapter.
+
+### `packages/protocol/src/attachments.ts` — the delivered shape, and the three roles one schema was serving.
+
+```diff title="packages/protocol/src/attachments.ts"
+@@ -103,6 +103,43 @@
+  * vanishing. */
+ export const attachmentSchema = z.discriminatedUnion("type", [urlArm, mediaArm]);
+ 
++/** FR-MED-07's first sentence: the three states a media object can be in, as the wire
++ * spells them. One declaration, because `0018`'s CHECK constraint and this enum are the
++ * same closed set seen from two sides and two spellings would be the `idem_key` against
++ * `idempotency_key` defect this file's own header names. */
++export const MEDIA_STATES = ["pending", "ready", "rejected"] as const;
++
++/** WHAT THE PLATFORM BUILDS, WHICH IS NOT WHAT A SENDER DECLARES (FR-MED-07).
++ *
++ * **One schema was serving both, and that is what made this chapter's first plan
++ * impossible.** `attachmentSchema` above is embedded by four things: three request doors
++ * — `messages.schema.ts:40`, `frames.ts:94` and `internal.ts:35` — and **`messageSchema`
++ * at `frames.ts:46`, which is the payload the api BUILDS**. A sender must not be able to
++ * declare a state; a delivered attachment must always carry one. Those are opposite
++ * requirements on one shape.
++ *
++ * **REQUIRED, NOT OPTIONAL, and `frames.ts:89` already wrote the argument for a
++ * different field**: *"a caller may send none, and a payload the platform BUILDS must
++ * always say."* Required is what makes the compiler name every construction site — which
++ * is how the set of doors was derived rather than listed, after a hand list of three
++ * turned out to be six.
++ *
++ * THE URL ARM IS UNCHANGED AND SHARED. A `url` attachment has no state to carry: nothing
++ * uploaded it, nothing scanned it, and FR-MED-03's verification never touches it. Giving
++ * it one for symmetry would be a field that is always the same value, which is a field
++ * a reader has to learn and can never use. */
++const deliveredMediaArm = mediaArm.extend({
++  state: z.enum(MEDIA_STATES),
++});
++
++export const deliveredAttachmentSchema = z.discriminatedUnion("type", [
++  urlArm,
++  deliveredMediaArm,
++]);
++
++export type DeliveredAttachment = z.infer<typeof deliveredAttachmentSchema>;
++export type MediaState = (typeof MEDIA_STATES)[number];
++
+ /** THE SAME UNION FOR A READER THAT FORWARDS RATHER THAN JUDGES, and it is one export
+  * because there were nearly four copies of it.
+  *
+@@ -136,6 +173,17 @@
+  * with no `type` is still a refusal, so the reader can still tell an attachment from
+  * garbage. */
+ export const forwardedAttachmentSchema = z.union([
++  // DELIVERED FIRST, AND THE ORDER IS THE WHOLE OF THIS CHANGE. A delivered media
++  // attachment already parsed before this line existed — it fails `attachmentSchema`'s
++  // strict arm on the unknown `state` key and falls through to the loose one — so
++  // nothing was broken and nothing is fixed. What changes is the TYPE: matched by the
++  // loose arm a delivered value degrades to `{ type: string }`, and the escape hatch
++  // FR-018d put there for an arm nobody has written yet starts absorbing one we did.
++  deliveredAttachmentSchema,
++  // STILL SECOND, AND REMOVING IT WOULD BE THE EXPENSIVE MISTAKE. An envelope written
++  // by the binary that ran before this deploy carries a media attachment with no
++  // `state`, and this is the only arm that accepts it. The cost of getting that wrong
++  // is `message.term()` — destroyed after the send was acknowledged, never redelivered.
+   attachmentSchema,
+   z.looseObject({ type: z.string() }),
+ ]);
+```
+
+### `packages/protocol/src/frames.ts` — `messageSchema` points at what the platform builds, and the new frame.
+
+```diff title="packages/protocol/src/frames.ts"
+@@ -2,6 +2,7 @@
+ 
+ import {
+   attachmentSchema,
++  deliveredAttachmentSchema,
+   forwardedAttachmentSchema,
+   MAX_ATTACHMENTS,
+   refineTextAndAttachments,
+@@ -43,7 +44,14 @@
+    *
+    * FR-007: a message with none carries `[]` rather than an absent key,
+    * so a reader needs no special case. `?? []` at the read sites, never `?? null`. */
+-  attachments: z.array(attachmentSchema),
++  // DELIVERED, NOT DECLARED (FR-MED-07). This is the payload the api BUILDS, and it was
++  // sharing `attachmentSchema` with three request doors — `messages.schema.ts:40`,
++  // `messageSendSchema` below, and `internal.ts:35`. A sender must not be able to say
++  // what state an object is in; a delivered attachment must always say. One schema
++  // cannot hold both rules, and the state is read when the message is SERVED rather
++  // than stored on the row, so a message sent before a verdict reflects it afterwards
++  // without being rewritten (constitution IV: one home for one fact).
++  attachments: z.array(deliveredAttachmentSchema),
+   created_at: z.iso.datetime(), // UTC, RFC 3339 (constitution: timestamps)
+ });
+ 
+@@ -192,6 +200,40 @@
+   payload: messageDeletedPayloadSchema,
+ });
+ 
++/** FR-MED-07's second sentence: a placeholder resolves without polling.
++ *
++ * **THE NAME IS `media.updated` AND THE COLLISION WAS WEIGHED, NOT MISSED.** It sits one
++ * letter from `message.updated`, and both can describe the same message: an edited
++ * message carrying a media attachment produces `message.updated` when its text changes
++ * and this frame when its object is verified. Three names were considered —
++ * `media.updated`, `attachment.updated` and `media.state_changed`. The clause says
++ * *"a `media.updated` event"* in as many words, and a frame named differently from the
++ * requirement that mandates it costs every future reader a lookup. The collision is
++ * mitigated where it actually bites, which is the `switch` in `session.ts`: the two
++ * arms sit adjacent with this sentence between them.
++ *
++ * **IT CARRIES NO MESSAGE ID, AND THAT IS NOT AN OMISSION.** One object can be attached
++ * by several messages in one channel — 44 objects on the development lane are referenced
++ * from two channels, and FR-MSG-11 has allowed the same id twice since chapter 3.24. The
++ * frame answers *this object changed*, and a client rendering per message finds its own
++ * by media id. Naming one message would be picking one of several and calling it the
++ * one.
++ *
++ * **AND IT IS AN OPTIMISATION OVER A FLOOR THAT DOES NOT NEED IT.** Every door already
++ * serves the attachment's state, read when the message is served. A client that never
++ * receives this frame — because it attached an object that was already terminal, because
++ * it was disconnected, or because an un-upgraded gateway dropped it during a deploy —
++ * reads the right state from history. The frame removes polling; it is not how the
++ * answer is known. */
++export const mediaUpdatedSchema = z.strictObject({
++  type: z.literal("media.updated"),
++  payload: z.strictObject({
++    media_id: z.uuid(),
++    channel: z.string().min(1),
++    state: z.enum(["ready", "rejected"]),
++  }),
++});
++
+ export const membershipChangedSchema = z.strictObject({
+   type: z.literal("membership.changed"),
+   payload: z.strictObject({
+@@ -277,6 +319,9 @@
+   messageCreatedSchema,
+   messageUpdatedSchema,
+   messageDeletedSchema,
++  // FR-MED-07. Adjacent to `messageUpdatedSchema` on purpose: the two are one letter
++  // apart and can describe the same message, so a reader meets them together.
++  mediaUpdatedSchema,
+   membershipChangedSchema,
+   presenceChangedSchema,
+   typingSchema,
+@@ -291,6 +336,7 @@
+  * needs a name of its own — otherwise every producer re-declares the shape inline and the
+  * schema stops being the single statement of it. */
+ export type MessageDeleted = z.infer<typeof messageDeletedPayloadSchema>;
++export type MediaUpdated = z.infer<typeof mediaUpdatedSchema>;
+ export type ConnectionAck = z.infer<typeof connectionAckSchema>;
+ export type MessageSend = z.infer<typeof messageSendSchema>;
+ export type MessageAck = z.infer<typeof messageAckSchema>;
+```
+
+### `packages/protocol/src/revision.ts` — the third arm, and the module that owns which field holds a channel.
+
+```diff title="packages/protocol/src/revision.ts"
+@@ -50,6 +50,23 @@
+ /** What crosses `revision:{channel_id}` between gateway instances. Consumed only by
+  * gateways; each arm becomes the wire frame `frames.ts` already published.
+  *
++ * **THE SUBJECT IS NAMED `revision:` AND CARRIES MORE THAN MESSAGE REVISIONS** (chapter
++ * 4.14). Its contract is *something changed about what this channel's messages show* —
++ * an edit, a deletion, or an attachment's media object reaching a terminal state. The
++ * name is narrower than the contents and it stays: renaming a subject is a wire change
++ * and a fence-chain change across every chapter that publishes this file. **A name that
++ * has quietly widened is worse than one that has widened on the record**, so this is the
++ * record.
++ *
++ * WHY THIS SUBJECT RATHER THAN A SIXTH GRAMMAR (ADR-33). ADR-19's rule is that a kind
++ * which cannot share a payload type cannot share a subject, and ADR-20 admitted two
++ * payload types onto one subject under a test this arm also passes: *a receiver
++ * subscribes to both or neither*. `fanout.ts` already subscribes `chan:` and `revision:`
++ * together under one reference count, calling them co-extensive by construction. And
++ * ADR-25's threshold is per-channel SUBSCRIBEs exceeding six: a sixth grammar would have
++ * sat exactly on the bound and spent the last of the headroom on a kind whose subscriber
++ * set is identical to one that already exists.
++ *
+  * `discriminatedUnion`, so the two arms cannot be confused and an unknown `kind` is a
+  * rejection rather than a silent pass. `strictObject` inside each arm for the reason
+  * `membershipFabricSchema` gives: a field added on one side of a rolling deploy fails
+@@ -66,6 +83,60 @@
+   // socket untouched: a refusal there is `fanout.invalid_payload` and a dropped edit.
+   z.strictObject({ kind: z.literal("updated"), message: forwardedMessageSchema }),
+   z.strictObject({ kind: z.literal("deleted"), message: messageDeletedPayloadSchema }),
++  // THE THIRD ARM CARRIES NO MESSAGE, WHICH IS THE PART EVERY READER HAS TO LEARN
++  // (FR-MED-07). The other two are about a message; this one is about an OBJECT a
++  // message references, so its channel is a field rather than `message.channel`. Eight
++  // sites in production reached through `.message` for the subject, the routing key or
++  // a log field before this arm existed.
++  //
++  // `state` IS TWO VALUES AND NOT THREE. The frame announces a transition OUT of
++  // `pending`, so `pending` is a value the producer cannot emit; admitting it would be
++  // a state nothing can reach, which is the argument `0018` made for refusing a fourth
++  // value in the column.
++  //
++  // NO `reason`. A rejection's cause is a closed set of two and broadcasting it would
++  // tell every subscriber that a member's upload failed a virus scan. FR-MED-06's three
++  // refusals are already byte-identical for the same reason: a refusal that names its
++  // cause reports a fact about somebody else.
++  z.strictObject({
++    kind: z.literal("media"),
++    media_id: z.uuid(),
++    channel: z.string().min(1),
++    state: z.enum(["ready", "rejected"]),
++  }),
+ ]);
+ 
+ export type RevisionFabric = z.infer<typeof revisionFabricSchema>;
++
++/** THE CHANNEL A REVISION IS ABOUT, ASKED OF THE MODULE THAT OWNS THE GRAMMAR.
++ *
++ * Before chapter 4.14 every arm carried a `message` and eight sites in two services
++ * reached through `revision.message.channel` for the subject, the routing key or a log
++ * field. The media arm has no message, so each of those was a place that had to learn a
++ * third shape — and `REVISION_SUBJECT_PREFIX` is exported for exactly the reason this
++ * function now exists: *a literal there would be a second place that knows this
++ * grammar.* A per-arm `switch` repeated eight times is eight places that know it.
++ *
++ * The compiler keeps this honest: the `switch` is exhaustive over the union, so a fourth
++ * arm is a type error here rather than a subject somebody forgot to derive. */
++export function channelOfRevision(revision: RevisionFabric): string {
++  switch (revision.kind) {
++    case "updated":
++    case "deleted":
++      return revision.message.channel;
++    case "media":
++      return revision.channel;
++  }
++}
++
++/** What a log line can say about any arm, since only two of the three have a message id.
++ * `message_id` is absent rather than `undefined` for the media arm: a field that reads
++ * `undefined` looks like a value the code failed to compute, and one that is missing
++ * looks like what it is — inapplicable. */
++export function logFieldsOfRevision(
++  revision: RevisionFabric,
++): { channel: string; kind: string; message_id?: string } {
++  return revision.kind === "media"
++    ? { channel: revision.channel, kind: revision.kind }
++    : { channel: revision.message.channel, kind: revision.kind, message_id: revision.message.id };
++}
+```
+
+### `services/api/src/fanout/publisher.ts` — a publisher that no longer assumes every arm carries a message.
+
+```diff title="services/api/src/fanout/publisher.ts"
+@@ -1,4 +1,6 @@
+ import {
++  channelOfRevision,
++  logFieldsOfRevision,
+   subjectForChannel,
+   subjectForChannelRevision,
+   type Message,
+@@ -132,16 +134,17 @@
+       if (now() < downUntil) return;
+       try {
+         await redis.publish(
+-          subjectForChannelRevision(revision.message.channel),
++          // `channelOfRevision` AND NOT `revision.message.channel` (chapter 4.14). The
++          // media arm has no message, and the module that owns the grammar is the one
++          // that should answer which channel an arm is about.
++          subjectForChannelRevision(channelOfRevision(revision)),
+           JSON.stringify(revision),
+         );
+         downUntil = 0;
+       } catch (error) {
+         downUntil = now() + DOWN_WINDOW_MS;
+         logger.log("error", "fanout.publish_failed", {
+-          channel: revision.message.channel,
+-          message_id: revision.message.id,
+-          kind: revision.kind,
++          ...logFieldsOfRevision(revision),
+           request_id: context.requestId,
+           environment_id: context.environmentId,
+           error: String(error),
+```
+
+### `services/gateway/src/fanout.ts` — the same assumption, on the routing key and the gateway's own publisher.
+
+```diff title="services/gateway/src/fanout.ts"
+@@ -1,4 +1,6 @@
+ import {
++  channelOfRevision,
++  logFieldsOfRevision,
+   forwardedMessageSchema,
+   subjectForChannel,
+   subjectForChannelRevision,
+@@ -105,7 +107,7 @@
+         logger.log("error", "fanout.invalid_payload", { subject });
+         return;
+       }
+-      deliverRevision(revision.data.message.channel, revision.data);
++      deliverRevision(channelOfRevision(revision.data), revision.data);
+       return;
+     }
+     // The fabric is inside the trust boundary, and frames are STILL
+@@ -142,7 +144,7 @@
+     async publishRevision(revision) {
+       try {
+         await publisher.publish(
+-          subjectForChannelRevision(revision.message.channel),
++          subjectForChannelRevision(channelOfRevision(revision)),
+           JSON.stringify(revision),
+         );
+       } catch (error) {
+@@ -150,7 +152,7 @@
+         // committed, and a client that missed the frame repairs by re-reading history —
+         // which is what the revisions chapter's resume decision rests on.
+         logger.log("error", "fanout.publish_failed", {
+-          channel: revision.message.channel,
++          ...logFieldsOfRevision(revision),
+           error: String(error),
+         });
+       }
+```
+
+### `services/gateway/src/session.ts` — the two-way ternary becomes an exhaustive switch.
+
+```diff title="services/gateway/src/session.ts"
+@@ -395,12 +395,38 @@
+   function deliverRevision(channelId: string, revision: RevisionFabric): void {
+     for (const connection of registry.subscribersOf(channelId)) {
+       if (connection.phase === "buffering") continue;
+-      send(
+-        connection.socket,
+-        revision.kind === "updated"
+-          ? { type: "message.updated", payload: revision.message }
+-          : { type: "message.deleted", payload: revision.message },
+-      );
++      // A SWITCH AND NOT A TERNARY, because there are three arms now and the third is
++      // not a variant of the other two (chapter 4.14). A two-way conditional would have
++      // sent a media transition as `message.deleted`; the compiler stopped that only
++      // because the media arm has no `message` to read. The `never` below is what makes
++      // a FOURTH arm a type error here rather than a frame silently taking the last
++      // branch.
++      //
++      // `media.updated` IS ONE LETTER FROM `message.updated` AND THEY SIT ADJACENT ON
++      // PURPOSE. Both can describe the same message: an edit changes its text, this
++      // changes what one of its attachments resolves to.
++      switch (revision.kind) {
++        case "updated":
++          send(connection.socket, { type: "message.updated", payload: revision.message });
++          break;
++        case "deleted":
++          send(connection.socket, { type: "message.deleted", payload: revision.message });
++          break;
++        case "media":
++          send(connection.socket, {
++            type: "media.updated",
++            payload: {
++              media_id: revision.media_id,
++              channel: revision.channel,
++              state: revision.state,
++            },
++          });
++          break;
++        default: {
++          const unreachable: never = revision;
++          return unreachable;
++        }
++      }
+     }
+   }
+   fanout?.onRevision(deliverRevision);
+```
+
+### `services/api/src/db/repository.ts` — the tenant out of the verdict, and the state into every read.
+
+```diff title="services/api/src/db/repository.ts"
+@@ -15,7 +15,11 @@
+   type SQL,
+ } from "drizzle-orm";
+ 
+-import type { Attachment } from "@relay/protocol";
++import type {
++  Attachment,
++  DeliveredAttachment,
++  MediaState,
++} from "@relay/protocol";
+ 
+ import {
+   DEFAULT_LIMITS,
+@@ -550,6 +554,7 @@
+     .select({
+       id: mediaObjects.id,
+       objectKey: mediaObjects.objectKey,
++      environmentId: mediaObjects.environmentId,
+       mimeType: mediaObjects.mimeType,
+       declaredBytes: mediaObjects.declaredBytes,
+       createdAt: mediaObjects.createdAt,
+@@ -600,6 +605,44 @@
+  *
+  * AND THE WORKER NEVER TOUCHES POSTGRES (ADR-04) — this runs inside the api, called by a
+  * route on the internal seam, exactly as `creditConnectionMinutes` is. */
++/** THE CHANNELS A MEDIA OBJECT IS REFERENCED FROM, for a caller that has no repository.
++ *
++ * **A MODULE-LEVEL SIBLING OF `recordMediaVerdict`, AND THE SCOPE IS AN ARGUMENT RATHER
++ * THAN A CONSTRUCTOR.** `Repository.channelsReferencingMedia` is the delivery gate's,
++ * and it takes its tenant from `this.environmentId` — which the verdict seam does not
++ * have, because its caller is a worker. The query body is the same one, deliberately:
++ * 4.12 built and tested it, and a second lookup written for this path would drift from
++ * the one that decides who may read the bytes.
++ *
++ * **THE PREDICATE IS NOT OPTIONAL EVEN THOUGH THE LOOKUP WOULD WORK WITHOUT IT.**
++ * `media_id` is a primary key, so an unscoped query returns exactly these rows. It would
++ * also be a read of a shared table with no tenant predicate, which constitution I
++ * forbids in the data-access layer and which `check-lane-scope.py` exists to find. The
++ * environment travels out of the verdict's own `RETURNING` list so this can be asked
++ * properly.
++ *
++ * The containment operand is built here as a bound value rather than in SQL from a
++ * joined column — 4.12 measured the difference at 1,042 buffers against 84. */
++export async function channelsReferencingMediaIn(
++  db: Db,
++  environmentId: string,
++  mediaId: string,
++): Promise<string[]> {
++  const rows = await db
++    .selectDistinct({ id: channels.id })
++    .from(messages)
++    .innerJoin(channels, eq(channels.id, messages.channelId))
++    .where(
++      and(
++        sql`${messages.attachments} @> ${JSON.stringify([
++          { type: "media", media_id: mediaId },
++        ])}::jsonb`,
++        eq(channels.environmentId, environmentId),
++      ),
++    );
++  return rows.map((row) => row.id);
++}
++
+ export async function recordMediaVerdict(
+   db: Db,
+   input: {
+@@ -612,7 +655,23 @@
+     durationMs?: number;
+     reason?: "declaration_mismatch" | "scan_failed";
+   },
+-): Promise<{ applied: boolean; state: string | null; objectKey: string | null }> {
++): Promise<{
++  applied: boolean;
++  state: string | null;
++  objectKey: string | null;
++  /** THE TENANT, BECAUSE THIS FUNCTION IS THE ONLY PLACE THAT KNOWS IT (chapter 4.14).
++   *
++   * This is a module-level function on a raw `Db`, deliberately outside the
++   * tenant-scoped repository, because its caller is a worker rather than a tenant — and
++   * the worker's principal carries `environmentId: undefined` by design (4.4). FR-MED-07
++   * needs the transition announced on every channel referencing the object, and that
++   * lookup is scoped by environment. Without this value the caller's only options are a
++   * second read that can disagree with the compare-and-set, or an unscoped query, which
++   * is constitution I in the data-access layer.
++   *
++   * `null` only when no such object exists, which the caller answers with a 404. */
++  environmentId: string | null;
++}> {
+   const [updated] = await db
+     .update(mediaObjects)
+     .set({
+@@ -632,22 +691,35 @@
+       // separately would open a window in which the row moved between the two
+       // statements and the delete addressed somebody else's object.
+       objectKey: mediaObjects.objectKey,
++      // AND THE TENANT, for the same reason: the fan-out FR-MED-07 needs is scoped by
++      // environment, and this statement is the only one that knows which.
++      environmentId: mediaObjects.environmentId,
+     });
+ 
+   if (updated)
+-    return { applied: true, state: updated.state, objectKey: updated.objectKey };
++    return {
++      applied: true,
++      state: updated.state,
++      objectKey: updated.objectKey,
++      environmentId: updated.environmentId,
++    };
+ 
+   // NOT `pending`: either somebody got there first, or the object does not exist. The
+   // caller needs to tell those apart, so the current state comes back rather than a
+   // bare false.
+   const [row] = await db
+-    .select({ state: mediaObjects.state, objectKey: mediaObjects.objectKey })
++    .select({
++      state: mediaObjects.state,
++      objectKey: mediaObjects.objectKey,
++      environmentId: mediaObjects.environmentId,
++    })
+     .from(mediaObjects)
+     .where(eq(mediaObjects.id, input.id));
+   return {
+     applied: false,
+     state: row?.state ?? null,
+     objectKey: row?.objectKey ?? null,
++    environmentId: row?.environmentId ?? null,
+   };
+ }
+ 
+@@ -2414,10 +2486,17 @@
+    * parse refuses at runtime, with no compiler anywhere in between. Required here means
+    * every path that builds a row is named by `tsc` instead.
+    *
+-   * `Attachment[]` AND NOT `Attachment[] | null`, so the null lives only in the column.
+-   * FR-007: a message with none is returned with an empty list rather than an absent or
+-   * null field, and the `?? []` that makes that true belongs at the read, once. */
+-  attachments: Attachment[];
++   * `DeliveredAttachment[]` AND NOT `Attachment[] | null`, so the null lives only in
++   * the column. FR-007: a message with none is returned with an empty list rather than
++   * an absent or null field, and the `?? []` that makes that true belongs at the read,
++   * once.
++   *
++   * **DELIVERED SINCE CHAPTER 4.14.** This interface is what a READ returns, and every
++   * read runs `withMediaStates` over it, so a media attachment on a row that reaches a
++   * caller always carries the state its object is in. A write path that builds one of
++   * these has to say the state too — which is the compiler naming the sites rather than
++   * a convention somebody has to remember. */
++  attachments: DeliveredAttachment[];
+   created_at: string;
+   /** When it was last edited, or `null` (FR-003). Optional on this
+    * interface rather than required, because the WRITE paths build a row that has never
+@@ -4301,7 +4380,11 @@
+       idempotencyKey?: string;
+     },
+   ): Promise<MessageRow> {
+-    return this.db.transaction(async (tx) => {
++    // FR-MED-07: decorated AFTER the transaction commits. The media state is not
++    // part of this write and reading it on the transaction's own connection would
++    // tie one fact's freshness to another's commit. One extra statement.
++    return this.withMediaState(
++      await this.db.transaction(async (tx) => {
+       // ONE PERIOD FOR THE WHOLE TRANSACTION, taken before anything is checked.
+       // The cap check and the increment must agree about which month this is; a
+       // send that checked August and incremented September would be refused
+@@ -4757,7 +4840,8 @@
+         attachments: attachments ?? [],
+         created_at: createdAt,
+       };
+-    });
++    }),
++    );
+   }
+ 
+   /** Change what a message says (FR-001, FR-002, FR-003, FR-004).
+@@ -4796,7 +4880,11 @@
+       userId,
+     }: { text: string; userId: string },
+   ): Promise<EditedMessageRow> {
+-    return this.db.transaction(async (tx) => {
++    // FR-MED-07: decorated AFTER the transaction commits. The media state is not
++    // part of this write and reading it on the transaction's own connection would
++    // tie one fact's freshness to another's commit. One extra statement.
++    return this.withMediaState(
++      await this.db.transaction(async (tx) => {
+       // THE ROW AND ITS CHANNEL IN ONE READ, joined so the tenant scope and the
+       // channel-membership of the message are the same question. `messageId` alone
+       // would edit a message of any channel of any tenant that guessed a uuid.
+@@ -4963,7 +5051,8 @@
+         edited_at: toIso(editedAt),
+         prior_text: row.text,
+       };
+-    });
++    }),
++    );
+   }
+ 
+   /** Turn a message into a tombstone (FR-006, FR-006a, FR-009).
+@@ -5626,7 +5715,10 @@
+         `idempotency key ${idempotencyKey} conflicted but its message is missing — index inconsistency`,
+       );
+     }
+-    return {
++    // FR-MED-07: the same decoration every other read does. An idempotent retry gets
++    // the state the object is in NOW, not the state it was in when the first send
++    // committed — which is the point of reading it at serve time.
++    return this.withMediaState({
+       ...row,
+       // FR-007's `?? []`, AT THE READ. The column holds NULL for a message with no
+       // attachments and `[]` is what a client gets, so exactly one place converts.
+@@ -5634,7 +5726,7 @@
+       // `||` here is how a `0` or a `""` becomes a default somewhere else.
+       attachments: row.attachments ?? [],
+       created_at: toIso(row.created_at),
+-    };
++    });
+   }
+ 
+   /** Does this channel resolve IN THIS TENANT? (chapter 2.8.)
+@@ -5817,23 +5909,75 @@
+    * channel afterwards, so the predicate below is redundant for correctness — and without
+    * it this is the only read in this file that would scan every tenant's rows. A query
+    * whose safety depends on a later call is a query somebody will reuse without it. */
+-  private async channelsReferencingMedia(mediaId: string): Promise<string[]> {
+-    const rows = await this.db
+-      .selectDistinct({ id: channels.id })
+-      .from(messages)
+-      .innerJoin(channels, eq(channels.id, messages.channelId))
+-      .where(
+-        and(
+-          // THE OPERAND IS A BOUND VALUE, WHICH IS WHAT THE INDEX NEEDS. Built here
+-          // rather than in SQL from a joined column: `jsonb_build_array(...)` over
+-          // `o.id` is an expression the planner cannot look up.
+-          sql`${messages.attachments} @> ${JSON.stringify([
+-            { type: "media", media_id: mediaId },
+-          ])}::jsonb`,
+-          eq(channels.environmentId, this.environmentId),
++  /** FR-MED-07's first sentence: an attachment is served with the state its object is
++   * in **right now**, not the state it was in when the message was sent.
++   *
++   * **TWO QUERIES PER PAGE AND NOT ONE PER ROW.** The obvious shape is a correlated
++   * subquery that decorates each row's jsonb, which is one lookup per message per
++   * attachment; 4.12 measured what that costs on the read path — 1,042 buffers against
++   * 84 — and the repair was to make the operand a value the planner already has. Here
++   * the whole page's media ids are collected first and fetched with one `= any(...)`
++   * against the primary key, scoped by environment. A fifty-message page costs one extra
++   * statement, whatever it attaches.
++   *
++   * **THE STATE IS NOT STORED ON THE MESSAGE, AND THAT IS FR-002 RATHER THAN A
++   * SHORTCUT.** `messages.attachments` holds what the sender declared. Writing a state
++   * into it would make every verdict a write across every referencing message and give
++   * one fact two homes, which is constitution IV.
++   *
++   * An id with no row — an object erased between the message being read and this
++   * query — is served as `pending`, because the alternative is dropping the attachment
++   * and a reader would see a message that never had it. FR-MED-10 destroys unreferenced
++   * objects, and a referenced one is not among them. */
++  private async withMediaStates<T extends { attachments: Attachment[] }>(
++    rows: T[],
++  ): Promise<(Omit<T, "attachments"> & { attachments: DeliveredAttachment[] })[]> {
++    const ids = [
++      ...new Set(
++        rows.flatMap((row) =>
++          row.attachments.filter((a) => a.type === "media").map((a) => a.media_id),
+         ),
+-      );
+-    return rows.map((row) => row.id);
++      ),
++    ];
++    const states = new Map<string, MediaState>();
++    if (ids.length > 0) {
++      const found = await this.db
++        .select({ id: mediaObjects.id, state: mediaObjects.state })
++        .from(mediaObjects)
++        .where(
++          and(
++            inArray(mediaObjects.id, ids),
++            // THE TENANT PREDICATE, on a lookup by primary key that does not need it to
++            // return the right rows — and constitution I is about the layer, not about
++            // whether a given query could get away without it.
++            eq(mediaObjects.environmentId, this.environmentId),
++          ),
++        );
++      for (const row of found) states.set(row.id, row.state as MediaState);
++    }
++    return rows.map((row) => ({
++      ...row,
++      attachments: row.attachments.map((a) =>
++        a.type === "media" ? { ...a, state: states.get(a.media_id) ?? "pending" } : a,
++      ),
++    }));
++  }
++
++  /** One row, same query, same rule. Named separately so a caller reads as what it is
++   * rather than as an array of one. */
++  private async withMediaState<T extends { attachments: Attachment[] }>(
++    row: T,
++  ): Promise<Omit<T, "attachments"> & { attachments: DeliveredAttachment[] }> {
++    const [decorated] = await this.withMediaStates([row]);
++    return decorated!;
++  }
++
++  private async channelsReferencingMedia(mediaId: string): Promise<string[]> {
++    // ONE QUERY BODY, TWO CALLERS (chapter 4.14). The verdict seam has no repository to
++    // call this on, so the statement moved to a module-level function that takes the
++    // scope as an argument. Delegating rather than repeating is what keeps the delivery
++    // gate and the fan-out asking the same question of the same predicate.
++    return channelsReferencingMediaIn(this.db, this.environmentId, mediaId);
+   }
+ 
+   async channelExists(channelId: string): Promise<boolean> {
+@@ -5972,7 +6116,12 @@
+           .where(scoped(gt(messages.sequence, afterSeq)))
+           .orderBy(asc(messages.sequence))
+           .limit(limit));
+-    return rows.map((row) => ({
++    // FR-MED-07: the state each media attachment's object is in NOW, added after the
++    // page is read and in one query for the whole page (see `withMediaStates`). It is
++    // read here rather than stored on the message, so a message sent before a verdict
++    // reflects the verdict the next time anybody reads it.
++    return this.withMediaStates(
++      rows.map((row) => ({
+       ...row,
+       /** FR-007's `?? []`, IN THE MAP AND NOT IN THE CALLER.
+        *
+@@ -5987,7 +6136,8 @@
+       // key and a null one are the same value through `??` — the control test for this
+       // field was green before the field existed because its first draft used `??`.
+       edited_at: row.edited_at === null ? null : toIso(row.edited_at),
+-    }));
++      })),
++    );
+   }
+ 
+   /** Resume backfill (chapter 2.7, FR-RTM-03): for each cursor, everything
+```
+
+### `services/api/src/internal/internal.module.ts` — the publisher `MessagesModule` withholds.
+
+```diff title="services/api/src/internal/internal.module.ts"
+@@ -1,9 +1,21 @@
+-import { Module, Scope } from "@nestjs/common";
++import {
++  Inject,
++  Injectable,
++  Module,
++  type OnModuleDestroy,
++  Scope,
++} from "@nestjs/common";
+ 
+ import { MessagesModule } from "../messages/messages.module";
+ import { AuthModule } from "../auth/auth.module";
+ import { createDb, createPool, type Db } from "../db/client";
++import {
++  createMessagePublisher,
++  MESSAGE_PUBLISHER,
++  type MessagePublisher,
++} from "../fanout/publisher";
+ import { LOGGER, apiLogger } from "../logger";
++import type { Logger } from "@relay/service-kit";
+ import {
+   createJetStreamPublisher,
+   ensureAnalyticsStream,
+@@ -29,6 +41,22 @@
+ // so this module declares its own — the same DEFAULT-scoped factory every other
+ // module here uses, and a smaller change than widening 2.2's exports for a
+ // reason 2.2 has nothing to do with.
++/** Closes the publisher this module declares. `MessagesModule` has its twin, and the
++ * two are separate clients on purpose: sharing one would mean exporting a token that
++ * module withholds, and `ANALYTICS_PUBLISHER` already set the precedent for a second
++ * client in this process — argued rather than assumed. The cost is one more Redis
++ * connection per api instance. */
++@Injectable()
++export class InternalMessagePublisherLifecycle implements OnModuleDestroy {
++  constructor(
++    @Inject(MESSAGE_PUBLISHER) private readonly publisher: MessagePublisher,
++  ) {}
++
++  async onModuleDestroy(): Promise<void> {
++    await this.publisher.close();
++  }
++}
++
+ @Module({
+   imports: [MessagesModule, AuthModule],
+   controllers: [
+@@ -75,6 +103,30 @@
+       useFactory: apiLogger,
+       scope: Scope.DEFAULT,
+     },
++    // FR-MED-07's producer needs a fabric, and this module had no way to reach one.
++    //
++    // `MessagesModule` declares `MESSAGE_PUBLISHER` and **deliberately does not export
++    // it** — its own comment says so — so importing that module gives the controllers
++    // here nothing to inject. Same reason `LOGGER` and `ANALYTICS_PUBLISHER` are
++    // redeclared above: a provider is visible to the module that declares it and to
++    // nothing it imports.
++    //
++    // **WITHOUT THIS THE FAILURE IS A RUNTIME ONE.** `Nest can't resolve dependencies of
++    // the MediaVerificationController` on the first request, after lint, typecheck and
++    // every unit test pass — which is exactly what chapter 4.10 recorded when
++    // `MediaModule` declared a service it did not provide: *"Only a running app asks
++    // that question."* `media-verdict.itest.ts` is the test that asks it.
++    {
++      provide: MESSAGE_PUBLISHER,
++      inject: [LOGGER],
++      useFactory: (logger: Logger): MessagePublisher =>
++        createMessagePublisher({ logger }),
++      scope: Scope.DEFAULT,
++    },
++    // AND SOMETHING HAS TO CLOSE IT. `MessagesModule` pairs its publisher with a
++    // lifecycle for the same reason; a second client with no `OnModuleDestroy` leaks its
++    // connection on shutdown, and the api is a process that gets restarted.
++    InternalMessagePublisherLifecycle,
+   ],
+ })
+ export class InternalModule {}
+```
+
+### `packages/protocol/src/frames.test.ts` — what the built shape must say and the forwarding shape must not insist on.
+
+```diff title="packages/protocol/src/frames.test.ts"
+@@ -1,13 +1,20 @@
+ import { describe, expect, it } from "vitest";
+ 
+-import { frameSchema, messageDeletedSchema, messageSchema, parseFrame } from "./frames.js";
++import {
++  forwardedMessageSchema,
++  frameSchema,
++  mediaUpdatedSchema,
++  messageDeletedSchema,
++  messageSchema,
++  parseFrame,
++} from "./frames.js";
+ 
+ // The contract must bite: for every frame, one specimen that parses and a
+ // table of malformed near-misses that MUST reject. A schema that accepts
+ // garbage is worse than no schema — it certifies garbage.
+ 
+ const message = {
+   id: "m1",
+   channel: "c1",
+   seq: 42,
+   user: "u1",
+@@ -257,22 +264,26 @@
+         type: "message.deleted",
+         payload: tombstone,
+       }).success,
+     ).toBe(true);
+   });
+ });
+ 
+ describe("the frame union's membership", () => {
+   const members = frameSchema.options.map((o) => o.shape.type.value);
+ 
+-  it("has eleven members", () => {
+-    expect(members).toHaveLength(11);
++  // TWELVE SINCE CHAPTER 4.14, AND THIS TEST IS WHY THE COUNT IS WRITTEN DOWN. It went
++  // red on `media.updated` the moment the frame joined the union, which is the whole
++  // job of an accounting assertion: a frame added and not announced is a contract
++  // change nobody reviewed.
++  it("has twelve members", () => {
++    expect(members).toHaveLength(12);
+   });
+ 
+   it("names exactly two inbound frames, and both end in `.send`", () => {
+     // The direction is not derivable from the schema — `isolation.itest.ts`'s
+     // DIRECTIONS table is where it lives, and this asserts the naming rule that
+     // makes the table's inbound rows predictable rather than remembered.
+     expect(members.filter((m) => m.endsWith(".send")).sort()).toEqual([
+       "message.send",
+       "typing.send",
+     ]);
+@@ -282,10 +293,96 @@
+     // FR-008: `typingSchema` is not edited by this chapter. The pair is the
+     // proof — same subject, two frames, and only the server's has a `user`.
+     expect(parseFrame({ type: "typing", payload: { channel: "c1" } }).success).toBe(
+       false,
+     );
+     expect(
+       parseFrame({ type: "typing.send", payload: { channel: "c1" } }).success,
+     ).toBe(true);
+   });
+ });
++
++describe("media.updated, the frame that lets a placeholder resolve (4.14)", () => {
++  const MEDIA = "b61bfdfb-b42e-4e95-a1ed-2bedd3a4ed21";
++  const CHANNEL = "6f1d2e3a-4b5c-4d6e-8f90-a1b2c3d4e5f6";
++  const frame = {
++    type: "media.updated",
++    payload: { media_id: MEDIA, channel: CHANNEL, state: "ready" },
++  } as const;
++
++  it("parses through the union every frame must belong to", () => {
++    expect(frameSchema.parse(frame)).toEqual(frame);
++  });
++
++  // NO `reason`. The cause of a rejection is a closed set of two, and putting it on a
++  // channel fabric tells every subscriber that a member's upload failed a virus scan.
++  // FR-MED-06's three refusals are byte-identical for the same reason.
++  it("refuses a rejection reason, which would be a fact about somebody else", () => {
++    expect(
++      mediaUpdatedSchema.safeParse({
++        type: "media.updated",
++        payload: { ...frame.payload, state: "rejected", reason: "scan_failed" },
++      }).success,
++    ).toBe(false);
++  });
++
++  // NO message id. One object can be attached by several messages in one channel, so
++  // naming one would be picking one of several and calling it the one.
++  it("refuses a message id", () => {
++    expect(
++      mediaUpdatedSchema.safeParse({
++        type: "media.updated",
++        payload: { ...frame.payload, message_id: MEDIA },
++      }).success,
++    ).toBe(false);
++  });
++
++  it("refuses state pending, which is not a transition out of pending", () => {
++    expect(
++      mediaUpdatedSchema.safeParse({
++        type: "media.updated",
++        payload: { ...frame.payload, state: "pending" },
++      }).success,
++    ).toBe(false);
++  });
++});
++
++describe("the live delivery reader and the binary that ran before this deploy (4.14)", () => {
++  const ID = "b61bfdfb-b42e-4e95-a1ed-2bedd3a4ed21";
++  const base = {
++    id: "m1",
++    channel: "c1",
++    seq: 1,
++    user: "u1",
++    text: "hello",
++    created_at: "2026-09-28T00:00:00.000Z",
++  };
++
++  // T028. `gateway/src/fanout.ts` parses every frame off the fabric with
++  // `forwardedMessageSchema` and answers a failure with a log line and a `return` — the
++  // frame is dropped, the sender already holds its 201, and no socket on that instance
++  // sees it. An envelope written before this chapter carries a media attachment with no
++  // `state`; if this reader required one, a rolling deploy would drop every message
++  // carrying a photo.
++  it("parses a forwarded message whose media attachment has no state", () => {
++    const envelope = { ...base, attachments: [{ type: "media", media_id: ID }] };
++    expect(forwardedMessageSchema.parse(envelope)).toEqual(envelope);
++  });
++
++  it("parses one written after, and keeps the state", () => {
++    const envelope = {
++      ...base,
++      attachments: [{ type: "media", media_id: ID, state: "rejected" }],
++    };
++    expect(forwardedMessageSchema.parse(envelope)).toEqual(envelope);
++  });
++
++  // AND THE STRICT SHAPE REFUSES THE OLD ONE, which is what makes the pair meaningful:
++  // `messageSchema` is what the api BUILDS and must always say, `forwardedMessageSchema`
++  // is what a relay READS and must never insist.
++  it("and the built shape refuses a media attachment with no state", () => {
++    expect(
++      messageSchema.safeParse({ ...base, attachments: [{ type: "media", media_id: ID }] })
++        .success,
++    ).toBe(false);
++  });
++});
+```
+
+### `packages/protocol/src/revision.test.ts` — the third arm, and `channelOfRevision` for every arm.
+
+```diff title="packages/protocol/src/revision.test.ts"
+@@ -2,6 +2,8 @@
+ 
+ import {
+   isChannelRevisionSubject,
++  channelOfRevision,
++  logFieldsOfRevision,
+   revisionFabricSchema,
+   subjectForChannelRevision,
+ } from "./revision.js";
+@@ -113,3 +115,58 @@
+     ).toBe(false);
+   });
+ });
++
++describe("the third arm: a transition of an object a message references (4.14)", () => {
++  const MEDIA = "b61bfdfb-b42e-4e95-a1ed-2bedd3a4ed21";
++  const CHANNEL = "6f1d2e3a-4b5c-4d6e-8f90-a1b2c3d4e5f6";
++  const arm = { kind: "media", media_id: MEDIA, channel: CHANNEL, state: "ready" } as const;
++
++  it("parses, and its channel is a field rather than a message's", () => {
++    expect(revisionFabricSchema.parse(arm)).toEqual(arm);
++  });
++
++  // `pending` IS A STATE THE PRODUCER CANNOT EMIT. The frame announces a transition out
++  // of it, so admitting it would be a value nothing can reach — `0018`'s argument for
++  // refusing a fourth value in the column, applied to the wire.
++  it("refuses state pending, which no transition can announce", () => {
++    expect(revisionFabricSchema.safeParse({ ...arm, state: "pending" }).success).toBe(false);
++  });
++
++  it("refuses an unknown key, like both older arms", () => {
++    expect(
++      revisionFabricSchema.safeParse({ ...arm, reason: "scan_failed" }).success,
++    ).toBe(false);
++  });
++
++  it("refuses an unknown kind rather than guessing", () => {
++    expect(revisionFabricSchema.safeParse({ ...arm, kind: "media.v2" }).success).toBe(false);
++  });
++});
++
++describe("channelOfRevision answers for every arm (4.14)", () => {
++  const CHANNEL = "6f1d2e3a-4b5c-4d6e-8f90-a1b2c3d4e5f6";
++
++  // Eight production sites reached through `revision.message.channel` before the media
++  // arm existed. This is the one place that knows which field each arm keeps it in.
++  it("reads a media arm's own channel field", () => {
++    expect(
++      channelOfRevision({
++        kind: "media",
++        media_id: "b61bfdfb-b42e-4e95-a1ed-2bedd3a4ed21",
++        channel: CHANNEL,
++        state: "rejected",
++      }),
++    ).toBe(CHANNEL);
++  });
++
++  it("omits message_id for a media arm rather than logging undefined", () => {
++    const fields = logFieldsOfRevision({
++      kind: "media",
++      media_id: "b61bfdfb-b42e-4e95-a1ed-2bedd3a4ed21",
++      channel: CHANNEL,
++      state: "ready",
++    });
++    expect(fields).toEqual({ channel: CHANNEL, kind: "media" });
++    expect("message_id" in fields).toBe(false);
++  });
++});
+```
+
+### `services/api/src/fanout/publisher.test.ts` — the media arm publishes to its own channel, and logs no message id.
+
+```diff title="services/api/src/fanout/publisher.test.ts"
+@@ -254,3 +254,39 @@
+     expect(publishes).toHaveLength(1);
+   });
+ });
++
++describe("the media arm, which carries no message (4.14)", () => {
++  const mediaRevision = {
++    kind: "media",
++    media_id: "b61bfdfb-b42e-4e95-a1ed-2bedd3a4ed21",
++    channel: "c1",
++    state: "ready",
++  } as const;
++
++  // THE SUBJECT COMES FROM THE ARM'S OWN CHANNEL FIELD. Before this chapter the
++  // publisher read `revision.message.channel`, which the media arm does not have —
++  // it would have published to `revision:undefined`, a subject nobody subscribes to,
++  // and `publishRevision` never rejects, so nothing would have said so.
++  it("publishes to the channel named on the arm itself", async () => {
++    const { logger } = sink();
++    await createMessagePublisher({ logger }).publishRevision(mediaRevision, context);
++    expect(publishes).toHaveLength(1);
++    expect(publishes[0]?.[0]).toBe("revision:c1");
++  });
++
++  // `publishRevision` NEVER REJECTS by contract, so a test that only checks the happy
++  // path cannot tell a published frame from a swallowed one. This asserts what the log
++  // says, and that a media arm logs no `message_id` rather than logging `undefined`.
++  it("logs without throwing when the broker is down, and omits message_id", async () => {
++    throwing = true;
++    const { lines, logger } = sink();
++    await expect(
++      createMessagePublisher({ logger }).publishRevision(mediaRevision, context),
++    ).resolves.toBeUndefined();
++    const failure = lines.find((l) => l["msg"] === "fanout.publish_failed");
++    expect(failure).toBeDefined();
++    expect(failure?.["channel"]).toBe("c1");
++    expect(failure?.["kind"]).toBe("media");
++    expect("message_id" in (failure ?? {})).toBe(false);
++  });
++});
+```
+
+### `services/gateway/src/session.test.ts` — a media transition is not a deletion, and who is not told.
+
+```diff title="services/gateway/src/session.test.ts"
+@@ -6,7 +6,12 @@
+ 
+ import { createLogger, type Logger } from "@relay/service-kit";
+ import { serve } from "@relay/service-kit";
+-import { CLOSE_CODES, type Frame, type RevisionFabric } from "@relay/protocol";
++import {
++  channelOfRevision,
++  CLOSE_CODES,
++  type Frame,
++  type RevisionFabric,
++} from "@relay/protocol";
+ 
+ import type { InternalSendResponse, Message } from "@relay/protocol";
+ 
+@@ -160,8 +165,13 @@
+     // The same rule the message emitter honours: a revision published to a subject this
+     // instance has not subscribed to does not arrive.
+     emitRevision: (revision: RevisionFabric) => {
+-      if (subjects.includes(revision.message.channel)) {
+-        deliverRevision(revision.message.channel, revision);
++      // `channelOfRevision` FOR THE REASON PRODUCTION USES IT: not every arm carries a
++      // message. A harness that cannot route the media arm would leave every test
++      // downstream of it unable to exercise that path — and it would do so while
++      // staying green, which is worse than a red test.
++      const channel = channelOfRevision(revision);
++      if (subjects.includes(channel)) {
++        deliverRevision(channel, revision);
+       }
+     },
+     subscribe: async (channelId) => {
+@@ -669,6 +679,84 @@
+     socket.close();
+   });
+ 
++  it("a media transition arrives as media.updated, not as a revision of a message", async () => {
++    const fanout = stubFanout();
++    harness = await boot(stubApi({}), undefined, fanout);
++    const socket = new WebSocket(`${harness.url}?token=${await token()}`);
++    const frames = record(socket);
++    await nextFrame(socket, "connection.ack");
++    await settle();
++
++    fanout.emitRevision({
++      kind: "media",
++      media_id: "b61bfdfb-b42e-4e95-a1ed-2bedd3a4ed21",
++      channel: CHANNEL,
++      state: "ready",
++    });
++    await settle();
++
++    const updates = frames.filter((f) => f.type === "media.updated");
++    expect(updates).toHaveLength(1);
++    expect(updates[0]).toMatchObject({
++      payload: { media_id: "b61bfdfb-b42e-4e95-a1ed-2bedd3a4ed21", state: "ready" },
++    });
++    // THE FALSIFYING HALF, AND IT IS WHY THE TERNARY BECAME A SWITCH. A two-way
++    // conditional on `kind === "updated"` sends everything else down the `deleted`
++    // branch, so a media transition would have arrived as `message.deleted` — a frame
++    // telling a client its message is gone. The compiler stopped that shape because the
++    // media arm has no `message`; this is the assertion that would have caught it if the
++    // arm had carried one.
++    expect(frames.filter((f) => f.type === "message.deleted")).toEqual([]);
++    expect(frames.filter((f) => f.type === "message.updated")).toEqual([]);
++    socket.close();
++  });
++
++  // T042/T043 — CONSTITUTION I ON THE DELIVERY SIDE. A transition is addressed to a
++  // CHANNEL, and a connection receives it only if it is subscribed to that channel.
++  // Subscription follows membership (`session.ts:593`), so a non-member receives
++  // nothing without this path needing an access rule of its own.
++  it("a media transition for a channel this connection is not in reaches nobody", async () => {
++    const fanout = stubFanout();
++    harness = await boot(stubApi({}), undefined, fanout);
++    const socket = new WebSocket(`${harness.url}?token=${await token()}`);
++    const frames = record(socket);
++    await nextFrame(socket, "connection.ack");
++    await settle();
++
++    // A POSITIVE CONTROL FIRST, so the silence below is evidence rather than a bet that
++    // nothing was delivered for an unrelated reason.
++    fanout.emitRevision({
++      kind: "media",
++      media_id: "b61bfdfb-b42e-4e95-a1ed-2bedd3a4ed21",
++      channel: CHANNEL,
++      state: "ready",
++    });
++    await settle();
++    expect(frames.filter((f) => f.type === "media.updated")).toHaveLength(1);
++
++    fanout.emitRevision({
++      kind: "media",
++      media_id: "c72cfefc-c53f-4fa6-b2be-3cfee4b5fe32",
++      channel: "99999999-9999-9999-9999-999999999999",
++      state: "rejected",
++    });
++    await settle();
++
++    // STILL ONE. The second transition names a channel this connection never joined,
++    // and the stub fabric routes on the subject exactly as Redis does.
++    //
++    // **AND THIS IS ALSO THE UNDER-DELIVERY CASE, WHICH IS THE SAFE DIRECTION.**
++    // FR-MED-08 authorises by channel VISIBILITY — a user may read a public channel's
++    // messages without being a member — while a connection subscribes by MEMBERSHIP.
++    // So subscribers are a subset of authorised readers: a non-member of a PUBLIC
++    // channel is entitled to the photo and will not get this frame. The set is
++    // narrower, never wider, so FR-007 holds by construction and history is the repair.
++    // Recorded here so nobody later "fixes" it by broadcasting wider, which is the
++    // direction that would leak.
++    expect(frames.filter((f) => f.type === "media.updated")).toHaveLength(1);
++    socket.close();
++  });
++
+   it("a deletion arrives as message.deleted, with no text on it", async () => {
+     const fanout = stubFanout();
+     harness = await boot(stubApi({}), undefined, fanout);
+```
+
+### `services/gateway/src/fanout.itest.ts` — three assertions that needed a `kind` guard once a third arm existed.
+
+```diff title="services/gateway/src/fanout.itest.ts"
+@@ -260,7 +260,10 @@
+ 
+     const [, revision] = await nextRevision(g2);
+     expect(revision.kind).toBe("deleted");
+-    expect(revision.message.seq).toBe(9);
++    // GUARDED, like the `updated` assertion above it. Before the media arm existed
++    // every arm had a message and the guard was optional; now it is what makes the
++    // assertion type-check, and asserting the kind first is what makes it meaningful.
++    expect(revision.kind === "deleted" && revision.message.seq).toBe(9);
+     expect(g2.deliveries).toEqual([]);
+     await g2.fanout.unsubscribe(CHANNEL);
+   });
+@@ -276,7 +279,7 @@
+     await g2.fanout.subscribe(own);
+     await g1.fanout.publishRevision({ kind: "updated", message: messageOn(own, 10) });
+     const [, revision] = await nextRevision(g2);
+-    expect(revision.message.seq).toBe(10);
++    expect(revision.kind === "updated" && revision.message.seq).toBe(10);
+ 
+     await g2.fanout.unsubscribe(own);
+     await g1.fanout.publishRevision({ kind: "updated", message: messageOn(own, 11) });
+@@ -310,7 +313,7 @@
+     // the schema and not a dead subscription.
+     await raw.fanout.publishRevision({ kind: "updated", message: messageOn(CHANNEL, 14) });
+     const [, good] = await nextRevision(g2);
+-    expect(good.message.seq).toBe(14);
++    expect(good.kind === "updated" && good.message.seq).toBe(14);
+     await raw.fanout.close();
+     await g2.fanout.unsubscribe(CHANNEL);
+   });
+```
+
+### `services/gateway/src/main.test.ts` — the second hard-coded frame count, which also fired.
+
+```diff title="services/gateway/src/main.test.ts"
+@@ -39,12 +39,18 @@
+       const expectedFrames = frameSchema.options.map((o) => o.shape.type.value);
+       expect(body.protocol.frames).toEqual(expectedFrames);
+       expect(body.protocol.frames).toContain("connection.ack");
+-      // ELEVEN from the typing chapter's `typing.send`. The `toEqual` above is derived
+-      // on both sides and needed nothing; this line is the second of the two
+-      // hard-coded frame counts in the repository, and the only one no task
+-      // owned until analysis pass 17. It failed here in the UNIT lane, which
+-      // `test:integration` does not run and no phase gate ran until pass 18.
+-      expect(body.protocol.frames).toHaveLength(11);
++      // TWELVE since chapter 4.14's `media.updated`. Eleven came from the typing
++      // chapter's `typing.send`. The `toEqual` above is derived on both sides and
++      // needed nothing; this line is the second of the two hard-coded frame counts in
++      // the repository, and the only one no task owned until analysis pass 17. It
++      // failed here in the UNIT lane, which `test:integration` does not run and no
++      // phase gate ran until pass 18.
++      //
++      // BOTH HARD-CODED COUNTS FIRED ON 4.14, WHICH IS WHY THERE ARE TWO. The protocol
++      // package asserts the union's own length; this asserts what the gateway
++      // ADVERTISES over HTTP. A frame added to the union and not served would pass the
++      // first and fail this one.
++      expect(body.protocol.frames).toHaveLength(12);
+       expect(body.protocol.close_codes).toEqual(
+         Object.keys(CLOSE_CODES).map(Number),
+       );
+```
+
+### `services/api/src/messages/messages.itest.ts` — the fourth assertion that predicted movement VI.
+
+```diff title="services/api/src/messages/messages.itest.ts"
+@@ -233,12 +233,17 @@
+         attachments: [{ type: "media", media_id }],
+       });
+       expect(res.status).toBe(201);
+-      // AND IT COMES BACK AS SENT. `state` is not on the wire — FR-013 — so what a
+-      // reader gets is the two keys the client wrote and nothing the platform knows
+-      // about the object. The slot is `pending` and will stay `pending` until movement
+-      // VI, and a client cannot tell from this payload.
++      // AND IT COMES BACK AS SENT, PLUS THE ONE FIELD MOVEMENT VI ADDS. This read
++      // `[{ type, media_id }]` under a comment saying the slot *"will stay `pending`
++      // until movement VI, and a client cannot tell from this payload"*. Chapter 4.14
++      // is movement VI and a client can tell. **The fourth assertion of this shape** —
++      // three are in `media/attach.itest.ts` and this one lives a directory away, which
++      // is why running the media suite alone did not find it.
++      //
++      // Still `toEqual` on the whole array: FR-013's claim is about what is ABSENT, and
++      // a property check would pass against a payload that had grown a filename too.
+       const body = (await res.json()) as { attachments: unknown[] };
+-      expect(body.attachments).toEqual([{ type: "media", media_id }]);
++      expect(body.attachments).toEqual([{ type: "media", media_id, state: "pending" }]);
+     });
+ 
+     // THE SECOND SENT `"m_1"`, WHICH IS NOW A 400 AT THE SCHEMA AND WAS A 422 AT THE
+```

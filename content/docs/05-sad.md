@@ -2050,6 +2050,55 @@ hard one — and if it ever needs `ffprobe`, that is a sixth such program and no
 language. What would engage VII is needing to *link* one.
 
 
+### ADR-33 — A media transition takes the revision fabric's third arm, not a sixth grammar
+
+**Status:** Accepted · **Date:** 2026-09-28 · **Chapter:** 4.14
+
+**Context.** FR-MED-07 requires a `media.updated` event on every channel referencing an object
+when it leaves `pending`. `docs/12` §7.4 asks whether that takes a sixth subject grammar. Five
+exist — `chan`, `revision`, `presence`, `typing`, `member` — each admitted by ADR-19's rule:
+**a kind that cannot share a payload type cannot share a subject.**
+
+**Decision.** A third arm on `revisionFabricSchema`, published on the existing
+`revision:{channel_id}`. Per-channel SUBSCRIBEs stay at **five**.
+
+**The arithmetic, which ADR-25 had already written.** That record sets the consolidation
+threshold at per-channel SUBSCRIBEs *exceeding* six, or a projected subject count over 250,000
+under `5 × channels + 1 × connected users`. A sixth grammar is therefore **permitted** — six
+does not exceed six — and it would spend the entire remaining headroom on a kind whose
+subscriber set is identical to one that already exists. `fanout.ts` subscribes `chan:` and
+`revision:` in one call under one reference count and calls them *co-extensive by construction*.
+This arm keeps the projection unchanged.
+
+**Rejected: widen `chan:{channel_id}`.** Refused by ADR-24 in writing — everything on that
+subject IS a creation, and the kind was never on the fabric.
+
+**Rejected: re-deliver the message as `message.updated`.** The cheapest shape available: no new
+subject, no new frame, and FR-MED-07's state is read at serve time so a re-read message carries
+it for free. It dies on a field that does not exist. `messageSchema` is `{id, channel, seq,
+user, text, attachments, created_at}` — **there is no `edited_at`** — so a client could not tell
+an attachment resolving from an author editing, and every verified photo would render its
+message as edited by somebody who did not touch it. That is ADR-24's own objection to putting
+edits on `chan:`, one level up.
+
+**Admitted under ADR-20's test, not as an exception to ADR-19's rule.** ADR-20 put two payload
+types on one subject with a discriminator because *an edit and a deletion are two things that
+happen to one message, a receiver subscribes to both or neither.* The same holds here: a
+connection that wants a channel's messages wants to know when one of their attachments resolves.
+
+**Costs, stated.** The subject is named `revision:` and carries something that is not a message
+revision; its contract becomes *something changed about what this channel's messages show*.
+Renaming it is a wire change and a fence-chain change across every chapter that publishes the
+file, so the name stays and the module says so. And reusing a subject means reusing its
+publisher: `publishRevision` derived its subject from `revision.message.channel`, which this arm
+does not have. Eight production sites across two services reached through `.message`; they
+delegate to `channelOfRevision` in the module that owns the grammar, whose `switch` is
+exhaustive so a fourth arm is a type error in one place.
+
+**Reversal condition.** A seventh real-time kind, or a deployment whose projected subject count
+approaches 250,000 — at which point ADR-25's typed envelope is the change, and this arm is
+already half of it.
+
 ## 10. Risks and technical debt register
 
 | # | Risk / debt | Exposure | Mitigation / trigger |
