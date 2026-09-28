@@ -11715,36 +11715,40 @@ these are here rather than in the chapter.
 ### `services/gateway/src/fanout.itest.ts` — three assertions that needed a `kind` guard once a third arm existed.
 
 ```diff title="services/gateway/src/fanout.itest.ts"
-@@ -260,7 +260,10 @@
- 
-     const [, revision] = await nextRevision(g2);
-     expect(revision.kind).toBe("deleted");
--    expect(revision.message.seq).toBe(9);
-+    // GUARDED, like the `updated` assertion above it. Before the media arm existed
-+    // every arm had a message and the guard was optional; now it is what makes the
-+    // assertion type-check, and asserting the kind first is what makes it meaningful.
-+    expect(revision.kind === "deleted" && revision.message.seq).toBe(9);
-     expect(g2.deliveries).toEqual([]);
+@@ -318,6 +318,33 @@
      await g2.fanout.unsubscribe(CHANNEL);
    });
-@@ -276,7 +279,7 @@
-     await g2.fanout.subscribe(own);
-     await g1.fanout.publishRevision({ kind: "updated", message: messageOn(own, 10) });
-     const [, revision] = await nextRevision(g2);
--    expect(revision.message.seq).toBe(10);
-+    expect(revision.kind === "updated" && revision.message.seq).toBe(10);
  
-     await g2.fanout.unsubscribe(own);
-     await g1.fanout.publishRevision({ kind: "updated", message: messageOn(own, 11) });
-@@ -310,7 +313,7 @@
-     // the schema and not a dead subscription.
-     await raw.fanout.publishRevision({ kind: "updated", message: messageOn(CHANNEL, 14) });
-     const [, good] = await nextRevision(g2);
--    expect(good.message.seq).toBe(14);
-+    expect(good.kind === "updated" && good.message.seq).toBe(14);
-     await raw.fanout.close();
-     await g2.fanout.unsubscribe(CHANNEL);
-   });
++  // CHAPTER 4.14, AND THE ONE THING NEITHER OTHER SUITE CAN SHOW. The api's
++  // `media-updated.itest.ts` proves the producer publishes; `session.test.ts` proves a
++  // gateway routes the arm to a subscribed socket, against a STUB fabric. Only two real
++  // clients over real Redis prove the arm survives the wire — and this is the arm that
++  // carries no `message`, so every site deriving a subject or a routing key from
++  // `revision.message.channel` had to learn a third shape.
++  it("carries a media transition to the other instance, routed by its own channel", async () => {
++    await g1.fanout.publishRevision({
++      kind: "media",
++      media_id: "b61bfdfb-b42e-4e95-a1ed-2bedd3a4ed21",
++      channel: CHANNEL,
++      state: "ready",
++    });
++
++    const [channelId, revision] = await nextRevision(g2);
++    // THE CHANNEL THE ROUTER CHOSE. Before this arm existed the router read
++    // `revision.data.message.channel` — a field this arm does not have, and the
++    // failure would have been a subject of `revision:undefined` that nobody subscribes
++    // to, published by a function whose contract is never to reject.
++    expect(channelId).toBe(CHANNEL);
++    expect(revision.kind).toBe("media");
++    expect(revision.kind === "media" && revision.media_id).toBe(
++      "b61bfdfb-b42e-4e95-a1ed-2bedd3a4ed21",
++    );
++    expect(revision.kind === "media" && revision.state).toBe("ready");
++  });
++
+   // THE SUBJECT GRAMMAR'S TEST MOVED IN THE FAN-OUT CHAPTER, to
+   // `packages/protocol/src/fanout.test.ts`, along with `subjectFor` itself. It
+   // was a pure string assertion sitting in a suite that needs a running Redis;
 ```
 
 ### `services/gateway/src/main.test.ts` — the second hard-coded frame count, which also fired.
@@ -11803,4 +11807,182 @@ these are here rather than in the chapter.
      });
  
      // THE SECOND SENT `"m_1"`, WHICH IS NOW A 400 AT THE SCHEMA AND WAS A 422 AT THE
+```
+
+### `services/gateway/src/isolation.itest.ts` — the directions table, and a well-formed forged sample.
+
+```diff title="services/gateway/src/isolation.itest.ts"
+@@ -767,6 +767,16 @@
+   // an inbound frame's sample and the case would be dead code a task required.
+   // Said here because the next reader adding an inbound type will wonder.
+   ["typing.send", "inbound", "this chapter: a client may say it is typing (session.ts)"],
++  // CHAPTER 4.14, AND THE FOURTH PLACE THIS REPOSITORY COUNTS FRAMES. The other three
++  // are the protocol union's own length, the gateway's advertised vocabulary, and the
++  // "classified exactly once" check below. All four fired on `media.updated`, which is
++  // what an accounting assertion is for: a frame added and not announced is a contract
++  // change nobody reviewed.
++  //
++  // OUTBOUND, and the reason is the same one `message.created` has: the server decides
++  // that an object's state changed, and it decides who is told. A client uttering this
++  // would be claiming a verdict it did not reach about bytes it never read.
++  ["media.updated", "outbound", "a verdict the server reached; a client claiming one would forge it"],
+   ["error", "outbound", "the server's refusal shape"],
+ ];
+ 
+@@ -787,6 +797,14 @@
+     created_at: new Date().toISOString(),
+   };
+   switch (type) {
++    // 4.14. A forged `media.updated` must be WELL-FORMED so its refusal is
++    // `unknown_frame_type` and not `invalid_frame` — the loop above exists to test the
++    // direction check, and a malformed sample would be refused a phase earlier.
++    case "media.updated":
++      return {
++        type,
++        payload: { media_id: randomUUID(), channel, state: "ready" },
++      };
+     case "connection.ack":
+       // AND `revisions` FOR THE SAME REASON, ONE FIELD LATER. This chapter made it
+       // required on the ack, so this sample stopped satisfying `connectionAckSchema`
+@@ -856,11 +874,12 @@
+     (option) => (option.shape.type as { value: string }).value,
+   );
+ 
+-  it("derives all eleven members from the union itself", () => {
+-    // ELEVEN with this chapter's `typing.send`. **The title carries the number
+-    // too**, and updating the assertion without the title is how the presence
+-    // chapter shipped a good test under a false name.
+-    expect(members.length).toBe(11);
++  it("derives all twelve members from the union itself", () => {
++    // TWELVE with chapter 4.14's `media.updated`; eleven with the typing chapter's
++    // `typing.send`. **The title carries the number too**, and updating the assertion
++    // without the title is how the presence chapter shipped a good test under a false
++    // name — so both moved here.
++    expect(members.length).toBe(12);
+   });
+ 
+   it("classifies every member exactly once", () => {
+```
+
+### `services/gateway/src/session.itest.ts` — the fifth frame count, and its own sample builder.
+
+```diff title="services/gateway/src/session.itest.ts"
+@@ -1290,6 +1290,20 @@
+       created_at: new Date().toISOString(),
+     };
+     switch (type) {
++      // 4.14, AND THE THIRD TIME THIS FILE HAS PAID THE SAME BILL. The comment on
++      // `connection.ack` below records the second: a field added to a frame makes the
++      // forged sample malformed, and the loop then asserts `invalid_frame` — the
++      // refusal a phase BEFORE the direction check it exists for. A new frame does it
++      // too, by having no case at all.
++      case "media.updated":
++        return {
++          type,
++          payload: {
++            media_id: "b61bfdfb-b42e-4e95-a1ed-2bedd3a4ed21",
++            channel,
++            state: "ready",
++          },
++        };
+       case "connection.ack":
+       // AND `revisions` FOR THE SAME REASON, ONE FIELD LATER. This chapter made it
+       // required on the ack, so the sample above stopped satisfying
+@@ -1421,7 +1435,13 @@
+       .map((option) => (option.shape.type as { value: string }).value)
+       .filter((type) => type !== "message.send" && type !== "typing.send");
+ 
+-    expect(outbound).toHaveLength(9);
++    // TEN SINCE CHAPTER 4.14's `media.updated`. **The FIFTH place this repository
++    // counts frames**, after the protocol union's own length, the gateway's advertised
++    // vocabulary, `isolation.itest.ts`'s derived count and its classified-exactly-once
++    // check. Every one of the five fired on this chapter, which is the argument for
++    // having them: a server-to-client frame added without a direction is one a client
++    // could forge.
++    expect(outbound).toHaveLength(10);
+ 
+     for (const type of outbound) {
+       const socket = connect(await mintToken());
+```
+
+### `vitest.coverage.config.mts` — a statement no test can reach.
+
+```diff title="vitest.coverage.config.mts"
+@@ -532,8 +532,21 @@
+           // arms this file has are the 404, the 422, the byte deletion and its log.
+           branches: 83,
+           functions: 100,
+-          lines: 93,
+-          statements: 93,
++          // 92 AND 92, FROM 93 AND 93, AND THE REASON IS A STATEMENT NO TEST CAN REACH
++          // (chapter 4.14). The file gained `announce`, and one of its statements is a
++          // `ready`/`rejected` guard that is unreachable: it runs only when the
++          // compare-and-set applied, and one that applied set the state to the verdict.
++          // The per-arm probe established that by deleting it and watching nothing turn
++          // red; it stays because it is what narrows `string | null` for the compiler.
++          //
++          // **This is not the branch pin's problem two lines up.** That one is a
++          // denominator that differs between this machine and CI (059-20) — two
++          // figures that are not samples of one quantity. This is one figure, measured
++          // the same everywhere, with an uncoverable statement in it. 059-22's rule:
++          // ask what the number is measuring before you move it, because both present
++          // as a red pin.
++          lines: 92,
++          statements: 92,
+         },
+ 
+         "services/dispatcher/src/expand.ts": {
+```
+
+### `eslint.config.mjs` — the fabric oracle's exemption, under reason (4).
+
+```diff title="eslint.config.mjs"
+@@ -173,6 +173,12 @@
+     // that is JSON and not a transition) that no module-level API can produce,
+     // because each only ever publishes payloads its own schema built.
+     "services/api/src/fanout/fanout.itest.ts",
++    // Chapter 4.14, and reason (4) exactly. This suite drives the verdict ROUTE and
++    // asserts a frame reached `revision:{channel}` — the subject, not the call. A spy
++    // on the publisher would prove the controller asked; only a subscriber proves the
++    // fan-out chose the right channels, published once per channel, and published
++    // nothing at all for an object nobody attached.
++    "services/api/src/media/media-updated.itest.ts",
+     "services/gateway/src/presence.itest.ts",
+     "services/gateway/src/membership.itest.ts",
+     "services/gateway/src/typing.itest.ts",
+```
+
+### `services/gateway/src/fanout.itest.ts` — and the three assertions that needed a `kind` guard.
+
+```diff title="services/gateway/src/fanout.itest.ts"
+@@ -260,7 +260,10 @@
+ 
+     const [, revision] = await nextRevision(g2);
+     expect(revision.kind).toBe("deleted");
+-    expect(revision.message.seq).toBe(9);
++    // GUARDED, like the `updated` assertion above it. Before the media arm existed
++    // every arm had a message and the guard was optional; now it is what makes the
++    // assertion type-check, and asserting the kind first is what makes it meaningful.
++    expect(revision.kind === "deleted" && revision.message.seq).toBe(9);
+     expect(g2.deliveries).toEqual([]);
+     await g2.fanout.unsubscribe(CHANNEL);
+   });
+@@ -276,7 +279,7 @@
+     await g2.fanout.subscribe(own);
+     await g1.fanout.publishRevision({ kind: "updated", message: messageOn(own, 10) });
+     const [, revision] = await nextRevision(g2);
+-    expect(revision.message.seq).toBe(10);
++    expect(revision.kind === "updated" && revision.message.seq).toBe(10);
+ 
+     await g2.fanout.unsubscribe(own);
+     await g1.fanout.publishRevision({ kind: "updated", message: messageOn(own, 11) });
+@@ -310,7 +313,7 @@
+     // the schema and not a dead subscription.
+     await raw.fanout.publishRevision({ kind: "updated", message: messageOn(CHANNEL, 14) });
+     const [, good] = await nextRevision(g2);
+-    expect(good.message.seq).toBe(14);
++    expect(good.kind === "updated" && good.message.seq).toBe(14);
+     await raw.fanout.close();
+     await g2.fanout.unsubscribe(CHANNEL);
+   });
 ```
