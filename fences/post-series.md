@@ -11986,3 +11986,57 @@ these are here rather than in the chapter.
      await g2.fanout.unsubscribe(CHANNEL);
    });
 ```
+
+### `packages/protocol/src/revision.test.ts` — narrowed before reading a union arm, which only `pnpm typecheck` reaches.
+
+```diff title="packages/protocol/src/revision.test.ts"
+@@ -70,7 +70,11 @@
+ describe("the revision fabric payload", () => {
+   it("takes an edit as a whole message", () => {
+     const parsed = revisionFabricSchema.parse({ kind: "updated", message });
+-    expect(parsed.kind).toBe("updated");
++    // NARROWED BEFORE READING `message`, because chapter 4.14's third arm does not have
++    // one. `expect(parsed.kind)` alone does not narrow for the compiler, and `pnpm
++    // build` never said so: `tsconfig.build.json` excludes tests, so only
++    // `pnpm typecheck` reaches this file.
++    if (parsed.kind !== "updated") throw new Error("expected the updated arm");
+     expect(Object.keys(parsed.message).sort()).toEqual([
+       "attachments",
+       "channel",
+@@ -84,7 +88,7 @@
+ 
+   it("takes a deletion as an identity with no text", () => {
+     const parsed = revisionFabricSchema.parse({ kind: "deleted", message: tombstone });
+-    expect(parsed.kind).toBe("deleted");
++    if (parsed.kind !== "deleted") throw new Error("expected the deleted arm");
+     expect(Object.keys(parsed.message).sort()).toEqual([
+       "channel",
+       "deleted_at",
+```
+
+### `packages/outsider/src/integrate.itest.ts` — the fifth assertion, in the suite no local lane runs.
+
+```diff title="packages/outsider/src/integrate.itest.ts"
+@@ -498,9 +498,20 @@
+ 
+     // BOTH ARMS, IN ORDER, ON THE SOCKET. The url arm proves nothing new; what it does is
+     // hold the order claim, which one attachment cannot show.
++    //
++    // AND THE MEDIA ARM CARRIES ITS STATE SINCE CHAPTER 4.14 — **the fifth assertion of
++    // this shape and the only one no local lane reaches.** `pnpm test`,
++    // `pnpm test:integration` and `pnpm coverage` all skip this suite: it needs a
++    // composed stack and three environment variables, so CI's sealed job and a
++    // hand-run are the only things that execute it. The other four were found by the
++    // api lane and the coverage lane; this one was found by CI.
++    //
++    // `pending` is right and is not a race. The object was uploaded but nothing has
++    // verified it — this suite runs no media worker, which is what makes the value
++    // stable rather than timing-dependent.
+     expect(delivered.payload.attachments).toEqual([
+       { type: "url", kind: "image", url: "https://example.test/outside-url.png" },
+-      { type: "media", media_id: mediaId },
++      { type: "media", media_id: mediaId, state: "pending" },
+     ]);
+     socket.close();
+ 
+```
