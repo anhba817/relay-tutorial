@@ -2099,6 +2099,73 @@ exhaustive so a fourth arm is a type error in one place.
 approaches 250,000 — at which point ADR-25's typed envelope is the change, and this arm is
 already half of it.
 
+---
+
+### ADR-34 — A native image library is a dependency, not a second language
+
+**Status:** Accepted · **Date:** 2026-09-29 · **Chapter:** 4.15
+
+**Context.** FR-MED-05 requires a thumbnail for every uploaded image. `ALLOWED_TYPES` admits
+four image formats and **nothing in this platform can decode any of them**: the media worker's
+runtime dependencies were two workspace packages, and `dimensions.ts` reads headers — a PNG
+`IHDR`, a GIF screen descriptor, a WebP `VP8`, a JPEG `SOF0` — without touching a pixel.
+Constitution VII says one language across services, and ADR-01 requires a superseding ADR with
+profiling evidence to introduce a second.
+
+**Decision.** `sharp` — libvips behind an npm package with prebuilt platform binaries — as a
+runtime dependency of `services/media-worker`. It is the workspace's first native binary in a
+shipped service. Clause VII is **not** engaged.
+
+**Why the clause is not engaged, and ADR-32's argument does not reach this.** ADR-32 settled
+that ClamAV does not make this a polyglot platform, and its reasoning is specific: Relay
+addresses five programs it is not written in — Postgres, Redis, NATS, MinIO, ClickHouse —
+*"each reached over a socket with a documented protocol"*, and **the clause governs what Relay
+is implemented in and not what Relay talks to.** A linked library is a different relationship
+and cannot borrow that sentence. The argument it takes instead: the worker is a TypeScript
+program, every line of it is TypeScript, and calling a native module from it is the same
+relationship as calling Node's own JSON parser, which is C. What VII forbids is a second
+language *this team writes and maintains*. No `.c` file enters this repository.
+
+**Alternatives, measured rather than argued.** Installed size is the delta on `/usr` + `/lib`
+inside `node:22-alpine`, which is what the worker's Dockerfile builds `FROM`; time is p50 of
+seven runs turning one 1920x1080 JPEG into a 320-bounded WebP:
+
+| option | added | jpeg/png/gif/webp | p50 |
+|---|---:|---|---:|
+| `sharp`, in-process | **30,380,799 B** | yes | **15.2 ms** |
+| ImageMagick, one subprocess per object | 28,936,284 B | yes | 35.8 ms |
+| ffmpeg, subprocess | +113,994,336 B | yes, badly | — |
+| a sixth container | a whole service | depends | — |
+| pure TypeScript | 0 B | **PNG only** | — |
+
+**The size did not decide it.** 30.4 MB against 28.9 MB is 5% on a choice between two
+fundamentally different relationships, and anyone re-running this should expect them to stay
+close. What decided it is the 2.4x and the shape: the subprocess pays its extra 20 ms as
+process spawn **on every object**, in a service whose whole job is a sweep over a backlog.
+Pure TypeScript is out on coverage rather than effort — `node:zlib` gives inflate, which reaches
+one of four formats, and JPEG needs a DCT decoder, GIF LZW and WebP VP8. A sixth container fails
+§4.2's "deliberately not a separate service" test on all three columns and engages ADR-31 for a
+job with no independent scaling story: the resizer would sit behind the only service that reads
+the bytes, reading the same objects, with the same lifecycle.
+
+**The video half is not built.** A poster frame needs a video decoder, and the only tool for it
+costs **113,994,336 B** — 3.75x the image half — for the harder half of a clause whose easier
+half (FR-MED-04's duration) this platform already declined at revision 1.20. SRS 1.22 records it
+as unmet by decision.
+
+**Costs, stated.** The worker's image grows from 245 MB to **279 MB**, and its dependency count
+from two workspace packages to three entries. The workspace's runtime dependency total moves for
+the first time in Part 4: **31 entries to 32**, third-party 13 to 14. A native binary means an
+install that can fail per-platform — mitigated, not eliminated, by the fact that `pnpm install`
+runs inside the target image and the lockfile records all 26 platform variants including
+`linuxmusl-x64`, both verified rather than assumed.
+
+**Reversal condition.** If a second clause needs video, ffmpeg's 114 MB buys two things instead
+of one and the subprocess option is re-priced against a `sharp` that would then be redundant.
+And if the image path ever needs a format libvips is not built with, the question is whether the
+binary changes or the allow-list does — which is a decision about `ALLOWED_TYPES`, not about
+this dependency.
+
 ## 10. Risks and technical debt register
 
 | # | Risk / debt | Exposure | Mitigation / trigger |
