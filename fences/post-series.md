@@ -12040,3 +12040,737 @@ these are here rather than in the chapter.
      socket.close();
  
 ```
+
+```diff title="packages/protocol/src/attachments.ts"
+@@ -106,12 +106,40 @@
+ /** FR-MED-07's first sentence: the three states a media object can be in, as the wire
+  * spells them. One declaration, because `0018`'s CHECK constraint and this enum are the
+  * same closed set seen from two sides and two spellings would be the `idem_key` against
+  * `idempotency_key` defect this file's own header names. */
+ export const MEDIA_STATES = ["pending", "ready", "rejected"] as const;
+ 
++/** FR-MED-05's derived objects, as the wire and the column spell them (chapter 4.15).
++ *
++ * A CLOSED SET HERE AND NOT A CHECK CONSTRAINT, which is migration `0018`'s argument for
++ * `rejected_reason`: a CHECK is a fourth thing to widen every time a kind arrives, and
++ * `0020` deliberately leaves the column unconstrained for that reason.
++ *
++ * ONE MEMBER, AND THE SET IS STILL A SET. `poster` is FR-MED-05's video half and is not
++ * built — a poster frame needs a video decoder, and ffmpeg measured 113,994,336 B against
++ * the image half's 30,380,799 B, for the harder half of a clause whose easier half
++ * (duration) chapter 4.13 already declined. SRS 1.22 and ADR-34 carry the reasoning and
++ * the reversal condition. Being a set rather than a boolean is what makes that a future
++ * insert instead of a future migration. */
++export const RENDITIONS = ["thumbnail"] as const;
++export type Rendition = (typeof RENDITIONS)[number];
++
++/** WHY A PARENT HAS NO RENDITION, WHICH FR-007 REQUIRES TO BE A VALUE AND NOT AN ABSENCE.
++ *
++ * Recorded on the parent, because a rendition that was never made has no row to carry it.
++ * `unsupported_source` is an allowed type this platform cannot decode — derived from what
++ * the decoder reports rather than listed, so the set of types that get a rendition is a
++ * measurement and not a second hand-maintained table. */
++export const RENDITION_FAILED = [
++  "unsupported_source",
++  "decode_failed",
++  "store_write_failed",
++] as const;
++export type RenditionFailure = (typeof RENDITION_FAILED)[number];
++
+ /** WHAT THE PLATFORM BUILDS, WHICH IS NOT WHAT A SENDER DECLARES (FR-MED-07).
+  *
+  * **One schema was serving both, and that is what made this chapter's first plan
+  * impossible.** `attachmentSchema` above is embedded by four things: three request doors
+  * — `messages.schema.ts:40`, `frames.ts:94` and `internal.ts:35` — and **`messageSchema`
+  * at `frames.ts:46`, which is the payload the api BUILDS**. A sender must not be able to
+@@ -125,14 +153,39 @@
+  * turned out to be six.
+  *
+  * THE URL ARM IS UNCHANGED AND SHARED. A `url` attachment has no state to carry: nothing
+  * uploaded it, nothing scanned it, and FR-MED-03's verification never touches it. Giving
+  * it one for symmetry would be a field that is always the same value, which is a field
+  * a reader has to learn and can never use. */
++/** FR-MED-05 ON THE WIRE. Absent when there is no rendition, and never `null`.
++ *
++ * **OPTIONAL, AND THAT IS WEAKER THAN `state` IN A WAY WORTH NAMING.** `state` above is
++ * required precisely so the compiler lists every place a message is built; an optional
++ * property is silently correct everywhere, so the door set for this field had to be
++ * derived by asserting on delivered payloads instead of by reading a build error. The
++ * derivation is in `specs/061-chapter-4-15/doors.txt`.
++ *
++ * **ABSENT RATHER THAN `null` WITH A REASON.** Three cases produce no rendition and only
++ * one is a failure: the attachment is not an image, the image was already inside the
++ * bound (`research.md` R2 — the output would be 97.3% of the parent and the same
++ * pixels), or generation failed. A client's question is only *"is there a smaller one"*;
++ * the reason lives on the row, where an operator can read it, rather than in every
++ * delivered message.
++ *
++ * **THE DIMENSIONS ARE THE RENDITION'S OWN**, not the parent's. Sending them is the
++ * whole reason a thumbnail helps before its bytes arrive: without a box to reserve, the
++ * page jumps when the image lands. */
++const thumbnailRef = z.strictObject({
++  media_id: z.uuid(),
++  width: z.number().int().positive(),
++  height: z.number().int().positive(),
++});
++
+ const deliveredMediaArm = mediaArm.extend({
+   state: z.enum(MEDIA_STATES),
++  thumbnail: thumbnailRef.optional(),
+ });
+ 
+ export const deliveredAttachmentSchema = z.discriminatedUnion("type", [
+   urlArm,
+   deliveredMediaArm,
+ ]);
+```
+
+```diff title="packages/protocol/src/internal.ts"
+@@ -2,12 +2,14 @@
+ 
+ import {
+   attachmentSchema,
+   forwardedAttachmentSchema,
+   MAX_ATTACHMENTS,
+   refineTextAndAttachments,
++  RENDITIONS,
++  RENDITION_FAILED,
+ } from "./attachments.js";
+ 
+ import { forwardedMessageSchema } from "./frames.js";
+ 
+ // The INTERNAL service contract (chapter 2.5) — distinct from the wire
+ // contract above it. `frames.ts` is what a customer's client speaks;
+@@ -544,12 +546,25 @@
+  * tenant parameter either — a worker that could ask for one tenant's objects
+  * would be a route worth forging. The worker never needs the tenant, because
+  * everything it does is addressed by object key and reported back by id. */
+ export const internalMediaPendingItemSchema = z.strictObject({
+   id: z.string().uuid(),
+   object_key: z.string().min(1),
++  /** THE TENANT, SO THE WORKER CAN NAME A RENDITION'S KEY IN THE PLATFORM'S OWN LAYOUT
++   * (chapter 4.15). Object keys are `${environment_id}/${id}` — `media.service.ts:108`
++   * — and FR-MED-05's derived objects use the same shape, so the worker has to know the
++   * first half to write the second.
++   *
++   * NOT A TENANCY LEAK, AND WORTH SAYING WHY. This service already holds the object's id
++   * and its key; the environment is the one whose object it was handed, and it reaches
++   * no database with it (ADR-04 — the worker holds no Postgres credential). The
++   * alternative was deriving the rendition's key from the parent's, which `schema.ts`
++   * forbids in its own words: `object_key` is *"OPAQUE, AND NOT A PATH INTO THE STORE …
++   * keeping them separate is what lets the storage layout change without breaking a
++   * published contract."* */
++  environment_id: z.string().uuid(),
+   /** What the CLIENT said this is, which is the whole subject of FR-MED-03. The
+    * worker's job is to find out whether it is true. */
+   mime_type: z.string().min(1),
+   declared_bytes: z.number().int().nonnegative(),
+   /** The ordering column, returned so the worker can ask for the next page.
+    *
+@@ -592,12 +607,33 @@
+       verified_type: z.string().min(1),
+       /** Present for the kinds a 64 KiB prefix answers for, absent for the
+        * rest — FR-MED-04 is recorded PARTLY MET rather than pretended. */
+       width: z.number().int().positive().optional(),
+       height: z.number().int().positive().optional(),
+       duration_ms: z.number().int().nonnegative().optional(),
++      /** FR-MED-05. What the worker produced and already wrote to the store, or nothing.
++       *
++       * ABSENT IS NOT A FAILURE. Three cases reach here with no rendition and only one
++       * of them is wrong: the object is not an image, the image is already inside the
++       * bound (`research.md` R2 — the output would be 97.3% of the parent and the same
++       * pixels), or generation failed. The third sets `rendition_failed_reason` and the
++       * first two set neither, which is why this is not a nullable field with a reason
++       * beside it. */
++      rendition: z
++        .strictObject({
++          id: z.string().uuid(),
++          kind: z.enum(RENDITIONS),
++          object_key: z.string().min(1),
++          bytes: z.number().int().positive(),
++          width: z.number().int().positive(),
++          height: z.number().int().positive(),
++        })
++        .optional(),
++      /** FR-007's *"a value, not an absence"*. Recorded on the PARENT, because a
++       * rendition that was never made has no row to carry it. */
++      rendition_failed_reason: z.enum(RENDITION_FAILED).optional(),
+     }),
+     z.strictObject({
+       verdict: z.literal("rejected"),
+       reason: mediaRejectionReasonSchema,
+       /** Optional on this arm: a scan failure knows nothing about the type,
+        * and a mismatch that failed on size alone knows no type either. */
+```
+
+```diff title="services/api/src/db/repository.ts"
+@@ -542,12 +542,13 @@
+    * something the code did not do. */
+   after?: Date,
+ ): Promise<
+   Array<{
+     id: string;
+     objectKey: string;
++    environmentId: string;
+     mimeType: string;
+     declaredBytes: number;
+     createdAt: Date;
+   }>
+ > {
+   return db
+@@ -640,23 +641,110 @@
+         eq(channels.environmentId, environmentId),
+       ),
+     );
+   return rows.map((row) => row.id);
+ }
+ 
++/** WHICH OF A TENANT'S MEDIA OBJECTS NOTHING REFERENCES ANY MORE — FR-MED-10's predicate.
++ *
++ * **CALLED BY NOTHING YET, AND THAT IS NOT AN OVERSIGHT.** FR-MED-10's reaper does not
++ * exist; `docs/12` row 22, the erasure chapter, is where it gets a caller. Chapter 4.15
++ * writes the predicate here anyway because the alternative is what happened to
++ * FR-MED-07's first sentence — three chapters cited the clause, every one of them
++ * implemented the half it needed, and nobody noticed the other half was unmet. A
++ * predicate with a test and no caller is weaker than one with both, and much stronger
++ * than a sentence in a specification. Its test drives it directly.
++ *
++ * **A RENDITION IS NEVER RETURNED, WHICH IS THE WHOLE OF FR-002.** The obvious reading —
++ * *"a rendition is unreferenced when its parent is"* — would have the reaper delete
++ * parent and rendition separately and depend on the order. It does not need to: a
++ * rendition cannot outlive its parent, because `media_objects_parent_fk` is
++ * `ON DELETE CASCADE`. So this asks only about uploads, and the renditions follow. The
++ * clause *"its reachability is its parent's"* is discharged by the foreign key rather
++ * than by a second arm of a predicate somebody has to keep in step.
++ *
++ * **TWO QUERIES, NOT ONE, AND 4.12 MEASURED WHY.** The natural single statement puts
++ * `NOT EXISTS (… attachments @> … m.id …)` against each candidate, which builds the
++ * containment operand from a column on the other side of the join — a GIN index cannot
++ * be looked up with a value the planner does not have yet, and that chapter measured the
++ * difference at **1,042 buffers against 84**, with the index present and idle. Here the
++ * candidates come back first and their ids go into the second query as bound values.
++ *
++ * The scope is an argument rather than a constructor, for `channelsReferencingMediaIn`'s
++ * reason: the caller will be a job, not a request. */
++export async function unreferencedMediaIn(
++  db: Db,
++  environmentId: string,
++  olderThan: Date,
++  limit = 100,
++): Promise<string[]> {
++  const candidates = await db
++    .select({ id: mediaObjects.id })
++    .from(mediaObjects)
++    .where(
++      and(
++        eq(mediaObjects.environmentId, environmentId),
++        isNull(mediaObjects.parentId),
++        lt(mediaObjects.createdAt, olderThan),
++      ),
++    )
++    .orderBy(mediaObjects.createdAt)
++    .limit(limit);
++  if (candidates.length === 0) return [];
++
++  // ONE QUERY FOR THE WHOLE BATCH: the messages that reference AT LEAST ONE candidate,
++  // each containment operand a bound value so the GIN index on `messages.attachments`
++  // can be looked up rather than scanned. What comes back is the attachment arrays, and
++  // the intersection is arithmetic in Node — cheaper than asking Postgres to unnest and
++  // far easier to read than a lateral join nobody will revisit.
++  const rows = await db
++    .select({ attachments: sql<Attachment[] | null>`${messages.attachments}` })
++    .from(messages)
++    .innerJoin(channels, eq(channels.id, messages.channelId))
++    .where(
++      and(
++        eq(channels.environmentId, environmentId),
++        or(
++          ...candidates.map(
++            (row) =>
++              sql`${messages.attachments} @> ${JSON.stringify([
++                { type: "media", media_id: row.id },
++              ])}::jsonb`,
++          ),
++        ),
++      ),
++    );
++  const referencedIds = new Set<string>();
++  for (const row of rows)
++    for (const attachment of row.attachments ?? [])
++      if (attachment.type === "media") referencedIds.add(attachment.media_id);
++
++  return candidates.map((row) => row.id).filter((id) => !referencedIds.has(id));
++}
++
+ export async function recordMediaVerdict(
+   db: Db,
+   input: {
+     id: string;
+     verdict: "ready" | "rejected";
+     verifiedBytes?: number;
+     verifiedType?: string;
+     width?: number;
+     height?: number;
+     durationMs?: number;
+     reason?: "declaration_mismatch" | "scan_failed";
++    /** FR-MED-05. Already written to the store by the worker; this records the row. */
++    rendition?: {
++      id: string;
++      kind: string;
++      objectKey: string;
++      bytes: number;
++      width: number;
++      height: number;
++    };
++    renditionFailedReason?: string;
+   },
+ ): Promise<{
+   applied: boolean;
+   state: string | null;
+   objectKey: string | null;
+   /** THE TENANT, BECAUSE THIS FUNCTION IS THE ONLY PLACE THAT KNOWS IT (chapter 4.14).
+@@ -669,48 +757,94 @@
+    * second read that can disagree with the compare-and-set, or an unscoped query, which
+    * is constitution I in the data-access layer.
+    *
+    * `null` only when no such object exists, which the caller answers with a 404. */
+   environmentId: string | null;
+ }> {
+-  const [updated] = await db
++  return db.transaction(async (tx) => {
++  const [updated] = await tx
+     .update(mediaObjects)
+     .set({
+       state: input.verdict,
+       verifiedBytes: input.verifiedBytes ?? null,
+       verifiedType: input.verifiedType ?? null,
+       width: input.width ?? null,
+       height: input.height ?? null,
+       durationMs: input.durationMs ?? null,
+       rejectedReason: input.reason ?? null,
++      renditionFailedReason: input.renditionFailedReason ?? null,
+     })
+     .where(and(eq(mediaObjects.id, input.id), eq(mediaObjects.state, "pending")))
+     .returning({
+       state: mediaObjects.state,
+       // THE KEY COMES BACK FROM THE UPDATE, not from a read before it. A rejection
+       // deletes the bytes and the caller needs the key to do that; fetching it
+       // separately would open a window in which the row moved between the two
+       // statements and the delete addressed somebody else's object.
+       objectKey: mediaObjects.objectKey,
+       // AND THE TENANT, for the same reason: the fan-out FR-MED-07 needs is scoped by
+       // environment, and this statement is the only one that knows which.
+       environmentId: mediaObjects.environmentId,
++      // AND THE UPLOADER (4.15), so a rendition inserted below carries the same
++      // `user_id` as its parent. FR-MED-10's second sentence makes compliance erasure
++      // delete *"a user's media objects and derived objects"*, and it will find both on
++      // one predicate only if the rendition was written with the parent's user. Reading
++      // it from the same statement rather than a second SELECT is this list's whole
++      // argument, applied once more.
++      userId: mediaObjects.userId,
+     });
+ 
+-  if (updated)
++  if (updated) {
++    // FR-MED-05's ROW, IN THE SAME TRANSACTION AS THE TRANSITION THAT EARNED IT.
++    //
++    // **THERE WAS NO TRANSACTION HERE UNTIL CHAPTER 4.15, AND THE PLAN SAID THERE WAS.**
++    // An analysis pass found it by opening this function rather than by reading the
++    // plan, which had written "insert the rendition row in the same transaction as the
++    // verdict" about a bare `UPDATE`. Without one, an UPDATE that lands and an INSERT
++    // that fails leaves the parent `ready` with no rendition AND no recorded reason —
++    // the absence FR-007 forbids and the silence FR-008 was written against.
++    //
++    // **TWO MECHANISMS, TWO DIFFERENT WINDOWS, AND NEITHER IS REDUNDANT.** `RETURNING`
++    // above is still how the key and the tenant come back, because a separate SELECT
++    // could read a row that moved between the two statements. The transaction is what
++    // makes the verdict and the rendition one fact. A reader who sees both should not
++    // conclude that one of them is belt-and-braces.
++    if (input.rendition) {
++      await tx.insert(mediaObjects).values({
++        id: input.rendition.id,
++        environmentId: updated.environmentId,
++        // THE PARENT'S UPLOADER, so erasure by user finds the rendition on the same
++        // predicate that finds the object it came from (FR-MED-10's second sentence).
++        userId: updated.userId,
++        filename: `${input.rendition.kind}.webp`,
++        mimeType: "image/webp",
++        // NOBODY DECLARED THIS. The column's comment says so; the quota sums it, and
++        // FR-012 wants derived bytes counted on the same basis as uploaded ones.
++        declaredBytes: input.rendition.bytes,
++        state: "ready",
++        objectKey: input.rendition.objectKey,
++        width: input.rendition.width,
++        height: input.rendition.height,
++        verifiedBytes: input.rendition.bytes,
++        verifiedType: "image/webp",
++        parentId: input.id,
++        rendition: input.rendition.kind,
++      });
++    }
+     return {
+       applied: true,
+       state: updated.state,
+       objectKey: updated.objectKey,
+       environmentId: updated.environmentId,
+     };
++  }
+ 
+   // NOT `pending`: either somebody got there first, or the object does not exist. The
+   // caller needs to tell those apart, so the current state comes back rather than a
+   // bare false.
+-  const [row] = await db
++  const [row] = await tx
+     .select({
+       state: mediaObjects.state,
+       objectKey: mediaObjects.objectKey,
+       environmentId: mediaObjects.environmentId,
+     })
+     .from(mediaObjects)
+@@ -718,12 +852,13 @@
+   return {
+     applied: false,
+     state: row?.state ?? null,
+     objectKey: row?.objectKey ?? null,
+     environmentId: row?.environmentId ?? null,
+   };
++  });
+ }
+ 
+ export async function creditConnectionMinutes(
+   db: Db,
+   entries: ReadonlyArray<{
+     connectionId: string;
+@@ -5470,12 +5605,24 @@
+             ? undefined
+             : or(
+                 isNull(mediaObjects.userId),
+                 eq(mediaObjects.userId, senderUserId),
+               ),
+           inArray(mediaObjects.state, ["pending", "ready"]),
++          // 4.15: A RENDITION IS NOT ATTACHABLE (FR-004), AND IT WOULD HAVE BEEN.
++          //
++          // A thumbnail is `ready` and belongs to the environment, so it satisfies every
++          // condition above and a sender who learned its id could attach it. It is not a
++          // thing a client uploaded and it is not a thing a message should name: the
++          // message names the parent, and the rendition rides along on delivery.
++          //
++          // IN THIS PREDICATE RATHER THAN BESIDE IT, so the refusal is the one arm this
++          // function already produces. A separate check with its own error code would
++          // tell a caller that somebody else's rendition exists, which is precisely what
++          // FR-MED-06's three-conditions-one-answer rule forbids.
++          isNull(mediaObjects.parentId),
+         ),
+       );
+ 
+     const passed = new Set(attachable.map((row) => row.id));
+     // IN ORDER, so ten attachments with the third one foreign name the third. `find`
+     // walks `wanted`, which was built by walking the array the caller sent.
+@@ -5857,13 +6004,19 @@
+    * can read. 11,557 public channels against 1,016 private on this lane. */
+   async readableMediaObjectKey(
+     mediaId: string,
+     userId?: string,
+   ): Promise<string | undefined> {
+     const [object] = await this.db
+-      .select({ objectKey: mediaObjects.objectKey })
++      .select({
++        objectKey: mediaObjects.objectKey,
++        // 4.15: null for an upload, the parent for a rendition. Fetched in the statement
++        // that already reads this row rather than by a second lookup, for the reason the
++        // verdict's own `RETURNING` list gives — a second read can disagree with the first.
++        parentId: mediaObjects.parentId,
++      })
+       .from(mediaObjects)
+       .where(
+         and(
+           eq(mediaObjects.id, mediaId),
+           eq(mediaObjects.environmentId, this.environmentId),
+           // ADR-14's DELIVERY GATE: NO SIGNED URL UNTIL `ready` (FR-012).
+@@ -5883,13 +6036,32 @@
+           // the one that built the route.
+           eq(mediaObjects.state, "ready"),
+         ),
+       );
+     if (!object) return undefined;
+ 
+-    for (const channelId of await this.channelsReferencingMedia(mediaId)) {
++    // FR-MED-05: A RENDITION IS AUTHORISED THROUGH ITS PARENT, BY THE SAME PREDICATE.
++    //
++    // A thumbnail is named by no message — the message names the parent — so
++    // `channelsReferencingMedia` returns nothing for it and the loop below refuses it.
++    // **That is FR-MED-08 working exactly as written**, not a bug: an object with no
++    // referencing message is readable by nobody, including whoever uploaded it. What
++    // FR-MED-05's "sharing the parent's lifecycle" adds is that a rendition's
++    // reachability IS the parent's, so the question is asked about the parent instead.
++    //
++    // **ONE SUBSTITUTION, NOT A SECOND PREDICATE.** FR-005 requires the authorisation to
++    // be the same predicate rather than a copy of it, so this changes which id the
++    // existing loop asks about and changes nothing else. A copy would be the third
++    // tenancy scope 4.12 found whose individual removal turned nothing red.
++    //
++    // The state condition above already applied to the row that was fetched: a rendition
++    // is `ready` by `media_objects_rendition_state_check`, and a rendition of a parent
++    // that never reached `ready` cannot exist, because generation runs after the verdict
++    // that would refuse it.
++    const authorisingId = object.parentId ?? mediaId;
++    for (const channelId of await this.channelsReferencingMedia(authorisingId)) {
+       if (await this.channelVisibleTo(channelId, userId)) return object.objectKey;
+     }
+     return undefined;
+   }
+ 
+   /** Every channel of this environment holding a message that references this object.
+@@ -5937,12 +6109,17 @@
+         rows.flatMap((row) =>
+           row.attachments.filter((a) => a.type === "media").map((a) => a.media_id),
+         ),
+       ),
+     ];
+     const states = new Map<string, MediaState>();
++    /** FR-MED-05: the parent's rendition, if it has one. */
++    const thumbnails = new Map<
++      string,
++      { media_id: string; width: number; height: number }
++    >();
+     if (ids.length > 0) {
+       const found = await this.db
+         .select({ id: mediaObjects.id, state: mediaObjects.state })
+         .from(mediaObjects)
+         .where(
+           and(
+@@ -5951,18 +6128,69 @@
+             // return the right rows — and constitution I is about the layer, not about
+             // whether a given query could get away without it.
+             eq(mediaObjects.environmentId, this.environmentId),
+           ),
+         );
+       for (const row of found) states.set(row.id, row.state as MediaState);
++
++      // THE RENDITIONS OF THIS PAGE'S OBJECTS — a THIRD query per page, not a second
++      // per row, and not a join.
++      //
++      // **WHY NOT A JOIN ON THE QUERY ABOVE.** A left join to the same table on
++      // `parent_id` would return one row per (object, rendition) pair and make the
++      // `states` map above a group-by in Node. One more `= any(...)` over the partial
++      // index `media_objects_parent_idx` is cheaper to read and, measured on this
++      // lane, indistinguishable to run. 4.12's rule is about the OPERAND being a bound
++      // value, which both shapes satisfy; the cost it warned about was a correlated
++      // subquery per row, which neither is.
++      //
++      // SAME TENANT PREDICATE, FOR THE SAME REASON. `parent_id` is already constrained
++      // to this environment by `media_objects_parent_fk`, so this clause cannot change
++      // the result — and 4.12 found three tenancy scopes whose individual removal
++      // turned nothing red, which is exactly what a clause that cannot change a result
++      // looks like from a test suite.
++      const derived = await this.db
++        .select({
++          id: mediaObjects.id,
++          parentId: mediaObjects.parentId,
++          width: mediaObjects.width,
++          height: mediaObjects.height,
++        })
++        .from(mediaObjects)
++        .where(
++          and(
++            inArray(mediaObjects.parentId, ids),
++            eq(mediaObjects.rendition, "thumbnail"),
++            eq(mediaObjects.environmentId, this.environmentId),
++          ),
++        );
++      for (const row of derived) {
++        // A rendition without dimensions cannot be offered: the whole point of sending
++        // it is a box the client can reserve, and `{media_id}` alone would make a
++        // caller fetch the bytes to find out how big they are.
++        if (row.parentId && row.width !== null && row.height !== null) {
++          thumbnails.set(row.parentId, {
++            media_id: row.id,
++            width: row.width,
++            height: row.height,
++          });
++        }
++      }
+     }
+     return rows.map((row) => ({
+       ...row,
+-      attachments: row.attachments.map((a) =>
+-        a.type === "media" ? { ...a, state: states.get(a.media_id) ?? "pending" } : a,
+-      ),
++      attachments: row.attachments.map((a) => {
++        if (a.type !== "media") return a;
++        const thumbnail = thumbnails.get(a.media_id);
++        return {
++          ...a,
++          state: states.get(a.media_id) ?? "pending",
++          // ABSENT, NEVER NULL. A spread of `undefined` would still create the key.
++          ...(thumbnail ? { thumbnail } : {}),
++        };
++      }),
+     }));
+   }
+ 
+   /** One row, same query, same rule. Named separately so a caller reads as what it is
+    * rather than as an array of one. */
+   private async withMediaState<T extends { attachments: Attachment[] }>(
+```
+
+```diff title="services/api/src/db/schema.ts"
+@@ -2,12 +2,13 @@
+ import {
+   bigserial,
+   bigint,
+   boolean,
+   check,
+   date,
++  foreignKey,
+   index,
+   integer,
+   jsonb,
+   pgTable,
+   primaryKey,
+   text,
+@@ -1137,14 +1138,19 @@
+     // NULLABLE, BECAUSE AN API KEY HAS NO USER. FR-MED-06's chapter distinguishes
+     // the two cases — a user token's media belongs to that user — and it cannot
+     // make that distinction if the absence is written as something else.
+     userId: uuid("user_id").references(() => users.id),
+     filename: text("filename").notNull(),
+     mimeType: text("mime_type").notNull(),
+-    // WHAT THE CALLER SAID, NOT WHAT ARRIVED. FR-MED-03 verifies the object and is
+-    // a later chapter, so every quota sum in this one is over declarations.
++    // WHAT THE CALLER SAID, NOT WHAT ARRIVED — for an UPLOAD. FR-MED-03 verifies the
++    // object and is a later chapter, so every quota sum in that one is over declarations.
++    //
++    // AND FOR A RENDITION NOBODY SAID ANYTHING, so it holds the actual length (4.15).
++    // The quota sums this column over every non-`rejected` row, and FR-012 wants derived
++    // bytes accounted on the same basis as uploaded ones; a second column summed alongside
++    // would make all three readers of the total learn about it.
+     declaredBytes: bigint("declared_bytes", { mode: "number" }).notNull(),
+     state: text("state").notNull().default("pending"),
+     objectKey: text("object_key").notNull(),
+     createdAt: timestamp("created_at", { withTimezone: true })
+       .notNull()
+       .defaultNow(),
+@@ -1172,12 +1178,29 @@
+     verifiedBytes: bigint("verified_bytes", { mode: "number" }),
+     verifiedType: text("verified_type"),
+     // A CLOSED SET OF TWO AND NOT A CHECK CONSTRAINT: `declaration_mismatch` and
+     // `scan_failed`. A CHECK would be a fourth thing to widen every time a reason
+     // arrives; the set lives in the protocol package where a reader can see it.
+     rejectedReason: text("rejected_reason"),
++    // CHAPTER 4.15 — FR-MED-05's "sharing the parent's lifecycle", which is the only
++    // part of that clause that needed a migration (0020). A rendition is referenced by
++    // no message, so FR-MED-08's gate refuses it and FR-MED-10's reap would collect it;
++    // both are correct, and both are why the relationship has to be expressible at all.
++    //
++    // NULL FOR EVERYTHING A CLIENT UPLOADED, and non-null exactly when this row exists
++    // because another one does. The pair is a CHECK, so the discriminator cannot
++    // disagree with itself.
++    parentId: uuid("parent_id"),
++    // THE CLOSED SET LIVES IN `@relay/protocol`, NOT IN A CHECK — 0018's argument for
++    // `rejected_reason`, and the same reason: a CHECK is a fourth thing to widen. One
++    // member today, `thumbnail`. `poster` is the video half and is not built (ADR-34).
++    rendition: text("rendition"),
++    // ON THE PARENT, NOT ON THE RENDITION. FR-007 wants an allowed type that produced no
++    // rendition recorded as a value rather than as an absence, and the row left to ask is
++    // the parent's. Null when nothing was attempted and null when it worked.
++    renditionFailedReason: text("rendition_failed_reason"),
+   },
+   (t) => [
+     // THREE VALUES SINCE CHAPTER 4.13, AND `pending` ALONE BEFORE IT. 4.10 wrote the
+     // one-value version deliberately — "a CHECK that accepted them now would be a schema
+     // claiming a state nothing can reach" — and the verification chapter is what makes
+     // the claim keepable. The constraint's job is unchanged: a fourth value still fails,
+@@ -1198,8 +1221,47 @@
+     // top-N heapsort against 4 buffers and an index scan, measured for a 50-row batch.
+     // Partial, so it shrinks to the size of the backlog as objects resolve rather than
+     // staying the size of the table.
+     index("media_objects_pending_age")
+       .on(t.createdAt)
+       .where(sql`${t.state} = 'pending'`),
++    // CHAPTER 4.15 (migration 0020). A row is an upload or a rendition and there is no
++    // third thing for a reader to guess at.
++    check(
++      "media_objects_rendition_pairing_check",
++      sql`(${t.parentId} IS NULL) = (${t.rendition} IS NULL)`,
++    ),
++    // A RENDITION HAS NO LIFECYCLE OF ITS OWN AND THIS IS WHAT KEEPS IT THAT WAY.
++    // `state` is NOT NULL DEFAULT 'pending', so a rendition row carries something; it
++    // carries `ready`. Without this the column quietly becomes a second state machine
++    // that only ever holds one value — what 0018 argued `scanning` out of being.
++    check(
++      "media_objects_rendition_state_check",
++      sql`${t.rendition} IS NULL OR ${t.state} = 'ready'`,
++    ),
++    // CONSTITUTION I, GIVEN TO THE DATABASE RATHER THAN TO A PREDICATE SOMEBODY KEEPS.
++    // A single-column `REFERENCES media_objects(id)` would let a rendition name a row in
++    // another environment, because the environment is a second column and a one-column
++    // foreign key never looks at it. This unique exists only so the composite key below
++    // has something to point at — it adds no uniqueness the primary key lacks, and that
++    // is its whole cost: 344 kB against a 1,504 kB heap, measured at 6,646 rows.
++    unique("media_objects_id_environment_key").on(t.id, t.environmentId),
++    foreignKey({
++      columns: [t.parentId, t.environmentId],
++      foreignColumns: [t.id, t.environmentId],
++      name: "media_objects_parent_fk",
++    }).onDelete("cascade"),
++    // ONE RENDITION OF EACH KIND PER PARENT (FR-010), AND PARTIAL BECAUSE IT WAS MEASURED.
++    // As a plain table constraint a btree indexes NULLs too, so it covered all 6,646 rows
++    // at 168 kB to police the zero rows that had a parent. Restricted to those rows it is
++    // 8,192 bytes and refuses the same duplicates — re-run to check that making it partial
++    // had not made it decorative.
++    uniqueIndex("media_objects_parent_rendition_key")
++      .on(t.parentId, t.rendition)
++      .where(sql`${t.parentId} IS NOT NULL`),
++    // The delivery join's read, and the unreferenced predicate's. Partial on 0019's
++    // precedent: it stays the size of the rendition population, not of the table.
++    index("media_objects_parent_idx")
++      .on(t.parentId)
++      .where(sql`${t.parentId} IS NOT NULL`),
+   ],
+ );
+```
+
+```diff title="services/api/src/media/store.ts"
+@@ -170,6 +170,40 @@
+     });
+     return res.ok;
+   } catch {
+     return false;
+   }
+ }
++
++/** DELETE A MEDIA OBJECT'S BYTES AND ITS RENDITIONS' BYTES TOGETHER — FR-003's store half.
++ *
++ * **CALLED BY NOTHING YET, AND THE REASON IS WORTH READING BEFORE WRITING A CALLER.**
++ * Nothing in this platform deletes a `media_objects` ROW. The one live deletion is the
++ * rejection path above, which removes bytes and keeps the row on purpose — migration
++ * `0018` says *"a rejected object's row is all that survives it"*, because a refusal has
++ * to stay auditable after the object is gone. `media_objects_parent_fk` is
++ * `ON DELETE CASCADE`, so the database half of FR-003 is already correct for every
++ * present and future path; **the store has no cascade and this is the whole of what
++ * stands in for one.** The caller arrives with FR-MED-10's reaper — `docs/12` row 22,
++ * the erasure chapter.
++ *
++ * The convention this comment follows is `CLAUDE.md`'s: a claim about when a symbol runs
++ * names the thing that runs it, so that the claim rots visibly. *"On boot, every boot"*
++ * was false for `ensureBucket` for two chapters because nothing named its caller.
++ *
++ * **A REJECTED PARENT NEVER HAS RENDITIONS**, so the rejection path needs no change:
++ * generation runs after the scan and the declaration check, which is the ordering that
++ * makes FR-009 free rather than a cleanup.
++ *
++ * Every delete is attempted even if an earlier one fails, and the result says whether
++ * ALL of them succeeded. A partial failure leaves bytes nobody can reach through this
++ * platform — the same condition the rejection path already tolerates and logs. */
++export async function deleteObjectWithRenditions(
++  config: StoreConfig,
++  parentKey: string,
++  renditionKeys: readonly string[],
++): Promise<boolean> {
++  const results = await Promise.all(
++    [parentKey, ...renditionKeys].map((key) => deleteObject(config, key)),
++  );
++  return results.every(Boolean);
++}
+```

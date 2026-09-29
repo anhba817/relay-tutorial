@@ -942,6 +942,16 @@ export const series: Part[] = [
         sourceDoc: "docs/04-srs.md, docs/05-sad.md, docs/06-adr-deep-dives.md, docs/12-part-4-structure.md",
         readerMinutes: 45,
       },
+      {
+        id: "4.15",
+        path: "/part-4/chapter-15/what-a-thumbnail-costs",
+        title: "What a thumbnail costs",
+        status: "published",
+        readerProduces:
+          "A thumbnail for every uploaded image, and the answer to what one costs — which is not the number anybody reaches for first. Across a real corpus the ratio to the parent spans 775x while the thumbnail's own size spans 4x, so the ratio is a fact about the parent and publishing it as the cost publishes the wrong variable. Below the bound a thumbnail is 97.3% of the parent and the same pixels, which decides a behaviour rather than a figure. Plus the clause's last five words, which turn out to be the hard part: a derived object is named by no message, so one shipped clause refuses to serve it and another reaps it after a day, both working exactly as written — and nothing in the schema could say that two rows were related. The dependency that had to be argued for without borrowing the previous chapter's argument, the fourth round trip nothing had needed before, and a transaction the plan said was there",
+        sourceDoc: "docs/04-srs.md, docs/05-sad.md, docs/12-part-4-structure.md",
+        readerMinutes: 45,
+      },
     ],
   },
   {

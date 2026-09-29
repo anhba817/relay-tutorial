@@ -1,0 +1,325 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import {
+  figWhatTwoClausesDo,
+  figTheRatioIsNotTheCost,
+  figThreeStateGate,
+  figWhereTheTimeGoes,
+} from "./figures";
+
+export const metadata = {
+  title: "What a thumbnail costs — Building Relay",
+  description:
+    "The ratio to the parent spans 775x while the thumbnail's own size spans 4x, so the ratio is a fact about the parent. Plus the clause's last five words, which two shipped clauses would otherwise destroy, and a dependency argued without borrowing the previous chapter's argument.",
+  alternates: {
+    canonical: "/part-4/chapter-15/what-a-thumbnail-costs",
+    languages: {
+      en: "/part-4/chapter-15/what-a-thumbnail-costs",
+      vi: "/vi/part-4/chapter-15/what-a-thumbnail-costs",
+    },
+  },
+};
+
+<ChapterHeader id="4.15" />
+
+FR-MED-05 is one sentence and it reads like two easy halves and a footnote:
+
+> The system shall generate a thumbnail for images and a poster frame for videos during
+> processing, stored as derived objects sharing the parent's lifecycle.
+
+The footnote is the chapter. *Stored as derived objects sharing the parent's lifecycle* sounds
+like a note about where files go. It is the only part of that sentence that needed a migration,
+and it is the part two clauses this platform already shipped would otherwise destroy.
+
+## The clause's last five words
+
+A thumbnail is referenced by no message. The message names the parent; the thumbnail is
+something the platform made afterwards. That single fact runs into two rules that are already
+live and already correct.
+
+**FR-MED-08 refuses to serve it.** Delivery authorises an object by asking which channels hold a
+message referencing it, then asking whether the caller may read any of those channels. For a
+thumbnail that list is empty, so nobody may read it — and that is not a bug, it is the clause's
+own stated rule: *an object with no referencing message is readable by nobody, including the
+credential that uploaded it.*
+
+**FR-MED-10 would reap it.** Unreferenced objects are hard-deleted after 24 hours. A thumbnail is
+unreferenced by construction, so it would be destroyed a day after it was made.
+
+Both clauses are working exactly as written. What is missing is the platform's ability to say
+that two rows are related at all — `media_objects` had no self-reference, no parent column, and
+nothing distinguishing an object a client uploaded from one the platform produced.
+
+<Figure code={figWhatTwoClausesDo} caption="Two correct clauses, and the thing neither of them can see." />
+
+<Why title="Why this is a foreign key and not a predicate">
+
+The obvious reading of *its reachability is its parent's* is a second arm on the reaper's
+predicate: a rendition is unreferenced when its parent is. Written that way, the reaper deletes
+parent and rendition separately and the result depends on which it does first.
+
+It does not need to. `media_objects_parent_fk` is a composite foreign key —
+`(parent_id, environment_id)` against `(id, environment_id)` — with `ON DELETE CASCADE`. The
+predicate asks only about uploads, and renditions follow because the database makes them follow.
+The clause is discharged by a constraint rather than by a rule somebody has to keep in step.
+
+The composite part is constitution I. A plain `REFERENCES media_objects(id)` would let a
+rendition name a parent in another environment, because the tenant is a second column and a
+one-column foreign key never looks at it. This one cannot: both columns have to match. That
+costs a redundant unique index on `(id, environment_id)` — **344 kB against a 1,504 kB heap** at
+6,646 rows — which buys no uniqueness the primary key lacks and exists only because Postgres
+requires the referenced columns to carry a constraint. It is the price of giving tenant
+isolation to the database instead of to a predicate, and it is worth paying.
+
+</Why>
+
+## The cost is not a ratio
+
+The chapter is called *what a thumbnail costs*, so here is the measurement that matters, taken
+over the images this workspace actually contains:
+
+| parent | parent bytes | thumbnail | ratio |
+|---|---:|---:|---:|
+| an animated GIF, 748×386, 777 frames | 3,175,063 | 2,558 | **0.08%** |
+| an animated GIF, 488×383, 300 frames | 4,631,886 | 6,070 | 0.13% |
+| a diagram, 969×588 | 68,527 | 4,118 | 6.01% |
+| a diagram, 933×794 | 107,248 | 10,258 | 9.56% |
+| an icon, 460×460 | 32,370 | 7,104 | 21.95% |
+| a logo, 620×96 | 11,047 | 6,848 | **61.99%** |
+
+**The ratio spans 775×. The thumbnail's own size spans 4×** — every one lands between 2,558 and
+10,258 bytes, because the output's size is a fact about the 320 px bound and not about whatever
+the tenant uploaded.
+
+So *"a thumbnail costs 2% of the original"* is not a sentence this platform can publish. The
+denominator is a property of somebody else's file. **A thumbnail costs about 7 kB.** The ratio is
+a fact about the parent, and publishing it as the cost publishes the wrong variable.
+
+<Figure code={figTheRatioIsNotTheCost} caption="Two spreads over the same six images. Only one of them is about the thumbnail." />
+
+### Where the crossover is, and what it decides
+
+The real corpus has no size series, so this one is synthetic: pixel noise encoded as JPEG, which
+does not compress and is therefore the *most favourable* case for the ratio. Said plainly rather
+than passed off as photographs.
+
+| parent | parent bytes | thumbnail | dims | p50 | ratio |
+|---|---:|---:|---|---:|---:|
+| 120×120 | 10,200 | 9,920 | 120×120 | 2.7 ms | **97.3%** |
+| 200×200 | 27,400 | 26,662 | 200×200 | 5.9 ms | **97.3%** |
+| 320×320 | 68,312 | 66,544 | 320×320 | 13.4 ms | **97.4%** |
+| 400×400 | 106,182 | 58,226 | 320×320 | 13.6 ms | 54.8% |
+| 640×480 | 204,284 | 35,178 | 320×240 | 11.1 ms | 17.2% |
+| 1920×1080 | 1,376,622 | 13,258 | 320×180 | 15.2 ms | 1.0% |
+| 4000×3000 | 7,984,317 | 4,100 | 320×240 | 50.8 ms | **0.1%** |
+
+At or below the bound the thumbnail is **97.3% of the parent and the same pixels**. The tenant
+would store the image twice to save 2.6%.
+
+That is a behaviour, not a figure. An image already inside the bound gets **no rendition at all**,
+and its delivered form simply carries no `thumbnail` key. The rule came out of the table; nobody
+chose it.
+
+One more thing in that table is worth a second look: the time is **not monotone** in the parent's
+pixels. 320×320 costs 13.4 ms and 640×480 costs 11.1. Below the bound the encoder is writing a
+full-size output, so the work is in the encode rather than the resize. It is the kind of curve a
+reader assumes is flat.
+
+## A fourth round trip, and why the worker had to learn to write
+
+The media worker reads objects. Before this chapter it made three calls to the store and held
+none of them:
+
+- `headObject` takes metadata — a size and a last-modified.
+- `streamObject` hands the scanner an async iterable, consumed once, **64 KiB at a time whatever
+  the object's size**, because the largest allowed object is 100 MB.
+- `getRange` takes a 64 KiB prefix for the type sniff and the dimensions.
+
+A thumbnail needs the bytes. A stream that ClamAV has already drained cannot be read again, and a
+prefix is not an image. So a rendition needs a whole-object GET that nothing in this service had
+ever made — and the alternatives were worse. Teeing the scan stream into a buffer costs no extra
+request and buffers *every* object, including the 100 MB video cap, because the scan runs before
+anything knows the type. One buffered GET up front has the same problem for the same reason.
+
+<Figure code={figWhereTheTimeGoes} caption="The whole bill for one 8 MB image, measured rather than estimated." />
+
+The fetch turned out to be the cheap part: **8.2 ms against a 52.0 ms resize**, 14% of a 60.2 ms
+total. And the memory worry did not survive contact either. The arithmetic for a 4000×3000 RGB
+bitmap is 36 MB, and peak RSS moved **0.4 MB** — libvips processes in strips and never holds the
+whole thing. That figure was written down as an upper bound from arithmetic and explicitly not
+published as a measurement until something measured it, which is the only reason the 36 MB did
+not end up in this table.
+
+<Trap title="The signer was read-only at the type level, not by omission">
+
+Adding a writer to the worker's store client did not fail at the HTTP call. It failed at the type:
+
+```
+SignOptions.method: "GET" | "HEAD"
+```
+
+The compiler refused `putObject` before a reviewer could. That narrow type was *true*: this
+service read what a client uploaded and produced nothing, so a signer that could not sign a
+write was an accurate statement about what the worker was for.
+
+Widening it is a one-word change and the temptation is to make it quietly. It is worth a comment
+instead, because the next person to see three verbs there should know the third one arrived with
+FR-MED-05 and is not a convenience somebody added in passing. A type that encodes a design
+decision is documentation the compiler enforces; when the decision changes, say so where the type
+is.
+
+</Trap>
+
+## The gate has three states, and the third one is an ordinary photograph
+
+Deciding whether to spend that fetch looks like two questions — is it an image, and is it bigger
+than the bound. The probe answers both from a 64 KiB prefix.
+
+Except when it does not. A JPEG stores its dimensions in an `SOF0` marker somewhere after the
+start, and everything before it is segments the decoder walks past. One of those segments is
+`APP1`, which holds EXIF — camera, lens, timestamp, GPS, and frequently an embedded preview
+image. A maximal `APP1` is 65,535 bytes, and the probe window is 65,536.
+
+Measured: a JPEG carrying one maximal `APP1` — 72,215 bytes, which is what an ordinary camera
+file looks like — reports **no dimensions at all** from the prefix, while the same bytes read
+whole decode as 1200×900.
+
+A two-state gate skips those. It would deny thumbnails to exactly the files most likely to want
+one, and it would do it silently, because "we could not read the dimensions" and "the image is
+small" arrive at the same branch. The third state fetches and lets the decoder answer, which
+costs nothing extra: by then the bytes are in hand.
+
+<Figure code={figThreeStateGate} caption="Two states would have been wrong for a category of file, not an edge case." />
+
+## What it cost to choose the dependency
+
+Nothing in this platform could decode an image. `dimensions.ts` reads headers — a PNG `IHDR`, a
+GIF screen descriptor, a WebP `VP8`, a JPEG `SOF0` — and touches no pixels. Four options, priced
+against the worker's own base image:
+
+| option | added | covers the four allowed types | p50 for 1920×1080 |
+|---|---:|---|---:|
+| `sharp`, in-process | **30,380,799 B** | yes | **15.2 ms** |
+| ImageMagick, one subprocess per object | 28,936,284 B | yes | 35.8 ms |
+| ffmpeg, subprocess | +113,994,336 B | yes, badly | — |
+| a sixth container | a whole service | depends | — |
+| pure TypeScript | 0 B | **PNG only** | — |
+
+**The size did not decide it.** 30.4 MB against 28.9 MB is 5% on a choice between two
+fundamentally different relationships, and anyone re-running this should expect them to stay
+close. What decided it is 2.4× and the shape: a subprocess pays its extra 20 ms as *process
+spawn, on every object*, in a service whose entire job is a sweep over a backlog.
+
+Pure TypeScript is out on coverage rather than effort. `node:zlib` gives inflate, which reaches
+PNG; JPEG needs a DCT decoder, GIF needs LZW and WebP needs VP8. One of four is not a feature.
+
+<Why title="Why the previous chapter's argument does not carry">
+
+Chapter 4.13 settled that ClamAV does not make this a polyglot platform, and ADR-32's reasoning
+is worth quoting because it is *specific*: Relay addresses five programs it is not written in —
+Postgres, Redis, NATS, MinIO, ClickHouse — **each reached over a socket with a documented
+protocol**, and the clause governs what Relay is *implemented in*, not what Relay *talks to*.
+
+A linked library is a different relationship, and ADR-34 cannot borrow that sentence. Its own
+argument is narrower: the worker is a TypeScript program, every line of it is TypeScript, and
+calling a native module from it is the same relationship as calling Node's JSON parser, which is
+C. What the clause forbids is a second language *this team writes and maintains*. No `.c` file
+enters the repository.
+
+The distinction matters because the easy move is to cite the nearest precedent and move on. The
+precedent was about sockets. This is not a socket.
+
+</Why>
+
+The video half is not built, and the reason is in the same table. A poster frame needs a video
+*decoder*, and the tool for it costs 114 MB — 3.75× the image half — for the harder half of a
+clause whose easier half this platform already declined. Chapter 4.13 recorded FR-MED-04 as
+partly met because *duration* needs four container parsers and MP3 variable bitrate has no
+header answer. A frame is strictly harder than a duration. It is recorded as unmet by decision,
+with the reversal condition: when video attachments are a measured fraction of stored objects,
+or when the platform already carries ffmpeg for something else, 114 MB buys two things and the
+question is re-opened.
+
+## Three instruments that lied while measuring this
+
+The dependency table above took four attempts, and every wrong number looked exactly like a
+right one.
+
+**`apk add imagemagick` cannot decode a JPEG.** The first size measurement returned 27,524,848 B
+for a build that answers `no decode delegate for this image format`. Alpine ships the format
+delegates as separate packages. A dependency's install size is not its *usable* install size, and
+the number that looked right was for an ImageMagick that reads none of the four types this
+platform allows.
+
+**The repair returned a zero that read as "already present".** Adding four delegate packages in
+one `apk add` reported a delta of **0 B**. Two of the four do not exist; apk is all-or-nothing, so
+the transaction failed whole and installed nothing — and with stderr redirected, the failure
+presented as *no change needed*.
+
+**A grep with no positive control published a confident zero.** Asking `magick -list format`
+which of the four types were supported printed nothing, which read as *no support*. The list
+writes `JPEG*` with a trailing asterisk, and the pattern could not match. Re-run with a control —
+JPEG must appear, because a conversion had just succeeded — the real answer is
+`GIF* JPEG* JPG* PNG* WEBP*`.
+
+<Trap title="`echo $?` after a pipeline reads the wrong command">
+
+And a fourth, which is this repository's most-repeated mistake and happened again while writing
+this chapter:
+
+```bash
+tsc --noEmit | tail -6 ; echo "EXIT=$?"     # prints 0 on a run that failed
+tsc --noEmit > out.log ; echo "EXIT=$?"     # prints the real one
+```
+
+`$?` is the exit status of the *last* command in the pipeline, which is `tail`. It is almost
+always 0. Every measurement in this chapter that reports an exit code was taken without a pipe,
+because the alternative is a green reading of a red run — and this project has recorded that
+exact mistake six times now, including in the session that wrote the rule down.
+
+</Trap>
+
+## What the lane cannot tell you
+
+One honest limit, stated where a reader will see it rather than buried in a record.
+
+This platform's development lane holds 6,535 media objects, 5,996 of them images. **Four are
+above the thumbnail bound.** Every figure in this chapter that came from real files came from six
+images of convenience — two icons, two diagrams and two animated GIFs, none of them a photograph
+— and every figure with a size series came from synthetic noise.
+
+So the ratios demonstrate that the ratio is unstable. They are not an estimate of what a real
+tenant would see, and the crossover is a property of the encoder and the bound rather than of
+anybody's traffic. The measurements that *are* transferable are the ones about this platform: the
+fetch is 14% of the cost, libvips does not hold the bitmap, and a thumbnail is about 7 kB.
+
+<Checkpoint>
+
+- An uploaded image above 320 px on its long edge gains a WebP rendition, stored as a row whose
+  `parent_id` points at the object it came from.
+- An image already inside the bound gains nothing, and says so by omitting the key rather than
+  by sending a null.
+- A rendition is authorised through its parent, by the same predicate — not a copy of it — and
+  refused identically to an id no object has.
+- A rendition cannot be attached to a message, cannot outlive its parent, and is never returned
+  by the job that collects unreferenced objects.
+- A verdict and its rendition are one transaction. Before this chapter the verdict was a bare
+  `UPDATE`, and a failed insert would have left a parent `ready` with no rendition and no reason.
+
+</Checkpoint>
+
+<ForwardRef>
+
+The bytes a rendition adds are charged to the tenant from the moment its row exists, because the
+storage quota sums every non-rejected object of the environment. That is deliberate — the
+alternative is a discount with no clause behind it — but it has a consequence this chapter can
+only record: a rendition is written by the platform, not asked for by a caller, so it can carry a
+tenant past the quota with **no request to refuse**. The overshoot is bounded by a few kilobytes
+and the next slot request is refused normally.
+
+The next chapter puts stored bytes on the bill, and inherits that sentence.
+
+</ForwardRef>
+
+<ChapterFooter id="4.15" />
