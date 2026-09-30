@@ -915,6 +915,29 @@ said "the rollups carry no TTL (FR-003a)" until chapter 4.7.** Both halves were 
 gave them one in the same feature this paragraph was written in, and `FR-003a` is a
 feature-local id four features use to mean four different things, not a clause in the SRS.
 
+**AND `daily_usage_billing` NOW CARRIES TWO COLUMNS WHOSE NAMES READ AS THE SAME QUANTITY
+AND ARE NOT (chapter 4.16).** `stored_delta` counts stored **messages** — it is
+`sum(multiIf(event = 'created', 1, event = 'deleted', -1, 0))` from `mv_billing_messages`,
+and it has counted nothing since it was written because `message_events` has no producer.
+`stored_bytes_delta` counts stored **bytes**, from `mv_billing_storage` over `media_events`.
+A reader meeting them side by side will assume the second is the first measured differently,
+and this chapter's own premise check nearly concluded the work was half done for exactly that
+reason. The name `stored_bytes` was rejected on the same grounds: it would have read as the
+byte-valued twin of a message count. **A column name is not a unit**, and where two of them
+share a stem the difference belongs in the schema comment and here, not in whoever is reading.
+
+**AND THE SECOND READER THAT CROSSES THE FENCE IS DR-17's, WHICH CROSSES IT TWICE
+(chapter 4.16).** `reconcileStorage` reads `daily_usage_billing` over HTTP, the object store
+over its own signed URL, and Postgres through the repository layer — three stores in one
+function, where FR-ANL-06's reconciler reads two. The third is not a convenience: the
+analytical side records a `reserved` event and no `uploaded` event, so **nothing in it can
+tell an outstanding slot from a delivered object**, and the term that explains a gap has to
+come from the operational side. Which of those reservations are still outstanding can only
+be answered by the inventory, so all three are load-bearing. It compares every tenant at
+once rather than one at a time, because its instrument is a listing of a bucket and that
+arrives whole. It writes nothing. The constitution III reading below is unchanged and now
+has a fourth item standing against it.
+
 **AND THE ONE READER THAT CROSSES THE FENCE IS FR-ANL-06's RECONCILER (chapter 4.7).** It runs
 in the api, reads `daily_usage_billing` over HTTP and `usage_periods`/`usage_active_users`
 through the repository layer, compares one tenant and one period at a time, and writes
