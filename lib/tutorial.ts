@@ -952,6 +952,16 @@ export const series: Part[] = [
         sourceDoc: "docs/04-srs.md, docs/05-sad.md, docs/12-part-4-structure.md",
         readerMinutes: 45,
       },
+      {
+        id: "4.16",
+        path: "/part-4/chapter-16/storage-on-the-bill",
+        title: "Storage on the bill",
+        status: "published",
+        readerProduces:
+          "A tenant's stored bytes, metered daily and counted by kind, and the weekly comparison the clause asks for against what the object store actually holds. The comparison is the chapter: run against real data it says the meter charges 4,436 MB while the bucket holds 30.7 MB, and 99.9% of the difference is slots reserved and never uploaded to — a reservation measured against a delivery, which is FR-MED-01 working as designed rather than a drift. So the verdict has a third outcome, and the term that explains it cannot be computed from either store alone. Plus a column whose name reads as this chapter's subject and counts something else entirely, a materialised view that was counting zeros under a key it had no business creating, and a coverage number that was right about a service running in the wrong process",
+        sourceDoc: "docs/04-srs.md, docs/05-sad.md, docs/12-part-4-structure.md",
+        readerMinutes: 50,
+      },
     ],
   },
   {

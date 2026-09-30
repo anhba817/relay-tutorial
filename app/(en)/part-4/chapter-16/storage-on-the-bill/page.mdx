@@ -1,0 +1,377 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import {
+  figWhatTheTwoSidesHold,
+  figThreeStores,
+  figOneLostDelta,
+  figDeltaVersusSample,
+} from "./figures";
+
+export const metadata = {
+  title: "Storage on the bill — Building Relay",
+  description:
+    "The meter charges 4,436 MB and the bucket holds 30.7 MB, and almost all of the difference is slots nobody uploaded to — a reservation measured against a delivery. Plus a column whose name reads as this chapter's subject and counts something else, and a view that was counting zeros.",
+  alternates: {
+    canonical: "/part-4/chapter-16/storage-on-the-bill",
+    languages: {
+      en: "/part-4/chapter-16/storage-on-the-bill",
+      vi: "/vi/part-4/chapter-16/storage-on-the-bill",
+    },
+  },
+};
+
+<ChapterHeader id="4.16" />
+
+Two clauses ask for this chapter, and one of them is a single row in a table of design
+requirements:
+
+> **DR-17.** Stored-bytes-per-tenant shall be maintained as a daily rollup summing
+> `media_events` deltas (uploaded/deleted), reconciled weekly against an object-storage
+> inventory listing — the media analogue of FR-ANL-06.
+
+Everything in that sentence is buildable. A table, a materialised view, a listing, a
+comparison. What it does not tell you is what the comparison will say, and that turns out to be
+the chapter — because the first time it ran against real data it reported that the meter
+charges **4,436 MB** while the bucket holds **30.7 MB**, and neither number is wrong.
+
+## Two sides that measure different things
+
+The quota charges a tenant the moment it hands out an upload slot. That is chapter 4.10's
+decision and it is the only safe one: a slot issued without charging is a tenant reserving
+without limit, so `reserveMediaSlot` sums `declared_bytes` over every non-rejected row of the
+environment and refuses when the sum would exceed the cap. A `pending` object is already
+charged.
+
+The object store holds bytes somebody actually uploaded.
+
+On the development lane those two populations barely overlap:
+
+| | rows | declared |
+|---|---|---|
+| `pending` — a slot taken, nothing uploaded | 6,580 | 4,436 MB |
+| `ready` — verified | 2,082 | 3,666 kB |
+| `rejected` — bytes destroyed, row kept | 237 | 233 kB |
+| **the bucket** | **1,775 objects** | **30.7 MB** |
+
+**99.9% of what the quota charges is slots that were taken and never uploaded to.** Nothing
+here is broken. It is what a development lane looks like when most of its media objects were
+created by tests that asked for a slot and then asserted something about the response.
+
+But it means *does the meter match the store* is comparing a reservation against a delivery.
+A comparison with two outcomes has to call that either agreement — which over a 4.4 GB gap
+would be true and unbelievable — or drift, which would be wrong.
+
+<Figure code={figWhatTheTwoSidesHold} caption="What each side holds, and why the difference is not a defect." />
+
+So the verdict has a third value. `reservations-only` says the two sides differ and the
+difference is entirely accounted for. Only the part that outstanding reservations cannot
+explain is a drift, and a store holding *more* than the meter knows about is the other
+direction and is always wrong.
+
+```ts
+export type StorageVerdict =
+  | "agree"
+  | "meter-high"
+  | "meter-low"
+  | "reservations-only"
+  | "not-comparable"
+  | "no-data";
+```
+
+This is chapter 4.7's shape arrived at from the other end. That chapter found a comparison
+whose two sides could not both exist for any tenant, and its product was a clause amendment
+rather than a green number. Here the two sides exist and measure different quantities, and the
+product is a third verdict. Both are the same lesson: **a comparison that can only say
+*agree* or *differ* will be made to say one of them about a situation that is neither.**
+
+## The term neither store can compute
+
+`reservations-only` needs a number: how many of the charged bytes belong to slots the store has
+no reason to hold yet.
+
+The analytical side cannot answer it. `media_events` records a `reserved` event when the slot is
+issued and there is **no `uploaded` event at all** — the client PUTs straight to the store
+(ADR-13), so the only two parties who know an upload finished are the client and the store, and
+chapter 4.13 built a sweep precisely because nothing tells the platform. From the rollup's point
+of view a reserved object and an uploaded one are the same record.
+
+So the term comes from Postgres: the declared bytes of every `pending` row. Which is nearly
+right, and wrong by a measurable amount.
+
+**267 of the lane's 6,580 pending rows name a key the bucket actually holds** — 6,533,174 bytes,
+21% of everything in it. Chapter 4.13's sweep is why that is ordinary rather than exotic: an
+object is uploaded and stays `pending` until the sweep issues a `HEAD` and moves it. At any
+instant some charged-and-uploaded objects are in both totals, and subtracting them as
+outstanding removes bytes from both sides at once and invents a `meter-low`.
+
+Which reservations are *still* outstanding is a question only the inventory can answer.
+
+<Figure code={figThreeStores} caption="Three stores in one function, and all three load-bearing." />
+
+Chapter 4.7's reconciler reads two stores and the architecture document records that as the one
+component crossing constitution III's fence. This one reads three, and the third is not a
+convenience — it is what makes the second's number mean anything.
+
+<Why title="Why the population is four sides and not three">
+
+The first design took the tenants to examine as the union of the rollup, the bucket and the
+outstanding reservations. That misses the tenant the comparison most wants to hear about: one
+whose objects are all `ready`, whose keys the bucket does not hold, and which the rollup has
+never heard of. It appears on none of the three and is examined by nobody, while the platform is
+charging it for bytes that exist nowhere.
+
+The lane holds **1,074 ready rows naming a key the bucket does not have**, so this is measured
+rather than imagined. Adding the operational tenant list as a fourth side moved the population
+from 1,855 to 1,868 — **thirteen tenants nobody was looking at**.
+
+</Why>
+
+## What the comparison actually said
+
+```
+inventory: 1,775 objects, 30,756,595 bytes, 2 page(s)
+tenants examined: 1,868 — rollup 84, bucket 297, outstanding reservations 1,657,
+                          holding media in Postgres 1,678
+keys belonging to no tenant: 83, 10,341,075 bytes
+verdicts: agree 47 · meter-high 10 · meter-low 1 · not-comparable 1,784 · reservations-only 26
+```
+
+The headline is the fourth verdict. **1,784 of 1,868 tenants — 95.5% — cannot be compared at
+all**, because the rollup knows 84 environments and Postgres knows 1,678 with media rows.
+
+That is chapter 4.6's finding at its widest. A materialised view is a trigger on future inserts,
+so a rollup created late is permanently short — and here the producer ships *in this chapter*.
+The meter's history begins now; the bucket's does not. Every object that existed before this
+code was written is invisible to the analytical side and always will be.
+
+Chapter 4.7 refused to collapse that into "missing data" and this chapter refuses again.
+`not-comparable` is a verdict, it is counted, and it is by far the commonest answer the job
+gives today. A report that folded it into agreement would describe a platform that agrees with
+itself about 84 tenants and say nothing about the other 1,784.
+
+The one `meter-low` is real and is the direction nothing explains: metered 0, bucket 6,852,575
+bytes, outstanding reservations 16,266. Bytes the meter has never charged for. On a development
+lane that is debris; in production it is a leak, and it is exactly what DR-17 exists to find.
+
+<Trap title="`stored_delta` is not stored bytes, and it is on the same table">
+
+`daily_usage_billing` already had a column called `stored_delta` when this chapter opened. It is
+`sum(multiIf(event = 'created', 1, event = 'deleted', -1, 0))` from the messages view: it counts
+stored **messages**, and it has counted nothing since it was written, because `message_events`
+has no producer.
+
+This chapter's premise check read the column list, saw a `stored_delta` on the billing rollup,
+and very nearly concluded the work was half done.
+
+The new column is `stored_bytes_delta`. The obvious name — `stored_bytes` — was rejected for the
+same reason: beside `stored_delta` it reads as the byte-valued twin of a message count rather
+than a different quantity.
+
+**A column name is not a unit.** Where two of them share a stem, a reader meeting them side by
+side will assume one is the other measured differently, and nothing in the schema will correct
+them. The difference is now in the migration comment, in the architecture document, and here.
+
+</Trap>
+
+## What a summed delta costs
+
+DR-17 says *summing deltas*, and that is a choice with a price the clause does not state.
+
+A sampled level is self-correcting. Ask the database how many bytes a tenant is storing, write
+the answer down, and any error you made yesterday is gone today. A summed level is not: it is
+yesterday's answer plus today's changes, so an error made once is carried for ever.
+
+What is one lost record worth? The honest answer is a distribution, not a number.
+
+<Figure code={figOneLostDelta} caption="One lost record, over 8,941 chargeable objects." />
+
+**The mean is 509 times the median.** A chapter that published *"a lost record costs about half
+a megabyte"* would be stating something true of no object in particular: half the objects on
+this lane are a kilobyte or smaller, and the largest are the per-kind cap exactly. As a share of
+the tenant's own level, over the 925 tenants holding more than one object, the median tenant's
+*worst* object is **50.00%** of everything it has, and somewhere on the lane there is a tenant
+whose single largest object is **99.96%** of its level.
+
+And a record can be lost. The publish happens after the commit and outside the transaction,
+which `webhooks/analytics.ts` argued three movements ago and this chapter inherits:
+
+```ts
+void publishStorageDelta(this.analytics, this.logger, {
+  environmentId: this.repo.environment,
+  mediaId: id,
+  cause: "reserved",
+  kind,
+  bytesDelta: input.bytes,
+  occurredAt: new Date(),
+});
+```
+
+A crash between the commit and the publish loses the record. The alternative is worse in two
+directions: a blocked outcome transaction is a customer's uploads stopping because a metering
+pipeline is unwell, which constitution III names as a design failure; and a publish *inside* a
+transaction that rolls back emits a delta for a slot that was never created — a permanent
+overcount, of the kind this whole section is about.
+
+<Why title="Why the clause chose a delta, and why it had no choice">
+
+A sampled level needs something to sample on a schedule. This platform has no scheduler: zero
+`schedule:` triggers in its workflow, no cron, no job runner of any kind. Chapter 4.9 recorded
+that for FR-ANL-06's *"daily"* and ADR-28 accepted it rather than building a sixth relay to
+satisfy one clause.
+
+A materialised view fires on insert. It is the only recurring computation this platform can
+currently perform, which is why DR-17 asks for a rollup and not a sampler, and why the
+reconciliation that would repair a summed level is itself unscheduled.
+
+</Why>
+
+<Figure code={figDeltaVersusSample} caption="The trade DR-17 made, and the one repair available afterwards." />
+
+There is a second cost, and no clause had stated it. The rollup carries a 25-month TTL — DR-09's
+*"daily aggregates for 25 months"*, applied in chapter 4.6 — so a level summed from the
+beginning of time is short by exactly the deltas that expired, permanently, with nothing in the
+system able to notice. Revision 1.23 of the specification now says so, and names the inventory
+as the re-base: **the object store holds the level directly rather than as a sum**, so the
+reconciliation can restate a truncated figure where no amount of re-reading the rollup can.
+
+## The view was counting zeros
+
+The per-kind counts are one expression in one materialised view, and the first version of it was
+wrong in a way that only a test could show.
+
+```sql
+sumMap(map(kind, toUInt64(if(event = 'reserved', 1, 0))))
+```
+
+Every event contributes its kind as a key. A rejection of an audio file contributes
+`{'audio': 0}`. So a day holding one image reservation, one audio rejection and one image
+rendition answers `{'audio':0,'image':1}` — an `audio` key in a column called `uploads_by_kind`,
+on a day nobody uploaded any audio.
+
+The values are right. What is wrong is the **key set**: it stops meaning *the kinds this tenant
+uploaded* and starts meaning *the kinds that had any media event*, and a caller iterating the map
+reports a kind belonging to a different question.
+
+```sql
+sumMapIf(map(kind, toUInt64(1)), event = 'reserved')
+```
+
+That emits no key for a row that does not match, and `{}` when no row in the group does — which
+is the rule the ingester's other rollup read already states: *a day with no activity is a missing
+row, never a row of zeros.*
+
+The zeros were also stable. `SummingMergeTree` drops a row whose summed columns are all zero; it
+does **not** drop a zero-valued key inside a map. Asked of the server with `OPTIMIZE … FINAL`:
+`{'audio':0,'image':1,'video':0}` before the merge and the same after. A wrong answer that a
+merge would have cleaned up is a nuisance; one that survives is the kind that gets published.
+
+<Why title="Why the map type had to be measured before the column was written">
+
+`SummingMergeTree` does not sum a plain `Map`. Measured against ClickHouse 25.3.14.14 before the
+migration was written: two rows at one key holding `map('image',2,'audio',1)` and
+`map('image',3,'video',5)` merge to **`{'image':2,'audio':1}`** — the first row wins, `image` is
+not summed, and `video` is gone. Plain `String` keys fail identically, so `LowCardinality` is not
+the cause. An `Int64` in the next column over sums correctly.
+
+`SimpleAggregateFunction(sumMap, Map(String, UInt64))` merges to `{'audio':1,'image':5,'video':5}`,
+and a materialised view can write it — which had to be measured separately, because a type that
+merges on direct insert and not through a view would have been half a fix.
+
+</Why>
+
+## The listing already worked; the pagination did not
+
+DR-17 asks for an inventory listing and nothing in this platform could list a bucket. It turned
+out to be nearly free: the signer written in chapter 4.10 already documents the key-less case,
+and `GET /{bucket}` with no key is a listing.
+
+What was not free is that one response carries a thousand keys and says `IsTruncated: true`.
+Chapter 4.13 shipped a sweep that read one page, and the consequence was an object nobody
+uploaded to staying `pending` for ever. A reconciliation that reads one page reports agreement
+about every tenant it never looked at, which is the same defect inside the instrument written to
+catch it. The listing pages on `marker`, and it reports the page cap rather than swallowing it:
+a truncated listing makes every tenant's `inStore` null, and the script exits 2 without printing
+a verdict.
+
+It also cost the signer a small change with a sharp reason. Appending `&marker=…` to an
+already-signed URL answers `SignatureDoesNotMatch` — **every parameter must be inside the
+signature** — so `presign` had to take extra parameters, and the moment a caller could add one,
+the five hand-written entries stopped being safely ordered and became a sort.
+
+The keys carry the tenant because chapter 4.15 kept the platform's layout: an object's key is
+`${environment_id}/${id}`, so a listing can be split per tenant with no database join at all.
+Heading each object instead would give the same answer for **73 times the cost** — 1,972 ms
+against 27 ms for 1,775 objects, serial; 650 ms at eight at a time, which is the figure worth
+stating because the ratio depends entirely on a number the earlier research never named.
+
+And 83 keys belong to no tenant — probes and test debris under four prefixes, none of them on
+the listing's first page, which is how a one-page measurement earlier in this feature concluded
+every key was tenant-prefixed. They are reported as their own category rather than skipped,
+because a bucket full of debris should not report clean.
+
+<Trap title="A coverage number is a claim about what ran in *this* process">
+
+The media path is exercised end to end on every run of its integration suite: a slot request
+through the API, a record across the broker, a row in ClickHouse. `pnpm coverage` reported the
+shaper at 78.57% and the insert at 83.78%, against pins of 100 and 84.
+
+Both readings are true. That suite **spawns the ingester as a child process**, because the
+ingester is not a compose service, so none of the code under test is instrumented.
+
+A green lane is a claim about what was re-run. A coverage number is a claim about what ran in
+the same process as the instrument — and a service exercised only through a subprocess measures
+as dead code no matter how hard it is working.
+
+</Trap>
+
+## What the lane cannot tell you
+
+The percentages in this chapter's distribution are facts about a lane whose median tenant holds
+a handful of objects. On a tenant with ten thousand photographs, one lost record is not 50% of
+anything. The absolute figures — a kilobyte at the median, twenty-five megabytes at the cap —
+are facts about the size distribution and the per-kind caps, and those transfer.
+
+The rollup-versus-raw measurement needed a corpus the lane does not have: 240,000 events over 90
+days, planted for one tenant. It reads **276 rows and 5,456 bytes** where accumulating the same
+answer from the raw table reads **89,823 rows and 2,874,336 bytes** — 527 times the bytes for
+twice the wall clock, because 2.8 MB is nothing to this engine. **DR-17's argument is about
+bytes scanned and the clock barely shows it**, which is worth saying plainly rather than
+publishing the ratio that flatters it.
+
+And the reconciliation cannot yet fail in one of the two directions it exists to watch. Nothing
+deletes a `media_objects` row — the rejection path subtracts the bytes and keeps the row on
+purpose — so no `deleted` event is ever published, and the failure a summed level is most
+exposed to, a lost `deleted` leaving the meter permanently over, cannot arise. A run of green
+verdicts is evidence about three causes and not four.
+
+<Checkpoint>
+
+- Every slot request, rejection and rendition publishes a signed byte delta, after the commit
+  and outside the transaction, and a lost one is wrong for ever.
+- A tenant's stored level is `sum(stored_bytes_delta)` over the billing rollup, bounded at the
+  rollup's 25-month retention horizon and re-basable only from the store itself.
+- Uploads are counted per tenant per day by kind, and a rendition is not an upload — nobody
+  uploaded it — while its bytes are in the level.
+- The comparison reads three stores, examines every tenant any of four sides knows about, and
+  reports how many that was.
+- A gap explained entirely by outstanding reservations is `reservations-only`, not agreement and
+  not drift.
+- The weekly cadence the clause asks for is unmet by decision: this platform has no scheduler,
+  and an exit code is the whole of what *raises an alert* can currently mean.
+
+</Checkpoint>
+
+<ForwardRef>
+
+Every figure in this chapter travelled through a process that no deployment starts. The ingester
+has no Dockerfile and no compose service; it is spawned by two test files, which is not a
+deployment. Stop it and the meter reads zero for every tenant — indistinguishable from a
+platform where nobody uploaded anything.
+
+The next chapter is the milestone: an image from the upload slot to the pixels on a screen, with
+every clause in this movement running at once.
+
+</ForwardRef>
+
+<ChapterFooter id="4.16" />

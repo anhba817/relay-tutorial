@@ -12774,3 +12774,785 @@ these are here rather than in the chapter.
 +  return results.every(Boolean);
 +}
 ```
+
+<!-- CHAPTER 4.16 — storage on the bill (feature 062). -->
+<!-- Ten files, twenty-two hunks, all at -U6 and every pre-image verified to match the
+     dumped chain state exactly once before it was pasted. Three of the ten are files this
+     appendix already amends, so their hunks go AFTER the existing ones; the other seven are
+     here for 4.15's reason — one rule for ten files beats a judgement per file, and a
+     2,795-word chapter cannot carry 765 diff lines. -->
+
+```diff title="packages/protocol/src/internal.ts"
+@@ -320,12 +320,63 @@
+     API_REQUEST_ACTION.domain,
+     API_REQUEST_ACTION.action,
+     environmentId,
+   );
+ }
+ 
++/** Storage metering's action (FR-MED-12, DR-17, chapter 4.16). */
++export const MEDIA_STORED_ACTION = { domain: "media", action: "stored" };
++
++export function mediaStoredSubject(environmentId: string): string {
++  return analyticsSubjectFor(
++    MEDIA_STORED_ACTION.domain,
++    MEDIA_STORED_ACTION.action,
++    environmentId,
++  );
++}
++
++/** THE DISCRIMINATOR, SHARED — which the three record types before this one are not.
++ *
++ * `"api.request"` is written as a literal in `services/api/src/request-log/event.ts`
++ * twice and again as `API_REQUEST_TYPE` in `services/ingester/src/shape.ts`: three
++ * copies of one string across two services that cannot import each other's code. Nothing
++ * has drifted yet, and the only thing standing between them is that nobody has retyped
++ * it. **This one is shared from the start** — both services already depend on
++ * `@relay/protocol`, so the cost is nothing and the failure it prevents is a producer
++ * publishing a type the consumer will not claim, which `ingest.ts` answers by
++ * redelivering the record for seven days while the `unclaimed` counter is the only
++ * signal (049). Not a refactor of the existing three; a choice not to add a fourth. */
++export const MEDIA_STORED_TYPE = "media.stored";
++
++/** What the api publishes when a tenant's stored bytes change (FR-001).
++ *
++ * **THE SIGN IS CARRIED, NEVER INFERRED FROM `event`.** `reserved` and `rendition` are
++ * positive and `rejected` and `deleted` negative, and a reader that derives that from
++ * the name puts the rule in a second place. `daily_usage_billing.stored_delta` is the
++ * counter-example living one table over: its sign comes from
++ * `multiIf(event = 'created', 1, …)` and its name has since read to a planner as though
++ * it counted bytes.
++ *
++ * **`bytes_delta` IS THE QUOTA'S QUANTITY** (FR-002). `reserveMediaSlot` sums
++ * `declared_bytes` where `state <> 'rejected'`, so a `pending` object is already charged
++ * and the meter agrees by construction rather than by reconciliation.
++ *
++ * **`kind` IS PRESENT ON EVERY RECORD INCLUDING `deleted`**, so the view that builds
++ * FR-009's per-kind counts can reverse them with the same expression. */
++export const mediaStoredRecordSchema = z.strictObject({
++  type: z.literal(MEDIA_STORED_TYPE),
++  environment_id: z.uuid(),
++  media_id: z.uuid(),
++  event: z.enum(["reserved", "rejected", "rendition", "deleted"]),
++  kind: z.enum(["image", "audio", "video"]),
++  bytes_delta: z.number().int(),
++  occurred_at: z.string().min(1),
++});
++
++export type MediaStoredRecord = z.infer<typeof mediaStoredRecordSchema>;
++
+ /** The token for a request that resolved to no tenant.
+  *
+  * A SEPARATE FUNCTION, NOT A RELAXED ARGUMENT TO `analyticsSubjectFor`. That validator
+  * refuses a non-UUID because an environment id becomes a dot-delimited subject token, and
+  * the refusal is what keeps one tenant's records out of another tenant's filter. A validator
+  * with an escape hatch is a validator with a hole, and the hole is measurable: publishing a
+```
+
+```diff title="services/ingester/src/shape.ts"
+@@ -9,12 +9,14 @@
+ //
+ // So the ingester SHAPES AND RENAMES rather than forwarding what it was given. Two server
+ // settings and one table constraint stand behind this function, each catching a different
+ // way of getting it wrong -- but the function is the thing that has to be right.
+ 
+ /** The publisher's record, as it arrives on `analytics.webhook.attempt.{env}`. */
++import { MEDIA_STORED_TYPE } from "@relay/protocol";
++
+ export interface AttemptEvent {
+   delivery_id: string;
+   endpoint_id: string;
+   environment_id: string;
+   event_id: string;
+   attempt: number;
+@@ -184,12 +186,17 @@
+ // ---------------------------------------------------------------------------
+ 
+ /** The wire's own discriminator. R11: the PAYLOAD says what the payload is, not the subject —
+  *  a router that parses subjects has to be right about tokens too, and a malformed token
+  *  publishes a subject one level deeper that no intended filter matches. */
+ export const API_REQUEST_TYPE = "api.request";
++/** 4.16's discriminator is IMPORTED, not retyped. `"api.request"` above is the third copy
++ * of one string across two services that cannot import each other's code; both already
++ * depend on `@relay/protocol`, so a fourth copy would have been a choice. Re-exported as
++ * well as imported, so a reader of this file finds all four types in one place. */
++export { MEDIA_STORED_TYPE };
+ export const CONNECTION_OPENED_TYPE = "connection.opened";
+ export const CONNECTION_CLOSED_TYPE = "connection.closed";
+ 
+ /** The gateway's record, as it arrives on `analytics.connection.{opened|closed}.{env}`. */
+ export interface ConnectionEvent {
+   type: string;
+@@ -264,16 +271,79 @@
+     close_code: isNumber(e.close_code) ? e.close_code : null,
+     duration_ms: isNumber(e.duration_ms) ? e.duration_ms : null,
+     user_external_id: e.user_external_id,
+   };
+ }
+ 
++/** The api's storage record, as it arrives on `analytics.media.stored.{env}` (4.16). */
++export interface MediaStoredEvent {
++  type: string;
++  environment_id: string;
++  media_id: string;
++  event: string;
++  kind: string;
++  bytes_delta: number;
++  occurred_at: string;
++}
++
++/** One row of `relay_analytics.media_events`, keyed by column name. */
++export interface MediaStoredRow {
++  environment_id: string;
++  media_id: string;
++  event: string;
++  kind: string;
++  bytes_delta: number;
++  ts: string;
++}
++
++/** THE SIGN IS CARRIED AND THIS READER DOES NOT SECOND-GUESS IT. `bytes_delta` arrives
++ * signed; deriving it here from `event` would put the rule in a second place, and
++ * `stored_delta` one table over is what that looks like after two chapters — a column
++ * whose sign comes from `multiIf(event = 'created', 1, …)` and whose name reads as bytes.
++ *
++ * A CLOSED SET FOR BOTH LABELS, not a substring of anything. `shapeConnection` records
++ * why: `e.type.split(".")[1]` would turn any `media.*` record into a row carrying whatever
++ * word followed the dot.
++ *
++ * AND `occurred_at` BECOMES `ts`, matching every other table's column. The wire says when
++ * it happened; the column says the same thing in the name the schema uses. */
++export function shapeMediaStored(raw: unknown): MediaStoredRow | null {
++  if (typeof raw !== "object" || raw === null) return null;
++  const e = raw as Partial<MediaStoredEvent>;
++
++  if (
++    !isString(e.environment_id) ||
++    !isString(e.media_id) ||
++    !isString(e.occurred_at) ||
++    !isString(e.event) ||
++    !isString(e.kind) ||
++    !isNumber(e.bytes_delta)
++  ) {
++    return null;
++  }
++  if (!MEDIA_EVENTS.includes(e.event)) return null;
++  if (!MEDIA_KINDS.includes(e.kind)) return null;
++
++  return {
++    environment_id: e.environment_id,
++    media_id: e.media_id,
++    event: e.event,
++    kind: e.kind,
++    bytes_delta: e.bytes_delta,
++    ts: e.occurred_at,
++  };
++}
++
++const MEDIA_EVENTS: readonly string[] = ["reserved", "rejected", "rendition", "deleted"];
++const MEDIA_KINDS: readonly string[] = ["image", "audio", "video"];
++
+ export type Shaped =
+   | { kind: "attempt"; row: AttemptRow }
+   | { kind: "request"; row: RequestRow }
+   | { kind: "connection"; row: ConnectionRow }
++  | { kind: "media"; row: MediaStoredRow }
+   | { kind: "malformed" }
+   | { kind: "unclaimed"; type: string };
+ 
+ /** Decide what a record is.
+  *
+  * AN ABSENT `type` MEANS ATTEMPT, AND THAT IS A COMPATIBILITY RULE RATHER THAN A DEFAULT.
+@@ -302,11 +372,18 @@
+   // consumer wants both.
+   if (type === CONNECTION_OPENED_TYPE || type === CONNECTION_CLOSED_TYPE) {
+     const row = shapeConnection(raw);
+     return row === null ? { kind: "malformed" } : { kind: "connection", row };
+   }
+ 
++  // The fourth arm (chapter 4.16). ONE TYPE, ONE TABLE — unlike the connection arm, which
++  // folds two because they are one table.
++  if (type === MEDIA_STORED_TYPE) {
++    const row = shapeMediaStored(raw);
++    return row === null ? { kind: "malformed" } : { kind: "media", row };
++  }
++
+   // Anything else is somebody's record and not this consumer's. Leaving it costs the stream's
+   // retention window; terminating it costs the record. Those are not comparable, and a
+   // consumer that does not recognise a type is the party with the least information.
+   return { kind: "unclaimed", type: typeof type === "string" ? type : String(type) };
+ }
+```
+
+```diff title="services/ingester/src/clickhouse.ts"
+@@ -1,14 +1,20 @@
+ // The write side. Node's own `fetch` against the HTTP interface -- no client package, which
+ // is what keeps `grep -c clickhouse pnpm-lock.yaml` at 0 by design rather than by luck.
+-import type { AttemptRow, ConnectionRow, RequestRow } from "./shape.js";
++import type {
++  AttemptRow,
++  ConnectionRow,
++  MediaStoredRow,
++  RequestRow,
++} from "./shape.js";
+ 
+ const DB = "relay_analytics";
+ const ATTEMPTS = "webhook_attempts";
+ const REQUESTS = "api_requests";
+ const CONNECTIONS = "connection_events";
++const MEDIA_EVENTS = "media_events";
+ 
+ // TWO SETTINGS, TWO DIFFERENT FAILURES, AND NEITHER IS OPTIONAL.
+ //
+ // `input_format_skip_unknown_fields=0` turns a RENAMED field into `Code: 117` instead of a
+ // silent default. Its server default is 1, which is exactly why the failure it prevents was
+ // invisible: the insert succeeds and the column takes the epoch.
+@@ -26,12 +32,15 @@
+    *  row shapes are different types and the compiler should say so at the call site. */
+   insertRequests(rows: RequestRow[]): Promise<void>;
+   /** The third table (chapter 4.5). A third call for the reason there is a second: three row
+    *  shapes are three types, and a `table` parameter would let the compiler watch a
+    *  `ConnectionRow` go into `api_requests` without a word. */
+   insertConnections(rows: ConnectionRow[]): Promise<void>;
++  /** The fourth table (chapter 4.16). A fourth call for the reason there is a third —
++   *  and the name says what it inserts, which `insert` above does not. */
++  insertMediaEvents(rows: MediaStoredRow[]): Promise<void>;
+   count(): Promise<number>;
+   countRequests(): Promise<number>;
+   countConnections(): Promise<number>;
+   /** A READ, AND THE FIRST ONE THIS INTERFACE HAS HAD (chapter 4.6).
+    *
+    * Everything above writes or counts. Chapter 4.6 needs to ASK the store a question --
+@@ -102,12 +111,22 @@
+       if (rows.length === 0) return;
+       await post(
+         `INSERT INTO ${DB}.${CONNECTIONS} FORMAT JSONEachRow`,
+         rows.map((r) => JSON.stringify(r)).join("\n"),
+       );
+     },
++    // THE EMPTY GUARD IS LOAD-BEARING HERE MORE THAN ANYWHERE. Storage records arrive on
++    // slot requests and verdicts, which the lane produces in ones and twos against
++    // 118,238 api requests — so nearly every batch carries none of these at all.
++    async insertMediaEvents(rows: MediaStoredRow[]): Promise<void> {
++      if (rows.length === 0) return;
++      await post(
++        `INSERT INTO ${DB}.${MEDIA_EVENTS} FORMAT JSONEachRow`,
++        rows.map((r) => JSON.stringify(r)).join("\n"),
++      );
++    },
+     // Reads take FINAL. The duplicate is physically present until a merge collapses it, so a
+     // bare count over-counts every redelivery -- by a plausible number.
+     async count(): Promise<number> {
+       return Number(await post(`SELECT count() FROM ${DB}.${ATTEMPTS} FINAL`, ""));
+     },
+     async countRequests(): Promise<number> {
+```
+
+```diff title="services/ingester/src/main.ts"
+@@ -47,19 +47,21 @@
+   const logger = createLogger("ingester");
+   const url = process.env["RELAY_NATS_URL"] ?? DEFAULT_NATS_URL;
+   const once = process.argv.includes("--once");
+ 
+   const nc = await connect({ servers: url });
+   const jsm = await nc.jetstreamManager();
+-  await jsm.consumers.add(ANALYTICS_STREAM, {
+-    durable_name: DURABLE,
+-    ack_policy: AckPolicy.Explicit,
+-    ack_wait: ACK_WAIT_NS,
+-    max_deliver: MAX_DELIVER,
+-    filter_subject: ALL_ANALYTICS_SUBJECT,
+-  }).catch(() => undefined); // already there; leave it alone
++  await jsm.consumers
++    .add(ANALYTICS_STREAM, {
++      durable_name: DURABLE,
++      ack_policy: AckPolicy.Explicit,
++      ack_wait: ACK_WAIT_NS,
++      max_deliver: MAX_DELIVER,
++      filter_subject: ALL_ANALYTICS_SUBJECT,
++    })
++    .catch(() => undefined); // already there; leave it alone
+ 
+   const store = createClickHouse();
+   let running = true;
+   const stop = (): void => {
+     running = false;
+   };
+@@ -84,12 +86,20 @@
+       if (r.written > 0 || r.malformed > 0 || r.unclaimed > 0) {
+         logger.log("info", "ingester.batch", {
+           written: r.written,
+           attempts: r.writtenAttempts,
+           requests: r.writtenRequests,
+           connections: r.writtenConnections,
++          // THE FIFTH RECORD TYPE, AND IT WAS MISSING FROM THIS LINE FOR A WHOLE
++          // CHAPTER. `IngestResult` has carried `writtenMediaEvents` since 4.16's
++          // phase 2 and nothing printed it, so a media delta showed up only inside
++          // `written` — a total that moved by one with no field saying which arm moved
++          // it. Found while watching this log through a ClickHouse outage (T050), which
++          // is the exact situation where an operator has nothing else to read. 4.13:
++          // *"the boot line is the only thing that said so."*
++          media: r.writtenMediaEvents,
+           malformed: r.malformed,
+           unclaimed: r.unclaimed,
+         });
+       }
+     } catch (error) {
+       // The store is unreachable, or the insert was refused. Nothing was acknowledged, so
+```
+
+```diff title="services/ingester/src/metering.ts"
+@@ -97,6 +97,100 @@
+   //
+   // `flat()[0]` rather than `rows[0]?.[0]`: the optional chain is a branch too, and the
+   // same one. A tenant with no rows would give NaN here if the server could produce one,
+   // and it cannot.
+   return Number(rows.flat()[0]);
+ }
++
++/** FR-MED-12's level: the bytes a tenant is storing as of a day (chapter 4.16).
++ *
++ * **DR-17's TECHNIQUE, AND `storedMessages` ABOVE IS THE SHAPE.** *"A daily rollup
++ * summing `media_events` deltas (uploaded/deleted)"* — the same accumulation one table
++ * over, with two of that function's details copied deliberately: no empty-result guard,
++ * because a bare aggregate with no `GROUP BY` always returns exactly one row, and
++ * `flat()[0]` rather than `rows[0]?.[0]`, because the optional chain is a branch too.
++ *
++ * **AND THE ANSWER IS SHORT BY WHATEVER THE TTL REMOVED.** This sums from the beginning
++ * of time, and `daily_usage_billing` carries `TTL toDateTime(day) + toIntervalMonth(25)`
++ * — so a level older than the retention horizon is understated by exactly the deltas
++ * that were deleted, permanently, with nothing in the system able to notice.
++ *
++ * `storedMessages` has the same defect and has never shown it, because `message_events`
++ * holds 0 rows and has no producer. **This is the first reader of this shape that will
++ * carry live data**, which is why SRS 1.23 bounds FR-MED-12 at the horizon and names
++ * DR-17's inventory as what re-bases a truncated sum: the object store holds the level
++ * directly, so the reconciliation can restate it. */
++export async function storedBytes(
++  store: ClickHouse,
++  environmentId: string,
++  asOf: string,
++): Promise<number> {
++  const rows = await store.query(
++    `SELECT sum(stored_bytes_delta) FROM ${DB}.daily_usage_billing
++      WHERE environment_id = toUUID('${environmentId}') AND day <= '${asOf}'
++      FORMAT TSV`,
++  );
++  return Number(rows.flat()[0]);
++}
++
++/** FR-009's counts: how many objects a tenant uploaded on a day, by kind (chapter 4.16).
++ *
++ * **THIS EXISTS BECAUSE 4.6's FINDING WOULD OTHERWISE HAVE HAPPENED AGAIN, ONE MOVEMENT
++ * LATER.** That chapter is called *"the rollup nobody read"*: it found a rollup that had
++ * existed for two chapters, satisfied its clause, and was read by nothing — `grep` gave a
++ * comment and a file referenced by no script, service or config. `uploads_by_kind` was in
++ * exactly that state when this function was written: one writer (`0018`), no reader
++ * outside a test. A clause that says the platform MUST count something is not discharged
++ * by a column that holds the count.
++ *
++ * A DAY RATHER THAN A BALANCE, WHICH IS THE OPPOSITE OF `storedBytes` ABOVE AND ON
++ * PURPOSE. Uploads are a FLOW — *"per tenant per day"* — so the window is closed at both
++ * ends, where a stored level is a stock and has no lower bound. The two live in the same
++ * `SELECT` in `0018` and the mistake of reading one the other's way is the specific thing
++ * FR-010 exists to prevent.
++ *
++ * `sumMap` AND NOT A BARE `SELECT`, for `dailyUsage`'s reason at one more remove. The
++ * column is `SimpleAggregateFunction(sumMap, …)` on a `SummingMergeTree`, so an unmerged
++ * table answers one map per insert; measured in phase 2, a plain `Map` in this position
++ * does not merge at all and keeps the first row's value.
++ *
++ * A KIND WITH NO UPLOADS IS ABSENT FROM THE MAP, NOT PRESENT AS ZERO — `dailyUsage`'s
++ * *"a day with no activity is a missing row, never a row of zeros"*, one level down. The
++ * caller fills the vocabulary if it needs a dense record, and this does not pretend to. */
++export async function uploadsByKind(
++  store: ClickHouse,
++  environmentId: string,
++  from: string,
++  to: string,
++): Promise<Record<string, number>> {
++  const rows = await store.query(
++    `SELECT sumMap(uploads_by_kind) FROM ${DB}.daily_usage_billing
++      WHERE environment_id = toUUID('${environmentId}') AND day BETWEEN '${from}' AND '${to}'
++      FORMAT TSV`,
++  );
++  return parseKindMap(rows.flat()[0]);
++}
++
++/** ClickHouse's TSV form for a `Map`, measured: `{'audio':14,'image':155,'video':2}` —
++ *  one line, single-quoted keys, unquoted values. **Not JSON**, and the difference is not
++ *  cosmetic: the first version of this read asked for `FORMAT JSONCompact`, whose keys are
++ *  double-quoted and whose body is a multi-line envelope this client's tab-splitter would
++ *  shred. The regex below would have matched nothing in it and returned **`{}`** — a
++ *  silently empty answer from a tenant with uploads, which is the shape of wrong this
++ *  project files against itself. The format was then asked of the server rather than
++ *  assumed.
++ *
++ *  PARSED RATHER THAN RE-SHAPED IN SQL, because the alternative — `arrayJoin` into rows —
++ *  turns one read into a shape every caller has to reassemble. */
++function parseKindMap(value: string | undefined): Record<string, number> {
++  const out: Record<string, number> = {};
++  // `String(value)` AND NOT `value ?? ""`, WHICH WAS AN UNREACHABLE BRANCH AND MEASURED
++  // AS HALF THIS FILE'S. A bare aggregate with no `GROUP BY` always returns exactly one
++  // row (4.6, asked of the server), so the absent arm cannot arise through the running
++  // query — the same fact `storedMessages` above cites for carrying no empty-result
++  // guard, and the same repair 4.6 made when it reached 100% by deleting branches rather
++  // than by writing a test that could not fail. On the impossible value the regex matches
++  // nothing and the answer is `{}`, which is exactly what the guard produced.
++  for (const m of String(value).matchAll(/'([^']+)':(\d+)/g))
++    out[m[1]!] = Number(m[2]);
++  return out;
++}
+```
+
+```diff title="services/api/src/db/repository.ts"
+@@ -743,12 +743,16 @@
+     };
+     renditionFailedReason?: string;
+   },
+ ): Promise<{
+   applied: boolean;
+   state: string | null;
++  /** 4.16: the quota's quantity, so a `rejected` delta can negate it. `null` only when
++   * no such object exists, like the fields beside it. */
++  declaredBytes: number | null;
++  mimeType: string | null;
+   objectKey: string | null;
+   /** THE TENANT, BECAUSE THIS FUNCTION IS THE ONLY PLACE THAT KNOWS IT (chapter 4.14).
+    *
+    * This is a module-level function on a raw `Db`, deliberately outside the
+    * tenant-scoped repository, because its caller is a worker rather than a tenant — and
+    * the worker's principal carries `environmentId: undefined` by design (4.4). FR-MED-07
+@@ -781,12 +785,22 @@
+       // separately would open a window in which the row moved between the two
+       // statements and the delete addressed somebody else's object.
+       objectKey: mediaObjects.objectKey,
+       // AND THE TENANT, for the same reason: the fan-out FR-MED-07 needs is scoped by
+       // environment, and this statement is the only one that knows which.
+       environmentId: mediaObjects.environmentId,
++      // AND THE BYTES AND THE MIME TYPE (4.16), which the verdict seam needs and did not
++      // have. A `rejected` delta has to negate the quota's own quantity —
++      // `declared_bytes`, which `reserveMediaSlot` sums — and FR-009's per-kind count
++      // needs the type. The input carries a field called `kind` and it is the
++      // RENDITION's (`"thumbnail"`), which is the near-miss a reader would use by
++      // accident. **Third chapter running that this list was short**: 4.14 added
++      // `environmentId`, 4.15 added `userId`, and each time the repair was the same —
++      // the statement that already reads the row is the one that should say.
++      declaredBytes: mediaObjects.declaredBytes,
++      mimeType: mediaObjects.mimeType,
+       // AND THE UPLOADER (4.15), so a rendition inserted below carries the same
+       // `user_id` as its parent. FR-MED-10's second sentence makes compliance erasure
+       // delete *"a user's media objects and derived objects"*, and it will find both on
+       // one predicate only if the rendition was written with the parent's user. Reading
+       // it from the same statement rather than a second SELECT is this list's whole
+       // argument, applied once more.
+@@ -830,31 +844,37 @@
+         rendition: input.rendition.kind,
+       });
+     }
+     return {
+       applied: true,
+       state: updated.state,
++      declaredBytes: updated.declaredBytes,
++      mimeType: updated.mimeType,
+       objectKey: updated.objectKey,
+       environmentId: updated.environmentId,
+     };
+   }
+ 
+   // NOT `pending`: either somebody got there first, or the object does not exist. The
+   // caller needs to tell those apart, so the current state comes back rather than a
+   // bare false.
+   const [row] = await tx
+     .select({
+       state: mediaObjects.state,
++      declaredBytes: mediaObjects.declaredBytes,
++      mimeType: mediaObjects.mimeType,
+       objectKey: mediaObjects.objectKey,
+       environmentId: mediaObjects.environmentId,
+     })
+     .from(mediaObjects)
+     .where(eq(mediaObjects.id, input.id));
+   return {
+     applied: false,
+     state: row?.state ?? null,
++    declaredBytes: row?.declaredBytes ?? null,
++    mimeType: row?.mimeType ?? null,
+     objectKey: row?.objectKey ?? null,
+     environmentId: row?.environmentId ?? null,
+   };
+   });
+ }
+ 
+```
+
+```diff title="services/api/src/media/presign.ts"
+@@ -38,12 +38,16 @@
+    * with no key segment and no trailing slash. The first probe of this chapter
+    * created its bucket with `mkdir` and so never exercised this path. */
+   key?: string;
+   accessKey: string;
+   secretKey: string;
+   region?: string;
++  /** Extra query parameters, signed with the rest (4.16). A bucket listing pages with
++   *  `marker`, and a parameter outside the signature is a 403 rather than an ignored
++   *  hint. Empty for every caller that predates the inventory. */
++  params?: Record<string, string>;
+   /** Seconds. FR-003 says 15 minutes for an upload slot, and the STORE enforces it —
+    * a URL past its expiry is refused with `AccessDenied · Request has expired` from
+    * the store's own clock, with nothing asked of us. */
+   expiresIn?: number;
+   /** Injectable for the tests; the signature is a function of this instant. */
+   now?: Date;
+@@ -57,28 +61,41 @@
+     key = "",
+     accessKey,
+     secretKey,
+     region = "us-east-1",
+     expiresIn = 900,
+     now = new Date(),
++    params = {},
+   } = options;
+ 
+   const host = new URL(endpoint).host;
+   const amzDate = now.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
+   const date = amzDate.slice(0, 8);
+   const scope = `${date}/${region}/s3/aws4_request`;
+ 
+-  // ORDER MATTERS AND `URLSearchParams` PRESERVES INSERTION ORDER. The canonical query
+-  // string is the signed parameters sorted by name, and these five already are.
+-  const query = new URLSearchParams({
+-    "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
+-    "X-Amz-Credential": `${accessKey}/${scope}`,
+-    "X-Amz-Date": amzDate,
+-    "X-Amz-Expires": String(expiresIn),
+-    "X-Amz-SignedHeaders": "host",
+-  });
++  // ORDER MATTERS, AND SINCE 4.16 IT IS SORTED RATHER THAN ARRANGED. The canonical query
++  // string is every signed parameter ordered by name, and the five below were written in
++  // that order by hand — which was true and stopped being a safe thing to rely on the
++  // moment a caller could add its own. `marker` and `max-keys` happen to sort after
++  // `X-Amz-*` because uppercase precedes lowercase in ASCII; a parameter beginning with a
++  // digit would not, and the failure is a `SignatureDoesNotMatch` with nothing to read.
++  //
++  // **EVERY PARAMETER MUST BE INSIDE THE SIGNATURE.** Measured before this was written:
++  // appending `&list-type=2` to an already-signed URL answers
++  // `SignatureDoesNotMatch` — which is how a bucket listing that needs pagination
++  // discovered it needed this argument at all.
++  const signed: [string, string][] = [
++    ["X-Amz-Algorithm", "AWS4-HMAC-SHA256"],
++    ["X-Amz-Credential", `${accessKey}/${scope}`],
++    ["X-Amz-Date", amzDate],
++    ["X-Amz-Expires", String(expiresIn)],
++    ["X-Amz-SignedHeaders", "host"],
++    ...Object.entries(params),
++  ];
++  signed.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
++  const query = new URLSearchParams(signed);
+ 
+   // SEGMENT BY SEGMENT. `encodeURIComponent` on the whole path would escape the
+   // separators too, and a key with a slash in it is the normal case here.
+   const uri = key
+     ? `/${bucket}/${key.split("/").map(encodeURIComponent).join("/")}`
+     : `/${bucket}`;
+```
+
+```diff title="services/api/src/media/store.ts"
+@@ -204,6 +204,75 @@
+ ): Promise<boolean> {
+   const results = await Promise.all(
+     [parentKey, ...renditionKeys].map((key) => deleteObject(config, key)),
+   );
+   return results.every(Boolean);
+ }
++
++/** One entry of the object store's own inventory (DR-17, chapter 4.16). */
++export interface StoredObject {
++  key: string;
++  bytes: number;
++}
++
++/** WHAT THE STORE SAYS IT HOLDS — the only thing that can contradict the meter.
++ *
++ * DR-17 asks for the rollup to be *"reconciled weekly against an object-storage inventory
++ * listing"*, and nothing in this platform could list a bucket. It turned out to be nearly
++ * free: `presign` with no key signs `/{bucket}`, which is a listing, and it already
++ * documented that case at 4.10.
++ *
++ * **IT PAGES, AND THAT IS NOT OPTIONAL.** One response carries 1,000 keys with
++ * `IsTruncated: true` against a bucket holding 8,120 objects. **4.13's sweep read one page
++ * and an object nobody uploaded to stayed `pending` for ever**; a reconciliation that
++ * read one page would report agreement for the 7,000 it never looked at. V1 pages with
++ * `marker` — V2's `continuation-token` belongs to `list-type=2`, which is not what was
++ * measured.
++ *
++ * **NO `HEAD` PER OBJECT.** Each entry carries its own `<Size>`, so the inventory costs
++ * nine requests rather than 8,120: **430 ms against 11.5 s** at this lane's size.
++ *
++ * XML BY REGULAR EXPRESSION, DELIBERATELY. The response is a fixed S3 shape with two
++ * elements this needs; a parser would be a dependency (ADR-30's ratio) and this platform
++ * has hand-written a SigV4 signer rather than take one. */
++export async function listObjects(
++  config: StoreConfig,
++  opts: { maxPages?: number } = {},
++): Promise<{ objects: StoredObject[]; pages: number; truncated: boolean }> {
++  const maxPages = opts.maxPages ?? 100;
++  const objects: StoredObject[] = [];
++  let marker: string | undefined;
++  let pages = 0;
++
++  for (; pages < maxPages; ) {
++    const url = presign({
++      method: "GET",
++      ...config,
++      endpoint: config.internalEndpoint,
++      expiresIn: 300,
++      ...(marker === undefined ? {} : { params: { marker } }),
++    });
++    const res = await fetch(url, { signal: AbortSignal.timeout(30_000) });
++    if (!res.ok) throw new Error(`LIST ${config.bucket}: ${res.status}`);
++    const xml = await res.text();
++    pages += 1;
++
++    // `[\s\S]` rather than the `s` flag, to match the file's target without a lib bump.
++    const entries = xml.matchAll(
++      /<Contents>[\s\S]*?<Key>([^<]+)<\/Key>[\s\S]*?<Size>(\d+)<\/Size>[\s\S]*?<\/Contents>/g,
++    );
++    let last: string | undefined;
++    for (const m of entries) {
++      objects.push({ key: m[1]!, bytes: Number(m[2]) });
++      last = m[1]!;
++    }
++
++    if (!/<IsTruncated>true<\/IsTruncated>/.test(xml) || last === undefined) {
++      return { objects, pages, truncated: false };
++    }
++    marker = last;
++  }
++  // THE PAGE CAP IS REPORTED, NOT SWALLOWED. A caller that stops early must be able to
++  // say its answer is partial — the alternative is a reconciliation reporting agreement
++  // about a bucket it did not finish reading.
++  return { objects, pages, truncated: true };
++}
+```
+
+```diff title="services/api/src/media/media.service.ts"
+@@ -1,13 +1,19 @@
+ import { randomUUID } from "node:crypto";
+ 
+-import { BadRequestException, HttpStatus, Injectable } from "@nestjs/common";
++import { BadRequestException, HttpStatus, Inject, Injectable } from "@nestjs/common";
++
++import type { Logger } from "@relay/service-kit";
+ 
+ import { Repository } from "../db/repository";
+ import { protocolError } from "../protocol-error";
+ import { KIND_CAPS, kindOf } from "./kinds";
++import { LOGGER } from "../logger";
++import { publishStorageDelta } from "../metering/storage-event";
++import type { Publisher } from "../outbox/publisher";
++import { ANALYTICS_PUBLISHER } from "../webhooks/analytics";
+ import { presign } from "./presign";
+ import { storeConfig, storeReady, type StoreConfig } from "./store";
+ 
+ /** What a caller declares. Nothing here is verified — FR-MED-03 is a later chapter,
+  * and the quota arithmetic below is over these numbers rather than over bytes. */
+ export interface SlotRequest {
+@@ -46,13 +52,17 @@
+ const SLOT_SECONDS = 900;
+ 
+ @Injectable()
+ export class MediaService {
+   private readonly store: StoreConfig = storeConfig();
+ 
+-  constructor(private readonly repo: Repository) {}
++  constructor(
++    private readonly repo: Repository,
++    @Inject(ANALYTICS_PUBLISHER) private readonly analytics: Publisher,
++    @Inject(LOGGER) private readonly logger: Logger,
++  ) {}
+ 
+   async createSlot(input: SlotRequest, userExternalId?: string): Promise<Slot> {
+     // ORDER MATTERS AND IT IS THE CLAUSE'S. Type, then size, then quota: the first two
+     // are facts about the request and the third needs a read, so refusing in this order
+     // means a request that was never going to be accepted does not touch the database.
+     const kind = kindOf(input.mime_type);
+@@ -136,12 +146,32 @@
+       method: "PUT",
+       ...this.store,
+       key: objectKey,
+       expiresIn: SLOT_SECONDS,
+     });
+ 
++    // FR-MED-12's `reserved` DELTA — **AFTER THE COMMIT, OUTSIDE THE TRANSACTION, AND NOT
++    // AWAITED.** `webhooks/analytics.ts` records the decision: *"guarantee independence →
++    // the publish happens after the commit, outside it, and a crash in that gap loses the
++    // record"*, because a blocked outcome transaction is what constitution III names as a
++    // design failure. And a publish INSIDE a transaction that rolls back would emit a
++    // delta for a slot that was never created — a permanent overcount, which is the whole
++    // thing this chapter argues nothing corrects.
++    //
++    // THE BYTES ARE THE QUOTA'S (FR-002). `reserveMediaSlot` sums `declared_bytes` where
++    // `state <> 'rejected'`, so a `pending` object is already charged and the meter says
++    // the same number for the same reason rather than by agreement.
++    void publishStorageDelta(this.analytics, this.logger, {
++      environmentId: this.repo.environment,
++      mediaId: id,
++      cause: "reserved",
++      kind,
++      bytesDelta: input.bytes,
++      occurredAt: new Date(),
++    });
++
+     return {
+       media_id: id,
+       state: "pending",
+       upload_url,
+       expires_at: new Date(Date.now() + SLOT_SECONDS * 1000).toISOString(),
+     };
+```
+
+```diff title="services/api/src/media/media.module.ts"
+@@ -1,10 +1,15 @@
+ import { Module, Scope } from "@nestjs/common";
+ import { REQUEST } from "@nestjs/core";
+ 
+ import { AuthModule } from "../auth/auth.module";
++import { LOGGER, apiLogger } from "../logger";
++import { ensureAnalyticsStream } from "../outbox/jetstream.publisher";
++import { createJetStreamPublisher } from "../outbox/jetstream.publisher";
++import type { Publisher } from "../outbox/publisher";
++import { ANALYTICS_PUBLISHER } from "../webhooks/analytics";
+ import { createDb, createPool, type Db } from "../db/client";
+ import { Repository } from "../db/repository";
+ import { MediaController } from "./media.controller";
+ import { MediaService } from "./media.service";
+ import type { RequestWithTenant } from "../messages/request-with-tenant";
+ 
+@@ -38,10 +43,25 @@
+       provide: Repository,
+       scope: Scope.REQUEST,
+       inject: ["DB", REQUEST],
+       useFactory: (db: Db, req: RequestWithTenant) =>
+         new Repository(db, req.principal?.environmentId ?? ""),
+     },
++    // A THIRD COPY OF THE SAME FACTORY, AND THE RULE THAT FORCES IT IS WRITTEN IN
++    // `internal.module.ts`: *"a provider is visible to the module that declares it and to
++    // nothing it imports"* — and `InternalModule` has no `exports:` array. `AppModule`
++    // already provides `ANALYTICS_PUBLISHER` for its middleware and `InternalModule` for
++    // the dispatcher; this module needs it for FR-MED-12's storage deltas (4.16).
++    //
++    // The cost is the one `app.module.ts` states: another lazy NATS connection and another
++    // idempotent `ensureAnalyticsStream` at boot. **And declaring a service without its
++    // providers compiles, typechecks and lints**, then fails at the first request with
++    // `Nest can't resolve dependencies` — 4.10's finding, in this very file's header.
++    {
++      provide: ANALYTICS_PUBLISHER,
++      useFactory: (): Publisher => createJetStreamPublisher({ ensure: ensureAnalyticsStream }),
++    },
++    { provide: LOGGER, useFactory: () => apiLogger() },
+     MediaService,
+   ],
+ })
+ export class MediaModule {}
+```
