@@ -1733,7 +1733,7 @@ FR-RTM-09 caps a user at five concurrent connections. §6.3 has carried a remedy
 first draft — a sorted set scored by heartbeat time, pruned with `ZREMRANGEBYSCORE` on read
 — and this record rejects it. **The row was right about the defect and wrong about the fix.**
 
-**A cap is a claim, not a count.** FR-013 requires that two connections arriving at the same
+**A cap is a claim, not a count.** Feature 040's FR-013 requires that two connections arriving at the same
 instant cannot both take the fifth place, which needs an atomic check-and-insert. A sorted
 set has none. `ZADD` then `ZCARD` is check-then-act. Add-then-verify — add, count, remove if
 over — refuses **both** of two connections arriving at four held: safe, and wrong. The
@@ -1902,9 +1902,30 @@ them anyway** — it selects packages, and the five `request-log.itest.ts` reds 
 line and reporting green), and `request-log.itest.ts` spawns the ingester it needs rather than
 the stack running one forever.
 
+**AND THE GATE'S ACCOUNT HAS A HOLE THE GATE CANNOT SEE** (added chapter 4.17). The lane list
+comes from the tree, which is what makes the suite count honest — and `packages/outsider` is not
+in it. That package declares no `@relay/*` dependency and talks to a composed stack over HTTP and
+WebSocket, so it is reached by **no local lane at all**: not `pnpm test`, not
+`pnpm test:integration`, and not `pnpm coverage`, which excludes it at
+`vitest.coverage.config.mts:98`. Its only runner is CI's **separate sealed job**, which builds
+two Node images and starts `--profile services`.
+
+That matters beyond bookkeeping, because **the sealed job is the only thing anywhere that
+exercises the deployed media worker.** Every other check of the verification path stands in for
+the container: `media-worker`'s own suite runs the sweep in process, the api's state machine
+tests call `recordMediaVerdict` directly, and the delivery gate's tests set states with SQL. So
+the service that decides whether a customer's upload is readable has **exactly one** automated
+consumer, it runs in a job most contributors never trigger locally, and **it contributes nothing
+to the coverage number** — a file that is 100% covered by the coverage lane and a file the
+deployed worker runs are two different claims about two different sets of code. Chapter 4.17 is
+where that job gained an assertion that fails when the worker stops.
+
 **One level up is not fixed and is not claimed.** `ci.yml`'s tutorial job ends with
-`pnpm check:fences`, which exits 1 at the standing 110 problems on every push since feature 045.
-That decision belongs to the series and is recorded, not taken here.
+`pnpm check:fences`. That exited 1 at a standing 110 problems on every push from feature 045
+until **feature 055 took the chain to 0**, where it has stayed; the sentence here said *"on every
+push"* for eight chapters after it stopped being true, and is corrected at chapter 4.17 rather
+than deleted, because the decision it records — that the series owns the threshold, not this
+document — still stands.
 
 Full argument, the four rejected options and the measurements: ADR-27 in `06-adr-deep-dives.md`.
 
@@ -2000,7 +2021,7 @@ from the store's own clock, tampered 403 — and those nine are an integration s
 one-off probe for that reason.
 
 **And the cost that is not the dependency.** A presigned URL needs no contact with the store, so
-the api never learns the store is down and FR-017's refusal needed a round trip built for it:
+the api never learns the store is down and feature 056's FR-017 refusal needed a round trip built for it:
 **+1.524 ms at p50, +24.1%** on the happy path, 200 samples a side.
 
 **Reversal condition.** If a later chapter needs listing, copying, lifecycle rules or multipart

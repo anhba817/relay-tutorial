@@ -1,0 +1,373 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import {
+  figWhatEachSuiteStandsInFor,
+  figWhereTheTimeGoes,
+  figThreeCasesTwoFields,
+  figWhatSilenceMeans,
+} from "./figures";
+
+export const metadata = {
+  title: "Milestone: an image, end to end — Building Relay",
+  description:
+    "Seven chapters built upload, scan, verdict, state, thumbnail and delivery, and no test joined them — every suite stood in for the step beside it. Plus a comment explaining why an assertion was stable that was false in the job that runs it, and a log whose silence means two different things.",
+  alternates: {
+    canonical: "/part-4/chapter-17/milestone-an-image-end-to-end",
+    languages: {
+      en: "/part-4/chapter-17/milestone-an-image-end-to-end",
+      vi: "/vi/part-4/chapter-17/milestone-an-image-end-to-end",
+    },
+  },
+};
+
+<ChapterHeader id="4.17" />
+
+A milestone chapter adds nothing. That is the whole of its brief, and it is harder to hold to
+than it sounds, because the way to find out whether seven chapters of work fit together is to
+make them fit together, and the moment something does not, the obvious move is to fix it.
+
+This one has a path to check. A customer's backend asks for an upload slot, PUTs an image
+straight to the object store, and sends a message naming it. Some seconds later a container
+nobody in the test has ever addressed decides the bytes are what they claimed to be, writes a
+thumbnail, and marks the object `ready`. A reader of that channel sees the attachment stop being
+a placeholder, asks for a link, and fetches the pixels.
+
+Every step of that has a chapter, and every chapter has a suite. What none of them had was each
+other.
+
+## What each suite stands in for
+
+<Figure caption="Four suites, four stand-ins. Each one replaces at least one of the steps beside it with something it controls." code={figWhatEachSuiteStandsInFor} />
+
+Read that figure as four separate claims, each true and each narrower than it looks.
+
+The media worker's own integration suite runs a real sweep against a real store and a real
+virus scanner, and produces a real verdict. It also runs that sweep **in process**, by importing
+the function and calling it. It never sends a message, so nothing downstream of the verdict is
+in the picture.
+
+The API's attachment-state suite covers the other end beautifully: a message is sent with a
+pending attachment, a verdict arrives, and history reports the new state. The verdict arrives
+because the test posts it. There is no worker.
+
+The delivery suite checks six refusals and one grant against the signed-URL route, with each
+object's state set by an `UPDATE`.
+
+And the thumbnail suite is a unit test over a buffer — the best kind, fast and exact, and
+entirely about a function.
+
+Four green suites. One path nobody had walked.
+
+<Why title="Why that is a normal way for a codebase to end up here">
+
+None of those four is a bad test. Each is the right test for the chapter that wrote it: the
+worker's chapter wanted to know whether the sweep reaches the right conclusion, and calling the
+function is the cheapest way to ask. The state machine's chapter wanted to know whether a
+verdict moves the state, and posting one is the cheapest way to ask.
+
+The stand-ins only become a problem in aggregate, and nothing in a codebase measures aggregates.
+A coverage report will tell you every line ran. A green lane will tell you every suite passed.
+Neither can tell you that the thing calling the worker is always a test.
+
+</Why>
+
+## The premise was partly wrong, and that made the chapter smaller
+
+The specification for this chapter opened with a table of how far each suite walks, written
+against the tree rather than against memory, and one of its rows said that the sealed
+integration suite — the one that talks to a composed stack over HTTP with no workspace imports —
+*asserts `state: "pending"`, no verdict in the picture.*
+
+It is in the picture. Sixty lines below the assertion that row was written from, the same test
+polls `GET /v1/media/{id}` to a thirty-second deadline, and that route cannot answer `200` until
+the deployed worker has marked the object `ready`. Then it fetches the signed URL and compares
+the bytes it gets back against the bytes it uploaded.
+
+A real scan has been deciding what that test can fetch since chapter 4.13.
+
+The honest consequence is a smaller chapter, which is worth saying plainly because the pull in
+the other direction is strong. What was genuinely missing is three things: nothing asserted that
+the state a **recipient** sees ever changes — the `pending` assertion was never followed by a
+second read; nothing fetched a thumbnail; and nothing anywhere watched a `media.updated` frame
+arrive. That is the milestone. It is less than the brief claimed and it is still the join.
+
+## The comment that was false in the job that runs it
+
+Finding that out meant reading the whole test instead of the line that had been quoted, and
+reading the whole test turned up something better than the correction.
+
+The `pending` assertion carried an explanation:
+
+> this suite runs no media worker, which is what makes the value stable rather than
+> timing-dependent
+
+CI's sealed job runs `docker compose --profile services up -d --wait`, and `media-worker` is in
+that profile. A worker has been running every single time that assertion passed.
+
+<Trap title="A comment that explains why an assertion is stable, and is false in the job that runs it">
+
+The sentence offers one reason — *no worker runs* — for a conclusion that is correct for a
+different reason: there is a margin. The sweep fires every five seconds, and the three HTTP
+calls between the upload and the assertion take milliseconds, so the read lands early in the
+cycle almost every time. Measured over ten independent trials: **min 1,861 · p50 3,993 · max
+5,568 ms** from upload to verdict.
+
+So the value is timing-dependent **and** it is stable. The comment treats those as alternatives.
+
+A race with a four-second margin is the kind nothing ever catches. It will not fail in CI, it
+will not fail under load, and it will not fail when somebody shortens the sweep interval to two
+seconds — it will start failing weeks later, in a test whose comment says a race is impossible.
+
+What survives this is not the comment. It is the assertion, which was right the whole time, and
+that is exactly why nobody looked.
+
+</Trap>
+
+The repair is two lines. The comment is replaced by the measurement, and the reason is then
+checked rather than written down: if `pending` is right because the read happens inside the
+window, then waiting past the window must produce a verdict. The existing assertion stays and a
+new one follows it, and if some later change stops a worker running in this lane, the first line
+keeps passing and the second goes red naming the worker.
+
+A comment is not a test. This chapter is about joining things up, and the first thing it joined
+was a claim to a check.
+
+An excerpt, untitled because it is one — the whole file is in the appendix:
+
+```ts
+    expect(delivered.payload.attachments).toEqual([
+      { type: "url", kind: "image", url: "https://example.test/outside-url.png" },
+      { type: "media", media_id: mediaId, state: "pending" },
+    ]);
+    socket.close();
+
+    // AND THE REASON IS NOW CHECKED RATHER THAN ASSERTED IN PROSE (chapter 4.17). A
+    // comment is not a test: if the state above is `pending` because the read is inside
+    // the window, then waiting past the window must produce a verdict.
+    const settled = await waitForAttachmentState(channelId, mediaId, credential);
+    expect(settled, "the deployed worker produced no verdict").toBe("ready");
+```
+
+The helper is a poll to a deadline over the **published** surface, because there is no route
+that answers *has the worker run yet* — the client PUTs straight to the store, so nothing tells
+the platform an upload finished and chapter 4.13 built a sweep on a timer instead. A client
+learns the verdict by reading the message again, and so does this:
+
+```ts
+    const started = Date.now();
+    for (;;) {
+      const res = await get(`/v1/channels/${channelId}/messages?limit=10`, auth);
+      const messages = (res.body["messages"] ?? []) as {
+        attachments?: { media_id?: string; state?: string }[];
+      }[];
+      const attachment = messages
+        .flatMap((m) => m.attachments ?? [])
+        .find((a) => a.media_id === mediaId);
+      const seen = attachment?.state ?? "absent";
+      if (seen !== "pending") return seen;
+      if (Date.now() - started > deadlineMs) {
+        throw new Error(
+          `media ${mediaId} is still '${seen}' after ${Date.now() - started} ms. ` +
+            `The sweep runs every 5,000 ms, so this is not the timer — the media worker ` +
+            `is not producing verdicts. …`,
+        );
+      }
+      await new Promise((r) => setTimeout(r, 200));
+    }
+```
+
+That message is the point of the helper, not the loop. From outside the platform a stopped
+worker and an object nobody uploaded to are the same 404, so a deadline reporting only *still
+pending* would be describing a legitimate state and saying nothing about why.
+
+## The journey
+
+<Checkpoint>
+
+The suite goes in `packages/outsider`, for one decisive reason: **it is the only lane whose job
+starts the deployed worker.** The end-to-end harness boots services in process. The API lane
+calls the verdict function directly. The sealed job is the one that runs
+`--profile services`, which is where the container is.
+
+</Checkpoint>
+
+The test is one `it`, because the point is the join. Ten steps, each naming the chapter it
+depends on — a convention borrowed from the Tuấn test, and not decoration: this walk crosses
+seven chapters and three services, so a bare `expected 404 to be 200` at step nine sends a
+reader to the delivery route, which is the one part of the path that is almost never the cause.
+
+Three details are worth more than the code.
+
+**The image has to be bigger than 320 pixels on its long edge, or there is no thumbnail.** The
+suite already had a PNG fixture: a 1×1 greyscale image, 67 bytes, written as a literal because
+this package may not import workspace code. At or below the bound the worker writes no rendition
+at all — chapter 4.15's decision, and the right one — so a journey built on that fixture would
+assert a rendition id the payload never carries, and fail naming the id rather than the bound.
+The new fixture is 800×600, generated with `node:zlib` because half a megabyte of deflate cannot
+be a literal.
+
+**The subscriber must be a member, even of a public channel.** Without the membership call, a
+socket opened with a valid token receives `connection.ack` and `presence.changed` and nothing
+else. No `message.created`, no `media.updated`. The absence of every frame looks exactly like the
+absence of the one you came for, and an early version of this probe spent three attempts
+concluding that `media.updated` did not exist.
+
+**And the send happens before the verdict, on purpose.** FR-MED-06 allows attaching an object the
+moment the upload completes, because the alternative is a client waiting on a timer it cannot
+see. So the recipient's first sight of the message is a placeholder, and that is a state being
+asserted rather than a race the test happens to win.
+
+## The other half: a refusal is a marker, not a gap
+
+The clause this movement ends on asks for something a platform cannot fully provide:
+
+> A `rejected` attachment shall render as an explicit rejection marker in history — never as a
+> broken link — preserving the record that *something* was sent.
+
+*Renders* is a claim about a client, and there is no client in this repository. What the platform
+owes a renderer, though, is checkable, and the second journey checks it with a 43-byte GIF89a
+declared as `image/png` — a file that is perfectly valid and is not what was claimed.
+
+<Figure caption="Three things a recipient must tell apart, and the two fields that separate them." code={figThreeCasesTwoFields} />
+
+The message survives the refusal: history returns it, with the attachment reading `rejected`.
+That was checked as a premise before it was asserted, because a history route that filtered such
+a message would have made the clause unbuildable rather than unmet, and the chapter's job would
+then have been to say so.
+
+And the distinction the clause exists for holds — in **two** fields. A deleted message is a
+tombstone: its `text` is `NULL` and its attachments are gone. A message with nothing attached has
+its text and an empty array. A refused upload has its text and an attachment that says what
+happened. A client reading only `attachments` cannot tell a deletion from a plain message, and a
+client reading only `text` cannot tell a refusal from a delivery. That sentence is the part a
+client author needs, and no suite had ever put the three side by side.
+
+The object itself is gone, and asking for it says nothing: `GET /v1/media/{id}` for the rejected
+object is byte-identical to the same call for an id no object has ever had, apart from the
+request id. Chapter 4.12 built that indistinguishability deliberately, because a refusal naming
+its cause reports whether somebody else's object exists. This is the first time it has been
+checked with a real refusal on one side instead of a state set by a fixture.
+
+## What it costs
+
+<Figure caption="n = 25, each trial preceded by a uniform random sleep so the upload lands at a uniform point in the sweep's cycle." code={figWhereTheTimeGoes} />
+
+Every step a client controls is under twenty milliseconds. The one it waits on is three orders
+of magnitude larger, and publishing a single total would describe a slow platform when what is
+there is a fast platform that checks every five seconds.
+
+The sweep's own period was measured from a different instrument — the API's access log, in which
+every pass announces itself as nine `GET /internal/media/pending` requests. Twelve consecutive
+passes: **5.37, 5.39, 5.40, 5.40, 5.40, 5.41, 5.36, 5.37, 5.37, 5.36, 5.37 seconds.** Five
+seconds of interval and about 370 milliseconds of work, because the loop sleeps after the pass
+rather than running on a fixed schedule.
+
+So the wait is uniform on the interval plus the work, and the work is a residual rather than a
+measurement: the smallest total observed is 433 ms, the smallest possible wait is zero, so the
+`HEAD`, the download of 480,813 bytes, the scan, the sniff, the dimensions, the thumbnail, the
+rendition upload, the verdict and the history read that sees it come to **no more than 433 ms**
+between them. That is a total minus a bound and is published as one.
+
+<Trap title="A measurement taken in a loop synchronises with the thing it is measuring">
+
+The first version of this battery ran five trials back to back and reported a median of
+**5,693 ms** — almost the whole interval, every time, with a spread of 467 ms across five
+samples of a process gated by a five-second timer.
+
+That spread is the tell, and it was read past. Each trial began immediately after the sweep that
+ended the one before, so each upload landed at the same point in the next cycle: a loop that
+waits for the thing it is timing synchronises with it.
+
+Ten trials with a random sleep in front of each gave **min 1,197 · p50 2,953 · max 5,840**. The
+published figure had been the worst case wearing a median's name.
+
+</Trap>
+
+**And the tail is published rather than smoothed.** One upload in six — four of twenty-five, one
+of twelve — waited five or six whole passes: 19.3, 30.2, 32.2 and 36.2 seconds, with the object
+pending, present in the bucket, inside the window and not decided. Three candidate explanations
+were eliminated by measurement rather than by argument. The sweep did not stop: twelve
+consecutive passes, no gap. The scan was not slow: twenty scans of this exact fixture straight to
+`clamd` are **min 2 · p50 2 · max 4 ms**. The worker had not died: it was being served nine
+pages every 5.4 seconds throughout.
+
+It is left open, with the evidence attached, because this chapter adds no mechanism and the
+sweep belongs to chapter 4.13. A median of 3,398 ms alone would claim the path is reliably under
+four seconds, and one upload in six is not.
+
+## A log that cannot say "alive, nothing to do"
+
+Eliminating that third candidate took ten minutes and was the most instructive wrong turn in the
+chapter.
+
+<Figure caption="The same ten minutes, read from two logs." code={figWhatSilenceMeans} />
+
+The worker's log had not moved for four minutes. `docker compose ps` said `running`. Everything
+about that reads as a hung process, and the conclusion was drawn confidently enough to start
+looking for a missing timeout.
+
+The worker logs a sweep **only when it produced a verdict** — deliberately, with the reason in
+the comment beside it: a sweep over an empty backlog every five seconds would otherwise be the
+loudest thing in the log. So an idle worker is byte-identical, in its own log, to a stopped one.
+
+Sixty-two seconds of deliberate idle confirmed it: zero sweep lines, zero change in the ready
+count, and the API's access log showing nine pending requests every 5.4 seconds throughout.
+
+This series has now met four checks that could not fail for the reason somebody was reading
+them: a `/ping` that answered while every query was refused, a credential whose absence turned
+three attacks into silent passes, a bucket that never existed, and a scanner signature thirteen
+days stale. This is the same family with the polarity reversed — not a check that cannot fail,
+but a log that cannot say it is working. **For liveness, read the log of whatever the process
+talks to.**
+
+## The two halves of the milestone
+
+Every milestone in this part splits into a claim the lane checks on every run and a figure
+recorded once, and the split exists to stop the second being presented as the first.
+
+**What the lane checks, on every push:** one image travels from slot to delivered bytes with the
+verdict made by the deployed worker, and the bytes that come back are the bytes that went in; the
+thumbnail is fetched by an id no message names; a `media.updated` frame arrives carrying `ready`
+on one path and `rejected` on the other; and a refused upload reaches history as a marker that is
+distinguishable from a deletion. Stop the worker and the suite is 18 of 20, with both failures
+naming the worker and the command to run.
+
+**What is recorded once:** the decomposition above. Twenty-five trials on one machine with
+everything on loopback, one image of 480,813 bytes, one tenant, 441 pending objects in the
+sweep's window. The shape travels — a wait uniform on the interval plus work under half a second.
+The numbers are this deployment's.
+
+## What the milestone could not demonstrate
+
+**There is no renderer.** FR-MED-09's *"renders as"* is unreachable from this repository and is
+recorded unmet rather than claimed, on the same footing as FR-MED-07 at chapter 4.11 and
+FR-MED-12's dashboard half at 4.16. The data a renderer needs is published and checked; the
+rendering is somebody else's chapter.
+
+**The meter is not in the path.** Chapter 4.16's stored-bytes accounting runs through the
+analytical store, which this journey never reads. The uploads it makes are charged by it, and
+nothing here asserts that they are.
+
+**It is one image.** The scan is 52% of the work at 4 KiB and 97.7% at 100 MB, so every figure
+in this chapter is one point on a curve. Nothing here says what the sweep costs when fifty
+tenants upload inside the same interval.
+
+**And the sealed job is the only consumer of the deployed worker.** It is reached by no local
+lane: not `pnpm test`, not `pnpm test:integration`, and not `pnpm coverage`, which excludes the
+package outright. A file at 100% in the coverage lane and a file the deployed worker runs are two
+different claims about two different sets of code — which is the architecture document's gap, and
+is now written there.
+
+<ForwardRef title="What movement VII opens with">
+
+Eleven clause-parts are now checked end to end against the software a deployment runs. Before
+this chapter the count was zero: every one of them was verified by a suite standing in for at
+least one of the steps beside it.
+
+Movement VII begins with the log that cannot be edited, and it comes first in its movement rather
+than last, because everything after it writes to it.
+
+</ForwardRef>
+
+<ChapterFooter id="4.17" />

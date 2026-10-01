@@ -13625,3 +13625,834 @@ these are here rather than in the chapter.
            // by the observed swing and put both numbers in the config"*, with only one
            // observation to go on. CI then reported **84.61 on three consecutive runs**.
 ```
+
+---
+
+### `packages/outsider/src/integrate.itest.ts` — the sealed suite carries one image end to end, and the comment that said no worker runs is replaced by the measurement.
+
+Chapter 4.17 adds two journeys to this file and corrects two sentences in it. The hunks are
+here rather than in the chapter for the reason the appendix exists: four earlier sections of
+this document already amend this file, and a chapter hunk anchored between them would be
+written against a state no reader of that chapter ever sees.
+
+**The bill was 23 hunks before it was 6.** The first version of this work ran
+`prettier --write` over the whole file — which had never been Prettier-clean, through chapters
+4.13, 4.14 and 4.16 — and the reformatting touched **221 lines nobody had asked about**, every
+one of them a hunk this appendix would have carried for ever. The edits were re-applied to the
+original formatting instead. A formatter is free on a file you own and is not free on a file the
+fence chain publishes.
+
+```diff title="packages/outsider/src/integrate.itest.ts"
+@@ -1,7 +1,8 @@
+ import { randomUUID } from "node:crypto";
++import { crc32, deflateSync } from "node:zlib";
+ import { beforeAll, describe, expect, it } from "vitest";
+ 
+ // AN INTEGRATION BUILT FROM PUBLISHED DOCUMENTATION ALONE (FR-031, SC-009,
+ // SC-030).
+ //
+ // This file is the SRS Phase 2 exit criterion as a test: "an external developer
+@@ -29,13 +30,24 @@
+ //
+ // WHAT NONE OF THE THREE CLOSES: reading the repository's source with human eyes.
+ // The seals make it impossible to IMPORT workspace code; they cannot make it
+ // impossible to look. That is a discipline, and the chapter says so rather than
+ // letting three rules imply a fourth (FR-034).
+ //
+-// AND IT IMPORTS NOTHING AT ALL BEYOND VITEST. The socket uses Node's GLOBAL
++// AND IT REACHES NO WORKSPACE PATH — WHICH IS THE RULE, AND IS NOT THE SAME AS
++// IMPORTING NOTHING. This sentence read *"AND IT IMPORTS NOTHING AT ALL BEYOND
++// VITEST"* and was already false when it was written: line 1 is
++// `import { randomUUID } from "node:crypto"`. Chapter 4.17 added `node:zlib` and made
++// it falser, which is how it was noticed. **A Node builtin is not a workspace path**,
++// and the three seals below say so precisely — they refuse `@relay/*`, a specifier
++// that climbs out of this package, and the `".."` literal. None of them has anything
++// to say about `node:`. A sentence nobody can trust is worse than no sentence, and an
++// overclaiming one invites the first person who checks it to assume the seals are
++// decorative too.
++//
++// THE SOCKET USES NODE'S GLOBAL
+ // `WebSocket`, not the `ws` package every suite in this workspace uses — which
+ // was not the plan and is the better answer. `ws` resolves from the workspace root
+ // by the ordinary parent walk, so the suite could have used it while declaring
+ // nothing; its TYPES do not, and the choice was between borrowing `@types/ws`
+ // through a parent walk, writing a local ambient declaration, or using the
+ // platform's own client. Node 22 has had a standards-compliant `WebSocket` since
+@@ -70,12 +82,90 @@
+         `  export RELAY_API_URL=http://localhost:4000 RELAY_WS_URL=ws://localhost:4001`,
+     );
+   }
+   return { api: API!, ws: WS!, credential: CREDENTIAL! };
+ }
+ 
++/** An 800 × 600 greyscale PNG, built here because it cannot be a literal (chapter 4.17).
++ *
++ * **IT HAS TO EXCEED 320 px ON ITS LONG EDGE OR THERE IS NO THUMBNAIL TO FETCH.** The
++ * worker's `thumbnailOf` answers `within-bound` at or below the bound and writes no
++ * rendition at all (chapter 4.15), so the 1×1 literal this file already carries would
++ * make the journey assert a rendition id the history payload never contains — and the
++ * assertion would fail naming the id rather than the bound.
++ *
++ * AND AT THAT SIZE A LITERAL IS NOT AVAILABLE: the pixels deflate to 480,756 bytes.
++ * `node:zlib` is a Node builtin, not a workspace path, so building it here breaks no
++ * seal — see the header, whose claim to import nothing was corrected in the same
++ * chapter.
++ *
++ * NOISE FROM A FIXED SEED, WHICH IS TWO PROPERTIES AND BOTH ARE WANTED. Deterministic,
++ * so the file is the same 480,813 bytes on every machine and `bytes` can be declared
++ * against it — FR-MED-03 refuses a declaration that is one byte out, in either
++ * direction (chapter 4.13). And incompressible, so the size is a fact about the
++ * dimensions rather than about the picture, which is what keeps the thumbnail
++ * comparison meaningful: a photograph of a white wall would thumbnail LARGER than the
++ * parent and the assertion would read as a defect.
++ *
++ * GREYSCALE RATHER THAN RGB for the reason a fixture should be cheap: one byte a pixel
++ * is a third of the store, a third of the quota the slot reserves and a third of the
++ * PUT. */
++const journeyPng = (): Uint8Array<ArrayBuffer> => {
++  const width = 800;
++  const height = 600;
++
++  const chunk = (type: string, data: Buffer): Buffer => {
++    const out = Buffer.alloc(data.length + 12);
++    out.writeUInt32BE(data.length, 0);
++    out.write(type, 4, "ascii");
++    data.copy(out, 8);
++    // THE CRC COVERS THE TYPE AND THE DATA, NOT THE LENGTH. A PNG with the length
++    // included decodes in nothing, and `sharp` would answer `rendition_failed` — which
++    // the journey would read as the worker being broken.
++    const crc = crc32(Buffer.concat([Buffer.from(type, "ascii"), data]));
++    out.writeUInt32BE(crc >>> 0, data.length + 8);
++    return out;
++  };
++
++  const ihdr = Buffer.alloc(13);
++  ihdr.writeUInt32BE(width, 0);
++  ihdr.writeUInt32BE(height, 4);
++  ihdr[8] = 8; // bit depth
++  ihdr[9] = 0; // colour type 0, greyscale
++
++  // XORSHIFT32, NOT A LINEAR CONGRUENTIAL GENERATOR. The obvious
++  // `seed = (seed * 1103515245 + 12345) >>> 0` loses its low bits to floating point —
++  // the product passes 2^53 — and the sequence degenerates: the same 800 × 600 image
++  // built that way deflated to **23,284 bytes**, a 62× ratio that says the "noise" was
++  // structure. The byte count is the tell, and it is the reason this fixture is
++  // measured rather than assumed.
++  const raw = Buffer.alloc(height * (1 + width));
++  let seed = 1;
++  for (let y = 0; y < height; y++) {
++    const row = y * (1 + width);
++    raw[row] = 0; // filter type 0, None — one byte before every scanline
++    for (let x = 0; x < width; x++) {
++      seed ^= seed << 13;
++      seed >>>= 0;
++      seed ^= seed >>> 17;
++      seed ^= seed << 5;
++      seed >>>= 0;
++      raw[row + 1 + x] = seed & 0xff;
++    }
++  }
++
++  return new Uint8Array(
++    Buffer.concat([
++      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
++      chunk("IHDR", ihdr),
++      chunk("IDAT", deflateSync(raw)),
++      chunk("IEND", Buffer.alloc(0)),
++    ]),
++  );
++};
++
+ describe("integrating with Relay from the outside", () => {
+   let api: string;
+   let ws: string;
+   let credential: string;
+   let channelId: string;
+   let token: string;
+@@ -97,12 +187,68 @@
+     const res = await fetch(`${api}${path}`, {
+       headers: { authorization: `Bearer ${auth}` },
+     });
+     return { status: res.status, body: (await res.json()) as Record<string, unknown> };
+   };
+ 
++  /** Wait for a media attachment to leave `pending`, by reading the channel the way a
++   *  client would (chapter 4.17).
++   *
++   *  **THERE IS NO SURFACE THAT ANSWERS "HAS THE WORKER RUN YET".** The client PUTs
++   *  straight to the store (ADR-13), so nothing tells the platform the upload finished
++   *  and chapter 4.13 built a sweep on a 5,000 ms timer instead. A client learns the
++   *  verdict by reading the message again, which is what this does.
++   *
++   *  A CONDITION WITH A DEADLINE, NEVER AN ELAPSED TIME. The wait is uniform over the
++   *  interval — measured at min 1,861, p50 3,993, max 5,568 ms over ten independent
++   *  trials — so an assertion on duration would be tuned to whichever point in the cycle
++   *  the test happened to start at. An earlier measurement of this platform reported
++   *  `p50 5,693 ms` from five runs taken in a loop, each beginning just after the sweep
++   *  that ended the one before: **a loop that waits for the thing it is timing
++   *  synchronises with it.**
++   *
++   *  AND THE FAILURE NAMES THE WORKER, because from out here it has to. With the worker
++   *  stopped an uploaded object stays `pending` for ever and `GET /v1/media/{id}` answers
++   *  the same 404 as an id nobody has — chapter 4.12 built that indistinguishability
++   *  deliberately — so a deadline that reported only "still pending" would describe a
++   *  legitimate state and say nothing about why. */
++  const waitForAttachmentState = async (
++    channelId: string,
++    mediaId: string,
++    auth: string,
++    deadlineMs = 25_000,
++  ): Promise<string> => {
++    // NO `let seen = "pending"` BEFORE THE LOOP — the initialiser is never read, and
++    // `no-useless-assignment` says so. Chapter 4.16 hit the identical rule on a
++    // `let seen = 0`; this is the second time, which makes it a habit rather than a slip.
++    const started = Date.now();
++    for (;;) {
++      const res = await get(
++        `/v1/channels/${channelId}/messages?limit=10`,
++        auth,
++      );
++      const messages = (res.body["messages"] ?? []) as {
++        attachments?: { media_id?: string; state?: string }[];
++      }[];
++      const attachment = messages
++        .flatMap((m) => m.attachments ?? [])
++        .find((a) => a.media_id === mediaId);
++      const seen = attachment?.state ?? "absent";
++      if (seen !== "pending") return seen;
++      if (Date.now() - started > deadlineMs) {
++        throw new Error(
++          `media ${mediaId} is still '${seen}' after ${Date.now() - started} ms. ` +
++            `The sweep runs every 5,000 ms, so this is not the timer — the media worker ` +
++            `is not producing verdicts. Check that it is running and that its boot line ` +
++            `names a reachable scanner: 'docker compose logs media-worker | tail -2'.`,
++        );
++      }
++      await new Promise((r) => setTimeout(r, 200));
++    }
++  };
++
+   beforeAll(() => {
+     ({ api, ws, credential } = required());
+   });
+ 
+   it("reaches the platform at all", async () => {
+     // Before anything else, and separately, so a platform that is not there says
+@@ -503,21 +649,43 @@
+     // this shape and the only one no local lane reaches.** `pnpm test`,
+     // `pnpm test:integration` and `pnpm coverage` all skip this suite: it needs a
+     // composed stack and three environment variables, so CI's sealed job and a
+     // hand-run are the only things that execute it. The other four were found by the
+     // api lane and the coverage lane; this one was found by CI.
+     //
+-    // `pending` is right and is not a race. The object was uploaded but nothing has
+-    // verified it — this suite runs no media worker, which is what makes the value
+-    // stable rather than timing-dependent.
++    // `pending` IS RIGHT, AND THE REASON WRITTEN HERE WAS FALSE FOR TWO CHAPTERS.
++    //
++    // It read: *"this suite runs no media worker, which is what makes the value stable
++    // rather than timing-dependent."* **CI's sealed job runs
++    // `docker compose --profile services up -d --wait`, and `media-worker` is in that
++    // profile** — so a worker has been running every time this assertion passed.
++    //
++    // It is timing-dependent AND it is stable, which are two different claims. The sweep
++    // runs every 5,000 ms and the three steps between the PUT and this line take
++    // milliseconds, so the margin is most of an interval: measured at min 1,861, p50
++    // 3,993, max 5,568 ms from PUT to verdict over ten independent trials. **A race with
++    // a four-second margin is the kind nothing ever catches**, and the sentence that
++    // would have explained it away is the one chapter 4.17 went looking for.
+     expect(delivered.payload.attachments).toEqual([
+       { type: "url", kind: "image", url: "https://example.test/outside-url.png" },
+       { type: "media", media_id: mediaId, state: "pending" },
+     ]);
+     socket.close();
+ 
++    // AND THE REASON IS NOW CHECKED RATHER THAN ASSERTED IN PROSE (chapter 4.17). A
++    // comment is not a test: if the state above is `pending` because the read is inside
++    // the window, then waiting past the window must produce a verdict. If a future
++    // change stops a worker running in this lane, the line above keeps passing and this
++    // one goes red naming the worker.
++    const settled = await waitForAttachmentState(
++      channelId,
++      mediaId,
++      credential,
++    );
++    expect(settled, "the deployed worker produced no verdict").toBe("ready");
++
+     // AND THE BYTES COME BACK, FROM OUTSIDE (chapter 4.12, SC-010). The frame above
+     // carries an id and nothing else; a client holding it has to ask for a URL, and
+     // this is the only test in the repository that asks as a customer does — over the
+     // published surface, from a process that started nothing, through a URL whose host
+     // was chosen by the api and has to be reachable from here.
+     //
+@@ -553,12 +721,569 @@
+     // `new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0])` — the old fixture,
+     // written out twice — and when the upload became a real PNG the assertion kept
+     // comparing against eleven bytes that were no longer sent anywhere.
+     expect(new Uint8Array(await bytes.arrayBuffer())).toEqual(png);
+   });
+ 
++  /** **★ THE MILESTONE: ONE IMAGE, END TO END, THROUGH THE WORKER A DEPLOYMENT RUNS**
++   *  (chapter 4.17 — FR-001, FR-002, FR-004a, FR-006a, SC-001, SC-002, SC-003, SC-003a).
++   *
++   *  Seven chapters built this path one piece at a time and **no test joined them.** The
++   *  pieces each have a suite: 4.13's worker verifies in process, 4.14's state machine is
++   *  driven by SQL, 4.15's thumbnail is a unit test over a buffer, 4.12's delivery gate
++   *  sets its states by hand. Every one of them stands in for the step beside it. This is
++   *  the only check in the repository where **nothing stands in for anything** — the
++   *  verdict is made by the container `docker compose --profile services` starts, and the
++   *  suite learns it the way a customer would, by reading the message again.
++   *
++   *  EACH STEP NAMES THE CHAPTER THAT MADE IT POSSIBLE (FR-002). That is not decoration:
++   *  this test crosses seven chapters and three services, so a failure here is a question
++   *  about which of them moved. A bare `expected 404 to be 200` at step eight sends a
++   *  reader to the delivery route, which is the one part of the path that is almost never
++   *  the cause.
++   *
++   *  ITS OWN CHANNEL, AND NOT THE SHARED ONE. `channelId` has collected messages from
++   *  eleven tests by the time this runs, so a history read against it would have to
++   *  search rather than assert — and a journey that searches cannot claim the recipient
++   *  sees one message with one attachment.
++   *
++   *  AND IT CALLS NO INTERNAL ROUTE. `POST /internal/media/{id}/verdict` would make every
++   *  assertion below pass in forty milliseconds, and it is the thing this chapter exists
++   *  to stop doing: a test that calls the verdict route is a test of the api's reaction
++   *  to a verdict, which 4.14 already has. */
++  it("carries one image from slot to delivered bytes, with the deployed worker making the verdict (4.17, SC-001)", async () => {
++    // STEP 1 — A CHANNEL OF ITS OWN, AND A MEMBER IN IT (chapters 2.2 and 3.8).
++    //
++    // THE MEMBERSHIP IS NOT OPTIONAL AND ITS ABSENCE IS SILENT. Measured while this was
++    // being written: a socket opened with a valid token for a non-member received
++    // `connection.ack` and `presence.changed` and **no `message.created` and no
++    // `media.updated`** — on a PUBLIC channel. The absence of every frame looks exactly
++    // like the absence of the one you came for, which is how an earlier probe read as
++    // `media.updated` not existing at all.
++    const journeyChannel = await post(
++      "/v1/channels",
++      { external_id: `journey-${Date.now()}`, type: "public" },
++      credential,
++    );
++    expect(
++      journeyChannel.status,
++      "the journey could not create its own channel",
++    ).toBe(201);
++    const journeyId = journeyChannel.body["id"] as string;
++
++    const member = await post(
++      `/v1/channels/${journeyId}/members`,
++      { user_ids: ["ana"] },
++      credential,
++    );
++    expect(
++      member.status,
++      "chapter 3.8's members route refused ana, so her socket will hear nothing",
++    ).toBe(200);
++
++    // STEP 2 — A SOCKET OPEN BEFORE ANY OF IT (chapter 3.4).
++    //
++    // Before the send, deliberately. A subscriber who connects afterwards learns the
++    // state from history and tells us nothing about the frame; the claim FR-006a makes
++    // is that a client holding a placeholder is TOLD when it becomes a picture.
++    const socket = new WebSocket(`${ws}/v1/ws?token=${token}`);
++    const frames: { type: string; payload?: Record<string, unknown> }[] = [];
++    socket.addEventListener("message", (event) => {
++      frames.push(JSON.parse(String(event.data)) as { type: string });
++    });
++    socket.addEventListener("error", () => undefined);
++    await new Promise<void>((resolve, reject) => {
++      socket.addEventListener("open", () => resolve());
++      socket.addEventListener("close", (event) =>
++        reject(new Error(`closed ${(event as CloseEvent).code}`)),
++      );
++      setTimeout(
++        () => reject(new Error(`no socket at ${ws} within 10s`)),
++        10_000,
++      );
++    });
++
++    const until = async (
++      predicate: (f: {
++        type: string;
++        payload?: Record<string, unknown>;
++      }) => boolean,
++      what: string,
++    ): Promise<{ type: string; payload?: Record<string, unknown> }> => {
++      const deadline = Date.now() + 15_000;
++      for (;;) {
++        const found = frames.find(predicate);
++        if (found) return found;
++        if (Date.now() > deadline) {
++          throw new Error(
++            `no ${what}; saw ${frames.map((f) => f.type).join(", ") || "nothing"}`,
++          );
++        }
++        await new Promise((r) => setTimeout(r, 50));
++      }
++    };
++    await until((f) => f.type === "connection.ack", "ana's connection.ack");
++
++    // STEP 3 — A SLOT FOR A REAL IMAGE (chapter 4.10).
++    //
++    // `bytes` is DECLARED and the store counts what arrives. FR-MED-03 refuses a
++    // mismatch of one byte in either direction (chapter 4.13), which is why the fixture
++    // is deterministic and its length is read rather than written down.
++    const image = journeyPng();
++    expect(
++      image.length,
++      "the fixture moved; the figures in the chapter are measured",
++    ).toBe(480_813);
++
++    const slot = await post(
++      "/v1/media",
++      { filename: "journey.png", mime_type: "image/png", bytes: image.length },
++      credential,
++    );
++    expect(
++      slot.status,
++      "chapter 4.10's slot route refused a published credential",
++    ).toBe(201);
++    expect(
++      slot.body["state"],
++      "a slot is pending before anything is uploaded",
++    ).toBe("pending");
++    const journeyMediaId = slot.body["media_id"] as string;
++
++    // STEP 4 — THE BYTES GO TO THE STORE, NOT THROUGH RELAY (ADR-13, chapter 4.10).
++    const put = await fetch(slot.body["upload_url"] as string, {
++      method: "PUT",
++      body: image,
++    });
++    expect(put.status, "the presigned URL was not usable from outside").toBe(
++      200,
++    );
++
++    // STEP 5 — THE SEND HAPPENS BEFORE THE VERDICT, ON PURPOSE (chapter 4.11).
++    //
++    // FR-MED-06's decision: a photo may be attached the moment the upload completes,
++    // because the alternative is a client that has to wait on a timer it cannot see.
++    // So the recipient's first sight of this message is a placeholder, and that is the
++    // state being asserted — not a race this test happens to win.
++    const journeyText = `journey ${randomUUID()}`;
++    const sent = await post(
++      `/v1/channels/${journeyId}/messages`,
++      {
++        text: journeyText,
++        user: "outside-bot",
++        idempotency_key: randomUUID(),
++        attachments: [{ type: "media", media_id: journeyMediaId }],
++      },
++      credential,
++    );
++    expect(
++      sent.status,
++      "chapter 4.11's reference check refused an object this tenant owns",
++    ).toBe(201);
++    expect(sent.body["attachments"]).toEqual([
++      { type: "media", media_id: journeyMediaId, state: "pending" },
++    ]);
++
++    // And the recipient sees the placeholder too (chapter 3.4, chapter 4.14).
++    const created = await until(
++      (f) =>
++        f.type === "message.created" && f.payload?.["text"] === journeyText,
++      "message.created for the journey's message",
++    );
++    expect(created.payload?.["attachments"]).toEqual([
++      { type: "media", media_id: journeyMediaId, state: "pending" },
++    ]);
++
++    // STEP 6 — THE DEPLOYED WORKER DECIDES (chapters 4.13 and 4.14).
++    //
++    // Nothing is called here. The sweep runs on its own 5,000 ms timer inside a
++    // container this process did not start, HEADs the object, scans the bytes, checks
++    // them against what was declared, and writes a verdict. A condition with a
++    // deadline, never an elapsed time.
++    const state = await waitForAttachmentState(
++      journeyId,
++      journeyMediaId,
++      credential,
++    );
++    expect(
++      state,
++      "the deployed worker produced no verdict for a valid PNG",
++    ).toBe("ready");
++
++    // STEP 7 — AND THE CLIENT IS TOLD (chapter 4.14, FR-006a, SC-003a).
++    //
++    // The frame carries `{media_id, channel, state}` and no thumbnail, so a client
++    // learns THAT the placeholder resolved from the socket and WHAT it resolved to from
++    // history. That split is the gateway's: `announce` returns early unless the state is
++    // `ready` or `rejected`, so the two terminal states travel the same way.
++    const updated = await until(
++      (f) =>
++        f.type === "media.updated" &&
++        f.payload?.["media_id"] === journeyMediaId,
++      "media.updated for the journey's attachment",
++    );
++    //
++    // THE WHOLE PAYLOAD, NOT THE STATE ALONE. `{media_id, channel, state}` and nothing
++    // else — asserting only the state would pass for a frame announcing somebody else's
++    // object in somebody else's channel, which is the shape a fan-out bug takes. The
++    // channel is the id rather than the external id, which is worth pinning from out
++    // here because it is the field a client routes on.
++    expect(updated.payload).toEqual({
++      media_id: journeyMediaId,
++      channel: journeyId,
++      state: "ready",
++    });
++
++    // STEP 8 — WHAT A RECIPIENT ACTUALLY READS (chapters 4.14 and 4.15).
++    //
++    // The whole payload, not the state alone: the rendition's id and its dimensions
++    // travel beside it, so a client never has to guess what to ask for. 320 × 240 is
++    // 4.15's bound applied to an 800 × 600 parent — the long edge lands ON the bound and
++    // the aspect ratio is kept.
++    //
++    // `messages`, NOT `data`. A defaulting accessor over the wrong key turned this into
++    // what looked like history dropping the attachment (research R7).
++    const history = await get(
++      `/v1/channels/${journeyId}/messages?limit=10`,
++      credential,
++    );
++    expect(history.status).toBe(200);
++    const read = (
++      history.body["messages"] as { text?: string; attachments?: unknown[] }[]
++    ).find((m) => m.text === journeyText);
++    expect(read?.attachments).toEqual([
++      {
++        type: "media",
++        media_id: journeyMediaId,
++        state: "ready",
++        thumbnail: { media_id: expect.any(String), width: 320, height: 240 },
++      },
++    ]);
++    const thumbnailId = (
++      read?.attachments as { thumbnail: { media_id: string } }[]
++    )[0]!.thumbnail.media_id;
++
++    // STEP 9 — THE BYTES COME BACK, AND THEY ARE THE BYTES (chapter 4.12).
++    //
++    // BYTE-IDENTICAL, NOT THE SAME LENGTH. A length check passes for a file the store
++    // truncated, for a file served from the wrong key at the same size, and for a
++    // thumbnail that happens to match.
++    const parentLink = await get(`/v1/media/${journeyMediaId}`, credential);
++    expect(
++      parentLink.status,
++      "chapter 4.12's gate refused a ready object in a visible channel",
++    ).toBe(200);
++    const parentBytes = await fetch(parentLink.body["url"] as string);
++    expect(
++      parentBytes.status,
++      "the delivery URL was not usable from outside",
++    ).toBe(200);
++    expect(new Uint8Array(await parentBytes.arrayBuffer())).toEqual(image);
++
++    // STEP 10 — AND THE THUMBNAIL, WHICH NO MESSAGE NAMES (chapter 4.15).
++    //
++    // **THE ONLY MEDIA ID THE PLATFORM HANDS OUT THAT NO MESSAGE REFERENCES.** 4.12's
++    // authorisation asks which channels reference the object, and the answer for a
++    // rendition is none — so it would be readable by nobody if the rule were applied to
++    // it directly. `readableMediaObjectKey` resolves `parentId ?? mediaId`, which is
++    // what makes this request answerable at all, and this is the first time anything
++    // outside the platform has asked it.
++    const thumbLink = await get(`/v1/media/${thumbnailId}`, credential);
++    expect(
++      thumbLink.status,
++      "a rendition inherits its parent's reachability (4.15)",
++    ).toBe(200);
++    const thumbBytes = await fetch(thumbLink.body["url"] as string);
++    expect(thumbBytes.status).toBe(200);
++    const thumb = new Uint8Array(await thumbBytes.arrayBuffer());
++
++    // TWO SIGNED URLS THAT BOTH ANSWER 200 PROVE NOTHING IF THEY SERVE THE SAME OBJECT,
++    // and `parentId ?? mediaId` is exactly the shape that would quietly return the
++    // parent for both. Smaller AND different, because either alone can be satisfied by
++    // the wrong answer: a truncated parent is smaller, and a second copy of the parent
++    // is different from nothing at all.
++    expect(
++      thumb.length,
++      "the thumbnail is not smaller than its parent",
++    ).toBeLessThan(image.length);
++    expect(thumb).not.toEqual(image);
++
++    socket.close();
++
++    // WHAT THIS TEST DOES NOT ASSERT, AND WHY IT IS NOT AN OVERSIGHT: how long any of it
++    // took. The verdict arrives somewhere inside a 5,000 ms window whose phase this
++    // process does not control, so an elapsed-time assertion would be tuned to whichever
++    // point in the sweep the run happened to start at — which is how an earlier
++    // measurement of this platform came back with a p50 of 5,693 ms, a figure that was
++    // the worst case wearing a median's name. **The lane checks the condition and the
++    // chapter publishes the distribution.**
++  });
++
++  /** **THE OTHER HALF: A REFUSAL ARRIVES AS A MARKER, NOT A GAP** (chapter 4.17 —
++   *  FR-003, FR-006a, SC-004, SC-003a).
++   *
++   *  FR-MED-09's reason is a person: a recipient must be able to tell *"somebody sent me
++   *  a file and the platform refused it"* from *"somebody deleted a message"* and from
++   *  *"somebody sent text"*. Those are three different things to say back, and before
++   *  this test nothing checked they are three different things to READ.
++   *
++   *  THE BYTES CONTRADICT THE DECLARATION, WHICH IS FR-MED-03 AND NOT THE SCANNER. A
++   *  43-byte GIF89a declared as `image/png`: the slot route records what the caller said
++   *  and the worker reads what arrived (chapter 4.13). **No object can both satisfy
++   *  `ALLOWED_TYPES` and trip the virus scanner** — there is no text type in the table,
++   *  so EICAR cannot be uploaded as anything — which is why the refusal this journey can
++   *  actually produce is the type one.
++   *
++   *  AND THE DECLARED SIZE IS HONEST. 43 bytes declared, 43 uploaded; a mismatch of one
++   *  byte in either direction is a different refusal, and a test that got both wrong at
++   *  once would pass for the wrong reason. */
++  it("delivers a refused upload as a rejected marker a recipient can tell apart (4.17, SC-004)", async () => {
++    const rejectChannel = await post(
++      "/v1/channels",
++      { external_id: `reject-${Date.now()}`, type: "public" },
++      credential,
++    );
++    expect(rejectChannel.status).toBe(201);
++    const rejectId = rejectChannel.body["id"] as string;
++    expect(
++      (
++        await post(
++          `/v1/channels/${rejectId}/members`,
++          { user_ids: ["ana"] },
++          credential,
++        )
++      ).status,
++      "ana was not added, so her socket will hear nothing",
++    ).toBe(200);
++
++    const socket = new WebSocket(`${ws}/v1/ws?token=${token}`);
++    const frames: { type: string; payload?: Record<string, unknown> }[] = [];
++    socket.addEventListener("message", (event) => {
++      frames.push(JSON.parse(String(event.data)) as { type: string });
++    });
++    // NOTHING IS SWALLOWED IN THIS TEST. An earlier probe of this path wrapped its setup
++    // in `.catch(() => {})`, so a members call with the wrong body failed silently and
++    // the subscriber stayed outside the channel — it then saw NO frames at all, and
++    // "no `media.updated`" read exactly like the feature not existing. Three of four
++    // attempts at this probe failed that way.
++    socket.addEventListener("error", () => undefined);
++    await new Promise<void>((resolve, reject) => {
++      socket.addEventListener("open", () => resolve());
++      socket.addEventListener("close", (event) =>
++        reject(new Error(`closed ${(event as CloseEvent).code}`)),
++      );
++      setTimeout(
++        () => reject(new Error(`no socket at ${ws} within 10s`)),
++        10_000,
++      );
++    });
++
++    // A REAL GIF89a, 1 × 1, 43 bytes — a file that is valid and is not what was claimed.
++    // Random bytes would be refused too, by `rendition_failed` or by the sniff finding
++    // nothing; a well-formed file of the wrong type is the case the clause describes.
++    const gif = new Uint8Array([
++      0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x80, 0x00,
++      0x00, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x21, 0xf9, 0x04, 0x01, 0x00,
++      0x00, 0x00, 0x00, 0x2c, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00,
++      0x00, 0x02, 0x02, 0x44, 0x01, 0x00, 0x3b,
++    ]);
++
++    const slot = await post(
++      "/v1/media",
++      { filename: "liar.png", mime_type: "image/png", bytes: gif.length },
++      credential,
++    );
++    // Chapter 4.10's slot route judges the DECLARATION; chapter 4.13's worker judges the
++    // bytes. That split is why a lying upload is accepted here and refused later.
++    expect(
++      slot.status,
++      "chapter 4.10's slot route judges the declaration, not the bytes",
++    ).toBe(201);
++    const rejectedId = slot.body["media_id"] as string;
++    expect(
++      (
++        await fetch(slot.body["upload_url"] as string, {
++          method: "PUT",
++          body: gif,
++        })
++      ).status,
++      "chapter 4.10's presigned PUT refused bytes the store should have taken",
++    ).toBe(200);
++
++    const rejectText = `rejected journey ${randomUUID()}`;
++    const sent = await post(
++      `/v1/channels/${rejectId}/messages`,
++      {
++        text: rejectText,
++        user: "outside-bot",
++        idempotency_key: randomUUID(),
++        attachments: [{ type: "media", media_id: rejectedId }],
++      },
++      credential,
++    );
++    expect(
++      sent.status,
++      "chapter 4.11's reference check refused a send that happens before the verdict",
++    ).toBe(201);
++
++    const state = await waitForAttachmentState(
++      rejectId,
++      rejectedId,
++      credential,
++    );
++    expect(
++      state,
++      "chapter 4.13's worker accepted a GIF declared as a PNG (FR-MED-03)",
++    ).toBe("rejected");
++
++    // THE FRAME CARRIES THE REFUSAL TOO (FR-006a, SC-003a). `announce` returns early
++    // unless the state is `ready` or `rejected`, so both terminal states travel the same
++    // way — and until this test the rejection half had only ever been watched with
++    // `recordMediaVerdict` called directly by a test (chapter 4.14).
++    const deadline = Date.now() + 15_000;
++    for (;;) {
++      if (frames.some((f) => f.type === "media.updated")) break;
++      if (Date.now() > deadline) {
++        throw new Error(
++          `no media.updated after a rejection; saw ${frames.map((f) => f.type).join(", ")}`,
++        );
++      }
++      await new Promise((r) => setTimeout(r, 50));
++    }
++    expect(frames.find((f) => f.type === "media.updated")?.payload).toEqual({
++      media_id: rejectedId,
++      channel: rejectId,
++      state: "rejected",
++    });
++    socket.close();
++
++    // FR-MED-09's TESTABLE HALF: THE MESSAGE SURVIVES THE REFUSAL. Checked as a premise
++    // before it was asserted — a history route that filtered a message whose only
++    // attachment was refused would make this whole user story unbuildable, and the
++    // chapter would have had to record that rather than work round it. It does not
++    // filter.
++    const history = await get(
++      `/v1/channels/${rejectId}/messages?limit=10`,
++      credential,
++    );
++    const read = (
++      history.body["messages"] as {
++        text?: string | null;
++        attachments?: unknown[];
++      }[]
++    ).find((m) => m.text === rejectText);
++    expect(
++      read,
++      "the message vanished from history when its attachment was refused",
++    ).toBeDefined();
++    expect(read?.attachments).toEqual([
++      { type: "media", media_id: rejectedId, state: "rejected" },
++    ]);
++
++    // AND THREE CASES A RECIPIENT MUST TELL APART, FROM PUBLISHED FIELDS ALONE. This is
++    // the clause's own reason rather than a shape test:
++    //
++    //   a refused upload      text: the sender's   attachments: [{… state:"rejected"}]
++    //   a message with none   text: the sender's   attachments: []
++    //   a deleted message     text: NULL           attachments: []
++    //
++    // The tombstone is what makes the third distinguishable, and it is a different field
++    // from the one carrying the second — so a client that reads only `attachments`
++    // cannot tell a deletion from a plain message, and one that reads only `text` cannot
++    // tell a refusal from a delivery.
++    const plain = await post(
++      `/v1/channels/${rejectId}/messages`,
++      {
++        text: `plain ${randomUUID()}`,
++        user: "outside-bot",
++        idempotency_key: randomUUID(),
++      },
++      credential,
++    );
++    // Chapter 3.18 is where a message gained an `attachments` array at all, so an empty
++    // one is that chapter's answer for "nothing attached" rather than an absent field.
++    expect(plain.status).toBe(201);
++    expect(
++      plain.body["attachments"],
++      "chapter 3.18's empty array became something else",
++    ).toEqual([]);
++
++    const doomed = await post(
++      `/v1/channels/${rejectId}/messages`,
++      {
++        text: `doomed ${randomUUID()}`,
++        user: "outside-bot",
++        idempotency_key: randomUUID(),
++      },
++      credential,
++    );
++    expect(doomed.status, "chapter 3.18's send refused a plain message").toBe(
++      201,
++    );
++    const removed = await fetch(
++      `${api}/v1/channels/${rejectId}/messages/${doomed.body["id"] as string}`,
++      { method: "DELETE", headers: { authorization: `Bearer ${credential}` } },
++    );
++    expect(
++      removed.status,
++      "chapter 3.17's delete refused its own message",
++    ).toBe(204);
++
++    const after = await get(
++      `/v1/channels/${rejectId}/messages?limit=10`,
++      credential,
++    );
++    const tombstone = (
++      after.body["messages"] as {
++        id: string;
++        text?: string | null;
++        attachments?: unknown[];
++      }[]
++    ).find((m) => m.id === (doomed.body["id"] as string));
++    expect(
++      tombstone?.text,
++      "chapter 3.17's tombstone keeps the row and loses the text, and this did not",
++    ).toBeNull();
++    expect(
++      tombstone?.attachments,
++      "chapter 3.17's tombstone left attachments behind",
++    ).toEqual([]);
++
++    // AND THE LINK IS REFUSED, INDISTINGUISHABLY FROM AN ID NOBODY HAS (chapter 4.12).
++    //
++    // Byte-identical apart from `request_id`, which is the property 4.12 built on
++    // purpose: a refusal naming the cause would report whether somebody else's object
++    // exists. **This is the first time it has been checked from outside with a real
++    // refusal behind it** — every earlier check set the state with SQL, so the two sides
++    // of the comparison were both fixtures.
++    const refused = await get(`/v1/media/${rejectedId}`, credential);
++    const ghost = await get(`/v1/media/${randomUUID()}`, credential);
++    expect(refused.status).toBe(404);
++    expect(ghost.status).toBe(404);
++    // FILTERED RATHER THAN DESTRUCTURED. `const { request_id: _ignored, ...rest }` is
++    // the idiomatic spelling and `no-unused-vars` refuses it here, underscore and all.
++    const withoutRequestId = (body: Record<string, unknown>) =>
++      Object.fromEntries(
++        Object.entries(body).filter(([key]) => key !== "request_id"),
++      );
++    expect(withoutRequestId(refused.body)).toEqual(
++      withoutRequestId(ghost.body),
++    );
++    // AND THE CONTROL, BECAUSE TWO EMPTY OBJECTS ARE ALSO EQUAL. The comparison above is
++    // worth nothing unless the bodies have content, and a refusal that dropped its code
++    // would satisfy it. Both fields are chapter 3.26's envelope.
++    expect(
++      refused.body["code"],
++      "chapter 3.26's error envelope lost its code",
++    ).toBe("not_found");
++    expect(
++      refused.body["request_id"],
++      "chapter 3.26's request_id is the one field that must differ",
++    ).not.toBe(ghost.body["request_id"]);
++  });
++
+   /** T100a — **the first `socket.send` in this file's history.**
+    *
+    * `grep -c "\.send(" packages/outsider/src/integrate.itest.ts` read **0** across
+    * eleven tests before this one: ten REST, and one socket test whose title says
+    * "sent over REST" because the fan-out chapter corrected it. This file is the only
+    * check in the repository that uses the public surface as a customer does —
+```

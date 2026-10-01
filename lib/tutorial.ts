@@ -962,6 +962,16 @@ export const series: Part[] = [
         sourceDoc: "docs/04-srs.md, docs/05-sad.md, docs/12-part-4-structure.md",
         readerMinutes: 50,
       },
+      {
+        id: "4.17",
+        path: "/part-4/chapter-17/milestone-an-image-end-to-end",
+        title: "Milestone: an image, end to end",
+        status: "published",
+        readerProduces:
+          "One image carried from an upload slot to delivered bytes by the software a deployment runs, with the verdict made by a container the test did not start — the join seven chapters had each built a piece of and nothing had ever checked. Plus a second image the worker refuses, arriving as a marker a reader can tell apart from a deleted message in two fields rather than one. The chapter is also an argument about what a milestone is for: its own premise turned out to be partly wrong, which made it smaller rather than larger, and the thing it found on the way was a comment explaining why an assertion was stable that was false in the job that runs it. What the path costs, with its sample size: every step a client controls is under 20 ms and the one it waits on is three orders of magnitude larger, uniform over a five-second sweep — and one upload in six waits five or six passes for a reason that is neither the timer nor the scanner, published rather than smoothed away",
+        sourceDoc: "docs/04-srs.md, docs/05-sad.md, docs/12-part-4-structure.md",
+        readerMinutes: 45,
+      },
     ],
   },
   {
