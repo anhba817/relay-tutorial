@@ -13556,3 +13556,72 @@ these are here rather than in the chapter.
  })
  export class MediaModule {}
 ```
+
+<!-- AND AN ELEVENTH FILE, WHICH CI FOUND AND THE LOCAL RUN COULD NOT HAVE.
+     `check:fences` was taken to zero in phase 8 and the coverage pins for this chapter's
+     three new files were added in phase 9, AFTER it. `CLAUDE.md`'s rule is "run
+     `check:fences` after ANY source edit", and 4.14 recorded the same sequence from the
+     other side: a platform edit made to turn CI green invalidates the hunks that publish
+     it. Here the edit was not even a repair — it was the ratchet being tightened. -->
+
+```diff title="vitest.coverage.config.mts"
+@@ -507,12 +507,58 @@
+           // which are covered in `sweep.test.ts` against a fake client rather than here.
+           branches: 49,
+           functions: 100,
+           lines: 100,
+           statements: 77,
+         },
++        // ── CHAPTER 4.16's OWN THREE FILES ──────────────────────────────────
++        //
++        // **THIS CHAPTER SHIPPED THREE SOURCE FILES AND ALMOST PINNED NONE OF
++        // THEM**, which is the defect the quota chapter's note further down
++        // already records: *"this one shipped seven and left the ratchet nothing
++        // to hold, which is visible only by comparing two chapters."* The global
++        // floor is an aggregate, so an unpinned file at 20% passes as long as the
++        // rest carry it — 68 of the 139 files this run sees are unpinned, and the
++        // lowest is at 20.00.
++        //
++        // ONE OBSERVATION EACH, SO THE PINS SIT BELOW IT BY A MARGIN. 045's rule
++        // is *pin below the lower observation by the observed swing and put both
++        // numbers in the config*, and there is only one observation here — so the
++        // margin is a guess rather than a measurement, and it is written down as
++        // one. Measured 2026-09-30, full run, 145 files, 2,113 tests:
++        //
++        //   storage-reconcile.ts   st 100.00  br  90.38  fn 100  ln 100.00
++        //   storage-reads.ts       st 100.00  br 100.00  fn 100  ln 100.00
++        //   storage-event.ts       st 100.00  br 100.00  fn 100  ln 100.00
++        //
++        // `storage-reconcile.ts`'s branches are the composed half's — the
++        // truncated-listing arm and the `?? null` defaults, which a live store
++        // will not produce on demand. The pure half is exercised to the letter.
++        "services/api/src/metering/storage-reconcile.ts": {
++          statements: 95,
++          branches: 85,
++          functions: 100,
++          lines: 95,
++        },
++        "services/api/src/db/storage-reads.ts": {
++          statements: 95,
++          branches: 95,
++          functions: 100,
++          lines: 95,
++        },
++        // **PINNED AT 100 RATHER THAN AT WHAT IT MEASURED FIRST.** This file read
++        // 66.66% statements with no pin to notice, and the missing third was the
++        // `catch` — which is not a defensive branch but the whole of what *"a lost
++        // record is the accepted cost"* means in code. A test drives it now, so
++        // the pin is what the file achieves rather than what it achieved.
++        "services/api/src/metering/storage-event.ts": {
++          statements: 100,
++          branches: 100,
++          functions: 100,
++          lines: 100,
++        },
+         "services/api/src/internal/media.controller.ts": {
+           // 83, FROM TWO ENVIRONMENTS THAT DISAGREE, AND THE DISAGREEMENT IS NOT A
+           // SWING. This was pinned at 89 from a single local observation of 90.90 —
+           // the mistake 045 names in as many words, *"pin below the lower observation
+           // by the observed swing and put both numbers in the config"*, with only one
+           // observation to go on. CI then reported **84.61 on three consecutive runs**.
+```
