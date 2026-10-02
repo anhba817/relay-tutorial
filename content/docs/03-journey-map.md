@@ -400,7 +400,11 @@ safety property, not a convenience.**
 | **Feeling** | Careful — this is the part her own manager audits |
 
 **What Relay must provide** — the immutable moderation audit log (FR-MOD-03): actor,
-action, target, timestamp. When the deletion request under data-protection law arrives a
+action, target, timestamp, **and request ID**. (This list said four of five until chapter
+4.18 came to build it, and the missing one is the field doing the most work: the request
+id is what joins an entry to the request log's row for the same request, so Priya can go
+from *a ban happened* to *this is the call that made it*.) When the deletion request under
+data-protection law arrives a
 month later, the compliance erasure endpoint (FR-MOD-04) with its completion receipt is
 what lets her close that ticket in minutes instead of escalating it.
 

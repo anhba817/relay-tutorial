@@ -2339,3 +2339,145 @@ SDK's.
 
 If the production store turns out not to be S3-compatible, neither option B nor option C
 survives, and that is a store decision rather than a signing one.
+
+---
+
+## ADR-35 — The audit log is operational, its immutability is a trigger, and its timestamp is declared
+
+### Problem
+
+FR-MOD-03: *"Every moderation action shall be recorded in an immutable audit log with actor,
+action, target, timestamp, and request ID, retained for 1 year."*
+
+Three decisions are hidden in that sentence and none of them is the obvious one. **Which store
+holds it**, because this platform has two and a log is the shape that usually goes in the
+analytical one. **What makes it immutable**, because the mechanism a reader would reach for does
+nothing on this deployment. And **what precision its timestamp has**, which looks like a schema
+detail and decides whether a reader can page through the log without losing rows.
+
+Constitution VII requires the record: *"Every architecture decision is recorded as an ADR stating
+its drivers, rejected alternatives, and reversal condition."* Nine analysis passes read past
+these three because no requirement captured them.
+
+### Drivers
+
+- FR-005 of feature 064: the entry is written as part of the action it records, so an action that succeeded
+  with no entry is not reachable.
+- FR-006 of feature 064: a tenant reads its own history, paged, newest first.
+- Constitution I: the read is scoped to the caller's environment and no parameter names one.
+- Constitution III: the two data paths are independent, and a log is normally the analytical
+  path's business.
+- NFR-SEC-10 asks for an immutable audit trail for a different actor, and this decision is what
+  determines whether that clause is reachable from here.
+
+### Decision 1 — Postgres, and ADR-26 is the same driver running the other way
+
+**The audit log is an operational table.** FR-005 of feature 064 is the whole argument: the entry must commit
+with the action, and the action is a Postgres transaction. Writing it anywhere else makes the
+guarantee probabilistic — an entry published to a broker and consumed into ClickHouse can be
+lost after the ban succeeded, which is the case the clause exists to prevent.
+
+**This is the direct mirror of ADR-26**, whose problem statement is *"The api serves a customer
+request from the analytical store"* and whose rejected **option D** was *"Mirror the log into
+Postgres and serve it from there."* That option was refused for the request log because the rows
+were already in ClickHouse and mirroring them would have been a second copy with a second
+retention story. **The audit log's rows are written by the api inside a transaction, so Postgres
+is where they already are**, and the same driver — serve the log from the store that already
+holds it — selects the other store. Two ADRs reaching opposite conclusions from one driver is a
+register working; reaching them without reference to each other is how it stops being one.
+
+The consequence is one this chapter can state rather than fear: a moderation action records
+successfully while the analytical pipeline is down. **Measured** — `docker compose stop nats
+clickhouse`, then a ban and an unban, then two entries read back with the right actor, target and
+order.
+
+**Rejected: ClickHouse, with the entry published on the action's success.** It is the request
+log's shape and it is wrong here for a reason the request log does not have: an API request is
+observed, and a moderation action is performed. Losing the record of an observation degrades a
+diagnostic; losing the record of a performance breaks the clause.
+
+### Decision 2 — a trigger, because the obvious mechanism was measured inert
+
+`REVOKE UPDATE, DELETE ON audit_log FROM relay` is what a reader expects, and it does nothing:
+
+    select usesuper from pg_user where usename = 'relay';   →  t
+
+    revoke update, delete on probe_immutable from relay;
+    update probe_immutable set v='b' where id=1;            →  UPDATE 1   the value changed
+
+A superuser bypasses privilege checks, and this api connects as one. **Nothing in the schema
+would have looked wrong** — the grant would be in the migration and the table would be mutable.
+
+A `BEFORE UPDATE OR DELETE` trigger fires for a superuser and refuses both verbs, which is why it
+is the mechanism:
+
+    update audit_log set actor_id='tampered' …   →  ERROR: audit entries are append-only (FR-MOD-03)
+    delete from audit_log where …                →  ERROR: audit entries are append-only (FR-MOD-03)
+                                                     and the row is still there
+
+**And the trigger looked unprecedented for a reason that does not apply here.** No migration in
+`services/api/migrations/` had ever created one, and that zero is *enforced*:
+`packages/test-harness/src/no-trigger-in-migrations.test.ts` asserts it over every `.sql` in that
+directory. Its own comment scopes the rule to the test-database sentinel guard — *"the api ships
+a trigger whose only purpose is to reject its own legitimate sweeps, in production"* — so **the
+rule was wider than its reason**, and the audit trigger's purpose is the opposite: it refuses
+writes the api must never make. The first assertion was narrowed to the guard by name, the
+sentinel check left alone, and the narrowing itself asserted so a later edit cannot widen it back
+in silence.
+
+**Rejected: row-level security.** A superuser bypasses it too unless `FORCE ROW LEVEL SECURITY`
+is set, and it answers a different question — who may see which rows, not who may change them.
+
+**Rejected: hash-chaining each entry to its predecessor.** It detects tampering rather than
+preventing it, which is a larger clause than FR-MOD-03 asks for. It is the thing to reach for if
+the reversal condition below is ever met.
+
+### Decision 3 — `timestamptz(3)`, because the cursor compares it to a value from the wire
+
+Postgres defaults `timestamptz` to microsecond precision and the platform serialises with
+`toIso`, which emits milliseconds. A keyset cursor minted from the transmitted value and compared
+against an undeclared column sits before every row inside the lost fraction, so **in DESC order
+every row between `.083000` and `.083489` is skipped at the page boundary.**
+
+This is the platform's first keyset cursor over a Postgres timestamp, which is why nothing had
+met it: the request log's is exact because its column is `DateTime64(3, 'UTC')` and its wire
+format is millisecond, and the message history pages on an integer. The constitution already asks
+for millisecond precision in as many words; **all 40 other `timestamptz` columns are precision
+6**, and that platform-wide deviation is not this chapter's to repair. This column is declared
+because it is the one place the deviation costs a reader rows — and it is **unfixable once
+entries exist**, since changing a column's precision rewrites every row.
+
+### Consequences
+
+- **The claim is scoped and the chapter publishes the scope.** One `SET
+  session_replication_role = replica` disables every trigger in the session, and `DROP TRIGGER`
+  is one statement. Both measured, both succeed. The log is immutable to the application and to
+  accident; it is not immutable to somebody holding the database password.
+- **NFR-SEC-10 is not satisfied by this and asks for the same words.** *"Administrative access to
+  production data shall require multi-factor authentication and shall be logged to an immutable
+  audit trail."* Its actor is an operator with a database password — **exactly the actor this
+  trigger cannot refuse** — and nothing records a `psql` session at all. The two clauses are
+  different artifacts, and a reader who sees *"immutable audit log, shipped"* would reasonably
+  assume otherwise.
+- **The retention FR-MOD-03 names is not enforced.** Nothing prunes this table, on ADR-28's
+  precedent: there is no scheduler. The read deliberately publishes no `retention_edge`, where
+  the request log publishes one because its table has a TTL — announcing a boundary the platform
+  does not enforce is worse than announcing none.
+- **Four actions gained a transaction they did not have**, and it costs more than the entry does.
+  Measured over 200 samples a side: the entry is 0.431 ms at p50 and the transaction about as
+  much again, so an archive is 94.6% slower than before this chapter.
+
+### Reversal condition
+
+**A separate, non-superuser role for the application.** That one change makes `REVOKE UPDATE,
+DELETE` real for the role the api actually uses, demotes the trigger from the only line of
+defence to the second, and turns `psql` as a superuser from this platform's ordinary posture into
+an exceptional act somebody can require a reason for. It is the single change that would move
+both FR-MOD-03's scope and NFR-SEC-10's, and it is a deployment decision rather than a chapter.
+
+When it is taken, hash-chaining becomes worth its cost too: detection is a reasonable second
+layer once prevention is real, and it is not a substitute for prevention that does not exist.
+
+Decision 3 reverses only if the platform's other 40 `timestamptz` columns are brought to
+millisecond precision, at which point this column stops being a special case and the declaration
+is redundant rather than wrong.

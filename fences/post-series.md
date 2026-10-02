@@ -14456,3 +14456,1490 @@ fence chain publishes.
     * "sent over REST" because the fan-out chapter corrected it. This file is the only
     * check in the repository that uses the public surface as a customer does —
 ```
+
+## Chapter 4.18 — the audit log
+
+### `eslint.config.mjs` — the audit suite's exemption, and it is the list's purest case — FR-004 needs two statements the repository cannot make.
+
+```diff title="eslint.config.mjs"
+@@ -98,12 +98,24 @@
+     // AND THE QUOTA SUITE ITSELF, for a different reason from its sibling above.
+     // `period.itest.ts` writes a row the repository cannot; this one READS the two
+     // roll-up tables directly to check what a send left behind. Going through
+     // `usageFor` would mean asserting the roll-up against the function that reads
+     // it — the same circularity, one table over.
+     "services/api/src/quotas/quotas.itest.ts",
++    // AND THE AUDIT LOG'S, WHICH IS THE EXEMPTION'S HONEST CASE IN ITS PUREST FORM: the
++    // state under test is one the repository CANNOT reach, and could not be made to.
++    // FR-004 says an entry must not be modifiable or removable by any path the platform
++    // exposes, and that the refusal must be DEMONSTRATED rather than asserted — so the
++    // test has to attempt an `UPDATE` and a `DELETE` on `audit_log`. There is no
++    // repository method for either and there must never be one; a route that does not
++    // exist proves nothing about a table. The attempt has to go through the driver or
++    // the requirement has no test at all.
++    //
++    // The suite's READS go through `db/audit-reads.ts` like the route's, so this
++    // exemption buys exactly the two statements it exists for.
++    "services/api/src/audit/audit.itest.ts",
+     // AND THE CONNECTION-METERING CHAPTER'S, WHICH MAKES THE SAME CLAIM ONE
+     // DIMENSION OVER: a credited minute survives a `FLUSHALL` of the counter store,
+     // because a quota is about THIS MONTH and the rate limiter's store is allowed to
+     // lose things. Proving that needs the flush, and the flush needs a raw client.
+     //
+     // LISTED RATHER THAN DODGED. Published's version reached for
+```
+
+### `services/api/src/app.module.ts` — `AuditModule` registered, because only a running app asks whether a module provides what it declares.
+
+```diff title="services/api/src/app.module.ts"
+@@ -26,12 +26,13 @@
+ import { LOGGER, apiLogger } from "./logger";
+ import { ProtocolErrorFilter } from "./protocol-error.filter";
+ import { LimitsModule } from "./limits/limits.module";
+ import { RateLimitMiddleware } from "./limits/rate-limit.middleware";
+ import { RequestContextMiddleware } from "./request-context.middleware";
+ import { RequestLogMiddleware, requestLogEnabled } from "./request-log/request-log.middleware";
++import { AuditModule } from "./audit/audit.module";
+ import { RequestLogModule } from "./request-log/request-log.module";
+ import { ANALYTICS_PUBLISHER } from "./webhooks/analytics";
+ import { createJetStreamPublisher, ensureAnalyticsStream } from "./outbox/jetstream.publisher";
+ import type { Publisher } from "./outbox/publisher";
+ 
+ // The application described as a module graph — ADR-15's convention for the
+@@ -53,12 +54,13 @@
+     WebhooksModule,
+     LimitsModule,
+     // Chapter 4.8's read surface. Registered here for the reason `ChannelsModule` and
+     // `UsersModule` are: without this line the module compiles, is imported by nothing,
+     // and the route does not exist — which `pnpm build` would not notice and the
+     // cross-tenant gauntlet would, because it derives its targets from the router.
++    AuditModule,
+     RequestLogModule,
+     // HOSTED MEDIA, AND THIS LINE IS THE WHOLE OF WHETHER THE ROUTE EXISTS. A module
+     // written, tested and never registered gives a 404 that reads as a routing bug
+     // rather than as a missing import — chapter 4.6's `Unknown chapter id`, one
+     // repository over.
+     MediaModule,
+```
+
+### `services/api/src/db/schema.ts` — the `audit_log` table, and the half of it drizzle cannot express.
+
+```diff title="services/api/src/db/schema.ts"
+@@ -1262,6 +1262,76 @@
+     // precedent: it stays the size of the rendition population, not of the table.
+     index("media_objects_parent_idx")
+       .on(t.parentId)
+       .where(sql`${t.parentId} IS NOT NULL`),
+   ],
+ );
++
++// THE AUDIT LOG (FR-MOD-03), AND THE ONLY TABLE HERE NOTHING CAN UPDATE OR DELETE.
++//
++// The immutability is a `BEFORE UPDATE OR DELETE` trigger in `0021_audit_log.sql` and it
++// cannot be expressed here — drizzle has no trigger vocabulary — so this declaration is
++// the half of the table a reader of this file sees, and the other half is the half that
++// matters. `REVOKE UPDATE, DELETE` would have been expressible and does nothing: the api
++// connects as a superuser, measured, which is why the mechanism is a trigger.
++export const auditLog = pgTable(
++  "audit_log",
++  {
++    id: uuid("id").primaryKey(),
++    environmentId: uuid("environment_id")
++      .notNull()
++      .references(() => environments.id),
++    // MILLISECOND, AND NOT THE DEFAULT MICROSECOND. The one place in this file where a
++    // precision is declared, because this is the platform's first keyset cursor over a
++    // Postgres timestamp. `toIso` emits `…083Z` and an undeclared column stores
++    // `…083489`, so a cursor minted from the transmitted value and compared against the
++    // column skips every row inside the lost fraction, at every page boundary. The other
++    // 40 `timestamptz` columns are precision 6 and the constitution asks for
++    // millisecond; that deviation is not this chapter's to repair, and this column is
++    // the one place it would cost a reader rows.
++    //
++    // AND IT IS `occurred_at`, NOT `created_at`, WHICH EVERY OTHER TABLE HERE USES.
++    // The two instants are identical by construction — the row is written inside the
++    // action's transaction — and that is exactly why the familiar name would mislead. A
++    // reader who sees `created_at` reasonably wonders whether the row could have been
++    // written after the action; it cannot. If a later chapter ever writes an entry
++    // outside the action's transaction, this name is what has to change, and that is the
++    // right place for the friction.
++    occurredAt: timestamp("occurred_at", {
++      withTimezone: true,
++      precision: 3,
++    }).notNull(),
++    actorKind: text("actor_kind").notNull(),
++    // NULL FOR A PLATFORM PRINCIPAL, which carries no tenant and so no identifier a
++    // tenant could read. A key id for an application credential, an external id for a
++    // user.
++    actorId: text("actor_id"),
++    // `METHOD /path`, the derived route's own key. One name for this column, the read
++    // route's filter and `audit/moderation-routes.ts`'s both-directions check.
++    action: text("action").notNull(),
++    targetKind: text("target_kind").notNull(),
++    // THE IDENTIFIER A CUSTOMER USES: an external id for a user, a uuid for a channel or
++    // a message, because those are what the routes take.
++    targetId: text("target_id").notNull(),
++    requestId: uuid("request_id").notNull(),
++  },
++  (t) => [
++    check(
++      "audit_log_actor_kind_check",
++      sql`${t.actorKind} IN ('application', 'user', 'platform')`,
++    ),
++    check(
++      "audit_log_target_kind_check",
++      sql`${t.targetKind} IN ('user', 'message', 'membership', 'channel')`,
++    ),
++    // THE READ ROUTE'S ONLY ACCESS PATH, AND THE TENANCY PREDICATE'S. The third column is
++    // the cursor's tiebreaker and it is not optional: `occurred_at` is not unique, and
++    // `request-log/reader.ts` already measured what a single-column keyset costs — "42
++    // `(environment_id, ts)` pairs in this lane hold more than one row; a `ts`-only
++    // comparison skips or repeats all 89 of them."
++    index("audit_log_read_idx").on(
++      t.environmentId,
++      t.occurredAt.desc(),
++      t.id.desc(),
++    ),
++  ],
++);
+```
+
+### `services/api/src/db/repository.ts` — the actor context, the private insert, and the eight actions that record — one of which gained a transaction, a guard and a `RETURNING` in the same change.
+
+```diff title="services/api/src/db/repository.ts"
+@@ -4,12 +4,13 @@
+   and,
+   asc,
+   desc,
+   eq,
+   gt,
+   inArray,
++  isNotNull,
+   isNull,
+   lt,
+   ne,
+   or,
+   sql,
+   type SQL,
+@@ -22,16 +23,19 @@
+ } from "@relay/protocol";
+ 
+ import {
+   DEFAULT_LIMITS,
+   type LimitedOperation,
+ } from "../limits/policy";
++import { RECORDS_NOTHING, type ActorContext } from "../audit/actor";
++import { ACTION } from "../audit/moderation-routes";
+ import type { Db } from "./client";
+ import {
+   apiKeys,
+   applications,
++  auditLog,
+   channels,
+   consumedEvents,
+   environments,
+   humans,
+   members,
+   mediaObjects,
+@@ -2876,15 +2880,24 @@
+ }
+ 
+ export class Repository {
+   // Constructor parameter properties — the shorthand chapter 1.4 released
+   // for this service when ADR-15 spent erasableSyntaxOnly on decorator
+   // metadata. The guarantee still holds in the gateway and every package.
++  //
++  // THE THIRD ARGUMENT IS OPTIONAL, AND THAT IS A MEASUREMENT RATHER THAN A PREFERENCE.
++  // Required, the compiler names every construction site — which is the property chapter
++  // 4.14 wanted and got — and here that is **110 sites across 32 test files**, 17 of them
++  // fenced across 131 pages, to give an actor to repositories that will never record
++  // anything. Optional, the compiler names none, so the check moves to a test that reads
++  // the source: an optional parameter is a check the compiler stopped doing, and
++  // `repository.itest.ts` is what replaces it.
+   constructor(
+     private readonly db: Db,
+     private readonly environmentId: string,
++    private readonly actor?: ActorContext | typeof RECORDS_NOTHING,
+   ) {}
+ 
+   /** The environment this repository is scoped to, readable.
+    *
+    * EXPOSED SO A CALLER NEED NOT REACH FOR THE PRINCIPAL'S OPTIONAL CHAIN.
+    * `req.principal?.environmentId ?? "unknown"` reads the same id and carries a branch
+@@ -2907,12 +2920,77 @@
+    * it five chapters earlier for the first. A deferral justified by a comment is a
+    * deferral justified by one caller's opinion of why the code exists. */
+   get environment(): string {
+     return this.environmentId;
+   }
+ 
++  /** Write one audit entry, inside the caller's transaction (FR-MOD-03, FR-005).
++   *
++   * Called by every recording method in this class — `banUser`, `unbanUser`,
++   * `deleteUser`, `removeMembers`, `setMemberRole`, `archiveChannel`,
++   * `unarchiveChannel` and `deleteMessage` — after each has established that its action
++   * changed something.
++   *
++   * `tx` IS THE ACTION'S OWN TRANSACTION AND THAT IS THE WHOLE OF FR-005. An entry
++   * committed separately from the action it describes is a log that can disagree with
++   * the platform, in both directions: an action with no entry if the second write fails,
++   * and an entry for an action that rolled back.
++   *
++   * IT WRITES NOTHING WHEN THERE IS NO ACTOR, AND THAT IS NOT A SILENT FAILURE — it is
++   * two things a check covers. A production `Repository` is built with an actor or with
++   * `RECORDS_NOTHING`, and `db/repository.itest.ts` reads the source of every
++   * construction site to say so, because the parameter is optional and the compiler
++   * stopped asking. A repository built with neither is a test's, and a test that means
++   * to exercise the log supplies one — `audit.itest.ts` asserts the entries appear, and
++   * asserts that a `RECORDS_NOTHING` repository writes none.
++   *
++   * The alternative was throwing, and it was costed rather than dismissed: 30 `new
++   * Repository(` sites across the eight test files that call a recording method would
++   * have to supply an actor to go on testing something else. That buys a second guard
++   * over the same property `repository.itest.ts` already guards, at four times the
++   * price, and every one of those sites is a file the fence chain publishes. */
++  /** The actor's kind, or `undefined` when this repository records nothing.
++   *
++   * Read by `deleteMessage` alone, which is the one action whose classification depends
++   * on the credential (FR-002a): a tenant key deleting somebody else's message is
++   * FR-MOD-02, a user deleting their own is chapter 3.23's FR-013, and a compliance log
++   * that recorded the second would fill with ordinary user activity. */
++  private get actorKind(): ActorContext["kind"] | undefined {
++    const actor = this.actor;
++    return actor === undefined || actor === RECORDS_NOTHING
++      ? undefined
++      : actor.kind;
++  }
++
++  private async recordAction(
++    tx: Pick<Db, "insert">,
++    entry: {
++      action: string;
++      targetKind: "user" | "message" | "membership" | "channel";
++      targetId: string;
++    },
++  ): Promise<void> {
++    const actor = this.actor;
++    if (actor === undefined || actor === RECORDS_NOTHING) return;
++    await tx.insert(auditLog).values({
++      id: randomUUID(),
++      environmentId: this.environmentId,
++      // `new Date()` AND NOT `sql`now()``, which every other write in this class uses
++      // for a timestamp. `now()` is the transaction's start instant, so a long
++      // transaction would date the entry before the action it records — and the column
++      // is millisecond-precision expressly so the read route's cursor can trust it.
++      occurredAt: new Date(),
++      actorKind: actor.kind,
++      actorId: actor.id,
++      action: entry.action,
++      targetKind: entry.targetKind,
++      targetId: entry.targetId,
++      requestId: actor.requestId,
++    });
++  }
++
+   // ---------------------------------------------------------------------
+   // Hosted media. The slot's whole database half, in one method, because the
+   // check reads what the insert writes.
+   // ---------------------------------------------------------------------
+ 
+   /** Reserve a slot, or report why not.
+@@ -3547,37 +3625,75 @@
+    * `now()` FROM THE DATABASE rather than the app clock, because nothing compares
+    * this timestamp against another statement's value. `sendMessage` takes its period
+    * from the app clock for the opposite reason: two statements there need the same
+    * value and only one of them can be `now()`.
+    */
+   async archiveChannel(channelId: string): Promise<boolean> {
+-    const updated = await this.db
+-      .update(channels)
+-      .set({ archivedAt: sql`now()` })
+-      .where(
+-        and(
+-          eq(channels.id, channelId),
+-          eq(channels.environmentId, this.environmentId),
+-        ),
+-      )
+-      .returning({ id: channels.id });
+-    return updated.length > 0;
++    // FR-005a's EXCEPTION, THE THIRD AND FOURTH TIME. Neither of this pair had a
++    // transaction and neither needed one for itself; both need one so the entry commits
++    // with the change. The answers are unchanged.
++    return this.db.transaction(async (tx) => {
++      const updated = await tx
++        .update(channels)
++        .set({ archivedAt: sql`now()` })
++        .where(
++          and(
++            eq(channels.id, channelId),
++            eq(channels.environmentId, this.environmentId),
++          ),
++        )
++        .returning({ id: channels.id });
++      if (updated.length === 0) return false;
++
++      // FR-MOD-03. The target is the channel's uuid, which is what the route takes and
++      // therefore what a customer already has — no threading, unlike the user cases.
++      //
++      // ARCHIVING AN ARCHIVED CHANNEL WRITES AN ENTRY, for the reason the comment above
++      // gives for the boolean: this write is idempotent BY THE WRITE, so the statement
++      // really did affect a row. The mechanical rule is uniform across the eight actions
++      // and this is the case where it is most visibly a choice.
++      await this.recordAction(tx, {
++        action: ACTION.archiveChannel,
++        targetKind: "channel",
++        targetId: channelId,
++      });
++      return true;
++    });
+   }
+ 
+   async unarchiveChannel(channelId: string): Promise<boolean> {
+-    const updated = await this.db
+-      .update(channels)
+-      .set({ archivedAt: null })
+-      .where(
+-        and(
+-          eq(channels.id, channelId),
+-          eq(channels.environmentId, this.environmentId),
+-        ),
+-      )
+-      .returning({ id: channels.id });
+-    return updated.length > 0;
++    // FR-005a's EXCEPTION, THE THIRD AND FOURTH TIME. Neither of this pair had a
++    // transaction and neither needed one for itself; both need one so the entry commits
++    // with the change. The answers are unchanged.
++    return this.db.transaction(async (tx) => {
++      const updated = await tx
++        .update(channels)
++        .set({ archivedAt: null })
++        .where(
++          and(
++            eq(channels.id, channelId),
++            eq(channels.environmentId, this.environmentId),
++          ),
++        )
++        .returning({ id: channels.id });
++      if (updated.length === 0) return false;
++
++      // FR-MOD-03. The target is the channel's uuid, which is what the route takes and
++      // therefore what a customer already has — no threading, unlike the user cases.
++      //
++      // ARCHIVING AN ARCHIVED CHANNEL WRITES AN ENTRY, for the reason the comment above
++      // gives for the boolean: this write is idempotent BY THE WRITE, so the statement
++      // really did affect a row. The mechanical rule is uniform across the eight actions
++      // and this is the case where it is most visibly a choice.
++      await this.recordAction(tx, {
++        action: ACTION.unarchiveChannel,
++        targetKind: "channel",
++        targetId: channelId,
++      });
++      return true;
++    });
+   }
+ 
+   /** Set a member's role (FR-011).
+    *
+    * SCOPED THROUGH THE CHANNEL, like every other write to `members`: that table
+    * carries no `environment_id`, so the `EXISTS` is what keeps another tenant's rows
+@@ -3598,26 +3714,49 @@
+    * where somebody will look for it: a reader who sees add and remove producing
+    * events will otherwise assume a `PATCH` does too, and find silence. */
+   async setMemberRole(
+     channelId: string,
+     userId: string,
+     role: string,
++    userExternalId: string,
+   ): Promise<"set" | "not_a_member"> {
+-    const updated = await this.db
+-      .update(members)
+-      .set({ role })
+-      .where(
+-        and(
+-          eq(members.channelId, channelId),
+-          eq(members.userId, userId),
+-          sql`EXISTS (SELECT 1 FROM channels c WHERE c.id = ${channelId}
++    // THE TRANSACTION IS FR-005a's EXCEPTION, TAKEN A SECOND TIME. This method had none
++    // and did not need one for its own sake; it needs one so the entry and the role
++    // change commit together. The answer it returns is unchanged.
++    return this.db.transaction(async (tx) => {
++      const updated = await tx
++        .update(members)
++        .set({ role })
++        .where(
++          and(
++            eq(members.channelId, channelId),
++            eq(members.userId, userId),
++            sql`EXISTS (SELECT 1 FROM channels c WHERE c.id = ${channelId}
+                        AND c.environment_id = ${this.environmentId})`,
+-        ),
+-      )
+-      .returning({ userId: members.userId });
+-    return updated.length > 0 ? "set" : "not_a_member";
++          ),
++        )
++        .returning({ userId: members.userId });
++      if (updated.length === 0) return "not_a_member";
++
++      // FR-MOD-03. THE EXTERNAL ID IS THREADED HERE AND IT IS THE ONLY PLACE IT HAD TO
++      // BE: this `RETURNING` carries a uuid, because unlike the ban and the removal this
++      // method emits no customer-facing event and never needed the other identifier.
++      //
++      // AND SETTING THE ROLE A MEMBER ALREADY HOLDS WRITES AN ENTRY. The no-op rule in
++      // this chapter is mechanical — did the write statement affect a row — and here it
++      // did. Knowing whether the VALUE changed would need a SELECT inside the write
++      // transaction, which is the query `deleteMessage` argues against paying on every
++      // call, and the softer reading is defensible anyway: the moderator performed the
++      // action and the platform carried it out.
++      await this.recordAction(tx, {
++        action: ACTION.setMemberRole,
++        targetKind: "membership",
++        targetId: `${channelId}/${userExternalId}`,
++      });
++      return "set";
++    });
+   }
+ 
+   /** One member's role, or null when there is no membership. Used by the tests that
+    * assert the default rather than reading it out of the DDL. */
+   async memberRole(channelId: string, userId: string): Promise<string | null> {
+     const rows = await this.db
+@@ -3730,12 +3869,34 @@
+         membership: { channel_id: channelId, user: row.userExternalId },
+       });
+       await tx.insert(outbox).values({
+         subject: event.subject,
+         payload: event.payload,
+       });
++
++      // FR-MOD-03, IN THE SAME LOOP AND FOR THE SAME REASON. One entry per member the
++      // `RETURNING` gave back, so a bulk call naming five of which two were not members
++      // writes three — the no-op rule applied per member rather than per request.
++      //
++      // AND THE EXTERNAL ID WAS ALREADY HERE, which is the second time in this chapter.
++      // The plan had it threaded in from `channels.service.ts`, which does hold it; this
++      // method's `RETURNING` has carried a `external_id` subquery since the membership
++      // chapter, because the event one line up publishes the member as a customer sees
++      // them. **A method that already emits a customer-visible event already holds
++      // customer-visible identifiers**, and that is what the threading survey should
++      // have asked.
++      //
++      // THE TARGET IS THE MEMBERSHIP, WHICH IS A PAIR, so the id is the two identifiers
++      // the route carries with a slash between them. Unambiguous whatever the external
++      // id contains — a uuid is 36 characters and cannot hold a slash, so the first one
++      // is always the separator.
++      await this.recordAction(tx, {
++        action: ACTION.removeMember,
++        targetKind: "membership",
++        targetId: `${channelId}/${row.userExternalId}`,
++      });
+     }
+ 
+     await tx
+       .delete(readPositions)
+       .where(
+         and(
+@@ -4051,12 +4212,28 @@
+       // ONLY WHEN A ROW WAS UPDATED. `isNull(users.bannedAt)` already makes a re-ban
+       // touch nothing, so without this guard every repeated ban would emit a full set
+       // of events for a state that did not change (FR-005).
+       if (banned.length === 0) return [];
+       const externalId = banned[0]!.externalId;
+ 
++      // FR-MOD-03, AFTER THE GUARD AND INSIDE THE SAME TRANSACTION. After, because an
++      // action that changed nothing earns no entry and `isNull(users.bannedAt)` above is
++      // what makes a re-ban change nothing — the same guard that already stops the
++      // events. Inside, because FR-005 wants the entry and the ban to commit or roll
++      // back together.
++      //
++      // AND THE EXTERNAL ID WAS ALREADY HERE. The chapter's plan said this method would
++      // have to be given it, on the reasoning that `setBanned` resolves the user and
++      // hands over a uuid. It does — and the `RETURNING` three lines up reads the
++      // external id back out, for the membership events. Nothing was threaded.
++      await this.recordAction(tx, {
++        action: ACTION.ban,
++        targetKind: "user",
++        targetId: externalId,
++      });
++
+       const channelRows = await tx
+         .select({ channelId: members.channelId })
+         .from(members)
+         .where(eq(members.userId, userId));
+ 
+       const occurredAt = new Date().toISOString();
+@@ -4074,19 +4251,55 @@
+         });
+       }
+       return channelRows.map((r) => r.channelId);
+     });
+   }
+ 
++  /** Lift a ban (FR-032), and record it (FR-MOD-03).
++   *
++   * THREE THINGS CHANGED HERE AND THEY ARE ONE CHANGE. Before this chapter the method
++   * was a bare `update` with no transaction, no `RETURNING` and no `isNull` guard — so
++   * lifting a real ban and unbanning somebody who was never banned were the same call
++   * with the same answer, `void`. It could not tell whether it had done anything, which
++   * is the one question FR-008 asks of every recording action.
++   *
++   * `isNotNull(bannedAt)` IS THE GUARD, and it is `banUser`'s in the mirror: that method
++   * has had `isNull(bannedAt)` since the ban chapter, for exactly this reason, and the
++   * pair was asymmetric for no recorded reason. The entry now follows the same rule as
++   * the ban's — an unban that lifted nothing writes nothing.
++   *
++   * THE TRANSACTION IS FR-005a's EXCEPTION, TAKEN DELIBERATELY. FR-012 says this chapter
++   * adds no transaction to an action that lacked one; four actions could not satisfy
++   * both clauses and this is the first. What it buys is the entry committing with the
++   * action. What it costs is a new way to fail, and the answer this method returns is
++   * unchanged — `void` then, `void` now — so no caller sees a difference.
++   *
++   * THE EXTERNAL ID COMES FROM THE `RETURNING`, not from a threaded parameter. The
++   * chapter's plan had it threaded from `users.service.ts`; once the method needed a
++   * `RETURNING` anyway, the column was already coming back. */
+   async unbanUser(userId: string): Promise<void> {
+-    await this.db
+-      .update(users)
+-      .set({ bannedAt: null })
+-      .where(
+-        and(eq(users.id, userId), eq(users.environmentId, this.environmentId)),
+-      );
++    await this.db.transaction(async (tx) => {
++      const lifted = await tx
++        .update(users)
++        .set({ bannedAt: null })
++        .where(
++          and(
++            eq(users.id, userId),
++            eq(users.environmentId, this.environmentId),
++            isNotNull(users.bannedAt),
++          ),
++        )
++        .returning({ externalId: users.externalId });
++
++      if (lifted.length === 0) return;
++      await this.recordAction(tx, {
++        action: ACTION.unban,
++        targetKind: "user",
++        targetId: lifted[0]!.externalId,
++      });
++    });
+   }
+ 
+   /** Delete a user, keeping the row (FR-027, FR-028, FR-029).
+    *
+    * WHAT GOES: the profile fields, the memberships, the read positions.
+    * WHAT STAYS: the row, the messages, and every `usage_active_users` row.
+@@ -4105,13 +4318,13 @@
+    * membership does: a position is per-member state keyed by channel and user, so keeping
+    * it would leave a row pointing at a membership that no longer exists. It is the same
+    * deletion the member-removal path already performs.
+    *
+    * IDEMPOTENT, and it reports which happened, so the route can answer 200 twice while a
+    * user who never existed still gets 404. */
+-  async deleteUser(userId: string): Promise<boolean> {
++  async deleteUser(userId: string, userExternalId: string): Promise<boolean> {
+     return this.db.transaction(async (tx) => {
+       const [alive] = await tx
+         .select({ id: users.id, deletedAt: users.deletedAt })
+         .from(users)
+         .where(
+           and(eq(users.id, userId), eq(users.environmentId, this.environmentId)),
+@@ -4145,12 +4358,31 @@
+           displayName: null,
+           avatarUrl: null,
+           metadata: {},
+           deletedAt: alive.deletedAt ?? new Date(),
+         })
+         .where(eq(users.id, userId));
++
++      // FR-MOD-03, AND THE NO-OP TEST IS NOT THIS METHOD'S RETURN VALUE.
++      //
++      // `deleteUser` answers `true` for a user it just deleted AND for one already
++      // deleted — the `?? new Date()` above keeps the original instant, so the second
++      // call changes nothing and still reports `true`. The boolean means "a row
++      // existed", which is what the route needs to tell 200 from 404; it does not mean
++      // "something changed". Chapter 4.18's own phase-2 survey read it as the no-op
++      // discriminator and was wrong.
++      //
++      // `alive.deletedAt` is the discriminator. A second deletion writes no entry, for
++      // the same reason a re-ban writes none.
++      if (alive.deletedAt === null) {
++        await this.recordAction(tx, {
++          action: ACTION.deleteUser,
++          targetKind: "user",
++          targetId: userExternalId,
++        });
++      }
+       return true;
+     });
+   }
+ 
+   /** Write a user's profile (FR-023, FR-024).
+    *
+@@ -5406,12 +5638,31 @@
+       });
+       await tx.insert(outbox).values({
+         subject: event.subject,
+         payload: event.payload,
+       });
+ 
++      // FR-MOD-03, AND ONLY WHEN A TENANT KEY DID IT (FR-002a). This is the one route
++      // whose classification the credential decides: `moderation-when-application`.
++      //
++      // THE CONDITION IS THE ACTOR'S KIND, NOT `userId === undefined`. The two agree
++      // today — the controller passes the user only for a user token — but they are
++      // different claims, and the one the audit log is entitled to is who authenticated
++      // the request. Reading the parameter would make the entry depend on a calling
++      // convention rather than on a credential.
++      //
++      // On this branch only, like the event above: a repeated deletion returned before
++      // reaching here, so a client retrying a 204 writes no second entry.
++      if (this.actorKind === "application") {
++        await this.recordAction(tx, {
++          action: ACTION.deleteMessage,
++          targetKind: "message",
++          targetId: messageId,
++        });
++      }
++
+       return {
+         deleted: {
+           id: row.id,
+           channel_id: channelId,
+           seq: row.seq,
+           text: null,
+```
+
+### `services/api/src/db/repository.itest.ts` — the source walk that replaces a check the compiler stopped doing, and the two defects it found in itself.
+
+```diff title="services/api/src/db/repository.itest.ts"
+@@ -1,7 +1,9 @@
+ import { randomUUID } from "node:crypto";
++import { readdirSync, readFileSync } from "node:fs";
++import { join } from "node:path";
+ 
+ import { afterAll, beforeAll, describe, expect, it } from "vitest";
+ import { sql } from "drizzle-orm";
+ 
+ import { createDb, createPool, DEFAULT_DATABASE_URL, type Db } from "./client";
+ import { migrate } from "./migrate";
+@@ -303,13 +305,13 @@
+ 
+     // The constraint name is in the CAUSE, not the message: drizzle's top-level
+     // text is "Failed query: update …" and the driver's error underneath it carries
+     // `constraint`. Asserting on the wrapper's message would have passed for any
+     // failed update at all — including one that failed for the wrong reason.
+     const error = await repoA
+-      .setMemberRole(channel.id, user.id, "admin")
++      .setMemberRole(channel.id, user.id, "admin", user.external_id)
+       .then(() => null)
+       .catch((e: unknown) => e);
+     expect(error).toBeInstanceOf(Error);
+     const chain = JSON.stringify({
+       message: (error as Error).message,
+       cause: String((error as { cause?: unknown }).cause ?? ""),
+@@ -324,13 +326,18 @@
+     // something: a constraint that refused BOTH words would pass the assertion
+     // above while being just as wrong.
+     const channel = await repoA.createChannel("role-check-ok", "public");
+     const user = await repoA.createUser("role-check-ok-user");
+     await repoA.addMember(channel.id, user.id);
+ 
+-    expect(await repoA.setMemberRole(channel.id, user.id, "moderator")).toBe("set");
++    expect(await repoA.setMemberRole(
++        channel.id,
++        user.id,
++        "moderator",
++        user.external_id,
++      )).toBe("set");
+     expect(await repoA.memberRole(channel.id, user.id)).toBe("moderator");
+   });
+ 
+   it("gives a member created without a role the column's default", async () => {
+     const channel = await repoA.createChannel("role-default", "public");
+     const user = await repoA.createUser("role-default-user");
+@@ -582,18 +589,18 @@
+ // IN-PROCESS ON PURPOSE (T174b). Five of this feature's tests drive new repository code
+ // through the gateway's api CHILD PROCESS, whose coverage is not attributable. The webhook dispatcher chapter
+ // added six operations to this file the same way and branches went 85.91% → 78.22% on the
+ // next run: the instrument was right and the code was untested.
+ describe("the repository's own refusals", () => {
+   it("returns false when deleting a user that does not exist", async () => {
+-    expect(await repoA.deleteUser("00000000-0000-4000-8000-000000000000")).toBe(false);
++    expect(await repoA.deleteUser("00000000-0000-4000-8000-000000000000", "nobody")).toBe(false);
+   });
+ 
+   it("returns null when patching a deleted user's profile", async () => {
+     const doomed = await repoA.createUser("arm-patch-deleted", "Doomed");
+-    await repoA.deleteUser(doomed.id);
++    await repoA.deleteUser(doomed.id, "arm-patch-deleted");
+     // The route answers 404 before reaching this, because `requireUser` reads the marker.
+     // One layer down, the `isNull(deletedAt)` in the WHERE is what refuses.
+     expect(await repoA.updateUserProfile(doomed.id, { display_name: "nope" })).toBeNull();
+     // And the same for an empty patch, which takes the other branch entirely — no UPDATE
+     // is issued, so the refusal comes from the SELECT.
+     expect(await repoA.updateUserProfile(doomed.id, {})).toBeNull();
+@@ -849,13 +856,13 @@
+     const channel = await repoA.createChannel("t036b", "public");
+     await repoA.addMember(channel.id, author.id);
+     const sent = await repoA.sendMessage(channel.id, { text: "before", userId: author.id });
+     await repoA.editMessage(channel.id, sent.id, { text: "after", userId: author.id });
+ 
+     await repoA.archiveChannel(channel.id);
+-    await repoA.deleteUser(author.id);
++    await repoA.deleteUser(author.id, author.external_id);
+ 
+     // `message_edits` references the MESSAGE, and both of those operations keep their
+     // rows — the archive sets a timestamp (FR-020) and a user deletion is a
+     // tombstone too (FR-USR-05). A cascade on either would take the history with it.
+     const edits = await repoA.listMessageEdits(channel.id, sent.id);
+     expect(edits.map((e) => e.prior_text)).toEqual(["before"]);
+@@ -1671,6 +1678,137 @@
+     // A TEST-ONLY HELPER WITH FIVE CALL SITES, all in `idempotency.itest.ts`, which count
+     // rows and read text. An exact key set rather than a negative check: this is what
+     // stops the helper growing a column nobody asked for.
+     expect(Object.keys(rows[0]!).sort()).toEqual(["id", "seq", "text"]);
+   });
+ });
++
++// ---------------------------------------------------------------------------
++// FR-MOD-03 — what the compiler stopped checking when the actor became optional.
++//
++// `Repository`'s third argument is optional and chapter 4.18 measured why: required, the
++// compiler names every construction site, and here that is 110 of them across 32 test
++// files, 17 fenced across 131 pages, to hand an actor to repositories that will never
++// record anything. The cost of optional is that a production site can forget, and a
++// repository built without an actor writes entries with no actor and nothing says so.
++//
++// So the check moves here, and it is structural for the reason 4.4's guard walker is:
++// a behavioural test cannot catch a construction site that does not exist yet.
++//
++// THE ASSERTION READS "OR" BECAUSE ONE SITE LEGITIMATELY RECORDS NOTHING.
++// `auth/dev-token.controller.ts` mints a credential and performs no moderation action.
++// Demanding context from all of them would be satisfied only by an exemption list, which
++// is what `RECORDS_NOTHING` exists to avoid — the absence is a value a check can read.
++// ---------------------------------------------------------------------------
++describe("every production Repository is built with an actor", () => {
++  // ASK THE TREE, DO NOT RESTATE IT. A list of construction sites written here goes
++  // stale the day somebody adds one, and the test keeps passing — which is the failure
++  // this block exists to prevent, reproduced inside its own assertion. 4.4's precedent.
++  const walk = (dir: string): string[] =>
++    readdirSync(dir, { withFileTypes: true }).flatMap((e) =>
++      e.isDirectory()
++        ? walk(join(dir, e.name))
++        : e.name.endsWith(".ts") &&
++            !e.name.includes(".test.") &&
++            !e.name.includes(".itest.")
++          ? [join(dir, e.name)]
++          : [],
++    );
++
++  /** Every `new Repository(` outside a test file, with the argument list that follows
++   * it — to the closing paren of the call, across however many lines prettier wrapped
++   * it onto. Chapter 4.16 found that matching a formatter-owned file by the text you
++   * last wrote matches nothing; this reads the call, not a line. */
++  /** A file with its comments blanked, same length, so offsets still line up.
++   *
++   * BECAUSE THE SCAN MATCHED ITS OWN DOCUMENTATION. `audit/actor.ts` has a comment
++   * saying that this test "reads every production `new Repository(`", and the first
++   * version of this scan found that sentence and demanded three arguments of it. An
++   * instrument that reads prose as code reports a defect in the paragraph describing
++   * itself. Blanked rather than deleted so a future failure's offsets are still the
++   * file's. */
++  const decommented = (src: string): string =>
++    src
++      .replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, " "))
++      .replace(/\/\/[^\n]*/g, (m) => " ".repeat(m.length));
++
++  const sites = (): { file: string; call: string }[] => {
++    const out: { file: string; call: string }[] = [];
++    for (const file of walk(join(__dirname, ".."))) {
++      const src = decommented(readFileSync(file, "utf8"));
++      for (let i = src.indexOf("new Repository("); i !== -1; i = src.indexOf("new Repository(", i + 1)) {
++        let depth = 0;
++        let end = i + "new Repository".length;
++        for (; end < src.length; end++) {
++          if (src[end] === "(") depth++;
++          else if (src[end] === ")" && --depth === 0) break;
++        }
++        out.push({ file, call: src.slice(i, end + 1) });
++      }
++    }
++    return out;
++  };
++
++  it("finds the construction sites it claims to police", () => {
++    // A scan that finds nothing passes vacuously, and five gate scripts in this project
++    // have exited 0 on an absent corpus. Assert the count, not the loop.
++    expect(sites().length).toBeGreaterThan(3);
++  });
++
++  /** The call's top-level arguments, with comments removed first.
++   *
++   * COUNTING ARGUMENTS, NOT MATCHING A WORD. The first version of this test asked
++   * whether the call text mentioned `actor` or `RECORDS_NOTHING`, and it was wrong in
++   * both directions: `actorFrom(req)` has no word boundary after `actor`, so every
++   * module failed, and a comment inside the call saying the word would have satisfied it
++   * — which `isolation/fixtures.ts` actually contains. A third argument is a structural
++   * fact and a comment cannot be one. */
++  const args = (call: string): string[] => {
++    const body = call
++      .slice(call.indexOf("(") + 1, call.lastIndexOf(")"))
++      .replace(/\/\*[\s\S]*?\*\//g, "")
++      .replace(/\/\/[^\n]*/g, "");
++    const out: string[] = [];
++    let depth = 0;
++    let cur = "";
++    for (const ch of body) {
++      if ("([{".includes(ch)) depth++;
++      else if (")]}".includes(ch)) depth--;
++      if (ch === "," && depth === 0) {
++        out.push(cur);
++        cur = "";
++      } else cur += ch;
++    }
++    if (cur.trim() !== "") out.push(cur);
++    return out.map((a) => a.trim()).filter((a) => a !== "");
++  };
++
++  it("gives each one an actor or the named absence", () => {
++    for (const { file, call } of sites()) {
++      expect(
++        args(call).length,
++        `${file} builds a Repository with no actor context`,
++      ).toBe(3);
++    }
++  });
++
++  it("does not read its own documentation as a construction site", () => {
++    // The control for the blanking above. Both halves: a call inside a comment is not a
++    // site, and a real call still is.
++    expect(decommented('// see `new Repository(db, env)`')).not.toContain(
++      "new Repository(",
++    );
++    expect(decommented("const r = new Repository(db, env, a);")).toContain(
++      "new Repository(",
++    );
++    // and the line structure survives, so a reported offset is still the file's
++    expect(decommented("a\n/* x */\nb").split("\n")).toHaveLength(3);
++  });
++
++  it("can tell a comment from an argument", () => {
++    // The control for the paragraph above: the shape that fooled the first version must
++    // not fool this one.
++    expect(args('new Repository(db, env, /* actor */)')).toHaveLength(2);
++    expect(args('new Repository(db, env, actorFrom(req))')).toHaveLength(3);
++    expect(args('new Repository(\n  db,\n  env,\n  // RECORDS_NOTHING\n)')).toHaveLength(2);
++  });
++});
+```
+
+### `services/api/src/isolation/targets.ts` — `GET /v1/audit-log`, and the derivation found it before the list did — the eighth time.
+
+```diff title="services/api/src/isolation/targets.ts"
+@@ -443,12 +443,31 @@
+   // `accepts: "application"` MATCHES THE DECORATOR AND THE TWO ARE NOT COMPARED BY
+   // ANYTHING. The controller declares `@Accepts("application")`; this field tells the
+   // gauntlet which credential to attack with, so a `"user"` here would send it at the
+   // route with a token the guard refuses at the door and the handler would never run.
+   { method: "GET", path: "/v1/request-log", accepts: "application", shape: "list" },
+ 
++  // ── THE AUDIT LOG (chapter 4.18, FR-MOD-03), AND THE DERIVATION FOUND IT FIRST AGAIN ──
++  //
++  // Run before this entry existed: `47 derived, 39 attacked, 8 exempt` with
++  // `unclassified: ["GET /v1/audit-log"]`. Eighth time, and the list has still never been
++  // ahead of the derivation.
++  //
++  // `list`, AND `application` FOR THE REQUEST LOG'S REASON. The controller declares
++  // `@Accepts("application")`; this field tells the gauntlet which credential to attack
++  // with, so `"user"` here would send it at the route with a token the guard refuses at
++  // the door and the handler would never run.
++  //
++  // AND THE ATTACK HAS TO PLANT ITS OWN ROWS, like the request log's and for a sharper
++  // version of the same reason: an audit log is empty until somebody moderates, so on a
++  // fresh lane both tenants' logs hold nothing and an empty page passes a leak check
++  // without the route having been asked anything. The attack bans a throwaway user in
++  // each environment over HTTP first, which exercises the write path rather than planting
++  // rows behind it.
++  { method: "GET", path: "/v1/audit-log", accepts: "application", shape: "list" },
++
+   // ── THE UPLOAD SLOT (chapter 4.10, FR-MED-01), AND THE DERIVATION FOUND IT EIGHTH ──
+   //
+   // Run before this entry existed: `44 derived, 37 attacked, 6 exempt` with
+   // `unclassified: ["POST /v1/media"]`. Eight chapters, eight times, and the list has
+   // never once been ahead of the derivation.
+   //
+```
+
+### `services/api/src/isolation/fixtures.ts` — test support that lives in `src/`, so the source walk reads it as production — correctly.
+
+```diff title="services/api/src/isolation/fixtures.ts"
+@@ -1,6 +1,7 @@
++import { RECORDS_NOTHING } from "../audit/actor";
+ import { createApiKey, createEnvironment, Repository } from "../db/repository";
+ import { encryptSecret, mintSigningSecret } from "../webhooks/secret";
+ 
+ import type { Db } from "../db/client";
+ 
+ /** Two tenants, so every attack has a victim and an attacker.
+@@ -49,13 +50,23 @@
+   victim: Tenant;
+ }
+ 
+ async function seedTenant(db: Db, label: string): Promise<Tenant> {
+   const environment = await createEnvironment(db, { name: `isolation-${label}` });
+   const key = await createApiKey(db, { environmentId: environment.id });
+-  const repo = new Repository(db, environment.id);
++  const repo = new Repository(
++    db,
++    environment.id,
++    // `RECORDS_NOTHING` (FR-MOD-03). This file is test support that lives in `src/`
++    // rather than in a `.itest.ts`, so the source walk in `db/repository.itest.ts`
++    // reads it as a production site — correctly, because a check that trusted a
++    // filename would be an exemption list with extra steps. These fixtures plant
++    // rows and perform no moderation action, so there is no actor to supply and the
++    // absence is stated rather than left to be inferred.
++    RECORDS_NOTHING,
++  );
+ 
+   const userExternalId = `${label}-user`;
+   const user = await repo.createUser(userExternalId, `${label} user`);
+   const channelExternalId = `${label}-channel`;
+   // A BOT PER TENANT. Every attack in the gauntlet presents a KEY, and a
+   // key send names a bot — so each tenant needs one of its own, or an attack would be
+@@ -143,13 +154,13 @@
+ }
+ 
+ export async function seedSameTenant(db: Db, mintToken: MintToken): Promise<SameTenant> {
+   const stamp = Math.random().toString(36).slice(2, 8);
+   const environment = await createEnvironment(db, { name: `iso-same-${stamp}` });
+   const key = await createApiKey(db, { environmentId: environment.id });
+-  const repo = new Repository(db, environment.id);
++  const repo = new Repository(db, environment.id, RECORDS_NOTHING);
+ 
+   const member = await repo.createUser(`same-${stamp}-member`, "A Member");
+   const stranger = await repo.createUser(`same-${stamp}-stranger`, "A Stranger");
+   const privateChannel = await repo.createChannel(`same-${stamp}-private`, "private");
+   const publicChannel = await repo.createChannel(`same-${stamp}-public`, "public");
+   await repo.addMember(privateChannel.id, member.id);
+@@ -219,13 +230,13 @@
+   const stamp = Math.random().toString(36).slice(2, 8);
+   const sharedExternalId = `collide-${stamp}`;
+ 
+   const seed = async (label: string, type: "public" | "private") => {
+     const environment = await createEnvironment(db, { name: `iso-collide-${label}-${stamp}` });
+     const key = await createApiKey(db, { environmentId: environment.id });
+-    const repo = new Repository(db, environment.id);
++    const repo = new Repository(db, environment.id, RECORDS_NOTHING);
+     const userExternalId = `collide-${label}-${stamp}-user`;
+     const user = await repo.createUser(userExternalId);
+     // THE SAME external id in both environments. `DR-02` makes it unique per
+     // environment, which is exactly the property under test.
+     const channel = await repo.createChannel(sharedExternalId, type);
+     // The `public` tenant's user is deliberately NOT a member either: this fixture
+```
+
+### `services/api/src/isolation/attack.ts` — `rowsOf` meets its third envelope, which is the whole cost of keeping the table rather than deriving it.
+
+```diff title="services/api/src/isolation/attack.ts"
+@@ -148,17 +148,25 @@
+  *
+  * WHAT THE FAILURE READS LIKE IS THE ONE REAL COST. An unrecognised shape fails as *"the
+  * attacker's own listing came back empty"*, which names a symptom and not the cause. The
+  * test below is what turns that into a sentence about the recogniser. */
+ export function rowsOf(body: unknown): unknown[] {
+   if (Array.isArray(body)) return body;
+-  const shaped = body as { data?: unknown; requests?: unknown } | null;
++  const shaped = body as {
++    data?: unknown;
++    requests?: unknown;
++    entries?: unknown;
++  } | null;
+   if (Array.isArray(shaped?.data)) return shaped.data;
+   // Chapter 4.8's envelope: the array is named for the resource, as
+   // `messages.service.ts` names its own. R23 refused `rows` for being a storage word.
+   if (Array.isArray(shaped?.requests)) return shaped.requests;
++  // AND CHAPTER 4.18's, WHICH IS THE THIRD TIME THIS FUNCTION HAS MET A NEW ONE. Adding
++  // the name is the whole cost of keeping the table rather than deriving it, and 4.8
++  // measured what deriving it costs instead — a false pass on any array in the body.
++  if (Array.isArray(shaped?.entries)) return shaped.entries;
+   return [];
+ }
+ 
+ export async function listAttack(
+   baseUrl: string,
+   credential: string,
+```
+
+### `services/api/src/isolation/attack.test.ts` — and the `requests` arm had no test at all, found while adding one for `entries`.
+
+```diff title="services/api/src/isolation/attack.test.ts"
+@@ -59,12 +59,20 @@
+   });
+ 
+   it("reads a paginated envelope", () => {
+     expect(rowsOf({ data: [1, 2], next_cursor: "x" })).toEqual([1, 2]);
+   });
+ 
++  it("reads each envelope the platform actually serves, by name", () => {
++    // ONE PER NAMED ARM, AND THE `requests` ARM HAD NO TEST AT ALL until chapter 4.18
++    // came to add a third. Every arm here is one a `list` attack depends on, and an arm
++    // nothing drives is an arm that can be deleted or mistyped without a word.
++    expect(rowsOf({ requests: [1, 2], has_more: false })).toEqual([1, 2]);
++    expect(rowsOf({ entries: [1], has_more: false })).toEqual([1]);
++  });
++
+   it("returns nothing for a shape it does not recognise", () => {
+     // The arm that matters. Zero rows from an unknown shape looks exactly like
+     // zero rows from a correctly-scoped list, and only one of those is a pass.
+     expect(rowsOf({ code: "not_found" })).toEqual([]);
+     expect(rowsOf(null)).toEqual([]);
+     expect(rowsOf("an html error page")).toEqual([]);
+```
+
+### `services/api/src/isolation/gauntlet.itest.ts` — the attack that plants its rows through the product rather than behind it.
+
+```diff title="services/api/src/isolation/gauntlet.itest.ts"
+@@ -24,12 +24,13 @@
+   nowhereId,
+   seedCollidingTenants,
+   seedSameTenant,
+   seedTwoTenants,
+   type CollidingTenants,
+   type SameTenant,
++  type Tenant,
+   type TwoTenants,
+ } from "./fixtures";
+ import { periodOf } from "../quotas/period";
+ import { CLASSIFICATIONS, targetKey } from "./targets";
+ 
+ import type { Db } from "../db/client";
+@@ -1356,12 +1357,67 @@
+       // AND ITS OWN ROW IS THERE. A listing that returned nothing at all would pass the
+       // leak check while being broken, which is the `list` shape's own trap — and here it
+       // is not hypothetical, because a log with no ingester behind it really is empty.
+       expect(verdict.count, "the attacker's own log came back empty").toBeGreaterThan(0);
+     });
+ 
++    /** GET /v1/audit-log (chapter 4.18, FR-MOD-03, FR-006).
++     *
++     * AND THIS ONE PLANTS ITS ROWS THROUGH THE PRODUCT, not behind it. The request log's
++     * attack has to `INSERT` because nothing in the composed stack writes to that table
++     * (no ingester runs, `gaps.md` 050-8). An audit entry has a writer right here: a ban
++     * over HTTP produces one, so the plant exercises the whole path the leak check is
++     * about — credential to principal to actor to row — instead of asserting isolation
++     * over rows the api never wrote.
++     *
++     * A THROWAWAY USER IN EACH ENVIRONMENT, not the fixture's own. Banning
++     * `t.attacker.userExternalId` would leave a banned user behind for whatever attack
++     * runs next, which is the shape 045 found eight times: an action scoped wider than
++     * the thing it tests.
++     *
++     * THE FORBIDDEN VALUES ARE THE VICTIM's TARGET AND ITS ENVIRONMENT ID. `listAttack`
++     * searches the serialised body, so a victim identifier reaching a cursor or an echo
++     * counts as a leak exactly as a row would. */
++    it("GET /v1/audit-log — a tenant's moderation history holds its own entries and none of the victim's", async () => {
++      attacked.add("GET /v1/audit-log");
++      const stamp = randomUUID().slice(0, 8);
++      const banned = async (who: Tenant): Promise<string> => {
++        const externalId = `audit-${stamp}-${who === t.victim ? "victim" : "attacker"}`;
++        const created = await send(url, who.credential, {
++          method: "POST",
++          path: "/v1/users",
++          // THE BATCH SHAPE, which is what this route takes — `{ users: [...] }`, 200
++          // and not 201 because the array reports created, updated and revived per
++          // entry. The single-entry guess answered 400.
++          body: { users: [{ external_id: externalId, display_name: "Audit probe" }] },
++        });
++        expect(created.status, `could not create ${externalId}`).toBe(200);
++        const ban = await send(url, who.credential, {
++          method: "POST",
++          path: `/v1/users/${externalId}/ban`,
++        });
++        expect(ban.status, `could not ban ${externalId}`).toBe(200);
++        return externalId;
++      };
++      await banned(t.attacker);
++      const victimTarget = await banned(t.victim);
++
++      const verdict = await listAttack(
++        url,
++        t.attacker.credential,
++        { method: "GET", path: "/v1/audit-log" },
++        [t.victim.environmentId, victimTarget],
++      );
++      expect(verdict.status).toBe(200);
++      expect(verdict.leaked, `leaked: ${verdict.leaked.join(", ")}`).toEqual([]);
++      // AND ITS OWN ENTRY IS THERE. A page that returned nothing passes the leak check
++      // while being broken — the `list` shape's own trap, and on a log that is empty
++      // until somebody moderates it is not hypothetical.
++      expect(verdict.count, "the attacker's own audit log came back empty").toBeGreaterThan(0);
++    });
++
+     it("POST /v1/webhooks — a create by one tenant cannot appear in another's list", async () => {
+       attacked.add("POST /v1/webhooks");
+       // NO IDENTIFIER TO FORGE on this route: the tenant comes from the key. So the
+       // pair is two legitimate creates and the assertion is about the VICTIM's state —
+       // this is the one webhook write whose attack is entirely the state read.
+       const body = (n: string) => ({
+```
+
+### `services/api/src/auth/dev-token.controller.ts` — the one production site that records nothing, saying so in a way a check can read.
+
+```diff title="services/api/src/auth/dev-token.controller.ts"
+@@ -15,12 +15,13 @@
+ import { environmentSigningSecret, Repository } from "../db/repository";
+ import { AUTH_DB } from "./authenticate.middleware";
+ import { Accepts, CredentialGuard } from "./credential.guard";
+ import type { RequestWithPrincipal } from "./principal";
+ import { MAX_TOKEN_LIFETIME_SECONDS, mintUserToken } from "./user-token";
+ import { ZodValidationPipe } from "../messages/zod-validation.pipe";
++import { RECORDS_NOTHING } from "../audit/actor";
+ 
+ // FR-AUT-09: the development-only endpoint that turns an API key into an
+ // end-user token. It exists so a developer reaches a first authenticated
+ // message before writing any token-signing code of their own — the alternative
+ // being a quickstart that starts with "implement JWT minting".
+ //
+@@ -113,13 +114,23 @@
+     // identifier that exists nowhere — but on this route an unknown identifier answers
+     // **200 with a token**, because the user-surface chapter made the mint create the row. So there
+     // is nothing for a refusal to be identical to: any refusal at all says "this
+     // identifier exists and is not a person". That is a leak this route cannot close,
+     // and 404 is chosen because it is the answer this route already gives for an
+     // environment it cannot resolve — one shape rather than a new one (FR-005).
+-    const repo = new Repository(this.db, principal.environmentId);
++    // `RECORDS_NOTHING`, AND IT IS A VALUE RATHER THAN AN OMISSION (FR-MOD-03).
++    // Minting a credential is not a moderation action — `POST /auth/dev-token` is
++    // classified `not-moderation` — so this repository will never write an audit entry
++    // and has no actor to write one with. Leaving the argument off would make this site
++    // indistinguishable from one that forgot, which is what `repository.itest.ts` reads
++    // the source to prevent.
++    const repo = new Repository(
++      this.db,
++      principal.environmentId,
++      RECORDS_NOTHING,
++    );
+     const existing = await repo.getUserByExternalId(body.user);
+     if (existing?.kind === "bot") {
+       throw new NotFoundException({
+         code: "not_found",
+         message: "no such user",
+       });
+```
+
+### `services/api/src/auth/credentials.itest.ts` — a call site the compiler named.
+
+```diff title="services/api/src/auth/credentials.itest.ts"
+@@ -591,13 +591,13 @@
+     });
+ 
+     it("reuses a deleted user's row without reviving them (FR-030)", async () => {
+       const repo = new Repository(db, env.id);
+       const gone = `deleted-${Math.random().toString(36).slice(2, 8)}`;
+       const row = await repo.createUser(gone, "Deleted");
+-      await repo.deleteUser(row.id);
++      await repo.deleteUser(row.id, gone);
+ 
+       const minted = await devToken(key.credential, { user: gone });
+       expect(minted.status).toBe(200);
+ 
+       const after = await repo.getUserByExternalId(gone);
+       // THE SAME ROW, and still deleted. FR-030 says presenting the id again reuses the
+```
+
+### `services/api/src/messages/messages.module.ts` — one of the five request-scoped factories that now build an actor.
+
+```diff title="services/api/src/messages/messages.module.ts"
+@@ -17,12 +17,13 @@
+ import { apiLogger, LOGGER } from "../logger";
+ import { createDb, createPool, type Db } from "../db/client";
+ import type { RequestWithTenant } from "./request-with-tenant";
+ import { Repository } from "../db/repository";
+ import { MessagesController } from "./messages.controller";
+ import { MessagesService } from "./messages.service";
++import { actorFrom } from "../audit/actor";
+ 
+ /** The api publishes to the live fan-out from the send path, so
+  * the module that owns that path owns the client.
+  *
+  * PROVIDED AND NOT EXPORTED, and that is the point. `internal.module.ts` imports
+  * this module and, in its own words, "reuse[s] MessagesModule's providers
+@@ -80,13 +81,17 @@
+         // else about this line. It used to be an environment header — a
+         // header any caller could type. It is now the environment resolved
+         // from a verified credential, so a request cannot name a tenant it
+         // has not proved it may act for. The empty-string fallback is the
+         // same as 2.2's: no principal means no scope, and the guard below
+         // turns that into a 401 before any handler runs.
+-        new Repository(db, req.principal?.environmentId ?? ""),
++        new Repository(
++          db,
++          req.principal?.environmentId ?? "",
++          actorFrom(req),
++        ),
+     },
+     MessagesService,
+     { provide: LOGGER, useFactory: apiLogger },
+     {
+       provide: MESSAGE_PUBLISHER,
+       inject: [LOGGER],
+```
+
+### `services/api/src/channels/channels.module.ts` — one of the five.
+
+```diff title="services/api/src/channels/channels.module.ts"
+@@ -5,12 +5,13 @@
+ import { MembershipModule } from "../membership/membership.module";
+ import { createDb, createPool, type Db } from "../db/client";
+ import { Repository } from "../db/repository";
+ import { ChannelsController } from "./channels.controller";
+ import { ChannelsService } from "./channels.service";
+ import type { RequestWithTenant } from "../messages/request-with-tenant";
++import { actorFrom } from "../audit/actor";
+ 
+ // The messages module's shape, for the messages module's reasons: the repository
+ // is the plain 2.1 class, constructed per request with the tenant the middleware
+ // already resolved from a verified credential (ADR-15).
+ @Module({
+   imports: [AuthModule, MembershipModule],
+@@ -23,12 +24,16 @@
+     },
+     {
+       provide: Repository,
+       scope: Scope.REQUEST,
+       inject: ["DB", REQUEST],
+       useFactory: (db: Db, req: RequestWithTenant) =>
+-        new Repository(db, req.principal?.environmentId ?? ""),
++        new Repository(
++          db,
++          req.principal?.environmentId ?? "",
++          actorFrom(req),
++        ),
+     },
+     ChannelsService,
+   ],
+ })
+ export class ChannelsModule {}
+```
+
+### `services/api/src/users/users.module.ts` — one of the five.
+
+```diff title="services/api/src/users/users.module.ts"
+@@ -5,12 +5,13 @@
+ import { MembershipModule } from "../membership/membership.module";
+ import { createDb, createPool, type Db } from "../db/client";
+ import { Repository } from "../db/repository";
+ import { UsersController } from "./users.controller";
+ import { UsersService } from "./users.service";
+ import type { RequestWithTenant } from "../messages/request-with-tenant";
++import { actorFrom } from "../audit/actor";
+ 
+ // The channels module's shape, for the channels module's reasons.
+ //
+ // A SEPARATE MODULE AND NOT A ROUTE ON `ChannelsController`. Five SRS clauses need
+ // routes whose subject is a user — the listing, the profile read, the upsert, the
+ // deletion, the ban — and hanging them off the channels controller would put user
+@@ -27,12 +28,16 @@
+     },
+     {
+       provide: Repository,
+       scope: Scope.REQUEST,
+       inject: ["DB", REQUEST],
+       useFactory: (db: Db, req: RequestWithTenant) =>
+-        new Repository(db, req.principal?.environmentId ?? ""),
++        new Repository(
++          db,
++          req.principal?.environmentId ?? "",
++          actorFrom(req),
++        ),
+     },
+     UsersService,
+   ],
+ })
+ export class UsersModule {}
+```
+
+### `services/api/src/webhooks/webhooks.module.ts` — one of the five.
+
+```diff title="services/api/src/webhooks/webhooks.module.ts"
+@@ -18,12 +18,13 @@
+   createDeliveryRelay,
+   ensureDeliveriesStream,
+   type DeliveryRelay,
+ } from "./delivery-relay";
+ import { WebhooksController } from "./webhooks.controller";
+ import { WebhooksService } from "./webhooks.service";
++import { actorFrom } from "../audit/actor";
+ 
+ export const DELIVERY_RELAY = "DELIVERY_RELAY";
+ 
+ /** The api's SECOND relay (research R13), started with the service
+  * exactly as the outbox chapter's is. An event spine that only runs when someone remembers is
+  * not a spine, and the same is true of a retry schedule.
+@@ -66,13 +67,17 @@
+     },
+     {
+       provide: Repository,
+       scope: Scope.REQUEST,
+       inject: ["DB", REQUEST],
+       useFactory: (db: Db, req: RequestWithTenant) =>
+-        new Repository(db, req.principal?.environmentId ?? ""),
++        new Repository(
++          db,
++          req.principal?.environmentId ?? "",
++          actorFrom(req),
++        ),
+     },
+     WebhooksService,
+     {
+       provide: DELIVERY_RELAY,
+       useFactory: (): DeliveryRelay =>
+         createDeliveryRelay({
+```
+
+### `services/api/src/media/media.module.ts` — one of the five.
+
+```diff title="services/api/src/media/media.module.ts"
+@@ -9,12 +9,13 @@
+ import { ANALYTICS_PUBLISHER } from "../webhooks/analytics";
+ import { createDb, createPool, type Db } from "../db/client";
+ import { Repository } from "../db/repository";
+ import { MediaController } from "./media.controller";
+ import { MediaService } from "./media.service";
+ import type { RequestWithTenant } from "../messages/request-with-tenant";
++import { actorFrom } from "../audit/actor";
+ 
+ // Hosted media's module (FR-MED-01, FR-MED-02).
+ //
+ // REGISTERED IN `app.module.ts`, WHICH IS A TASK NO REQUIREMENT NAMES. Without that
+ // line the route does not exist and every test in this chapter gets a 404 that reads
+ // as a routing bug. Chapter 4.6 shipped the same omission in the tutorial's manifest
+@@ -41,13 +42,17 @@
+     },
+     {
+       provide: Repository,
+       scope: Scope.REQUEST,
+       inject: ["DB", REQUEST],
+       useFactory: (db: Db, req: RequestWithTenant) =>
+-        new Repository(db, req.principal?.environmentId ?? ""),
++        new Repository(
++          db,
++          req.principal?.environmentId ?? "",
++          actorFrom(req),
++        ),
+     },
+     // A THIRD COPY OF THE SAME FACTORY, AND THE RULE THAT FORCES IT IS WRITTEN IN
+     // `internal.module.ts`: *"a provider is visible to the module that declares it and to
+     // nothing it imports"* — and `InternalModule` has no `exports:` array. `AppModule`
+     // already provides `ANALYTICS_PUBLISHER` for its middleware and `InternalModule` for
+     // the dispatcher; this module needs it for FR-MED-12's storage deltas (4.16).
+```
+
+### `services/api/src/channels/channels.service.ts` — the external id threaded where the `RETURNING` does not carry it.
+
+```diff title="services/api/src/channels/channels.service.ts"
+@@ -168,13 +168,18 @@
+     userExternalId: string,
+     role: ChannelRole,
+   ): Promise<{ external_id: string; role: ChannelRole }> {
+     if (!(await this.repo.channelExists(channelId))) throw this.notFound();
+     const user = await this.repo.getUserByExternalId(userExternalId);
+     if (!user) throw this.notFound();
+-    const outcome = await this.repo.setMemberRole(channelId, user.id, role);
++    const outcome = await this.repo.setMemberRole(
++      channelId,
++      user.id,
++      role,
++      userExternalId,
++    );
+     if (outcome === "not_a_member") throw this.notFound();
+     return { external_id: userExternalId, role };
+   }
+ 
+   /** A user joining a channel themselves (FR-CHN-03).
+    *
+```
+
+### `services/api/src/users/users.service.ts` — the second of the two places that needed it.
+
+```diff title="services/api/src/users/users.service.ts"
+@@ -224,13 +224,13 @@
+    * here — it 404s a user who is already deleted, and deleting twice is the ordinary
+    * outcome of a customer's retry after a timeout. So the row is read without the
+    * liveness filter, and only "no row at all" is a 404. */
+   async deleteUser(externalId: string): Promise<{ external_id: string; deleted: true }> {
+     const user = await this.repo.getUserByExternalId(externalId);
+     if (!user) throw new NotFoundException("user not found");
+-    await this.repo.deleteUser(user.id);
++    await this.repo.deleteUser(user.id, externalId);
+     return { external_id: externalId, deleted: true };
+   }
+ 
+   /** Ban and unban, tenant-wide (FR-031, FR-032).
+    *
+    * BOTH IDEMPOTENT AND BOTH 200. Banning a banned user and unbanning an unbanned one
+```
+
+### `services/api/src/users/users.itest.ts` — call sites the compiler named.
+
+```diff title="services/api/src/users/users.itest.ts"
+@@ -175,19 +175,19 @@
+     );
+     await repo.unarchiveChannel(middle);
+   });
+ 
+   // ── T116b: the role is in the projection ────────────────────────────────────
+   it("returns each channel's role for the user the path names", async () => {
+-    await repo.setMemberRole(newest, member.id, "moderator");
++    await repo.setMemberRole(newest, member.id, "moderator", "lister");
+     const body = (await (await list("lister")).json()) as {
+       data: Array<{ external_id: string; role: string }>;
+     };
+     expect(body.data.find((c) => c.external_id === "newest")?.role).toBe("moderator");
+     expect(body.data.find((c) => c.external_id === "oldest")?.role).toBe("member");
+-    await repo.setMemberRole(newest, member.id, "member");
++    await repo.setMemberRole(newest, member.id, "member", "lister");
+   });
+ 
+   // ── T113: the cursor ────────────────────────────────────────────────────────
+   //
+   // THE TIE IS TESTED IN `repository.itest.ts` AND NOT HERE. Two channels sharing a
+   // `last_activity_at` cannot be produced through the API: `now()` is the
+@@ -1153,13 +1153,13 @@
+     expect((await unban("twice-banned")).status).toBe(200);
+   });
+ 
+   it("answers 404 for a user this tenant does not have, and for a deleted one", async () => {
+     expect((await ban("never-heard-of")).status).toBe(404);
+     const gone = await repo.createUser("ban-then-delete", "Gone");
+-    await repo.deleteUser(gone.id);
++    await repo.deleteUser(gone.id, "ban-then-delete");
+     // A DELETED USER CANNOT BE BANNED, and does not need to be: every route naming them
+     // answers 404 and their session carries no channels. Banning one would be a state
+     // with no observable difference.
+     expect((await ban("ban-then-delete")).status).toBe(404);
+   });
+ 
+```
+
+### `services/api/src/outbox/outbox.itest.ts` — a call site the compiler named.
+
+```diff title="services/api/src/outbox/outbox.itest.ts"
+@@ -641,13 +641,13 @@
+     const removed = (await rowsFor("channel.member_removed")).length;
+ 
+     // `moderator`, not `admin`. `members_role_check` is ('owner','moderator','member')
+     // and `memberships_role_check` — the ORGANISATION one — is ('owner','admin',
+     // 'member'). The schema comment predicts this confusion in as many words and the
+     // first draft of this test made it anyway.
+-    expect(await repo.setMemberRole(channelId, mai.id, "moderator")).toBe("set");
++    expect(await repo.setMemberRole(channelId, mai.id, "moderator", "mai")).toBe("set");
+ 
+     // `membership.changed`'s enum has two members and neither means "role".
+     // A reader who sees add and remove producing events will assume a PATCH does
+     // too; this is where they find out it does not.
+     expect(await rowsFor("channel.member_added")).toHaveLength(added);
+     expect(await rowsFor("channel.member_removed")).toHaveLength(removed);
+```

@@ -972,6 +972,16 @@ export const series: Part[] = [
         sourceDoc: "docs/04-srs.md, docs/05-sad.md, docs/12-part-4-structure.md",
         readerMinutes: 45,
       },
+      {
+        id: "4.18",
+        path: "/part-4/chapter-18/the-log-that-cannot-be-edited",
+        title: "The log that cannot be edited",
+        status: "published",
+        readerProduces:
+          "A table nothing in the application can change, and the decision that makes it worth having. FR-MOD-03 asks for an immutable audit log of every moderation action, and the clause names a population without saying who is in it — so the chapter's product is a classification of all 24 mutating routes a tenant can reach, each with a reason, checked in both directions against the routes a booted application reports. The set comes out at eight where a reader would predict nine, and the rule that produced it is wrong about two routes in the same direction, which is how the line it actually draws gets named: standing, not data. The word `immutable` costs a mechanism this schema had never used — the obvious one, revoking the privilege, does nothing at all against a superuser, and a unit test had forbidden the one that works for a reason that is the exact opposite of this case. Both ways around the trigger are measured and published beside the claim, because a security sentence with no attack against it is a comment",
+        sourceDoc: "docs/04-srs.md, docs/05-sad.md, docs/06-adr-deep-dives.md, docs/12-part-4-structure.md",
+        readerMinutes: 40,
+      },
     ],
   },
   {

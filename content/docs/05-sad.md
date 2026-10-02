@@ -427,15 +427,33 @@ others. This scenario is the clearest illustration of why the outbox/queue spine
 > the message's **author's** token as well as a tenant API key (FR-MOD-02 grants the key
 > deletion of any message; FR-013 of chapter 3.23 grants the author their own).
 >
-> **There is no `audit_log` table**, in §6.1 or anywhere in the schema, so the second
-> `INSERT` in the original diagram wrote to something that does not exist and the
-> paragraph above counts a consumer that is not built. What the deletion records instead
-> is `metadata.deleted_by` on the message row — the actor's KIND, and their external id
-> when there is one — which is FR-MSG-08's "deletion metadata" and not FR-MOD-03's log.
-> The distinction is real and narrow: a single mutable column on the row it describes
-> carries no request id, cannot be appended to, and says nothing about moderation actions
-> that leave no row. FR-MOD-03 is P3 and unbuilt; the boundary is written down in chapter
-> 3.23's `gaps.md` item 2.
+> **There was no `audit_log` table when this diagram was drawn**, so the second `INSERT`
+> in the original wrote to something that did not exist and the paragraph above counted a
+> consumer that was not built. What the deletion recorded instead is `metadata.deleted_by`
+> on the message row — the actor's KIND, and their external id when there is one — which
+> is FR-MSG-08's "deletion metadata" and not FR-MOD-03's log. The distinction is real and
+> narrow: a single mutable column on the row it describes carries no request id, cannot be
+> appended to, and says nothing about moderation actions that leave no row.
+>
+> **Amended again 2026-10-02 (chapter 4.18): the table exists.** `0021_audit_log.sql`
+> creates it and a `BEFORE UPDATE OR DELETE` trigger makes it append-only, and a deletion
+> by an application credential now writes an entry inside the same transaction as the
+> tombstone (ADR-35, §6.1). The sentence above was true of the schema for eight chapters
+> and **the SRS's own §6.1 drew `AuditLogEntry` throughout** — the data model was ahead of
+> the schema and this document recorded only the absence, which is what a reader checking
+> whether the table was intended would have found first.
+>
+> **`metadata.deleted_by` stays and is still not the log.** It is written on the row the
+> deletion changes and the audit entry is written beside it; the paragraph above is the
+> reason both exist rather than one. Note also that `metadata` is not published on any
+> read path — the API answers `metadata: null` — so the fragment was invisible to the
+> tenant whose log it would have been.
+>
+> **And the entry is written only when an application credential deletes.** A user
+> deleting their own message is chapter 3.23's FR-013, not FR-MOD-02, and a compliance log
+> that recorded it would fill with ordinary user activity: `DELETE
+> /v1/channels/:channelId/messages/:messageId` is the one route in the moderation set
+> whose classification the credential decides.
 >
 > **And the deletion is idempotent** (FR-009 of chapter 3.23): the second DELETE answers
 > 204, changes nothing — `deleted_at` in particular does not move — and emits no second
@@ -587,7 +605,59 @@ CREATE TABLE media_objects (
 CREATE INDEX media_unreferenced
     ON media_objects (created_at)
     WHERE status = 'pending';                               -- the 24 h reaper's scan (FR-MED-10)
+
+-- FR-MOD-03 (chapter 4.18, ADR-35). The SRS's §6.1 has drawn `AuditLogEntry` since before
+-- Part 4; this is the table.
+CREATE TABLE audit_log (
+    id              UUID PRIMARY KEY,
+    environment_id  UUID NOT NULL REFERENCES environments(id),   -- no ON DELETE: the
+                                                                 -- convention, and it
+                                                                 -- refuses to orphan
+    occurred_at     TIMESTAMPTZ(3) NOT NULL,                     -- (3) decides whether the
+                                                                 -- cursor loses rows
+    actor_kind      TEXT NOT NULL CHECK (actor_kind IN ('application','user','platform')),
+    actor_id        TEXT,                                        -- NULL for a platform
+                                                                 -- principal: no tenant,
+                                                                 -- no readable identifier
+    action          TEXT NOT NULL,                               -- `METHOD /path`, the
+                                                                 -- route's own key
+    target_kind     TEXT NOT NULL
+                    CHECK (target_kind IN ('user','message','membership','channel')),
+    target_id       TEXT NOT NULL,                               -- what a CUSTOMER calls it
+    request_id      UUID NOT NULL                                -- the join to the request log
+);
+CREATE INDEX audit_log_read_idx
+    ON audit_log (environment_id, occurred_at DESC, id DESC);    -- the read's only path;
+                                                                 -- `id` is the cursor's
+                                                                 -- tiebreaker and is not
+                                                                 -- optional
+
+-- WHAT MAKES IT IMMUTABLE, AND WHAT THAT DOES NOT COVER. `REVOKE UPDATE, DELETE` was
+-- measured inert: the api connects as a superuser. The trigger fires for one.
+CREATE FUNCTION audit_log_refuse_write() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'audit entries are append-only (FR-MOD-03)'
+      USING ERRCODE = 'restrict_violation';
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER audit_log_append_only
+    BEFORE UPDATE OR DELETE ON audit_log
+    FOR EACH ROW EXECUTE FUNCTION audit_log_refuse_write();
 ```
+
+**What the trigger enforces, and what it does not (ADR-35).** It refuses `UPDATE` and `DELETE`
+from the application and from accident, including from a superuser, which is the whole reason it
+is a trigger rather than a grant. It does **not** survive `SET session_replication_role =
+replica`, which is one statement and disables every trigger in the session, nor `DROP TRIGGER`.
+Both were measured. So the log is immutable to the application and not to somebody holding the
+database password — and **NFR-SEC-10 asks for an immutable trail for exactly that actor**, so
+that clause is not satisfied by this table. A separate, non-superuser role for the application
+is the one change that would move both; it is ADR-35's reversal condition.
+
+**And nothing prunes it.** FR-MOD-03 says one year; this platform has no scheduler (ADR-28), so
+the retention is unmet by decision and the read publishes no `retention_edge` — announcing a
+boundary nothing enforces is worse than announcing none.
 
 **Hot-path indexes:** history pagination (FR-MSG-09) is a pure index-order scan over
 `(channel_id, sequence)` — the composite index's leftmost-prefix behaviour is exactly what
@@ -2223,6 +2293,43 @@ this dependency.
 | R7 | **Single-language monoculture** (ADR-01) | CPU-bound hot spots have no escape hatch in-language | Isolate HMAC/crypto behind an interface; a Rust/Go sidecar is a contained swap if profiling demands it |
 | R8 | **Customer-hosted emoji images** — Relay serves URLs it does not control (FR-EMJ design note 1) | Broken/slow images degrade perceived quality; malicious URL swaps after moderation review alter a record's *appearance* (though never its text) | Document CDN/caching responsibility; resolution map is versioned so Priya's tooling can pin the resolution seen at review time; revisit trigger: emoji images may now optionally use hosted media (ADR-13), which removes this class entirely for customers who opt in |
 | R9 | **Hosted media liability surface** — Relay now stores user-uploaded bytes: illegal content, scanner misses, storage-cost runaway | Legal exposure; cost growth decoupled from message volume | Mandatory scan gate (ADR-14) with audit trail; per-kind size caps + per-tenant storage quotas and spend caps (FR-MED-02, FR-RTL-06); DR-17 inventory reconciliation catches metering drift; abuse-report takedown path rides the existing moderation API (FR-MOD-02 + FR-MED-10's unlink-and-reap) |
+
+### ADR-35 — The audit log is operational, its immutability is a trigger, and its timestamp is declared
+
+FR-MOD-03 hides three decisions in one sentence, and none is the obvious one. The full
+argument, with its measurements and its reversal condition, is in `docs/06-adr-deep-dives.md`.
+
+**Postgres, not ClickHouse, and ADR-26 is the same driver running the other way.** FR-005 of feature 064
+requires the entry to commit with the action, and the action is a Postgres transaction.
+ADR-26's rejected option D was *"mirror the log into Postgres and serve it from there"* — right
+to reject for the request log, whose rows were already in ClickHouse, and the audit log's rows
+are already in Postgres. Serve the log from the store that already holds it selects a different
+store each time. Measured: with `nats` and `clickhouse` stopped, a ban and an unban both commit
+and both leave an entry.
+
+**A trigger, because `REVOKE` was measured inert.** The api connects as `relay` and `relay` is a
+superuser, so `REVOKE UPDATE, DELETE` changes nothing — the grant would be in the migration and
+the table would be mutable, with nothing in the schema looking wrong. A `BEFORE UPDATE OR
+DELETE` trigger fires for a superuser and refuses both verbs. Row-level security answers a
+different question and a superuser bypasses it too; hash-chaining detects rather than prevents.
+
+**And the trigger was forbidden by a test whose rule was wider than its reason.**
+`no-trigger-in-migrations.test.ts` asserts no migration creates one, scoped in its own comment
+to the test-database sentinel guard — a trigger that rejects the api's own sweeps. This one
+refuses writes the api must never make. Narrowed to the guard by name, with the narrowing
+asserted.
+
+**`occurred_at timestamptz(3)`**, because this is the platform's first keyset cursor over a
+Postgres timestamp: the column defaults to microseconds and `toIso` emits milliseconds, so an
+undeclared column loses every row inside the lost fraction at each page boundary. Unfixable once
+entries exist.
+
+**The claim is scoped and the chapter publishes the scope.** `SET session_replication_role =
+replica` and `DROP TRIGGER` both succeed, both measured. The log is immutable to the application
+and to accident, not to somebody holding the database password — and **NFR-SEC-10 wants an
+immutable trail for exactly that actor**, so the two clauses are different artifacts and only
+one of them ships here. The reversal condition is the single change that would move both: a
+separate, non-superuser role for the application.
 
 ---
 
