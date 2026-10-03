@@ -1,0 +1,388 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import {
+  figTwoOfThree,
+  figTwoWriters,
+  figThreeSurfaces,
+  figTheBoundary,
+} from "./figures";
+
+export const metadata = {
+  title: "Everything, including what was deleted — Building Relay",
+  description:
+    "FR-MOD-01 wants a channel's complete history, tombstones and edit history included. Both of those are already built. Their composition loses exactly one text per deletion, every time, and nothing in the platform records that it did.",
+  alternates: {
+    canonical: "/part-4/chapter-19/everything-including-what-was-deleted",
+    languages: {
+      en: "/part-4/chapter-19/everything-including-what-was-deleted",
+      vi: "/vi/part-4/chapter-19/everything-including-what-was-deleted",
+    },
+  },
+};
+
+<ChapterHeader id="4.19" />
+
+Send a message. Edit it twice. Delete it with the tenant's API key — the way a support
+tool would. Then ask the platform what it said.
+
+```bash
+curl -sX POST  -H "authorization: Bearer $TOKEN" "$API/v1/channels/$CH/messages" \
+  -d '{"text":"will be edited"}'
+curl -sX PATCH -H "authorization: Bearer $TOKEN" "$API/v1/channels/$CH/messages/$M" \
+  -d '{"text":"edited once"}'
+curl -sX PATCH -H "authorization: Bearer $TOKEN" "$API/v1/channels/$CH/messages/$M" \
+  -d '{"text":"edited twice"}'
+curl -sX DELETE -H "authorization: Bearer $KEY" "$API/v1/channels/$CH/messages/$M"
+curl -s -H "authorization: Bearer $KEY" "$API/v1/channels/$CH/messages/$M/edits"
+```
+
+```json
+{
+  "edits": [
+    { "prior_text": "will be edited", "edited_at": "2026-10-03T09:05:05.634Z" },
+    { "prior_text": "edited once",    "edited_at": "2026-10-03T09:05:05.648Z" }
+  ]
+}
+```
+
+Three texts existed. Two come back. The one that is missing is `"edited twice"` — the
+text that was on screen at the moment the moderator decided to remove it, which is the
+only one anybody is ever going to ask about.
+
+<Figure code={figTwoOfThree} caption="Three texts existed and two come back, because an edit records the text it replaced and a deletion recorded nothing." />
+
+Your journey map has been describing this moment since before any of this was built.
+Journey 3, stage 3, the one marked with a star: *"The driver says the address never
+arrived. Three possibilities: it was never sent, it was sent and deleted, or it was sent
+and edited afterwards. A history model that cannot distinguish these three is useless for
+her purpose."* And then, as the thing that settles the dispute: *"The dispatcher edited
+the address message eleven minutes after sending it. That's the whole case."*
+
+There is a fourth possibility that stage does not list, and it is the one this chapter is
+about. **Sent, edited, and then deleted.** If the dispatcher's corrected address was
+removed before Priya went looking, the text her whole case turns on is gone — and the
+platform will hand her two earlier versions with no indication that a third ever existed.
+
+## Run the premise before you write the chapter
+
+`docs/12`'s row for this chapter carries a warning attached to it: *check the premise
+first — FR-MOD-01 and FR-MOD-02 are P2, and chapter 3.23 built edit history and
+tombstones; some of this chapter may already exist.*
+
+It does. Run it and you find:
+
+```text
+FR-MOD-02 — a tenant key deletes another author's message       204
+FR-MOD-01 — history returns tombstones, in place, text: null    200
+FR-MOD-01 — GET …/messages/{id}/edits returns prior texts       200
+             the same route with a user token                    403
+```
+
+Four of FR-MOD-01's five obligations are already met, and FR-MOD-02 needs no work at all.
+A feature list would have had you building a moderation history API for a week. The
+premise check turns a twenty-two-chapter row into a one-gap chapter — and the gap is
+invisible from either of the clause's two nouns on its own. Tombstones work. Edit history
+works. **Their composition loses exactly one version per deletion.**
+
+This is what a premise check is for, and it is the reason the warning was written into
+the structure document two months before anybody read it.
+
+## Why the deletion wrote nothing
+
+Open the schema and the answer is sitting in a comment.
+
+```text
+// FR-MSG-07: what the message said before this edit. NOT NULL, and that
+// has a consequence the chapter meets rather than works around: a deletion
+// writes no row here, because a tombstone has no text to preserve.
+```
+
+Read that sentence twice. *A tombstone has no text to preserve* is **true of the row after
+the deletion** and **false at the moment before it**. Inside `deleteMessage`, three lines
+above the statement that sets `text = NULL`, the method is holding the text it is about to
+destroy. It had it the whole time.
+
+<Trap title="A comment that explains an absence as a necessity">
+
+The behaviour was described correctly and the reason given was not the reason. That is the
+most expensive kind of comment to get wrong, because it answers the question before anybody
+asks it. Four chapters read past this gap. Each of them was working on something adjacent —
+tombstones, revisions, the audit log — and each of them had this sentence in front of them
+saying, in effect, *there is nothing to do here.*
+
+A comment that says **why something is absent** deserves the same scrutiny as a comment that
+says why something is present. The test is mechanical: *is this reason true at the moment the
+code runs, or only afterwards?* Here the answer was *only afterwards*, and one line of code
+was all the gap ever was.
+
+</Trap>
+
+## One row, in the table that already exists
+
+The fix is an insert. A deletion writes a version row like an edit does, carrying the text
+the message held, and the table gains a column saying which of the two happened.
+
+```text
+ALTER TABLE message_edits ADD COLUMN ended_by text;
+UPDATE message_edits SET ended_by = 'edit';
+ALTER TABLE message_edits ALTER COLUMN ended_by SET NOT NULL;
+ALTER TABLE message_edits
+  ADD CONSTRAINT message_edits_ended_by_check CHECK (ended_by IN ('edit', 'deletion'));
+```
+
+Three statements before the constraint, and the order is the whole of it: `ADD COLUMN …
+NOT NULL` with no default fails on a table that already holds rows, and this one held
+4,863. Every existing row is an edit by construction rather than by assumption — until
+this chapter the only writer was `editMessage` — so the backfill is exact.
+
+**Two values, and no default.** A default would let a writer stay silent, and the one rule
+this column exists for is that a row cannot be silent about which happened. There is no
+third value because a message's text stops being current for exactly two reasons on this
+platform. Retention and erasure are the candidates for a third and both *destroy* the row
+rather than ending a version, so neither produces one.
+
+<Figure code={figTwoWriters} caption="One table, one writer before and two after — and the second one is why the table also had to stop being rewritable." />
+
+<Why clause="FR-MSG-08" title="The clause this was already breaking">
+
+It is tempting to write a new requirement for this. You do not need one.
+
+FR-MSG-08 says: *"Deleting a message shall replace its content with a tombstone retaining
+sequence number, author, timestamps, and deletion metadata. **Hard deletion shall occur
+only via the compliance deletion endpoint.**"*
+
+Losing the final text at a moderation delete **is** a hard deletion — of one version,
+performed by the moderation path, which that sentence reserves for erasure. The clause
+needed no amendment. It had been describing a rule the platform was quietly breaking for
+twenty-five chapters, and the chapter's job was to stop breaking it.
+
+This is worth noticing as a habit. When you find a gap, read the clauses you already have
+before you write a new one. A requirement that already forbids the thing is stronger
+evidence than a requirement you wrote this morning to describe what you were about to
+build.
+
+</Why>
+
+## And a recovered text you can rewrite is not an answer
+
+FR-MSG-07 has said this since chapter 3.23: *"recording an **immutable** edit history with
+timestamps."* Check whether that word means anything.
+
+```text
+relay=> update message_edits set prior_text = 'tampered' where message_id = '…';
+UPDATE 1
+relay=> delete from message_edits where message_id = '…';
+DELETE 1
+```
+
+Both succeed. The word was a description, not a mechanism, for six chapters — while
+`audit_log`, which holds the same kind of evidence, had carried a guard since the chapter
+before this one.
+
+The obvious fix does nothing. `REVOKE UPDATE, DELETE ON message_edits FROM relay` is inert,
+because the api connects as a superuser and a superuser is not subject to table privileges.
+The grant would sit in the migration, the word would be in three documents, and the table
+would stay as mutable as it is now. A `BEFORE UPDATE OR DELETE` trigger does fire for a
+superuser, so that is the mechanism — the same one ADR-35 chose for the audit log, applied
+to a second table.
+
+<Why clause="FR-MSG-07, ADR-35" title="Immutable, and to whom">
+
+The scope is published with the claim, because a security sentence with no attack against
+it is a comment. Both ways around this trigger were measured on this table rather than
+assumed to carry over from the last one:
+
+```text
+set session_replication_role = replica;
+update message_edits set prior_text = 'x' …   -->  UPDATE 1   the trigger did not fire
+drop trigger message_edits_append_only …;
+delete from message_edits …                   -->  DELETE 1   the row is gone
+```
+
+So the honest claim is: **the edit history is immutable to the application and to
+accident, and it is not immutable to somebody holding the database password.** This api
+holds that password. ADR-35's reversal condition — a separate non-superuser role for the
+application — is a deployment decision rather than a chapter, and it would strengthen this
+claim and NFR-SEC-10's at the same time.
+
+</Why>
+
+## The test that cost more than the feature
+
+Here is the part worth the chapter. Adding the insert took one statement. Running the
+existing test suite afterwards turned up something that had been true since chapter 3.23.
+
+A suite from the revisions chapter fires a concurrent edit and deletion of one message from
+two separate connection pools, ten times, and asserts that whichever lands first, the
+message ends a tombstone. It failed on attempt one.
+
+```text
+23505  message_edits_message_id_edited_at_pk
+Key (message_id, edited_at)=(6254a80e-…, 2026-10-03 11:10:28.806+00) already exists.
+```
+
+The deletion's whole transaction rolled back. A message that a moderator deleted was left
+**not deleted**, because a user happened to be editing it at the same instant.
+
+Look at the timestamp: `.806+00`. The column is `timestamptz` at precision 6 — microseconds
+— and `now()` in Postgres returns `…450807+00`. So why is the colliding value a round
+millisecond? Ask the table:
+
+```text
+relay=> select count(*) from message_edits
+relay->  where date_part('microsecond', edited_at)::int % 1000 = 0;
+ 5149
+relay=> select count(*) from message_edits;
+ 5149
+```
+
+**Every row.** Every value ever written to that column arrived through the driver as a
+JavaScript `Date`, which holds milliseconds, so a microsecond column has only ever stored
+millisecond-truncated instants. The primary key's collision window has been **a thousand
+times wider** than the schema's own comment claimed — *"Postgres holds microseconds, so
+that needs two edits inside one microsecond on one message"* — for as long as the table has
+existed.
+
+Nobody hit it, because one writer cannot race itself in any realistic way. This chapter
+added a second writer, and the second writer races the first by design: an edit and a
+deletion of the same message are exactly the two things a moderator and an author do at the
+same moment.
+
+The repair is one expression — the deletion writes `now()` in SQL rather than the `Date`
+the driver handed back. Both are the same instant, because `now()` is the transaction
+timestamp and is stable across the transaction, so the version row and the tombstone still
+quote one value. The SQL form keeps the microseconds. Eighty races afterwards, no failures.
+
+The edit path still writes a `Date`, so two concurrent edits inside one millisecond would
+still collide. That is pre-existing, it is out of this chapter's scope, and it is written
+down rather than fixed in passing — changing the clock on the platform's busiest write path
+deserves its own measurement rather than a drive-by.
+
+## When it was removed, and the surface that was missing it
+
+The second half of the chapter is one field. A client that was offline when a message was
+removed, and catches up by reading history, learns that the message is gone and not when.
+
+<Figure code={figThreeSurfaces} caption="Three things describe one removal and two of them carried the instant. The DELETE itself carries nothing at all — it answers 204 with an empty body." />
+
+The real-time `message.deleted` frame has carried `deleted_at` since chapter 3.23, and so
+has the webhook built from the outbox row — both read it off the same `RETURNING` inside
+the deletion's transaction. The REST history row did not. So the field goes on the history
+row, equal to the instant the other two publish, and a reader catching up has the same
+facts as a reader who was connected.
+
+**Where you put that field matters more than whether you add it**, and getting it wrong
+cost three red tests. The obvious home is `MessageRow`, the interface every message-shaped
+read returns — and making it required there is the right instinct, because a required field
+is how the compiler names every construction site instead of leaving you a convention to
+remember.
+
+It is also what the *send* path returns. One seam over, a strict schema parses that
+response:
+
+```text
+ZodError: unrecognized_keys  keys: ["deleted_at"]
+```
+
+The field belongs on `MessageWithSender` — what the read paths return — and not on
+`MessageRow`. The contract had said so all along: `deleted_at` is added to
+`GET /v1/channels/{id}/messages`, and nothing in it mentions the send response.
+
+<Trap title="An argument that is right about the producer can invert about the reader">
+
+This platform has now paid for the same mistake three times, in three chapters, and each
+time the argument that caused it was correct.
+
+*Required is what makes the compiler name every construction site.* True — and true only
+about code that **writes** the shape. A reader of the same shape gains nothing from the
+requirement and may be broken by it: a durable queue's consumer cannot require a field the
+previous binary never wrote, and a strict response schema rejects a field the producer
+suddenly started sending.
+
+The tell is to ask, of every type you are about to tighten, **who parses this?** Not who
+builds it. The repository file even names the schema that breaks, in the comment arguing for
+the optional field right beside this one — and it was read as *required is better* rather
+than as *here is the reader that breaks.*
+
+</Trap>
+
+## A moderator removes a message; erasure destroys it
+
+A reader who gets this far will notice something uncomfortable: a deleted message's text is
+still in your database. It is worth saying plainly rather than letting somebody discover it.
+
+**These are two different operations and only one of them is about the words.** A
+moderator removing a message is taking it off the screen — the tombstone keeps the
+sequence, the author, the timestamps, and now the text, because the whole point of a
+moderation action is that somebody can later ask what was moderated and why. Compliance
+erasure is the operation that destroys a person's words, and it is a different clause
+(FR-MOD-04), a different endpoint, and a different chapter.
+
+If you collapse them, you get a moderation log that cannot answer the question it exists
+for, or an erasure that leaves the data it was asked to remove. Keeping them apart is why
+FR-MSG-08's last sentence reserves hard deletion for one specific endpoint.
+
+**And this chapter makes erasure's job harder, which is worth handing forward honestly.**
+A version row references its message, that foreign key is `NO ACTION`, and so a message with
+version rows refuses a hard delete *before any trigger is consulted*. Before this chapter
+only edited messages had one; now every deleted message does. On our lane that is 4,565
+messages today, growing by one per deletion.
+
+<ForwardRef chapter="4.22">
+Erasure meets two obstacles here and the foreign key is the first — the append-only trigger
+is the second. The audit log has only the second, because its foreign key points at
+environments and nothing deletes those. Three of this feature's own documents said the
+collision was "exactly as the audit log does" until somebody ran the delete and read the
+error.
+</ForwardRef>
+
+## The boundary, as two numbers
+
+The last thing this chapter produces is a count, and the reason it is two numbers rather
+than one is the most useful sentence in it.
+
+<Figure code={figTheBoundary} caption="Of 5,060 tombstones that predate the chapter, 1,298 keep their earlier texts — which is what makes them harder to reason about than the 3,762 that keep nothing." />
+
+Nothing recovers the 5,060. A deletion before this chapter destroyed the text, the backfill
+writes `ended_by = 'edit'` on rows that already existed and invents nothing, and no
+migration can conjure a value that was never stored.
+
+**The 1,298 are the ones to worry about.** A tombstone with version rows *looks served*:
+ask for its history and texts come back, several of them, with timestamps. The text the
+dispute turns on is not among them, and nothing in the response says so. The 3,762 with no
+versions at all are honest by comparison — they return an empty list and you know
+immediately that you have nothing.
+
+Publishing only the 3,762 would have understated the boundary by a quarter. This feature's
+own specification made exactly that mistake and carried it through five analysis passes
+before somebody re-derived the figures from the table.
+
+## What this chapter did not do
+
+- **It recovers nothing retroactively.** Said twice on purpose.
+- **It does not say who ended a version.** That is the audit log's (chapter 4.18), and the
+  two are deliberately not joined: an entry exists only for an application credential's
+  deletion, so a joined shape would be null for most rows and read as missing data.
+- **It does not record what was attached.** FR-MED-10 unlinks a tombstone's attachments
+  and versions hold text. A deleted photo is not recoverable.
+- **It does not bound the list.** Nothing bounds how many times a message may be edited, so
+  nothing bounds how many versions it has. The worst case on our lane is three. A page
+  bound is a second contract change and the question has been open on this route since
+  3.23.
+- **It does not expire any of it.** Retention and erasure both remove this data and
+  **neither is built** — the same absent scheduler bounds both, which is now the third
+  clause in this platform limited by it.
+
+<Checkpoint>
+A message edited twice and then deleted returns three texts, the last marked
+`ended_by: "deletion"`. A message deleted with no edits returns one, where it returned
+none. An attempt to rewrite any of them is refused by the database, and the refusal's scope
+is published beside the claim. A tombstone's history row says when it was removed. And the
+number of messages whose final text can never be recovered is written down, in two parts,
+because one of them would have been misleading.
+</Checkpoint>
+
+<SkipAhead tag="part4-ch19" />
+
+<ChapterFooter id="4.19" />

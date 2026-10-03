@@ -982,6 +982,16 @@ export const series: Part[] = [
         sourceDoc: "docs/04-srs.md, docs/05-sad.md, docs/06-adr-deep-dives.md, docs/12-part-4-structure.md",
         readerMinutes: 40,
       },
+      {
+        id: "4.19",
+        path: "/part-4/chapter-19/everything-including-what-was-deleted",
+        title: "Everything, including what was deleted",
+        status: "published",
+        readerProduces:
+          "The text a message held at the moment somebody removed it \u2014 which this platform threw away, every time, for twenty-five chapters. FR-MOD-01 asks for a channel's complete history including tombstones and edit history, and both of those nouns were already built: the chapter opens by running the premise and finding four of the clause's five obligations met. The hole is at the join. An edit records the text it REPLACED and a deletion recorded nothing, so a message edited twice and then deleted gives back two of its three texts and a message deleted with no edits gives back none of its one, and nothing anywhere notices. You will build the row that closes it, make the table append-only because FR-MSG-07 has said `immutable` since chapter 3.23 and nothing enforced it, and publish the boundary as two numbers rather than one \u2014 because a tombstone that kept its earlier texts looks served and is missing the only text a dispute turns on. Two findings cost more than the feature did: a microsecond column that has only ever held milliseconds, and a required field that reached a strict schema one seam away",
+        sourceDoc: "docs/04-srs.md, docs/05-sad.md, docs/06-adr-deep-dives.md, docs/12-part-4-structure.md",
+        readerMinutes: 35,
+      },
     ],
   },
   {

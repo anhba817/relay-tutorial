@@ -16042,3 +16042,432 @@ fence chain publishes.
      swc.vite({
        module: { type: "es6" },
 ```
+
+## Chapter 4.19 — everything, including what was deleted
+
+Five files, eleven hunks, all at `-U6` with every pre-image verified to match exactly
+once in the chain's own replay before any of this was pasted. They are here rather than
+in the chapter because every one of these files is published by pages chapter 4.19 does
+not own — `repository.ts` by 52, `schema.ts` by 34, `messages.itest.ts` and
+`messages.controller.ts` by 18 each — and one rule for five files beats a judgement per
+file.
+
+**Placed last**, after every other amendment in this appendix, because the appendix
+applies after every chapter and a hunk anchored on a state an earlier amendment changes
+is a broken chain even when the hunk itself is right.
+
+```diff title="services/api/src/db/schema.ts"
+@@ -439,18 +439,36 @@
+ // first draft of this chapter's data model gave the table a surrogate
+ // `id UUID PRIMARY KEY` and stated that it was quoting the SAD. It was not.
+ // Three columns and a composite key:
+ //
+ //     PRIMARY KEY (message_id, edited_at)
+ //
+-// The key is a constraint with a cost the SAD does not spell out: two edits to
++// The key is a constraint with a cost the SAD does not spell out: two writes to
+ // one message at the same timestamp collide rather than both being kept.
+-// Postgres holds microseconds, so that needs two edits inside one microsecond
+-// on one message. A surrogate id would take both rows and leave a history with
+-// two entries claiming the same instant, which is a silent wrong answer where
+-// this is a loud refusal. The published constraint stands (Constitution VII).
++//
++// THE WINDOW IS A MILLISECOND, NOT A MICROSECOND, and this comment said the
++// latter until chapter 4.19 measured it. The column is `timestamptz` at
++// precision 6 and `now()` does produce microseconds — but every value ever
++// written here arrives through the driver as a JavaScript `Date`, which holds
++// milliseconds, so the stored instant is always truncated. The table says so:
++// **5,149 of 5,149 rows land exactly on a millisecond boundary.** The collision
++// window was a thousand times wider than the sentence claimed, for as long as
++// this table has existed.
++//
++// It became reachable when 4.19 gave the table a second writer: a concurrent
++// edit and deletion of one message collided on attempt 1 of 10 in
++// `repository.itest.ts`'s race, and the deletion's transaction rolled back —
++// leaving the message un-tombstoned, which is FR-007's property. The deletion
++// path writes `sql`now()`` for that reason and keeps full precision. **The edit
++// path still writes a `Date`**, so two concurrent edits of one message inside
++// one millisecond would still collide; that is pre-existing, out of this
++// chapter's scope under FR-008, and recorded in its `gaps.md`.
++//
++// A surrogate id would take both rows and leave a history with two entries
++// claiming the same instant, which is a silent wrong answer where this is a
++// loud refusal. The published constraint stands (Constitution VII).
+ //
+ // APPEND ONLY (FR-004). Nothing updates or deletes a row here. A
+ // second edit appends a second row; the current text lives on `messages`.
+ //
+ // NO `environment_id`, exactly like `messages` above. The tenant is reached
+ // through `message_id -> messages -> channels`, which is how every read below
+@@ -459,18 +477,36 @@
+   "message_edits",
+   {
+     messageId: uuid("message_id")
+       .notNull()
+       .references(() => messages.id),
+     editedAt: timestamp("edited_at", { withTimezone: true }).notNull(),
+-    // FR-MSG-07: what the message said before this edit. NOT NULL, and that
+-    // has a consequence the chapter meets rather than works around: a deletion
+-    // writes no row here, because a tombstone has no text to preserve. FR-010
+-    // refuses an edit on a tombstone instead of defining what its history
+-    // would say.
++    // FR-MSG-07: what the message said before this edit. NOT NULL.
++    //
++    // THIS COMMENT USED TO EXPLAIN AN ABSENCE AS A NECESSITY, and four chapters
++    // read past the gap because of it. It said: "a deletion writes no row here,
++    // because a tombstone has no text to preserve". That is true of the row
++    // AFTER the deletion and false at the moment before it — `deleteMessage`
++    // holds the text it is about to destroy. The sentence described the
++    // behaviour correctly and gave a reason that was not the reason, which is
++    // the most expensive kind of comment to get wrong.
++    //
++    // Chapter 4.19 writes a row here on deletion too, carrying that last text.
+     priorText: text("prior_text").notNull(),
++    // WHY THIS VERSION STOPPED BEING CURRENT (chapter 4.19) — `'edit'` or
++    // `'deletion'`, bounded by `message_edits_ended_by_check` in `0022`.
++    //
++    // REQUIRED, so the compiler names both insert sites. There are two: the
++    // edit path's, which has been here since 3.23, and the deletion's, which is
++    // this chapter's. The count was read rather than grepped (T014a) — the
++    // grep's estimate was three times too large.
++    //
++    // No default, because a default lets a writer stay silent and the one rule
++    // this column exists for is that a row cannot be silent about which
++    // happened.
++    endedBy: text("ended_by").notNull(),
+   },
+   (t) => [primaryKey({ columns: [t.messageId, t.editedAt] })],
+ );
+ 
+ // DECISION (chapter 2.1): the docs/07 row and SAD §6.3's hot-path index
+ // both reference a members table that §6.1 never defines. This shape is
+```
+
+```diff title="services/api/src/db/repository.ts"
+@@ -2689,12 +2689,35 @@
+  * honest reasons: the column has been nullable since 2.1 (system messages
+  * have no author), and every row written through the socket before 2.6's
+  * fix has no author recorded. A caller that needs to build a wire frame
+  * has to decide what to do with those; the layer does not decide for it. */
+ export interface MessageWithSender extends MessageRow {
+   user: string | null;
++  /** When it was removed, or `null` (chapter 4.19, FR-007).
++   *
++   * **REQUIRED AND NULLABLE, UNLIKE `edited_at?` DIRECTLY ABOVE**, and the contrast is
++   * the decision rather than an inconsistency. Three precedents were read before it was
++   * taken. `edited_at?` is optional for write-path convenience — which its own comment
++   * calls "exactly what made the attachments chapter's `internalSendResponseSchema` a
++   * break waiting to happen". The USER row's `deleted_at: string | null` is required and
++   * nullable, and its comment is this argument already written down: *"selected here
++   * rather than filtered in the query so a caller can tell the two apart: a repository
++   * that hid deleted rows would make the marker unobservable and the deletion
++   * untestable."* And `text: string | null` on this very interface is the same shape for
++   * the same class of value — null on most rows, load-bearing when it is not.
++   *
++   * The bill was counted before it was chosen: FIVE construction sites, read rather than
++   * grepped, four of which must now spell `deleted_at: null`. A grep over the type's name
++   * said fourteen and that figure was three times too large.
++   *
++   * WHY A CLIENT NEEDS IT. Three things describe one removal — the real-time
++   * `message.deleted` frame, the webhook built from the outbox row, and this. The first
++   * two carry the instant and history did not, so a client that was offline when the
++   * message went learned that it is gone and not when. (The `DELETE` itself answers 204
++   * with an empty body and carries nothing at all.) */
++  deleted_at: string | null;
+ }
+ 
+ /** Thrown when a channel id resolves to nothing IN THIS TENANT — which,
+  * from the caller's side, is indistinguishable from "does not exist"
+  * (FR-TEN-05: no data, and no reveal that the foreign id exists). The
+  * layer stays framework-free; the service turns this into the wire's
+@@ -5384,12 +5407,17 @@
+       // is the right answer to a state this table cannot represent — SAD §6.1 published
+       // the key and `baseline.txt` records what it costs.
+       await tx.insert(messageEdits).values({
+         messageId,
+         editedAt,
+         priorText: row.text,
++        // CHAPTER 4.19. This row's text stopped being current because a later edit
++        // replaced it — which was the only way a row got here until this chapter, and
++        // is now one of two. The backfill in `0022` wrote `'edit'` on all 4,863
++        // existing rows for the same reason.
++        endedBy: "edit",
+       });
+ 
+       // THE EVENT COMMITS WITH THE EDIT (FR-019, ADR-06). Same argument
+       // as the send path's and the deletion's: publishing after the commit leaves a
+       // window where the row changed and the event never existed, silently, with
+       // nothing to reconcile against.
+@@ -5606,12 +5634,67 @@
+         .where(eq(messages.id, messageId))
+         .returning({ deletedAt: messages.deletedAt });
+       // Read back rather than recomputed: the row carries the instant the database
+       // assigned, and the event and the frame must both quote that one.
+       const deletedAt = toIso(updated!.deletedAt!);
+ 
++      // CHAPTER 4.19, FR-001. THE TEXT THE MESSAGE HELD WHEN IT WAS REMOVED.
++      //
++      // Until this line a deletion wrote nothing here, so a message deleted after N
++      // edits left N recoverable texts out of the N+1 that existed and a message
++      // deleted with no edits left zero of one. FR-MOD-01 asks for a complete history
++      // and FR-MSG-08 reserves hard deletion for the compliance endpoint; losing the
++      // last version at a moderation delete was a hard deletion on the wrong path.
++      //
++      // ON THIS BRANCH ONLY, which is FR-004 and the same half of FR-009 the event
++      // insert below turns on: a repeated deletion returned above without writing, so
++      // it records no second final version. The count is what proves it — three rows
++      // after the first delete and three after the second, not a delta of zero, which
++      // nothing happening also satisfies.
++      //
++      // THE INSTANT IS THE ROW'S, NOT A SECOND READING. `updated!.deletedAt!` is the
++      // value the database assigned and the `.returning()` handed back, and the
++      // tombstone, the frame, the outbox event and this row therefore all quote one
++      // timestamp. `editMessage` states the same rule 280 lines up and gives the
++      // reason: the history row's own primary key is `(message_id, edited_at)`, so a
++      // caller matching an entry to the message state that produced it needs the two
++      // to be equal. A fresh `now()` here would be a different microsecond and the
++      // match would fail silently.
++      //
++      // `row.text` IS NARROWED TO A STRING by the early return above — the branch that
++      // sends an already-deleted message back tests `row.text === null` — so
++      // `prior_text NOT NULL` is never offered a null, including for the system
++      // messages with no text that `deleteMessage`'s own comment contemplates.
++      // `sql`now()`` AND NOT `updated!.deletedAt!`, AND A TEST FOUND THE DIFFERENCE.
++      //
++      // Both express the same instant — `now()` is `transaction_timestamp()` and is
++      // stable across this transaction, so this row and the tombstone's `deleted_at`
++      // are the same value by construction. What differs is PRECISION. The column is
++      // `timestamptz` at precision 6 and the value that came back through the driver
++      // is a JavaScript `Date`, which holds MILLISECONDS — so writing it back
++      // truncates, and the primary key `(message_id, edited_at)` gets a collision
++      // window a thousand times wider than the column can represent.
++      //
++      // Measured: `repository.itest.ts`'s concurrent edit-and-deletion race failed on
++      // attempt 1 of 10 with `23505 … Key (message_id, edited_at)=(…, 11:10:28.806+00)
++      // already exists`, and the deletion's whole transaction rolled back — the
++      // message was left un-tombstoned by a concurrent edit, which is FR-007's
++      // property broken by this chapter's own insert.
++      //
++      // AND THE TABLE SAYS HOW LONG THAT HAS BEEN TRUE OF THE EDIT PATH: 5,149 of
++      // 5,149 existing rows are millisecond-exact on a microsecond column, because
++      // every value ever written here came from JavaScript. `schema.ts` claimed the
++      // key needed "two edits inside one microsecond"; it needed two inside one
++      // millisecond, and that comment is corrected.
++      await tx.insert(messageEdits).values({
++        messageId,
++        editedAt: sql`now()`,
++        priorText: row.text,
++        endedBy: "deletion",
++      });
++
+       // FEATURE 044, FR-002/FR-003. A DELETION IS A REVISION and raises the count exactly as
+       // an edit does — US1's third acceptance scenario fails if only edits are counted. Same
+       // transaction, same argument as the edit path.
+       await tx
+         .update(channels)
+         .set({ revisionSequence: sql`${channels.revisionSequence} + 1` })
+@@ -5693,32 +5776,54 @@
+    * `asc(editedAt)` AND NOT AN `id`. The table has no surrogate key, so insertion order
+    * is not available to order by; `edited_at` is the ordering FR-023 asks for and the
+    * primary key already indexes it. */
+   async listMessageEdits(
+     channelId: string,
+     messageId: string,
+-  ): Promise<Array<{ prior_text: string; edited_at: string }>> {
++  ): Promise<
++    Array<{
++      prior_text: string;
++      edited_at: string;
++      ended_at: string;
++      ended_by: string;
++    }>
++  > {
+     const rows = await this.db
+       .select({
+         priorText: messageEdits.priorText,
+         editedAt: messageEdits.editedAt,
++        endedBy: messageEdits.endedBy,
+       })
+       .from(messageEdits)
+       .innerJoin(messages, eq(messages.id, messageEdits.messageId))
+       .innerJoin(channels, eq(channels.id, messages.channelId))
+       .where(
+         and(
+           eq(messageEdits.messageId, messageId),
+           eq(messages.channelId, channelId),
+           eq(channels.environmentId, this.environmentId),
+         ),
+       )
+       .orderBy(asc(messageEdits.editedAt));
++    // `edited_at` AND `ended_at` CARRY THE SAME VALUE, DELIBERATELY (chapter 4.19).
++    //
++    // One column, two names, because `edited_at` is published and cannot be removed
++    // without a breaking change under CON-05 — and it is the wrong word for a row whose
++    // text ended in a deletion. `ended_at` is the right word and is additive. The
++    // duplication is one field wide, it is the price of not versioning a route over a
++    // noun, and it is stated in `contracts/message-versions.md` so nobody has to work
++    // out which of two names to trust. A client should read `ended_at` and `ended_by`;
++    // `edited_at` is kept for callers written before this chapter.
++    //
++    // The array key stays `edits` where `versions` would read better, for the same
++    // reason and at the same price.
+     return rows.map((r) => ({
+       prior_text: r.priorText,
+       edited_at: toIso(r.editedAt),
++      ended_at: toIso(r.editedAt),
++      ended_by: r.endedBy,
+     }));
+   }
+ 
+   /** Does this message exist in this channel of this tenant?
+    *
+    * THE EDIT-HISTORY ROUTE NEEDS IT and `listMessageEdits` cannot supply it: an empty
+@@ -6576,12 +6681,13 @@
+       // diff the text to notice, and FR-021 says the platform does not compare texts.
+       //
+       // WHAT THIS IS *NOT*: the superseded text. That is `message_edits`, readable
+       // only by a tenant key (FR-023a), and this column says an edit happened without
+       // saying what it replaced.
+       edited_at: messages.editedAt,
++      deleted_at: messages.deletedAt,
+     };
+     const scoped = (extra?: SQL) =>
+       and(
+         eq(messages.channelId, channelId),
+         eq(channels.environmentId, this.environmentId),
+         ...(extra ? [extra] : []),
+@@ -6632,12 +6738,19 @@
+       attachments: row.attachments ?? [],
+       created_at: toIso(row.created_at),
+       // `null`, NOT `undefined`, and the difference is what a test can see. An absent
+       // key and a null one are the same value through `??` — the control test for this
+       // field was green before the field existed because its first draft used `??`.
+       edited_at: row.edited_at === null ? null : toIso(row.edited_at),
++      // CHAPTER 4.19, FR-007. `null`, NOT `undefined`, for the reason the line above
++      // states: an absent key and a null one are the same value through `??` and
++      // different to a contract. This is the field that lets a client catching up
++      // through history tell a removal from a message that never had text, and say
++      // when — the `message.deleted` frame and the webhook have carried the instant
++      // since 3.23 and this surface did not.
++      deleted_at: row.deleted_at === null ? null : toIso(row.deleted_at),
+       })),
+     );
+   }
+ 
+   /** Resume backfill (chapter 2.7, FR-RTM-03): for each cursor, everything
+    * the client has not applied yet — capped, with an honest truncation
+```
+
+```diff title="services/api/src/db/repository.itest.ts"
+@@ -848,12 +848,51 @@
+     ).rejects.toThrow(MessageDeletedError);
+     // AND NO HISTORY ROW WAS WRITTEN. A refusal that had already inserted would leave
+     // the table holding an entry for an edit that never happened.
+     expect(await repoA.listMessageEdits(channel.id, sent.id)).toEqual([]);
+   });
+ 
++  it("an edit and a deletion on one message never collide on (message_id, edited_at)", async () => {
++    // ASSERTED RATHER THAN ASSUMED (chapter 4.19, T020). The primary key is
++    // `(message_id, edited_at)` and this chapter gives the table a second writer, so
++    // the two could in principle land on one instant and the second insert would be a
++    // loud failure in the middle of a deletion. *Cannot collide by construction* is
++    // the kind of claim this project has had to withdraw, so here is the measurement.
++    //
++    // The construction argument, for the record: FR-010 of chapter 3.23 refuses an
++    // edit on a tombstone, so every edit strictly precedes the deletion, and `now()`
++    // is the transaction timestamp — two transactions, two instants. The test exists
++    // because that paragraph is an argument and this is evidence.
++    const author = await repoA.createUser("t020-order", "Author");
++    const channel = await repoA.createChannel("t020-order", "public");
++    await repoA.addMember(channel.id, author.id);
++    const sent = await repoA.sendMessage(channel.id, { text: "first", userId: author.id });
++    await repoA.editMessage(channel.id, sent.id, { text: "second", userId: author.id });
++    await repoA.deleteMessage(channel.id, sent.id, {});
++
++    const edits = await repoA.listMessageEdits(channel.id, sent.id);
++    expect(edits.map((e) => e.prior_text)).toEqual(["first", "second"]);
++    expect(edits.map((e) => e.ended_by)).toEqual(["edit", "deletion"]);
++
++    // DISTINCT AND ORDERED, which is the property the key needs and the ordering the
++    // route promises. Equal instants would mean the insert had already thrown.
++    const instants = edits.map((e) => e.ended_at);
++    expect(new Set(instants).size).toBe(2);
++    expect(instants[0]! < instants[1]!).toBe(true);
++
++    // AND THE DELETION'S INSTANT IS THE TOMBSTONE'S, not a second clock reading. The
++    // row, the frame, the outbox event and this version all quote one timestamp, so a
++    // caller can match a version to the message state that produced it.
++    const [row] = (
++      await db.execute<{ deleted_at: Date }>(
++        sql`SELECT deleted_at FROM messages WHERE id = ${sent.id}`,
++      )
++    ).rows;
++    expect(new Date(instants[1]!).getTime()).toBe(new Date(row!.deleted_at).getTime());
++  });
++
+   it("the history survives its channel being archived and its author deleted", async () => {
+     const author = await repoA.createUser("t036b-author", "Author");
+     const channel = await repoA.createChannel("t036b", "public");
+     await repoA.addMember(channel.id, author.id);
+     const sent = await repoA.sendMessage(channel.id, { text: "before", userId: author.id });
+     await repoA.editMessage(channel.id, sent.id, { text: "after", userId: author.id });
+```
+
+```diff title="services/api/src/messages/messages.controller.ts"
+@@ -495,13 +495,25 @@
+    * question separately — `listMessageEdits` returning `[]` cannot tell them apart. */
+   @Get(":messageId/edits")
+   @Accepts("application")
+   async edits(
+     @Param("channelId") channelId: string,
+     @Param("messageId") messageId: string,
+-  ): Promise<{ edits: Array<{ prior_text: string; edited_at: string }> }> {
++  ): Promise<{
++    edits: Array<{
++      prior_text: string;
++      edited_at: string;
++      // CHAPTER 4.19. Widened here as well as in the repository, and the compiler
++      // would not have asked: the returned literal's `edits` value is a call result
++      // rather than an object literal, so no excess-property check fires, and the two
++      // new fields would have reached the client at runtime while this signature said
++      // there were two. A type that is wrong and silent.
++      ended_at: string;
++      ended_by: string;
++    }>;
++  }> {
+     // NO `userId`, AND THAT IS THE DECLARATION SPEAKING. Only an application credential
+     // reaches this handler, so there is no member to resolve and no membership to
+     // check; `channelVisibleTo(channelId, undefined)` is the tenant reading, which sees
+     // everything it owns. Passing a user here would be inventing a caller.
+     if (!(await this.repo.channelVisibleTo(channelId))) {
+       throw new NotFoundException("channel not found");
+```
+
+```diff title="services/api/src/messages/messages.itest.ts"
+@@ -1410,13 +1410,24 @@
+       const { edits } = (await res.json()) as {
+         edits: Array<Record<string, unknown>>;
+       };
+       expect(edits).toHaveLength(1);
+       // AN EXACT KEY SET, not `attachments === undefined`: an absent key and an
+       // undefined value are the same to a truthiness check and different to a contract.
+-      expect(Object.keys(edits[0]!).sort()).toEqual(["edited_at", "prior_text"]);
++      //
++      // FOUR KEYS SINCE CHAPTER 4.19, and this assertion moving is the contract test
++      // doing its job rather than FR-008 being broken: `ended_at` and `ended_by` are
++      // added to every row. It was the ONE assertion the chapter predicted would move,
++      // and running the file unedited found exactly it — 67 of 68 otherwise green.
++      // `attachments` is still absent, which is what this test is about.
++      expect(Object.keys(edits[0]!).sort()).toEqual([
++        "edited_at",
++        "ended_at",
++        "ended_by",
++        "prior_text",
++      ]);
+     });
+ 
+     it("returns a tombstone as an empty list through the history route (FR-012, SC-003)", async () => {
+       // THE SIX READ SHAPES `data-model.md` NAMES, and the assertion differs by shape
+       // because the shapes do. Two carry the field and get `[]`; four never carried it
+       // and the field stays ABSENT — which is the stronger answer, not a weaker one.
+```

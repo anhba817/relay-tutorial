@@ -411,6 +411,7 @@ sequenceDiagram
     A->>A: verify key scope
     A->>P: UPDATE message SET text=NULL, attachments=NULL,<br/>deleted_at=now(),<br/>metadata.deleted_by (FR-MSG-08, FR-006a of 3.23)
     A->>P: INSERT outbox event (same transaction)
+    A->>P: INSERT message_edits (the final text, 4.19)
     A-->>S: 204
     P->>J: outbox relay drains event
     J->>G: message.deleted → push to connected members (FR-RTM-05)
@@ -458,6 +459,20 @@ others. This scenario is the clearest illustration of why the outbox/queue spine
 > **And the deletion is idempotent** (FR-009 of chapter 3.23): the second DELETE answers
 > 204, changes nothing — `deleted_at` in particular does not move — and emits no second
 > event, so nothing downstream in this diagram fires twice for one deletion.
+>
+> **Amended again 2026-10-03 (chapter 4.19): the transaction has a third write.** The
+> text the message held at the moment of removal goes into `message_edits`, because
+> until then an edit recorded the text it replaced and a deletion recorded nothing — so
+> FR-MOD-01's *"complete history"* lost exactly one version per deletion, which
+> FR-MSG-08 reserves for the compliance endpoint. The row is written on the branch that
+> actually deletes, so a repeated DELETE records no second version for the same reason
+> it emits no second event. **It costs 0.331 ms at p50 on a 3.2 ms deletion**, 200
+> samples a side interleaved — against chapter 4.18's audit entry at 0.43 ms, which cost
+> 94.6% because four actions had to GAIN a transaction and this one already had hers.
+>
+> **And the paragraph above still counts right.** One write path, four consumers: the
+> version row is a fourth WRITE and not a fifth consumer — nothing subscribes to it, and
+> `GET …/messages/{id}/edits` reads it on demand.
 
 ---
 
@@ -543,8 +558,19 @@ CREATE TABLE message_edits (                                -- built in 3.23
     message_id  UUID NOT NULL REFERENCES messages(id),
     edited_at   TIMESTAMPTZ NOT NULL,
     prior_text  TEXT NOT NULL,                              -- FR-MSG-07
-    PRIMARY KEY (message_id, edited_at)
+    ended_by    TEXT NOT NULL,                              -- 4.19: 'edit' | 'deletion'
+    PRIMARY KEY (message_id, edited_at),
+    CONSTRAINT message_edits_ended_by_check
+        CHECK (ended_by IN ('edit', 'deletion'))
 );
+-- APPEND-ONLY SINCE CHAPTER 4.19 (FR-MSG-07's `immutable`, ADR-35's mechanism applied
+-- to a second table). `REVOKE` is inert because the api connects as a superuser, so a
+-- `BEFORE UPDATE OR DELETE` trigger refuses both verbs. Two bypasses remain and are
+-- published rather than omitted: `SET session_replication_role = replica` and
+-- `DROP TRIGGER`.
+CREATE TRIGGER message_edits_append_only
+  BEFORE UPDATE OR DELETE ON message_edits
+  FOR EACH ROW EXECUTE FUNCTION message_edits_refuse_write();
 
 CREATE TABLE outbox (
     id          BIGSERIAL PRIMARY KEY,
@@ -655,6 +681,13 @@ database password — and **NFR-SEC-10 asks for an immutable trail for exactly t
 that clause is not satisfied by this table. A separate, non-superuser role for the application
 is the one change that would move both; it is ADR-35's reversal condition.
 
+**And it guards two tables since chapter 4.19, with the decision unchanged.**
+`message_edits` carries the same `BEFORE UPDATE OR DELETE` trigger, for FR-MSG-07's
+*immutable* — a word that had been a description since 3.23. Both bypasses were
+re-measured on that table rather than assumed to transfer, and both still succeed. The
+argument, with its measurements and its reversal condition, is in
+`docs/06-adr-deep-dives.md`; this is the summary and that is the ADR.
+
 **And nothing prunes it.** FR-MOD-03 says one year; this platform has no scheduler (ADR-28), so
 the retention is unmet by decision and the read publishes no `retention_edge` — announcing a
 boundary nothing enforces is worse than announcing none.
@@ -747,8 +780,11 @@ message and they do not agree, which is a fact about this codebase rather than a
 | `listChannelsForUser.last_message` | no — a preview shows what was said |
 
 **An edit does not change them** (FR-MSG-07 changes message *text*), and `message_edits`
-keeps the three columns this document publishes: an edit records what the text WAS and
-says nothing about attachments, because nothing about them changed.
+says nothing about attachments either way: a version records what the text WAS, because
+nothing about the attachments changed. **The table is four columns since chapter 4.19**
+— `ended_by` joined the three this document published — and the new one says why a text
+stopped being current, not what was attached to it. What a deleted message HAD attached
+is not recoverable at all: FR-MED-10 unlinks it.
 
 **A deletion unlinks them.** The tombstone's column becomes `NULL` alongside its text, and
 the `message.deleted` event carries no attachment field at all — for the reason it carries
@@ -768,7 +804,7 @@ goes stale and the code does not:
 
 | Path | A deleted message |
 |---|---|
-| REST history (`GET /v1/channels/:id/messages`) | **returned**, in its original position, `text: null`. `listMessages` has never had a predicate on `messages.text` |
+| REST history (`GET /v1/channels/:id/messages`) | **returned**, in its original position, `text: null`, **and carrying `deleted_at` since chapter 4.19** — the instant, where a live message's row carries `null` for the same key. `listMessages` has never had a predicate on `messages.text`. Before 4.19 a client catching up through history could see the tombstone in place and could not say when it was removed; the real-time frame and the webhook had both carried the instant since 3.23, and the `DELETE` itself answers 204 with an empty body and carries nothing |
 | Resume backfill (`POST /internal/backfill`) | **dropped.** A tombstone is not a `message.created` and there is no truthful `text` to invent, so `toFrame` returns nothing for it and the client sees a gap it repairs through history |
 | Channel listing (`GET /v1/users/:id/channels`) | **previewed** with a `null` text at its own sequence, and **still counted as one unread** — unread is `last_sequence - read_position`, so a tombstone keeps its place in the arithmetic |
 | Backfill truncation flag | computed from **rows read**, not frames delivered. A page at the cap containing tombstones returns fewer frames and still reports `truncated: true`: dropping an unrenderable row is not a reason to tell the client to go page history, and hiding a real cap would be |

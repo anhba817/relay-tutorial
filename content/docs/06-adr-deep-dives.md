@@ -2312,7 +2312,7 @@ anything has to assert that it did.
 ### The cost that is not the dependency
 
 A presigned URL needs no contact with the store. That is the design's whole economy and it is
-also the reason FR-017 needed something built for it: the api never opens a socket, so it never
+also the reason **feature 056's FR-017** needed something built for it: the api never opens a socket, so it never
 learns the store is down, and a slot issued into an outage is byte-identical to a good one.
 
 `docs/05-sad.md:1062` requires the opposite — *"Object storage lost … Upload slots return a
@@ -2481,3 +2481,16 @@ layer once prevention is real, and it is not a substitute for prevention that do
 Decision 3 reverses only if the platform's other 40 `timestamptz` columns are brought to
 millisecond precision, at which point this column stops being a special case and the declaration
 is redundant rather than wrong.
+
+> **Applied to a second table 2026-10-03 (chapter 4.19). The decision is unchanged.**
+> `message_edits` is now append-only by the same mechanism, because FR-MSG-07 has said
+> *"an immutable edit history"* since chapter 3.23 and nothing enforced it — measured
+> before the migration: an `UPDATE` and a `DELETE` both succeeded. **Both bypasses were
+> re-measured on this table rather than assumed to transfer** — `SET
+> session_replication_role = replica` and `DROP TRIGGER` still succeed — so the scope
+> published here holds for two tables and not one. Nothing in the Decision, the rejected
+> alternatives or the reversal condition is rewritten: the reversal condition is a
+> separate non-superuser role for the application, which is a deployment decision about
+> this api and not a statement about which tables it guards. Recorded as a dated note
+> rather than an edit, because constitution VII makes an accepted ADR immutable.
+
