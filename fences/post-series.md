@@ -16471,3 +16471,607 @@ is a broken chain even when the hunk itself is right.
        // because the shapes do. Two carry the field and get `[]`; four never carried it
        // and the field stays ABSENT — which is the stronger answer, not a weaker one.
 ```
+
+## Chapter 4.20 — the messages that expire
+
+
+Five files, eleven hunks, and the bill was counted at analysis rather than
+discovered here: `repository.ts` is titled on 52 pages, `schema.ts` 34,
+`app.module.ts` 23, `targets.ts` 13 and `gauntlet.itest.ts` 13. The last of
+those was missing from the first count and found by asking what a new route
+costs — **a gauntlet attack is written inside that file, not beside it**, so
+classifying a route and covering it are two edits to two expensive files.
+
+`moderation-routes.ts` is titled on no page at all, which is why the route's
+third classification costs nothing here and still had to be made.
+
+### `services/api/src/db/repository.ts` — the paged read, the destroy, the extracted containment check and five test helpers.
+
+```diff title="services/api/src/db/repository.ts"
+@@ -648,13 +648,23 @@
+   return rows.map((row) => row.id);
+ }
+ 
+ /** WHICH OF A TENANT'S MEDIA OBJECTS NOTHING REFERENCES ANY MORE — FR-MED-10's predicate.
+  *
+  * **CALLED BY NOTHING YET, AND THAT IS NOT AN OVERSIGHT.** FR-MED-10's reaper does not
+- * exist; `docs/12` row 22, the erasure chapter, is where it gets a caller. Chapter 4.15
++ * exist; `docs/12` row 22, the erasure chapter, is where it gets a caller.
++ *
++ * **CHAPTER 4.20 CAME CLOSE AND DID NOT TAKE IT, WHICH IS WORTH RECORDING HERE BECAUSE
++ * THE NEXT READER WILL HAVE THE SAME IDEA.** The retention sweep needs a reference
++ * check and this function is one, so reusing it looked free. It asks a different
++ * question: *which objects in this environment older than X does no message reference*
++ * — a superset that includes objects **never attached to anything**, 48 of them in one
++ * environment on the development lane. Those are this function's own population,
++ * FR-MED-10's orphans, and a retention policy has nothing to do with them. The sweep
++ * brings the `media_id` values of the messages it just destroyed instead, to
++ * `unreferencedAmong` below, which is the half the two callers share. Chapter 4.15
+  * writes the predicate here anyway because the alternative is what happened to
+  * FR-MED-07's first sentence — three chapters cited the clause, every one of them
+  * implemented the half it needed, and nobody noticed the other half was unmet. A
+  * predicate with a test and no caller is weaker than one with both, and much stronger
+  * than a sentence in a specification. Its test drives it directly.
+  *
+@@ -697,35 +707,72 @@
+ 
+   // ONE QUERY FOR THE WHOLE BATCH: the messages that reference AT LEAST ONE candidate,
+   // each containment operand a bound value so the GIN index on `messages.attachments`
+   // can be looked up rather than scanned. What comes back is the attachment arrays, and
+   // the intersection is arithmetic in Node — cheaper than asking Postgres to unnest and
+   // far easier to read than a lateral join nobody will revisit.
++  return unreferencedAmong(
++    db,
++    environmentId,
++    candidates.map((row) => row.id),
++  );
++}
++
++/** OF THESE OBJECT IDS, WHICH DOES NO SURVIVING MESSAGE REFERENCE?
++ *
++ * Called by `unreferencedMediaIn` above, which brings every old object in an
++ * environment, and by `sweepRetention` in `../retention/sweep.ts`, which brings the
++ * `media_id` values of the messages it has just destroyed. **The two populations are
++ * different and only the caller knows which one it means** — the sweep must not be
++ * handed the first, because it contains objects that were never attached to anything,
++ * and those are FR-MED-10's orphans rather than FR-MED-11's. On this lane that is 48
++ * objects in one environment: a sweep destroying them would be enforcing the wrong
++ * clause under a retention policy.
++ *
++ * ONE QUERY FOR THE WHOLE BATCH, AND IT REACHES THE INDEX. The operand of each
++ * containment test is a bound value rather than a column from the other side of a
++ * join, which is what chapter 4.12 measured the difference of: bound, the planner uses
++ * `messages_attachments_gin`; set-wise it cannot, and the same index sits idle under a
++ * parallel sequential scan. Measured here at 100 candidates — a `BitmapOr` over 100
++ * `Bitmap Index Scan`s, 976 buffers and 15.2 ms, about 9.8 buffers an object against
++ * 107 for a single one issued alone.
++ *
++ * **AN `OR` IS NOT ALWAYS A `Filter:`**, which is worth saying because chapter 4.18
++ * found the opposite for a keyset cursor written as one. A cursor's range predicates
++ * cannot be ORed into an index scan; containment predicates can, and this was checked
++ * rather than assumed. */
++export async function unreferencedAmong(
++  db: Db,
++  environmentId: string,
++  candidateIds: readonly string[],
++): Promise<string[]> {
++  if (candidateIds.length === 0) return [];
++
+   const rows = await db
+     .select({ attachments: sql<Attachment[] | null>`${messages.attachments}` })
+     .from(messages)
+     .innerJoin(channels, eq(channels.id, messages.channelId))
+     .where(
+       and(
+         eq(channels.environmentId, environmentId),
+         or(
+-          ...candidates.map(
+-            (row) =>
++          ...candidateIds.map(
++            (id) =>
+               sql`${messages.attachments} @> ${JSON.stringify([
+-                { type: "media", media_id: row.id },
++                { type: "media", media_id: id },
+               ])}::jsonb`,
+           ),
+         ),
+       ),
+     );
+   const referencedIds = new Set<string>();
+   for (const row of rows)
+     for (const attachment of row.attachments ?? [])
+       if (attachment.type === "media") referencedIds.add(attachment.media_id);
+ 
+-  return candidates.map((row) => row.id).filter((id) => !referencedIds.has(id));
++  return candidateIds.filter((id) => !referencedIds.has(id));
+ }
+ 
+ export async function recordMediaVerdict(
+   db: Db,
+   input: {
+     id: string;
+@@ -6827,7 +6874,281 @@
+           eq(messages.channelId, channelId),
+           eq(channels.environmentId, this.environmentId),
+         ),
+       )
+       .orderBy(asc(messages.sequence));
+   }
++
++  /** ONE PAGE OF THIS ENVIRONMENT'S EXPIRED MESSAGES — FR-MOD-06's predicate.
++   *
++   * Called by `sweepRetention` in `../retention/sweep.ts`, once per page per
++   * environment with a policy. The convention `CLAUDE.md` sets: a claim about when a
++   * symbol runs names the thing that runs it.
++   *
++   * THE BOUND IS A CONSTANT COMPUTED BY THE CALLER, which is the whole reason this is
++   * one query per environment rather than one join across all of them. Written as a
++   * join over every environment the age lands in a `Join Filter` — measured, 617
++   * buffers with `Rows Removed by Join Filter: 1018`. Per environment with the bound
++   * bound it is 73 and the planner reaches `channels_environment_last_activity`.
++   * **Neither is a speedup over the other**: 546 of that 617 is the scan of all 33,051
++   * environments, which the per-environment form pays too as its first step. What this
++   * shape buys is pageability and a predicate the planner can push into an index.
++   *
++   * KEYSET ON `(channel_id, created_at)`, which is what `messages_channel_created`
++   * exists for. Chapter 4.13's sweep read one page with an offset and the head never
++   * moved, so an object nobody uploaded to stayed `pending` for ever. And the cursor is
++   * a SQL row value rather than an `OR` chain: chapter 4.18 measured that an `OR`
++   * cursor lands in a `Filter:` and re-walks every earlier page. */
++  async expiredMessageIds(
++    olderThan: Date,
++    limit: number,
++    after?: { channelId: string; createdAt: Date },
++  ): Promise<
++    {
++      id: string;
++      channelId: string;
++      createdAt: Date;
++      attachments: Attachment[] | null;
++    }[]
++  > {
++    return this.db
++      .select({
++        id: messages.id,
++        channelId: messages.channelId,
++        createdAt: messages.createdAt,
++        // THE FORWARD HALF OF FR-MED-11, AND IT IS FREE. `attachments` is a jsonb
++        // column on the row the sweep already has in hand, so collecting the
++        // `media_id` values costs no second query. The expensive half is the reverse
++        // question — *is this object still referenced?* — which `unreferencedAmong`
++        // answers for the whole batch at once.
++        //
++        // AND IT MUST BE READ BEFORE THE DELETE, which is the one ordering constraint
++        // in this pair that is not obvious: after `destroyMessages` the rows are gone
++        // and so is every id they named.
++        attachments: sql<Attachment[] | null>`${messages.attachments}`,
++      })
++      .from(messages)
++      .innerJoin(channels, eq(channels.id, messages.channelId))
++      .where(
++        and(
++          eq(channels.environmentId, this.environmentId),
++          lt(messages.createdAt, olderThan),
++          after
++            ? sql`(${messages.channelId}, ${messages.createdAt}) > (${after.channelId}::uuid, ${after.createdAt})`
++            : undefined,
++        ),
++      )
++      .orderBy(asc(messages.channelId), asc(messages.createdAt))
++      .limit(limit);
++  }
++
++  /** DESTROY A PAGE OF EXPIRED MESSAGES, AND THE VERSION ROWS THEY OWN.
++   *
++   * Called by `sweepRetention` in `../retention/sweep.ts` and by nothing else. This is
++   * the one legitimate hard deletion outside FR-MOD-04's compliance endpoint, which
++   * ADR-36's first decision licenses by reading the constitution's *compliance path* as
++   * admitting a retention sweep.
++   *
++   * THE `SET LOCAL` IS THE MECHANISM AND THE WORD `LOCAL` IS THE GUARANTEE. Without it
++   * the flag outlives this transaction on a pooled connection and every later request
++   * can delete version rows — measured. And `SET LOCAL` outside a transaction block is
++   * a WARNING, not an error, which leaves the flag unset and every cascade refused in a
++   * way that looks exactly like the trigger working. Both failures are silent and they
++   * point in opposite directions, so the delete runs inside this explicit transaction
++   * and `retention.itest.ts` asserts the flag's VALUE at the moment of the delete.
++   *
++   * The version rows go by `ON DELETE CASCADE` rather than by a second statement here:
++   * a cascade keeps *a version cannot outlive its message* in the schema instead of in
++   * a procedure somebody maintains. `0025` records why that needed a trigger exception
++   * at all — a cascade issues an ordinary `DELETE` and a row trigger fires on it. */
++  /** DESTROY MEDIA OBJECTS AND THE RENDITIONS THAT HANG OFF THEM, returning what the
++   * caller needs to finish the job outside the database.
++   *
++   * Called by `sweepRetention` in `../retention/sweep.ts`, after the messages that
++   * referenced them are gone and after `unreferencedAmong` has confirmed no surviving
++   * message still names them. Nothing else deletes a `media_objects` row: chapter 4.15
++   * established that the rejection path removes bytes and keeps the row on purpose, so
++   * before this chapter the table only ever grew.
++   *
++   * **THE RENDITIONS GO BY CASCADE**, `media_objects_parent_fk`, which chapter 4.15
++   * chose precisely so a rendition's reachability is its parent's and no caller has to
++   * keep two deletes in step. The keys come back anyway, because the STORE has no
++   * foreign keys and the bytes have to be removed one request at a time.
++   *
++   * RETURNS THE ROWS RATHER THAN A COUNT because the caller owes two more things per
++   * object: a `deleteObjectWithRenditions` against the store, and a `deleted` storage
++   * event whose `bytesDelta` is negative (FR-013). Neither can be reconstructed from a
++   * number. */
++  async destroyMediaObjects(ids: readonly string[]): Promise<
++    {
++      id: string;
++      objectKey: string;
++      declaredBytes: number;
++      mimeType: string;
++      renditionKeys: string[];
++    }[]
++  > {
++    if (ids.length === 0) return [];
++
++    const scoped = and(
++      inArray(mediaObjects.id, [...ids]),
++      // THE TENANCY PREDICATE, AND HERE A MISS IS A LOSS RATHER THAN A LEAK.
++      eq(mediaObjects.environmentId, this.environmentId),
++      isNull(mediaObjects.parentId),
++    );
++
++    const parents = await this.db
++      .select({
++        id: mediaObjects.id,
++        objectKey: mediaObjects.objectKey,
++        declaredBytes: mediaObjects.declaredBytes,
++        // THE MIME TYPE RATHER THAN THE KIND. The storage event wants a `kind`, and
++        // `kindOf` is the one function that maps between them — it lives in `media/`
++        // and this file does not reach into a feature directory. The caller converts.
++        mimeType: mediaObjects.mimeType,
++      })
++      .from(mediaObjects)
++      .where(scoped);
++    if (parents.length === 0) return [];
++
++    const parentIds = parents.map((p) => p.id);
++    const renditions = await this.db
++      .select({ parentId: mediaObjects.parentId, objectKey: mediaObjects.objectKey })
++      .from(mediaObjects)
++      .where(inArray(mediaObjects.parentId, parentIds));
++
++    await this.db.delete(mediaObjects).where(scoped);
++
++    return parents.map((p) => ({
++      ...p,
++      renditionKeys: renditions
++        .filter((r) => r.parentId === p.id)
++        .map((r) => r.objectKey),
++    }));
++  }
++
++  /** Whether a media object row is still there. Called by `retention.itest.ts` only —
++   * `listMessagesRaw`'s convention, because lint keeps SQL in this directory. */
++  async mediaObjectExistsRaw(id: string): Promise<boolean> {
++    const rows = await this.db
++      .select({ id: mediaObjects.id })
++      .from(mediaObjects)
++      .where(
++        and(eq(mediaObjects.id, id), eq(mediaObjects.environmentId, this.environmentId)),
++      );
++    return rows.length > 0;
++  }
++
++  /** How many renditions hang off a parent object. Called by `retention.itest.ts`. */
++  async renditionCountRaw(parentId: string): Promise<number> {
++    const rows = await this.db
++      .select({ id: mediaObjects.id })
++      .from(mediaObjects)
++      .where(eq(mediaObjects.parentId, parentId));
++    return rows.length;
++  }
++
++  /** HOW MANY VERSION ROWS A MESSAGE OWNS. Called by `retention.itest.ts` only, which
++   * is `listMessagesRaw`'s convention: a test that needs SQL cannot write it, because
++   * `eslint.config.mjs` restricts `drizzle-orm` and `pg` to this directory. */
++  async versionRowCountRaw(messageId: string): Promise<number> {
++    const rows = await this.db
++      .select({ id: messageEdits.messageId })
++      .from(messageEdits)
++      .where(eq(messageEdits.messageId, messageId));
++    return rows.length;
++  }
++
++  /** Move a message's `created_at` back by whole days, each fixture to its own instant.
++   *
++   * Called by `retention.itest.ts` only. **Nothing on this lane is thirty days old** —
++   * the oldest message is 2026-09-14 and FR-MOD-06's shortest policy is thirty days —
++   * so every retention fixture is backdated and the chapter says so rather than
++   * implying it measured real traffic. */
++  async backdateMessageRaw(messageId: string, days: number): Promise<void> {
++    await this.db
++      .update(messages)
++      .set({ createdAt: sql`now() - make_interval(days => ${days})` })
++      .where(eq(messages.id, messageId));
++  }
++
++  /** An UPDATE the append-only trigger must refuse, flag or no flag.
++   *
++   * Called by `retention.itest.ts` only. It exists to be rejected: `TG_OP = 'DELETE'`
++   * is part of `0025`'s condition precisely so that expiry destroys rows and never
++   * rewrites one, and reading that condition is not testing it. */
++  async tamperVersionRowRaw(messageId: string): Promise<void> {
++    await this.db
++      .update(messageEdits)
++      .set({ priorText: "tampered" })
++      .where(eq(messageEdits.messageId, messageId));
++  }
++
++  /** A DELETE of the children with no flag set, which the trigger must still refuse.
++   *
++   * Called by `retention.itest.ts` only. The exception `0025` opens is one verb on one
++   * table reached one way; this is the same verb reached the other way. */
++  async deleteVersionRowsRaw(messageId: string): Promise<void> {
++    await this.db.delete(messageEdits).where(eq(messageEdits.messageId, messageId));
++  }
++
++  async destroyMessages(ids: string[]): Promise<number> {
++    if (ids.length === 0) return 0;
++    return this.db.transaction(async (tx) => {
++      await tx.execute(sql`SET LOCAL relay.expiring = 'on'`);
++      const destroyed = await tx
++        .delete(messages)
++        .where(
++          and(
++            inArray(messages.id, ids),
++            // THE TENANCY PREDICATE, AND IT IS NOT DECORATION. `ids` arrives from
++            // `expiredMessageIds`, which is already scoped — but this is a bulk DELETE,
++            // and constitution I's usual failure is a leak where this one is a loss.
++            // An id from another tenant reaching this list destroys that tenant's data.
++            inArray(
++              messages.channelId,
++              this.db
++                .select({ id: channels.id })
++                .from(channels)
++                .where(eq(channels.environmentId, this.environmentId)),
++            ),
++          ),
++        )
++        .returning({ id: messages.id });
++      return destroyed.length;
++    });
++  }
++}
++
++/** SET OR CLEAR AN ENVIRONMENT'S RETENTION POLICY — FR-MOD-06's only write.
++ *
++ * Called by `EnvironmentsController.patch` and by `retention.itest.ts`. Standalone
++ * rather than a `Repository` method because the caller already holds the environment
++ * id as the thing it is addressing, not as a scope it is reading within — and the
++ * controller resolves tenancy before it gets here.
++ *
++ * **`null` IS INDEFINITE AND IS NOT A MISSING FIELD.** FR-MOD-06's fourth option is
++ * *indefinite*, and the absence of a value is how this schema has spelled that since
++ * chapter 2.1. A client clearing a policy sends `null` explicitly; a client omitting
++ * the field changes nothing, and the two are different requests all the way down — the
++ * route's schema distinguishes them and so does this signature, which is why it takes
++ * `number | null` rather than `number | undefined`.
++ *
++ * The three legal values are enforced by `environments_retention_days_check` rather
++ * than here: the clause enumerates them, and a constraint is how an enumeration
++ * survives a caller nobody anticipated. */
++export async function setRetentionPolicy(
++  db: Db,
++  environmentId: string,
++  retentionDays: number | null,
++): Promise<{ id: string; name: string; retentionDays: number | null } | undefined> {
++  const [row] = await db
++    .update(environments)
++    .set({ retentionDays })
++    .where(eq(environments.id, environmentId))
++    .returning({
++      id: environments.id,
++      name: environments.kind,
++      retentionDays: environments.retentionDays,
++    });
++  return row;
+ }
+```
+
+### `services/api/src/db/schema.ts` — the CHECK, the cascade, and the comment that said nothing read the column.
+
+```diff title="services/api/src/db/schema.ts"
+@@ -132,14 +132,17 @@
+       .notNull()
+       .references(() => applications.id),
+     kind: text("kind").notNull(),
+     // envelope-encrypted (NFR-SEC-02)
+     signingSecret: text("signing_secret").notNull(),
+     retentionDays: integer("retention_days"),
+-    // DECLARED IN 2.1 AND STILL EMPTY. Named in SRS §6.1's Environment entity
+-    // and SAD §338, read by nothing in seventeen chapters. THIS chapter
++    // DECLARED IN 2.1 AND READ BY NOTHING FOR SEVENTEEN CHAPTERS. Named in SRS
++    // §6.1's Environment entity and SAD §338, and set on 0 of 33,051 rows at
++    // the open of the chapter that finally reads it — `retention-reads.ts`
++    // enumerates the environments holding one and `sweep.ts` acts on them
++    // (FR-MOD-06). Bounded to the clause's three values below. THE chapter
+     // deliberately did NOT put rate-limit policy here: the column is named for
+     // quotas, quotas are a later chapter, and the distinction between a limit
+     // that may be lost and a quota that is money is the thing this chapter is
+     // about.
+     // (Deliberately not a chapter NUMBER: the deduplication chapter renumbered
+     // quotas once already, and a comment in a file fenced byte-exact into a
+@@ -175,12 +178,23 @@
+     // No trigger, no counting query, nothing to lose a race to.
+     unique("environments_application_kind_unique").on(t.applicationId, t.kind),
+     check(
+       "environments_rest_limit_non_negative",
+       sql`${t.restLimitPerMinute} IS NULL OR ${t.restLimitPerMinute} >= 0`,
+     ),
++    // CHAPTER 4.20. FR-MOD-06 enumerates 30 / 90 / 365 days / indefinite rather
++    // than describing a range, so `45` is not a stricter policy a customer
++    // chose — it is a value nothing in the specification licenses, and a sweep
++    // acting on it would enforce a promise nobody made. NULL is indefinite,
++    // which is this column's own existing spelling for it rather than a fourth
++    // sentinel value. Added by `0024` against 0 of 33,051 rows, so it validated
++    // against an empty set.
++    check(
++      "environments_retention_days_check",
++      sql`${t.retentionDays} IS NULL OR ${t.retentionDays} IN (30, 90, 365)`,
++    ),
+     check(
+       "environments_send_limit_non_negative",
+       sql`${t.sendLimitPerMinute} IS NULL OR ${t.sendLimitPerMinute} >= 0`,
+     ),
+     check(
+       "environments_connect_limit_non_negative",
+@@ -473,15 +487,28 @@
+ // NO `environment_id`, exactly like `messages` above. The tenant is reached
+ // through `message_id -> messages -> channels`, which is how every read below
+ // the boundary already scopes (constitution I).
+ export const messageEdits = pgTable(
+   "message_edits",
+   {
++    // CHAPTER 4.20 MADE THIS A CASCADE, and by itself that changed nothing —
++    // which is the measurement that shaped the design. A cascade issues an
++    // ordinary `DELETE` against this table and `message_edits_append_only` is a
++    // ROW trigger, so it fires on the generated statement and refuses it; the
++    // error even names it, `DELETE FROM ONLY "public"."message_edits"`. The
++    // cascade needs `0025`'s named exception to work at all.
++    //
++    // IT IS STILL RIGHT FOR A REASON INDEPENDENT OF EXPIRY: a version row must
++    // not outlive its message. Without the cascade the sweep would carry an
++    // ordered two-step delete in application code and that invariant would live
++    // in a procedure somebody maintains rather than in the schema — which is
++    // the distinction chapter 4.15 drew when it gave a rendition's reachability
++    // to a composite foreign key rather than to a predicate.
+     messageId: uuid("message_id")
+       .notNull()
+-      .references(() => messages.id),
++      .references(() => messages.id, { onDelete: "cascade" }),
+     editedAt: timestamp("edited_at", { withTimezone: true }).notNull(),
+     // FR-MSG-07: what the message said before this edit. NOT NULL.
+     //
+     // THIS COMMENT USED TO EXPLAIN AN ABSENCE AS A NECESSITY, and four chapters
+     // read past the gap because of it. It said: "a deletion writes no row here,
+     // because a tombstone has no text to preserve". That is true of the row
+```
+
+### `services/api/src/app.module.ts` — the first environments module this platform has had.
+
+```diff title="services/api/src/app.module.ts"
+@@ -27,12 +27,13 @@
+ import { ProtocolErrorFilter } from "./protocol-error.filter";
+ import { LimitsModule } from "./limits/limits.module";
+ import { RateLimitMiddleware } from "./limits/rate-limit.middleware";
+ import { RequestContextMiddleware } from "./request-context.middleware";
+ import { RequestLogMiddleware, requestLogEnabled } from "./request-log/request-log.middleware";
+ import { AuditModule } from "./audit/audit.module";
++import { EnvironmentsModule } from "./environments/environments.module";
+ import { RequestLogModule } from "./request-log/request-log.module";
+ import { ANALYTICS_PUBLISHER } from "./webhooks/analytics";
+ import { createJetStreamPublisher, ensureAnalyticsStream } from "./outbox/jetstream.publisher";
+ import type { Publisher } from "./outbox/publisher";
+ 
+ // The application described as a module graph — ADR-15's convention for the
+@@ -55,12 +56,13 @@
+     LimitsModule,
+     // Chapter 4.8's read surface. Registered here for the reason `ChannelsModule` and
+     // `UsersModule` are: without this line the module compiles, is imported by nothing,
+     // and the route does not exist — which `pnpm build` would not notice and the
+     // cross-tenant gauntlet would, because it derives its targets from the router.
+     AuditModule,
++    EnvironmentsModule,
+     RequestLogModule,
+     // HOSTED MEDIA, AND THIS LINE IS THE WHOLE OF WHETHER THE ROUTE EXISTS. A module
+     // written, tested and never registered gives a 404 that reads as a routing bug
+     // rather than as a missing import — chapter 4.6's `Unknown chapter id`, one
+     // repository over.
+     MediaModule,
+```
+
+### `services/api/src/isolation/targets.ts` — one more route to classify, and the id in the path is the tenant's own.
+
+```diff title="services/api/src/isolation/targets.ts"
+@@ -278,12 +278,19 @@
+   { method: "POST", path: "/v1/channels/:channelId/join", accepts: "user", shape: "write" },
+   { method: "POST", path: "/v1/channels/:channelId/members/remove", accepts: "application", shape: "write" },
+   { method: "PATCH", path: "/v1/channels/:channelId/members/:userExternalId", accepts: "application", shape: "write" },
+   { method: "POST", path: "/v1/channels/:channelId/archive", accepts: "application", shape: "write" },
+   { method: "DELETE", path: "/v1/channels/:channelId/archive", accepts: "application", shape: "write" },
+ 
++  // ── the retention policy (chapter 4.20) ────────────────────────────────────────
++  // THE FIRST ENVIRONMENT-LEVEL ROUTE THIS PLATFORM HAS HAD, and the id in the path is
++  // the tenant's own environment — so a forged one is the attack, and the controller
++  // answers 404 rather than 403 because a refusal naming the cause reports whether
++  // somebody else's environment exists.
++  { method: "PATCH", path: "/v1/environments/:environmentId", accepts: "application", shape: "write" },
++
+   // ── the webhook surface (this chapter), and the derivation named all seven ─────
+   //
+   // ELEVEN ROUTES ARRIVED AND THE LEDGER SAID SIX. This chapter's rows were deferred
+   // from the harness chapter by a note that counted the `/v1/webhooks*` paths and not
+   // the internal seam beneath them; `targets.itest.ts` went red naming eleven, which is
+   // the third time a count in this feature's own records has been low and the first time
+```
+
+### `services/api/src/isolation/gauntlet.itest.ts` — the attack, which reads the policy column because a message listing cannot see it.
+
+```diff title="services/api/src/isolation/gauntlet.itest.ts"
+@@ -8,12 +8,13 @@
+ 
+ import { AppModule } from "../app.module";
+ import { createAnalyticalStore } from "../metering/clickhouse";
+ import { mintUserToken } from "../auth/user-token";
+ import { environmentSigningSecret, Repository, usageFor } from "../db/repository";
+ import { createDb, createPool } from "../db/client";
++import { retentionDaysOf } from "../db/retention-reads";
+ import {
+   credentialAttack,
+   listAttack,
+   readAttack,
+   rowsOf,
+   send,
+@@ -288,12 +289,45 @@
+     expect(verdict.foreign.status).toBe(404);
+     // THE STATE READ IS WHAT A STATUS CANNOT SAY. The listing carries `text` and
+     // `edited_at`, so a 404 that completed the edit shows up here and nowhere else.
+     expect(verdict.stateChanged, "the victim's message text or edited_at moved").toBe(false);
+   });
+ 
++  it("PATCH /v1/environments/:id — a foreign environment's retention policy is not set", async () => {
++    attacked.add("PATCH /v1/environments/:environmentId");
++    // THE WORST THING AN ATTACKER CAN DO TO ANOTHER TENANT ON THIS SURFACE IS NOT A
++    // READ. Setting a thirty-day policy on somebody else's environment arms a sweep to
++    // destroy their history, and `reset-lane.mjs` does not restore lane data by design.
++    // So constitution I's usual failure — a leak — is not the one to probe here; the
++    // failure is a LOSS, and the state read below is what would catch it.
++    const verdict = await writeAttack(
++      url,
++      t.attacker.credential,
++      {
++        method: "PATCH",
++        path: `/v1/environments/${t.victim.environmentId}`,
++        body: { retention_days: 30 },
++      },
++      {
++        method: "PATCH",
++        path: `/v1/environments/${ABSENT_UUID}`,
++        body: { retention_days: 30 },
++      },
++      () => t.victim.repo.listMessages(t.victim.channelId, { limit: 50 }),
++    );
++    expect(verdict.differences, verdict.differences.join("; ")).toEqual([]);
++    // 404 AND NOT 403, because a refusal naming the cause reports whether somebody
++    // else's environment exists — chapter 4.11's rule for media objects, and the same
++    // argument applies to an id a caller can guess.
++    expect(verdict.foreign.status).toBe(404);
++    expect(verdict.stateChanged, "the victim's messages moved").toBe(false);
++    // AND THE POLICY ITSELF, which the message listing cannot see. A 404 that wrote the
++    // column anyway leaves no trace in any other assertion in this suite.
++    expect(await retentionDaysOf(db, t.victim.environmentId)).toBeNull();
++  });
++
+   it("DELETE .../messages/:messageId — a foreign message is not tombstoned", async () => {
+     attacked.add("DELETE /v1/channels/:channelId/messages/:messageId");
+     const verdict = await writeAttack(
+       url,
+       // A KEY, and this route inherits `@Accepts("application", "user")` from the class
+       // rather than narrowing it, so the application half is the one attacked here — a
+```

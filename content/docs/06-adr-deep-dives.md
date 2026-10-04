@@ -2494,3 +2494,118 @@ is redundant rather than wrong.
 > this api and not a statement about which tables it guards. Recorded as a dated note
 > rather than an edit, because constitution VII makes an accepted ADR immutable.
 
+
+## ADR-36 — A retention sweep is a compliance path, and the trigger names its one deleter
+
+**Status**: accepted (feature 066, chapter 4.20, 2026-10-04)
+
+Two decisions. The first is a reading of three documents that disagreed with a fourth;
+the second is a mechanism chosen after the obvious three were measured and refused.
+
+### Decision 1 — a retention sweep IS a compliance path
+
+**The conflict.** FR-MOD-06 requires expired messages to be *hard-deleted by a scheduled
+job*. Three documents reserved that verb:
+
+    constitution II   hard deletion exists ONLY ON THE COMPLIANCE PATH
+    FR-MSG-08         Hard deletion shall occur ONLY VIA THE COMPLIANCE DELETION ENDPOINT
+    DR-06             Deleted messages shall RETAIN THEIR ROW
+
+No artifact in the feature noticed until its fifth analysis pass, and the chapter cannot
+be built under a literal reading of all three.
+
+**The decision.** A retention sweep is a compliance path. **The constitution's own word is
+`path` and not `endpoint`** — and the purpose test it implies is met: a retention policy
+exists because a customer promised an auditor that data would not outlive a period. That
+is the same kind of obligation FR-MOD-04's erasure endpoint discharges, arriving on a
+schedule instead of on a request.
+
+**Why this reading and not the others.** The constitution is the rule hardest to change
+and the one a feature has no authority to amend; FR-MSG-08 and DR-06 are narrower, are
+amendable through the SRS's own governance clause, and are the two that used the stricter
+word. **Changing the narrow clauses to match the broad one is the direction that loses
+least.** There are exactly two compliance paths after this and both are named in
+FR-MSG-08, so the category still refuses everything else.
+
+**Rejected alternatives.**
+
+- **Read constitution II as FR-MOD-04's endpoint and nothing else.** Then FR-MOD-06 is
+  unbuildable and should be withdrawn rather than left as a P3 nobody can satisfy. That
+  is a product decision and a feature cannot take it.
+- **Amend the constitution.** Outside a feature's authority, and unnecessary: the
+  principle's text already admits this reading.
+- **Soft expiry — clear `text` and `attachments`, keep the row.** This is the one worth
+  naming at length, because it is the trap. It satisfies **all three clauses word for
+  word**, needs no ADR, needs no migration beyond an UPDATE, and breaks nothing. It is
+  also the only option that leaves a compliance team believing data is gone while the row
+  is still in the table. FR-MOD-06 says *hard-deleted*, and a tombstone is precisely what
+  expiry is not.
+
+**Reversal condition.** If a later chapter needs hard deletion on a third path,
+`compliance path` has stopped being a category that distinguishes anything, and the
+clause needs rewriting rather than reinterpreting.
+
+### Decision 2 — the exception is a named flag in the trigger
+
+**The refusal is a pincer, and it is chapter 4.19's.** Exactly one table references
+`messages`, and 4.19 began putting a row in it for every deletion as well as every edit —
+5,495 messages owned one when this chapter opened. Measured in rolled-back transactions:
+
+    delete the message            ERROR  message_edits_message_id_fkey
+    delete the versions first     ERROR  message versions are append-only (FR-MSG-07)
+    ON DELETE CASCADE             ERROR  the same trigger, and the error names the
+                                         statement the cascade generated:
+                                         DELETE FROM ONLY "public"."message_edits"
+    control: no version rows      DELETE 1
+
+**The third line is the one that shaped the mechanism.** A cascade is not a privileged
+path — it issues an ordinary `DELETE`, and `message_edits_append_only` is a row trigger,
+so it fires. The cascade alone deletes nothing and the exception alone leaves the foreign
+key refusing the parent. Both, or neither.
+
+**The decision.** `0025` makes the foreign key `ON DELETE CASCADE` and gives the trigger
+one condition:
+
+    IF TG_OP = 'DELETE' AND current_setting('relay.expiring', true) = 'on'
+      THEN RETURN OLD; END IF;
+
+`TG_OP = 'DELETE'` is part of it because an `UPDATE` must stay refused with the flag set:
+expiry destroys a row and never rewrites one, so the immutability of a version's *content*
+is not what this chapter gives up. Measured in all three directions rather than the one
+that passes — UPDATE with the flag refused, DELETE with the flag unset refused, DELETE of
+the message with the flag set permitted and the child rows going 1 to 0.
+
+**Rejected alternatives.**
+
+- **`SET session_replication_role = replica`.** It works, which is the problem: it is the
+  hole ADR-35 published as the limit of its own guarantee, so using it would make this
+  platform's retention sweep the first caller of a bypass the previous chapter documented
+  as the reason its claim is scoped. It also disables **every** trigger in the session,
+  which is wider than one table and one verb.
+- **Drop the foreign key.** A version row could then outlive its message, which is what
+  makes the history trustworthy.
+- **An ordered two-step delete in application code.** The invariant *a version cannot
+  outlive its message* moves from the schema into a procedure somebody maintains — the
+  distinction chapter 4.15 drew when it gave a rendition's reachability to a composite
+  foreign key rather than to a predicate.
+
+**What it costs, and it is a published guarantee.** ADR-35 scoped the audit log's
+immutability as *to the application and to accident, and not to somebody holding the
+database password*, and chapter 4.19 applied that scope to `message_edits`. After this
+chapter the scope for that table is **to the application except one named path, and to
+accident**. `audit_log`'s scope is untouched. Constitution VII makes an accepted ADR
+immutable, so **this supersedes ADR-35's scope clause for `message_edits` rather than
+editing it**.
+
+**And the guarantee is one keyword wide.** `SET LOCAL` holds for one transaction. Measured
+both ways, because both are silent: with plain `SET` the flag outlives its transaction on
+a pooled connection and every later request can delete version rows; with `SET LOCAL`
+outside a transaction block Postgres emits a **warning**, the flag is never set, and every
+cascade is refused in a way indistinguishable from the trigger doing its job.
+`Repository.destroyMessages` is the only setter, and `retention.itest.ts` asserts the
+flag's value on both sides of a real destroy rather than asserting the statement was
+issued.
+
+**Reversal condition.** A separate non-superuser role for the api makes privilege the
+mechanism and this exception unnecessary — ADR-35's own reversal condition, unchanged by
+this ADR.

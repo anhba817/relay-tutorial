@@ -992,6 +992,16 @@ export const series: Part[] = [
         sourceDoc: "docs/04-srs.md, docs/05-sad.md, docs/06-adr-deep-dives.md, docs/12-part-4-structure.md",
         readerMinutes: 35,
       },
+      {
+        id: "4.20",
+        path: "/part-4/chapter-20/the-messages-that-expire",
+        title: "The messages that expire",
+        status: "published",
+        readerProduces:
+          "A retention policy a customer sets, a sweep that enforces it, and the two sentences the platform refuses to write. FR-MOD-06 asks for configurable retention with expired messages hard-deleted by a scheduled job, and the premise check found NONE of its three obligations met \u2014 the inverse of the chapter before it. The column had existed since chapter 2.1 and was set on 0 of 33,051 environments; nothing read it; and the hard deletion the clause names was refused by this platform's own schema on 5,495 messages. You will meet that refusal as a pincer: the foreign key stops the parent, the append-only trigger the previous chapter built stops the children, and `ON DELETE CASCADE` is refused as well \u2014 because a cascade issues an ordinary DELETE and a row trigger fires on it, which is the measurement that decides the whole design. The only thing that works unchanged is the bypass the previous chapter published as the limit of its own guarantee. So the products are a narrow auditable exception and a new ADR, and the ADR's first decision is a reading rather than a mechanism: three documents reserve hard deletion for the compliance path and the constitution's own word is PATH where the SRS said ENDPOINT, so the rule hardest to change is the one that already permitted this. What the chapter cannot do is run the sweep: there is no scheduler, this is the fourth clause bounded by its absence, and it is the first one where the absence is a customer telling an auditor that data does not exist",
+        sourceDoc: "docs/04-srs.md, docs/05-sad.md, docs/06-adr-deep-dives.md, docs/12-part-4-structure.md",
+        readerMinutes: 35,
+      },
     ],
   },
   {

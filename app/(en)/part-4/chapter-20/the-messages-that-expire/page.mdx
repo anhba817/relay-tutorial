@@ -1,0 +1,504 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import {
+  figThePincer,
+  figTwoPaths,
+  figTheSweep,
+  figTwoPopulations,
+} from "./figures";
+
+export const metadata = {
+  title: "The messages that expire — Building Relay",
+  description:
+    "FR-MOD-06 asks for configurable retention with expired messages hard-deleted by a scheduled job. None of its three obligations was met, and the deletion it requires was refused by the platform's own schema.",
+  alternates: {
+    canonical: "/part-4/chapter-20/the-messages-that-expire",
+    languages: {
+      en: "/part-4/chapter-20/the-messages-that-expire",
+      vi: "/vi/part-4/chapter-20/the-messages-that-expire",
+    },
+  },
+};
+
+<ChapterHeader id="4.20" />
+
+Pick any message that has ever been edited. Try to destroy it.
+
+```bash
+docker compose exec -T postgres psql -U relay -d relay -c "
+BEGIN;
+DELETE FROM messages WHERE id = (SELECT message_id FROM message_edits LIMIT 1);
+ROLLBACK;"
+```
+
+```
+ERROR:  update or delete on table "messages" violates foreign key constraint
+        "message_edits_message_id_fkey" on table "message_edits"
+```
+
+Fine — the child rows are in the way. Delete those first.
+
+```bash
+docker compose exec -T postgres psql -U relay -d relay -c "
+BEGIN;
+DELETE FROM message_edits WHERE message_id = (SELECT message_id FROM message_edits LIMIT 1);
+ROLLBACK;"
+```
+
+```
+ERROR:  message versions are append-only (FR-MSG-07)
+```
+
+That is the trigger you wrote one chapter ago. You are now standing between two
+refusals you installed yourself, and the requirement you are trying to satisfy is
+this one:
+
+> **FR-MOD-06** — Configurable message retention per environment (30 / 90 / 365
+> days / indefinite) shall be supported, with expired messages **hard-deleted** by
+> a scheduled job.
+
+Five thousand four hundred and ninety-five messages on the development lane own at
+least one version row. Not one of them can be removed.
+
+## Run the premise before you write the chapter
+
+The chapter before this one opened the same way and found the opposite. `docs/12`
+§7.5 told it to check FR-MOD-01's premise first, and four of that clause's five
+obligations turned out already built. Here the check inverts. FR-MOD-06 has three
+obligations and the platform has none of them.
+
+```bash
+docker compose exec -T postgres psql -U relay -d relay -t -A -c "
+select count(*) from environments;
+select count(*) from environments where retention_days is not null;"
+```
+
+```
+33051
+0
+```
+
+The column is not missing. `environments.retention_days` was declared in chapter
+2.1, named in the SRS's entity table and in the SAD's schema, and set on **zero of
+33,051 environments** in the seventeen chapters since. Nothing reads it. There is
+no scheduler of any kind — you will come back to that. And the verb the clause
+uses is refused by the database.
+
+A requirement that names a column, where the column exists and is empty, is a
+particular kind of unbuilt. Nobody declined to build it. It was declared and then
+nothing arrived to use it, and the absence left no trace anywhere except in the
+count above.
+
+## The refusal is a pincer, and it has a third jaw
+
+The two errors you just saw suggest an obvious fix: make the foreign key cascade,
+so deleting the message takes its version rows with it. Try it.
+
+```bash
+docker compose exec -T postgres psql -U relay -d relay -c "
+BEGIN;
+ALTER TABLE message_edits DROP CONSTRAINT message_edits_message_id_fkey;
+ALTER TABLE message_edits ADD CONSTRAINT message_edits_message_id_fkey
+  FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE;
+DELETE FROM messages WHERE id = (SELECT message_id FROM message_edits LIMIT 1);
+ROLLBACK;"
+```
+
+```
+ERROR:  message versions are append-only (FR-MSG-07)
+SQL statement "DELETE FROM ONLY "public"."message_edits"
+               WHERE $1 OPERATOR(pg_catalog.=) "message_id""
+```
+
+Read the second line. Postgres has told you exactly what happened: the cascade
+**generated a `DELETE` statement**, and your trigger fired on it.
+
+<Trap title="A cascade is not a privileged path">
+
+It is easy to read `ON DELETE CASCADE` as something the database does *underneath*
+constraints and triggers — a structural consequence of removing the parent rather
+than an operation in its own right. It is not. A cascade issues an ordinary
+`DELETE` against the child table, and a `FOR EACH ROW` trigger fires on it like any
+other.
+
+The error above is the only reason this is obvious rather than mysterious: it
+quotes the generated statement. Had the trigger been written to log and return
+rather than to `RAISE`, the cascade would have silently done nothing and the parent
+delete would have failed on the foreign key again — the same error as the first
+attempt, from a completely different cause.
+
+This is why the migration in this chapter changes the delete action **and** the
+trigger in one file. A cascade without the exception deletes nothing and fails
+louder than before; an exception without the cascade leaves the foreign key
+refusing the parent. Both, or neither.
+
+</Trap>
+
+<Figure caption="Three ways round the refusal, and the only one that works is the one you must not use." code={figThePincer} />
+
+There is a fourth thing to try, and it works:
+
+```bash
+docker compose exec -T postgres psql -U relay -d relay -c "
+BEGIN;
+SET LOCAL session_replication_role = replica;
+DELETE FROM message_edits WHERE message_id = (SELECT message_id FROM message_edits LIMIT 1);
+ROLLBACK;"
+```
+
+```
+DELETE 1
+```
+
+That is not a discovery. It is the bypass the previous chapter **published** as the
+limit of its own guarantee — ADR-35 says the audit log is immutable *to the
+application and to accident, and not to somebody holding the database password*,
+and that setting is the password-holder's door. Using it here would make this
+platform's own retention sweep the first caller of a hole it documented as the
+reason its claim is scoped. It also disables every trigger in the session, which is
+wider than one table and one verb.
+
+So the mechanism has to be narrower than that, and the chapter's first product is
+not a mechanism at all.
+
+## Three documents forbid what the fourth requires
+
+Before any of this can be built, there is a conflict to resolve, and it is not
+visible from FR-MOD-06. It is visible from the clauses beside it.
+
+```
+constitution II   hard deletion exists ONLY ON THE COMPLIANCE PATH
+FR-MSG-08         Hard deletion shall occur ONLY VIA THE COMPLIANCE DELETION ENDPOINT
+DR-06             Deleted messages shall RETAIN THEIR ROW
+FR-MOD-06         expired messages HARD-DELETED by a scheduled job
+```
+
+Three sentences reserve the verb and the fourth requires it. No reading makes all
+four true as written, and a chapter that builds the sweep without noticing has
+quietly broken the first three.
+
+The resolution turns on one word. **The constitution says `path`. FR-MSG-08 says
+`endpoint`.** A retention policy exists because a customer promised an auditor that
+data would not outlive a period — which is the same kind of obligation FR-MOD-04's
+erasure endpoint discharges, arriving on a schedule instead of on a request. Under
+the constitution's own wording, a retention sweep is a compliance path.
+
+<Figure caption="The broadest rule is the one that already permitted this. The two narrower ones moved." code={figTwoPaths} />
+
+<Why title="Why amend the SRS and not the constitution">
+
+The instinct runs the other way: the constitution is the thing that is wrong, so
+change the constitution. Three reasons not to.
+
+**A feature has no authority to amend a principle.** That is a separate, explicit
+act, and the governance clause says so. If a chapter can edit the constitution when
+the constitution is inconvenient, the constitution is a comment.
+
+**It did not need amending.** Its text already admits this reading. What was
+stricter was FR-MSG-08, which narrowed `path` to `endpoint` without saying it was
+narrowing anything — probably because at the time there was only one path and the
+two words meant the same thing. They stopped meaning the same thing the moment a
+second one existed.
+
+**The direction that loses least is downward.** Amending two clauses to match a
+principle keeps the principle load-bearing. Amending the principle to match a
+chapter makes the next conflict easier to resolve the same way.
+
+The option this deliberately refuses is worth naming, because it is the one a
+careful reader will think of and it is the trap. **Soft expiry** — clear `text` and
+`attachments`, keep the row — satisfies all three reserving clauses *word for
+word*, needs no ADR, needs no migration beyond an `UPDATE`, and breaks nothing. It
+is also the only option that leaves a compliance team believing data is gone while
+the row is still in the table. FR-MOD-06 says *hard-deleted*, and a tombstone is
+precisely what expiry is not.
+
+</Why>
+
+That decision, and the mechanism below, are **ADR-36**. It supersedes ADR-35's
+scope clause for `message_edits` rather than editing it, because an accepted ADR is
+immutable: the scope for that table becomes *immutable to the application except
+one named path, and to accident*. The audit log's scope does not move.
+
+## The exception names its one deleter
+
+```sql
+CREATE OR REPLACE FUNCTION message_edits_refuse_write() RETURNS trigger AS $$
+BEGIN
+  IF TG_OP = 'DELETE' AND current_setting('relay.expiring', true) = 'on' THEN
+    RETURN OLD;
+  END IF;
+  RAISE EXCEPTION 'message versions are append-only (FR-MSG-07)'
+    USING ERRCODE = 'restrict_violation';
+END;
+$$ LANGUAGE plpgsql;
+```
+
+`TG_OP = 'DELETE'` is part of the condition rather than an optimisation. Expiry
+destroys a row and never rewrites one, so an `UPDATE` stays refused **with the flag
+set**. The immutability of a version's content is not what this chapter gives up —
+only the immutability of its existence, and only on one path.
+
+Measure all three directions rather than the one that passes:
+
+```
+UPDATE, flag SET            refused
+DELETE child, flag unset    refused
+DELETE message, flag set    DELETE 1, and the child rows go 1 -> 0
+```
+
+The flag is set with `SET LOCAL`, inside the transaction that deletes. That word is
+the entire guarantee, and both ways of getting it wrong are silent in opposite
+directions.
+
+<Trap title="One keyword, two silent failures">
+
+Drop `LOCAL`:
+
+```sql
+BEGIN; SET relay.expiring = 'on'; COMMIT;
+-- a later, unrelated transaction on the same pooled connection:
+SELECT current_setting('relay.expiring', true);   --  on
+DELETE FROM message_edits WHERE …;                --  DELETE 1
+```
+
+The api runs a connection pool. A connection returned to it with the flag still set
+serves every subsequent request with the append-only guarantee off, until it is
+recycled. Nothing logs this and no test that only checks the sweep would see it.
+
+Keep `LOCAL` but forget the transaction:
+
+```sql
+SET LOCAL relay.expiring = 'on';
+```
+
+```
+WARNING:  SET LOCAL can only be used in transaction blocks
+```
+
+A **warning**, not an error. The flag is never set, every cascade is refused, and
+the symptom — *expiry does not work* — is indistinguishable from the trigger doing
+its job correctly.
+
+Neither failure changes an exit code and neither changes a counted line. The only
+assertion that tells them apart reads the **value**: `retention.itest.ts` checks
+`current_setting` on both sides of a real destroy, and the destroy itself proves the
+flag reached the trigger, because a message owning a version row cannot be deleted
+any other way.
+
+The trigger is written once. The `SET LOCAL` is written at every call site. That
+asymmetry is where the failure will come from.
+
+</Trap>
+
+## The sweep, and the word the platform cannot honour
+
+```
+pnpm --filter @relay/api exec node dist/retention/sweep.js [--dry-run]
+```
+
+<Figure caption="One query per environment, the bound computed in the application, the reference check after the delete." code={figTheSweep} />
+
+Two things about the shape are worth the measurement that produced them.
+
+**The bound is a constant, computed per environment.** Written instead as one join
+across every environment, the age predicate lands in a `Join Filter` and discards
+every message in the policied one — `Rows Removed by Join Filter: 1018`, 617
+buffers. Per environment it is 73 and the planner reaches
+`channels_environment_last_activity`.
+
+That is a real difference in plan shape and it is **not** a speedup. 546 of those
+617 buffers are a sequential scan of all 33,051 environments looking for the ones
+with a policy — and the per-environment form pays that too, as its first step. End
+to end, with one environment policied, the two come to 617 and 619. What the chosen
+shape buys is pageability, re-runnability and a predicate the planner can push into
+an index. None of those is a ratio, and publishing the ratio would have published
+the wrong variable.
+
+**Both indexes were measured before being added**, because an earlier chapter added
+the index its query obviously needed and bought a gap inside the run-to-run spread
+for 49% more storage.
+
+```
+environments (id) WHERE retention_days IS NOT NULL
+    546 buffers · 1.346 ms   ->   1 buffer · 0.018 ms      8,192 bytes
+
+messages (channel_id, created_at)
+     73 buffers · 4.226 ms   ->  38 buffers · 0.141 ms     7,992 kB
+     created_at moves from `Filter:` to `Index Cond:`
+```
+
+The first is 8 kB because it is partial: a btree over the unfiltered column would
+index 33,051 NULLs. The second costs a third of the table's size, and the
+justification is the second line rather than the ratio — the predicate reaching an
+`Index Cond` means the sweep's cost is linear in what expired, not in everything the
+tenant has ever sent.
+
+And then the part the chapter cannot build.
+
+> *with expired messages hard-deleted by **a scheduled job***
+
+There is no scheduler in this platform. Not a cron, not a timer, not a queue with a
+delay. This is the **fourth** clause bounded by that absence — FR-ANL-06's daily
+reconciliation, DR-17's storage comparison and FR-MOD-03's retention year came
+first — and the earlier decision not to build one still holds for the same reason it
+did then.
+
+But this clause is a different kind of sentence from the other three, and the
+difference is worth more than the count. Those are **reporting obligations**: when
+a reconciliation does not run, a number drifts and somebody reads a figure that is
+slightly wrong. This one is **a customer telling an auditor that data does not
+exist**. A sweep that never runs does not make a report inaccurate. It makes a
+promise false, and the party who discovers it is not the operator.
+
+So the sweep is a command, published as a command, and **nothing in this chapter
+publishes a deadline**. No `expires_at`, no `retention_edge`, no field a client
+could read as a bound. The audit log's retention year was refused the same field for
+the same reason one chapter ago; the request log has one only because its table has
+a TTL that the database itself enforces.
+
+## The objects go too, and the population is not the one next door
+
+FR-MED-11 extends the policy to media: *expired messages delete their objects with
+them* — unless a message that has not expired still references the object, which
+FR-MSG-11 has permitted since chapter 3.24.
+
+The reverse lookup that answers *is this still referenced?* already existed.
+`unreferencedMediaIn` was written in chapter 4.15, is tested, is scoped to an
+environment, and even carries a comment saying it is called by nothing yet and that
+a later chapter is where it gets a caller. Reusing it looked free.
+
+<Figure caption="Two questions that share a query and do not share an answer." code={figTwoPopulations} />
+
+It answers a different question. Its candidates are *every object in this
+environment older than a bound that no message references* — which includes objects
+**nothing ever attached**. On the development lane that is 48 objects in a single
+environment. Those are FR-MED-10's orphans, the 24-hour reaper's population, and a
+retention policy has nothing whatever to do with them. A sweep calling that function
+destroys a tenant's never-attached uploads under a thirty-day message policy.
+
+What is reusable is its second query — the containment check — extracted so each
+caller brings its own candidate list. The sweep brings the `media_id` values of the
+messages it has just destroyed, read off the jsonb **before** the delete, because
+afterwards both the rows and the ids are gone. The reference check runs **after**,
+because an object referenced only by expired messages is unreferenced only once they
+are.
+
+<Why title="Why the batched OR reaches the index when a batched OR usually does not">
+
+The containment check is issued for up to a hundred candidates at once, as a chain
+of `OR`ed `@>` predicates. Chapter 4.18 found that a keyset cursor written as an
+`OR` chain is not a keyset cursor at all — it lands in a `Filter:` and re-walks
+every earlier page — so the reasonable fear is that this one does the same.
+
+It does not, and the reason is the kind of predicate rather than the `OR`:
+
+```
+BitmapOr
+  -> Bitmap Index Scan on messages_attachments_gin   (x100)
+976 buffers · 15.2 ms · about 9.8 buffers an object
+```
+
+A cursor's comparison is a range over ordered columns, and the planner cannot turn a
+disjunction of those into one index traversal. A containment test against a GIN
+index is a lookup by value, and a disjunction of lookups is exactly what a
+`BitmapOr` is for.
+
+The thing that *does* break the index here is the one chapter 4.12 measured: an
+operand the planner cannot see before the join. Written set-wise — `NOT EXISTS (…
+@> … o.id …)` — the same index sits idle under a parallel sequential scan at 3,423
+buffers and 127.9 ms, against 107 for a single bound lookup.
+
+The rule that transfers is not *avoid `OR`*. It is: **check what the planner did,
+per table, and look for `Index Cond` rather than `Index Scan`.**
+
+</Why>
+
+Destroying the object row takes its renditions with it — chapter 4.15 gave a
+rendition's reachability to a composite foreign key with `ON DELETE CASCADE`
+precisely so no caller has to keep two deletes in step — then the bytes go, one
+store request each, and a `deleted` storage event is published with a **negative**
+`bytesDelta`.
+
+That event matters more than it looks. The operational quota is a
+`sum(declared_bytes)` over rows, so deleting the row corrects it automatically and
+every operational assertion stays green. The analytical meter is a sum of **events**
+and does not self-correct. Without the publish, a tenant is charged for bytes that
+no longer exist, permanently, and the reconciliation built two chapters ago
+attributes the gap to reservations. The asymmetry is what makes it easy to skip.
+
+## What it costs, and why the number is about media
+
+Backdated fixtures, each to its own instant, measured through the sweep end to end:
+
+```
+messages  objects  pages   total       per message
+   200        0      1       8.5 ms     0.043 ms
+   600        0      2      19.9 ms     0.033 ms
+   200       50      1     137.8 ms     0.689 ms
+   200      200      1     419.0 ms     2.095 ms
+```
+
+A message costs about **0.04 ms** to destroy and a media object about **2.05 ms** —
+roughly fifty times as much. The cost of a sweep is a fact about how much media
+expired rather than how many messages did, and the reason is structural: the object
+store has no foreign keys, so every object is a separate round trip while every
+message is part of one statement.
+
+Every figure there is from a fixture this chapter backdated. **Nothing on the
+development lane is thirty days old** — the oldest message is 2026-09-14 — so the
+figure a reader would most want, what a sweep removes from real traffic, cannot be
+measured here at all. Saying that is the difference between a measurement and a
+claim.
+
+<Checkpoint>
+
+- `PATCH /v1/environments/{id}` sets 30, 90, 365 or `null`, and refuses 45
+- an omitted field and an explicit `null` are different requests
+- an unknown field is a 400, not a silently ignored key
+- a user token is 403; another tenant's environment is 404 and indistinguishable
+  from one that does not exist
+- the sweep destroys expired messages, their version rows, their sole-referenced
+  objects and those objects' renditions and bytes
+- a shared object survives; an environment with no policy loses nothing at any age
+- running it twice destroys nothing the second time
+- `UPDATE` on a version row is still refused, flag or no flag
+
+</Checkpoint>
+
+## What this chapter could not do
+
+**It cannot run the sweep.** No scheduler exists, this is the fourth clause bounded
+by that, and the chapter publishes the command rather than implying a timer.
+
+**It cannot say what expiry costs on real data**, because nothing here is old
+enough to expire.
+
+**It cannot bound a single run.** Whether a sweep that would destroy a million rows
+should stop and resume is a real question and the corpus cannot inform it, so it
+loops to exhaustion and the limit is recorded as a known shape rather than guessed
+at.
+
+**There is no undo, and the clause that would have been one is two rows above
+FR-MOD-06 and unbuilt.** FR-MOD-05 asks for a tenant export as newline-delimited
+JSON. A customer who sets thirty days and later wants last quarter has no supported
+way to have taken a copy first. Naming the clause is the honest version of *no
+undo*.
+
+**An audit entry can now outlive the message it names.** 1,435 entries name a
+message target, there is no foreign key between the tables, and nothing refuses the
+deletion. Repairing it means either letting an audit entry block a compliance
+deletion, or deleting from an append-only log — narrowing a guarantee twice in two
+chapters for a cosmetic fix. The log records what a moderator did; it was never a
+copy of what they did it to.
+
+<ForwardRef>
+
+Row 22 is the erasure chapter — FR-MOD-04 and FR-MED-10, the end-user erasure
+endpoint and the 24-hour orphan reaper. It inherits two things from here: the
+second compliance path is already named in FR-MSG-08, and `unreferencedMediaIn` is
+still waiting for the caller its comment has been promising since chapter 4.15.
+
+</ForwardRef>
+
+<ChapterFooter id="4.20" />

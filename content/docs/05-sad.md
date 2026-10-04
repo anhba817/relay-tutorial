@@ -486,7 +486,12 @@ CREATE TABLE environments (
     application_id  UUID NOT NULL REFERENCES applications(id),
     kind            TEXT NOT NULL CHECK (kind IN ('development','production')),
     signing_secret  TEXT NOT NULL,          -- envelope-encrypted (NFR-SEC-02)
-    retention_days  INT,
+    retention_days  INT
+        CHECK (retention_days IS NULL OR retention_days IN (30, 90, 365)),
+        -- FR-MOD-06, bounded in 4.20. The clause ENUMERATES four options rather
+        -- than describing a range, so 45 is not a stricter policy somebody chose.
+        -- NULL is indefinite. Declared in 2.1, read by nothing for seventeen
+        -- chapters, set on 0 of 33,051 rows when the sweep was finally written.
     quota_config    JSONB NOT NULL DEFAULT '{}'
 );
 
@@ -555,7 +560,11 @@ CREATE UNIQUE INDEX messages_idem
     WHERE idempotency_key IS NOT NULL;                      -- DR-03
 
 CREATE TABLE message_edits (                                -- built in 3.23
-    message_id  UUID NOT NULL REFERENCES messages(id),
+    message_id  UUID NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                                                            -- 4.20: a version row
+                                                            -- must not outlive its
+                                                            -- message, and the cascade
+                                                            -- alone changes NOTHING
     edited_at   TIMESTAMPTZ NOT NULL,
     prior_text  TEXT NOT NULL,                              -- FR-MSG-07
     ended_by    TEXT NOT NULL,                              -- 4.19: 'edit' | 'deletion'
@@ -568,6 +577,13 @@ CREATE TABLE message_edits (                                -- built in 3.23
 -- `BEFORE UPDATE OR DELETE` trigger refuses both verbs. Two bypasses remain and are
 -- published rather than omitted: `SET session_replication_role = replica` and
 -- `DROP TRIGGER`.
+--
+-- AND ONE NAMED EXCEPTION SINCE CHAPTER 4.20 (ADR-36). The function returns OLD when
+-- `TG_OP = 'DELETE' AND current_setting('relay.expiring', true) = 'on'`, which the
+-- retention sweep sets with `SET LOCAL` inside the transaction that deletes. The
+-- cascade above needs it: a cascade issues an ordinary DELETE and a row trigger fires
+-- on it, so `ON DELETE CASCADE` was refused by this very trigger until the exception
+-- existed. An UPDATE stays refused with the flag set.
 CREATE TRIGGER message_edits_append_only
   BEFORE UPDATE OR DELETE ON message_edits
   FOR EACH ROW EXECUTE FUNCTION message_edits_refuse_write();
@@ -687,6 +703,16 @@ is the one change that would move both; it is ADR-35's reversal condition.
 re-measured on that table rather than assumed to transfer, and both still succeed. The
 argument, with its measurements and its reversal condition, is in
 `docs/06-adr-deep-dives.md`; this is the summary and that is the ADR.
+
+**THE SECOND TABLE'S SCOPE NARROWED ONCE, IN CHAPTER 4.20, AND THE FIRST'S DID NOT.**
+FR-MOD-06 requires expired messages to be hard-deleted and the trigger refused it — not
+only directly but through `ON DELETE CASCADE`, because a cascade issues an ordinary
+`DELETE` that a row trigger fires on. So `message_edits` now carries one named exception
+(ADR-36): `TG_OP = 'DELETE'` with a `SET LOCAL` flag the retention sweep is the only
+setter of. The scope for that table is *immutable to the application except one named
+path, and to accident*; `audit_log`'s is unchanged. **ADR-36 supersedes ADR-35's scope
+clause for `message_edits` rather than editing it**, because constitution VII makes an
+accepted ADR immutable.
 
 **And nothing prunes it.** FR-MOD-03 says one year; this platform has no scheduler (ADR-28), so
 the retention is unmet by decision and the read publishes no `retention_edge` — announcing a
@@ -2366,6 +2392,46 @@ and to accident, not to somebody holding the database password — and **NFR-SEC
 immutable trail for exactly that actor**, so the two clauses are different artifacts and only
 one of them ships here. The reversal condition is the single change that would move both: a
 separate, non-superuser role for the application.
+
+### ADR-36 — A retention sweep is a compliance path, and the trigger names its one deleter
+
+Chapter 4.20 took two decisions and the first is the one that unblocked the chapter. The
+full argument, with its measurements and its reversal conditions, is in
+`docs/06-adr-deep-dives.md`.
+
+**Decision 1 — a retention sweep IS a compliance path.** FR-MOD-06 requires expired
+messages to be hard-deleted, and three documents forbade it: constitution II reserves hard
+deletion for *the compliance path*, FR-MSG-08 said *only via the compliance deletion
+endpoint*, and DR-06 said a deleted message *retains its row*. **The constitution's own
+word is `path`, not `endpoint`** — and a retention policy exists to keep a promise a
+customer made to an auditor, which is the same kind of obligation FR-MOD-04's erasure
+endpoint serves. So the rule hardest to change is the one that already permits this, and
+the two narrower SRS clauses are amended to match rather than the constitution. There are
+exactly two compliance paths and both are named. **Rejected: soft expiry** — clear `text`,
+keep the row — which satisfies all three clauses word for word, needs no ADR, and is the
+only reading that keeps every internal rule and still tells a compliance team their data is
+gone while the row is still there.
+
+**Decision 2 — the exception is a named flag in the trigger, not a privilege.** Measured:
+the foreign key refuses the parent, `message_edits_append_only` refuses the children, and
+**`ON DELETE CASCADE` is refused too, because a cascade issues an ordinary `DELETE` and a
+row trigger fires on it** — the error names the generated statement. The only thing that
+worked unchanged was `SET session_replication_role = replica`, which is the hole ADR-35
+published as the limit of its own guarantee and which disables every trigger in the
+session. So `0025` adds `TG_OP = 'DELETE' AND current_setting('relay.expiring', true) =
+'on'`, auditable in a way the bypass is not: the condition is in the trigger's body, in a
+migration, inside the fence chain, naming one verb on one table.
+
+**THIS SUPERSEDES ADR-35's SCOPE CLAUSE FOR `message_edits` RATHER THAN AMENDING IT**,
+because constitution VII makes an accepted ADR immutable. The scope was *immutable to the
+application and to accident, and not to somebody holding the database password*; it is now
+*immutable to the application except one named path, and to accident*. `audit_log`'s scope
+is untouched.
+
+**Reversal.** Decision 1: if a later chapter needs hard deletion on a third path,
+`compliance path` has stopped being a category and the clause needs rewriting rather than
+reinterpreting. Decision 2: a separate non-superuser role makes privilege the mechanism and
+the exception unnecessary — ADR-35's own reversal condition, unchanged.
 
 ---
 
