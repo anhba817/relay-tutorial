@@ -1,0 +1,547 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import {
+  figSevenStores,
+  figTheTombstone,
+  figTheInjection,
+  figTheArms,
+} from "./figures";
+
+export const metadata = {
+  title: "Erasure, and every path it must find — Building Relay",
+  description:
+    "FR-MOD-04 asks for permanent erasure of a person's messages, memberships, profile and analytical records. One of those words fights another clause, and resolving it decides the whole design.",
+  alternates: {
+    canonical: "/part-4/chapter-21/erasure-and-every-path-it-must-find",
+    languages: {
+      en: "/part-4/chapter-21/erasure-and-every-path-it-must-find",
+      vi: "/vi/part-4/chapter-21/erasure-and-every-path-it-must-find",
+    },
+  },
+};
+
+<ChapterHeader id="4.21" />
+
+Delete a user. The platform has let you do that since Part 2.
+
+```bash
+curl -s -X DELETE "localhost:4000/v1/users/u-4821" \
+  -H "authorization: Bearer $KEY"
+```
+
+```json
+{ "external_id": "u-4821", "deleted": true }
+```
+
+Now go and look for them.
+
+```sql
+SELECT external_id, display_name, deleted_at IS NOT NULL AS deleted FROM users
+ WHERE external_id = 'u-4821';
+SELECT count(*) FROM messages WHERE user_id = (SELECT id FROM users WHERE external_id = 'u-4821');
+SELECT count(*) FROM usage_active_users WHERE user_id = (SELECT id FROM users WHERE external_id = 'u-4821');
+```
+
+```
+ external_id | display_name | deleted
+ u-4821      |              | t
+
+ count
+   143
+
+ count
+    22
+```
+
+The row is there. The messages are there. The billing rows are there. And their
+name — the one the customer chose, the one that is very often an email address —
+is sitting in the first column, unchanged.
+
+**Nothing here is broken.** Every one of those is a clause working exactly as
+written. That is what makes this chapter different from the four before it: there
+is no error to open on, no refusal, no red. There is a verb that does what it says
+and a requirement that wants a different verb entirely.
+
+## The clause, and the word in it that fights
+
+> **FR-MOD-04** — The system shall provide an endpoint that permanently erases
+> all data for a specified end user — messages, memberships, profile, and
+> analytical records — completing within 30 days and returning a completion
+> receipt.
+
+Four obligations. Three of them are work and one of them is an argument.
+
+The endpoint does not exist, so that is work. The receipt is the clause's least
+defined phrase and we will come back to it, because a `204 No Content` satisfies
+the grammar and tells a compliance officer nothing. The thirty days we will
+dispose of in a sentence at the end.
+
+The argument is in the second obligation, and specifically in its first noun.
+
+> **FR-USR-05** — Deleting a user shall remove profile data and memberships while
+> **preserving their messages as authored by a deleted user**, unless message
+> deletion is explicitly requested.
+
+One clause says erase the messages. The other says keep them. Both are in the
+specification, both were written deliberately, and the platform currently
+implements the second.
+
+<Why title="Why this is not resolved by the word 'unless'">
+
+FR-USR-05 has an escape hatch — *unless message deletion is explicitly
+requested* — and the tempting reading is that FR-MOD-04 *is* that request. Then
+nothing conflicts and the erasure deletes everything.
+
+The reason to refuse that reading is what it costs somebody who is not party to
+it. A channel is a conversation between people. Destroy one participant's half
+and everybody else in that channel loses the thread of their own conversation —
+questions with no answers, answers with no questions, a meeting nobody can
+reconstruct. None of those people asked to be erased and none of them consented
+to losing their own record.
+
+So the request being honoured is removal of **a person**, not removal of **a
+conversation**. Slack takes this reading: a deactivated-and-anonymised member's
+messages stay in channel history under a de-identified account. Microsoft Teams
+takes it too, and documents the retained messages as the tenant's record rather
+than the person's.
+
+The honest cost is in the open: **erasure removes the identity, not every
+trace.** If somebody wrote their own phone number into a message, that message
+still has it, and no column-level traversal will find it. The receipt says so.
+
+</Why>
+
+So: **the messages stay and the author is erased.** Write that down, because
+everything structural in this chapter is a consequence of it and none of it is a
+consequence you would predict.
+
+## The row cannot be deleted, and that is the design
+
+Keeping the messages means `messages.user_id` keeps pointing at the user. Ask the
+database what that implies.
+
+```sql
+SELECT conname, confdeltype FROM pg_constraint
+ WHERE confrelid = 'users'::regclass AND contype = 'f';
+```
+
+```
+ conname                                   | confdeltype
+ members_user_id_users_id_fk               | a
+ read_positions_user_id_users_id_fk        | a
+ messages_user_id_users_id_fk              | a
+ media_objects_user_id_users_id_fk         | a
+ usage_active_users_user_id_users_id_fk    | a
+```
+
+`a` is `NO ACTION`. All five. Nothing cascades and nothing nulls, so while a
+single message points at that row, the row is unreachable:
+
+```
+DELETE FROM users WHERE id = '...';
+ERROR:  update or delete on table "users" violates foreign key constraint
+        "messages_user_id_users_id_fk" on table "messages"
+```
+
+A reader coming from the previous chapter will reach for `ON DELETE CASCADE` here
+and should not: 4.20 measured that a cascade issues an ordinary `DELETE`, and in
+any case a cascade would destroy the messages we have just decided to keep.
+
+**There is no step in this traversal that deletes the user's row.** Erasure
+empties it instead — profile cleared, and the name replaced. What is left is a
+tombstone: a row that exists, satisfies five foreign keys, and identifies nobody.
+
+<Figure code={figTheTombstone} caption="One decision, and everything after it follows." />
+
+## Which turns the hardest problem into the easiest one
+
+Two stores name a user in a form nothing can remove one user from.
+
+```sql
+SELECT count(*) FROM usage_active_users;
+```
+
+```
+ 22298
+```
+
+```sql
+SELECT name, type FROM system.columns
+ WHERE database = 'relay_analytics' AND name LIKE '%user%';
+```
+
+```
+ connection_events    user_external_id      String
+ message_events       user_id               Nullable(UUID)
+ daily_usage          active_users_state    AggregateFunction(uniq, Nullable(UUID))
+ daily_usage_v2       active_users_state    AggregateFunction(uniq, Nullable(UUID))
+ daily_usage_billing  active_users_state    AggregateFunction(uniq, Nullable(UUID))
+ ...four more sketch columns
+```
+
+A `uniq` sketch is a probabilistic structure with no subtract operation. You
+cannot remove one member from it; you can only rebuild it from a source, and the
+source is `message_events`, which holds zero rows and has no producer. And
+`usage_active_users` could be deleted from — but those rows are what a customer
+was invoiced for. Delete them and March's bill loses its basis, retroactively,
+because somebody exercised a privacy right.
+
+Both obvious answers cost something real. Delete the billing rows and break an
+invoice; keep them and write *partly unmet* into the specification.
+
+**Neither, and the tombstone is why.** Look at what `usage_active_users` actually
+holds:
+
+```
+ environment_id   uuid
+ period           date
+ user_id          uuid
+ first_seen_at    timestamptz
+```
+
+One column could name anybody and it is a uuid — a key into the `users` table.
+After the erasure that key resolves to a row holding nothing. So the table stops
+naming the person without being touched: both foreign keys stay satisfied, the
+primary key is undisturbed, and `count(*)` — which is the billing figure, and
+which never joins to `users` — is unchanged to the row.
+
+The same argument covers all seven sketch columns, because they hash the same
+uuid.
+
+<Why title="Why this is an ADR and not a convenience">
+
+The decision is: **a record whose only identifier is a key into an erased row
+names nobody, and counts as erased.** It is written down as ADR-37 because it is
+a rule rather than a case — every store this platform adds from now on has to
+answer *does erasure touch this?*, and the answer is now derived rather than
+judged each time.
+
+**The line it draws is keys against contents**, and it is testable rather than
+rhetorical. `messages` and `media_objects` also reference the user by key, both
+hold contents, and both were decided on their own clauses — and **they went
+opposite ways**. The messages stay. The attributed media objects are destroyed.
+A rule that decided those two the same way would not be a line, it would be a
+convenience.
+
+The reversal condition is the part worth copying. If `users.id` ever becomes
+resolvable to a person by somebody outside the platform, the rule fails. One edge
+is already known: the `GET /v1/users` listing cursor is base64 of
+`{last_activity_at, id}`, and its own comment says *"opaque is not security"*. So
+a customer who paged through before an erasure is holding the uuid. What saves it
+is that **no route accepts a user uuid as input** — every one takes the external
+id — so a retained cursor positions a listing past a row that holds nothing. The
+handle survives and points at an empty room. That is bounded, it is measured, and
+it is in the ADR rather than left for somebody to discover.
+
+</Why>
+
+## The traversal
+
+<Figure code={figSevenStores} caption="Seven stores, four answers." />
+
+Two ordering rules, and both of them are the kind you only learn by getting them
+wrong.
+
+**Collect the media ids before anything is deleted.** They live on rows the
+traversal destroys. 4.20 paid this exact bill with `media_id` values that vanished
+with the messages naming them.
+
+**Carry the external id forward.** The analytical table keys on
+`user_external_id`, and the Postgres row holding it is emptied earlier in the same
+traversal. Read it first or the last step has nothing to match on.
+
+## The predicate that was missing, and the one that defeats it
+
+The analytical delete is one statement. Here is the version that was in the design
+document for two analysis passes:
+
+```sql
+DELETE FROM relay_analytics.connection_events WHERE user_external_id = '...'
+```
+
+Ask the lane what that does.
+
+```sql
+SELECT user_external_id, uniqExact(environment_id) AS envs, count() AS rows
+  FROM relay_analytics.connection_events
+ GROUP BY user_external_id ORDER BY envs DESC LIMIT 1;
+```
+
+```
+ user_external_id | envs | rows
+ tuan             |  111 |  156
+```
+
+External ids are unique **per environment**, not globally — `(environment_id,
+external_id)` is the uniqueness constraint, and on this lane 1,576 ids are reused
+across environments. So that statement, run for one tenant's `tuan`, removes 4
+rows correctly and 152 rows belonging to 110 other tenants. **97.4% wrong.**
+
+<Why title="Why this went missing here and nowhere else">
+
+Six of the seven stores in this traversal are reached through `Repository`, whose
+constructor requires an `environment_id`. Tenant scoping is not something a
+developer remembers there — it is something the class makes true.
+
+**ClickHouse is the only store that class does not mediate**, and it is the only
+one the first draft got wrong. Constitution I's mechanism stops at exactly the
+boundary where the predicate disappeared. So the function that does the analytical
+half takes `environmentId` as an explicit parameter: the signature carrying what
+the constructor would have carried.
+
+</Why>
+
+Add the predicate and the statement looks right:
+
+```sql
+DELETE FROM relay_analytics.connection_events
+ WHERE environment_id = '...' AND user_external_id = '...'
+```
+
+Now create a user.
+
+```bash
+HOSTILE="' OR 1=1 --"
+jq -n --arg id "$HOSTILE" '{users:[{external_id:$id,display_name:"hello"}]}' |
+  curl -s -X POST "localhost:4000/v1/users" -H "authorization: Bearer $KEY" \
+       -H "content-type: application/json" --data-binary @-
+```
+
+```
+201
+```
+
+The platform accepts it. `users.schema.ts` says `z.string().min(1).max(255)` —
+any 255 characters — and the response round-trips the id unchanged. Now put that
+value into the statement above:
+
+```sql
+WHERE environment_id = '<uuid>' AND user_external_id = '' OR 1=1 --'
+```
+
+```
+ 1116
+```
+
+The whole table. Every tenant.
+
+<Figure code={figTheInjection} caption="One value, two routes into SQL." />
+
+It does not widen the scope — it **defeats** it, because `OR` binds looser than
+the `AND` chain the scope is written in. The predicate added two paragraphs ago
+is exactly what this destroys, which is worth stating plainly: **the scope and the
+binding are one fix and neither works alone.**
+
+Measured end to end, erasing one user with that external id while an interpolated
+statement is in place: `connection_events` went from **1,116 rows to 3**. One
+erasure, one user, and every other tenant's connection history on the lane.
+
+<Trap title="The published payload for this attack does not work">
+
+The feature's own research document named the hostile id as `ev'il OR 1=1 --` and
+published the row count it produced. Running the probe against that string turned
+the test red — on the wrong assertion.
+
+```
+ev'il OR 1=1 --   Code: 62. Syntax error: failed at position 144 (il)
+' OR 1=1 --       1,116 — the whole table
+```
+
+The leading quote has to **close** the literal cleanly. `'ev'il …` parses as the
+string `'ev'` followed by an identifier and dies — which an interpolating
+implementation survives as a caught error and a *store not reached* line on the
+receipt. That is a **safe** failure.
+
+**A payload that errors tests the error path; only one that parses tests the
+predicate.** A probe run against the wrong one goes red, looks like proof, and
+proves the opposite of what you wanted. The number in the research document was
+real; the string printed beside it was not the one that produced it.
+
+</Trap>
+
+Chapter 4.8 met this surface before and answered it with *a type, not an escape*:
+what left the schema there was a `Date`, and the only function that turns one into
+SQL takes a `Date`, so there was nothing to escape and nothing to forget. **A
+free-text external id has no such type.** The answer here is to give the shared
+client bound parameters — `param_<name>` against `{name:Type}` placeholders — so a
+value is substituted after parsing and can never become syntax. Extending the
+client rather than escaping at one call site, because an escape is a thing every
+future caller must remember.
+
+## The receipt
+
+```json
+{
+  "user_external_id": "u-4821",
+  "requested_at": "2026-10-04T11:52:00.000Z",
+  "completed_at": "2026-10-04T11:52:00.412Z",
+  "stores": [
+    { "store": "profile",            "outcome": "erased", "rows": 1 },
+    { "store": "memberships",        "outcome": "erased", "rows": 7 },
+    { "store": "read_positions",     "outcome": "erased", "rows": 7 },
+    { "store": "media_objects",      "outcome": "erased", "rows": 2,
+      "note": "attributed uploads only; 73.6% of objects platform-wide record no uploader" },
+    { "store": "messages",           "outcome": "retained_anonymous", "rows": 143,
+      "note": "kept: a channel's history must not lose one participant's half of every conversation" },
+    { "store": "usage_active_users", "outcome": "retained_anonymous", "rows": 22,
+      "note": "kept: usage already invoiced" },
+    { "store": "connection_events",  "outcome": "erased", "rows": 31 },
+    { "store": "api_requests",       "outcome": "nothing_to_erase",
+      "note": "this table records no user identifier" },
+    { "store": "daily_usage",        "outcome": "retained_anonymous", "rows": 0 },
+    { "store": "audit_log",          "outcome": "cannot_erase",
+      "note": "target_id holds the external id and the log is append-only" }
+  ]
+}
+```
+
+Five words, and the clause asked for none of them.
+
+<Trap title="Three of these stores removed zero rows, and they are not the same">
+
+`api_requests`, `daily_usage` and `audit_log` all come back having deleted
+nothing. A receipt that reported *0 rows erased* for each would be true three
+times and useless three times.
+
+- **`api_requests` never named them.** 205,697 rows and no user column at all —
+  chapter 4.4 decided that, and the cheapest erasure there is is the column
+  nobody collected.
+- **`daily_usage` names them by a key that now resolves to nothing.** Nothing to
+  do, and nothing left that identifies anybody.
+- **`audit_log` holds their name and cannot give it up.** That is the only one of
+  the three a compliance officer needs to act on, and it is the one a row count
+  hides most completely.
+
+The difference between *we looked and there was nothing* and *we looked and we
+cannot* is the entire reason this receipt exists.
+
+</Trap>
+
+And one outcome exists for a failure rather than a result:
+
+```
+docker compose stop clickhouse
+```
+
+```
+STATUS 200 · 53 ms
+  profile              erased
+  memberships          erased
+  connection_events    NOT_REACHED — the analytical store did not answer;
+                                     these rows may still be there
+  audit_log            cannot_erase
+```
+
+The operational half committed. A person's profile, their external id and their
+uploads are gone and cannot be put back, so rolling the transaction back because a
+metering pipeline is unwell would be the coupling constitution III exists to
+forbid. The analytical half is attempted and reported.
+
+<Why title="Why the note is two sentences and not a status code">
+
+The first version of that line read **"the analytical store answered 0"** — which
+is what the client's error object says when there was no response at all. A status
+of zero is not a status. It reports a number that does not exist, to the one
+reader least able to come and ask what it means.
+
+The unit test for this outcome asserts that a note is present and would have
+passed on the nonsense. **Only running it with the container actually stopped
+produced the string.**
+
+</Why>
+
+## The one that cannot comply, and it is not an analytical store
+
+```sql
+SELECT count(*) FILTER (WHERE target_kind = 'user') AS user_targets,
+       count(*) FILTER (WHERE target_kind = 'user'
+                          AND target_id !~ '^[0-9a-f]{8}-') AS not_a_uuid
+  FROM audit_log;
+```
+
+```
+ user_targets | not_a_uuid
+         1357 |       1357
+```
+
+Every audit entry whose target is a user holds that person's **external id**, in
+plain text. Not one holds a uuid. The log is append-only — the previous chapters
+made it so deliberately — so no operation removes one.
+
+And the erasure writes another one.
+
+That is not an oversight. FR-MOD-03's log exists so an operator can demonstrate
+that an action happened, and the entry recording this erasure is the only proof
+the erasure took place. Recording the uuid instead would protect the person and
+leave the operator unable to answer *did you honour that request?*
+
+**So the one place the name survives is the record that the name was erased.** The
+receipt says `cannot_erase` and the chapter says it out loud rather than leaving it
+for somebody to find.
+
+<ForwardRef>
+Repairing this means narrowing the append-only guarantee a second time, three
+chapters after the first. A guarantee with two exceptions is a list, so this one
+is recorded as a gap with its design rather than taken now.
+</ForwardRef>
+
+## What the tests had to be, because the obvious ones passed
+
+Four tenancy arms, each deleted on its own, both suites re-run each time.
+
+<Figure code={figTheArms} caption="Three of four changed nothing." />
+
+The one that matters is **D**. Deleting `@Accepts("application")` — the decorator
+that refuses an end-user token — turned nothing red anywhere. Chapter 4.18 found
+the same thing one route over, and there the undefended case was a read and the
+consequence was a leak. Here an end-user token that reaches this handler
+**destroys another person's data**, and every read-shaped assertion in the suite
+still passes, because there is nothing left to read.
+
+**A is a defence behind a defence**: the service resolves the external id through
+a tenant-scoped query first, so the method never receives a foreign id from any
+caller that exists today. A single-mutation probe measures the defence, not the
+arm.
+
+**B is genuinely redundant** — deleting it alone changes nothing because the
+function it calls carries its own scope, and deleting both turns 2 of 122 red in
+another suite. Two locks, and the inner one is tested.
+
+When an arm turns nothing red, the answer is the test that makes it visible, not
+the deletion that makes it honest. A and D have tests now.
+
+<Checkpoint>
+You have an endpoint that erases a person from every store that can erase them,
+a receipt that distinguishes four reasons a store removed nothing, and a rule —
+written down as an ADR — for deciding whether a new store needs erasing at all.
+</Checkpoint>
+
+## What this chapter did not do
+
+**There is no scheduler**, so the thirty-day bound is met by being synchronous:
+53 ms on its slow path, four orders of magnitude inside the clause, and therefore
+**untestable**. It is the fifth requirement in this part bounded by that absence
+and the first where the absence costs nothing.
+
+**There is no undo**, and the clause that would make one possible —
+FR-MOD-05's tenant export, two rows above the retention clause in the same
+document — is still unbuilt. It has been named by three chapters running.
+
+**There is no cross-environment erasure.** A person who exists in two of a
+customer's environments is two users here, and the receipt names the one it
+erased.
+
+**73.6% of media objects record no uploader** — 11,173 of 15,189 — because a
+server-side upload has no user to attribute. An erasure that takes the attributed
+ones is correct and cannot be complete, and the receipt carries the figure rather
+than a comment nobody reads.
+
+**And a second erasure answers 404**, not a 200 with an empty receipt. The
+external id is gone, so no user has it. A support tool retrying after a timeout
+cannot distinguish *already erased* from *never existed* — a hash on the tombstone
+would answer that, and a hash of `u-4821` or an email address is brute-forceable,
+which makes it the identity wearing a disguise. The operator's proof is the audit
+entry instead, which is the one thing this chapter could not take away.
+
+<ChapterFooter id="4.21" />

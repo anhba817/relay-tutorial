@@ -1002,6 +1002,16 @@ export const series: Part[] = [
         sourceDoc: "docs/04-srs.md, docs/05-sad.md, docs/06-adr-deep-dives.md, docs/12-part-4-structure.md",
         readerMinutes: 35,
       },
+      {
+        id: "4.21",
+        path: "/part-4/chapter-21/erasure-and-every-path-it-must-find",
+        title: "Erasure, and every path it must find",
+        status: "published",
+        readerProduces:
+          "An endpoint that erases a person from seven stores, and a receipt that names the one it cannot. FR-MOD-04 asks for permanent erasure of messages, memberships, profile and analytical records \u2014 and the chapter opens on a behaviour rather than an error: you delete a user the way the platform already lets you, and find the row, the messages and the billing rows still there, all of it correct. The hard part is the word MESSAGES. FR-USR-05 preserves them and FR-MOD-04 destroys them, both clauses are right, and the reading that resolves it is the one Slack and Microsoft Teams both take: a compliance erasure asks for removal of a person, not of a conversation. Everything else follows from that single decision. Keeping the messages means the author's row can never be deleted, because all five foreign keys refuse it \u2014 so erasure leaves a tombstone, and a tombstone is what makes every store that references the user BY KEY stop naming anybody without being touched. That is a new ADR, and it turns what was going to be the chapter's weakest limitation into its argument. You will also watch a tenant-scoped delete statement take 1,113 of 1,116 rows belonging to other tenants, because one value came out of a URL path and went into SQL unbound \u2014 and you will see the published payload for that attack fail to reproduce it, which is its own lesson about probes. The store that cannot comply is not an analytical one: it is the audit log, which holds the person's external id on every row naming them and is append-only on purpose. The erasure writes one more. The one place the name survives is the record that the name was erased",
+        sourceDoc: "docs/04-srs.md, docs/05-sad.md, docs/06-adr-deep-dives.md, docs/12-part-4-structure.md",
+        readerMinutes: 40,
+      },
     ],
   },
   {

@@ -17137,3 +17137,541 @@ this file touched after the last `check:fences`.
          // them — chapter 4.13's `shape.ts`, raised rather than lowered, and it runs in
          // the Docker-free lane because a cursor is arithmetic.
 ```
+
+## Chapter 4.21 — erasure
+
+Ten hunks across six files, placed last because the appendix applies after every
+chapter and these are the newest. Generated from `check:fences --dump`, the
+checker's own replay, and every pre-image verified to match exactly once at `-U6`
+before anything was pasted.
+
+**The bill said six files and the chain charged six, and they are not the same
+six.** `users.service.ts` is charged and `research.md`'s table has no row for it;
+`schema.ts` is not charged, because this chapter adds no column. And
+`clickhouse.ts` took the most consequential change in the chapter — bound
+parameters on a shared client — and is titled on **0 pages**, so it costs the
+chain nothing.
+
+```diff title="services/api/src/db/repository.ts"
+@@ -4451,12 +4451,159 @@
+         });
+       }
+       return true;
+     });
+   }
+ 
++  /** Erase an end user — FR-MOD-04's traversal through every Postgres store that
++   * names them. The analytical half is `users/erasure.ts`; constitution III keeps the
++   * two apart and the receipt reports them separately.
++   *
++   * **THIS IS NOT `deleteUser`, AND THE DIFFERENCE IS THE POINT.** That method is
++   * FR-USR-05's and keeps the row, the messages and the `usage_active_users` rows ON
++   * PURPOSE. This one keeps the messages and the billing rows for the same two clauses
++   * and destroys everything that identifies the person, `external_id` included.
++   * `erasure.itest.ts` asserts the two side by side so they cannot drift together.
++   *
++   * ## WHY THE ROW SURVIVES, WHICH IS THE WHOLE STRUCTURE IN ONE PARAGRAPH
++   *
++   * FR-USR-05 keeps the messages — *"preserving their messages as authored by a
++   * deleted user"* — so `messages.user_id` stays. All five foreign keys to
++   * `users` are `NO ACTION`, so the row is then unreachable: there is no "delete the
++   * row last", because there is no deleting it at all. `erasure.itest.ts`'s first test
++   * is that refusal, with a control.
++   *
++   * And that is what makes the rest legal. The row becomes a tombstone holding nothing,
++   * so every other store that references the user BY KEY — `usage_active_users`, the
++   * `uniq` sketches — stops naming anybody without being touched. One decision, three
++   * consequences, and `baseline.txt`'s T010 and T011 carry the argument.
++   *
++   * ## `external_id` IS REPLACED, NOT CLEARED, AND THE COLUMN IS WHY
++   *
++   * It is `NOT NULL` under `users_environment_id_external_id_unique`, so there is no
++   * null to write. The replacement is `erased:<users.id>` — unique by construction
++   * because the uuid is the primary key, and non-identifying for exactly the reason
++   * T011 established. **The two decisions hold each other up**: without the key
++   * argument there would be no safe value to put here.
++   *
++   * A SECOND ERASURE THEREFORE ANSWERS 404, not a 200 with an empty receipt, because
++   * no user has that external id any more. `contracts/erasure.md` carries the cost and
++   * why a hash is refused.
++   *
++   * `description` IS NOT CLEARED, for FR-004a's reason one method down: it says what a
++   * bot IS, and clearing it violates `users_bot_description_check`, which would make a
++   * bot the one kind of user that cannot be erased.
++   *
++   * RETURNS THE MEDIA ROWS rather than a count, because the caller owes a
++   * `deleteObjectWithRenditions` and a negative `deleted` storage event per object —
++   * `destroyMediaObjects`' convention, and neither is reconstructable from a number. */
++  async eraseUser(
++    userId: string,
++    userExternalId: string,
++  ): Promise<{
++    profile: number;
++    readPositions: number;
++    memberships: number;
++    messagesRetained: number;
++    activeUserRowsRetained: number;
++    media: Awaited<ReturnType<Repository["destroyMediaObjects"]>>;
++  }> {
++    // THE MEDIA IDS COME OUT BEFORE THE TRANSACTION, because `destroyMediaObjects`
++    // opens one of its own. Collecting them first is also the ordering rule
++    // `data-model.md` states: a value that lives on a row the traversal destroys has
++    // to be read before the row goes. Chapter 4.20 paid this with `media_id`.
++    const owned = await this.db
++      .select({ id: mediaObjects.id })
++      .from(mediaObjects)
++      .where(
++        and(
++          eq(mediaObjects.userId, userId),
++          eq(mediaObjects.environmentId, this.environmentId),
++          isNull(mediaObjects.parentId),
++        ),
++      );
++
++    const media = await this.destroyMediaObjects(owned.map((o) => o.id));
++
++    return this.db.transaction(async (tx) => {
++      const [alive] = await tx
++        .select({ id: users.id, deletedAt: users.deletedAt })
++        .from(users)
++        .where(and(eq(users.id, userId), eq(users.environmentId, this.environmentId)))
++        .limit(1);
++      if (alive === undefined) {
++        throw new Error(`eraseUser: no user ${userId} in this environment`);
++      }
++
++      const positions = await tx
++        .delete(readPositions)
++        .where(eq(readPositions.userId, userId))
++        .returning({ userId: readPositions.userId });
++      const memberships = await tx
++        .delete(members)
++        .where(eq(members.userId, userId))
++        .returning({ userId: members.userId });
++
++      // COUNTED, NOT DELETED. Both are `retained_anonymous` on the receipt: the rows
++      // stay under a named clause and the key they carry now resolves to a tombstone.
++      // The counts are what let the receipt say so with a number instead of a promise.
++      const retainedMessages = await tx
++        .select({ id: messages.id })
++        .from(messages)
++        .where(eq(messages.userId, userId));
++      const retainedActive = await tx
++        .select({ userId: usageActiveUsers.userId })
++        .from(usageActiveUsers)
++        .where(
++          and(
++            eq(usageActiveUsers.userId, userId),
++            eq(usageActiveUsers.environmentId, this.environmentId),
++          ),
++        );
++
++      await tx
++        .update(users)
++        .set({
++          displayName: null,
++          avatarUrl: null,
++          metadata: {},
++          externalId: `erased:${userId}`,
++          deletedAt: alive.deletedAt ?? new Date(),
++        })
++        .where(eq(users.id, userId));
++
++      // FR-013, AND THE ENTRY CARRIES THE NAME IT JUST ERASED.
++      //
++      // `targetId` is the EXTERNAL id, as every other user-target entry in this log
++      // is — 1,357 of 1,357, not one of them a uuid. Writing the uuid instead was
++      // considered and refused: this entry is the operator's only proof the erasure
++      // happened, and FR-MOD-03's log exists to demonstrate exactly that. The log is
++      // append-only (ADR-35), so the receipt reports it as `cannot_erase` and the
++      // chapter says plainly that the one place the name survives is the record that
++      // the name was erased.
++      //
++      // UNCONDITIONAL, unlike `deleteUser`'s. That method skips the entry on a second
++      // call because the user was already deleted; a second erasure cannot reach this
++      // line at all, because the external id it would be called with no longer exists.
++      await this.recordAction(tx, {
++        action: ACTION.eraseUser,
++        targetKind: "user",
++        targetId: userExternalId,
++      });
++
++      return {
++        profile: 1,
++        readPositions: positions.length,
++        memberships: memberships.length,
++        messagesRetained: retainedMessages.length,
++        activeUserRowsRetained: retainedActive.length,
++        media,
++      };
++    });
++  }
++
+   /** Write a user's profile (FR-023, FR-024).
+    *
+    * THE FIRST WRITER `users.avatar_url` AND `users.metadata` HAVE EVER HAD. Both columns
+    * have been in the schema since chapter 2.1 with zero references outside tests — two of
+    * the four columns this feature was specified to give readers, and giving them a reader
+    * meant giving them a writer first.
+@@ -7088,12 +7235,32 @@
+    * Called by `retention.itest.ts` only. The exception `0025` opens is one verb on one
+    * table reached one way; this is the same verb reached the other way. */
+   async deleteVersionRowsRaw(messageId: string): Promise<void> {
+     await this.db.delete(messageEdits).where(eq(messageEdits.messageId, messageId));
+   }
+ 
++  /** Delete the `users` row itself, with nothing cleared first.
++   *
++   * Called by `erasure.itest.ts` only — `listMessagesRaw`'s convention, because
++   * `eslint.config.mjs` keeps `drizzle-orm` inside this directory.
++   *
++   * IT EXISTS TO BE REFUSED. All five foreign keys to `users` are `NO ACTION`, so a
++   * row with any child anywhere is unreachable and the error names the key that
++   * stopped it. That refusal is why `eraseUser` traverses children first and the row
++   * last: the order is a correctness property rather than a preference, and the only
++   * way to show it is to try the row on its own and be told no. The control — the
++   * same statement against a user with no children — is what makes the refusal mean
++   * the keys rather than a broken call. */
++  async deleteUserRowRaw(userId: string): Promise<number> {
++    const gone = await this.db
++      .delete(users)
++      .where(and(eq(users.id, userId), eq(users.environmentId, this.environmentId)))
++      .returning({ id: users.id });
++    return gone.length;
++  }
++
+   async destroyMessages(ids: string[]): Promise<number> {
+     if (ids.length === 0) return 0;
+     return this.db.transaction(async (tx) => {
+       await tx.execute(sql`SET LOCAL relay.expiring = 'on'`);
+       const destroyed = await tx
+         .delete(messages)
+```
+
+```diff title="services/api/src/isolation/targets.ts"
+@@ -142,12 +142,24 @@
+     method: "DELETE",
+     path: "/v1/users/:externalId",
+     accepts: "application",
+     shape: "write",
+   },
+ 
++  // FR-MOD-04's erasure, and `write` for a reason the other entries here do not have.
++  // Constitution I's usual failure is a LEAK — a tenant reads what is not theirs — and
++  // this one is a LOSS. A forged erasure that answers 404 and destroys the rows anyway
++  // leaves nothing for a read-shaped assertion to find, so the attack in
++  // `gauntlet.itest.ts` asks what SURVIVED rather than what came back.
++  {
++    method: "DELETE",
++    path: "/v1/users/:externalId/data",
++    accepts: "application",
++    shape: "write",
++  },
++
+   // The ban pair, both `write`. The attack is a foreign external id: a
+   // tenant must not be able to ban another tenant's user, and the refusal is the 404 a
+   // user who does not exist in THIS environment gets — which is what they are.
+   {
+     method: "POST",
+     path: "/v1/users/:externalId/ban",
+```
+
+```diff title="services/api/src/isolation/gauntlet.itest.ts"
+@@ -1164,12 +1164,56 @@
+     // And the attacker's own row IS deleted, which is what makes the assertion above
+     // about scoping rather than about the delete failing altogether.
+     const mine = await t.attacker.repo.getUserByExternalId(shared);
+     expect(mine?.deleted_at ?? null, "the caller's own user was not deleted").not.toBeNull();
+   });
+ 
++  it("DELETE /v1/users/:externalId/data — the erasure takes one tenant's user", async () => {
++    attacked.add("DELETE /v1/users/:externalId/data");
++    // THE SAME COLLISION AS THE DELETE ABOVE, AND A HARDER ASSERTION, because
++    // constitution I's usual failure here is a LOSS rather than a leak. An erasure
++    // that answers 404 and destroys the rows anyway leaves nothing for a read-shaped
++    // assertion to find, so this one asks what SURVIVED.
++    const shared = `gauntlet-erase-${randomUUID().slice(0, 8)}`;
++    const victim = await t.victim.repo.createUser(shared, "the victim's own");
++    await t.attacker.repo.createUser(shared, "the attacker's own");
++
++    const channel = await t.victim.repo.createChannel(shared, "public");
++    await t.victim.repo.addMember(channel.id, victim.id);
++
++    const res = await fetch(`${url}/v1/users/${shared}/data`, {
++      method: "DELETE",
++      headers: { authorization: `Bearer ${t.attacker.credential}` },
++    });
++    // 200, because the attacker genuinely has a user with that id and erasing their
++    // own is the correct outcome. A 404 here would make the test pass for the wrong
++    // reason — a scoping bug and a correct refusal are the same status code.
++    expect(res.status).toBe(200);
++
++    // THE VICTIM'S USER IS STILL THERE, STILL NAMED, STILL A MEMBER. Erasure replaces
++    // `external_id`, so the victim's row is unreachable by that id if it leaked —
++    // which is why the lookup itself is the assertion.
++    const after = await t.victim.repo.getUserByExternalId(shared);
++    expect(after, "the victim's user was erased by the attacker").not.toBeNull();
++    expect(after?.display_name, "the victim's profile was cleared").toBe(
++      "the victim's own",
++    );
++    // `listMembers` returns user ids, so the membership is checked by the victim's
++    // own uuid rather than by a shape the method does not return.
++    const stillAMember = await t.victim.repo.listMembers(channel.id);
++    expect(
++      stillAMember,
++      "the victim's membership was deleted by the attacker",
++    ).toContain(victim.id);
++
++    // And the attacker's own IS gone, which is what makes the above about scoping
++    // rather than about the erasure failing altogether.
++    const mine = await t.attacker.repo.getUserByExternalId(shared);
++    expect(mine, "the caller's own user was not erased").toBeNull();
++  });
++
+   // ── the profile: a read pair and a write pair over the same path ────────────────
+   //
+   // Two routes on one path, and they take different attacks: `GET` is a read pair —
+   // the foreign external id and one that exists nowhere must be indistinguishable —
+   // and `PATCH` is a write, so the victim's own row has to be read back afterwards.
+   //
+```
+
+```diff title="services/api/src/users/users.module.ts"
+@@ -6,12 +6,19 @@
+ import { createDb, createPool, type Db } from "../db/client";
+ import { Repository } from "../db/repository";
+ import { UsersController } from "./users.controller";
+ import { UsersService } from "./users.service";
+ import type { RequestWithTenant } from "../messages/request-with-tenant";
+ import { actorFrom } from "../audit/actor";
++import { LOGGER, apiLogger } from "../logger";
++import {
++  createJetStreamPublisher,
++  ensureAnalyticsStream,
++} from "../outbox/jetstream.publisher";
++import type { Publisher } from "../outbox/publisher";
++import { ANALYTICS_PUBLISHER } from "../webhooks/analytics";
+ 
+ // The channels module's shape, for the channels module's reasons.
+ //
+ // A SEPARATE MODULE AND NOT A ROUTE ON `ChannelsController`. Five SRS clauses need
+ // routes whose subject is a user — the listing, the profile read, the upsert, the
+ // deletion, the ban — and hanging them off the channels controller would put user
+@@ -34,10 +41,25 @@
+         new Repository(
+           db,
+           req.principal?.environmentId ?? "",
+           actorFrom(req),
+         ),
+     },
++    // A FOURTH COPY OF THIS FACTORY, and `internal.module.ts` states the rule that
++    // forces it: *"a provider is visible to the module that declares it and to nothing
++    // it imports"*. 4.21's erasure destroys a user's uploads and owes a negative
++    // `deleted` storage delta for each — the operational quota recomputes from the rows
++    // and the analytical meter does not, so a skipped delta is a permanent overcount.
++    //
++    // AND DECLARING A SERVICE WITHOUT ITS PROVIDERS COMPILES, TYPECHECKS AND LINTS,
++    // then fails at the first request with `Nest can't resolve dependencies` — 4.10's
++    // finding, and the reason this module is edited at all.
++    {
++      provide: ANALYTICS_PUBLISHER,
++      useFactory: (): Publisher =>
++        createJetStreamPublisher({ ensure: ensureAnalyticsStream }),
++    },
++    { provide: LOGGER, useFactory: () => apiLogger() },
+     UsersService,
+   ],
+ })
+ export class UsersModule {}
+```
+
+```diff title="services/api/src/users/users.service.ts"
+@@ -1,10 +1,19 @@
+-import { HttpStatus, Injectable, NotFoundException } from "@nestjs/common";
++import { HttpStatus, Inject, Injectable, NotFoundException } from "@nestjs/common";
++
++import type { Logger } from "@relay/service-kit";
+ 
+ import { protocolError } from "../protocol-error";
+ import { Repository, type UserRow } from "../db/repository";
++import { LOGGER } from "../logger";
++import { deleteObjectWithRenditions, storeConfig } from "../media/store";
++import { kindOf } from "../media/kinds";
++import { publishStorageDelta } from "../metering/storage-event";
++import { ANALYTICS_PUBLISHER } from "../webhooks/analytics";
++import type { Publisher } from "../outbox/publisher";
++import { eraseFromAnalyticalStore, type StoreResult } from "./erasure";
+ import {
+   encodeCursor,
+   type ListingQuery,
+   type UpsertUsersBody,
+   type UserProfileBody,
+ } from "./users.schema";
+@@ -16,13 +25,17 @@
+  * distinction four documents got wrong for twelve analysis passes, because FR-015's
+  * "a channel the caller is not a member of MUST NOT appear in their listing" is
+  * vacuous when the caller is an application key: a key is a member of nothing and an
+  * empty list satisfied it. The requirement is about the user the PATH names. */
+ @Injectable()
+ export class UsersService {
+-  constructor(private readonly repo: Repository) {}
++  constructor(
++    private readonly repo: Repository,
++    @Inject(ANALYTICS_PUBLISHER) private readonly analytics: Publisher,
++    @Inject(LOGGER) private readonly logger: Logger,
++  ) {}
+ 
+   /** A deleted user is a 404 on every route that names them (FR-017).
+    *
+    * The row survives deletion — a message keeps its author, and `toFrame` drops a
+    * senderless row, so "authored by a deleted user" and "authored by nobody" are
+    * different states and only one of them is the clause. The marker is what makes the
+@@ -228,12 +241,110 @@
+     const user = await this.repo.getUserByExternalId(externalId);
+     if (!user) throw new NotFoundException("user not found");
+     await this.repo.deleteUser(user.id, externalId);
+     return { external_id: externalId, deleted: true };
+   }
+ 
++  /** Erase an end user from every store that can remove them (FR-MOD-04).
++   *
++   * NOT `deleteUser`, which is the method directly above and keeps the row, the
++   * messages and the billing rows on purpose. The two verbs sit next to each other
++   * here for the same reason their routes do: `contracts/erasure.md` argues that two
++   * operations differing only in what they preserve must not differ only in a flag,
++   * and side by side they are harder to confuse than in two files.
++   *
++   * A SECOND ERASURE IS A 404 AND THAT INVERTS THE OBVIOUS ANSWER. The traversal
++   * replaces `external_id`, so after the first call no user has the one in the path.
++   * `deleteUser` above goes to some trouble to answer 200 twice; this cannot, and a
++   * hash kept on the tombstone to make it possible is refused — `u-4821` and an email
++   * address are both brute-forceable, so a hash is the identity wearing a disguise.
++   * **The operator's proof is the audit entry**, which is append-only by design. */
++  async eraseUser(externalId: string): Promise<{
++    user_external_id: string;
++    requested_at: string;
++    completed_at: string;
++    stores: StoreResult[];
++  }> {
++    const requestedAt = new Date();
++    const user = await this.repo.getUserByExternalId(externalId);
++    if (!user) throw new NotFoundException("user not found");
++
++    const erased = await this.repo.eraseUser(user.id, externalId);
++
++    // THE BYTES AND THE DELTAS, OUTSIDE THE TRANSACTION AND ONE REQUEST PER OBJECT.
++    // The store has no foreign keys and nothing cascades there, and a publish inside a
++    // transaction that rolled back would emit a delta for an object that still exists
++    // — `storage-event.ts` makes both arguments. The operational quota recomputes from
++    // the rows and the analytical meter does not, which is what makes a skipped delta
++    // a permanent overcount rather than a blip.
++    for (const row of erased.media) {
++      await deleteObjectWithRenditions(
++        storeConfig(),
++        row.objectKey,
++        row.renditionKeys,
++      );
++      void publishStorageDelta(this.analytics, this.logger, {
++        environmentId: this.repo.environment,
++        mediaId: row.id,
++        cause: "deleted",
++        kind: kindOf(row.mimeType) ?? "image",
++        // NEGATIVE, AND CARRIED RATHER THAN DERIVED FROM `cause`: a reader that infers
++        // the sign puts the rule in a second place.
++        bytesDelta: -row.declaredBytes,
++        occurredAt: new Date(),
++      });
++    }
++
++    // THE ANALYTICAL HALF RUNS AFTER THE OPERATIONAL ONE HAS COMMITTED, and its
++    // failure is a receipt line rather than an exception. Constitution III: a
++    // ClickHouse outage must not roll back an erasure that has already destroyed a
++    // person's profile, their external id and their uploads.
++    const analytical = await eraseFromAnalyticalStore(
++      this.repo.environment,
++      externalId,
++    );
++
++    return {
++      user_external_id: externalId,
++      requested_at: requestedAt.toISOString(),
++      completed_at: new Date().toISOString(),
++      stores: [
++        { store: "profile", outcome: "erased", rows: erased.profile,
++          note: "display_name, avatar_url, metadata AND external_id" },
++        { store: "memberships", outcome: "erased", rows: erased.memberships },
++        { store: "read_positions", outcome: "erased", rows: erased.readPositions },
++        // THE NOTE IS THE POINT, NOT THE COUNT. `media_objects.user_id` is nullable
++        // and 73.6% of objects on this platform record no uploader — 11,173 of
++        // 15,189 — so an erasure that takes the attributed ones is correct AND
++        // incomplete. The receipt is where that gets said; a comment in the source
++        // would be true and unread by the person who needs it.
++        { store: "media_objects", outcome: "erased", rows: erased.media.length,
++          note: "attributed uploads only; 73.6% of objects platform-wide record no uploader" },
++        // NO CLAUSE IDS IN A NOTE, AND IT IS NOT A STYLE RULE. This body is read by a
++        // compliance officer at a CUSTOMER, who has no access to this platform's
++        // specification — `FR-028` in a receipt is a string they cannot resolve by
++        // any means available to them. The reason goes in words or it does not go.
++        //
++        // (And the two ids the first draft used were feature-local to the chapter
++        // that built `deleteUser`, so they do not resolve inside this repository
++        // either: there is no FR-028 in `docs/04-srs.md`. The messages clause is
++        // FR-USR-05; the billing one is an argument in `deleteUser`'s own comment
++        // and no clause at all.)
++        { store: "messages", outcome: "retained_anonymous",
++          rows: erased.messagesRetained,
++          note: "kept: a channel's history must not lose one participant's half of every conversation. The author is erased and the text is not" },
++        { store: "usage_active_users", outcome: "retained_anonymous",
++          rows: erased.activeUserRowsRetained,
++          note: "kept: usage already invoiced. The rows count a user per period and name nobody once the profile is erased" },
++        ...analytical,
++        { store: "audit_log", outcome: "cannot_erase",
++          note: "target_id holds the external id and the log is append-only (ADR-35)" },
++      ],
++    };
++  }
++
+   /** Ban and unban, tenant-wide (FR-031, FR-032).
+    *
+    * BOTH IDEMPOTENT AND BOTH 200. Banning a banned user and unbanning an unbanned one
+    * are the ordinary outcomes of a retry, and the caller's intent is satisfied either
+    * way. A 409 here would make a customer's reconciliation loop — "ensure these users
+    * are banned" — have to distinguish success from success.
+```
+
+```diff title="services/api/src/users/users.controller.ts"
+@@ -138,12 +138,33 @@
+   /** Delete a user, keeping their row and their messages (FR-027). */
+   @Delete(":externalId")
+   async deleteUser(@Param("externalId") externalId: string) {
+     return this.users.deleteUser(externalId);
+   }
+ 
++  /** Erase a user — everything about them that any store can remove (FR-MOD-04).
++   *
++   * `/data` ON THE END, AND NOT A FLAG ON THE ROUTE ABOVE. That one is FR-USR-05's
++   * deletion and keeps the row, the messages and the billing rows on purpose. Two
++   * verbs that differ only in what they preserve must not differ only in a query
++   * parameter: a mistyped flag would be an irreversible erasure, and the path is the
++   * thing a reader of the call site sees. `contracts/erasure.md` carries it.
++   *
++   * NO `@Body()`, AND THAT IS WHY CONSTITUTION VI's FIFTH BULLET IS NOT ENGAGED rather
++   * than unmet. The bullet governs endpoints that take input; this one takes a path
++   * parameter. Measured against the bodyless `DELETE` above: `{"totally":"unknown"}`
++   * and `{}` answer identically, because no decorator exists to parse either.
++   *
++   * THE CREDENTIAL IS THE CLASS'S DECISION, not a branch in here. `@Accepts(
++   * "application")` at the top of this file refuses a user token before the handler
++   * runs — which chapter 4.18 found is the arm nothing had tested, one route over. */
++  @Delete(":externalId/data")
++  async eraseUser(@Param("externalId") externalId: string) {
++    return this.users.eraseUser(externalId);
++  }
++
+   /** The ban pair (FR-031).
+    *
+    * TWO ROUTES ON ONE PATH RATHER THAN A `PATCH` WITH A BOOLEAN. `POST …/ban` and
+    * `DELETE …/ban` say what they do in the method, and a customer's reconciliation loop
+    * can issue either without reading the current state first. A `{"banned": false}` body
+    * would be a second way to spell the same thing.
+```
