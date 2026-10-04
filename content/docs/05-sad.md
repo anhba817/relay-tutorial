@@ -718,6 +718,41 @@ accepted ADR immutable.
 the retention is unmet by decision and the read publishes no `retention_edge` — announcing a
 boundary nothing enforces is worse than announcing none.
 
+**AND THE LOG IS WHAT COMPLIANCE ERASURE CANNOT REACH (chapter 4.21).** `audit_log.target_id`
+holds the user's EXTERNAL id — measured at **1,357 of 1,357 user-target rows, not one of them a
+uuid** — so FR-MOD-04's erasure, which destroys every other trace of a person, writes one more
+entry naming them. That is deliberate: the entry is the operator's only proof the erasure
+happened, and FR-MOD-03's log exists to demonstrate exactly that. **The one place the name
+survives is the record that the name was erased.** The receipt reports it as `cannot_erase`
+rather than omitting it, and narrowing ADR-35 a second time was refused — a guarantee with two
+exceptions three chapters apart is a list, not a guarantee (`gaps.md` 067-1).
+
+## ADR-37 — A key into an erased row is not personal data
+
+**Summary.** `users.id` is an internal uuid that the platform exposes nowhere a caller can act
+on. When FR-MOD-04's erasure empties a user's row — profile cleared, `external_id` replaced with
+`erased:<users.id>` — every store that references that user **by key alone** stops naming
+anybody, without being touched. So `usage_active_users` keeps all its rows with its `count(*)`
+unchanged to the row, and the seven `AggregateFunction(uniq, Nullable(UUID))` sketch columns
+need no subtract operation, which is as well because none exists.
+
+**The line is keys against contents**, and it is testable rather than rhetorical: `messages` and
+`media_objects` also reference the user by key, hold CONTENTS, and were decided on their own
+clauses — **and they went opposite ways**. A photo is personal data whatever key it hangs from.
+
+**Why the tombstone is available at all.** FR-USR-05 preserves the messages, so
+`messages.user_id` stays, so all five `NO ACTION` foreign keys make the row undeletable. The
+constraint and the decision are the same fact.
+
+**Reversal condition.** If `users.id` ever becomes resolvable to a person by a party outside the
+platform, this rule fails and every uuid-keyed store is decided on its own merits again. **One
+live edge is already known and bounded**: the `GET /v1/users` listing cursor is base64 of
+`{a, id}` and its own comment says *"opaque is not security"*, so a customer who paged before an
+erasure holds the uuid. No route accepts a user uuid as input — the controller takes
+`:externalId` — so a retained cursor positions a listing past a row that holds nothing.
+
+The argument is in `docs/06-adr-deep-dives.md`; this is the summary and that is the ADR.
+
 **Hot-path indexes:** history pagination (FR-MSG-09) is a pure index-order scan over
 `(channel_id, sequence)` — the composite index's leftmost-prefix behaviour is exactly what
 cursor pagination wants. That ordering is already supplied by DR-01's
@@ -903,8 +938,18 @@ The clause names its quantity now; the column is still empty (`gaps.md` 048-2). 
 kept as the shape; chapter 4.2 carries the nullability and the measurements behind it.
 
 No message text anywhere in this store (DR-08 / FR-ANL-11) — the compliance erasure
-endpoint (FR-MOD-04) deletes analytical rows by `user_id` mutation, which is tolerable
-precisely because it is rare and content-free.
+endpoint (FR-MOD-04) deletes analytical rows, which is tolerable precisely because it is
+rare and content-free.
+
+**TWO THINGS IN THAT SENTENCE WERE WRONG BY CHAPTER 4.21 AND BOTH MATTER.** It is not a
+**mutation**: `ALTER TABLE … DELETE` returns with its rows still countable, so a receipt
+built on it reports an intention, and the erasure uses the lightweight `DELETE FROM`,
+which the next `SELECT` sees. And it is not by **`user_id`**: the one analytical table
+that names a user names them by `user_external_id`, and the statement must carry
+`environment_id` as well — an external id is unique per environment, not globally, so an
+unscoped delete of the lane's worst id takes 152 rows from 110 other tenants against 4
+correctly. **Both predicates are bound parameters**, because a free-text external id
+interpolated into that statement defeats the tenant scope outright.
 
 **AND THE API REQUEST LOG, ADDED IN REVISION 1.4.** `relay_analytics.api_requests` carries
 FR-ANL-07's 30-day retention beside `webhook_attempts`' 90 — a second table rather than more
@@ -1091,8 +1136,10 @@ their own for exactly this reason.
 A sixth table, `emoji_events` (DR-14), records emoji usage as `(environment_id, ts, kind,
 identifier, pack_id)` with the same partitioning and TTL. It deliberately omits `channel_id`
 and `user_id`: per-tenant-per-day aggregates (FR-EMJ-11) need neither, and omitting them
-keeps the table outside the scope of the compliance-erasure mutation entirely — an
-aggregate that cannot identify a person needs no erasing.
+keeps the table outside the scope of compliance erasure entirely — an aggregate that
+cannot identify a person needs no erasing. **ADR-37 generalises that sentence**: it is
+not only an aggregate with no identifier that needs no erasing, but any record whose
+only identifier is a key into a row erasure has already emptied.
 
 ### 6.3 Redis — ephemeral state only
 
@@ -1562,7 +1609,11 @@ Downloads: signed GET URLs minted at read time, authorised by channel membership
 (FR-MED-08), never persisted (DR-16). Relay's services handle metadata only — the original
 exclusion's cost argument (bandwidth, CDN, storage ops) is answered by not building any of
 it: object storage's durability, bandwidth, and lifecycle rules are bought, not rebuilt.
-Tenant-prefixed keys (DR-15) make erasure and export prefix operations. **Trade-off:**
+Tenant-prefixed keys (DR-15) make **tenant** erasure and export prefix operations —
+**and USER erasure is not one of them**, which chapter 4.21 had to measure rather than
+assume. The key is `{environment_id}/{media_id}` and carries no user segment, so
+FR-MOD-04's erasure of one person's uploads is a lookup in Postgres followed by one store
+request per object. DR-15's prefix is for tenants. **Trade-off:**
 presigned-URL auth is coarser than per-request auth (a leaked signed URL is valid until
 expiry — bounded at 1 h, unguessable, and never stored); upload success is observed
 asynchronously (the confirm/scan event), not synchronously. **Rejected:** proxied uploads

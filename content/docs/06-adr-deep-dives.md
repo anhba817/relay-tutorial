@@ -2609,3 +2609,108 @@ issued.
 **Reversal condition.** A separate non-superuser role for the api makes privilege the
 mechanism and this exception unnecessary — ADR-35's own reversal condition, unchanged by
 this ADR.
+
+---
+
+## ADR-37 — A key into an erased row is not personal data
+
+**Status**: accepted (feature 067, chapter 4.21, 2026-10-04)
+
+### Context
+
+FR-MOD-04 requires an endpoint that permanently erases all data for an end user,
+*analytical records* among them. Seven stores name a user. Two of them name a user in a
+form from which no single user can be removed:
+
+```
+usage_active_users    (environment_id, period, user_id, first_seen_at)   22,298 rows
+daily_usage_*         seven AggregateFunction(uniq, Nullable(UUID))      880 rows
+```
+
+The sketch has no subtract operation and recomputing it needs `message_events`, which
+holds 0 rows and has no producer. `usage_active_users` could be deleted from, and
+deleting from it would change a figure a customer has already been invoiced for.
+
+The obvious readings both cost something real. Delete the billing rows and an invoice
+loses its basis. Keep them and FR-MOD-04's *analytical records* is partly unmet, which
+has to be written into the SRS as a non-conformance.
+
+### Decision
+
+**Neither. A record whose only identifier is a key into an erased row names nobody, and
+counts as erased.**
+
+The chapter's other decision makes this available. FR-USR-05 preserves a deleted user's
+messages, so `messages.user_id` stays; all five foreign keys to `users` are `NO ACTION`;
+so the row cannot be deleted and erasure leaves it standing and empty — profile cleared,
+`external_id` replaced with `erased:<users.id>`. Four measurements then settle it:
+
+```
+the table's columns     one could name anybody, and it is a uuid
+both FKs' delete rule   NO ACTION — the tombstone keeps them satisfied
+every reader            a count(*) scoped by (environment_id, period), and a
+                        membership probe keyed on the uuid. NEITHER JOINS TO `users`
+the count afterwards    unchanged, to the row
+```
+
+The table never produced a name. It produced a number, and the uuid was only ever what
+made the number distinct.
+
+### The line this draws, and the test that it is a real one
+
+**Keys against contents.** A uuid pointing at an erased row names nobody; that says
+nothing about the VALUE on the row. `messages` and `media_objects` also reference the
+user by key and both hold contents, so both were decided on their own clauses — and
+**they went opposite ways**: the messages stay under FR-USR-05, the attributed media
+objects are destroyed under FR-MED-10. A rule that decided those two the same way would
+not be a line, it would be a convenience.
+
+What it costs is one sentence in FR-MOD-04 rather than a recorded non-conformance, and
+that sentence is the rule: *an analytical record whose only identifier is a key into an
+erased row counts as erased.*
+
+### Alternatives considered
+
+**Delete the `usage_active_users` rows.** Satisfies the clause literally and breaks
+FR-RTL-05's accounting: a customer who deleted a user in March would stop owing for
+March, retroactively, because somebody exercised a privacy right. No clause asks for
+that and the code's own comment argues against it.
+
+**Record FR-MOD-04's *analytical records* as partly unmet by decision.** Honest, and the
+fallback this project has used for FR-MED-07, FR-MED-09's rendering half, FR-MOD-03's
+year and FR-ANL-06's job. Refused because it is not true: after the erasure nothing in
+those rows identifies anybody, so recording them as un-erased would understate the
+platform rather than overstate it — the rarer and more confusing direction.
+
+**Anonymise in place with a placeholder user.** A synthetic `anonymous` row per
+environment, with the billing rows repointed at it. Costs a row nobody created, a
+primary-key collision the moment two erased users share a period, and a second kind of
+user every reader has to know about. **The tombstone already is the placeholder**, there
+is exactly one per user, and `(environment_id, period, user_id)` wants exactly that.
+
+**Hash the external id onto the tombstone** so a second erasure can still find it.
+Refused for the reason it is tempting: `u-4821` and an email address are both
+brute-forceable, so a hashed identifier is the identity wearing a disguise. The cost of
+refusing is that a second erasure answers 404 and a support tool retrying after a
+timeout cannot tell *already erased* from *never existed*; the operator's proof is the
+audit entry instead.
+
+### Reversal condition
+
+If `users.id` ever becomes resolvable to a person by a party outside the platform, this
+rule fails and every uuid-keyed store is decided on its own merits again.
+
+**One live edge is already known, measured and bounded.** `users.schema.ts`'s listing
+cursor is base64 of `{a: last_activity_at, id: users.id}`, and its own comment says
+*"OPAQUE IS NOT SECURITY. Base64 of JSON is readable by anyone who wants to read it."*
+So a customer who paged `GET /v1/users` before an erasure holds the uuid. What they can
+do with it is the measurable part: **no route accepts a user uuid as input** — the
+controller takes `:externalId` — so a retained cursor positions a listing past a row
+that now holds nothing. The handle survives and points at an empty room. If that ever
+stops being true, so does this ADR.
+
+**And one thing this ADR does not cover.** `messages.user_id` still links a person's
+retained messages to each other, so *"these were written by the same erased person"*
+stays computable. If the text names them, the text is the re-identification and not the
+key — which is the same position Slack and Microsoft Teams take, and the reason the
+receipt reports `retained_anonymous` rather than `erased`.
