@@ -17675,3 +17675,70 @@ chain nothing.
     * can issue either without reading the current state first. A `{"banned": false}` body
     * would be a second way to spell the same thing.
 ```
+
+**AND A SEVENTH FILE, ADDED AFTER THE OTHER SIX WERE PLACED.** The coverage ratchet
+gained three pins for `services/api/src/users/`, which held **zero** before this
+chapter — and `vitest.coverage.config.mts` is titled on 23 pages, so the chain went
+from 0 to 1 the moment the pins landed. **This is the file the task predicted would
+do it**, and it is why `check:fences` runs again after the ratchet and not only
+after the source.
+
+```diff title="vitest.coverage.config.mts"
+@@ -1281,12 +1281,56 @@
+         // right-hand side there and the run measured **86.95, uncovered 58, 108, 115**.
+         // Reproduced locally by setting the variable, byte for byte, and fixed by
+         // deleting it: five readers all default to `localhost`, so it changed nothing
+         // else. **The pin was right and the environment was wrong**, which is the
+         // opposite of the two pins 4.13 had to lower — and worth telling apart before
+         // reaching for the ratchet. `gaps.md` 059-22.
++        // Chapter 4.21's two new files, pinned BELOW the measured value. `session.ts`
++        // has read 87.80 and 85.36 on identical code twenty minutes apart, so a floor
++        // at the measurement is a ratchet that teaches its next reader to lower it.
++        //
++        // `erasure.ts` MEASURED 100 / 63.63 / 100 / 100 BEFORE TWO TESTS WERE WRITTEN
++        // FOR IT, which is the order the task demands: when a new file measures thin
++        // the answer is a test, not a lower number. What was uncovered was the arm
++        // where the delete returns and the rows are still there — the arm that makes
++        // the choice of ClickHouse verb matter — and the arm that names an HTTP status
++        // rather than reporting the sentinel 0 as one. Both are now driven by injected
++        // stores. A THIRD TEST FOLLOWED, AND ONLY THE PIN PROBE ASKED FOR IT: the
++        // first two took the file from 63.63% to **81.81%**, not to 100, and a pin of
++        // 90 written on the assumption of 100 would have been silently wrong in the
++        // same way a pin on an absent file is. The remaining pair were the `?? 0`
++        // fallbacks on a `SELECT count()` that always answers with a row — defensive,
++        // and covered with an injected empty store rather than pinned around, because
++        // the alternative is a lower floor justified by a sentence nobody can check.
++        "services/api/src/users/erasure.ts": {
++          branches: 90,
++          functions: 100,
++          lines: 100,
++          statements: 100,
++        },
++        // 100 / 100 / 100 / 100 measured. A controller that is six one-line
++        // delegations has no arm to miss, and pinning it is worth more than the
++        // number: `services/api/src/users/` held ZERO per-file pins before this
++        // chapter, which is 062-12's population and the reason a file can sit at
++        // 66.66% with nothing to notice.
++        "services/api/src/users/users.controller.ts": {
++          branches: 100,
++          functions: 100,
++          lines: 100,
++          statements: 100,
++        },
++        // 94.44 / 88.46 / 100 / 96 measured, pinned below each. The uncovered lines
++        // are the media loop's body — this lane's fixtures reserve slots without
++        // uploading bytes, so `deleteObjectWithRenditions` never runs here and the
++        // store round trip is measured in `baseline.txt` by hand instead.
++        "services/api/src/users/users.service.ts": {
++          branches: 85,
++          functions: 100,
++          lines: 93,
++          statements: 92,
++        },
+         "services/api/src/metering/clickhouse.ts": {
+           branches: 91,
+           functions: 100,
+           lines: 100,
+           statements: 100,
+         },
+```
