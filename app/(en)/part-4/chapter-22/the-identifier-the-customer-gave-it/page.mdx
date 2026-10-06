@@ -534,4 +534,69 @@ platform — and nobody has counted it.
 a uuid-shaped identifier. The tie-break is exercised by a test that builds the
 case, and by nothing else, which is the most that can honestly be said about it.
 
+## Debt this chapter took on, and did not pay off
+
+Shipping it turned CI red for a reason that has nothing to do with channels, and
+the diagnosis is worth more than the fix.
+
+Chapter 4.13 gave the virus scanner a healthcheck that asks the **daemon** how
+old its signature database is, rather than pinging it — because a scanner is
+only as good as what it has loaded, and `zPING` answers cheerfully from a
+fortnight-old database. It allowed seven days. What nobody knew is that
+`clamav/clamav:1.5` is a **moving tag republished every seven days**, each build
+bundling that week's database:
+
+```
+sha256:0e31ce…   built 2026-09-21   bundles Sep 21
+sha256:ebec5bc…  built 2026-09-28   bundles Sep 28
+
+bound        <= 7 days
+Sep 28 + 7    = Oct 5    CI green, day 7
+today         = Oct 6    CI red,   day 8
+```
+
+**A seven-day bound against a seven-day rebuild is zero margin.** The check
+passes for exactly one week after each rebuild and fails from the eighth day
+until the next one lands. It had been true since 4.13 and nobody had pushed on a
+day eight.
+
+Underneath it is the real fault. `freshclam` downloads the new database and then
+cannot tell the daemon:
+
+```
+daily.cld updated (version: 28145, sigs: 355726, ...)
+WARNING: Clamd was NOT notified: Can't connect to clamd through
+         /tmp/clamd.sock: No such file or directory
+```
+
+The two race at startup. When the download wins, clamd loads the fresh database
+and all is well; when clamd wins, it loads the image's bundled one and
+freshclam's daemon sleeps for hours before it would try again. So the check was
+measuring *the age of whatever clamd happened to load at container start.*
+
+The repair is three words in the healthcheck — reload the daemon when the answer
+is stale, and only then, because a reload re-reads 3,628,118 signatures and
+doing that every five seconds on a healthy container buys nothing.
+
+<Trap title="The fix is a workaround and the debt is still outstanding">
+Reloading from a healthcheck is the wrong place for it. A healthcheck is
+supposed to *observe*, and this one now repairs — which means the thing it
+reports is partly its own doing, and a future reader debugging a stale scanner
+will find the probe mutating the thing it measures.
+
+**The debt, stated so it can be paid:** the container should not need it. Either
+the image's entrypoint should order freshclam after clamd's socket exists, or
+freshclam should be configured to retry its notification, or the stack should
+build its own thin image that does. All three are upstream of this workspace and
+none of them is a channel-addressing chapter's business, which is exactly why
+this chapter took the workaround and wrote the debt down instead of pretending.
+
+And a second, smaller one underneath it: **a persisted volume hides the whole
+problem.** The development machine was green throughout, reporting a database
+its daemon had loaded from a volume while the image on disk was fifteen days
+stale. Only an empty volume ever sees it — the third time in this part of the
+book that a durable volume has concealed a defect from every local run and left
+CI to find it.
+</Trap>
+
 <ChapterFooter id="4.22" />
