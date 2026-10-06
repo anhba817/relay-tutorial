@@ -342,7 +342,7 @@ and React Native 0.72+.
 > guarantee has no red test to watch, which is why the amendment says so here rather than
 > leaving a reader to look for one.
 >
-> **FR-USR-01 still holds for bots.** *"Relay shall not generate end-user identifiers"* — a
+> **FR-USR-01 still holds for bots.** *"Relay shall not generate end-user identities"* — a
 > bot's identifier is customer-supplied like any other, and the platform invents nothing. The
 > alternative this chapter rejected was a synthetic sender the platform mints for a key, which
 > is what chapter 3.10 argued against and still argues against; a bot is a *declared* identity
