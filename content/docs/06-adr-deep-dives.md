@@ -2700,17 +2700,132 @@ audit entry instead.
 If `users.id` ever becomes resolvable to a person by a party outside the platform, this
 rule fails and every uuid-keyed store is decided on its own merits again.
 
-**One live edge is already known, measured and bounded.** `users.schema.ts`'s listing
-cursor is base64 of `{a: last_activity_at, id: users.id}`, and its own comment says
-*"OPAQUE IS NOT SECURITY. Base64 of JSON is readable by anyone who wants to read it."*
-So a customer who paged `GET /v1/users` before an erasure holds the uuid. What they can
-do with it is the measurable part: **no route accepts a user uuid as input** — the
-controller takes `:externalId` — so a retained cursor positions a listing past a row
-that now holds nothing. The handle survives and points at an empty room. If that ever
-stops being true, so does this ADR.
+**The live edge this ADR named does not exist** (feature 068, chapter 4.22). It said
+`users.schema.ts`'s listing cursor is base64 of `{a: last_activity_at, id: users.id}`
+and that a customer who paged `GET /v1/users` before an erasure holds the uuid. Three
+things measured against a running api:
+
+    GET /v1/users                            404     there is no such route
+    listingQuerySchema, consumers            one: GET /v1/users/{externalId}/channels
+    the cursor it issues, decoded            {"a": <timestamp>, "id": <a CHANNEL uuid>}
+
+The cursor is real and it carries a **channel** uuid — a value the same response
+already returns as a top-level field and every channel route accepts. The paragraph
+was right that opacity is not security and wrong about which id was inside, and it
+stood for one chapter because every reader checked the comment rather than the route.
+
+**What was live instead was a write route.** `POST /v1/channels/{channelId}/members`
+returned `members[].user_id` — the row's `users.id` — on every member added, for every
+user, erased or not. **No route accepts that value**: `GET /v1/users/{a users.id}`
+answers 404 while `GET /v1/users/{external_id}` answers 200, so a caller holding it
+held a key to nothing, and this ADR's opening sentence was false. Nothing asserted the
+field, nothing documented it and no tutorial page showed it, which is why six analysis
+passes and a chapter went past it. **4.22 removed it**, and the sentence is true now.
+
+**AND THE METHOD IS THE PART WORTH KEEPING.** The phantom came from reading; the real
+one came from enumerating every v1 response shape and asking of each value *does a
+route accept this?* Three siblings turned up and all three are kept with reasons —
+`audit_log[].id` and `audit_log[].actor.id` are record references a customer quotes
+back to support, and `request_id` is constitution V's requirement in every error body.
+Only `members[].user_id` had no answer to the question.
+
+**The exception that remains is this ADR's own argument working.** An erased user's
+`external_id` is `erased:<users.id>`, and that string surfaces wherever an identity
+does — `message.user` on 290 retained messages across 367 tombstones, and
+`member.external_id`. It is a `users.id` crossing the boundary and it **names nobody**:
+the row it keys is empty, and no route accepts it either, because a second erasure
+answers 404. The handle survives and points at an empty room — which is what the
+previous paragraph claimed about the wrong handle. If that ever stops being true, so
+does this ADR.
 
 **And one thing this ADR does not cover.** `messages.user_id` still links a person's
 retained messages to each other, so *"these were written by the same erased person"*
 stays computable. If the text names them, the text is the re-identification and not the
 key — which is the same position Slack and Microsoft Teams take, and the reason the
 receipt reports `retained_anonymous` rather than `erased`.
+
+## ADR-38 — A noun with a customer-supplied identifier is addressed by it
+
+**Status**: accepted (feature 068, chapter 4.22, 2026-10-06)
+
+### Context
+
+FR-USR-01 says *"Relay shall not generate end-user identities"* and ADR-18 says an
+end user's identity *"is whatever `external_id` the customer already had for them."*
+Both are about users. Nothing said what to do with the next noun that has one, and
+the next noun was `channels`: FR-CHN-01 took a customer-supplied identifier at
+creation, and all thirteen routes beneath `/v1/channels/{channelId}` then required a
+uuid Relay minted. A customer had to store Relay's key to post to a channel they had
+named themselves — the lookup table FR-CHN-01 exists to remove, and the one
+`docs/03-journey-map.md` Stage 1 promises Mai will not need.
+
+**Measured, 2026-10-05.** Exactly two tables carry a customer-supplied identifier,
+from `information_schema` rather than from judgement: `users` and `channels`. Users:
+8 of 8 routes take the identity, the upsert returns no uuid. Channels: 0 of 13, and
+`GET /v1/channels/order-88412` answered **500** — `'order-88412'::uuid` raises in
+Postgres before the `OR` beside it can short-circuit, so the natural first attempt
+told an integrating developer the platform was broken rather than that they had used
+the wrong key.
+
+### Decision
+
+**A noun with a customer-supplied identifier is addressed by that identifier. A noun
+with only a Relay identifier is addressed by that.** Where both could name the same
+thing, the customer's wins.
+
+The four nouns the second half covers have no `external_id` column, measured:
+`messages`, `media_objects`, `webhook_endpoints`, `environments`. A Relay identifier
+is the only identifier they have, so a uuid on their routes is correct and not an
+oversight.
+
+### What a key is still for
+
+A uuid remains the foreign key, the ordering key and the primary key, and this ADR
+does not propose otherwise. A text primary key across 216,922 messages and 182,434
+memberships costs more than it is worth. **There is one identity and one internal
+key, and only one of them belongs on the wire** — which is the sentence the whole
+decision reduces to.
+
+Keys may also stay ON the wire where a route accepts them: the thirteen channel
+routes keep taking a uuid, because 173 call sites and every published client hold
+one, and removing it needs a window, a warning and a version. **What a response may
+not carry is a key no route accepts.** `members[].user_id` was one and is gone: chapter
+4.22 swept every v1 response shape and asked of each uuid whether a route accepts it.
+
+### Alternatives considered
+
+**Resolve in middleware**, one registration instead of thirteen. Nest runs middleware
+before guards, so it has no principal and cannot scope the lookup to an environment —
+and an unscoped resolution is a cross-tenant read. Disqualifying rather than
+inconvenient.
+
+**Resolve in each service method.** Thirteen call sites instead of thirteen
+decorators, and it spreads the ambiguity into ten repository queries that currently
+take a key and nothing else.
+
+**Key-first on a uuid-shaped value.** Simplest to describe, and it strands a customer
+who names a channel with another channel's uuid: they could never reach their own,
+with no error they could act on. 0 of 41,772 channels have a uuid-shaped identifier
+today, so this is a case the chapter constructs rather than waits for.
+
+**Retire the uuid.** 173 call sites and every published client hold one. A
+deprecation needs a window, a warning and a version, none of which belongs in a
+chapter whose subject is making the identity work.
+
+### Reversal condition
+
+If a noun ever needs an identifier the customer supplies **and** cannot be relied on
+to be unique within a tenant, the first half fails for that noun and it is decided on
+its own merits. Uniqueness is what makes the identity addressable at all:
+`channels_environment_id_external_id_unique` and
+`users_environment_id_external_id_unique` are the constraints this ADR rests on.
+
+**And what it does not cover.** The real-time surface still addresses channels by
+uuid — every gateway frame carries `channel: <uuid>`, the session response hands a
+connecting client a list of channel uuids, and a socket send is forwarded to a door
+typed `z.string().uuid()`. `packages/protocol/src/internal.ts` states this ADR's own
+principle two lines above that field — *"`user` is the EXTERNAL id, as everywhere else
+on this contract: internal uuids are the api's business"* — and applies it to one
+field of two. A customer holding a socket still keeps the mapping REST no longer
+needs. Not fixed here: it is the gateway, `subjectForChannel`, the resume cursors and
+the internal contract.

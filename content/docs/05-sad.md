@@ -507,7 +507,9 @@ CREATE TABLE users (
     kind            TEXT NOT NULL DEFAULT 'person'
                     CHECK (kind IN ('person','bot')),     -- FR-USR-07 (chapter 3.17)
     description     TEXT,                                 -- what the software is, and why
-    UNIQUE (environment_id, external_id),                 -- DR-02
+    UNIQUE (environment_id, external_id),                 -- DR-02, and FR-CHN-11:
+                                                          -- uniqueness per tenant is what
+                                                          -- lets a route take the identity
     CHECK (kind <> 'bot' OR description IS NOT NULL)      -- a bot without one is not a bot
 );
 
@@ -521,8 +523,9 @@ CREATE TABLE channels (
     last_sequence   BIGINT NOT NULL DEFAULT 0,             -- ADR-03
     archived_at     TIMESTAMPTZ,
     last_activity_at TIMESTAMPTZ NOT NULL DEFAULT now(),   -- FR-CHN-08's ordering
-    UNIQUE (environment_id, external_id)                   -- DR-02
-);
+    UNIQUE (environment_id, external_id)                   -- DR-02, and FR-CHN-11:
+);                                                         -- the constraint that makes
+                                                           -- the identity ADDRESSABLE
 
 -- FR-CHN-09's unread count. Per user, per channel, the sequence up to which that
 -- user has read — and no counter column: unread is
@@ -727,10 +730,11 @@ survives is the record that the name was erased.** The receipt reports it as `ca
 rather than omitting it, and narrowing ADR-35 a second time was refused — a guarantee with two
 exceptions three chapters apart is a list, not a guarantee (`gaps.md` 067-1).
 
-## ADR-37 — A key into an erased row is not personal data
+### ADR-37 — A key into an erased row is not personal data
 
 **Summary.** `users.id` is an internal uuid that the platform exposes nowhere a caller can act
-on. When FR-MOD-04's erasure empties a user's row — profile cleared, `external_id` replaced with
+on — **true since chapter 4.22 and not before it**, see the reversal condition below. When
+FR-MOD-04's erasure empties a user's row — profile cleared, `external_id` replaced with
 `erased:<users.id>` — every store that references that user **by key alone** stops naming
 anybody, without being touched. So `usage_active_users` keeps all its rows with its `count(*)`
 unchanged to the row, and the seven `AggregateFunction(uniq, Nullable(UUID))` sketch columns
@@ -745,11 +749,29 @@ clauses — **and they went opposite ways**. A photo is personal data whatever k
 constraint and the decision are the same fact.
 
 **Reversal condition.** If `users.id` ever becomes resolvable to a person by a party outside the
-platform, this rule fails and every uuid-keyed store is decided on its own merits again. **One
-live edge is already known and bounded**: the `GET /v1/users` listing cursor is base64 of
-`{a, id}` and its own comment says *"opaque is not security"*, so a customer who paged before an
-erasure holds the uuid. No route accepts a user uuid as input — the controller takes
-`:externalId` — so a retained cursor positions a listing past a row that holds nothing.
+platform, this rule fails and every uuid-keyed store is decided on its own merits again.
+
+**THE LIVE EDGE THIS ADR NAMED DOES NOT EXIST, AND A REAL ONE DID** (feature 068, chapter 4.22).
+It said the one bounded exception was *"the `GET /v1/users` listing cursor"*. **There is no such
+route.** `listingQuerySchema` has exactly one consumer, `GET /v1/users/{externalId}/channels`,
+and the cursor it issues decodes to `{"a": <timestamp>, "id": <a CHANNEL uuid>}` — a value the
+same response already returns as a top-level field and every channel route accepts. Measured
+against a running api, not read.
+
+**What was live instead was `POST /v1/channels/{channelId}/members`**, which returned
+`members[].user_id` — the row's `users.id` — on every member added, for every user. No route
+accepts that value: `GET /v1/users/{a users.id}` answers 404 while `GET /v1/users/{external_id}`
+answers 200. So the summary sentence above was false on a write route everyone uses, and it was
+found by sweeping every v1 response shape rather than by reading, because reading is what
+produced the phantom. **Chapter 4.22 removed the field**, which is what makes the first paragraph
+true.
+
+**The one exception that remains is this ADR's own argument working.** An erased user's
+`external_id` is `erased:<users.id>`, and that string surfaces wherever an identity does — in
+`message.user` on 290 retained messages across 367 tombstones, and in `member.external_id`. It
+is a `users.id` crossing the boundary, and it **names nobody**: the row it keys is empty, and no
+route accepts it either, since a second erasure answers 404. An exception a reader can check in
+one query beats a claim of none.
 
 The argument is in `docs/06-adr-deep-dives.md`; this is the summary and that is the ADR.
 
@@ -2489,3 +2511,34 @@ the exception unnecessary — ADR-35's own reversal condition, unchanged.
 *Every ADR above states its reversal condition or rejected alternatives. If a review
 disagrees with a decision, the productive move is to attack the driver, not the choice —
 the choices follow from D1–D8 fairly mechanically.*
+
+
+### ADR-38 — A noun with a customer-supplied identifier is addressed by it
+
+**Summary.** FR-USR-01 and ADR-18 say an end user's identity is whatever `external_id` the
+customer already had. This carries that to every noun: **a noun with a customer-supplied
+identifier is addressed by it, a noun with only a Relay identifier is addressed by that, and
+where both could name the same thing the customer's wins.** Exactly two tables carry one,
+measured from `information_schema` — `users` and `channels` — and the four that do not
+(`messages`, `media_objects`, `webhook_endpoints`, `environments`) are correctly addressed by
+uuid rather than by oversight.
+
+A uuid stays the foreign key, the ordering key and the primary key; a text primary key across
+216,922 messages costs more than it is worth. **There is one identity and one internal key, and
+only one of them belongs on the wire.** A key may stay on the wire where a route accepts it —
+the thirteen channel routes keep taking one, for 173 call sites' sake — and may not where none
+does, which is why `members[].user_id` is gone — chapter 4.22 swept every v1 response
+shape and removed the one value no route took.
+
+**Reversal condition.** If a noun ever needs a customer-supplied identifier that cannot be
+relied on to be unique within a tenant, the first half fails for that noun. Uniqueness is what
+makes an identity addressable:
+`channels_environment_id_external_id_unique` and `users_environment_id_external_id_unique` are
+the constraints this rests on.
+
+**What it does not cover.** The real-time surface still addresses channels by uuid — every
+gateway frame carries `channel: <uuid>` and a socket send goes to a door typed
+`z.string().uuid()`. `packages/protocol/src/internal.ts` states this principle two lines above
+that field and applies it to one of two.
+
+The argument is in `docs/06-adr-deep-dives.md`; this is the summary and that is the ADR.

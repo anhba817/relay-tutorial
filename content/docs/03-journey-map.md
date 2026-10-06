@@ -338,8 +338,16 @@ exist for Priya, not for elegance.
 database, which turns a 10-minute task into a 2-day one. On her previous employer's
 homegrown system, this was the norm.
 
-**What Relay must provide** — channel retrieval by external ID; a user's channel list
-(FR-CHN-08) for the "I don't know the order number, but it was this driver" case.
+**What Relay must provide** — channel retrieval by external ID (**FR-CHN-11**); a user's
+channel list (FR-CHN-08) for the "I don't know the order number, but it was this driver"
+case.
+
+**This stage cited no clause for four parts, and when one was written the platform did not
+meet it.** Until chapter 4.22 every route beneath `/v1/channels/{channelId}` required the
+uuid Relay minted, and `GET /v1/channels/order-88412` answered **500** — so the first thing
+Priya's tool tries returned an internal error, and the "zero lookup tables" Stage 1 promises
+was a lookup table. FR-CHN-11 is the clause that now says it must work, and it exists because
+this stage was walked rather than read.
 
 **Measure (for the customer, enabled by Relay):** median time from ticket to conversation
 open. Target: under one minute.
