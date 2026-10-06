@@ -18329,7 +18329,45 @@ after the source.
 ```
 
 ```diff title="compose.yaml"
-@@ -255,12 +255,21 @@
+@@ -240,12 +240,37 @@
+       interval: 5s
+       timeout: 10s
+       # LONGER THAN THE OTHERS, because this is not "is it up" — it is "has
+       # freshclam finished", and the answer is a 355,678-signature download that is
+       # bandwidth-bound and unbounded on a slow link. Twenty retries at five
+       # seconds is 100 s of grace after the start period.
++      #
++      # AND ON A FRESH VOLUME NO NUMBER OF RETRIES PASSES THIS CHECK (feature 068).
++      # freshclam downloads the database and cannot tell the daemon, every time, on
++      # every machine:
++      #
++      #     daily.cld updated (version: 28145, sigs: 355726, ...)
++      #     WARNING: Clamd was NOT notified: Can't connect to clamd through
++      #              /tmp/clamd.sock: No such file or directory
++      #
++      # freshclam finishes before clamd has opened its socket, and the freshclam
++      # DAEMON then sleeps for hours before it would try again. `clamdscan -V` asks
++      # the daemon, so what this check measures is **the age of the database clamd
++      # loaded at container start** — not the age of the database.
++      #
++      # ON A WARM VOLUME that is a recent database and the check passes in
++      # milliseconds; this host answers `28143/Sun Oct 4` from the daemon while the
++      # disk holds `28145` written the same morning, and is green. ON AN EMPTY
++      # VOLUME it is whatever the pinned image bundles, which ages one day per day:
++      # on 2026-10-06 that was 28136 against a remote 28145, past the seven days
++      # this check allows, so CI could not pass at all.
++      #
++      # RETRIES WERE RAISED TO 40 AND PUT BACK, because the first reading of the CI
++      # log was "the download finished as the budget ran out" — true, and not the
++      # cause. The next line said the daemon was never told. **A number that cannot
++      # fix a fault should not be left looking as though it did.**
+       retries: 20
+       start_period: 30s
+ 
+ 
+   # --- the services (the webhook dispatcher chapter) -----------------------
+   # Behind `--profile services`, for the reason above.
+@@ -255,12 +280,21 @@
      build:
        context: .
        dockerfile: services/api/Dockerfile
