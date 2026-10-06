@@ -1012,6 +1012,17 @@ export const series: Part[] = [
         sourceDoc: "docs/04-srs.md, docs/05-sad.md, docs/06-adr-deep-dives.md, docs/12-part-4-structure.md",
         readerMinutes: 40,
       },
+      {
+        id: "4.22",
+        path: "/part-4/chapter-22/the-identifier-the-customer-gave-it",
+        title: "The identifier the customer gave it",
+        status: "published",
+        readerProduces:
+          "Thirteen routes that take the name your customer already had for a channel, and the one query that makes them. FR-USR-01 says Relay shall not generate end-user identities and ADR-18 says an end user's identity is whatever external_id the customer already had \u2014 and yet every route beneath /v1/channels/:channelId wanted a uuid Relay minted, so a customer had to keep a lookup table mapping their order number to our key. The exact table the journey map promises they will not need. You open on the failure: create a channel called order-88412, ask for it back by that name, and get a 500. Not a 404 \u2014 an internal error, which tells a developer the platform is broken rather than that they used the wrong key. The cause is three layers down and it is a cast: 'order-88412'::uuid raises in Postgres before the OR beside it can short-circuit, which is simultaneously why the error happens and why one query cannot resolve both forms. So the fix and the repair are a single edit, and the chapter's first product is a reading rather than a mechanism. You will build the resolution as a pipe and find out why the cheaper design cannot work: middleware runs BEFORE guards, so it has no principal, and a resolution with no environment is a cross-tenant read. Then you will write the pipe wrong in the way that looks right \u2014 throwing the same 404 every handler throws \u2014 and watch the isolation gauntlet catch it, because a pipe answers before every check the handler makes, and a banned user could suddenly tell a real channel from an invented one. You will measure what the resolution costs rather than assert it is cheap, delete the tenancy scope to see which tests notice and find that the suite built for that question notices nothing, and sweep every response the API returns for an identifier no route accepts \u2014 which turns up one, on a write route everyone uses, that a published ADR said could not exist",
+        sourceDoc:
+          "docs/04-srs.md, docs/05-sad.md, docs/06-adr-deep-dives.md, docs/03-journey-map.md, docs/12-part-4-structure.md",
+        readerMinutes: 35,
+      },
     ],
   },
   {

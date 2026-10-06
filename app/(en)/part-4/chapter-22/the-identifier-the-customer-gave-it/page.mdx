@@ -1,0 +1,537 @@
+import { Why, Trap, SkipAhead, ForwardRef, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import {
+  figTwoSpaces,
+  figTheCast,
+  figTheOrder,
+  figThePipeline,
+} from "./figures";
+
+export const metadata = {
+  title: "The identifier the customer gave it — Building Relay",
+  description:
+    "Thirteen routes wanted a uuid Relay minted for a channel the customer had already named. The failure is a 500, the cause is a cast, and the fix is one query.",
+  alternates: {
+    canonical: "/part-4/chapter-22/the-identifier-the-customer-gave-it",
+    languages: {
+      en: "/part-4/chapter-22/the-identifier-the-customer-gave-it",
+      vi: "/vi/part-4/chapter-22/the-identifier-the-customer-gave-it",
+    },
+  },
+};
+
+<ChapterHeader id="4.22" />
+
+Create a channel the way a support tool would — named for the thing it is about.
+
+```bash
+curl -s -X POST localhost:4000/v1/channels \
+  -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -d '{"external_id":"order-88412","type":"private"}'
+```
+
+```json
+{ "id": "419320ca-eaa8-412f-b157-c0a8f4bc8de5", "external_id": "order-88412",
+  "type": "private", "name": null, "metadata": {} }
+```
+
+Now ask for it back by the name you gave it.
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' \
+  -H "authorization: Bearer $KEY" "localhost:4000/v1/channels/order-88412"
+```
+
+```
+500
+```
+
+Not a 404. A 500, with a body that says `internal_error` and a message that says
+`unexpected internal error`. The first thing anybody tries, on the identifier
+they chose themselves, and the platform reports that something broke.
+
+It did not break. It did exactly what it was built to do, and what it was built
+to do is wrong — in a way that four published documents had already said was
+wrong, without anyone noticing that the code disagreed with them.
+
+## Two identifiers, and only one of them is yours
+
+Relay's specification is unusually direct about this. FR-USR-01:
+
+> The system shall represent end users by an identifier supplied by the customer,
+> unique within a tenant. **Relay shall not generate end-user identities.**
+
+And ADR-18, which decided that two populations of person share nothing but the
+word "user":
+
+> their identity is whatever `external_id` the customer already had for them.
+
+So the uuid in that create response is not a second name for the channel. It is
+a **key** — the thing foreign keys point at, the thing rows are ordered by, the
+thing a primary key index is built on. A text primary key across 216,922
+messages and 182,434 memberships costs more than it is worth, so Relay mints a
+uuid and uses it everywhere inside. That is a storage decision, and storage
+decisions are allowed.
+
+What is not allowed is the key escaping onto the wire as the only way to name
+the thing.
+
+<Figure code={figTwoSpaces} caption="One identity, one key, and which one each noun accepted." />
+
+Users got this right from the beginning. All eight routes under `/v1/users` take
+the customer's string, and the upsert response does not even contain a uuid —
+you cannot accidentally come to depend on one, because you are never given one.
+
+Channels got it exactly backwards. Thirteen routes live beneath
+`/v1/channels/{channelId}` and every one of them wanted the key. The create
+response hands you the uuid first, as the leading field, and after that you need
+it for everything: reading the channel, posting to it, adding a member,
+archiving it, editing a message in it.
+
+Which means a customer has to keep a table mapping their order number to our
+uuid. That table is precisely what `docs/03-journey-map.md` promises they will
+not need, in the first stage of the journey this part of the book is building
+towards:
+
+> map order #88412 → channel `order-88412` with **zero lookup tables**.
+
+The promise is in the journey map, the clause is in the SRS, the decision is in
+an ADR — and the routes had never agreed with any of them.
+
+## The 500 is a cast, and the cast is the whole problem
+
+A 404 would be a design disagreement. A 500 is a defect, and it is worth finding
+out which one you have before you decide what to build.
+
+Ask the database the question the route is really asking:
+
+```sql
+SELECT id FROM channels
+WHERE external_id = 'order-88412' OR id = 'order-88412'::uuid;
+```
+
+```
+ERROR:  invalid input syntax for type uuid: "order-88412"
+```
+
+There it is, and it is more useful than "the route takes a uuid". **Postgres
+raises on the cast before the `OR` beside it can short-circuit.** It does not
+evaluate the left-hand side, find a match, and skip the right; it plans the
+whole predicate, types the whole predicate, and the literal `'order-88412'`
+cannot be a uuid, so the statement dies before any row is examined.
+
+<Figure code={figTheCast} caption="Where the 500 comes from, and why no OR can rescue it." />
+
+Two consequences follow, and they point in opposite directions.
+
+The first is that **a single query cannot resolve both forms**. The obvious fix —
+"just check both columns" — is the thing that is already failing. Any design
+that hands an arbitrary path segment to a `uuid` column has this defect in it
+somewhere.
+
+The second is that **fixing the addressing fixes the 500 for free**. If a value
+that cannot be a uuid is never compared to a uuid column, `22P02` cannot arise.
+The repair and the feature are one edit, which is a pleasant thing to discover
+and a dangerous thing to assume — so we will come back and measure it rather
+than believe it.
+
+<Trap title="The error the operator never sees">
+The api logged this request. Here is the entire log line:
+
+```json
+{"level":"info","msg":"request","method":"GET",
+ "path":"/v1/channels/order-88412","status":500}
+```
+
+A status and nothing else. No `22P02`, no `invalid input syntax`, no constraint
+name, no stack. An operator paged at three in the morning for a spike of 500s on
+this route learns that there were 500s on this route.
+
+This is not a property of this route. `ProtocolErrorFilter` has no rung for a
+driver error, so **every** 500 on this platform is logged this way. Gap 058-3
+counted sixteen routes where a malformed uuid in a path produces one; the
+logging gap is wider than that and has never been counted. This chapter closes
+the sixteen and leaves the logging, because repairing it for one route and
+leaving the rest is worse than naming the class.
+</Trap>
+
+## Deciding the order before writing the query
+
+An `external_id` is `z.string().min(1).max(255)` — any string. Nothing stops a
+customer naming a channel with something that looks exactly like a uuid, and
+nothing stops that uuid being another channel's key.
+
+Measured on the development lane: **0 of 41,772 channels have a uuid-shaped
+`external_id`, and 0 have one equal to their own row id.** So this is a case
+that has never happened and is perfectly legal, which means it is a case you
+construct in a test or never test at all.
+
+The tempting way to decide it is on cost. That turns out to be a dead end, and
+the measurement is worth showing because the shape of the answer is the point:
+
+```
+                                            2026-10-05     2026-10-06 warm
+WHERE environment_id = $1 AND id = $2         1.475 ms        0.364 ms
+WHERE environment_id = $1 AND external_id = $2  1.094 ms      0.675 ms
+```
+
+Both are single index hits. On the first run the identity lookup was cheaper; a
+day later the key lookup was, by a similar margin. **The ordering reversed
+between the two runs**, which is what a difference inside the run-to-run spread
+looks like when you take two samples instead of one. There is no performance
+argument here, in either direction, and anyone who publishes one has measured
+once.
+
+So the order is decided by which failure is worse.
+
+Under **key-first**, a customer who names a channel with another channel's uuid
+can never reach their own. Every request for that name finds the other channel,
+forever, with no error they can act on and nothing in the response to suggest
+their channel exists. Under **identity-first**, the customer reaches the channel
+they named, and the other one remains perfectly reachable by its uuid from any
+caller holding it — which is every caller that has it, since that is how they
+got it.
+
+One of those strands somebody. That is the whole argument, and it does not need
+a benchmark.
+
+<Figure code={figTheOrder} caption="The shape test is what removes the 500; the order is what resolves a tie." />
+
+The query that does both is one query:
+
+```sql
+SELECT id FROM channels
+WHERE environment_id = $1
+  AND (external_id = $2 OR id = $2::uuid)
+ORDER BY (external_id = $2) DESC
+LIMIT 1;
+```
+
+— reached **only** when the segment is uuid-shaped. When it is not, the
+identity predicate runs alone and `$2::uuid` never appears in a statement.
+
+Chapter 4.18 found a keyset cursor written as an `OR` landing in a `Filter:` and
+re-walking every earlier page, so that plan is worth reading before choosing the
+form rather than after:
+
+```
+Limit -> Sort -> Bitmap Heap Scan on channels          shared hit=11   0.068 ms
+  Sort Key: ((external_id = $2)) DESC
+  BitmapOr
+    Bitmap Index Scan on …_environment_id_external_id_unique   Index Cond
+    Bitmap Index Scan on channels_pkey                         Index Cond
+```
+
+Both arms are index scans with real conditions. Eleven buffers against about
+three for a single lookup, which buys one round trip instead of two on every
+caller that still passes a uuid — and there are 173 of those in the test corpus
+alone.
+
+<Why title="Why the key arm's tenancy looks like a leak and is not">
+Read that plan carefully and something is missing. The `BitmapOr`'s second arm
+is `Index Cond: (id = $2)` with no environment predicate — so a channel
+belonging to another tenant can enter the bitmap. The scope is applied at the
+heap recheck, after the index has already matched the row.
+
+That is correct, and it is what the platform already does. The plain
+`channels_pkey` lookup every channel route runs today has exactly the same
+shape: `Index Cond: (id = …)` followed by `Filter: (environment_id = …)`. A uuid
+is globally unique, so the index can find the row without knowing the tenant and
+the filter decides whether you may have it. Nothing crosses a boundary; the
+boundary is just enforced one step later than the index.
+
+It is written down here because the next person to read this plan will reach for
+the alarm, and the thing that tells them not to is the plan of the query the
+platform was already running.
+</Why>
+
+## Where the resolution goes, and why the cheap place cannot work
+
+Thirteen `@Param("channelId")` sites, counted from the decorators rather than
+from a route list: seven in `channels.controller.ts`, five under
+`messages.controller.ts`, one on `users.controller.ts`'s read-position route.
+There is no chokepoint — `channelId` is passed into ten different repository
+methods — so this is either thirteen edits or one interception.
+
+The cheapest interception is a middleware: one registration in `app.module.ts`,
+applied to a path pattern, done. It cannot work, and the reason is an ordering
+fact about Nest rather than anything about this feature.
+
+<Figure code={figThePipeline} caption="Middleware has no principal. Pipes have one, and they also run before the handler." />
+
+**Middleware runs before guards.** At that point `CredentialGuard` has not run,
+so there is no `req.principal`, so there is no environment — and a channel
+resolution with no environment is a lookup across every tenant on the platform.
+Not a slow one or an untidy one: a cross-tenant read, which constitution I makes
+a correctness property rather than a preference.
+
+A pipe runs after guards. By the time it executes, the principal is on the
+request and the request-scoped `Repository` can be constructed with its
+`environment_id` — which is where the scope comes from:
+
+```ts
+@Injectable()
+export class ChannelIdPipe implements PipeTransform<string, Promise<string>> {
+  constructor(private readonly repo: Repository) {}
+
+  async transform(value: string): Promise<string> {
+    return (await this.repo.resolveChannelId(value)) ?? randomUUID();
+  }
+}
+```
+
+The scope is not in that file. It is in the constructor of the thing the file
+asks for, which is chapter 4.21's mechanism — and it is the difference between a
+predicate somebody has to remember to write and one they would have to go out of
+their way to remove.
+
+## The version that looked right
+
+Here is the pipe as it was first written, and the only difference is the last
+line:
+
+```ts
+  async transform(value: string): Promise<string> {
+    const id = await this.repo.resolveChannelId(value);
+    if (id === null) {
+      throw new NotFoundException("channel not found");
+    }
+    return id;
+  }
+```
+
+That is the same refusal every handler already makes — the same exception class,
+the same constant message, chosen deliberately in `channels.service.ts` so that
+a foreign channel and an absent one answer identically. It passed the new
+chapter's ninety-two assertions. It is wrong, and the isolation gauntlet is what
+said so:
+
+```
+FAIL  the isolation gauntlet > a banned user gets one answer for every channel id
+      > refuses a real channel and an invented one identically
+AssertionError: expected 404 to be 403
+```
+
+A banned user posting to a real channel gets `403 user_banned`. A banned user
+posting to an invented channel used to get the same thing, because the ban check
+runs before the channel is read. With a refusing pipe, the invented channel gets
+`404 not_found` — from the pipe, before the handler runs at all.
+
+So a banned user can now tell which channels exist.
+
+**A pipe answers before every check the handler makes**, and some of those
+checks come first on purpose. A second test found the same shape one check over:
+`messages.itest.ts` asserts that a token for a user with no row gets the same
+answer for a private channel it cannot see and a uuid that names nothing — and
+with a refusing pipe one answered `400 unknown user` and the other `404`.
+
+The fix is that the pipe never refuses. An unresolved segment becomes a fresh
+`randomUUID()`, and downstream it simply *is* a uuid that names nothing — the
+case every handler has always handled, in whatever order it handles it. Every
+refusal on all thirteen routes is the one that shipped; the only thing the pipe
+changes is which strings can reach them.
+
+<Trap title="Why a random uuid and not a nil one">
+`00000000-0000-0000-0000-000000000000` is the obvious sentinel and it is a value
+a row could in principle hold. `randomUUID()` cannot collide with anything that
+exists, costs a few microseconds, and makes the claim exact rather than
+probable: an identifier that names nothing behaves like a uuid that names
+nothing, because by the time it reaches the handler it is one.
+
+The cost of the other choice is not a bug today. It is a bug the day somebody
+inserts a fixture with a zero uuid, and it would present as one route
+mysteriously returning somebody else's channel.
+</Trap>
+
+## What it costs, measured rather than asserted
+
+The handlers still read the channel themselves. `getChannelById`,
+`channelExists` and `channelVisibleTo` all still run, with the resolved uuid —
+which is what leaving the ten repository methods untouched buys, and what it
+costs. The resolution is an **added** query, not a relocated one.
+
+So measure it. Two hundred samples after forty warm-up requests, three runs a
+side, with the pipe removed from the read route and restored between:
+
+```
+with the pipe       5.499  5.423  5.285     mean 5.402 ms   spread 0.214
+without             4.847  4.719  4.795     mean 4.787 ms   spread 0.128
+                                            +0.615 ms       +12.8%
+```
+
+Each side's spread is about a third of the difference, so this is a real shift
+rather than noise — which is the check worth making before publishing a delta,
+and the one that the two lookup timings earlier in this chapter failed.
+
+Twelve point eight percent is the price of correctness on a route that was
+answering 500. It is published rather than hidden because the alternative
+designs all cost something too, and a reader deciding between them needs the
+number.
+
+## Deleting the scope to find out who notices
+
+Constitution I says tenant isolation is a correctness property, and this chapter
+added a new way to name somebody else's channel — one an attacker can *guess*,
+where a uuid has to be given to them. So the gauntlet gets three new attacks: a
+foreign external id must read as an absent one, must write nothing, and — the
+one that makes the other two mean anything — **the same name from the tenant
+that owns it must work.** A resolution that refused everybody would pass the
+first two perfectly.
+
+Then delete the scope and see what goes red:
+
+```
+addressing.itest.ts    18 RED    of 95
+gauntlet.itest.ts       0 red    of 67
+```
+
+Eighteen tests notice, and **not one of them is in the suite built for exactly
+this question** — including the three attacks just added.
+
+The reason is two defences in series. The pipe hands a foreign uuid downstream
+and the handler's own scoped read refuses it, because the repository still
+carries `environment_id` on every query it makes. An attacker is turned away
+twice, so removing one turn-away changes nothing an attacker can see.
+
+What *does* go red is the arm with no second defence. With the scope gone, the
+same `external_id` existing in two environments — and 1,597 user external ids
+are reused across environments on this lane — resolves to whichever row the
+planner reaches first. A caller asking for their own channel gets a 404, or
+somebody else's channel.
+
+So the honest statement is narrower and more useful than "the scope is tested":
+**the scope stops a tenant reading their own data wrongly, and the handlers stop
+them reading anybody else's.** Had the probe been run only against the gauntlet,
+it would have reported the scope untested.
+
+<Checkpoint>
+
+```bash
+ORD="order-$RANDOM"
+curl -s -X POST localhost:4000/v1/channels -H "authorization: Bearer $KEY" \
+  -H 'content-type: application/json' -d "{\"external_id\":\"$ORD\",\"type\":\"public\"}" >/dev/null
+
+for r in "GET /v1/channels/$ORD" "GET /v1/channels/$ORD/messages" \
+         "POST /v1/channels/$ORD/archive" "DELETE /v1/channels/$ORD/archive"; do
+  set -- $r
+  printf '  %-6s %-46s %s\n' "$1" "$2" \
+    "$(curl -s -o /dev/null -w '%{http_code}' -X "$1" \
+       -H "authorization: Bearer $KEY" "localhost:4000$2")"
+done
+curl -s -o /dev/null -w '  absent identifier: %{http_code}\n' \
+  -H "authorization: Bearer $KEY" "localhost:4000/v1/channels/order-nobody-created-this"
+```
+
+Four 200s and a 404. The last line is the one that was a 500 when the chapter
+opened.
+
+</Checkpoint>
+
+## The sweep, and the field that should not have been there
+
+The chapter's second requirement is the mirror of its first: if a customer
+should address things by their own identifier, then nothing we hand back should
+be an identifier they cannot use.
+
+There was a known answer to this. ADR-37, written one chapter earlier, says:
+
+> `users.id` is an internal uuid that the platform exposes nowhere a caller can
+> act on.
+
+and then names its one exception — the `GET /v1/users` listing cursor, which is
+base64 of `{a, id}` and whose own comment says *opaque is not security*.
+
+Go and look at that route, and it is not there. There is no `GET /v1/users`.
+`listingQuerySchema` has exactly one consumer — `GET /v1/users/{externalId}/channels`
+— and the cursor it issues decodes to a **channel** uuid, which the same
+response already returns as a top-level field and which every route in this
+chapter accepts. The named exception does not exist.
+
+Which left the question genuinely open, so the only way to answer it was to
+enumerate every response shape the API can return and ask one thing of each
+uuid in it: **does a route accept this?**
+
+| | | |
+|---|---|---|
+| `channels[].id`, `messages[].channel_id` | `channels.id` | all 13 routes |
+| `messages[].id` | `messages.id` | 3 routes |
+| `media_id` | `media_objects.id` | `GET /v1/media/{mediaId}` |
+| `request_id` | — | constitution V requires it in every error |
+| `audit_log[].id`, `actor.id` | record references | a customer quotes them back |
+| **`members[].user_id`** | **`users.id`** | **nothing** |
+
+```json
+{"members":[{"user_id":"4775a041-0b28-4cd1-b292-f67bcdfe13c4",
+             "external_id":"normal-10861","status":"added","role":"member"}]}
+```
+
+Every member add, for every user, on a write route everyone uses. And
+`GET /v1/users/4775a041-…` answers 404 while `GET /v1/users/normal-10861`
+answers 200 — so the field is a key to nothing, handed over on a routine call,
+and ADR-37's opening sentence was false for as long as it had existed.
+
+Nothing asserted that field. No clause documented it, no test read it, no page
+of this book showed it. That is why reading found a phantom and enumerating
+found the real one.
+
+It is gone, and ADR-37 is amended in both of its homes — with the exception it
+names now being its own argument working: an erased user's `external_id` is
+`erased:<users.id>`, which surfaces in `message.user` on 290 retained messages
+across 367 tombstones, and which **names nobody**, because the row it keys is
+empty and a second erasure answers 404.
+
+<Why title="Why the clause is new rather than an amendment">
+FR-CHN-01 takes a customer-supplied identifier at creation. FR-CHN-02 makes that
+creation idempotent on it. FR-CHN-08 lists a user's channels. All ten FR-CHN
+clauses were read before anything was written, and **none of them says the
+identifier may then be used to name the channel.**
+
+So the behaviour had no requirement, which constitution VI's first bullet
+forbids — and the repair is a new clause, FR-CHN-11, rather than a widening.
+Stretching FR-CHN-01 to cover addressing would make a creation clause carry a
+retrieval rule, and would hide the fact that the gap was ever there.
+
+ADR-38 does the other half: *a noun with a customer-supplied identifier is
+addressed by it; a noun with only a Relay identifier is addressed by that.*
+Exactly two tables carry one, from `information_schema` rather than from
+judgement — `users` and `channels` — and the four that do not (`messages`,
+`media_objects`, `webhook_endpoints`, `environments`) are correctly addressed by
+uuid rather than by oversight.
+</Why>
+
+## What this chapter did not do
+
+**It did not retire the uuid.** 173 call sites in the test corpus alone pass one,
+and every published client holds some. A deprecation needs a window, a warning
+and a version, none of which belongs here.
+
+**It did not fix the real-time surface, and that is the largest thing left.**
+Every frame the gateway sends carries `channel: <uuid>`; the session response
+hands a connecting client a list of channel uuids; a socket send is forwarded to
+a door typed `z.string().uuid()`. So a customer holding a WebSocket still keeps
+the lookup table REST no longer needs — on Journey 3's Stage 5, in the same
+journey whose Stage 1 promises zero of them.
+
+The evidence that this is an oversight rather than a decision is in the contract
+itself. Two lines above the field that carries those uuids,
+`packages/protocol/src/internal.ts` says:
+
+> `user` is the EXTERNAL id, as everywhere else on this contract: internal uuids
+> are the api's business.
+
+The principle is stated there, and applied to one field of two. Fixing it means
+the gateway, the fan-out subjects, the resume cursors and the internal contract
+— a chapter, not a paragraph.
+
+**It did not fix the swallowed 500 cause.** Sixteen routes could produce a
+caller-triggered 500 from a malformed uuid in a path; this chapter closes all
+sixteen, thirteen by never casting and three with a shape check. How the
+remaining 500s are *logged* is a different population — every route on the
+platform — and nobody has counted it.
+
+**And the collision is constructed, not observed.** Zero of 41,772 channels have
+a uuid-shaped identifier. The tie-break is exercised by a test that builds the
+case, and by nothing else, which is the most that can honestly be said about it.
+
+<ChapterFooter id="4.22" />

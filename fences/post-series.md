@@ -17742,3 +17742,613 @@ after the source.
            statements: 100,
          },
 ```
+
+<!-- CHAPTER 4.22 — the identifier the customer gave it. Nine files, 23 hunks.
+     Three of them (`channels.controller.ts`, `media/media.controller.ts`,
+     `compose.yaml`) had no appendix block at all before this chapter: they are
+     fenced in chapter pages and nothing had changed them since, so these are the
+     first. Generated from `check:fences --dump` rather than from the working
+     tree, which is fence-chain rule 1a. -->
+
+```diff title="services/api/src/db/repository.ts"
+@@ -1451,12 +1451,27 @@
+  * the one the chapter shows going up while the broker is down. */
+ /** The name this consumer claims events under. One name, because the ledger is
+  * keyed per consumer and the dispatcher is one consumer however many processes
+  * run it (the broker chapter's data model). */
+ export const DISPATCHER_CONSUMER = "dispatcher";
+ 
++/** Whether a path segment could be a uuid at all (FR-CHN-11).
++ *
++ * A SHAPE TEST AND NOT A VALIDATION. Nothing here asks whether the uuid names a
++ * row — only whether handing it to a `uuid` column can raise `22P02`, which is
++ * the question `resolveChannelId` has to answer before it writes a predicate.
++ * The 500 this chapter opens on is that cast, so the one branch that matters is
++ * the negative one: a value failing this test is never compared to `channels.id`.
++ *
++ * Deliberately not `z.uuid()`. The repository layer takes no schema dependency
++ * (the lint rule keeps the query engine here and the schemas out), and the
++ * question is narrower than zod's: Postgres accepts any of the eight canonical
++ * hex-and-dash forms and this is the one it will not raise on. */
++const UUID_SHAPE =
++  /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
++
+ /** Turn one event into one delivery per matching endpoint — **in one
+  * transaction** (research R2).
+  *
+  * Admin surface, like `drainOutbox`: one dispatcher serves every environment, so
+  * this cannot go through the scoped Repository. It is still safe, because the
+  * environment comes from the EVENT rather than from a caller's parameter.
+@@ -3549,12 +3564,68 @@
+           eq(channels.externalId, externalId),
+         ),
+       );
+     return rows[0] ?? null;
+   }
+ 
++  /** Turn whatever arrived in a path segment into this channel's key (FR-CHN-11).
++   *
++   * THE SHAPE TEST IS WHAT REMOVES THE 500, and it is not an optimisation. A path
++   * segment that cannot parse as a uuid is handed to the identity query alone, so
++   * `'order-88412'::uuid` never happens — and that cast is the whole of the defect
++   * this chapter opens on. Postgres raises it before the `OR` beside it can
++   * short-circuit, so a single `external_id = $2 OR id = $2::uuid` is not a
++   * resolution that sometimes fails: it is one that always fails for every value
++   * a customer is likely to send.
++   *
++   * THE IDENTITY WINS A TRUE TIE. An `external_id` is `z.string().min(1).max(255)`
++   * and may itself be a uuid — legal, and 0 of 41,772 channels have one. When a
++   * value could name both spaces, `order by (external_id = $2) desc` prefers the
++   * channel the customer NAMED; the other stays reachable by its uuid from any
++   * caller holding it. Key-first would strand a customer permanently with no error
++   * they could act on, which is the only argument that decides this: the two
++   * lookups cost the same, measured twice a day apart with the ordering reversing
++   * between runs.
++   *
++   * ONE QUERY, AND BOTH ARMS ARE INDEX SCANS. 4.18 found a keyset cursor written
++   * as an `OR` landing in a `Filter:` and re-walking every page, so this plan was
++   * read before the form was chosen, not after:
++   *
++   *     Limit -> Sort -> Bitmap Heap Scan              shared hit=11   0.068 ms
++   *       BitmapOr
++   *         Bitmap Index Scan …_environment_id_external_id_unique   Index Cond
++   *         Bitmap Index Scan channels_pkey                         Index Cond
++   *
++   * The key arm's tenancy lands on the heap recheck rather than in its index
++   * condition — a foreign tenant's row enters the bitmap and is filtered out. That
++   * reads as a leak and is not: the plain `channels_pkey` lookup every route runs
++   * today does exactly the same thing.
++   *
++   * SCOPED BY CONSTRUCTION. `this.environmentId` comes from the constructor, which
++   * is 4.21's mechanism: there is no predicate here for a later chapter to forget.
++   * Delete it and `gauntlet.itest.ts` turns red.
++   *
++   * Called by `ChannelIdPipe.transform`, which is the only caller. */
++  async resolveChannelId(segment: string): Promise<string | null> {
++    const looksLikeUuid = UUID_SHAPE.test(segment);
++    const rows = await this.db
++      .select({ id: channels.id })
++      .from(channels)
++      .where(
++        and(
++          eq(channels.environmentId, this.environmentId),
++          looksLikeUuid
++            ? or(eq(channels.externalId, segment), eq(channels.id, segment))
++            : eq(channels.externalId, segment),
++        ),
++      )
++      .orderBy(sql`(${channels.externalId} = ${segment}) desc`)
++      .limit(1);
++    return rows[0]?.id ?? null;
++  }
++
+   async listChannels(): Promise<ChannelRow[]> {
+     return this.db
+       .select({
+         id: channels.id,
+         external_id: channels.externalId,
+         type: sql<ChannelRow["type"]>`${channels.type}`,
+```
+
+```diff title="services/api/src/messages/messages.controller.ts"
+@@ -13,12 +13,13 @@
+   Query,
+   Req,
+   UseGuards,
+ } from "@nestjs/common";
+ 
+ import { Accepts, CredentialGuard } from "../auth/credential.guard";
++import { ChannelIdPipe } from "../channels/channel-id.pipe";
+ import { Repository } from "../db/repository";
+ import { MessagesService } from "./messages.service";
+ import {
+   MESSAGE_PUBLISHER,
+   type MessagePublisher,
+ } from "../fanout/publisher";
+@@ -30,12 +31,13 @@
+ // `import type` is required, not stylistic: with isolatedModules and
+ // emitDecoratorMetadata on (ADR-15's trade-off, chapter 1.4), a type used
+ // in a decorated signature must be imported as a type or TS1272 refuses
+ // to compile it.
+ import type { EditMessageBody, HistoryQuery, SendMessageBody } from "./messages.schema";
+ import type { RequestWithPrincipal } from "../auth/principal";
++import { UuidParamPipe } from "./uuid-param.pipe";
+ import { ZodValidationPipe } from "./zod-validation.pipe";
+ 
+ /** The end user this request acts for, or `undefined` when the tenant is acting.
+  *
+  * SOFT, unlike `internal.controller.ts`'s `principalUser`, which throws. These two
+  * routes accept both credential classes — declared as `@Accepts("application", "user")`
+@@ -111,13 +113,13 @@
+     // every member's screen twice (FR-006).
+     @Inject(MESSAGE_PUBLISHER) private readonly fanout: MessagePublisher,
+   ) {}
+ 
+   @Post()
+   async send(
+-    @Param("channelId") channelId: string,
++    @Param("channelId", ChannelIdPipe) channelId: string,
+     @Body(new ZodValidationPipe(sendMessageBodySchema)) body: SendMessageBody,
+     @Req() req: RequestWithPrincipal,
+   ) {
+     // WHO IS SENDING, resolved here (FR-001, T031a).
+     //
+     // This route called `this.messages.send(channelId, body)` with no user for
+@@ -295,14 +297,14 @@
+    * `dev-token.controller.ts:51` is the precedent for a method-level narrowing, and
+    * `credential.guard.ts:31` argues why the class is DECLARED while the authorship is
+    * CHECKED: authorship cannot be declared, because it is a fact about a row. */
+   @Patch(":messageId")
+   @Accepts("user")
+   async edit(
+-    @Param("channelId") channelId: string,
+-    @Param("messageId") messageId: string,
++    @Param("channelId", ChannelIdPipe) channelId: string,
++    @Param("messageId", new UuidParamPipe("messageId")) messageId: string,
+     @Body(new ZodValidationPipe(editMessageBodySchema)) body: EditMessageBody,
+     @Req() req: RequestWithPrincipal,
+   ) {
+     // THE GUARD ALREADY REFUSED ANYTHING BUT A USER TOKEN, so `actingUser` cannot be
+     // undefined here — and the narrowing is a throw rather than a `!`, on
+     // `messages.service.ts`'s precedent for the same shape. A `!` would put the
+@@ -403,14 +405,14 @@
+    * body; there is no body, and idempotence means the second call is
+    * indistinguishable from the first on the wire. What differs is the fan-out, and
+    * `alreadyDeleted` is how this handler knows. */
+   @Delete(":messageId")
+   @HttpCode(204)
+   async remove(
+-    @Param("channelId") channelId: string,
+-    @Param("messageId") messageId: string,
++    @Param("channelId", ChannelIdPipe) channelId: string,
++    @Param("messageId", new UuidParamPipe("messageId")) messageId: string,
+     @Req() req: RequestWithPrincipal,
+   ): Promise<void> {
+     // THE DELETER, PER CREDENTIAL CLASS. A user token names its subject; an application
+     // credential names nobody, and unlike the send path it does not have to — FR-006a
+     // records the KIND of principal, and `{ kind: "application" }` is a complete
+     // answer. There is no body on a DELETE to name a `user` in, and inventing one
+@@ -493,14 +495,14 @@
+    * absence of edits is a fact about the message rather than the absence of a resource,
+    * and the two are distinguishable here because `messageExistsIn` answers the second
+    * question separately — `listMessageEdits` returning `[]` cannot tell them apart. */
+   @Get(":messageId/edits")
+   @Accepts("application")
+   async edits(
+-    @Param("channelId") channelId: string,
+-    @Param("messageId") messageId: string,
++    @Param("channelId", ChannelIdPipe) channelId: string,
++    @Param("messageId", new UuidParamPipe("messageId")) messageId: string,
+   ): Promise<{
+     edits: Array<{
+       prior_text: string;
+       edited_at: string;
+       // CHAPTER 4.19. Widened here as well as in the repository, and the compiler
+       // would not have asked: the returned literal's `edits` value is a call result
+@@ -523,13 +525,13 @@
+     }
+     return { edits: await this.repo.listMessageEdits(channelId, messageId) };
+   }
+ 
+   @Get()
+   async history(
+-    @Param("channelId") channelId: string,
++    @Param("channelId", ChannelIdPipe) channelId: string,
+     @Query(new ZodValidationPipe(historyQuerySchema)) query: HistoryQuery,
+     @Req() req: RequestWithPrincipal,
+   ) {
+     // The same resolution the send handler above does, on the other route of this
+     // controller (T041a). Both dropped the caller; the send path was
+     // found in one analysis pass and this one in the next, because finding the first
+```
+
+```diff title="services/api/src/channels/channels.controller.ts"
+@@ -21,12 +21,13 @@
+ import { Repository } from "../db/repository";
+ import {
+   MEMBERSHIP_PUBLISHER,
+   type MembershipPublisher,
+ } from "../membership/publisher";
+ import { ZodValidationPipe } from "../messages/zod-validation.pipe";
++import { ChannelIdPipe } from "./channel-id.pipe";
+ import { ChannelsService } from "./channels.service";
+ import {
+   addMembersBodySchema,
+   createChannelBodySchema,
+   removeMembersBodySchema,
+   setMemberRoleBodySchema,
+@@ -109,13 +110,13 @@
+    * tenant reads any of its channels (FR-005), and a user reads the ones they may
+    * see, which is what makes `channels.type` decide something.
+    */
+   @Get(":channelId")
+   @Accepts("application", "user")
+   async read(
+-    @Param("channelId") channelId: string,
++    @Param("channelId", ChannelIdPipe) channelId: string,
+     @Req() req: RequestWithPrincipal,
+   ) {
+     const actingExternalId =
+       req.principal?.kind === "user" ? req.principal.userExternalId : undefined;
+     let userId: string | undefined;
+     if (actingExternalId !== undefined) {
+@@ -148,31 +149,31 @@
+    * action. `POST …/ban` and `POST …/members/remove` take the same shape.
+    *
+    * The tenant's routes. A member does not archive the channel they are in.
+    */
+   @Post(":channelId/archive")
+   @HttpCode(HttpStatus.OK)
+-  async archive(@Param("channelId") channelId: string) {
++  async archive(@Param("channelId", ChannelIdPipe) channelId: string) {
+     return this.channels.setArchived(channelId, true);
+   }
+ 
+   @Delete(":channelId/archive")
+   @HttpCode(HttpStatus.OK)
+-  async unarchive(@Param("channelId") channelId: string) {
++  async unarchive(@Param("channelId", ChannelIdPipe) channelId: string) {
+     return this.channels.setArchived(channelId, false);
+   }
+ 
+   /** One member's role (FR-011, FR-011a).
+    *
+    * The tenant's route: an application credential decides who moderates. A member
+    * cannot promote themselves, which is why this is not `@Accepts("user")` like
+    * join.
+    */
+   @Patch(":channelId/members/:userExternalId")
+   async setMemberRole(
+-    @Param("channelId") channelId: string,
++    @Param("channelId", ChannelIdPipe) channelId: string,
+     @Param("userExternalId") userExternalId: string,
+     @Body(new ZodValidationPipe(setMemberRoleBodySchema)) body: SetMemberRoleBody,
+   ) {
+     return this.channels.setMemberRole(channelId, userExternalId, body.role);
+   }
+ 
+@@ -186,13 +187,13 @@
+    * and two routes for one job is two classification entries, two tests and two
+    * chances to disagree.
+    */
+   @Post(":channelId/members/remove")
+   @HttpCode(HttpStatus.OK)
+   async removeMembers(
+-    @Param("channelId") channelId: string,
++    @Param("channelId", ChannelIdPipe) channelId: string,
+     @Body(new ZodValidationPipe(removeMembersBodySchema)) body: RemoveMembersBody,
+   ) {
+     const results = await this.channels.removeMembers(channelId, body);
+ 
+     // ONLY THE ONES THAT CHANGED SOMETHING (FR-005). The route reports per entry and
+     // `not_a_member` is a legitimate outcome, so publishing the whole list would tell
+@@ -251,13 +252,13 @@
+    * chapter and then turned nine of fifteen tests red.
+    */
+   @Post(":channelId/join")
+   @HttpCode(HttpStatus.OK)
+   @Accepts("user")
+   async join(
+-    @Param("channelId") channelId: string,
++    @Param("channelId", ChannelIdPipe) channelId: string,
+     @Req() req: RequestWithPrincipal,
+   ) {
+     // The guard has already refused anything that is not a user principal, so this
+     // is narrowing for the type system rather than for trust.
+     if (req.principal?.kind !== "user") {
+       throw new BadRequestException("joining is an end user's action");
+@@ -279,13 +280,13 @@
+    * 200 and not 201: this is idempotent in a way creation is not — a member list
+    * sent twice is the same list, and the per-user `status` says which ones were
+    * already there. */
+   @Post(":channelId/members")
+   @HttpCode(200)
+   async addMembers(
+-    @Param("channelId") channelId: string,
++    @Param("channelId", ChannelIdPipe) channelId: string,
+     @Body(new ZodValidationPipe(addMembersBodySchema)) body: AddMembersBody,
+   ) {
+     const members = await this.channels.addMembers(channelId, body);
+     // `added` only. `already_a_member` is the idempotent repeat and changed nothing.
+     for (const member of members) {
+       if (member.status !== "added") continue;
+```
+
+```diff title="services/api/src/channels/channels.service.ts"
+@@ -36,13 +36,28 @@
+   /** `removed` if a membership row went away, `not_a_member` otherwise — including
+    * when the external id belongs to no user this tenant knows. */
+   result: "removed" | "not_a_member";
+ }
+ 
+ export interface MemberResult {
+-  user_id: string;
++  /** THE IDENTITY, AND NOTHING ELSE (FR-006, FR-CHN-11).
++   *
++   * This shape carried `user_id: string` — the row's `users.id` — on every member
++   * added, for every user, erased or not. **No route accepts that value**:
++   * `GET /v1/users/{a users.id}` is 404 while `GET /v1/users/{external_id}` is
++   * 200, so a caller who stored it held a key to nothing. No test asserted it, no
++   * clause documented it, no tutorial page showed it, and ADR-37's opening
++   * sentence said it could not happen — *"`users.id` is an internal uuid that the
++   * platform exposes nowhere a caller can act on."*
++   *
++   * Found by FR-006's sweep rather than by reading: the chapter went looking for
++   * the listing cursor ADR-37 names, found that route does not exist, and swept
++   * every v1 response shape instead. Three siblings turned up and are kept with
++   * their reasons — `audit_log[].id` and `actor.id` are record references a
++   * customer quotes back, and `request_id` is constitution V's requirement. This
++   * one had no reason. */
+   external_id: string;
+   status: "added" | "already_a_member";
+   /** What role the member holds AFTER the call — read back, not
+    * echoed, so an `already_a_member` reports the role they already had rather than
+    * the one the request asked for. Adding is not changing. */
+   role: string;
+@@ -275,13 +290,12 @@
+         // The channel was read above and both ids are this environment's, so this
+         // is not reachable by a foreign request — it means the channel was deleted
+         // between the read and here. Answer as the read would have.
+         throw new NotFoundException("channel not found");
+       }
+       results.push({
+-        user_id: user.id,
+         external_id: externalId,
+         status: outcome,
+         // The role the member ends up with, read back rather than echoed: on an
+         // `already_a_member` the request's role is NOT applied, because adding is
+         // not changing. `PATCH` is the route that changes one.
+         role: (await this.repo.memberRole(channelId, user.id)) ?? "member",
+```
+
+```diff title="services/api/src/users/users.controller.ts"
+@@ -16,12 +16,13 @@
+ 
+ import { ALL_CHANNELS } from "@relay/protocol";
+ 
+ import { Repository } from "../db/repository";
+ 
+ import { Accepts, CredentialGuard } from "../auth/credential.guard";
++import { ChannelIdPipe } from "../channels/channel-id.pipe";
+ import {
+   MEMBERSHIP_PUBLISHER,
+   type MembershipPublisher,
+ } from "../membership/publisher";
+ import { ZodValidationPipe } from "../messages/zod-validation.pipe";
+ import {
+@@ -86,13 +87,13 @@
+    * names channel parameters `:channelId` — a classification entry copied from it
+    * verbatim will not match a derived target. */
+   @Put(":externalId/channels/:channelId/read")
+   @Accepts("application", "user")
+   async setReadPosition(
+     @Param("externalId") externalId: string,
+-    @Param("channelId") channelId: string,
++    @Param("channelId", ChannelIdPipe) channelId: string,
+     @Body(new ZodValidationPipe(readPositionBodySchema)) body: ReadPositionBody,
+   ): Promise<{ sequence: number }> {
+     return this.users.setReadPosition(externalId, channelId, body.sequence);
+   }
+ 
+   /** The profile, read and written (FR-023, FR-024).
+```
+
+```diff title="services/api/src/isolation/gauntlet.itest.ts"
+@@ -682,12 +682,72 @@
+       () => t.victim.repo.listMembers(t.victim.channelId),
+     );
+     expect(verdict.differences, verdict.differences.join("; ")).toEqual([]);
+     expect(verdict.stateChanged, "the victim gained a member").toBe(false);
+   });
+ 
++  // THE NEW WAY TO NAME SOMEBODY ELSE'S CHANNEL (FR-CHN-11, constitution I).
++  //
++  // Until chapter 4.22 there was one forgeable channel identifier and it was a uuid,
++  // which an attacker has to be GIVEN. Now there are two, and the second is one they
++  // can GUESS: `support-ticket-1`, `order-88412`, the customer's own naming scheme.
++  // The resolution is scoped by the request-scoped `Repository`'s constructor, so a
++  // foreign identifier resolves to nothing — and this is the test that says so.
++  //
++  // THE PAIR IS FOREIGN-VERSUS-ABSENT, as everywhere else here: the victim's real
++  // external id against one nobody has used. Indistinguishable, or the answer tells
++  // the attacker the victim's channel exists.
++  it("GET /v1/channels/:channelId — a foreign EXTERNAL id reads as an absent one", async () => {
++    attacked.add("GET /v1/channels/:channelId");
++    const foreign = await fetch(`${url}/v1/channels/${t.victim.channelExternalId}`, {
++      headers: { authorization: `Bearer ${t.attacker.credential}` },
++    });
++    const absent = await fetch(`${url}/v1/channels/nobody-has-named-this`, {
++      headers: { authorization: `Bearer ${t.attacker.credential}` },
++    });
++    expect(foreign.status).toBe(absent.status);
++    expect(withoutRequestId(await foreign.json())).toEqual(
++      withoutRequestId(await absent.json()),
++    );
++  });
++
++  it("POST /v1/channels/:channelId/messages — a foreign EXTERNAL id writes nothing", async () => {
++    attacked.add("POST /v1/channels/:channelId/messages");
++    const verdict = await writeAttack(
++      url,
++      t.attacker.credential,
++      {
++        method: "POST",
++        path: `/v1/channels/${t.victim.channelExternalId}/messages`,
++        body: { user: "intruder", text: "by the name you gave it" },
++      },
++      {
++        method: "POST",
++        path: `/v1/channels/nobody-has-named-this/messages`,
++        body: { user: "intruder", text: "by a name nobody gave" },
++      },
++      () => t.victim.repo.listMessagesRaw(t.victim.channelId),
++    );
++    expect(verdict.differences, verdict.differences.join("; ")).toEqual([]);
++    expect(verdict.stateChanged, "the victim's channel took a message").toBe(false);
++  });
++
++  // AND THE CONTROL THAT MAKES BOTH OF THOSE MEAN SOMETHING: the same external id,
++  // from the tenant that owns it, must WORK. A resolution that refused everyone
++  // would pass the two attacks above perfectly.
++  it("the control: the victim's own credential reaches it by the same name", async () => {
++    const res = await fetch(`${url}/v1/channels/${t.victim.channelExternalId}`, {
++      headers: { authorization: `Bearer ${t.victim.credential}` },
++    });
++    expect(res.status).toBe(200);
++    expect(await res.json()).toMatchObject({
++      external_id: t.victim.channelExternalId,
++      id: t.victim.channelId,
++    });
++  });
++
+   it("POST /v1/channels — the other tenant's external_id is not interference", async () => {
+     attacked.add("POST /v1/channels");
+     // THIS ROUTE CARRIES NO IDENTIFIER TO FORGE, so the pair is not foreign-versus-
+     // absent. What a caller can present is the other tenant's own `external_id`, and
+     // the property is NON-INTERFERENCE rather than indistinguishability: the call must
+     // SUCCEED. Two tenants may use the same customer-supplied id — that is the whole
+```
+
+```diff title="services/api/src/media/media.controller.ts"
+@@ -45,16 +45,20 @@
+    *     500 {"code":"internal_error","message":"unexpected internal error"}
+    *
+    * A malformed uuid reaches the driver, Postgres answers `invalid input syntax for type
+    * uuid`, and the filter has no rung for it — a caller-triggered 500 on sixteen shipped
+    * routes, thirteen taking `channelId` and three taking `messageId`. It is chapter
+    * 4.11's research R3 exactly, which found the same defect in a request BODY, measured
+-   * it, and fixed it with `z.uuid()` — while nobody looked at the path. The other sixteen
+-   * are recorded in `gaps.md` with their measurement rather than repaired here, because a
+-   * chapter about signed delivery that rewrites three controllers is teaching two things
+-   * badly.
++   * it, and fixed it with `z.uuid()` — while nobody looked at the path.
++   *
++   * THE OTHER SIXTEEN ARE CLOSED, and this sentence used to say they were recorded in
++   * `gaps.md` rather than repaired, because a chapter about signed delivery that
++   * rewrites three controllers teaches two things badly. The identifier chapter
++   * (FR-CHN-11) repaired them: `ChannelIdPipe` closes the thirteen `channelId` routes
++   * as a side effect of never casting a value that cannot be a uuid, and
++   * `UuidParamPipe` closes the three `messageId` ones. 058-3 is 16 to 0.
+    *
+    * NOT THROUGH `ZodValidationPipe`, AND THE REASON IS ITS `field`. That pipe names the
+    * field from the zod issue's `path`, which is empty for a scalar and then omitted — so
+    * the reuse would answer 400 without saying which parameter was wrong. The check is
+    * three lines here and names `mediaId`. */
+   @Get(":mediaId")
+```
+
+```diff title="vitest.coverage.config.mts"
+@@ -691,12 +691,67 @@
+         "services/api/src/channels/channels.service.ts": {
+           branches: 75,
+           functions: 100,
+           lines: 94,
+           statements: 94,
+         },
++        // CHAPTER 4.22. The resolution is one line and v8 counts four branches in
++        // the file; three run. Measured rather than assumed, because T033a said a
++        // figure below 100 on a tenant-isolation file means a missing test:
++        //
++        //     branch 0  binary-expr  line 84  [97, 56]   the `??`, both arms
++        //     branch 1  cond-expr    line 79  [ 0,  1]   `@Injectable()`
++        //
++        // **LINE 79 IS THE DECORATOR AND THERE IS NO TERNARY ON IT.** Both arms
++        // carry an identical location with a null end column, which is what the
++        // compiler's own emitted code looks like after source-mapping. No test can
++        // reach an arm that is not in the file, so this is 75 and the clause is met
++        // by the three that are.
++        //
++        // I WAS WRONG TWICE GETTING HERE AND THE SECOND ONE IS WORTH THE LINES.
++        // `media/media.service.ts` is also `@Injectable()`, also takes `Repository`
++        // by class type, and measures 18/18 — which looked like a refutation. Its
++        // one null-end-column `cond-expr` is at line 113 and is a REAL ternary
++        // spanning four lines: `userExternalId === undefined ? null : await …`,
++        // counts [1, 5]. **A null end column means a multi-line expression, not an
++        // emitted one**; what distinguishes the shim is two arms at the SAME
++        // location. Comparing the percentages said one thing and comparing the
++        // branch maps said another.
++        "services/api/src/channels/channel-id.pipe.ts": {
++          branches: 75,
++          functions: 100,
++          lines: 100,
++          statements: 100,
++        },
++        // 058-3's last three. Four statements, one `safeParse`, both arms run.
++        "services/api/src/messages/uuid-param.pipe.ts": {
++          branches: 100,
++          functions: 100,
++          lines: 100,
++          statements: 100,
++        },
++        // CHAPTER 4.22 EDITED THESE TWO AND NEITHER HAD A PIN, which a re-measure
++        // of existing pins cannot see — 062-12's finding, where 68 of 139 files
++        // were unpinned and a human found it by comparing one chapter to another.
++        // 92.50 / 85.00 / 100 / 97.22 measured; pinned under it by the usual
++        // margin, because this file is a controller with forty-odd branch points
++        // and a moving denominator is exactly what that margin is for.
++        "services/api/src/channels/channels.controller.ts": {
++          branches: 83,
++          functions: 100,
++          lines: 95,
++          statements: 90,
++        },
++        // 100 / 100 / 100 / 100 measured, and pinned there: it is a schema file of
++        // pure declarations, so there is no denominator to move.
++        "services/api/src/users/users.schema.ts": {
++          branches: 100,
++          functions: 100,
++          lines: 100,
++          statements: 100,
++        },
+ 
+         "services/api/src/webhooks/disable.ts": {
+           branches: 100,
+           functions: 100,
+           lines: 100,
+           statements: 100,
+```
+
+```diff title="compose.yaml"
+@@ -255,12 +255,21 @@
+     build:
+       context: .
+       dockerfile: services/api/Dockerfile
+     environment:
+       DATABASE_URL: postgres://relay:relay@postgres:5432/relay
+       RELAY_NATS_URL: nats://nats:4222
++      # ONE REPLICA, BECAUSE THIS BROKER IS ONE NODE. The Dockerfile sets
++      # `NODE_ENV=production`, so `replicaCount()` returns ADR-02's R3 and every
++      # `streams.add` answers `replicas > 1 not supported in non-clustered mode`
++      # — the composed api cannot create a stream it does not have (049-2). The
++      # escape hatch has existed since chapter 4.4 and nothing set it: the
++      # streams were created from OUTSIDE the container once, and survived on
++      # the volume for nineteen features, which is why the defect stayed hidden
++      # until feature 068 recreated the volume.
++      RELAY_NATS_REPLICAS: "1"
+       # Container names, not localhost — the api's own default is
+       # `redis://localhost:6379`, which inside this container is not the Redis
+       # service. And the tenant limiter FAILS OPEN by design (SAD §6.3), so a
+       # missing address would not crash anything: the composed stack would serve
+       # every request unlimited while reporting a limit. The constitution
+       # requires the full stack to start with one command, and this is what makes
+```
