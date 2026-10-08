@@ -20168,3 +20168,161 @@ everything the compiler reached.
      const onResume = resumed.frames.filter((f) => f.type === "message.created");
      expect(onResume).toHaveLength(1);
 ```
+
+### `packages/e2e/src/harness.ts` — the journey's clients read the name they are given.
+
+```diff title="packages/e2e/src/harness.ts"
+@@ -548,13 +548,17 @@
+       await repo.addMember(channel.id, tuanUser.id);
+       say(`seeded one channel with two members in ${primaryEnvironment}`);
+       return {
+         environmentId: primaryEnvironment,
+         // The REST assertions present a credential, not a header.
+         credential: await keyFor(primaryEnvironment),
+-        channel: channel.id,
++        // THE NAME, NOT THE KEY (FR-RTM-11, chapter 4.23). A socket client sees
++        // `fleet` in every frame now, so a journey test that filters its timeline
++        // by the uuid matches nothing — which is how this lane found the change.
++        // Sending still accepts either form; reading only ever sees one.
++        channel: "fleet",
+         dispatcher: new Client(
+           "dispatcher",
+           await token(primaryEnvironment, "dispatcher"),
+           say,
+         ),
+         tuan: new Client("tuan", await token(primaryEnvironment, "tuan"), say),
+```
+
+### `packages/outsider/src/integrate.itest.ts` — the sealed suite stops pinning the key.
+
+```diff title="packages/outsider/src/integrate.itest.ts"
+@@ -165,12 +165,16 @@
+ 
+ describe("integrating with Relay from the outside", () => {
+   let api: string;
+   let ws: string;
+   let credential: string;
+   let channelId: string;
++  /** What the customer called the channel. A socket client sees THIS in every frame
++   * from chapter 4.23 on, so a suite that holds a socket has to hold both names:
++   * REST routes take either, and frames only ever carry one. */
++  let channelExternalId: string;
+   let token: string;
+ 
+   const post = async (path: string, body: unknown, auth: string) => {
+     const res = await fetch(`${api}${path}`, {
+       method: "POST",
+       headers: { "content-type": "application/json", authorization: `Bearer ${auth}` },
+@@ -260,12 +264,13 @@
+   it("creates a channel, and creating it twice is not an error", async () => {
+     const external = `outsider-${Date.now()}`;
+     const first = await post("/v1/channels", { external_id: external, type: "public" }, credential);
+     expect(first.status).toBe(201);
+     expect(first.body["external_id"]).toBe(external);
+     channelId = first.body["id"] as string;
++    channelExternalId = external;
+ 
+     // The documentation says a repeat returns the existing channel. 200 rather
+     // than 201 is how a client tells which happened without reading the body.
+     const again = await post("/v1/channels", { external_id: external, type: "public" }, credential);
+     expect(again.status).toBe(200);
+     expect(again.body["id"]).toBe(channelId);
+@@ -756,15 +761,16 @@
+     // THE MEMBERSHIP IS NOT OPTIONAL AND ITS ABSENCE IS SILENT. Measured while this was
+     // being written: a socket opened with a valid token for a non-member received
+     // `connection.ack` and `presence.changed` and **no `message.created` and no
+     // `media.updated`** — on a PUBLIC channel. The absence of every frame looks exactly
+     // like the absence of the one you came for, which is how an earlier probe read as
+     // `media.updated` not existing at all.
++    const journeyExternal = `journey-${Date.now()}`;
+     const journeyChannel = await post(
+       "/v1/channels",
+-      { external_id: `journey-${Date.now()}`, type: "public" },
++      { external_id: journeyExternal, type: "public" },
+       credential,
+     );
+     expect(
+       journeyChannel.status,
+       "the journey could not create its own channel",
+     ).toBe(201);
+@@ -921,18 +927,22 @@
+         f.payload?.["media_id"] === journeyMediaId,
+       "media.updated for the journey's attachment",
+     );
+     //
+     // THE WHOLE PAYLOAD, NOT THE STATE ALONE. `{media_id, channel, state}` and nothing
+     // else — asserting only the state would pass for a frame announcing somebody else's
+-    // object in somebody else's channel, which is the shape a fan-out bug takes. The
+-    // channel is the id rather than the external id, which is worth pinning from out
+-    // here because it is the field a client routes on.
++    // object in somebody else's channel, which is the shape a fan-out bug takes.
++    //
++    // **THE CHANNEL IS THE EXTERNAL ID SINCE CHAPTER 4.23, AND THIS COMMENT USED TO SAY
++    // THE OPPOSITE** — "the id rather than the external id… because it is the field a
++    // client routes on". That reasoning was right and its conclusion is now inverted:
++    // what a client routes on is the name the customer gave the channel, which is what
++    // the frame carries. A test pinning the uuid from out here was pinning the defect.
+     expect(updated.payload).toEqual({
+       media_id: journeyMediaId,
+-      channel: journeyId,
++      channel: journeyExternal,
+       state: "ready",
+     });
+ 
+     // STEP 8 — WHAT A RECIPIENT ACTUALLY READS (chapters 4.14 and 4.15).
+     //
+     // The whole payload, not the state alone: the rendition's id and its dimensions
+@@ -1034,15 +1044,16 @@
+    *  actually produce is the type one.
+    *
+    *  AND THE DECLARED SIZE IS HONEST. 43 bytes declared, 43 uploaded; a mismatch of one
+    *  byte in either direction is a different refusal, and a test that got both wrong at
+    *  once would pass for the wrong reason. */
+   it("delivers a refused upload as a rejected marker a recipient can tell apart (4.17, SC-004)", async () => {
++    const rejectExternal = `reject-${Date.now()}`;
+     const rejectChannel = await post(
+       "/v1/channels",
+-      { external_id: `reject-${Date.now()}`, type: "public" },
++      { external_id: rejectExternal, type: "public" },
+       credential,
+     );
+     expect(rejectChannel.status).toBe(201);
+     const rejectId = rejectChannel.body["id"] as string;
+     expect(
+       (
+@@ -1148,13 +1159,15 @@
+         );
+       }
+       await new Promise((r) => setTimeout(r, 50));
+     }
+     expect(frames.find((f) => f.type === "media.updated")?.payload).toEqual({
+       media_id: rejectedId,
+-      channel: rejectId,
++      // The name, not the key — a frame carries what the customer called the
++      // channel since chapter 4.23 (FR-RTM-11).
++      channel: rejectExternal,
+       state: "rejected",
+     });
+     socket.close();
+ 
+     // FR-MED-09's TESTABLE HALF: THE MESSAGE SURVIVES THE REFUSAL. Checked as a premise
+     // before it was asserted — a history route that filtered a message whose only
+@@ -1339,13 +1352,16 @@
+     await until(ben.frames, (f) => f.type === "connection.ack", "ben's ack");
+ 
+     ana.socket.send(JSON.stringify({ type: "typing.send", payload: { channel: channelId } }));
+ 
+     await until(
+       ben.frames,
+-      (f) => f.type === "typing" && f.payload?.channel === channelId && f.payload?.user === "ana",
++      (f) =>
++        f.type === "typing" &&
++        f.payload?.channel === channelExternalId &&
++        f.payload?.user === "ana",
+       "a typing frame naming ana",
+     );
+     // And the signaller hears nothing of their own — checked here rather than only
+     // in-workspace, because it is the half a customer would notice.
+     expect(ana.frames.filter((f) => f.type === "typing")).toEqual([]);
+ 
+```
