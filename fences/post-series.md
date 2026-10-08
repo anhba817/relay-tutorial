@@ -18435,3 +18435,1736 @@ after the source.
        # every request unlimited while reporting a limit. The constitution
        # requires the full stack to start with one command, and this is what makes
 ```
+
+## Chapter 4.23 — the channel a socket names
+
+**TWENTY FILES AGAINST A BILL OF TWELVE, AND THE EIGHT IT MISSED ARE TESTS.** The bill
+counted the files the subject touches. Changing `channel_ids` to pairs is a TYPE change,
+so the compiler named every stub that constructs a session response — and eight of those
+stubs live in files the fence chain publishes. 4.15's rule a fifth time, from a direction
+it had not come from before: the estimate was of source files and the charge is for
+everything the compiler reached.
+
+### `packages/protocol/src/frames.ts` — the comment that says what a `channel` carries, since the type does not.
+```diff title="packages/protocol/src/frames.ts"
+@@ -12,12 +12,29 @@
+ // `type` discriminator and a `payload` (EIR-WS-02). Schemas are the single
+ // source of truth: every exported static type is inferred from its schema,
+ // so the types and the validation cannot drift — there is no second
+ // definition. Payloads are strict: unknown fields are rejected.
+ 
+ /** Per-channel resume cursor: { channel_id: highest seq seen } (ADR-03). */
++/** WHAT A `channel` IS CALLED ON THIS CONTRACT (FR-RTM-11, chapter 4.23).
++ *
++ * Every `channel` field below, and every key of `cursorSchema` and of the ack's
++ * `revisions`, and every member of the ack's `truncated`, carries the identifier the
++ * CUSTOMER gave the channel — not the uuid Relay minted. **The type did not change
++ * and that is why this comment exists**: `z.string().min(1)` admitted both before
++ * and after, so nothing in the toolchain can tell a reader which one arrives.
++ *
++ * AND SEVEN IS A COUNT OF DECLARATIONS, NOT OF SCHEMAS. `forwardedMessageSchema`
++ * extends `messageSchema`, and `messageCreatedSchema`, `messageUpdatedSchema` and
++ * `messageDeletedSchema` wrap payloads that carry the field — four more places the
++ * rule holds and is not written.
++ *
++ * INBOUND, BOTH FORMS ARE ACCEPTED. A client published before this chapter holds a
++ * uuid-keyed cursor and a uuid in its sends, and 19 of 44,574 channels carry an
++ * identifier that is itself another channel's uuid — so no shape test separates
++ * them and the gateway tries the identity first, as REST does. */
+ export const cursorSchema = z.record(z.string(), z.number().int().positive());
+ 
+ /** The message on the wire — derived from the SAD §6.1 `messages` columns.
+  * Wire spellings follow SAD §5.1's own frame line (`channel`, `seq`).
+  *
+  * `metadata` is the one column of §6.1 this payload still does not carry.
+```
+
+### `packages/protocol/src/internal.ts` — the session and memberships responses carry pairs.
+```diff title="packages/protocol/src/internal.ts"
+@@ -165,15 +165,28 @@
+   if (!environmentId) throw new Error("an environment id is required");
+   const [domain, ...rest] = type.split(".");
+   const abbreviated = DOMAIN_ABBREVIATION[domain!] ?? domain!;
+   return [EVENT_SUBJECT_PREFIX, abbreviated, ...rest, environmentId].join(".");
+ }
+ 
+-/** api → gateway: the channels this user may hear (FR-RTM-01). */
++/** api → gateway: the channels this user may hear (FR-RTM-01).
++ *
++ * PAIRS, FOR THE SAME REASON THE SESSION RESPONSE CARRIES THEM (FR-RTM-11, chapter
++ * 4.23). This route is the revocation backstop's: it re-reads the truth on a timer
++ * and the gateway applies the difference through the same `deliverMembership` the
++ * fast path takes. An ADDITION found that way announces a channel the connection
++ * has never heard of, so without the identity here the one frame telling a client
++ * about the channel is the one frame that cannot name it — and the gateway, which
++ * has no database, has nothing to look it up with. */
+ export const internalMembershipsResponseSchema = z.strictObject({
+-  channel_ids: z.array(z.string().min(1)),
++  channels: z.array(
++    z.strictObject({
++      id: z.string().min(1),
++      external_id: z.string().min(1),
++    }),
++  ),
+ });
+ 
+ /** api → gateway: who the presented token belongs to, and what it
+  * may hear — in ONE answer.
+  *
+  * This replaces the memberships response above rather than joining it. The
+@@ -184,14 +197,32 @@
+  *
+  * `user` is the EXTERNAL id, as everywhere else on this contract: internal uuids
+  * are the api's business. */
+ export const internalSessionResponseSchema = z.strictObject({
+   environment_id: z.string().min(1),
+   user: z.string().min(1),
+-  channel_ids: z.array(z.string().min(1)),
+-  /** Per channel, how many revisions it has seen — the same keys as `channel_ids`.
++  /** The channels this user may hear, each as the pair the gateway needs: the key
++   * everything behind the client edge routes on, and the identifier the customer
++   * gave it (FR-RTM-11, chapter 4.23).
++   *
++   * PAIRS RATHER THAN A SECOND FIELD, because two parallel arrays are two lists
++   * that must agree with nothing comparing them — the defect `gaps.md` 3.23-4
++   * records about `targets.ts`, and the reason `channelsForUser` carries its
++   * revision count on the same row rather than in a second call. */
++  channels: z.array(
++    z.strictObject({
++      id: z.string().min(1),
++      external_id: z.string().min(1),
++    }),
++  ),
++  /** Per channel, how many revisions it has seen — the same keys as `channels[].id`.
++   *
++   * KEYED BY THE KEY, AND DELIBERATELY. The gateway re-keys this map to identities
++   * at the ack, because that is the edge where a client is; this contract is the
++   * api talking to the gateway, where the sentence two paragraphs up still holds —
++   * internal uuids are the api's business.
+    *
+    * ONE QUERY, TWO FIELDS. The membership read already joins `channels` to answer
+    * `channel_ids`, so the counter comes back on rows the api was fetching anyway: no
+    * second round trip, and no possibility of the two disagreeing about which channels
+    * the user belongs to. */
+   revisions: z.record(z.string().min(1), z.number().int().nonnegative()),
+```
+
+### `packages/protocol/src/membership.ts` — the fabric change carries the channel's identity.
+```diff title="packages/protocol/src/membership.ts"
+@@ -61,12 +61,24 @@
+  * rather than one, and the sentinel is documented here rather than inferred from a
+  * log line. `channel` stays `z.string().min(1)`, so `"*"` is a value the schema admits
+  * and this comment is what makes it mean something. */
+ export const membershipFabricSchema = z.strictObject({
+   environment: z.string().min(1),
+   channel: z.string().min(1),
++  /** What the customer calls this channel (FR-RTM-11, chapter 4.23).
++   *
++   * IT RIDES THE CHANGE BECAUSE THE GATEWAY CANNOT LOOK IT UP. A user added
++   * mid-session learns of the channel from this frame, and until it arrives the
++   * connection's map has no entry for it — so the identity has to come WITH the
++   * change or the first frame for a new channel cannot be named. The backstop that
++   * re-reads memberships is a sixty-second timer (`DEFAULT_REREAD_INTERVAL_MS`) and
++   * this frame goes out immediately; it cannot stand in.
++   *
++   * ABSENT FOR `ALL_CHANNELS`, which is not a channel and is expanded into one
++   * change per real channel before anything is sent. */
++  channel_identity: z.string().min(1).optional(),
+   user: z.string().min(1),
+   change: z.enum(["added", "removed"]),
+ });
+ 
+ export type MembershipFabric = z.infer<typeof membershipFabricSchema>;
+ 
+```
+
+### `services/api/src/db/repository.ts` — `channelsForUser` returns the identity beside the key.
+```diff title="services/api/src/db/repository.ts"
+@@ -4097,16 +4097,23 @@
+    * TWO CALLERS, AND BOTH ARE REPAIRED IN THE SAME CHANGE. `session.controller.ts` wants
+    * the counts; `memberships.controller.ts` wants ids alone and maps them. Widening the
+    * return without fixing both leaves the second assigning objects to a `string[]`, which
+    * is a typecheck failure at exactly the boundary this project commits at. */
+   async channelsForUser(
+     userId: string,
+-  ): Promise<{ channel_id: string; revision_sequence: number }[]> {
++  ): Promise<
++    { channel_id: string; external_id: string; revision_sequence: number }[]
++  > {
+     return await this.db
+       .select({
+         channel_id: members.channelId,
++        // THE IDENTITY COSTS A COLUMN AND NOT A JOIN (FR-RTM-11, chapter 4.23).
++        // `channels` is already reached for the revision count, so the name the
++        // customer gave this channel rides a row the query was fetching anyway —
++        // the same argument the count itself made one feature earlier.
++        external_id: channels.externalId,
+         revision_sequence: channels.revisionSequence,
+       })
+       .from(members)
+       .innerJoin(users, eq(users.id, members.userId))
+       .innerJoin(channels, eq(channels.id, members.channelId))
+       .where(
+```
+
+### `services/api/src/internal/session.controller.ts` — pairs, not strings.
+```diff title="services/api/src/internal/session.controller.ts"
+@@ -126,13 +126,19 @@
+       // with no channels rather than an error — and a user with no row has no ban either.
+       banned: user?.banned_at != null,
+       // IDS AND COUNTS OFF ONE READ. `channelsForUser` returns a row per channel, so
+       // the two fields cannot disagree about which channels this user belongs to — and
+       // the counter costs no extra query, because the membership join already touches
+       // `channels` to answer the ids.
+-      channel_ids: channels.map((c) => c.channel_id),
++      // THE PAIR, NOT THE KEY (FR-RTM-11). `channelsForUser` returns both off one
++      // row, so the gateway is told what the customer calls each channel at the
++      // same instant it is told which channels there are.
++      channels: channels.map((c) => ({
++        id: c.channel_id,
++        external_id: c.external_id,
++      })),
+       revisions: Object.fromEntries(
+         channels.map((c) => [c.channel_id, c.revision_sequence]),
+       ),
+       limits: {
+         connect: policy.limits.connect,
+         send: policy.limits.send,
+```
+
+### `services/api/src/internal/memberships.controller.ts` — the backstop's route needs the name too.
+```diff title="services/api/src/internal/memberships.controller.ts"
+@@ -65,12 +65,15 @@
+       req.principal.userExternalId,
+     );
+     return {
+       // Ids alone: this route answers what a user may hear, not what has changed in it.
+       // `channelsForUser` carries revision counts for the session route (feature 044);
+       // mapping them off here keeps one query behind both.
+-      channel_ids: user
+-        ? (await this.repo.channelsForUser(user.id)).map((c) => c.channel_id)
++      channels: user
++        ? (await this.repo.channelsForUser(user.id)).map((c) => ({
++            id: c.channel_id,
++            external_id: c.external_id,
++          }))
+         : [],
+     };
+   }
+ }
+```
+
+### `services/api/src/channels/channels.controller.ts` — the announcement reads the name back.
+```diff title="services/api/src/channels/channels.controller.ts"
+@@ -225,19 +225,27 @@
+    * The environment is the PRINCIPAL's, established by the guard, never a body's. */
+   private async announce(
+     channelId: string,
+     user: string,
+     change: "added" | "removed",
+   ): Promise<void> {
++    // ONE READ, ON A LOW-RATE PATH, AND 4.22 IS WHY IT IS NEEDED AT ALL
++    // (FR-RTM-11, chapter 4.23). A gateway cannot name a channel a connection has
++    // just joined — its map was built at connect — so the identity rides the
++    // change. `ChannelIdPipe` resolved the caller's identifier to a key before this
++    // handler ran, so the name has to be read back; a membership change is rare
++    // enough to pay for it, which a delivered message would not be.
++    const channel = await this.repo.getChannelById(channelId);
+     await this.membership.publish({
+       // THE REPOSITORY'S SCOPE, NOT AN OPTIONAL CHAIN OFF THE PRINCIPAL. Both read
+       // the same id from the same verified credential, and `?? "unknown"` carries a
+       // branch the guard makes unreachable — the coverage ratchet found the identical
+       // arm in `users.controller.ts` at 75% against a pin of 100.
+       environment: this.repo.environment,
+       channel: channelId,
++      ...(channel !== null && { channel_identity: channel.external_id }),
+       user,
+       change,
+     });
+   }
+ 
+   /** The user-initiated half of FR-CHN-03.
+```
+
+### `services/api/src/internal/internal.itest.ts` — and a hand-written cast is a hole in the instrument.
+```diff title="services/api/src/internal/internal.itest.ts"
+@@ -140,26 +140,32 @@
+     const res = await fetch(`${url}/internal/session`, {
+       method: "POST",
+       headers: await headers(),
+     });
+     const parsed = internalSessionResponseSchema.safeParse(await res.json());
+     expect(parsed.error?.issues ?? []).toEqual([]);
+-    expect(parsed.data?.channel_ids).toContain(channelId);
++    expect(parsed.data?.channels.map((c) => c.id)).toContain(channelId);
++    // AND THE NAME THE CUSTOMER GAVE IT, BESIDE THE KEY (FR-RTM-11). The gateway
++    // cannot translate what it was never told, and this is the only place it is
++    // told — one row per channel, so the two cannot disagree.
++    expect(
++      parsed.data?.channels.find((c) => c.id === channelId)?.external_id,
++    ).toBeTypeOf("string");
+     // The half that is new: the api says who the token belongs to.
+     expect(parsed.data?.user).toBe("tuan");
+     expect(parsed.data?.environment_id).toBe(env.id);
+   });
+ 
+   it("answers for an unknown user with no channels rather than an error", async () => {
+     const res = await fetch(`${url}/internal/session`, {
+       method: "POST",
+       headers: await headers("nobody-here"),
+     });
+     expect(res.status).toBe(200);
+     expect(
+-      internalSessionResponseSchema.parse(await res.json()).channel_ids,
++      internalSessionResponseSchema.parse(await res.json()).channels,
+     ).toEqual([]);
+   });
+ 
+   it("refuses an unverifiable token instead of answering for it", async () => {
+     // The refusal the gateway turns into a 4001. It exists here because the
+     // route that verifies is the route that must refuse — the gateway holds no
+@@ -182,26 +188,26 @@
+     const res = await fetch(`${url}/internal/memberships`, {
+       headers: await headers(),
+     });
+     expect(res.status).toBe(200);
+     const parsed = internalMembershipsResponseSchema.safeParse(await res.json());
+     expect(parsed.error?.issues ?? []).toEqual([]);
+-    expect(parsed.data?.channel_ids).toContain(channelId);
++    expect(parsed.data?.channels.map((c) => c.id)).toContain(channelId);
+   });
+ 
+   it("answers a user with no row as a user with no channels", async () => {
+     // The branch the backstop depends on. A re-read that threw for a deleted user
+     // would turn a routine refresh into a failure the gateway has to interpret, and
+     // 2.5's rule already says a token for an unseen user is a user with no channels
+     // rather than an error.
+     const res = await fetch(`${url}/internal/memberships`, {
+       headers: await headers("nobody-here"),
+     });
+     expect(res.status).toBe(200);
+     expect(
+-      internalMembershipsResponseSchema.parse(await res.json()).channel_ids,
++      internalMembershipsResponseSchema.parse(await res.json()).channels,
+     ).toEqual([]);
+   });
+ 
+   it("refuses an unverifiable token", async () => {
+     const res = await fetch(`${url}/internal/memberships`, {
+       headers: { authorization: "Bearer not-a-token" },
+@@ -264,25 +270,33 @@
+   it("names neither a private nor a public channel the user is not a member of", async () => {
+     const res = await fetch(`${url}/internal/session`, {
+       method: "POST",
+       headers: await headers("stranger"),
+     });
+     expect(res.status).toBe(200);
+-    const body = (await res.json()) as { channel_ids: string[] };
+-    expect(body.channel_ids).not.toContain(privateChannelId);
++    // A HAND-WRITTEN CAST IS A HOLE IN THE INSTRUMENT. The session response became
++    // pairs in chapter 4.23 and the compiler named thirteen construction sites — not
++    // this one, because `as { … }` asserts a shape rather than reading it. Typed off
++    // the schema now, so the next change to that contract names this line too.
++    const body = internalSessionResponseSchema.parse(await res.json());
++    expect(body.channels.map((c) => c.id)).not.toContain(privateChannelId);
+     // `channelId` is the PUBLIC channel this suite's other user belongs to. The
+     // stranger can read it by id and send to it, and it is still not in their
+     // session: membership decides subscription, visibility decides reads.
+-    expect(body.channel_ids).not.toContain(channelId);
++    expect(body.channels.map((c) => c.id)).not.toContain(channelId);
+   });
+ 
+   it("names a channel the user IS a member of", async () => {
+     // The control. An empty list would satisfy the assertions above while proving
+     // that the session is broken rather than that it is scoped.
+     const res = await fetch(`${url}/internal/session`, {
+       method: "POST",
+       headers: await headers("tuan"),
+     });
+-    const body = (await res.json()) as { channel_ids: string[] };
+-    expect(body.channel_ids).toContain(privateChannelId);
++    // A HAND-WRITTEN CAST IS A HOLE IN THE INSTRUMENT. The session response became
++    // pairs in chapter 4.23 and the compiler named thirteen construction sites — not
++    // this one, because `as { … }` asserts a shape rather than reading it. Typed off
++    // the schema now, so the next change to that contract names this line too.
++    const body = internalSessionResponseSchema.parse(await res.json());
++    expect(body.channels.map((c) => c.id)).toContain(privateChannelId);
+   });
+ });
+```
+
+### `services/gateway/src/auth.ts` — the pairs carried one hop.
+```diff title="services/gateway/src/auth.ts"
+@@ -36,13 +36,17 @@
+  * `refused` instead would close 4001, "your credential is bad", which a client
+  * acts on by re-authenticating for ever. */
+ export type Authentication =
+   | {
+       outcome: "ok";
+       identity: Identity;
+-      channelIds: string[];
++      /** The channels this user may hear, as pairs (FR-RTM-11, chapter 4.23): the
++       * key everything behind the client edge routes on, and the identifier the
++       * customer gave it. The connection derives both a key set and a translation
++       * from this one list, so the two cannot disagree. */
++      channels: { id: string; external_id: string }[];
+       /** Per channel, how many revisions it has seen. Reported to the client on the
+        * ack and never compared here: the gateway has no opinion about staleness, and
+        * no database to form one with. */
+       revisions: Record<string, number>;
+       /** The environment's two socket allowances, read from
+        * Postgres by the api and carried on the same response — the gateway has
+@@ -97,13 +101,13 @@
+         environmentId: session.environment_id,
+         userExternalId: session.user,
+         // Carried, not trusted: the internal hop forwards this instead of
+         // asserting an identity the gateway invented.
+         token,
+       },
+-      channelIds: session.channel_ids,
++      channels: session.channels,
+       revisions: session.revisions,
+       limits: session.limits,
+     };
+   } catch (error) {
+     return { outcome: "unavailable", error: String(error) };
+   }
+```
+
+### `services/gateway/src/registry.ts` — the connection holds both directions.
+```diff title="services/gateway/src/registry.ts"
+@@ -20,12 +20,29 @@
+    * reconnects, which is the only moment the number is useful to it. */
+   revisions: Record<string, number>;
+   readonly id: string;
+   readonly identity: Identity;
+   readonly socket: WebSocket;
+   channelIds: Set<string>;
++  /** What the customer calls each of those channels, and the way back
++   * (FR-RTM-11, chapter 4.23).
++   *
++   * BOTH DIRECTIONS, BECAUSE THE EDGE HAS TWO. `identities` names a channel on the
++   * way out — every frame, and the three structures on the ack that carry no
++   * `channel` field. `keys` turns what a client SAYS back into the key the api, the
++   * subjects and the cursor filter all speak, because a client may now say either.
++   *
++   * DERIVED FROM ONE LIST, so they cannot disagree, and safe to invert because
++   * `unique("channels_environment_id_external_id_unique")` makes an identity unique
++   * inside the environment this connection belongs to.
++   *
++   * AND `channelIds` STAYS KEYS. Three membership tests read it — signalTyping's
++   * guard, the revocation backstop's set difference, and the resume cursor's filter
++   * — and all three invert silently if it ever holds an identity. */
++  identities: Map<string, string>;
++  keys: Map<string, string>;
+   missedPings: number;
+   /** Chapter 2.7. A connection resuming through the tunnel spends its first
+    * milliseconds holding live frames back so the backfill can go first; a
+    * fresh connect is born "live" and never buffers. Delivery reads this
+    * field and nothing else — the resume machinery is invisible to it. */
+   phase: ResumePhase;
+```
+
+### `services/gateway/src/session.ts` — one place a frame leaves, and therefore one place a channel is renamed.
+```diff title="services/gateway/src/session.ts"
+@@ -113,14 +113,101 @@
+  * code the coverage ratchet would have to be told to ignore — and this chapter's
+  * pins are 100/100/100/100. */
+ function isInboundFrame(frame: Frame): frame is Extract<Frame, { type: InboundFrameType }> {
+   return INBOUND_FRAME_TYPES.has(frame.type as InboundFrameType);
+ }
+ 
+-function send(socket: WebSocket, frame: RelayedFrame): void {
+-  socket.send(JSON.stringify(frame));
++/** THE ONE PLACE A FRAME LEAVES, AND THEREFORE THE ONE PLACE A CHANNEL IS RENAMED
++ * (FR-RTM-11, chapter 4.23).
++ *
++ * WHY HERE AND NOT AT THE SITES THAT BUILD FRAMES. Of the twenty-one places this
++ * service writes `channel:`, three build a client frame, eleven are LOG LINES an
++ * operator reads against the subjects, six are internal publishes and one is a
++ * comment — and `message.created`, the commonest frame on the socket, arrives as a
++ * payload FORWARDED from the api and is written by no expression here at all. A
++ * per-site translation would rename eleven log lines, rename two publishes, and
++ * miss the frame clients see most.
++ *
++ * AND EVERYTHING BEHIND THIS LINE STAYS KEYED, which is the other half of the
++ * argument: `connection.buffer` holds frames that `flushable` indexes by
++ * `marks[frame.channel]` and that the revocation filter compares with
++ * `change.channel`. Translating where a frame is BUILT would put an identity into
++ * the buffer and leave both comparisons looking at keys — a resuming client re-sent
++ * its whole backlog, and a revoked channel's backlog flushed anyway (FR-029). Both
++ * failures are silent. Translating on the way out cannot reach them.
++ *
++ * A MISS DROPS THE FRAME AND SAYS SO. After the membership frame carries its own
++ * identity and `ALL_CHANNELS` is handled before the map, a miss is a bug. The
++ * alternative — emit the key — hands a client the uuid this chapter removes, on
++ * exactly the channel it just failed to name, and a client cannot recover from that;
++ * a dropped frame is recoverable, because the message is durable and the resume
++ * cursor carries it on the next connect. */
++function send(
++  connection: Pick<Connection, "socket" | "identities" | "id">,
++  frame: RelayedFrame,
++  logger?: Logger,
++): void {
++  const named = nameForClient(connection, frame, logger);
++  if (named === undefined) return;
++  connection.socket.send(JSON.stringify(named));
++}
++
++/** The translation itself, separated so the refusal has one place to live. */
++function nameForClient(
++  connection: Pick<Connection, "identities" | "id">,
++  frame: RelayedFrame,
++  logger?: Logger,
++): RelayedFrame | undefined {
++  const payload = (frame as { payload?: Record<string, unknown> }).payload;
++  if (payload === undefined) return frame;
++
++  const rename = (key: unknown): string | undefined => {
++    if (typeof key !== "string") return undefined;
++    const identity = connection.identities.get(key);
++    if (identity === undefined) {
++      logger?.log("error", "frame.unnamed_channel", {
++        connection_id: connection.id,
++        type: frame.type,
++        channel: key,
++      });
++    }
++    return identity;
++  };
++
++  if (typeof payload["channel"] === "string") {
++    const identity = rename(payload["channel"]);
++    if (identity === undefined) return undefined;
++    return { ...frame, payload: { ...payload, channel: identity } } as RelayedFrame;
++  }
++
++  // THE ACK, WHICH NAMES CHANNELS THREE TIMES WITHOUT THE WORD: `revisions` and
++  // `cursor` are keyed by channel and `truncated` is a list of them. A count of
++  // `channel` fields cannot see any of the three.
++  if (frame.type !== "connection.ack") return frame;
++  const rekey = (map: unknown): Record<string, number> | undefined => {
++    const out: Record<string, number> = {};
++    for (const [key, value] of Object.entries(map as Record<string, number>)) {
++      const identity = rename(key);
++      if (identity === undefined) return undefined;
++      out[identity] = value;
++    }
++    return out;
++  };
++  const revisions = rekey(payload["revisions"]);
++  const cursor = rekey(payload["cursor"]);
++  const truncated: string[] = [];
++  for (const key of (payload["truncated"] ?? []) as string[]) {
++    const identity = rename(key);
++    if (identity === undefined) return undefined;
++    truncated.push(identity);
++  }
++  if (revisions === undefined || cursor === undefined) return undefined;
++  return {
++    ...frame,
++    payload: { ...payload, revisions, cursor, truncated },
++  } as RelayedFrame;
+ }
+ 
+ /** EIR-API-04's envelope, wearing its WebSocket clothes.
+  *
+  * `request_id` ARRIVED IN THE RATE-LIMIT CHAPTER, and the gateway had none to give — it
+  * minted no ids at all. The field is required on the frame rather than optional,
+@@ -180,22 +267,25 @@
+    * side.
+    *
+    * Omitted when there is no path, exactly as the pipe does: an empty path means the
+    * whole frame failed and there is no field to name. */
+   field?: string,
+ ): void {
+-  send(socket, {
++  // DIRECT, AND NOT THROUGH `send` ABOVE. An error frame names no channel, so there
++  // is nothing to translate — and this refusal has to work at the upgrade, before a
++  // `Connection` and therefore before any map exists (FR-RTM-11, chapter 4.23).
++  socket.send(JSON.stringify({
+     type: "error",
+     payload: {
+       code,
+       message,
+       docs_url: docsUrl(code),
+       request_id: requestId,
+       ...(field !== undefined && field.length > 0 ? { field } : {}),
+     },
+-  });
++  }));
+ }
+ 
+ export interface SessionServerOptions {
+   server: Server;
+   api: ApiClient;
+   logger: Logger;
+@@ -365,13 +455,13 @@
+       // nothing to remember: a frame at or below what its backfill already
+       // delivered is one it has, however long ago the resume finished. Before
+       // this, delivery consulted `phase` and nothing else, and the marks were
+       // discarded the moment the connection went live — which is precisely when
+       // the fabric could still be catching up.
+       if (suppressed(connection.marks, message)) continue;
+-      send(connection.socket, { type: "message.created", payload: message });
++      send(connection, { type: "message.created", payload: message });
+     }
+   }
+   fanout?.onDelivery(deliver);
+ 
+   /** An edit or a deletion arriving from the revision fabric (ADR-24).
+    *
+@@ -404,19 +494,19 @@
+       //
+       // `media.updated` IS ONE LETTER FROM `message.updated` AND THEY SIT ADJACENT ON
+       // PURPOSE. Both can describe the same message: an edit changes its text, this
+       // changes what one of its attachments resolves to.
+       switch (revision.kind) {
+         case "updated":
+-          send(connection.socket, { type: "message.updated", payload: revision.message });
++          send(connection, { type: "message.updated", payload: revision.message });
+           break;
+         case "deleted":
+-          send(connection.socket, { type: "message.deleted", payload: revision.message });
++          send(connection, { type: "message.deleted", payload: revision.message });
+           break;
+         case "media":
+-          send(connection.socket, {
++          send(connection, {
+             type: "media.updated",
+             payload: {
+               media_id: revision.media_id,
+               channel: revision.channel,
+               state: revision.state,
+             },
+@@ -466,13 +556,13 @@
+           connection_id: connection.id,
+           channel: signal.channel,
+         });
+         continue;
+       }
+       if (connection.identity.userExternalId === signal.user) continue;
+-      send(connection.socket, {
++      send(connection, {
+         type: "typing",
+         payload: { channel: signal.channel, user: signal.user },
+       });
+     }
+   }
+   typing?.onSignal(deliverTyping);
+@@ -490,13 +580,13 @@
+    * published and `frames.test.ts` asserts. */
+   function deliverPresence(channelId: string, payload: PresenceFabric): void {
+     for (const connection of registry.subscribersOf(channelId)) {
+       // One frame per transition per connection, however many channels this
+       // connection shares with the subject (FR-012).
+       if (!presence?.claim(payload.transition, connection.id)) continue;
+-      send(connection.socket, {
++      send(connection, {
+         type: "presence.changed",
+         payload: { user: payload.user, state: payload.state },
+       });
+     }
+   }
+   presence?.onTransition(deliverPresence);
+@@ -600,13 +690,13 @@
+     }
+ 
+     const frame = {
+       type: "membership.changed" as const,
+       payload: { channel: change.channel, user: change.user, change: change.change },
+     };
+-    for (const connection of others) send(connection.socket, frame);
++    for (const connection of others) send(connection, frame);
+ 
+     for (const connection of subject) {
+       // SEND, THEN CUT. Reversing these two statements is the whole of FR-008, and
+       // T065 proves the ordering test bites by removing this line and watching it
+       // fail.
+       if (change.change === "added") {
+@@ -625,13 +715,23 @@
+           // analysis pass 2 reading this function rather than the feature's own
+           // documents, every one of which was internally consistent and wrong.
+           typing?.subscribe(change.channel),
+         ]).then(
+           () => {
+             connection.channelIds.add(change.channel);
+-            send(connection.socket, frame);
++            // THE MAP BEFORE THE SEND, AND THAT ORDERING IS THE WHOLE OF FR-RTM-11
++            // HERE. This frame is the first thing a client hears about a channel it
++            // has just joined; `send` names a channel from `identities`, so an entry
++            // added after the send would make the one frame announcing the channel
++            // the only frame that cannot name it. The identity rides the change for
++            // exactly this reason — the gateway has nothing to look it up with.
++            if (change.channel_identity !== undefined) {
++              connection.identities.set(change.channel, change.channel_identity);
++              connection.keys.set(change.channel_identity, change.channel);
++            }
++            send(connection, frame, logger);
+             logger.log("info", "membership.applied", {
+               change: "added",
+               connection_id: connection.id,
+               channel: change.channel,
+               user: change.user,
+             });
+@@ -646,18 +746,24 @@
+               error: String(error),
+             });
+           },
+         );
+         continue;
+       }
+-      send(connection.socket, frame);
++      send(connection, frame, logger);
+       if (change.change !== "removed") continue;
+ 
+       // THE FIRST MUTATION OF THIS SET AFTER THE CONNECTION EXISTS. Every reader of
+       // `channelIds` has assumed it immutable since chapter 2.5.
+       connection.channelIds.delete(change.channel);
++      // AFTER THE SEND ABOVE, NOT BEFORE IT. The frame that tells a client it has
++      // been removed still has to name the channel it is about, so the entry
++      // outlives the membership by exactly one frame (FR-RTM-11).
++      const removedIdentity = connection.identities.get(change.channel);
++      connection.identities.delete(change.channel);
++      if (removedIdentity !== undefined) connection.keys.delete(removedIdentity);
+       // AND THE BUFFER IS ONE OF THOSE READERS (FR-029). `flushable(buffer, marks)`
+       // filters on `frame.seq` and on nothing else, so a removal landing mid-resume
+       // would unsubscribe the channel and then flush its buffered messages anyway —
+       // access revoked and the backlog delivered in the same act.
+       connection.buffer = connection.buffer.filter(
+         (message) => message.channel !== change.channel,
+@@ -723,13 +829,14 @@
+    * the fast path — a second application path would be a second set of rules about
+    * buffers, reference counts and frame ordering, kept in step by hope.
+    *
+    * The client cannot tell which trigger fired, and that is correct: a
+    * `membership.changed` frame means the same thing either way. */
+   async function reread(connection: Connection): Promise<void> {
+-    const actual = new Set(await api.memberships(connection.identity));
++    const truth = await api.memberships(connection.identity);
++    const actual = new Set(truth.map((c) => c.id));
+     const held = new Set(connection.channelIds);
+ 
+     for (const channelId of held) {
+       if (actual.has(channelId)) continue;
+       deliverMembership({
+         environment: connection.identity.environmentId,
+@@ -740,12 +847,20 @@
+     }
+     for (const channelId of actual) {
+       if (held.has(channelId)) continue;
+       deliverMembership({
+         environment: connection.identity.environmentId,
+         channel: channelId,
++        // THE BACKSTOP CARRIES THE NAME TOO (FR-RTM-11). An addition found on the
++        // timer announces a channel this connection has never heard of, exactly as
++        // a published change does — and the gateway has no database to ask. Without
++        // this the one frame that tells a client about the channel would be the one
++        // frame unable to name it, and `send` would drop it.
++        ...(truth.find((c) => c.id === channelId) !== undefined && {
++          channel_identity: truth.find((c) => c.id === channelId)!.external_id,
++        }),
+         user: connection.identity.userExternalId,
+         change: "added",
+       });
+     }
+   }
+   // noServer: the upgrade is handled by hand so the token can be checked
+@@ -927,13 +1042,13 @@
+           logger.log("info", "connection.rejected", { reason: "quota_exceeded" });
+           return;
+         }
+         void open(
+           ws,
+           result.identity,
+-          result.channelIds,
++          result.channels,
+           result.revisions,
+           req.url ?? "/",
+           // REQUIRED, SO IT COMES BEFORE THE TWO OPTIONAL ONES. `sendLimit` is a
+           // number and `claimedId` a string, so a wrong order here is a type error
+           // rather than a silent swap — unlike `sendError`'s two `string`s in this
+           // same file, where the compiler had nothing to say.
+@@ -945,13 +1060,15 @@
+     })();
+   });
+ 
+   async function open(
+     socket: WebSocket,
+     identity: Identity,
+-    channelIds: string[],
++    /** Pairs, not keys (FR-RTM-11): the connection derives its key set AND both
++     * directions of the translation from this one list, so they cannot disagree. */
++    channels: { id: string; external_id: string }[],
+     /** BESIDE `channelIds` AND NOT AFTER `url`, because it arrives with them from one
+      * session answer — and because `claimedId` below is optional: gaps.md 045-18 records
+      * a parameter inserted ahead of an optional one silently renaming every later
+      * argument. A required parameter here makes the compiler name every call site. */
+     revisions: Record<string, number>,
+     url: string,
+@@ -971,13 +1088,16 @@
+       identity,
+       socket,
+       // Memberships arrived with the identity, from the session
+       // call at the door. There is no second lookup to fail here — the api is
+       // still the only source of membership (ADR-05), it just answers both
+       // questions at once, and a failure now closes the socket before it opens.
+-      channelIds: new Set(channelIds),
++      channelIds: new Set(channels.map((c) => c.id)),
++      // ONE LIST, TWO MAPS, AND `channelIds` STAYS KEYS (FR-RTM-11).
++      identities: new Map(channels.map((c) => [c.id, c.external_id])),
++      keys: new Map(channels.map((c) => [c.external_id, c.id])),
+       // Reported on the ack and never read again by this service.
+       revisions,
+       missedPings: 0,
+       phase: presented === undefined ? "live" : "buffering",
+       buffer: [],
+       overflowed: false,
+@@ -1309,13 +1429,13 @@
+     payload: {
+       cursor: Record<string, number>;
+       resume_ok: boolean;
+       truncated: string[];
+     },
+   ): void {
+-    send(connection.socket, {
++    send(connection, {
+       type: "connection.ack",
+       payload: {
+         user: connection.identity.userExternalId,
+         // EVERY CHANNEL THIS USER BELONGS TO, ZEROS INCLUDED, on every ack — a resume
+         // and a fresh connect report the same way, because a client cannot act on a
+         // number it only sometimes receives.
+@@ -1331,13 +1451,15 @@
+   async function resume(
+     connection: Connection,
+     presented: Record<string, number> | null,
+     subscribing: Promise<unknown>,
+   ): Promise<void> {
+     const cursors =
+-      presented === null ? {} : scopeCursors(presented, connection.channelIds);
++      presented === null
++        ? {}
++        : scopeCursors(presented, connection.channelIds, connection.keys);
+ 
+     /** Everything that cannot promise completeness ends up here: the client
+      * is told resume did not happen and which channels to page instead. The
+      * frames held so far are dropped on purpose — they would be an arbitrary
+      * fragment of a stream the client is about to refetch in full. */
+     const degrade = (reason: string): void => {
+@@ -1398,13 +1520,13 @@
+     if (connection.overflowed) return degrade("buffer_overflow");
+ 
+     ack(connection, { cursor: cursors, resume_ok: true, truncated });
+ 
+     for (const [, page] of Object.entries(backfilled)) {
+       for (const message of page.messages) {
+-        send(connection.socket, {
++        send(connection, {
+           type: "message.created",
+           payload: message,
+         });
+       }
+     }
+ 
+@@ -1415,13 +1537,13 @@
+     // measured rather than guessed.)
+     if (connection.overflowed) {
+       connection.socket.close(1011, "resume buffer overflow");
+       return;
+     }
+     for (const message of flushable(connection.buffer, marks)) {
+-      send(connection.socket, { type: "message.created", payload: message });
++      send(connection, { type: "message.created", payload: message });
+     }
+     connection.buffer = [];
+     // KEPT, where chapter 2.7 discarded them. Scoped to the cursors this
+     // connection actually presented, so the bound is this service's rather than
+     // one inherited from the shape of the api's response.
+     connection.marks = scopeMarks(marks, cursors);
+@@ -1565,13 +1687,24 @@
+ 
+     // THE SECOND INBOUND FRAME, and it leaves before the send
+     // limiter below: a typing signal is not a send and must not spend a send's
+     // budget (FR-014). It also never reaches the api — the whole path is this
+     // gateway, Redis, and whoever is subscribed.
+     if (frame.data.type === "typing.send") {
+-      await signalTyping(connection, frame.data.payload.channel);
++      // TRANSLATED BEFORE `signalTyping`, WHICH IS WHERE FR-003 IS LOST IF IT IS
++      // LOST (FR-RTM-11). That function opens with a membership test against
++      // `channelIds` — a KEY set — and drops a miss "with no frame, no close code
++      // and no log line" (FR-013). Past it the string becomes a NATS subject. So an
++      // untranslated identifier here is indistinguishable from a client typing into
++      // a channel it has left, and unlike a send there is no api round trip to
++      // refuse it.
++      const typingChannel = frame.data.payload.channel;
++      await signalTyping(
++        connection,
++        connection.keys.get(typingChannel) ?? typingChannel,
++      );
+       return;
+     }
+ 
+     // THE SEND LIMIT IS SPENT ON THE FRAME, not on the api call
+     // it becomes — a socket send and a REST send count against one budget
+     // (FR-RTL-01), or a client could double its allowance by opening a socket.
+@@ -1614,24 +1747,31 @@
+ 
+     // A NAMED DESTRUCTURE, AND THAT IS THE POINT (FR-001). Widening
+     // `messageSendSchema` puts `attachments` on the wire; without naming it here nothing
+     // carries it further, the message commits without attachments, and the client is
+     // acked as though it worked. There is no error anywhere in that sequence.
+     const { channel, text, idem_key, attachments } = frame.data.payload;
++    // THE GATEWAY TRANSLATES BEFORE IT KNOCKS (FR-RTM-11, chapter 4.23). The api's
++    // internal door is typed `z.string().uuid()` and stays that way — `internal.ts`
++    // says internal uuids are the api's business — so an identifier has to become a
++    // key on this side. A value the map does not hold is passed through unchanged
++    // and refused by the api exactly as an unknown channel is refused today, which
++    // is the point: this line adds a name, not a new way to be told no.
++    const channelKey = connection.keys.get(channel) ?? channel;
+     try {
+       const committed = await api.sendMessage(connection.identity, {
+-        channel_id: channel,
++        channel_id: channelKey,
+         text,
+         ...(attachments !== undefined && { attachments }),
+         idempotency_key: idem_key,
+       });
+       const { seq } = committed;
+       // The ack carries the sequence the API committed — after the commit,
+       // never before (FR-MSG-05, unchanged since 2.2; the socket is a new
+       // door onto the same write path).
+-      send(connection.socket, { type: "message.ack", payload: { seq } });
++      send(connection, { type: "message.ack", payload: { seq } });
+       // …and only THEN does anyone else hear about it. Durability, then the
+       // sender's confirmation, then everybody's copy: no step overtakes the
+       // one before it (§5.1's ordering, now spanning machines).
+       //
+       // A RECOGNISED RETRY IS NOT REPUBLISHED. 2.3 made the retry safe for
+       // storage; that did not make it safe for delivery, and a client that
+```
+
+### `services/gateway/src/resume.ts` — `scopeCursors` takes either form.
+```diff title="services/gateway/src/resume.ts"
+@@ -72,16 +72,34 @@
+  * is asked. Membership is the api's truth (ADR-05) and it re-checks; this
+  * is about not turning one connect into a thousand index scans, and about
+  * a foreign channel id being a no-op rather than a question. */
+ export function scopeCursors(
+   cursors: Record<string, number>,
+   channelIds: Set<string>,
++  /** Identity to key, for a client that presents the name it was given
++   * (FR-RTM-11, chapter 4.23). Optional so every caller that holds no map — the
++   * unit tests of this function among them — keeps the behaviour it had. */
++  keys?: Map<string, string>,
+ ): Record<string, number> {
+-  return Object.fromEntries(
+-    Object.entries(cursors).filter(([channelId]) => channelIds.has(channelId)),
+-  );
++  // BOTH FORMS, AND THE FILTER IS WHY THIS MATTERS. A key this set does not hold is
++  // DROPPED here — silently, with no error and no log — so a client presenting the
++  // identifiers this chapter started handing out would have resumed NOTHING and
++  // been told nothing, which is FR-003's one forbidden outcome reached by a filter
++  // rather than by a refusal. Every client connected before the chapter still
++  // presents uuids, so both have to work.
++  //
++  // THE IDENTITY IS TRIED FIRST, AS IT IS ON REST. 19 of 44,574 channels carry an
++  // identifier that is itself another channel's uuid, so no shape test separates
++  // the two and the order is a correctness choice: under key-first a customer who
++  // named a channel with another channel's uuid could never resume their own.
++  const resolved: Record<string, number> = {};
++  for (const [presented, seq] of Object.entries(cursors)) {
++    const key = keys?.get(presented) ?? presented;
++    if (channelIds.has(key)) resolved[key] = seq;
++  }
++  return resolved;
+ }
+ 
+ /** The backfill's high-water mark per channel: the last sequence the
+  * client is about to have. Channels absent from the backfill keep their
+  * presented cursor as the mark — nothing new arrived, so anything buffered
+  * is genuinely new. */
+```
+
+### `services/gateway/src/api-client.ts` — the memberships call returns pairs.
+```diff title="services/gateway/src/api-client.ts"
+@@ -82,13 +82,15 @@
+     token: string,
+   ): Promise<InternalSessionResponse | { quotaExceeded: string } | null>;
+   /** The backstop: what this connection may hear, now.
+    *
+    * The one question a periodic re-read has, asked of the route that answers only
+    * it. `session()` would answer this too and three other things. */
+-  memberships(identity: Identity): Promise<string[]>;
++  memberships(
++    identity: Identity,
++  ): Promise<{ id: string; external_id: string }[]>;
+   /** Resume backfill (chapter 2.7): everything past the cursors, per
+    * channel, already shaped as wire frames. */
+   backfill(
+     identity: Identity,
+     cursors: Record<string, number>,
+   ): Promise<InternalBackfillResponse["channels"]>;
+@@ -204,13 +206,13 @@
+       });
+       const body = await parse(
+         res,
+         internalMembershipsResponseSchema,
+         "memberships",
+       );
+-      return body.channel_ids;
++      return body.channels;
+     },
+     async backfill(identity, cursors) {
+       const res = await fetch(`${baseUrl}/internal/backfill`, {
+         method: "POST",
+         headers: headers(identity),
+         body: JSON.stringify({ cursors } satisfies InternalBackfillRequest),
+```
+
+### `services/gateway/src/isolation-fixtures.ts` — the gauntlet's tenants know what they called their channel.
+```diff title="services/gateway/src/isolation-fixtures.ts"
+@@ -67,12 +67,17 @@
+ export interface SocketTenant {
+   environmentId: string;
+   credential: string;
+   userExternalId: string;
+   userId: string;
+   channelId: string;
++  /** What the customer called that channel — `${label}-channel` — which is what a
++   * client now sees in every frame and in the ack's three structures (FR-RTM-11,
++   * chapter 4.23). The gauntlet asserts the identity because that is what the
++   * socket emits; asserting the key would be asserting the defect. */
++  channelIdentity: string;
+   /** A private channel in the same environment that this tenant's user is NOT a
+    * member of. */
+   privateChannelId: string;
+   /** That private channel's history, read with the APPLICATION key — which sees
+    * private channels (FR-005) — so a refused send can be checked against the
+    * rows rather than against its own error frame. */
+@@ -102,12 +107,13 @@
+    * (T153). */
+   banSelf: () => Promise<void>;
+   unbanSelf: () => Promise<void>;
+   seedDeletable: () => Promise<{
+     userExternalId: string;
+     channelId: string;
++    channelIdentity: string;
+     seq: number;
+     witnessToken: string;
+   }>;
+   /** A token for `userExternalId`, minted through the api's own dev-token route so
+    * the signing secret never leaves the api — research R1's rule, and the reason
+    * the gateway asks rather than verifies. */
+@@ -213,12 +219,13 @@
+     return {
+       environmentId: environment.id,
+       credential: key.credential,
+       userExternalId,
+       userId: user.id,
+       channelId: channel.id,
++      channelIdentity: `${label}-channel`,
+       privateChannelId: privateChannel.id,
+       // Minted through the api rather than signed here: the signing secret never
+       // leaves the api (research R1), which is also why the gateway asks the api to
+       // verify rather than verifying itself.
+       token: await mintToken(api.url, key.credential, userExternalId),
+       say: (text: string) =>
+@@ -311,12 +318,13 @@
+           userId: doomed.id,
+           userExternalId: `${label2}-doomed`,
+         });
+         return {
+           userExternalId: `${label2}-doomed`,
+           channelId: room.id,
++          channelIdentity: `${label2}-room`,
+           seq: sent.seq,
+           witnessToken: await mintToken(api.url, key.credential, `${label2}-witness`),
+         };
+       },
+       unarchiveOwnChannel: async () => {
+         const res = await fetch(`${api.url}/v1/channels/${channel.id}/archive`, {
+```
+
+### `services/gateway/src/isolation.itest.ts` — three attacks a derived target list cannot find.
+```diff title="services/gateway/src/isolation.itest.ts"
+@@ -261,12 +261,81 @@
+     // proves is absent on every route — the socket does not get an exemption.
+     expect(JSON.stringify(payload)).not.toContain(t.victim.channelId);
+     expect(payload.code).toBeTruthy();
+     socket.socket.close();
+   }, 20_000);
+ 
++  it("message.send naming the other tenant's channel by its IDENTITY is refused", async () => {
++    // THE SUITE DERIVES ITS TARGETS FROM `frameSchema`'S MEMBERS, so it catches a
++    // frame type added and forgotten — and chapter 4.23 adds no frame type. It
++    // changes what a field CARRIES, and three of the structures it changes are not
++    // frame types at all. **A derived-target suite is green by construction against
++    // a value change**, which is why these cases are written by hand.
++    //
++    // AND THE IDENTITY IS THE SHARPER ATTACK. The uuid above is a value the attacker
++    // had to be given; `victim-channel` is a name they can GUESS, and after this
++    // chapter it is a name the platform accepts.
++    const socket = connect(url, t.attacker.token);
++    await socket.waitFor("connection.ack");
++    socket.socket.send(
++      JSON.stringify({
++        type: "message.send",
++        payload: {
++          idem_key: randomUUID(),
++          channel: t.victim.channelIdentity,
++          text: "from the attacker, by name",
++        },
++      }),
++    );
++    const error = await socket.waitFor("error");
++    const payload = error.payload as { code?: string; message?: string };
++    expect(JSON.stringify(payload)).not.toContain(t.victim.channelIdentity);
++    expect(JSON.stringify(payload)).not.toContain(t.victim.channelId);
++    expect(payload.code).toBeTruthy();
++    socket.socket.close();
++  }, 20_000);
++
++  it("a typing frame for the other tenant's channel reaches nobody, by key or by identity", async () => {
++    // THE ONE INBOUND PATH WITH NO REFUSAL BEHIND IT. `signalTyping` drops a channel
++    // the connection does not hold with no frame, no close code and no log line
++    // (FR-013) — so the assertion is that nothing comes back and the socket stays
++    // open, which is what "dropped" looks like from outside. A refusal here would
++    // be the leak: it would tell the attacker the channel exists.
++    const socket = connect(url, t.attacker.token);
++    await socket.waitFor("connection.ack");
++    const seen: unknown[] = [];
++    socket.socket.on("message", (raw: Buffer) => seen.push(JSON.parse(raw.toString())));
++    for (const channel of [t.victim.channelId, t.victim.channelIdentity]) {
++      socket.socket.send(JSON.stringify({ type: "typing.send", payload: { channel } }));
++    }
++    await new Promise((r) => setTimeout(r, 600));
++    expect(JSON.stringify(seen)).not.toContain(t.victim.channelId);
++    expect(JSON.stringify(seen)).not.toContain(t.victim.channelIdentity);
++    expect(socket.socket.readyState).toBe(WebSocket.OPEN);
++    socket.socket.close();
++  }, 20_000);
++
++  it("a cursor naming the other tenant's channel by IDENTITY backfills nothing", async () => {
++    // The uuid half of this is asserted below and has been since the previous
++    // chapter. This is the half the identity opens: `scopeCursors` now resolves an
++    // identity before filtering, so the question is whether that resolution can
++    // reach outside the connection's own map. It cannot — the map is built from the
++    // session response, which is scoped by `users.environmentId` — and this is the
++    // test that says so from outside.
++    const socket = connect(
++      url,
++      t.attacker.token,
++      `&cursor=${t.victim.channelIdentity}:0`,
++    );
++    const ack = await socket.waitFor("connection.ack");
++    const payload = ack.payload as { cursor?: Record<string, number> };
++    expect(Object.keys(payload.cursor ?? {})).not.toContain(t.victim.channelIdentity);
++    expect(Object.keys(payload.cursor ?? {})).not.toContain(t.victim.channelId);
++    socket.socket.close();
++  }, 20_000);
++
+   it("every declared frame type that is not message.send is refused inbound", async () => {
+     // SCHEMA VALIDATION RUNS BEFORE THE TYPE CHECK, and that shapes what this can
+     // claim. A frame whose payload does not match its own schema is answered
+     // `invalid_frame` and never reaches the rule that says clients may not utter a
+     // server frame — so a loop sending `{}` for every type would pass while testing
+     // the parser, not the rule. The first draft of this test did exactly that.
+@@ -386,13 +455,13 @@
+     // difference between the two acks is the whole assertion.
+     await t.attacker.say(`before removal ${randomUUID()}`);
+ 
+     const asMember = connect(url, t.attacker.token, `&cursor=${t.attacker.channelId}:0`);
+     const first = await asMember.waitFor("connection.ack");
+     const beforeCursor = (first.payload as { cursor?: Record<string, number> }).cursor ?? {};
+-    expect(Object.keys(beforeCursor)).toContain(t.attacker.channelId);
++    expect(Object.keys(beforeCursor)).toContain(t.attacker.channelIdentity);
+     asMember.socket.close();
+ 
+     // Through the PUBLIC ROUTE, so the test asserts the consequence of the API rather
+     // than of a direct write — a repository call would prove the session reads
+     // `members` and nothing about whether the endpoint gets there.
+     await t.attacker.removeSelf();
+@@ -432,13 +501,13 @@
+   it("keeps an archived channel in the session and its cursor accepted", async () => {
+     await t.attacker.archiveOwnChannel();
+     try {
+       const socket = connect(url, t.attacker.token, `&cursor=${t.attacker.channelId}:0`);
+       const ack = await socket.waitFor("connection.ack");
+       const cursor = (ack.payload as { cursor?: Record<string, number> }).cursor ?? {};
+-      expect(Object.keys(cursor)).toContain(t.attacker.channelId);
++      expect(Object.keys(cursor)).toContain(t.attacker.channelIdentity);
+       socket.socket.close();
+     } finally {
+       // IN A `finally`, BECAUSE THE TEST ABOVE LEARNED THIS THE OTHER WAY. It left a
+       // removed membership behind and the next test failed on its control rather
+       // than on its subject. An assertion that throws must still put the state back,
+       // or the diagnosis lands in a file that did nothing wrong.
+@@ -581,13 +650,13 @@
+   // client's cursor, which is the only place in this suite where a stored message becomes
+   // a frame — the live fan-out does not reach this suite at all (see T134).
+   it("delivers a deleted user's message on resume, still attributed to them", async () => {
+     // ITS OWN FIXTURE. The first version deleted the shared `victim`, which took that
+     // tenant's membership with it and made the next test's profile PATCH answer 404 —
+     // the same shared-fixture mutation the removal test hit.
+-    const { userExternalId, channelId, seq, witnessToken } =
++    const { userExternalId, channelId, channelIdentity, seq, witnessToken } =
+       await t.victim.seedDeletable();
+ 
+     const deleted = await fetch(`${t.apiUrl}/v1/users/${userExternalId}`, {
+       method: "DELETE",
+       headers: { authorization: `Bearer ${t.victim.credential}` },
+     });
+@@ -596,13 +665,13 @@
+     // A REMAINING MEMBER RESUMES. The deletion took the doomed user's own membership, so
+     // their session no longer carries the channel — and the case that matters is that the
+     // message survives for everybody else.
+     const socket = connect(url, witnessToken, `&cursor=${channelId}:0`);
+     const ack = await socket.waitFor("connection.ack");
+     const cursor = (ack.payload as { cursor?: Record<string, number> }).cursor ?? {};
+-    expect(Object.keys(cursor)).toContain(channelId);
++    expect(Object.keys(cursor)).toContain(channelIdentity);
+ 
+     const mine = await socket.waitFor("message.created");
+     // THE FRAME ARRIVED, and its `user` is the deleted user's external id. Both halves
+     // matter: absent means `toFrame` dropped the row, and a null `user` means
+     // `messageSchema` would have refused it.
+     expect((mine.payload as Record<string, unknown>)["seq"]).toBe(seq);
+```
+
+### `services/gateway/src/session.test.ts` — the stubs the compiler named.
+```diff title="services/gateway/src/session.test.ts"
+@@ -54,13 +54,13 @@
+         ? {
+             environment_id: "env-1",
+             user: "tuan",
+             // The api now reports whether the user is banned, and a stub
+             // that does not say is a stub that has not thought about it.
+             banned: false,
+-            channel_ids: [CHANNEL],
++            channels: [{ id: CHANNEL, external_id: CHANNEL }],
+             revisions: {},
+             // The limits ride the session response because the
+             // gateway has no database to read them from — so the stub supplies
+             // them, exactly as the api would. Generous by default: every test
+             // in this file is about something else.
+             limits: { connect: 3_000, send: 600 },
+@@ -69,13 +69,13 @@
+     backfill: async () => ({}),
+     sendMessage: async () => committed(42),
+         // The backstop reads this. The default answers what the session above says,
+         // so a stub that never overrides it is a stub whose re-read agrees with its
+         // own connect — which is the state every test in this file that is not about
+         // membership wants.
+-        memberships: async () => [CHANNEL],
++        memberships: async () => ([CHANNEL]).map((c: string) => ({ id: c, external_id: c })),
+         // Null is what a gateway with no metering credential gets, and it is the right
+         // default here: every test in this file is about the socket, and a meter that
+         // reported would only add a call nobody asserts on.
+         reportUsage: async () => null,
+     ...overrides,
+   };
+@@ -1147,13 +1147,13 @@
+         session: async () => ({
+           environment_id: "env-1",
+           user: "tuan",
+           // The ban flag, which is upstream of this chapter in this order — a stub
+           // that does not say is a stub that has not thought about it.
+           banned: false,
+-          channel_ids: [CHANNEL],
++          channels: [{ id: CHANNEL, external_id: CHANNEL }],
+           revisions: {},
+           limits: { connect: 2, send: 600 },
+         }),
+       }),
+       undefined,
+       undefined,
+@@ -1184,13 +1184,13 @@
+         session: async () => ({
+           environment_id: "env-1",
+           user: "tuan",
+           // The ban flag, which is upstream of this chapter in this order — a stub
+           // that does not say is a stub that has not thought about it.
+           banned: false,
+-          channel_ids: [CHANNEL],
++          channels: [{ id: CHANNEL, external_id: CHANNEL }],
+           revisions: {},
+           limits: { connect: 3_000, send: configured },
+         }),
+       }),
+       undefined,
+       undefined,
+```
+
+### `services/gateway/src/resume.itest.ts` — the stubs the compiler named.
+```diff title="services/gateway/src/resume.itest.ts"
+@@ -123,40 +123,40 @@
+     // The backfill leg is deliberately slow, and a DIFFERENT process — a
+     // different fanout client on the same subject — publishes into the
+     // window. Neither side coordinates; only the buffer saves this.
+     harness = await boot({
+       session: async () => ({
+         environment_id: "env-1",
+         user: "tuan",
+         // The api now reports whether the user is banned, and a stub
+         // that does not say is a stub that has not thought about it.
+         banned: false,
+-        channel_ids: [CHANNEL],
++        channels: [{ id: CHANNEL, external_id: CHANNEL }],
+         revisions: {},
+         // The limits ride the session response now. Generous, and
+         // beside the point of every test in this file.
+         limits: { connect: 3_000, send: 600 },
+       }),
+       backfill: async () => {
+         await publishFromElsewhere(frame(43));
+         await settle(150); // give Redis time to actually deliver it
+         return {
+           [CHANNEL]: { messages: [frame(42), frame(43)], truncated: false },
+         };
+       },
+       sendMessage: async () => {
+         throw new Error("not used");
+       },
+       // Agrees with `session` above: this file is about the resume,
+       // and a backstop that disagreed with the connect would be a second subject
+       // under test.
+-      memberships: async () => [CHANNEL],
++      memberships: async () => ([CHANNEL]).map((c: string) => ({ id: c, external_id: c })),
+     });
+     const socket = new WebSocket(
+       `${harness.url}?token=${await token()}&cursor=${CHANNEL}:41`,
+     );
+     const frames = record(socket);
+     await settle(700);
+     const seqs = created(frames);
+     expect(seqs).toEqual([42, 43]);
+     expect(new Set(seqs).size).toBe(seqs.length);
+     socket.close();
+@@ -165,72 +165,72 @@
+   it("delivers a mid-backfill frame that the backfill did not contain", async () => {
+     // Committed after the backfill's snapshot: it exists ONLY in the buffer,
+     // and the flush is the only reason the client ever sees it.
+     harness = await boot({
+       session: async () => ({
+         environment_id: "env-1",
+         user: "tuan",
+         // The api now reports whether the user is banned, and a stub
+         // that does not say is a stub that has not thought about it.
+         banned: false,
+-        channel_ids: [CHANNEL],
++        channels: [{ id: CHANNEL, external_id: CHANNEL }],
+         revisions: {},
+         // The limits ride the session response now. Generous, and
+         // beside the point of every test in this file.
+         limits: { connect: 3_000, send: 600 },
+       }),
+       backfill: async () => {
+         await publishFromElsewhere(frame(43));
+         await settle(150);
+         return { [CHANNEL]: { messages: [frame(42)], truncated: false } };
+       },
+       sendMessage: async () => {
+         throw new Error("not used");
+       },
+       // Agrees with `session` above: this file is about the resume,
+       // and a backstop that disagreed with the connect would be a second subject
+       // under test.
+-      memberships: async () => [CHANNEL],
++      memberships: async () => ([CHANNEL]).map((c: string) => ({ id: c, external_id: c })),
+     });
+     const socket = new WebSocket(
+       `${harness.url}?token=${await token()}&cursor=${CHANNEL}:41`,
+     );
+     const frames = record(socket);
+     await settle(700);
+     expect(created(frames)).toEqual([42, 43]);
+     socket.close();
+   });
+ 
+   it("goes live after the flush, with no buffering left behind", async () => {
+     harness = await boot({
+       session: async () => ({
+         environment_id: "env-1",
+         user: "tuan",
+         // The api now reports whether the user is banned, and a stub
+         // that does not say is a stub that has not thought about it.
+         banned: false,
+-        channel_ids: [CHANNEL],
++        channels: [{ id: CHANNEL, external_id: CHANNEL }],
+         revisions: {},
+         // The limits ride the session response now. Generous, and
+         // beside the point of every test in this file.
+         limits: { connect: 3_000, send: 600 },
+       }),
+       backfill: async () => ({
+         [CHANNEL]: { messages: [frame(42)], truncated: false },
+       }),
+       sendMessage: async () => {
+         throw new Error("not used");
+       },
+       // Agrees with `session` above: this file is about the resume,
+       // and a backstop that disagreed with the connect would be a second subject
+       // under test.
+-      memberships: async () => [CHANNEL],
++      memberships: async () => ([CHANNEL]).map((c: string) => ({ id: c, external_id: c })),
+     });
+     const socket = new WebSocket(
+       `${harness.url}?token=${await token()}&cursor=${CHANNEL}:41`,
+     );
+     const frames = record(socket);
+     await settle(400);
+     // A frame published AFTER the resume finished must arrive immediately —
+     // the phase went back to normal 2.6 delivery.
+     await publishFromElsewhere(frame(44));
+     await settle(300);
+@@ -255,36 +255,36 @@
+     // closed, because `marks` was a local variable that `resume()` discarded.
+     //
+     // One number different from the test above it. That is the whole bug.
+     harness = await boot({
+       session: async () => ({
+         environment_id: "env-1",
+         user: "tuan",
+         // The api now reports whether the user is banned, and a stub
+         // that does not say is a stub that has not thought about it.
+         banned: false,
+-        channel_ids: [CHANNEL],
++        channels: [{ id: CHANNEL, external_id: CHANNEL }],
+         revisions: {},
+         // The limits ride the session response now. Generous, and
+         // beside the point of every test in this file.
+         limits: { connect: 3_000, send: 600 },
+       }),
+       backfill: async () => ({
+         [CHANNEL]: { messages: [frame(42)], truncated: false },
+       }),
+       sendMessage: async () => {
+         throw new Error("not used");
+       },
+       // Agrees with `session` above: this file is about the resume,
+       // and a backstop that disagreed with the connect would be a second subject
+       // under test.
+-      memberships: async () => [CHANNEL],
++      memberships: async () => ([CHANNEL]).map((c: string) => ({ id: c, external_id: c })),
+     });
+     const socket = new WebSocket(
+       `${harness.url}?token=${await token()}&cursor=${CHANNEL}:41`,
+     );
+     const frames = record(socket);
+     await settle(400);
+     // The resume has completed. NOW the fabric catches up with a message the
+     // backfill already delivered — the publish that was still in flight while the
+     // backfill query ran.
+     await publishFromElsewhere(frame(42));
+@@ -302,36 +302,36 @@
+     // This is the case that made the spec's first design unsafe. It proposed
+     // retiring the mark once a higher sequence arrived — which would see the 43,
+     // drop the mark, and then deliver the 42 (research R3).
+     harness = await boot({
+       session: async () => ({
+         environment_id: "env-1",
+         user: "tuan",
+         // The api now reports whether the user is banned, and a stub
+         // that does not say is a stub that has not thought about it.
+         banned: false,
+-        channel_ids: [CHANNEL],
++        channels: [{ id: CHANNEL, external_id: CHANNEL }],
+         revisions: {},
+         // The limits ride the session response now. Generous, and
+         // beside the point of every test in this file.
+         limits: { connect: 3_000, send: 600 },
+       }),
+       backfill: async () => ({
+         [CHANNEL]: { messages: [frame(42)], truncated: false },
+       }),
+       sendMessage: async () => {
+         throw new Error("not used");
+       },
+       // Agrees with `session` above: this file is about the resume,
+       // and a backstop that disagreed with the connect would be a second subject
+       // under test.
+-      memberships: async () => [CHANNEL],
++      memberships: async () => ([CHANNEL]).map((c: string) => ({ id: c, external_id: c })),
+     });
+     const socket = new WebSocket(
+       `${harness.url}?token=${await token()}&cursor=${CHANNEL}:41`,
+     );
+     const frames = record(socket);
+     await settle(400);
+     // 43 is ABOVE the mark and must be delivered. A rule that retired the mark on
+     // seeing it would then have nothing left to compare the delayed 42 against.
+     await publishFromElsewhere(frame(43));
+     await settle(150);
+@@ -362,37 +362,37 @@
+    *
+    * **THE ABSENCE IS THE ASSERTION.** A resume that carried `message.updated` for a
+    * message the client is receiving for the first time would be telling it that
+    * something it has never seen has changed. */
+   it("replays an edited message as message.created with its current text, and no message.updated", async () => {
+     harness = await boot({
+       session: async () => ({
+         environment_id: "env-1",
+         user: "tuan",
+         banned: false,
+-        channel_ids: [CHANNEL],
++        channels: [{ id: CHANNEL, external_id: CHANNEL }],
+         revisions: {},
+         limits: { connect: 3_000, send: 600 },
+       }),
+       // The api's backfill returns ROWS AS THEY ARE NOW — which for an edited message
+       // is the corrected text under its original sequence. The stub says exactly that,
+       // and `backfill.itest.ts` proves the real one does.
+       backfill: async () => ({
+         [CHANNEL]: {
+           messages: [{ ...frame(42), text: "m42, corrected" }],
+           truncated: false,
+         },
+       }),
+       sendMessage: async () => {
+         throw new Error("not used");
+       },
+-      memberships: async () => [CHANNEL],
++      memberships: async () => ([CHANNEL]).map((c: string) => ({ id: c, external_id: c })),
+     });
+     const socket = new WebSocket(
+       `${harness.url}?token=${await token()}&cursor=${CHANNEL}:41`,
+     );
+     const frames = record(socket);
+     await settle(400);
+ 
+     expect(created(frames)).toEqual([42]);
+     const replayed = frames.find((f) => f.type === "message.created") as {
+       payload: Message;
+@@ -409,36 +409,36 @@
+     // backfill it received is a fragment or nothing at all. A mark taken from it
+     // would suppress messages the client never got — turning this chapter's
+     // duplicate into a gap, which constitution II ranks worse.
+     harness = await boot({
+       session: async () => ({
+         environment_id: "env-1",
+         user: "tuan",
+         // The api now reports whether the user is banned, and a stub
+         // that does not say is a stub that has not thought about it.
+         banned: false,
+-        channel_ids: [CHANNEL],
++        channels: [{ id: CHANNEL, external_id: CHANNEL }],
+         revisions: {},
+         // The limits ride the session response now. Generous, and
+         // beside the point of every test in this file.
+         limits: { connect: 3_000, send: 600 },
+       }),
+       backfill: async () => {
+         throw new Error("backfill unavailable");
+       },
+       sendMessage: async () => {
+         throw new Error("not used");
+       },
+       // Agrees with `session` above: this file is about the resume,
+       // and a backstop that disagreed with the connect would be a second subject
+       // under test.
+-      memberships: async () => [CHANNEL],
++      memberships: async () => ([CHANNEL]).map((c: string) => ({ id: c, external_id: c })),
+     });
+     const socket = new WebSocket(
+       `${harness.url}?token=${await token()}&cursor=${CHANNEL}:41`,
+     );
+     const frames = record(socket);
+     await settle(400);
+     // A sequence at or below the presented cursor. With no mark retained it must
+     // still arrive: the client was told to page history, not to expect silence.
+     await publishFromElsewhere(frame(41));
+     await settle(300);
+@@ -477,31 +477,31 @@
+     const socket = new WebSocket(`${harness.url}?token=${await token()}`);
+     sockets.push(socket);
+     return record(socket);
+   };
+ 
+   const stub = (channels: string[]) => ({
+     session: async () => ({
+       environment_id: "env-1",
+       user: "tuan",
+       banned: false,
+-      channel_ids: channels,
++      channels: channels.map((c) => ({ id: c, external_id: c })),
+       revisions: {},
+       limits: { connect: 3_000, send: 600 },
+     }),
+     backfill: async () => ({}),
+     sendMessage: async () => {
+       throw new Error("not used");
+     },
+     // The same list `session` answers with, so the backstop confirms
+     // what the connect already established and changes nothing.
+-    memberships: async () => channels,
++    memberships: async () => channels.map((c) => ({ id: c, external_id: c })),
+   });
+ 
+   afterEach(async () => {
+     for (const socket of sockets.splice(0)) socket.close();
+     await member?.close();
+     await bystander?.close();
+     member = undefined;
+     bystander = undefined;
+   });
+ 
+```
+
+### `services/gateway/src/typing.itest.ts` — a fixture that pre-dated the contract.
+```diff title="services/gateway/src/typing.itest.ts"
+@@ -110,20 +110,20 @@
+   });
+   const api: ApiClient = {
+     session: async () => ({
+       environment_id: environment,
+       user: options.user,
+       banned: false,
+-      channel_ids: options.channels,
++      channels: options.channels.map((c: string) => ({ id: c, external_id: c })),
+       revisions: {},
+       // The limits ride this response as of the limits chapter, and this fixture is
+       // generous on purpose: T048b below asserts that a typing signal spends NO send
+       // budget, and a tight number here would make that pass for the wrong reason.
+       limits: { connect: 3_000, send: 600 },
+     }),
+-    memberships: async () => options.channels,
++    memberships: async () => options.channels.map((c: string) => ({ id: c, external_id: c })),
+     backfill: async () => {
+       if (options.backfillDelayMs !== undefined) {
+         await new Promise((r) => setTimeout(r, options.backfillDelayMs));
+       }
+       return (options.backfillFrames ?? {}) as never;
+     },
+@@ -799,12 +799,19 @@
+     });
+     await announcer.publish(
+       subjectForUserMembership("env-1", "mai"),
+       JSON.stringify({
+         environment: "env-1",
+         channel,
++        // THE IDENTITY RIDES THE CHANGE NOW (FR-RTM-11, chapter 4.23), and a fixture
++        // imitating the api has to carry it: without this the gateway's map has no
++        // entry for a channel joined mid-connection, so the typing frame announcing
++        // it is DROPPED and logged — which is the designed behaviour, and this test
++        // is how it was observed. This suite's stubs name a channel by its key, so
++        // the identity here is the key.
++        channel_identity: channel,
+         user: "mai",
+         change: "added",
+       }),
+     );
+     await settle();
+ 
+```
+
+### `services/gateway/src/connections.itest.ts` — the stubs the compiler named.
+```diff title="services/gateway/src/connections.itest.ts"
+@@ -134,17 +134,17 @@
+   });
+   const api: ApiClient = {
+     session: async () => ({
+       environment_id: environment,
+       user: options.user,
+       banned: false,
+-      channel_ids: options.channels,
++      channels: options.channels.map((c: string) => ({ id: c, external_id: c })),
+       revisions: {},
+       limits: { connect: 3_000, send: 600 },
+     }),
+-    memberships: async () => options.channels,
++    memberships: async () => options.channels.map((c: string) => ({ id: c, external_id: c })),
+     backfill: async () => ({}) as never,
+     sendMessage: async () => {
+       throw new Error("not used");
+     },
+     // NULL, WHICH IS WHAT A GATEWAY WITH NO METERING CREDENTIAL GETS. This suite is
+     // about the connection cap and reports nothing; the api's side takes the same safe direction, so
+```
+
+### `services/gateway/src/public-surface.itest.ts` — the public surface keeps both names.
+```diff title="services/gateway/src/public-surface.itest.ts"
+@@ -158,40 +158,47 @@
+       }
+     };
+     return { socket, frames, opened, waitForText };
+   }
+ 
+   /** A channel and two members, all over public HTTP. Returns the channel id. */
+-  async function seedOverTheWire(label: string, users: string[]): Promise<string> {
++  async function seedOverTheWire(
++    label: string,
++    users: string[],
++  ): Promise<{ id: string; external_id: string }> {
++    // THE NAME IS KEPT, NOT JUST THE KEY. A client sees the identifier in every
++    // frame and in the ack's cursor now (FR-RTM-11, chapter 4.23), so a suite about
++    // the public surface has to hold both to assert either.
++    const externalId = `${label}-${randomUUID().slice(0, 8)}`;
+     const created = await post(
+       "/v1/channels",
+-      { external_id: `${label}-${randomUUID().slice(0, 8)}`, type: "public" },
++      { external_id: externalId, type: "public" },
+       api.credential,
+     );
+     expect(created.status).toBe(201);
+     const channelId = ((await created.json()) as { id: string }).id;
+     const members = await post(
+       `/v1/channels/${channelId}/members`,
+       { user_ids: users },
+       api.credential,
+     );
+     expect(members.status).toBe(200);
+     const body = (await members.json()) as { members: { status: string }[] };
+     expect(body.members.every((m) => m.status === "added")).toBe(true);
+-    return channelId;
++    return { id: channelId, external_id: externalId };
+   }
+ 
+   const mint = async (user: string): Promise<string> => {
+     // 200, not 201: minting a token creates nothing that has a URL.
+     const res = await post("/auth/dev-token", { user, ttl_seconds: 3600 }, api.credential);
+     expect(res.status).toBe(200);
+     return ((await res.json()) as { token: string }).token;
+   };
+ 
+   it("delivers a message between two members added over the wire", async () => {
+-    const channelId = await seedOverTheWire("live", ["tuan", "mai"]);
++    const { id: channelId } = await seedOverTheWire("live", ["tuan", "mai"]);
+ 
+     const tuan = reader(`${wsUrl}/v1/ws?token=${await mint("tuan")}`);
+     const mai = reader(`${wsUrl}/v1/ws?token=${await mint("mai")}`);
+     await Promise.all([tuan.opened, mai.opened]);
+ 
+     const text = `over the wire ${randomUUID().slice(0, 8)}`;
+@@ -245,13 +252,14 @@
+   // harness's `gaps.md` G1 listed exactly those two mechanisms; neither remains.
+   //
+   // THE SENDER IS A BOT, because the caller is a key. A key may not name "tuan" — that
+   // is a person and `sender_not_permitted` is the refusal — so the send that this test
+   // needs to succeed must name software.
+   it("delivers a REST-sent message, live and on resume", async () => {
+-    const channelId = await seedOverTheWire("rest", ["tuan"]);
++    const { id: channelId, external_id: channelExternalId } =
++      await seedOverTheWire("rest", ["tuan"]);
+     const token = await mint("tuan");
+     // Created over the public route, because this suite has no database handle by
+     // design — it is the one that tests what a customer can reach.
+     await post(
+       "/v1/users",
+       {
+@@ -342,13 +350,13 @@
+     await resumed.opened;
+     await new Promise((resolve) => setTimeout(resolve, 1_500));
+     const ack = resumed.frames.find((f) => f.type === "connection.ack") as
+       | { payload: { cursor: Record<string, number>; resume_ok: boolean } }
+       | undefined;
+     expect(ack?.payload.resume_ok).toBe(true);
+-    expect(Object.keys(ack?.payload.cursor ?? {})).toContain(channelId);
++    expect(Object.keys(ack?.payload.cursor ?? {})).toContain(channelExternalId);
+     // ONE FRAME, NOT TWO, AND THE CURSOR IS WHY. `cursor=${channelId}:1` says "I have
+     // seen through sequence 1", so the backfill replays what came after it — the second
+     // message only. Asserting two was an assumption about the fixture rather than a
+     // reading of the cursor.
+     const onResume = resumed.frames.filter((f) => f.type === "message.created");
+     expect(onResume).toHaveLength(1);
+```

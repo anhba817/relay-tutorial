@@ -347,7 +347,12 @@ meet it.** Until chapter 4.22 every route beneath `/v1/channels/{channelId}` req
 uuid Relay minted, and `GET /v1/channels/order-88412` answered **500** — so the first thing
 Priya's tool tries returned an internal error, and the "zero lookup tables" Stage 1 promises
 was a lookup table. FR-CHN-11 is the clause that now says it must work, and it exists because
-this stage was walked rather than read.
+this stage was walked rather than read. **And the promise was still half-kept after that**:
+every gateway frame carried the uuid, so a tool reading REST and holding a socket needed the
+table on one of its two surfaces. FR-RTM-11 closed that at chapter 4.23. **One surface is
+still open and it is worth naming here rather than discovering it in Stage 5**: a webhook
+payload carries `channel_id` as a Relay identifier, so a customer's backend — the integration
+Journey 1 is about — keeps the table this journey says it will not need.
 
 **Measure (for the customer, enabled by Relay):** median time from ticket to conversation
 open. Target: under one minute.
@@ -396,7 +401,10 @@ day. The abuse stayed visible the whole time.
 
 **What Relay must provide** — moderator deletion of any message (FR-MOD-02), tenant-scoped
 ban (FR-USR-06), both effective in real time: connected clients see the deletion event
-immediately (FR-RTM-05), and a banned user's connections drop. **Latency of moderation is a
+immediately (FR-RTM-05), and a banned user's connections drop. **And the frame names the
+channel the way Stage 1 promised** — `order-88412`, not a uuid (FR-RTM-11, chapter 4.23).
+Until then this stage handed Mai's support tool the lookup table Stage 1 says she will not
+need, on the one surface where she cannot go and look it up. **Latency of moderation is a
 safety property, not a convenience.**
 
 ### Stage 6 — Record

@@ -1,0 +1,288 @@
+import { Why, Trap, Checkpoint } from "@/components/tutorial/boxes";
+import { ChapterHeader, ChapterFooter } from "@/components/tutorial/chapter-shell";
+import { Figure } from "@/components/tutorial/figure";
+import {
+  figTwoSurfaces,
+  figWhatCountsAsNaming,
+  figTwentyOneSites,
+  figTheBuffer,
+} from "./figures";
+
+export const metadata = {
+  title: "The channel a socket names — Building Relay",
+  description:
+    "REST learned the customer's name for a channel last chapter. The socket did not. Closing that gap turns out to be a lesson in counting the right things.",
+  alternates: {
+    canonical: "/part-4/chapter-23/the-channel-a-socket-names",
+    languages: {
+      en: "/part-4/chapter-23/the-channel-a-socket-names",
+      vi: "/vi/part-4/chapter-23/the-channel-a-socket-names",
+    },
+  },
+};
+
+<ChapterHeader id="4.23" />
+
+Last chapter you made thirteen REST routes take the name your customer already had
+for a channel. `GET /v1/channels/order-88412` works. So does deleting a message in
+it, listing its members, and reading its history.
+
+Now open a socket onto the same channel and watch what arrives.
+
+```
+message.created   channel = 419320ca-eaa8-412f-b157-c0a8f4bc8de5
+```
+
+One platform. Two answers.
+
+<Figure caption="The same channel, named two ways by one product" code={figTwoSurfaces} />
+
+This is not a bug report from a customer. It is worse than that: it is a promise
+half-kept, on the two surfaces one support tool uses together. Journey 3's Stage 1
+says Mai maps order #88412 to channel `order-88412` *with zero lookup tables*. After
+4.22 that holds when her tool asks a question. Stage 5 is the real-time half — her
+tool holds a socket so she sees the deletion land — and every frame it receives
+names the channel something she never chose. To know which order a frame is about,
+she needs exactly the table the journey says she will not need.
+
+And nothing in the specification said the socket should follow. That is the first
+thing worth noticing, because it is the same shape 4.22 found one surface over: ten
+FR-RTM clauses describe what is delivered and when, and **not one of them names an
+identifier**. There was no rule being broken. There was no rule.
+
+## Start by counting, and get it wrong
+
+The obvious way to size this chapter is to count the places a frame names a channel.
+Seven schemas in `packages/protocol/src/frames.ts` carry a `channel` field.
+Twenty-one expressions in the gateway write `channel:`. Seven and twenty-one: that
+is the work.
+
+Both numbers are right and the conclusion drawn from them is wrong, in two different
+directions. Take the seven first.
+
+<Figure caption="Seven fields, and three more things that name a channel without the word" code={figWhatCountsAsNaming} />
+
+`connection.ack` is the first frame every client receives. Its payload carries
+`revisions`, a map **keyed by channel**; `cursor`, another map keyed by channel; and
+`truncated`, a **list of channel ids**. None of the three contains the string
+`channel:` anywhere near the value it names. A requirement written against the seven
+fields would have shipped a chapter that renames every frame a client might receive
+and leaves the first frame it definitely receives carrying uuids.
+
+<Trap>
+**A grep for a field name cannot see a map keyed by that field's value.** The three
+structures above were invisible to every count this chapter started with, and they
+sit on the one frame that always arrives. When you are sizing a rename, the question
+is not *where does this word appear* but *where does this value appear* — as a field,
+as a key, or as a member of a list.
+</Trap>
+
+Now the twenty-one. Open them instead of counting them.
+
+<Figure caption="What the twenty-one sites actually are" code={figTwentyOneSites} />
+
+**Three write a client frame.** Eleven are log lines — `membership.applied`,
+`fanout.publish_failed`, `typing.published` — which an operator reads beside subject
+names and Postgres rows, and which must therefore keep the key. Six are internal
+publishes, where the string becomes a NATS subject. One is a comment.
+
+And the frame a client sees most often is not in the list at all. `message.created`
+reaches a socket as a payload **forwarded from the api**: the gateway parses it,
+hands it on, and writes no `channel:` of its own. A chapter that edited twenty-one
+expressions would have renamed eleven log lines, broken two publishes, and missed
+the commonest frame on the surface.
+
+So the rename goes somewhere else: at `send`, the single function every frame leaves
+through.
+
+## Why one place is correctness and not tidiness
+
+Moving the translation to the edge looks like a matter of taste until you look at
+what a frame does between being built and being sent.
+
+<Figure caption="The buffer, where a client-facing frame is also internal state" code={figTheBuffer} />
+
+A connection that presents a resume cursor is born *buffering*: frames for its
+channels queue in `connection.buffer` while the backfill goes first. Those queued
+objects are the frames a client will receive — and they are also the rows two
+internal comparisons index by channel.
+
+`flushable(buffer, marks)` decides which buffered frames are genuinely new by
+reading `marks[frame.channel]`. The marks come from the api's backfill, keyed by the
+channel's key. Put an identity into `frame.channel` and every lookup misses, every
+mark reads as zero, and **a resuming client is re-sent its entire buffer**.
+
+One line over, the revocation path filters the buffer with
+`m.channel !== change.channel` so that a removal landing mid-resume does not flush
+the backlog of a channel the user just lost. Put an identity on one side of that
+comparison and the key on the other and **a revoked channel's backlog is delivered
+anyway** — access taken away and the messages handed over in the same act.
+
+Both failures are silent. Neither produces an error, a log line, or a red test
+anywhere outside the two suites written for those exact cases. Translating at `send`
+cannot reach them, because everything behind `send` still holds keys.
+
+<Why>
+**Where a translation happens is a constitution II question, not a style question.**
+Constitution II says no acknowledged message is ever lost. The resume path is the
+mechanism that keeps it true, and the resume path indexes frames by channel. A
+design that renames a frame when it is BUILT puts the new name into a structure two
+comparisons read as a key — so the principle is decided by a choice that looks, from
+the outside, like where to put a function call.
+</Why>
+
+## The map, and the direction nobody asked for
+
+The connection already holds `channelIds`, a set of keys built from the session
+response at connect. It gains two maps beside it: key to identity for everything
+going out, and **identity to key for everything coming in**.
+
+The second direction is easy to forget, because the chapter's whole description is
+about what a client *sees*. But FR-002 says a client may also *say* the identifier,
+and three places turn what a client says back into a key: the send that knocks at
+the api's internal door, the typing signal that becomes a NATS subject, and the
+resume cursor's filter.
+
+Deriving one map from the other is safe here for a reason worth stating rather than
+assuming: `unique("channels_environment_id_external_id_unique")` makes an identity
+unique inside an environment, and the session response is scoped to one. Two keys
+cannot collide on one identity. If that constraint were ever dropped the inverse map
+would become lossy and nothing in this service would notice.
+
+## The hole, and the timer that cannot cover it
+
+The map is built at connect. A user added to a channel **during** a session learns
+about it from a `membership.changed` frame — and at the instant that frame is built,
+the map has no entry for the channel it is about. The one frame announcing a channel
+would be the one frame unable to name it.
+
+There is a tempting answer: the gateway already re-reads memberships on a timer, as
+the revocation backstop. Let that fill the map. The measurement kills it —
+`DEFAULT_REREAD_INTERVAL_MS` is **sixty seconds** and the frame goes out immediately.
+A backstop is a backstop.
+
+So the identity rides the change. `membershipFabricSchema` gains an optional
+`channel_identity`, the api reads it back when it announces a membership change, and
+the gateway inserts into the map *before* the send — inside the same `.then()` that
+already orders subscribe, insert, send, and whose comment says that ordering is the
+whole of FR-008.
+
+And then the backstop needed it too, which is the part this chapter did not predict.
+
+<Why>
+**The defect was found by running the lane, not by reading the code.** With the map
+in place, `membership.itest.ts`'s backstop test failed: `reread` delivers additions
+discovered on the timer, and those changes carried no identity, so the new `send`
+dropped the frame exactly as designed. The fix is that `GET /internal/memberships`
+carries pairs as well — a second api→gateway contract this chapter had listed as
+*probably untouched*. An analysis pass had flagged that route as worth checking and
+priced it as a tidy; it was a defect.
+</Why>
+
+## The inbound half, where the failure is silence
+
+Three paths take a channel from a client, and they fail in three different ways.
+
+A **send** reaches the api, which refuses an unknown channel with a code and a
+message. Translate or not, the client is told something.
+
+A **typing signal** does not. `signalTyping` opens with a membership test against
+the connection's key set and drops a miss with — in the words of the comment already
+there — *no frame, no close code and no log line*. An untranslated identifier on that
+path is indistinguishable from a client typing into a channel it has left. There is
+no api round trip to refuse it, so if the translation is missing there, nothing
+anywhere says so.
+
+A **resume cursor** is worse again, because it is filtered rather than parsed.
+`scopeCursors` drops any key the connection's set does not hold. A client presenting
+the identifiers this chapter started handing out would have resumed **nothing**, been
+told nothing, and silently missed every message sent while it was away. That is
+constitution II's worst shape, reached by a filter and not by a refusal — which is
+why both forms are accepted going in, for ever, and not just during an upgrade.
+
+Which leaves the question of how to tell the two forms apart. You cannot do it by
+shape:
+
+```
+channels whose external_id is uuid-shaped          19 of 44,574
+of those, equal to ANOTHER channel's Relay id      19
+```
+
+Four days before this chapter the same query returned **0 of 41,772**, which is the
+figure 4.22 published and reasoned from. A string can be one channel's name and
+another channel's key at the same time, and on the lane nineteen of them are. So the
+gateway tries the identity first and falls back to the key — the same tie-break 4.22
+chose for a path segment, for the same reason: under key-first, a customer who named
+a channel with another channel's uuid could never reach their own.
+
+<Checkpoint>
+Before the inbound half, confirm the outbound half from outside. Connect a client,
+let one message arrive, and read the frame:
+
+```
+message.created   channel = order-88412
+connection.ack    revisions keys = ["order-88412"]
+```
+
+If the ack's `revisions` still shows a uuid while `message.created` shows the order
+number, the translation is in the frame builders rather than at `send` — the exact
+split this chapter's counting error produces.
+</Checkpoint>
+
+## What the gauntlet could not catch
+
+The cross-tenant suite attacks the socket. It derives its target list from
+`frameSchema`'s own members, so a frame type added and forgotten is attacked
+automatically — which is the right design and it is why nobody has had to maintain a
+list.
+
+This chapter adds no frame type. It changes what a field carries, and three of the
+structures it changes are not frame types at all. **A derived-target suite is green
+by construction against a value change.** The attacks that matter here were written
+by hand:
+
+- a send naming the victim's channel **by its identity**, which is the sharper
+  attack of the two — the uuid is a value an attacker has to be *given*, and
+  `victim-channel` is a name they can **guess**;
+- a typing frame for the victim's channel, asserting that nothing comes back and the
+  socket stays open, because a refusal there would itself be the leak;
+- a resume cursor naming the victim's channel by identity, which must backfill
+  nothing.
+
+And the tenancy probe says what it has said for four chapters running. Delete the
+environment scope from `channelsForUser` and the socket gauntlet stays green at 35 of
+35; one test in the suite built for that question goes red. The map arrives already
+scoped, and the gateway's own membership checks absorb the difference. **A
+single-mutation probe measures the defence, not the arm.**
+
+## What is still true, and what is still open
+
+The subjects did not move. `subjectForChannel` and its four siblings still derive
+from the key, the resume cursor's storage and comparison are still keyed, and the
+api's internal send door is still typed `z.string().uuid()` — the gateway translates
+before it knocks. That is 4.22's division applied one service out, and `git diff`
+against the previous chapter's tag says so in zero changed lines.
+
+One surface is still wrong, and it is named here rather than left for somebody to
+find. A **webhook payload** carries `channel_id` as a Relay identifier, in three
+payload types, on a boundary whose own comment reads *"Consumers are customers: they
+get external ids and the field names the REST surface uses."* The field under that
+sentence is the one that breaks it — the third time in three chapters that a comment
+has stated a principle two lines above the code contradicting it.
+
+It is not this chapter's. It is written into the SRS, into ADR-38 in both of its
+homes, and into the journey map, so that the next person to meet it meets a decision
+rather than a surprise.
+
+And there is one more thing to say about how this chapter came to exist, because it
+is the second in a row that did. Chapter 4.22 exists because a milestone's premise
+check found thirteen REST routes contradicting a published clause. This one exists
+because 4.22's own closing sweep found the gateway doing the same thing. **A part
+that keeps growing out of its own discoveries can stop converging**, and the honest
+defence is not that each discovery was worth taking — it is that each was bounded
+and measured before it was started: seven schemas, twenty-one sites, 98 fence pages,
+one map at one edge. The webhook surface above is a third discovery, and it is
+recorded rather than built for exactly that reason. Two in a row is a pattern worth
+watching. Three would be a part that cannot finish.
+
+<ChapterFooter id="4.23" />

@@ -2820,12 +2820,33 @@ its own merits. Uniqueness is what makes the identity addressable at all:
 `channels_environment_id_external_id_unique` and
 `users_environment_id_external_id_unique` are the constraints this ADR rests on.
 
-**And what it does not cover.** The real-time surface still addresses channels by
-uuid — every gateway frame carries `channel: <uuid>`, the session response hands a
-connecting client a list of channel uuids, and a socket send is forwarded to a door
-typed `z.string().uuid()`. `packages/protocol/src/internal.ts` states this ADR's own
-principle two lines above that field — *"`user` is the EXTERNAL id, as everywhere else
-on this contract: internal uuids are the api's business"* — and applies it to one
-field of two. A customer holding a socket still keeps the mapping REST no longer
-needs. Not fixed here: it is the gateway, `subjectForChannel`, the resume cursors and
-the internal contract.
+**And what it did not cover, which chapter 4.23 closed.** The real-time surface
+addressed channels by uuid — every gateway frame carried `channel: <uuid>`, the
+session response handed a connecting client a list of channel uuids, and a socket
+send went to a door typed `z.string().uuid()`. `packages/protocol/src/internal.ts`
+stated this ADR's own principle two lines above that field — *"`user` is the EXTERNAL
+id, as everywhere else on this contract: internal uuids are the api's business"* —
+and applied it to one field of two.
+
+**FR-RTM-11 now says which identifier names a channel on the socket**, and the
+translation sits at the gateway's client edge: the session response carries pairs,
+the connection holds both directions of the map, and one function — `send` — renames
+on the way out. The subjects, the resume cursors' internal keying and the api-facing
+door keep the Relay identifier, which is this ADR's division applied one service
+over rather than a new one.
+
+**TWO THINGS THAT CHAPTER MEASURED AND THIS ADR SHOULD CARRY.** The surface was
+larger than a count of `channel` fields showed: `connection.ack` names channels three
+more times without the word, in `revisions` and `cursor` (both keyed by channel) and
+in `truncated` (a list of them). And the tie-break this ADR fixed for REST is now
+load-bearing on the socket too — **19 of 44,574 channels carry an identifier that is
+itself another channel's Relay identifier** (measured 2026-10-08, against 0 of 41,772
+four days earlier), so no shape test separates the two forms in a resume cursor and
+the identifier wins, as it does on a path segment.
+
+**AND A THIRD SURFACE IS STILL OPEN.** Webhook payloads carry `channel_id` as a Relay
+identifier — `MessageCreatedData`, `MessageDeletedData` and `MembershipChangedData`
+in `services/api/src/outbox/event.ts`, delivered to the customer's own endpoint — on
+a boundary whose own comment says *"Consumers are customers: they get external ids
+and the field names the REST surface uses."* Recorded rather than closed: it belongs
+to no chapter yet.

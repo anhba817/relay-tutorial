@@ -2536,9 +2536,12 @@ makes an identity addressable:
 `channels_environment_id_external_id_unique` and `users_environment_id_external_id_unique` are
 the constraints this rests on.
 
-**What it does not cover.** The real-time surface still addresses channels by uuid — every
-gateway frame carries `channel: <uuid>` and a socket send goes to a door typed
-`z.string().uuid()`. `packages/protocol/src/internal.ts` states this principle two lines above
-that field and applies it to one of two.
+**What it did not cover, and what still does not.** The real-time surface addressed
+channels by uuid until chapter 4.23: **FR-RTM-11 now states the rule for the socket**, the
+session response carries pairs, and one function at the gateway's client edge renames on the
+way out while the subjects, the cursors' internal keying and the api-facing door keep the
+Relay identifier. **Webhook payloads still carry `channel_id` as a Relay identifier**
+(`services/api/src/outbox/event.ts`), on a boundary whose own comment says consumers get
+external ids — recorded, and nobody's chapter yet.
 
 The argument is in `docs/06-adr-deep-dives.md`; this is the summary and that is the ADR.

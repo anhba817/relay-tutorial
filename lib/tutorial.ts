@@ -1023,6 +1023,17 @@ export const series: Part[] = [
           "docs/04-srs.md, docs/05-sad.md, docs/06-adr-deep-dives.md, docs/03-journey-map.md, docs/12-part-4-structure.md",
         readerMinutes: 35,
       },
+      {
+        id: "4.23",
+        path: "/part-4/chapter-23/the-channel-a-socket-names",
+        title: "The channel a socket names",
+        status: "published",
+        readerProduces:
+          "A real-time surface that calls a channel what your customer calls it, and a lesson in counting the right things. Chapter 4.22 made thirteen REST routes take the identifier the customer gave a channel; the gateway did not change and was never asked to, so one platform answered two ways and Journey 3's \u201Czero lookup tables\u201D held on the surface a support tool asks questions with and not on the surface it watches. You open on that: the same channel, named order-88412 over REST and 419320ca-\u2026 on the socket, one minute apart. Then you size the work and get it wrong twice. Seven schemas carry a channel field \u2014 and connection.ack names channels three more times WITHOUT the word, in two maps keyed by channel and a list of them, so a grep for a field cannot see a map keyed by that field's value. Twenty-one gateway expressions write a channel \u2014 and only three build a client frame; eleven are log lines an operator reads against the subject names, six are internal publishes, and the commonest frame on the socket is forwarded from the api and written by no gateway expression at all. So the rename goes at the single send, and that turns out to be a correctness choice rather than a tidy one: the resume buffer holds frames that two internal comparisons index by channel, so translating where a frame is BUILT re-sends a resuming client its whole backlog and flushes a revoked channel's messages anyway, both silently. You will build the map in both directions, find the hole where a channel joined mid-session cannot be named, discover that the sixty-second backstop cannot cover it, and then watch the lane catch a defect the reading missed \u2014 the backstop's own additions carried no identity and the new send dropped them. You will measure 19 of 44,574 identifiers that are another channel's key, which is why no shape test can separate the two forms in a resume cursor, and you will write three cross-tenant attacks by hand because a suite that derives its targets from the protocol is green by construction against a change in what a field carries",
+        sourceDoc:
+          "docs/04-srs.md, docs/05-sad.md, docs/06-adr-deep-dives.md, docs/03-journey-map.md, docs/12-part-4-structure.md",
+        readerMinutes: 35,
+      },
     ],
   },
   {
